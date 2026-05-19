@@ -1,0 +1,78 @@
+---
+title: API overview
+sidebarTitle: Overview
+description: Learn the public Ursula HTTP routes for creating, appending, reading, and replaying streams.
+---
+
+Ursula exposes a small public HTTP API for durable append-only streams. Most users only need the `/{bucket}/{stream}` route family, which maps cleanly to buckets and stream IDs.
+
+This API is Ursula's implementation of the [Durable Streams Protocol](/docs/specs/durable-stream), defined by the durable-streams community, with additional route families for compatibility and deployment needs.
+
+## Bucket operations
+
+| Method | Path | Description |
+| -------- | ----------------------------- | ------------------------------------------------------------ |
+| `PUT` | `/{bucket}` | [Create a bucket](/docs/api/create-bucket) |
+
+Bucket-level `GET` (metadata), `DELETE`, and `GET /{bucket}/streams` (list) are part of the Durable Streams Protocol but are not yet implemented in Ursula. Track stream existence at the application layer for now.
+
+## Stream operations
+
+| Method | Path | Description |
+| -------- | ----------------------------- | ------------------------------------------------------------ |
+| `PUT` | `/{bucket}/{stream}` | [Create a stream](/docs/api/create-stream) |
+| `POST` | `/{bucket}/{stream}` | [Append data or close](/docs/api/append) |
+| `POST` | `/{bucket}/{stream}/append-batch` | Batched append. See [extensions spec](/docs/specs/extensions#append-batch) |
+| `GET` | `/{bucket}/{stream}` | [Read (catch-up, long-poll, SSE)](/docs/api/read) |
+| `HEAD` | `/{bucket}/{stream}` | [Get stream metadata](/docs/api/head-stream) |
+| `DELETE` | `/{bucket}/{stream}` | [Delete a stream](/docs/api/delete-stream) |
+
+## Bootstrap and snapshots
+
+| Method | Path | Description |
+| -------- | --------------------------------------------- | ---------------------------------------------------- |
+| `GET` | `/{bucket}/{stream}/bootstrap` | [Snapshot + tail replay](/docs/api/bootstrap) |
+| `GET` | `/{bucket}/{stream}/snapshot` | [Read latest snapshot](/docs/api/read-snapshot) |
+| `GET` | `/{bucket}/{stream}/snapshot/{offset}` | [Read snapshot at offset](/docs/api/read-snapshot) |
+| `PUT` | `/{bucket}/{stream}/snapshot/{offset}` | [Publish a snapshot](/docs/api/publish-snapshot) |
+
+## v1 compatibility
+
+A flat [v1 compatibility layer](/docs/api/v1-compatibility) is also available under `/v1/stream/{path}` for simpler integrations that don't need explicit bucket management.
+
+## Common request patterns
+
+### Create a bucket and stream
+
+```bash
+curl -X PUT http://127.0.0.1:4437/demo
+curl -X PUT http://127.0.0.1:4437/demo/hello
+```
+
+### Append data
+
+```bash
+curl -X POST http://127.0.0.1:4437/demo/hello \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary 'hello world'
+```
+
+### Read from the beginning
+
+```bash
+curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
+```
+
+### Subscribe with SSE
+
+```bash
+curl 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
+```
+
+## Related concepts
+
+- [Read modes](/docs/concepts/read-modes): catch-up vs long-poll vs SSE
+- [Bootstrap](/docs/concepts/bootstrap): snapshot + tail recovery
+- [Snapshots](/docs/concepts/snapshots): snapshot lifecycle
+- [Exactly-once writes](/docs/concepts/exactly-once-writes): producer deduplication
+- [Conditional writes](/docs/concepts/conditional-writes): ETag and sequence-based writes

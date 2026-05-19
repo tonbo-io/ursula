@@ -1,0 +1,95 @@
+---
+title: Clients
+description: Talking to Ursula from any HTTP client.
+---
+
+Ursula speaks plain HTTP and Server-Sent Events. There is no required client library. Any HTTP client in any language works.
+
+The examples elsewhere in these docs use `curl` because it's universal. The same routes, headers, and query parameters apply to every other client.
+
+## Minimal examples
+
+<Tabs>
+<Tab title="curl">
+
+```bash
+# create a bucket and stream
+curl -X PUT http://127.0.0.1:4437/demo
+curl -X PUT http://127.0.0.1:4437/demo/hello
+
+# append
+curl -X POST http://127.0.0.1:4437/demo/hello \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary 'hello world'
+
+# catch-up read
+curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
+
+# live tail
+curl 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
+```
+
+</Tab>
+<Tab title="Python">
+
+```python
+import requests
+
+base = "http://127.0.0.1:4437"
+
+requests.put(f"{base}/demo")
+requests.put(f"{base}/demo/hello")
+
+requests.post(
+    f"{base}/demo/hello",
+    headers={"Content-Type": "application/octet-stream"},
+    data=b"hello world",
+)
+
+# catch-up read
+resp = requests.get(f"{base}/demo/hello", params={"offset": -1})
+print(resp.content)
+
+# live tail with SSE
+with requests.get(
+    f"{base}/demo/hello",
+    params={"offset": -1, "live": "sse"},
+    stream=True,
+) as r:
+    for line in r.iter_lines():
+        if line:
+            print(line.decode())
+```
+
+</Tab>
+<Tab title="TypeScript / fetch">
+
+```ts
+const base = "http://127.0.0.1:4437";
+
+await fetch(`${base}/demo`, { method: "PUT" });
+await fetch(`${base}/demo/hello`, { method: "PUT" });
+
+await fetch(`${base}/demo/hello`, {
+  method: "POST",
+  headers: { "Content-Type": "application/octet-stream" },
+  body: "hello world",
+});
+
+// catch-up read
+const data = await (await fetch(`${base}/demo/hello?offset=-1`)).text();
+
+// live tail with native EventSource
+const es = new EventSource(`${base}/demo/hello?offset=-1&live=sse`);
+es.addEventListener("data", (e) => console.log(e.data));
+```
+
+</Tab>
+</Tabs>
+
+## Notes for client implementers
+
+- After every read and append, the server returns `Stream-Next-Offset`. Track it. Use it as the `offset` query parameter on the next read. Don't construct offsets manually. They're opaque.
+- For binary streams over SSE, `data` events arrive as a JSON envelope (`{ encoding, contentType, payload }`) with a base64 payload. See [Binary SSE](/docs/concepts/binary-sse).
+- For exactly-once writes, send `Producer-Id`, `Producer-Epoch`, `Producer-Seq` headers and retry on network errors. The server deduplicates. See [Exactly-once writes](/docs/concepts/exactly-once-writes).
+- For conditional writes, use `Stream-Seq` with a monotonically increasing token. (`If-Match` is part of the Durable Streams Protocol but is not yet implemented in Ursula.) See [Conditional writes](/docs/concepts/conditional-writes).

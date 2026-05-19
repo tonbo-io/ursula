@@ -1,0 +1,48 @@
+---
+title: Head stream
+api: "HEAD /{bucket}/{stream}"
+description: Get stream metadata without reading its content.
+---
+
+<ParamField path="bucket" type="string" required>
+ Bucket ID.
+</ParamField>
+
+<ParamField path="stream" type="string" required>
+ Stream ID within the bucket.
+</ParamField>
+
+<ParamField header="If-None-Match" type="string">
+ ETag for conditional request. Returns `304` if the stream state has not changed.
+</ParamField>
+
+## Response
+
+| Status | Meaning |
+| ------ | ------------------------------------------------------ |
+| `200` | Stream found. |
+| `304` | Stream state unchanged (when `If-None-Match` matches). |
+| `404` | Stream not found or expired. |
+
+Response headers include:
+
+| Header | Description |
+| ------------------------ | --------------------------------------------------------- |
+| `Content-Type` | The stream's content type. |
+| `Stream-Next-Offset` | The next writable offset (= current length). |
+| `ETag` | Stream state ETag (encodes offset and open/closed state). |
+| `Stream-Closed` | Present and `true` if the stream is closed. |
+| `Stream-Snapshot-Offset` | Present if a snapshot exists, showing its offset. |
+| `Stream-TTL` | Remaining TTL in seconds (if a TTL was set). |
+| `Stream-Expires-At` | Expiration timestamp (if set). |
+| `Cache-Control` | `no-store`. |
+
+<RequestExample>
+```bash Example
+curl -I http://127.0.0.1:4437/demo/hello
+```
+</RequestExample>
+
+<Tip>
+Use `If-None-Match` with a previously received `ETag` to efficiently poll for state changes without transferring data.
+</Tip>

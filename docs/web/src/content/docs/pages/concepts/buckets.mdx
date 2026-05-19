@@ -1,0 +1,31 @@
+---
+title: Buckets
+sidebarTitle: Buckets
+description: Buckets group related streams into namespaces.
+---
+
+Streams are organized into buckets. A bucket is a namespace, like a folder that holds related streams under one URL prefix:
+
+```
+/{bucket}/{stream}
+```
+
+A collaborative editing app might use one bucket per workspace, with one stream per document: `/workspace-a/doc-1`, `/workspace-a/doc-2`. An agent platform might use one bucket per tenant: `/tenant-acme/run-xyz`.
+
+## Naming
+
+Bucket IDs match the regex `[a-z0-9_-]{4,64}`: 4–64 bytes, lowercase ASCII letters and digits plus `_` and `-`. Uppercase letters, `/`, `.`, and most punctuation are rejected with `400`.
+
+The combined bucket-plus-stream URL path also has a 122-byte ceiling. With a 64-byte bucket name, you have 58 bytes left for the stream ID.
+
+## Lifecycle
+
+- **`PUT /{bucket}`** creates the bucket. Idempotent if it already exists.
+- **`GET /{bucket}`** returns metadata.
+- **`DELETE /{bucket}`** removes the bucket but only when empty. If any stream still exists, `DELETE` returns `409 Conflict` with `bucket_not_empty`. There is no cascading delete. Remove streams first.
+- **`GET /{bucket}/streams`** lists streams in the bucket with optional prefix filtering and cursor-based pagination (page size up to 1000, default 1000).
+
+## Related
+
+- [Streams](/docs/concepts/streams)
+- [API: list streams](/docs/api/list-streams)

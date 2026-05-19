@@ -1,0 +1,115 @@
+---
+title: Configuration
+description: Every Ursula configuration knob - CLI flags and environment variables.
+---
+
+Ursula is configured via CLI flags and environment variables. There is no TOML or YAML configuration file today.
+
+```
+defaults < environment variables < CLI flags
+```
+
+## CLI flags
+
+| Flag | Default | Notes |
+| ---- | ------- | ----- |
+| `--listen ADDR` | `127.0.0.1:4437` | TCP bind address for the HTTP + gRPC-Raft listener |
+| `--core-count N` | `available_parallelism` | Worker threads (each pinned to its mailbox event loop) |
+| `--raft-group-count N` | `core_count × 16` | Total Raft groups. Higher = better stream-to-group hash spread |
+| `--raft-memory` | off | In-memory Raft log. Volatile |
+| `--wal-dir DIR` | none | Per-group JSON log + per-core `journal.bin` for single-node persistence |
+| `--raft-log-dir DIR` | none | Durable Raft log directory (use with static gRPC cluster) |
+| `--raft-node-id ID` | none | Required for static gRPC cluster mode |
+| `--raft-peer ID=URL` | none | Static peer list (repeatable: one per node, including self) |
+| `--raft-cluster-config FILE` | none | JSON file equivalent to `--raft-node-id` + `--raft-peer` lines |
+| `--raft-init-membership` | off | One-time cluster-wide membership bootstrap (first start only) |
+| `--raft-init-membership-per-group` | off | Same, but bootstrap each Raft group independently |
+
+Storage flags (`--raft-memory`, `--wal-dir`, `--raft-log-dir`) are mutually exclusive. Static gRPC cluster mode requires either `--raft-memory` or `--raft-log-dir`. It does not accept `--wal-dir`.
+
+## Cluster config file
+
+The `--raft-cluster-config FILE` JSON shape:
+
+```json
+{
+  "node_id": 1,
+  "init_membership_per_group": true,
+  "peers": [
+    {"node_id": 1, "url": "http://10.0.0.1:4437"},
+    {"node_id": 2, "url": "http://10.0.0.2:4437"},
+    {"node_id": 3, "url": "http://10.0.0.3:4437"}
+  ]
+}
+```
+
+Same file on every host. Only `node_id` at the top level changes.
+
+## Cold storage environment variables
+
+Cold backend is selected entirely via `URSULA_COLD_*` env vars. See [Configure S3](/docs/configure-s3) for the full reference. Minimum set:
+
+| Variable | Required when | Notes |
+| -------- | ------------- | ----- |
+| `URSULA_COLD_BACKEND` | optional | `s3` or `fs`. Default: no cold backend configured. |
+| `URSULA_COLD_S3_BUCKET` | `BACKEND=s3` | Bucket name. |
+| `URSULA_COLD_S3_REGION` | `BACKEND=s3` | AWS region. |
+| `URSULA_COLD_S3_ENDPOINT` | optional | Set for S3-compatible stores. |
+| `URSULA_COLD_S3_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY`, `_SESSION_TOKEN` | optional | Explicit credentials. Omit to use the AWS SDK credential chain. |
+| `URSULA_COLD_ROOT` | optional | Prefix for all cold keys. Defaults to `data/cold` (`fs`) or unprefixed (`s3`). |
+
+## Flush and admission tuning
+
+| Variable | Default | Purpose |
+| -------- | ------- | ------- |
+| `URSULA_COLD_FLUSH_INTERVAL_MS` | `1000` | Background flush worker tick interval |
+| `URSULA_COLD_FLUSH_MIN_HOT_BYTES` | `8 MiB` | Skip flush if a group's hot ring is smaller |
+| `URSULA_COLD_FLUSH_MAX_BYTES` | `8 MiB` | Max bytes flushed per group per tick |
+| `URSULA_COLD_FLUSH_MAX_CONCURRENCY` | `4` | Parallel cold writes |
+| `URSULA_COLD_MAX_HOT_BYTES_PER_GROUP` | `64 MiB` | Per-group hot ceiling - appends return `503` (cold backpressure) above this |
+| `URSULA_LIVE_READ_MAX_WAITERS_PER_CORE` | `65536` | Hard cap on SSE waiters held per core |
+
+## Diagnostic
+
+| Variable | Purpose |
+| -------- | ------- |
+| `URSULA_TOKIO_CONSOLE` | When set and the binary was built with the `tokio-console` feature, initializes the console subscriber on startup |
+| `RUST_LOG` | Standard tracing filter `ursula_http=info,ursula_runtime=info,ursula_raft=info` is a reasonable baseline |
+
+## Minimal examples
+
+In-memory single node:
+
+```bash
+ursula-http \
+  --listen 127.0.0.1:4437 \
+  --core-count 4 \
+  --raft-group-count 64 \
+  --raft-memory
+```
+
+WAL-backed single node:
+
+```bash
+ursula-http \
+  --listen 127.0.0.1:4437 \
+  --core-count 4 \
+  --raft-group-count 64 \
+  --wal-dir ./data/wal
+```
+
+Three-node durable cluster (same command on each host, `node_id` from the cluster config):
+
+```bash
+URSULA_COLD_BACKEND=s3 \
+URSULA_COLD_S3_BUCKET=my-ursula-bucket \
+URSULA_COLD_S3_REGION=us-east-1 \
+ursula-http \
+  --listen 0.0.0.0:4437 \
+  --core-count 16 \
+  --raft-group-count 256 \
+  --raft-log-dir /var/lib/ursula/raft \
+  --raft-cluster-config /etc/ursula/cluster.json
+```
+
+See [Deploy a cluster](/docs/deploy-cluster) for the full walk-through and [Configure S3](/docs/configure-s3) for cold-tier specifics.

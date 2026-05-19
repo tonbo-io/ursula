@@ -1,0 +1,81 @@
+---
+title: Create stream
+api: "PUT /{bucket}/{stream}"
+description: Create a new append-only stream within a bucket.
+---
+
+<ParamField path="bucket" type="string" required>
+ Bucket ID. The Durable Streams Protocol specifies `[a-z0-9_-]{4,64}`. Ursula does not currently enforce this regex but client-side conformance is recommended.
+</ParamField>
+
+<ParamField path="stream" type="string" required>
+ Stream ID within the bucket. Cannot contain `\0` and segments cannot equal `..`. Note: Ursula does not currently enforce the Durable Streams Protocol's 122-byte stream-ID ceiling - clients should still respect it for conformance.
+</ParamField>
+
+<ParamField header="Content-Type" type="string">
+ Content type of the initial payload (e.g. `application/json`). Becomes the stream's content type.
+</ParamField>
+
+<ParamField header="Stream-Closed" type="string">
+ Set to `true` to close the stream immediately after creation.
+</ParamField>
+
+<ParamField header="Stream-TTL" type="string">
+ Time-to-live in seconds. The stream will expire after this duration.
+</ParamField>
+
+<ParamField header="Stream-Expires-At" type="string">
+ Absolute expiration timestamp (RFC 3339). Mutually exclusive with `Stream-TTL`.
+</ParamField>
+
+<ParamField header="Stream-Seq" type="string">
+ Client-supplied monotonic sequence token. Rejects creates whose `Stream-Seq` is not lexicographically greater than the previous value seen for this stream.
+</ParamField>
+
+<ParamField header="Producer-Id" type="string">
+ Producer identity for [exactly-once writes](/docs/concepts/exactly-once-writes).
+</ParamField>
+
+<ParamField header="Producer-Epoch" type="string">
+ Producer epoch (must accompany `Producer-Id`).
+</ParamField>
+
+<ParamField header="Producer-Seq" type="string">
+ Producer sequence number (must accompany `Producer-Id`).
+</ParamField>
+
+<ParamField body="body" type="binary">
+ Optional initial payload. If provided, becomes the first entry in the stream.
+</ParamField>
+
+## Response
+
+| Status | Meaning |
+| ------ | ------------------------------------------------------------------------- |
+| `201` | Stream created. |
+| `200` | Stream already exists (idempotent). |
+| `400` | Invalid stream ID, invalid headers, or bad JSON payload. |
+| `409` | Stream already exists with different content type, or sequence conflict. |
+
+Response headers include `Location`, `Content-Type`, `Stream-Next-Offset`, and lifetime headers (`Stream-TTL` / `Stream-Expires-At`) when set. `Stream-Closed: true` is set if the create request also closed the stream. `ETag` is set on reads only.
+
+<RequestExample>
+```bash Create empty stream
+curl -X PUT http://127.0.0.1:4437/demo/hello
+```
+
+```bash Create with initial payload
+curl -X PUT http://127.0.0.1:4437/demo/hello \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"msg": "first entry"}'
+```
+
+```bash Create with TTL
+curl -X PUT http://127.0.0.1:4437/demo/ephemeral \
+  -H 'Stream-TTL: 3600'
+```
+</RequestExample>
+
+<Note>
+If a stream with the same ID already exists and has identical configuration, the response is `200 OK` (idempotent). If the existing stream differs in content type, closed state, or retention, the response is `409 Conflict`.
+</Note>

@@ -1,0 +1,25 @@
+---
+title: Create bucket
+api: "PUT /{bucket}"
+description: Create a bucket namespace for streams.
+---
+
+<ParamField path="bucket" type="string" required>
+ Bucket ID. The Durable Streams Protocol specifies `[a-z0-9_-]{4,64}`. Client-side conformance is recommended even though Ursula does not currently enforce the regex.
+</ParamField>
+
+## Response
+
+| Status | Meaning |
+| ------ | -------------------------------------- |
+| `201` | Bucket created (idempotent - Ursula returns `201` whether or not the bucket existed before). |
+
+<Note>
+In the current Ursula implementation `PUT /{bucket}` is a no-op acknowledgement and always returns `201`. Bucket existence is implicit. Streams created under any bucket name will succeed. Validation of the bucket ID (`400`) and conflict detection (`409`) are part of the Durable Streams Protocol but are not yet wired up here.
+</Note>
+
+<RequestExample>
+```bash Example
+curl -X PUT http://127.0.0.1:4437/demo
+```
+</RequestExample>

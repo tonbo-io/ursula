@@ -1,0 +1,85 @@
+---
+title: Run locally
+description: Start a single-node Ursula server and verify the HTTP API.
+---
+
+Ursula's HTTP server is the `ursula-http` binary. It takes its configuration from CLI flags and a small set of environment variables - there is no config file yet.
+
+## In-memory (fastest, volatile)
+
+Best for first-impression testing. Nothing is persisted to disk:
+
+```bash
+cargo run -p ursula-http --bin ursula-http -- \
+  --listen 127.0.0.1:4437 \
+  --core-count 4 \
+  --raft-group-count 64 \
+  --raft-memory
+```
+
+Without `--raft-memory`, `--wal-dir`, or `--raft-log-dir`, Ursula runs an in-process non-replicated default runtime (no Raft at all). That's useful for state-machine smoke tests but not how production runs.
+
+## WAL-backed single node
+
+Persistent local storage. Streams survive a restart:
+
+```bash
+cargo run -p ursula-http --bin ursula-http -- \
+  --listen 127.0.0.1:4437 \
+  --core-count 4 \
+  --raft-group-count 64 \
+  --wal-dir ./data/wal
+```
+
+The `--wal-dir` directory will contain one JSON log per Raft group plus a shared `journal.bin` per core. Removing the directory wipes state cleanly.
+
+## Smoke test
+
+```bash
+curl -X PUT http://127.0.0.1:4437/demo
+curl -X PUT http://127.0.0.1:4437/demo/hello
+
+curl -X POST http://127.0.0.1:4437/demo/hello \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary 'hello'
+
+curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
+```
+
+Inspect runtime metrics (placement, mailbox depth, per-core counters):
+
+```bash
+curl http://127.0.0.1:4437/__ursula/metrics | jq .
+```
+
+## Flags
+
+| Flag | Default | Notes |
+| ---- | ------- | ----- |
+| `--listen ADDR` | `127.0.0.1:4437` | TCP bind address |
+| `--core-count N` | `available_parallelism` | Worker threads (each pinned to its mailbox event loop) |
+| `--raft-group-count N` | `core_count × 16` | Total Raft groups. Higher = better stream-to-group hash spread |
+| `--raft-memory` | off | In-memory Raft log. No persistence |
+| `--wal-dir DIR` | none | Per-group WAL + per-core journal under `DIR` |
+| `--raft-log-dir DIR` | none | Durable Raft log directory (used with static gRPC cluster mode) |
+| `--raft-node-id ID` | none | Required for static gRPC cluster mode |
+| `--raft-peer ID=URL` | none (repeatable) | Static peer list for the cluster |
+| `--raft-cluster-config FILE` | none | JSON file equivalent of `--raft-node-id` + `--raft-peer` |
+| `--raft-init-membership[-per-group]` | off | One-time membership bootstrap |
+
+Storage flags (`--raft-memory`, `--wal-dir`, `--raft-log-dir`) are mutually exclusive.
+
+## Environment variables
+
+A small set of knobs are read at startup:
+
+- `URSULA_LIVE_READ_MAX_WAITERS_PER_CORE` (default `65536`) - SSE waiter cap per core
+- `URSULA_COLD_MAX_HOT_BYTES_PER_GROUP` (default 64 MiB) - when a group's hot ring exceeds this, cold flush kicks in
+- `URSULA_COLD_BACKEND` (`fs` or `s3`), `URSULA_COLD_S3_*`, `URSULA_COLD_ROOT`, `URSULA_COLD_FLUSH_*` - cold-storage configuration. See [configure S3](/docs/configure-s3)
+- `URSULA_TOKIO_CONSOLE` - when set, initializes the tokio-console subscriber (requires building with the `tokio-console` feature)
+
+## Next
+
+- [Deploy a cluster](/docs/deploy-cluster) - three-node static gRPC Raft
+- [Configure S3](/docs/configure-s3) - shared cold storage
+- [Operations](/docs/operations) - the EC2 helper and runtime introspection

@@ -1,0 +1,30 @@
+---
+title: Delete stream
+api: "DELETE /{bucket}/{stream}"
+description: Delete a stream and its data.
+---
+
+<ParamField path="bucket" type="string" required>
+ Bucket ID.
+</ParamField>
+
+<ParamField path="stream" type="string" required>
+ Stream ID within the bucket.
+</ParamField>
+
+## Response
+
+| Status | Meaning |
+| ------ | ----------------- |
+| `204` | Stream deleted. |
+| `404` | Stream not found. |
+
+<RequestExample>
+```bash Example
+curl -X DELETE http://127.0.0.1:4437/demo/hello
+```
+</RequestExample>
+
+<Warning>
+Deletion is permanent. The stream's data will be asynchronously garbage-collected after the delete is committed.
+</Warning>

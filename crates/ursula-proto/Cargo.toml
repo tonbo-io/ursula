@@ -1,0 +1,16 @@
+[package]
+name = "ursula-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Shared protobuf schema types for Ursula durable stream semantics."
+
+[dependencies]
+prost = "0.13"
+serde = { version = "1.0", features = ["derive"] }
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"

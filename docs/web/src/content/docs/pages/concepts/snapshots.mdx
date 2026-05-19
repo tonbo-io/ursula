@@ -1,0 +1,37 @@
+---
+title: Snapshots
+sidebarTitle: Snapshots
+description: Compact stream history and accelerate first-load for new clients.
+---
+
+As a stream grows, replaying it from `offset=-1` becomes expensive. Snapshots solve this by storing a compacted representation of all data up to a given offset.
+
+```
+PUT    /{bucket}/{stream}/snapshot/{offset}    publish a snapshot
+GET    /{bucket}/{stream}/snapshot             read the latest snapshot
+GET    /{bucket}/{stream}/snapshot/{offset}    read a specific snapshot
+```
+
+## Who publishes
+
+Snapshots are an **application-level** operation. Ursula stores them but does not produce them. The writer that knows how to compute the merged state is responsible for publishing. A CRDT editor, for example, periodically computes the merged document and publishes it as the latest snapshot. An agent system might snapshot accumulated tool-call state.
+
+Application snapshots are separate from the Raft-internal snapshots Ursula takes for replication and recovery. The two never collide.
+
+## Size and content type
+
+Snapshot bodies are capped at **128 MiB**. The snapshot has its own content type (separate from the stream's), stored as `snapshot_content_type` and defaulting to `application/octet-stream`. A binary CRDT document can be snapshotted under `application/octet-stream` even when the stream itself carries `application/json` deltas.
+
+## Garbage collection
+
+Publishing a snapshot at offset N tells Ursula that data before N is no longer needed for application replay. Cold-tier chunks below N are enqueued for asynchronous GC immediately on publish. Reads to trimmed offsets return `410 Gone`. Clients should switch to the snapshot via [`/bootstrap`](/docs/concepts/bootstrap) or seek forward.
+
+## Immutability
+
+Snapshots are immutable once published. The `DELETE /{bucket}/{stream}/snapshot/{offset}` endpoint exists for protocol-level completeness, but Ursula refuses every delete: targeting the latest snapshot returns `409`, anything else returns `404`. To replace a snapshot, publish a new one at a higher offset.
+
+## Related
+
+- [Bootstrap](/docs/concepts/bootstrap): fetch latest snapshot plus post-snapshot updates in one request
+- [API: publish snapshot](/docs/api/publish-snapshot)
+- [API: read snapshot](/docs/api/read-snapshot)

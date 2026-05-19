@@ -1,0 +1,90 @@
+---
+title: Quick Start
+sidebarTitle: Quick Start
+description: Run Ursula locally, create a stream, append data, and subscribe with SSE.
+---
+
+The Ursula HTTP binary lives in the `ursula-http` crate of the workspace. Start a local node with in-memory Raft (no on-disk state, good for kicking the tires):
+
+```bash
+cargo run -p ursula-http --bin ursula-http -- \
+  --listen 127.0.0.1:4437 \
+  --core-count 4 \
+  --raft-group-count 64 \
+  --raft-memory
+```
+
+For local WAL-backed persistence instead, point `--wal-dir` at an empty directory:
+
+```bash
+cargo run -p ursula-http --bin ursula-http -- \
+  --listen 127.0.0.1:4437 \
+  --core-count 4 \
+  --raft-group-count 64 \
+  --wal-dir ./data/wal
+```
+
+Then drive the HTTP API with `curl` in another terminal.
+
+## Acknowledge the bucket
+
+Bucket creation in the current build is an idempotent acknowledgement - Ursula returns `201` whether or not the name has been seen before. It's still worth issuing because clients and docs assume the call:
+
+```bash
+curl -X PUT http://127.0.0.1:4437/demo
+```
+
+## Create a stream
+
+```bash
+curl -X PUT http://127.0.0.1:4437/demo/hello
+```
+
+## Append data
+
+```bash
+curl -X POST http://127.0.0.1:4437/demo/hello \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary 'first message'
+
+curl -X POST http://127.0.0.1:4437/demo/hello \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary 'second message'
+```
+
+Each successful append returns `204 No Content` with a `Stream-Next-Offset` header. Add `Producer-Id` / `Producer-Epoch` / `Producer-Seq` if you need [exactly-once retries](/docs/concepts/exactly-once-writes).
+
+## Read everything from the beginning
+
+```bash
+curl -i 'http://127.0.0.1:4437/demo/hello?offset=-1'
+```
+
+The body contains the appended bytes. Response headers include `Stream-Next-Offset`, `Stream-Up-To-Date`, and an `ETag`.
+
+## Subscribe for live updates
+
+Open a second terminal:
+
+```bash
+curl -N 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
+```
+
+`-N` keeps `curl` from line-buffering the SSE stream. Append more data from the first terminal and you'll see it arrive immediately as `event: data` lines. Binary streams are delivered as a JSON envelope with a base64-encoded payload (`Stream-Sse-Data-Encoding: base64`). See [binary SSE](/docs/concepts/binary-sse) for details.
+
+## Inspect runtime state
+
+Each node exposes a JSON metrics endpoint that is handy when checking that work landed on the right cores:
+
+```bash
+curl http://127.0.0.1:4437/__ursula/metrics
+```
+
+## Next steps
+
+- [Run locally](/docs/run-locally): flags, environment variables, and durability modes
+- [Deploy a cluster](/docs/deploy-cluster): static gRPC Raft cluster shape
+- [Configure S3](/docs/configure-s3): shared cold storage for clusters
+- [API overview](/docs/api/overview): the HTTP surface Ursula currently exposes
+- [Streams](/docs/concepts/streams): the core stream abstraction and lifecycle
+- [Architecture](/docs/architecture/overview): thread-per-core, multi-Raft internals

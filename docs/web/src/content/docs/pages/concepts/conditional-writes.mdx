@@ -1,0 +1,23 @@
+---
+title: Conditional Writes
+sidebarTitle: Conditional Writes
+description: Coordinate writers using Stream-Seq to enforce ordering without locks or transactions.
+---
+
+Writers appending to the same stream sometimes need coordination. Ursula currently supports one form of optimistic concurrency control via request headers, without locks or transactions.
+
+<Note>
+The Durable Streams Protocol also specifies an `If-Match` ETag-based precondition for multi-writer guards. Ursula does not yet implement `If-Match`. For current deployments use `Stream-Seq` or producer epoch/seq headers ([exactly-once writes](/docs/concepts/exactly-once-writes)) for ordering and dedup.
+</Note>
+
+## Stream-Seq
+
+`Stream-Seq` is a client-supplied monotonic sequence token. The server tracks the last accepted value per stream and rejects any append whose `Stream-Seq` is not lexicographically greater than the previous one.
+
+This is useful when a single logical writer wants to enforce ordering without relying on server-side ETags. For instance, an agent that numbers its steps and wants the server to reject out-of-order delivery.
+
+## When to use
+
+- **Stream-Seq**: single-writer ordering. "Reject this if my writes arrive out of order."
+- **Producer-Id / Producer-Epoch / Producer-Seq** ([exactly-once writes](/docs/concepts/exactly-once-writes)): deduplicate retries from a producer that may resend the same logical append after a network hiccup or restart.
+- **Neither**: append-only workloads where every write is independent (e.g. event logging). Just POST.

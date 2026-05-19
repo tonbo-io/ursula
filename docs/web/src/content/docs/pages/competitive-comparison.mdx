@@ -1,0 +1,63 @@
+---
+title: Comparisons
+description: How Ursula relates to other stream and storage systems for application-facing timelines.
+---
+
+Ursula occupies a specific niche: distributed Durable Streams over HTTP, with one timeline per application resource, served from a thread-per-core multi-Raft cluster. This page is a longer narrative on how that niche differs from the systems Ursula gets compared to.
+
+## Object storage (S3 directly)
+
+S3 and its peers are excellent for durable immutable blobs and static reads. They are awkward as an append interface: every append is a new object, conditional writes are optimistic and degrade into retry storms under contention, and live readers must poll. Putting per-resource append-only logs directly on S3 surfaces these trade-offs to every writer and reader.
+
+Ursula uses S3, but for the cold tier and snapshots, not the write path. Appends commit at Raft quorum in an in-memory hot ring. A background flush carries older segments to S3 once they leave the active window. The hot-to-cold boundary is invisible to clients - the same `GET` works for in-memory and S3-resident data, served as one response.
+
+## Durable Streams reference server (Electric)
+
+The upstream reference server implements the same protocol Ursula does. It is designed to be easy to embed and run as a single process, which makes it a good starting point for small deployments and local development. The trade-off is that high availability requires building or sourcing another layer.
+
+Ursula provides that layer natively (per-group Raft leadership, quorum replication, transparent leader forwarding, snapshot publication, cold offload), at the cost of running a multi-node cluster. Both speak the same protocol, so client code is unchanged.
+
+## S2 / S2 Lite
+
+S2 is an object-storage-backed stream API with strong acknowledged-write durability, achieved by writing through S3 Express One Zone on the hot path. Its self-hosted shape (S2 Lite) is a single serving process. The managed product uses its own API surface.
+
+Ursula and S2 overlap on "durable append-only stream" but differ on:
+
+- **Protocol surface.** Ursula speaks Durable Streams HTTP. S2 has its own API.
+- **Write path.** Ursula commits at Raft quorum in a replicated hot ring with no S3 in the hot path. S2 commits via S3 Express.
+- **Cost model.** Ursula uses S3 Standard for the cold tier. S2's hot path uses S3 Express, which is roughly 7× the per-GB cost of Standard.
+- **Operational shape.** Ursula requires running a Raft cluster. S2 Lite is single-process self-hosted.
+
+## Kafka / Redpanda
+
+Kafka and Redpanda target high-throughput event pipelines: topics with many partitions, consumer groups, and processing semantics. They are excellent for that workload, and Redpanda specifically shares one design idea with Ursula - **thread-per-core**: each core owns its partitions and processes them without cross-core synchronization on the hot path.
+
+Ursula differs in primitive and protocol:
+
+- **Primitive.** Topic + partition + consumer group vs. one independently-addressable durable stream per application resource. Ursula is meant for thousands of small streams (one per document, session, run) rather than a few high-throughput pipelines.
+- **Protocol.** Kafka/Redpanda use the Kafka wire protocol with partition-aware clients. Ursula uses plain HTTP plus SSE. Any HTTP client is a valid client.
+- **Co-location of groups.** Redpanda strictly owns one Raft group per core (Seastar reactor). Ursula runs many small Raft groups co-scheduled on a single `tokio::current_thread` runtime per core, which trades a bit of within-core isolation for the flexibility of having group count ≫ core count without forcing matched scaling. (See [architecture overview](/docs/architecture/overview) for the trade-off.)
+- **Operational maturity.** Kafka and Redpanda have years of production hardening, broker management, schema registry, ACLs, and ecosystem tooling. Ursula is `v0.x` and ships intentionally minimal operations.
+
+## etcd / single-Raft KV
+
+etcd is a single-Raft strongly-consistent KV. It's exemplary at small consistent state but caps throughput at what one Raft leader can serialize.
+
+Ursula's multi-Raft layout (hundreds to thousands of small groups, distributed across cores and nodes) is what allows aggregate write throughput to scale with cluster size rather than bottleneck on a single Raft log. The cost is more groups to manage and the loss of single-log linearizability across the whole namespace - but stream-level linearizability per stream is preserved.
+
+## When to pick which
+
+Reach for Ursula when:
+
+- The natural data model is a large number of small, independent timelines, one per resource
+- Clients are diverse and HTTP is the common denominator (browsers, agents, scripts)
+- Replayable recovery, live tailing, and snapshots all need to work without bolting on separate infrastructure
+- You want to run on commodity infrastructure with S3 as the cold tier, not S3 Express or another premium storage class
+
+Reach for something else when:
+
+- The model is a small number of high-throughput topics with consumer groups -> Kafka / Redpanda
+- The deployment must stay single-process -> the Durable Streams reference server
+- You want a managed service and accept a different API -> S2
+- You need only durable immutable blobs with no append or tail semantics -> object storage directly
+- You need a small consistent KV across the whole cluster -> etcd

@@ -1,0 +1,31 @@
+---
+title: Binary SSE
+sidebarTitle: Binary SSE
+description: How Ursula delivers binary payloads over the Server-Sent Events transport.
+---
+
+The SSE wire format is text-only: every `data:` field must be valid UTF-8. For streams with text-shaped content types (`text/*`, `application/json`), SSE works out of the box: each event's `data` field carries the bytes verbatim.
+
+For other content types (`application/octet-stream`, custom binary), Ursula wraps each event in a JSON envelope and base64-encodes the payload:
+
+```json
+{
+  "encoding": "base64",
+  "contentType": "application/octet-stream",
+  "payload": "aGVsbG8="
+}
+```
+
+The choice is automatic, determined by the stream's content type. There is no client opt-in. What you get is what the stream's content type implied. The response advertises the choice with the `Stream-Sse-Data-Encoding` header: `base64` for wrapped streams, absent for raw.
+
+## Decoding
+
+For wrapped streams, decode each event as JSON, then base64-decode `payload`. For raw streams, the `data` field is already the payload (UTF-8 text or JSON).
+
+Browser `EventSource` works for both modes. Only the `data` handler differs.
+
+## Related
+
+- [Read modes](/docs/concepts/read-modes)
+- [API: read](/docs/api/read)
+- [Length-prefixed framing](/docs/concepts/len-prefixed-framing): when one SSE event contains multiple application records

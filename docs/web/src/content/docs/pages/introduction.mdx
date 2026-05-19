@@ -1,0 +1,57 @@
+---
+title: Ursula
+sidebarTitle: Introduction
+description: A thread-per-core, multi-Raft implementation of the Durable Streams protocol over HTTP, with optional S3-backed cold storage.
+---
+
+<Info>
+Ursula is built by <a href="https://tonbo.io/" target="_blank" rel="noopener noreferrer"><img src="/assets/tonbo.png" alt="" width="16" height="16" style={{verticalAlign: "-3px", borderRadius: "3px", marginRight: "4px"}} />Tonbo</a>.
+</Info>
+
+Ursula is an open-source implementation of the [Durable Streams Protocol](/docs/specs/durable-stream): URL-addressable, append-only byte streams that can be replayed, resumed, and tailed with plain HTTP.
+
+Run it as a single in-memory or WAL-backed node for local development, or as a static-membership Raft cluster for replicated writes, transparent leader forwarding, snapshot publication, and optional S3-backed cold storage.
+
+## What it is
+
+**HTTP-native streams.** `PUT` creates buckets and streams, `POST` appends bytes, and `GET` reads from an offset or tails live with long-poll/SSE.
+
+**One timeline per resource.** Give each document, session, workflow, room, or agent run its own durable stream.
+
+**Distributed serving.** Ursula adds per-group Raft replication, leader-only reads with transparent follower forwarding, snapshot publication, and optional cold offload to S3 around the Durable Streams primitive.
+
+**Thread-per-core.** Streams are statically hashed to a Raft group, and each group is pinned to a specific core. Hot-path requests touch the owner core only. Cross-core synchronization is avoided by construction. See [architecture overview](/docs/architecture/overview) for the full layout.
+
+## Run locally
+
+Start a single in-memory node (fast iteration, no persistence):
+
+```bash
+cargo run -p ursula-http --bin ursula-http -- \
+  --listen 127.0.0.1:4437 \
+  --core-count 4 \
+  --raft-group-count 64 \
+  --raft-memory
+```
+
+Create a stream, append bytes, and read them back:
+
+```bash
+curl -X PUT http://127.0.0.1:4437/demo
+curl -X PUT http://127.0.0.1:4437/demo/hello
+
+curl -X POST http://127.0.0.1:4437/demo/hello \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary 'hello world'
+
+curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
+```
+
+## Learn more
+
+- **[Quick Start](/docs/quick-start):** step-by-step walkthrough with WAL and SSE
+- **[Why Ursula](/docs/why-ursula):** the design intent and current trade-offs
+- **[Concepts](/docs/concepts/streams):** streams, buckets, offsets, read modes, snapshots
+- **[Architecture](/docs/architecture/overview):** thread-per-core, multi-Raft, hot/cold tiers
+- **[API Reference](/docs/api/overview):** the HTTP routes Ursula currently implements
+- **[Protocol Spec](/docs/specs/durable-stream):** the Durable Streams Protocol plus [Ursula's extensions](/docs/specs/extensions)

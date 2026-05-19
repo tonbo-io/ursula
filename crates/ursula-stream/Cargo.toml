@@ -1,0 +1,16 @@
+[package]
+name = "ursula-stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Pure Durable Streams state-machine semantics for Ursula vNext."
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+ursula-shard = { path = "../ursula-shard" }
+ursula-proto = { path = "../ursula-proto" }
+
+[dev-dependencies]
+serde_json = "1.0"

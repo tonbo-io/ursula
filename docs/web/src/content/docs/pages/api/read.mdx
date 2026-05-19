@@ -1,0 +1,97 @@
+---
+title: Read stream
+api: "GET /{bucket}/{stream}"
+description: Read data from a stream using catch-up, long-poll, or SSE modes.
+---
+
+<ParamField path="bucket" type="string" required>
+ Bucket ID.
+</ParamField>
+
+<ParamField path="stream" type="string" required>
+ Stream ID within the bucket.
+</ParamField>
+
+<ParamField query="offset" type="string">
+ Starting offset. Use `-1` to read from the beginning, or a numeric offset.
+</ParamField>
+
+<ParamField query="cursor" type="string">
+ Opaque cursor token returned by a previous read. Alternative to `offset`.
+</ParamField>
+
+<ParamField query="stream-cursor" type="string">
+ Alias for `cursor`.
+</ParamField>
+
+<ParamField query="live" type="string">
+ Live mode: `sse` for Server-Sent Events, `long-poll` for long-polling. Omit for catch-up read.
+</ParamField>
+
+<ParamField query="max-bytes" type="number">
+ Maximum bytes to return in a single response (catch-up and long-poll only).
+</ParamField>
+
+## Read modes
+
+<Tabs>
+ <Tab title="Catch-up">
+ No `live` parameter. Returns all available data from the given offset immediately.
+
+    ```bash
+    curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
+    ```
+ </Tab>
+ <Tab title="Long-poll">
+ `live=long-poll`. Returns immediately if data is available, otherwise holds the connection until new data arrives or a ~3 second timeout.
+
+    ```bash
+    curl 'http://127.0.0.1:4437/demo/hello?offset=42&live=long-poll'
+    ```
+ </Tab>
+ <Tab title="SSE">
+ `live=sse`. Opens a persistent Server-Sent Events connection. The server pushes data events as new entries are appended. Includes periodic heartbeat comments.
+
+    ```bash
+    curl 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
+    ```
+ </Tab>
+</Tabs>
+
+## Response
+
+| Status | Meaning |
+| ------ | ------------------------------------------------------------- |
+| `200` | Data returned (catch-up or long-poll with data). |
+| `204` | No new data at the requested offset (catch-up only). |
+| `400` | Invalid offset or live mode. |
+| `404` | Stream not found or expired. |
+| `410` | Requested offset has been trimmed (data no longer available). |
+
+Response headers include `Stream-Next-Offset`, `Stream-Cursor`, `ETag`, `Stream-Up-To-Date`, `Stream-Closed`, and `Content-Type`.
+
+## SSE event format
+
+In SSE mode, the server sends:
+
+- **Data events** (`event: data`): stream payload in the `data` field. For binary streams, data is base64-encoded (controlled by the `Stream-Sse-Data-Encoding` header).
+- **Control events** (`event: control`): JSON metadata including the current offset and stream state.
+- **Heartbeat comments**: periodic `:` lines to keep the connection alive through proxies.
+
+<RequestExample>
+```bash Catch-up
+curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
+```
+
+```bash Long-poll
+curl 'http://127.0.0.1:4437/demo/hello?offset=42&live=long-poll'
+```
+
+```bash SSE tail
+curl 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
+```
+</RequestExample>
+
+<Info>
+See [read modes](/docs/concepts/read-modes), [binary SSE](/docs/concepts/binary-sse), and [offsets](/docs/concepts/offsets) for more details.
+</Info>

@@ -1,0 +1,81 @@
+---
+title: Install
+description: Build Ursula from source and prepare a host to run the server.
+---
+
+Ursula is currently installed from source. There is no embedded KV dependency, so the build is plain Rust plus the standard C toolchain that Cargo expects.
+
+## Prerequisites
+
+Required:
+
+- Rust stable and Cargo
+- a C compiler (for transitive native crates)
+- `pkg-config`
+
+Optional but useful: `just` (recipe runner) for the checked-in shortcuts in `justfile`.
+
+On macOS:
+
+```bash
+brew install rust pkg-config
+brew install just   # optional
+```
+
+On Debian or Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config curl
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+cargo install just   # optional
+```
+
+## Clone and build
+
+```bash
+git clone https://github.com/opendurability/ursula.git
+cd ursula
+cargo build --release -p ursula-http --bin ursula-http
+```
+
+The resulting binary lives at `target/release/ursula-http` and is what you ship to production hosts.
+
+With `just`:
+
+```bash
+just build    # cargo build --workspace
+just test     # cargo test --workspace
+just clippy   # cargo clippy --workspace --all-targets -- -D warnings
+```
+
+`just build` compiles every crate in the workspace. For just the HTTP server use the `cargo build -p ursula-http` form above.
+
+## Verify
+
+```bash
+./target/release/ursula-http --help
+```
+
+Should print the supported CLI flags. Then run a short smoke server:
+
+```bash
+./target/release/ursula-http \
+  --listen 127.0.0.1:4437 \
+  --core-count 2 \
+  --raft-group-count 16 \
+  --raft-memory &
+
+curl -X PUT http://127.0.0.1:4437/demo
+curl -X PUT http://127.0.0.1:4437/demo/hello
+curl -X POST -H 'Content-Type: text/plain' --data 'hi' http://127.0.0.1:4437/demo/hello
+curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
+```
+
+Kill the background process when you're done.
+
+## Next
+
+- [Run locally](/docs/run-locally) - durability modes and flags
+- [Deploy a cluster](/docs/deploy-cluster) - static gRPC Raft cluster
+- [Configure S3](/docs/configure-s3) - shared cold storage

@@ -1,0 +1,103 @@
+---
+title: Deploy a cluster
+description: Run a three-node Ursula cluster with static-membership Raft and shared cold storage.
+---
+
+Production-style Ursula runs as a static-membership Raft cluster: a fixed list of nodes with stable IDs, gRPC peer-to-peer Raft traffic, and an optional shared S3 cold backend. The migration benchmark target is three voting nodes across availability zones.
+
+## Topology
+
+Each node needs:
+
+- a stable Raft `node_id`
+- a TCP listen address (the same address every peer dials over gRPC)
+- the full peer list (including itself)
+- the same storage mode (`--raft-memory` or `--raft-log-dir DIR`) on every peer
+- a one-time membership initializer on the first start (`--raft-init-membership-per-group`)
+- a shared cold backend (filesystem path for single-host smoke, S3 for production)
+
+There is no separate "advertise" address. The `--listen` address must be reachable by other peers.
+
+## Cluster config file
+
+The `--raft-cluster-config` flag accepts a small JSON file shared across all nodes - only `node_id` differs per host:
+
+```json
+{
+  "node_id": 1,
+  "init_membership_per_group": true,
+  "peers": [
+    {"node_id": 1, "url": "http://10.0.0.1:4437"},
+    {"node_id": 2, "url": "http://10.0.0.2:4437"},
+    {"node_id": 3, "url": "http://10.0.0.3:4437"}
+  ]
+}
+```
+
+Same file on each host, only the top-level `node_id` field changes.
+
+## Start node 1
+
+```bash
+ursula-http \
+  --listen 0.0.0.0:4437 \
+  --core-count 16 \
+  --raft-group-count 256 \
+  --raft-log-dir /var/lib/ursula/raft \
+  --raft-cluster-config /etc/ursula/cluster.json
+```
+
+`init_membership_per_group: true` only needs to be present on the very first start of a fresh cluster. After that, Ursula remembers membership. Flip it to `false` (or remove it) for subsequent starts.
+
+## Start nodes 2 and 3
+
+Same command, same JSON file with `node_id` adjusted to 2 and 3 respectively. Use `--raft-memory` instead of `--raft-log-dir` if you want a non-durable test cluster.
+
+## Verify
+
+```bash
+# Each node should answer metrics
+for host in 10.0.0.1 10.0.0.2 10.0.0.3; do
+  curl -s "http://$host:4437/__ursula/metrics" | jq '.raft_groups | length'
+done
+```
+
+If you have access to the EC2 helper described in [operations](/docs/operations), `python3 scripts/ursula_ec2.py --config cluster.json wait-ready` polls the cluster until every Raft group has elected a leader.
+
+## Storage exclusivity
+
+These flags are mutually exclusive: pick one storage mode per cluster.
+
+- `--raft-memory` - fast, volatile. Survives no restart
+- `--raft-log-dir DIR` - durable gRPC-Raft mode (recommended for clusters)
+- `--wal-dir DIR` - single-node WAL mode **not compatible with static gRPC Raft**
+
+## Cold storage
+
+A shared object store is recommended for any multi-node deployment because peers need to read each other's flushed chunks. Configure via environment variables on every node:
+
+```bash
+URSULA_COLD_BACKEND=s3
+URSULA_COLD_S3_BUCKET=my-ursula-bucket
+URSULA_COLD_S3_REGION=us-east-1
+URSULA_COLD_ROOT=ursula-prod-20260518
+```
+
+See [configure S3](/docs/configure-s3) for the full set of `URSULA_COLD_*` variables.
+
+## Operating the cluster
+
+There is no dedicated control CLI yet. Day-to-day operations use:
+
+- `scripts/ursula_ec2.py` - start/stop/upload/perf-test against a static manifest of EC2 hosts. See [operations](/docs/operations)
+- `/__ursula/metrics` - per-node JSON snapshot
+- `POST /__ursula/raft/{group_id}/snapshot` - manually trigger a Raft snapshot for one group
+- `POST /__ursula/raft/{group_id}/purge` - purge stale log entries for one group
+- `POST /__ursula/raft/{group_id}/learners/{node_id}` - add a learner (non-voting) replica
+- `POST /__ursula/flush-cold/{bucket}/{stream}` - force a cold flush for one stream
+
+## Limits in the current build
+
+- Membership changes (adding/removing voters after bootstrap) are not yet exposed as a routine workflow. Learners can be added via the admin endpoint above.
+- Rolling restart and version upgrade tooling is not yet packaged. Stop each node in turn and start it back with the same `--raft-cluster-config`.
+- There is no zero-downtime config reload. Restart the process to pick up new flags or env vars.

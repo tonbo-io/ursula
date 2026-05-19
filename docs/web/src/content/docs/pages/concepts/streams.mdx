@@ -1,0 +1,34 @@
+---
+title: Streams
+sidebarTitle: Streams
+description: Ursula's core append-only stream primitive, with naming, content type, and lifecycle.
+---
+
+A stream is an append-only byte sequence addressed by a URL: `/{bucket}/{stream}`. Once data is written it cannot be modified or reordered. Only new data can be appended.
+
+## Naming
+
+Stream IDs may contain any byte that is not `/`, `\0`, or `..`. Maximum stream ID length is 122 bytes, and the combined bucket-plus-stream path is also capped at 122 bytes. The literal name `streams` is reserved (it's the bucket-level listing endpoint).
+
+A workspace app might use `/workspace-a/doc-123`. An agent system might use `/agents/run-2026-05-13-abc`. Anything within the rules above is fair.
+
+## Content type
+
+A stream's content type is set on creation (PUT) or on first append (POST) and defaults to `application/octet-stream` if no `Content-Type` header is supplied. Subsequent appends must declare the same content type, or the server rejects them with `400`. The content type rides along on reads so clients can dispatch on it without inspecting payloads.
+
+## Lifecycle
+
+Every stream is in one of these states:
+
+- **Open.** Accepts appends. The default on creation.
+- **Closed.** Sealed by `Stream-Closed: true` on a POST. Readers receive an EOF signal. Further appends return `409`. Close is irreversible.
+- **Expired.** Past its `Stream-TTL` or `Stream-Expires-At` deadline. Reads and writes return `404`. Expired streams are eventually garbage-collected.
+- **Deleted.** Removed by `DELETE`. Reads return `404`.
+
+`Stream-TTL` (seconds, relative) and `Stream-Expires-At` (RFC 3339 absolute) are mutually exclusive. Sending both yields `400`.
+
+## Related
+
+- [Buckets](/docs/concepts/buckets): how streams are grouped
+- [Snapshots](/docs/concepts/snapshots): compacting a long stream
+- [Bootstrap](/docs/concepts/bootstrap): efficient first-load for new clients

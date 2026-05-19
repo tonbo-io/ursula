@@ -1,0 +1,33 @@
+---
+title: Length-Prefixed Framing
+sidebarTitle: Len-Prefixed Framing
+description: A simple convention for delimiting messages inside raw byte streams.
+---
+
+Streams are raw byte sequences. The protocol does not impose message boundaries. Every append and every read returns whatever bytes are in flight, possibly mid-record. For streams carrying many small messages (CRDT operations, agent events), Ursula recommends a simple framing convention:
+
+```
+[4-byte big-endian length][payload bytes]
+```
+
+Each application-level append writes one framed record. Each read returns a concatenation of framed records that the client parses incrementally.
+
+## Server is frame-agnostic
+
+The server **does not** validate or enforce frames. It stores and serves raw bytes. That means:
+
+- A read may end mid-frame. The client must handle partial frames and resume parsing on the next read.
+- An ill-formed frame (wrong length, truncated payload) is the producer's bug, not a server-rejectable error.
+- The framing convention is per-application. Writers and readers of a stream must agree on it.
+
+## When you don't need framing
+
+- Streams using `application/json` typically use newline-delimited JSON or a single self-describing document. JSON has its own delimiters.
+- Streams holding one logical blob per stream don't need framing at all.
+
+Use framing when one stream carries many independently meaningful messages and the client wants to dispatch on each one without scanning.
+
+## Related
+
+- [Streams](/docs/concepts/streams)
+- [Binary SSE](/docs/concepts/binary-sse): over SSE, each event is one delivery. Framing lets one event carry multiple records.

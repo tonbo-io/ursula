@@ -1,0 +1,410 @@
+---
+title: "Durable Streams Extensions"
+description: "Extensions to the Durable Streams Protocol: bucket namespacing, snapshot semantics, bootstrap delivery, and Ursula append batching."
+---
+
+**Document:** Durable Streams Protocol Extensions
+**Status:** Draft
+**Date:** 2025-03-14
+
+---
+
+## Abstract
+
+This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, and multipart bootstrap delivery. It also documents Ursula-specific append batching as an implementation extension for high-throughput small-event writes.
+
+All base protocol semantics remain in effect. Where this document is silent, the base protocol governs.
+
+## Terminology
+
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC2119] [RFC8174].
+
+## Table of Contents
+
+1. [Buckets](#1-buckets)
+2. [Snapshots](#2-snapshots)
+3. [Bootstrap](#3-bootstrap)
+4. [Append Batch](#4-append-batch)
+5. [Ordinary SSE Compatibility](#5-ordinary-sse-compatibility)
+6. [URL Encoding](#6-url-encoding)
+
+---
+
+## 1. Buckets
+
+Every stream belongs to a bucket. The stream URL takes the form `{base_url}/{bucket_id}/{stream_id}`.
+
+### 1.1. Identifier Constraints
+
+- `bucket_id`: MUST match `^[a-z0-9_-]{4,64}$`. Globally unique within the service.
+- `stream_id`: Any UTF-8 string. MUST NOT exceed 122 bytes. MUST NOT contain `/`, `\0`, or `..`. On the bucketed `/` surface, the combined `{bucket_id}/{stream_id}` key MUST also not exceed 122 bytes.
+- The literal local stream ID `streams` is reserved for the bucket listing endpoint `/{bucket_id}/streams`.
+
+### 1.2. Create Bucket
+
+```
+PUT /{bucket_id}
+```
+
+Buckets MUST be created explicitly. `PUT /{bucket_id}/{stream_id}` MUST NOT implicitly create a bucket.
+
+**Response Codes:**
+
+- `201 Created`: Bucket created successfully.
+- `400 Bad Request`: `bucket_id` is invalid.
+- `409 Conflict`: Bucket already exists.
+
+### 1.3. Get Bucket Metadata
+
+```
+GET /{bucket_id}
+```
+
+**Response Codes:**
+
+- `200 OK`: Bucket exists. Returns a JSON object with at least `bucket_id` (string) and `streams` (integer, count of streams in the bucket).
+- `400 Bad Request`: `bucket_id` is invalid.
+- `404 Not Found`: Bucket does not exist.
+
+### 1.4. List Bucket Streams
+
+```
+GET /{bucket_id}/streams?prefix={prefix}&after={cursor}&limit={n}
+```
+
+- `prefix` filters bucket-local stream IDs by prefix. When omitted, all bucket-local stream IDs are eligible.
+- `after` is an exclusive cursor over bucket-local stream IDs.
+- `limit` defaults to `1000` and must be in `1..=1000`.
+
+The response body is:
+
+```json
+{
+  "bucket_id": "agents",
+  "prefix": "user-",
+  "stream_count": 2,
+  "streams": [
+    {
+      "stream_id": "user-1",
+      "status": "Open",
+      "content_type": "text/plain",
+      "tail_offset": 42,
+      "created_at_ms": 1735689600000,
+      "last_write_at_ms": 1735689601000
+    }
+  ],
+  "next_cursor": "user-2",
+  "has_more": true
+}
+```
+
+`streams` is sorted lexicographically by `stream_id`.
+
+**Response Codes:**
+
+- `200 OK`: Matching streams returned.
+- `400 Bad Request`: `bucket_id` or query parameters are invalid.
+- `404 Not Found`: Bucket does not exist.
+
+### 1.5. Delete Bucket
+
+```
+DELETE /{bucket_id}
+```
+
+A bucket MUST be empty (zero streams) before deletion.
+
+**Response Codes:**
+
+- `204 No Content`: Bucket deleted.
+- `400 Bad Request`: `bucket_id` is invalid.
+- `404 Not Found`: Bucket does not exist.
+- `409 Conflict`: Bucket is not empty.
+
+### 1.6. Stream Operations
+
+All stream operations defined in the base protocol apply under `{base_url}/{bucket_id}/{stream_id}`. When the bucket does not exist, the server MUST return `404 Not Found`.
+
+---
+
+## 2. Snapshots
+
+A snapshot is a materialized representation of a stream's content from offset `-1` (inclusive) to `snapshot_offset` (exclusive). Snapshots enable clients to skip full replay and resume from a compacted state.
+
+### 2.1. Offset Conventions
+
+- Offsets are opaque tokens as defined in the base protocol. Clients MUST use server-returned `Stream-Next-Offset` values.
+
+Servers that expose snapshots and `/bootstrap` as message sequences MUST use one consistent retained-message boundary model across ordinary reads, snapshot-offset validation, and bootstrap responses. This extension does not require any particular binary framing format.
+
+### 2.2. Publish Snapshot
+
+```
+PUT {stream_url}/snapshot/{snapshot_offset}
+```
+
+Creates a snapshot at the specified offset. The snapshot represents the materialized result of folding all updates in the range `[-1, snapshot_offset)`.
+
+**Request Headers:**
+
+- `Content-Type`: The content type of the snapshot blob. Servers MUST store this value and return it on subsequent reads. Defaults to `application/octet-stream`.
+
+**Response Codes:**
+
+- `204 No Content`: Snapshot published successfully.
+- `400 Bad Request`: `snapshot_offset` is invalid or not aligned to a committed message boundary.
+- `404 Not Found`: Stream does not exist.
+- `409 Conflict`: `snapshot_offset` exceeds the current tail, or the server cannot produce a consistent view at that offset.
+- `410 Gone`: `snapshot_offset` is older than the current earliest retained offset.
+- `413 Payload Too Large`: Snapshot exceeds the server's size limit.
+
+**Retention Effect:**
+
+When a new snapshot is published, the server MUST treat `snapshot_offset` as the new earliest retained offset. For any offset less than `snapshot_offset` (including `-1`), the server MUST return `410 Gone`, forcing clients to re-initialize via `/bootstrap`.
+
+Publishing a new snapshot replaces the previously visible snapshot immediately. The superseded snapshot MAY be garbage-collected asynchronously after the new snapshot becomes visible. Clients MUST NOT depend on older snapshots remaining readable after overwrite.
+
+**Concurrency:**
+
+Snapshot creation MUST NOT block concurrent appends. The snapshot's consistency boundary is `snapshot_offset`. Updates at or beyond that offset MUST NOT be folded into the snapshot.
+
+### 2.3. Read Latest Snapshot
+
+```
+GET {stream_url}/snapshot
+```
+
+Returns a redirect to the latest visible snapshot resource, if one exists.
+
+**Response:**
+
+- `307 Temporary Redirect` when a latest snapshot exists. The `Location` header points to `{stream_url}/snapshot/{snapshot_offset}`.
+- `404 Not Found` when no snapshot exists.
+
+### 2.4. Snapshot Metadata on HEAD
+
+```
+HEAD {stream_url}
+```
+
+Servers SHOULD include `Stream-Snapshot-Offset` when a latest visible snapshot exists for the stream.
+
+**Response Headers:**
+
+- `Stream-Snapshot-Offset`: The latest visible snapshot offset.
+
+**Semantics:**
+
+- Absence of `Stream-Snapshot-Offset` means the stream has no visible snapshot.
+- When present, the value MUST refer to the same latest visible snapshot that `GET {stream_url}/snapshot` would resolve to.
+
+### 2.5. Read Snapshot
+
+```
+GET {stream_url}/snapshot/{snapshot_offset}
+```
+
+Returns the snapshot blob at the specified offset.
+
+**Response Headers:**
+
+- `Content-Type`: The content type stored at publish time.
+- `Stream-Snapshot-Offset`: The snapshot offset.
+- `Stream-Next-Offset`: The next offset after the snapshot.
+- `Stream-Up-To-Date`: Boolean indicating whether the stream has updates beyond the snapshot.
+
+**Response Codes:**
+
+- `200 OK`: Snapshot exists.
+- `404 Not Found`: Snapshot does not exist or has been garbage-collected.
+
+### 2.6. Delete Snapshot
+
+```
+DELETE {stream_url}/snapshot/{snapshot_offset}
+```
+
+Deletes the snapshot identified by `snapshot_offset`, subject to bootstrap safety rules.
+
+**Response Codes:**
+
+- `404 Not Found`: Snapshot does not exist or has been superseded.
+- `409 Conflict`: `snapshot_offset` refers to the latest visible snapshot and cannot be deleted because `/bootstrap` would become incomplete.
+
+Implementations that expose only one visible snapshot MAY make superseded snapshots unreachable immediately after overwrite. In that case, deleting an older offset will return `404 Not Found`.
+
+---
+
+## 3. Bootstrap
+
+Bootstrap provides single-request initialization: a snapshot (if any) plus all retained updates after the snapshot point, returned as a single ordered response that preserves per-message content types.
+
+### 3.1. Request
+
+```
+GET {stream_url}/bootstrap
+```
+
+**Query Parameters:**
+
+- `/bootstrap` is a one-shot initialization endpoint. It does not define any query parameters of its own.
+- Servers SHOULD reject any `live` query parameter on `/bootstrap` with `400 Bad Request`.
+
+### 3.2. Response
+
+**Response Headers:**
+
+- `Content-Type: multipart/mixed; boundary=<token>`
+- `Stream-Snapshot-Offset`: The snapshot offset, or `-1` if no snapshot exists.
+- `Stream-Next-Offset`: The next offset after all returned data.
+- `Stream-Up-To-Date`: Boolean.
+
+**Response Body:**
+
+The body is an RFC 2046 `multipart/mixed` entity. Each MIME part is one logical bootstrap message. The multipart boundary, not any outer binary framing, defines the bootstrap message boundaries.
+
+1. **First part**: Snapshot message. If a snapshot exists, the part body MUST be the raw snapshot bytes and the part `Content-Type` MUST equal the snapshot blob's stored content type.
+2. **Subsequent parts**: Retained updates after the snapshot point, one update message per part. Each part body MUST be exactly one retained update message, and the part `Content-Type` MUST be the content type of that update. For streams with a fixed stream-level content type, all update parts will normally share that value.
+
+If no snapshot exists, the server MUST still emit an empty first part, `Stream-Snapshot-Offset` MUST be `-1`, and that empty part's `Content-Type` MUST be `application/octet-stream`. Update parts then begin at the earliest retained offset.
+
+Servers MUST NOT wrap the entire bootstrap response in an outer binary framing container. Each update part contains exactly one retained update message from the stream. Implementations MUST preserve the same retained-message boundaries they use for ordinary reads and snapshot-offset validation, and they MUST NOT reinterpret or reframe binary payloads when constructing bootstrap parts.
+
+**Example:**
+
+```http
+HTTP/1.1 200 OK
+Content-Type: multipart/mixed; boundary=rr-bootstrap-9f1c2e7a
+Stream-Snapshot-Offset: 0000000000000012
+Stream-Next-Offset: 0000000000000026
+Stream-Up-To-Date: true
+Cache-Control: no-store
+
+--rr-bootstrap-9f1c2e7a
+Content-Type: application/octet-stream
+
+<snapshot-bytes>
+--rr-bootstrap-9f1c2e7a
+Content-Type: application/json
+
+{"op":"set","path":["title"],"value":"hello"}
+--rr-bootstrap-9f1c2e7a
+Content-Type: application/json
+
+{"op":"insert","path":["body",0],"value":"world"}
+--rr-bootstrap-9f1c2e7a--
+```
+
+**Response Codes:**
+
+- `200 OK`: Bootstrap data returned.
+- `404 Not Found`: Stream does not exist.
+
+### 3.3. Follow-Up Live Reads
+
+Bootstrap is one-shot only:
+
+- `/bootstrap` returns an ordered initialization payload once.
+- `/bootstrap` does not support `live=sse` or `live=long-poll`.
+- After applying the bootstrap response, clients MUST continue tailing through the ordinary stream read APIs using the returned `Stream-Next-Offset`.
+- Clients SHOULD prefer `GET {stream_url}?offset=<offset>&live=sse` and fall back to `GET {stream_url}?offset=<offset>&live=long-poll` when SSE is unavailable.
+
+### 3.4. Compatibility
+
+- Regular `GET {stream_url}?offset=...` MUST NOT return snapshot bytes. Snapshots are only delivered through `/bootstrap`.
+- When a server returns `410 Gone` for a read (because retention has advanced), clients SHOULD call `/bootstrap` to rebuild state, then continue tailing from the returned `Stream-Next-Offset` through the ordinary read APIs.
+- If a server has begun returning `410 Gone` for a stream (i.e., earliest retained offset > `-1`), the server MUST ensure `/bootstrap` is available and can provide a snapshot covering that earliest retained offset.
+- Clients MUST parse `/bootstrap` as an ordered message sequence. Message boundaries come from MIME parts.
+
+---
+
+## 4. Append Batch
+
+Append Batch is an Ursula-specific implementation extension. It is not part of the base Durable Streams Protocol and clients MUST NOT assume it exists on other Durable Streams servers.
+
+The extension reduces HTTP request overhead for workloads that append many small independent records. It is a transport batching mechanism only: each frame in the request is committed as an independent logical append with its own acknowledgement. Servers MUST NOT concatenate the frames into one stream record.
+
+### 4.1. Request
+
+Bucketed Ursula route:
+
+```
+POST /{bucket_id}/{stream_id}/append-batch
+```
+
+Flat v1 compatibility route:
+
+```
+POST /v1/append-batch/{stream_path}
+```
+
+The request `Content-Type` applies to every frame and MUST match the stream's configured content type.
+
+The request body is a sequence of binary frames:
+
+```
+uint32_be payload_len
+payload bytes
+uint32_be payload_len
+payload bytes
+...
+```
+
+`payload_len` is a 32-bit unsigned integer encoded in network byte order. It is the number of payload bytes that immediately follow. Zero-length frames are invalid.
+
+Ursula currently accepts at most 512 frames per public append-batch request and a 32 MiB total body. Servers MAY reject larger batches with `413 Payload Too Large`.
+
+### 4.2. Unsupported Per-Append Controls
+
+The current Ursula append-batch endpoint does not support controls that require per-frame headers:
+
+- `Stream-Closed`
+- `Producer-Id`, `Producer-Epoch`, `Producer-Seq`
+- `If-Match`
+- `Stream-Seq`
+
+Clients that need producer fencing, idempotent producer sequence checks, stream preconditions, or atomic stream close MUST use the standard `POST {stream_url}` append operation.
+
+### 4.3. Response
+
+On a syntactically valid batch request, the response is `200 OK` with a JSON array. The array order matches the request frame order. Each element acknowledges one logical append:
+
+```json
+[
+  { "status": 204, "stream_next_offset": 3 },
+  { "status": 204, "stream_next_offset": 6 }
+]
+```
+
+Acknowledgement fields:
+
+- `status`: HTTP status code for the frame-level logical append.
+- `stream_next_offset`: Present when the frame append succeeds or when an error can report the stream tail.
+- `stream_closed`: Present and `true` if the append observes a closed stream.
+- `error_code`: Present for failed frame-level appends.
+- `error`: Human-readable failure detail for failed frame-level appends.
+
+Malformed framing, missing `Content-Type`, unsupported headers, or an oversized request MAY fail the entire HTTP request with `400 Bad Request` or `413 Payload Too Large`.
+
+Frame-level failures are reported inside the JSON array. A successful outer `200 OK` does not mean every frame committed. Clients MUST inspect every acknowledgement.
+
+### 4.4. Ordering and Compatibility
+
+Frames are submitted in request order and response acknowledgements preserve that order. For a single stream, successful frames advance the same stream offsets that standard `POST {stream_url}` would have produced.
+
+All standard stream read APIs remain unchanged. Data appended through Append Batch is read through ordinary `GET`, long-poll, SSE, snapshot, and bootstrap paths using the same offsets and content type rules as standard appends.
+
+---
+
+## 5. Ordinary SSE Compatibility
+
+Ordinary SSE behavior, including binary stream handling, is defined by `docs/specs/durable-stream.md`.
+
+- For binary streams, ordinary `event: data` payloads are raw base64 text and the response MUST include `stream-sse-data-encoding: base64`.
+- Extension endpoints MUST NOT redefine the payload shape of ordinary binary SSE `event: data` frames unless they document an explicit endpoint-local contract.
+
+---
+
+## 6. URL Encoding
+
+`snapshot_offset` values originate from `Stream-Next-Offset` and MAY contain characters requiring URL encoding. Clients and servers MUST apply standard URL encoding/decoding when using offset values in path segments.

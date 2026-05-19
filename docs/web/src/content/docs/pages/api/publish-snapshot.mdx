@@ -1,0 +1,65 @@
+---
+title: Publish snapshot
+api: "PUT /{bucket}/{stream}/snapshot/{offset}"
+description: Upload a snapshot blob at a specific stream offset.
+---
+
+Publishes a new snapshot blob at the given offset. The snapshot replaces any previously published snapshot and enables cold storage cleanup of data before this offset.
+
+<ParamField path="bucket" type="string" required>
+ Bucket ID.
+</ParamField>
+
+<ParamField path="stream" type="string" required>
+ Stream ID.
+</ParamField>
+
+<ParamField path="offset" type="string" required>
+ Stream offset this snapshot represents: the 20-character zero-padded decimal token.
+</ParamField>
+
+<ParamField header="Content-Type" type="string">
+ Content type of the snapshot blob, stored separately from the stream's own content type. Defaults to `application/octet-stream`.
+</ParamField>
+
+<ParamField body="body" type="binary" required>
+ The snapshot blob bytes. Maximum size is **128 MiB**. Larger bodies return `413`.
+</ParamField>
+
+## Response
+
+| Status | Meaning |
+| ------ | --------------------------------------------------------------- |
+| `204` | Snapshot published successfully. |
+| `400` | Invalid offset or content type. |
+| `404` | Stream not found or expired. |
+| `409` | Stale publish (a newer snapshot exists) or offset out of range. |
+| `410` | Snapshot offset is too old (data already garbage-collected). |
+| `413` | Snapshot body exceeds the maximum allowed size. |
+
+Response headers include `Stream-Next-Offset` and `Stream-Snapshot-Offset`.
+
+<RequestExample>
+```bash Example
+curl -X PUT 'http://127.0.0.1:4437/demo/hello/snapshot/00000000000000000042' \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"state": "aggregated snapshot data"}'
+```
+</RequestExample>
+
+---
+
+## Delete snapshot
+
+`DELETE /{bucket}/{stream}/snapshot/{offset}`
+
+Attempting to delete the current visible snapshot is not allowed.
+
+| Status | Meaning |
+| ------ | ----------------------------------- |
+| `404` | No snapshot at the given offset. |
+| `409` | Cannot delete the current snapshot. |
+
+<Note>
+Snapshots are immutable once published. Each publish creates a new blob with a unique key, so retries cannot overwrite a committed snapshot. After a snapshot is committed, cold storage chunks before the snapshot offset are automatically cleaned up.
+</Note>

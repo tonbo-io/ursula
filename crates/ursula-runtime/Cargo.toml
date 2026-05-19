@@ -1,0 +1,17 @@
+[package]
+name = "ursula-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Shard-owned actor runtime prototype for Ursula vNext."
+
+[dependencies]
+bytes = { version = "1.7", features = ["serde"] }
+opendal = { version = "0.51", features = ["services-fs", "services-memory", "services-s3"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "sync", "time"] }
+ursula-shard = { path = "../ursula-shard" }
+ursula-stream = { path = "../ursula-stream" }

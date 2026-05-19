@@ -1,0 +1,37 @@
+{
+  "name": "ursula-web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build && node scripts/build-llm-docs.mjs && pagefind --site dist --glob \"docs/**/*.html\" && rm -rf public/pagefind && cp -r dist/pagefind public/pagefind",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@fontsource/ibm-plex-sans": "^5.2.8",
+    "@mdx-js/react": "^3.1.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@mdx-js/rollup": "^3.1.1",
+    "@shikijs/rehype": "^4.0.2",
+    "@types/mdx": "^2.0.13",
+    "@types/node": "^25.6.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.1",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "pagefind": "^1.5.2",
+    "rehype-slug": "^6.0.0",
+    "remark-frontmatter": "^5.0.0",
+    "remark-gfm": "^4.0.1",
+    "remark-mdx-frontmatter": "^5.2.0",
+    "shiki": "^4.0.2",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10",
+    "vite-prerender-plugin": "^0.5.13"
+  }
+}

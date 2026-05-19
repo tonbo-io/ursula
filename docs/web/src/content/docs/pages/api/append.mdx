@@ -1,0 +1,77 @@
+---
+title: Append
+api: "POST /{bucket}/{stream}"
+description: Append data to an existing stream, or close it.
+---
+
+<ParamField path="bucket" type="string" required>
+ Bucket ID.
+</ParamField>
+
+<ParamField path="stream" type="string" required>
+ Stream ID within the bucket.
+</ParamField>
+
+<ParamField header="Content-Type" type="string" required>
+ Must match the stream's content type (set at PUT or first POST). Required when the body is non-empty. Mismatch returns `400`.
+</ParamField>
+
+<ParamField header="Stream-Closed" type="string">
+ Set to `true` to close the stream after this append.
+</ParamField>
+
+<ParamField header="Stream-Seq" type="string">
+ Client-supplied monotonic sequence token. The server tracks the last accepted value per stream and rejects any append whose `Stream-Seq` is not lexicographically greater than the previous one.
+</ParamField>
+
+<ParamField header="Producer-Id" type="string">
+ Stable producer identity (UUID, hostname, etc.) for [exactly-once writes](/docs/concepts/exactly-once-writes). Dedup state is per-stream.
+</ParamField>
+
+<ParamField header="Producer-Epoch" type="string">
+ Producer epoch. Bumped on producer restart. Must be ≥ the last epoch the server accepted for this `Producer-Id`. A new epoch resets the seq counter. Max value `2^53 − 1`.
+</ParamField>
+
+<ParamField header="Producer-Seq" type="string">
+ Producer sequence number. Starts at `0` for a new epoch and must increase by exactly `1` per append. Exact `(epoch, seq)` duplicates are silently deduplicated. Max value `2^53 − 1`.
+</ParamField>
+
+<ParamField body="body" type="binary" required>
+ The bytes to append. Must not be empty unless `Stream-Closed: true` is set (close-only request).
+</ParamField>
+
+## Response
+
+| Status | Meaning |
+| ------ | ------------------------------------------------------------------ |
+| `204` | Append successful (default success response, no body). |
+| `200` | Append successful with body - returned when a `Producer-Id` was supplied and the append was not deduplicated, so the response carries producer ack headers. |
+| `400` | Empty body without `Stream-Closed: true`, missing content type, or bad JSON. |
+| `404` | Stream not found. |
+| `409` | Stream is already closed, or sequence/producer conflict. |
+| `503` | Cold-write backpressure. Retry after the duration in `Retry-After`. |
+
+Response headers include `Stream-Next-Offset` (always). When a `Producer-Id` was supplied, the server echoes the accepted `Producer-Epoch` and `Producer-Seq` so the producer can confirm what was durably recorded. `Stream-Closed: true` is set if this request closed the stream. `ETag` is set on reads only, not on appends.
+
+<RequestExample>
+```bash Append binary
+curl -X POST http://127.0.0.1:4437/demo/hello \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary 'hello world'
+```
+
+```bash Append JSON
+curl -X POST http://127.0.0.1:4437/demo/hello \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"event": "click", "ts": 1711234567}'
+```
+
+```bash Close a stream
+curl -X POST http://127.0.0.1:4437/demo/hello \
+  -H 'Stream-Closed: true'
+```
+</RequestExample>
+
+<Note>
+Appends to JSON streams are validated and normalized. The server may coalesce multiple concurrent appends into a single batch for performance.
+</Note>

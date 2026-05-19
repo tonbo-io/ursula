@@ -1,0 +1,63 @@
+---
+title: Bootstrap
+api: "GET /{bucket}/{stream}/bootstrap"
+description: Recover full stream state from snapshot plus retained updates in a single request.
+---
+
+Returns the stream's latest snapshot (if any) plus all retained updates after the snapshot offset, packed as a `multipart/mixed` response. This is the recommended way to initialize a client that needs the complete current state of a stream.
+
+<ParamField path="bucket" type="string" required>
+ Bucket ID.
+</ParamField>
+
+<ParamField path="stream" type="string" required>
+ Stream ID within the bucket.
+</ParamField>
+
+Bootstrap does not accept `?live=sse`. Combining the multipart body with an SSE event stream is rejected with `400`. To go live after bootstrap, finish the multipart response, then open a separate `GET /{bucket}/{stream}?offset=<Stream-Next-Offset>&live=sse`.
+
+## Response
+
+| Status | Meaning |
+| ------ | --------------------------------------------- |
+| `200` | Bootstrap response with snapshot and updates. |
+| `400` | Invalid query parameters (including `live=sse`). |
+| `404` | Stream not found or expired. |
+| `410` | Requested offset has been trimmed. |
+
+Response headers include:
+
+| Header | Description |
+| ------------------------ | ---------------------------------------------------------------- |
+| `Content-Type` | `multipart/mixed; boundary=...` |
+| `Stream-Next-Offset` | The offset after the last included update. |
+| `Stream-Snapshot-Offset` | The snapshot offset (or `none` if no snapshot exists). |
+| `Stream-Up-To-Date` | `true` if the response includes all data up to the tail. |
+| `Stream-Closed` | Present and `true` if the stream is closed and fully caught up. |
+
+## Response body
+
+The body is a `multipart/mixed` message:
+
+<Steps>
+ <Step title="Snapshot part">
+ The first part is the snapshot blob (or an empty part if no snapshot exists).
+ </Step>
+ <Step title="Update parts">
+ Subsequent parts are individual update messages appended after the snapshot offset. For JSON streams, each update is a separate `application/json` part.
+ </Step>
+</Steps>
+
+<RequestExample>
+```bash Example
+curl 'http://127.0.0.1:4437/demo/hello/bootstrap'
+```
+</RequestExample>
+
+<Tip>
+After bootstrapping, switch to [SSE reads](/docs/api/read) with `live=sse` starting from the `Stream-Next-Offset` to receive real-time updates.
+</Tip>
+
+<Info>
+See [bootstrap](/docs/concepts/bootstrap) and [snapshots](/docs/concepts/snapshots) for the conceptual model.
+</Info>

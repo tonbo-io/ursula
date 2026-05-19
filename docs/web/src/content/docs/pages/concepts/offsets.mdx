@@ -1,0 +1,35 @@
+---
+title: Offsets
+sidebarTitle: Offsets
+description: Position tokens inside a stream, with how to read, resume, and follow safely.
+---
+
+An offset is a position inside a stream. Clients use offsets to read from a specific point or resume where they left off.
+
+## Format
+
+Offsets are numeric (`u64` byte positions internally) but are returned to clients as 20-character zero-padded decimal strings, for example `"00000000000000000042"`, so they sort lexicographically. Treat them as opaque tokens: read the value from the server's response and pass it back unchanged.
+
+Two special values are accepted on read requests:
+
+- `offset=-1`: start from the very beginning of retained data (the earliest still-available offset).
+- `offset=now`: start from the stream's current tail. Useful for "only new data" subscriptions.
+
+## Response headers
+
+After every read or append, the server returns two related headers:
+
+- **`Stream-Next-Offset`**: always present. The numeric position to use for the next request.
+- **`Stream-Cursor`**: set on live (long-poll, SSE) responses. An opaque token that bundles the stream identity and epoch with the offset, so a reconnecting client lands on the same stream version it was reading before.
+
+For pure catch-up reads, `Stream-Next-Offset` is enough. For live tailing across reconnects, prefer `Stream-Cursor` (passed as `?cursor=`). It surfaces stream re-creation as a clean error rather than silently re-reading new data under the same name.
+
+## Stability across snapshots
+
+Offsets are byte positions, not sequence numbers, and they're stable across snapshot publishes. Publishing a snapshot at offset 100 doesn't renumber later offsets. It only enables the server to garbage-collect data before offset 100. Reads to trimmed offsets return `410 Gone` with a `stream-earliest-offset` header pointing at the first still-available position.
+
+## Related
+
+- [Read modes](/docs/concepts/read-modes)
+- [Snapshots](/docs/concepts/snapshots)
+- [Bootstrap](/docs/concepts/bootstrap): recovery when offsets you remember have been trimmed

@@ -1,0 +1,125 @@
+syntax = "proto3";
+
+package ursula.raft.v1;
+
+message RaftRpcEnvelopeV1 {
+  uint32 raft_group_id = 1;
+  uint64 node_id = 2;
+  uint32 protocol_version = 3;
+  // Envelope metadata is protobuf; payload bytes currently encode the OpenRaft
+  // RPC container with the advertised codec.
+  string payload_codec = 4;
+  bytes payload = 5;
+}
+
+message RaftRpcAckV1 {
+  bytes payload = 1;
+}
+
+message RaftFullSnapshotRequestV1 {
+  uint32 raft_group_id = 1;
+  uint64 node_id = 2;
+  uint32 protocol_version = 3;
+  // Envelope metadata is protobuf; vote and snapshot metadata payloads currently
+  // encode OpenRaft container types with the advertised codec.
+  string payload_codec = 4;
+  bytes vote_payload = 5;
+  bytes snapshot_meta_payload = 6;
+  bytes snapshot_payload = 7;
+}
+
+message RaftFullSnapshotAckV1 {
+  bytes payload = 1;
+}
+
+message HttpHeaderV1 {
+  string name = 1;
+  bytes value = 2;
+}
+
+message HttpWriteRequestV1 {
+  string method = 1;
+  string target = 2;
+  repeated HttpHeaderV1 headers = 3;
+  bytes body = 4;
+}
+
+message HttpWriteResponseV1 {
+  uint32 status = 1;
+  repeated HttpHeaderV1 headers = 2;
+  bytes body = 3;
+}
+
+message GroupWriteRequestV1 {
+  uint32 raft_group_id = 1;
+  uint32 core_id = 2;
+  uint32 shard_id = 3;
+  repeated bytes command_payloads = 4;
+}
+
+message GroupWriteResultV1 {
+  bool ok = 1;
+  bytes payload = 2;
+}
+
+message GroupWriteResponseV1 {
+  repeated GroupWriteResultV1 results = 1;
+}
+
+message GroupReadRequestV1 {
+  uint32 raft_group_id = 1;
+  uint32 core_id = 2;
+  uint32 shard_id = 3;
+  string bucket_id = 4;
+  string stream_id = 5;
+  uint64 now_ms = 6;
+  oneof read {
+    HeadStreamReadV1 head = 7;
+    ReadStreamReadV1 read_stream = 8;
+  }
+}
+
+message HeadStreamReadV1 {}
+
+message ReadStreamReadV1 {
+  uint64 offset = 1;
+  uint64 max_len = 2;
+}
+
+message GroupReadResponseV1 {
+  bool ok = 1;
+  bytes payload = 2;
+}
+
+message HeadStreamResponsePayloadV1 {
+  uint32 core_id = 1;
+  uint32 shard_id = 2;
+  uint32 raft_group_id = 3;
+  string content_type = 4;
+  uint64 tail_offset = 5;
+  bool closed = 6;
+  optional uint64 stream_ttl_seconds = 7;
+  optional uint64 stream_expires_at_ms = 8;
+  optional uint64 snapshot_offset = 9;
+}
+
+message ReadStreamResponsePayloadV1 {
+  uint32 core_id = 1;
+  uint32 shard_id = 2;
+  uint32 raft_group_id = 3;
+  uint64 offset = 4;
+  uint64 next_offset = 5;
+  string content_type = 6;
+  bytes payload = 7;
+  bool up_to_date = 8;
+  bool closed = 9;
+}
+
+service RaftInternal {
+  rpc Append(RaftRpcEnvelopeV1) returns (RaftRpcAckV1);
+  rpc Vote(RaftRpcEnvelopeV1) returns (RaftRpcAckV1);
+  rpc FullSnapshot(RaftFullSnapshotRequestV1) returns (RaftFullSnapshotAckV1);
+  rpc ForwardHttpWrite(HttpWriteRequestV1) returns (HttpWriteResponseV1);
+  rpc GroupWrite(GroupWriteRequestV1) returns (GroupWriteResponseV1);
+  rpc GroupRead(GroupReadRequestV1) returns (GroupReadResponseV1);
+}

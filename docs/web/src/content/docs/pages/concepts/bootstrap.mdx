@@ -1,0 +1,39 @@
+---
+title: Bootstrap
+sidebarTitle: Bootstrap
+description: Initialize a new client with one request, fetching snapshot plus post-snapshot updates.
+---
+
+Bootstrap is the new-client initialization endpoint. A single request returns everything a client needs to catch up:
+
+1. The latest snapshot (if any)
+2. All updates after the snapshot, up to the stream's current tail
+
+```
+GET /{bucket}/{stream}/bootstrap
+```
+
+The response is `multipart/mixed`:
+
+- **First part.** The snapshot. If no snapshot exists, this part is present but empty.
+- **Subsequent parts.** Incremental updates from the snapshot offset (or from the earliest retained offset, if no snapshot exists).
+
+Each part has its own `Content-Type`: the snapshot part uses `snapshot_content_type`. Update parts use the stream's content type. The client does not need to know in advance whether a snapshot exists. The same parsing path handles both cases.
+
+## When to use bootstrap vs catch-up
+
+| You want… | Use |
+| --- | --- |
+| Latest state, fastest first-load | `/bootstrap` |
+| Replay every byte from the beginning | `GET /{b}/{s}?offset=-1` |
+| Resume from a known offset that's still retained | `GET /{b}/{s}?offset=N` |
+| Resume from an offset the server has since trimmed (`410 Gone`) | `/bootstrap`, then continue from the snapshot offset |
+
+## Live continuation
+
+Bootstrap does not accept `?live=sse`. Combining the multipart body with an SSE event stream is rejected with `400`. To go live after bootstrap, finish reading the bootstrap response, then open a separate `GET /{b}/{s}?offset=<snapshot_offset>&live=sse` (or pass the `cursor` returned by bootstrap).
+
+## Related
+
+- [Snapshots](/docs/concepts/snapshots)
+- [Read modes](/docs/concepts/read-modes)

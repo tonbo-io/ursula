@@ -1,0 +1,11 @@
+---
+title: Read Modes
+sidebarTitle: Read Modes
+description: Compare catch-up, long-poll, and SSE reads for Ursula clients.
+---
+
+Streams support three read modes, all via `GET`:
+
+- **Catch-up**: `GET /b/s?offset=-1` returns all data from the given offset immediately. Use this to sync historical data.
+- **Long-poll**: `GET /b/s?offset=...&live=long-poll` returns immediately if data is available, otherwise holds the connection until new data arrives or a timeout. Good for simple polling loops.
+- **SSE**: `GET /b/s?offset=...&live=sse` opens a persistent Server-Sent Events connection. The server pushes new data as it arrives. This is the recommended mode for real-time frontends (`EventSource` in the browser works out of the box).

@@ -1,0 +1,15 @@
+/target/
+**/.DS_Store
+**/__pycache__/
+
+# Docs site build artifacts
+docs/web/node_modules/
+docs/web/dist/
+docs/web/public/pagefind/
+docs/web/public/docs/
+docs/web/public/llms*.txt
+docs/web/*.tsbuildinfo
+docs/web/vite.config.d.ts
+
+# Local benchmark output
+.bench-results/

@@ -1,0 +1,59 @@
+---
+title: Read snapshot
+api: "GET /{bucket}/{stream}/snapshot"
+description: Read the latest snapshot or a snapshot at a specific offset.
+---
+
+## Latest snapshot
+
+`GET /{bucket}/{stream}/snapshot` redirects to the latest published snapshot's offset-specific URL.
+
+<ParamField path="bucket" type="string" required>
+ Bucket ID.
+</ParamField>
+
+<ParamField path="stream" type="string" required>
+ Stream ID.
+</ParamField>
+
+| Status | Meaning |
+| ------ | ------------------------------------------------------------- |
+| `307` | Redirect to `/{bucket}/{stream}/snapshot/{offset}`. |
+| `404` | Stream not found, expired, or no snapshot has been published. |
+
+Response headers include `Location`, `Stream-Next-Offset`, `Stream-Snapshot-Offset`, and `Stream-Up-To-Date`.
+
+---
+
+## Snapshot at offset
+
+`GET /{bucket}/{stream}/snapshot/{offset}` returns the snapshot blob at a specific offset.
+
+<ParamField path="offset" type="string" required>
+ Snapshot offset: the 20-character zero-padded decimal token returned by previous reads or `Stream-Snapshot-Offset` headers.
+</ParamField>
+
+| Status | Meaning |
+| ------ | -------------------------------------- |
+| `200` | Snapshot blob returned. |
+| `404` | Stream, snapshot, or offset not found. |
+
+Response headers include `Content-Type`, `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Up-To-Date`, and `Stream-Closed`.
+
+<RequestExample>
+```bash Follow redirect to latest
+curl -L 'http://127.0.0.1:4437/demo/hello/snapshot'
+```
+
+```bash Read specific offset
+curl 'http://127.0.0.1:4437/demo/hello/snapshot/00000000000000000042'
+```
+</RequestExample>
+
+<Note>
+Snapshot reads go through a linearizable freshness check to ensure you see the latest published snapshot. If the snapshot blob hasn't replicated to the current node yet, the request may be redirected to the leader.
+</Note>
+
+<Info>
+See [snapshots](/docs/concepts/snapshots) for the snapshot lifecycle.
+</Info>

@@ -1,0 +1,41 @@
+---
+title: Exactly-Once Writes
+sidebarTitle: Exactly-Once Writes
+description: Producer identifiers, epochs, and sequence numbers deliver deduplicated appends.
+---
+
+Network retries can produce duplicate appends. Ursula provides server-side deduplication so your application doesn't need its own bookkeeping. Three headers form the identity:
+
+- **`Producer-Id`**: a stable client identifier (UUID, hostname, etc.).
+- **`Producer-Epoch`**: bumped on producer restart. Must be ≥ the last epoch the server saw from this producer.
+- **`Producer-Seq`**: a per-epoch sequence number. Starts at `0` for a new epoch and must increase by exactly `1` per append.
+
+Both epoch and seq are capped at `2^53 − 1` so they survive a round-trip through JSON.
+
+## How dedup works
+
+The server records the highest `(epoch, seq)` accepted from each `Producer-Id` per stream. On an append:
+
+- **Exact duplicate** (same epoch and same seq as already accepted): silently deduplicated. The response carries the existing offset.
+- **Next in sequence** (`seq = last_seq + 1`): accepted.
+- **Out of order** (seq skips ahead or goes backward): rejected with `409 producer_seq_conflict`. The response body includes the `expected_seq` the server wanted.
+- **Epoch regression** (new epoch less than last accepted): rejected with `409`.
+
+## Restart and epoch hygiene
+
+When a producer crashes and restarts, **bump `Producer-Epoch`**. Otherwise the server still expects the next contiguous seq within the old epoch, and the producer (which has lost its in-memory seq counter) will collide. A new epoch starts the seq counter back at `0`.
+
+## Per-stream state
+
+Dedup state is scoped per stream. The same `Producer-Id` writing to two different streams maintains two independent epoch/seq counters, so you do not have to elect a single global writer per producer.
+
+The server retains only the highest accepted `(epoch, seq)` per `(producer_id, stream)` pair. Older epochs are dropped once a higher epoch is observed.
+
+## When you don't need this
+
+For append-only workloads where each write is independent (event logging, audit trails), exactly-once headers are optional. Just POST without them. Add them when retries are real and double-applies would be visible.
+
+## Related
+
+- [Conditional writes](/docs/concepts/conditional-writes): coordinate multiple writers, different problem
+- [API: append](/docs/api/append)

@@ -1,0 +1,172 @@
+---
+title: Troubleshooting
+description: Common Ursula failure modes, what they look like, how to diagnose them, and what to do.
+---
+
+When something goes wrong, start with `/__ursula/metrics` rather than guessing from logs. Most operational symptoms have a clear signal in the JSON snapshot.
+
+## Diagnostic surface
+
+```bash
+# Per-node JSON: placement, mailbox depth, Raft state, counters, backpressure
+curl http://NODE:4437/__ursula/metrics | jq .
+```
+
+Useful selectors:
+
+| What you need | jq filter |
+| ------------- | --------- |
+| Per-group leader / term | `.raft_groups[] | {id, leader_id, current_term, last_applied}` |
+| Hot bytes per group | `.raft_groups[] | {id, hot_bytes_total}` |
+| Cold backpressure tripped recently | `.cold_backpressure_events_total` |
+| Per-core mailbox depth | `.cores[] | {core_id, mailbox_pending}` |
+| Live-read watcher counts | `.cores[] | {core_id, live_read_watchers_active}` |
+| HTTP error counters | `.http.responses_by_status` |
+
+Ursula does **not** expose `/healthz`, `/readyz`, Prometheus `/metrics`, or `/cluster/status`. The JSON snapshot is the source of truth.
+
+## Startup failures
+
+### `use only one of --wal-dir or --raft-log-dir`
+
+Storage flags are mutually exclusive. Pick one of `--raft-memory`, `--wal-dir DIR`, or `--raft-log-dir DIR`.
+
+### `static gRPC Raft does not support --wal-dir`
+
+`--wal-dir` is for the standalone WAL runtime. Cluster mode requires `--raft-log-dir` (durable) or `--raft-memory` (volatile).
+
+### `static gRPC Raft requires --raft-node-id` / `--raft-peer ID=URL`
+
+Whenever any of `--raft-node-id`, `--raft-peer`, `--raft-init-membership`, or `--raft-cluster-config` is supplied, Ursula switches to static gRPC mode and requires the full peer list plus the local node ID. Pass `--raft-cluster-config FILE` to avoid repeating peer lines on every host.
+
+### `--raft-peer must include this node id N`
+
+The local `--raft-node-id` value must appear as one of the peer entries. The peer list always includes self.
+
+### `URSULA_COLD_S3_BUCKET is required when URSULA_COLD_BACKEND=s3`
+
+Self-explanatory. If you don't want cold storage at all, leave `URSULA_COLD_BACKEND` unset.
+
+### Port already in use
+
+`--listen` is bound by another process. The public HTTP and inter-node gRPC share the same port. If a peer Ursula is running on the same host, give it a different port.
+
+### Process exits with I/O error on `--wal-dir` or `--raft-log-dir`
+
+The directory must be writable. Check ownership and permissions. There is no lock file to clear. Ursula trusts the directory.
+
+## Bootstrap and cluster join
+
+### A fresh cluster never elects leaders
+
+Check `/__ursula/metrics` on each node - every Raft group should show a non-zero `leader_id` and a stable `current_term`. If groups stay leaderless:
+
+- The first start must include `--raft-init-membership-per-group` (or `--raft-init-membership`) on every voting node.
+- Every peer URL in the cluster config must be reachable from every node. From node 1: `curl http://10.0.0.2:4437/__ursula/metrics` should succeed.
+- All peers must use the same storage mode (`--raft-memory` everywhere, or `--raft-log-dir` everywhere). A mismatch causes silent join failures.
+
+### Replacing or restarting a node leaves it leaderless
+
+Restart the process with the **same** `--raft-node-id` and `--raft-cluster-config`. If you changed the storage directory, the new node will rehydrate from peers, which can be slow on cold-storage-only history.
+
+## Write path
+
+### `503` with `Retry-After` on append
+
+Cold-write backpressure for that group. Inspect the metrics for the placement of the affected stream and the `hot_bytes_total` of its group:
+
+- Hot ring exceeds `URSULA_COLD_MAX_HOT_BYTES_PER_GROUP` (default 64 MiB) - cold flush isn't keeping up.
+- S3 / filesystem cold backend is slow or erroring out.
+
+Either raise the per-group ceiling, lower `URSULA_COLD_FLUSH_INTERVAL_MS`, raise `URSULA_COLD_FLUSH_MAX_CONCURRENCY`, or fix the underlying cold-backend issue.
+
+### `409 Conflict` with `producer-expected-seq` / `producer-received-seq` headers
+
+The producer's `Producer-Id` + `Producer-Epoch` + `Producer-Seq` combination is out of order. Response headers tell you what the server expected:
+
+- `producer-expected-seq: N` - next allowed sequence
+- `producer-received-seq: M` - what the client sent
+
+Common causes:
+
+- A client restarted without bumping `Producer-Epoch`. Bump the epoch on every producer restart.
+- Two writers share the same `Producer-Id`. Use distinct IDs.
+- A retry skipped a sequence number. Producer sequences must be contiguous within an epoch.
+
+### `409 Conflict` from `Stream-Seq`
+
+The supplied `Stream-Seq` is not lexicographically greater than the previously accepted value for this stream. Either re-read and re-derive, or stop relying on `Stream-Seq` and use producer dedup instead.
+
+### `404 Not Found` on `POST /{bucket}/{stream}`
+
+The stream hasn't been created. Ursula creates streams via `PUT /{bucket}/{stream}` before they accept appends. There is no implicit creation on first POST. (Bucket existence is not currently checked.)
+
+### `400 Bad Request` on JSON appends
+
+JSON streams (`application/json` content type) are parsed and normalized on the server. Malformed JSON or empty arrays without the `allow_empty_array` flag are rejected. Send valid JSON or switch to `application/octet-stream`.
+
+## Read path
+
+### `Stream-Up-To-Date: false` on a normal read
+
+Just means there is more committed data than this response carries. Page forward with `Stream-Next-Offset` and reissue. Not an error.
+
+### SSE connection drops after 30–60 seconds idle
+
+A proxy or load balancer is closing idle TCP connections. Raise its idle timeout, or enable TCP keepalive on the proxy -> Ursula leg. Ursula does not currently emit SSE keepalive comment lines, so a long idle period genuinely has no traffic.
+
+### SSE on a binary stream returns base64 JSON instead of raw bytes
+
+Expected behavior. SSE wire format is text-only, so binary streams are wrapped in a JSON envelope and the `Stream-Sse-Data-Encoding: base64` response header tells the client to decode. See [Binary SSE](/docs/concepts/binary-sse).
+
+### Reads stall for hundreds of milliseconds for cold offsets
+
+The first read of a cold offset triggers an S3 `GetObject` range read. Ursula spawns this off the owner group's actor turn so it doesn't block other commands, but the request itself still pays S3 latency. Subsequent reads for the same chunk can benefit from cold-backend caching if your store has it.
+
+## Replication and consensus
+
+### A group has no leader (`leader_id == 0` in metrics)
+
+Either an election is in progress or quorum is lost for that group. Since groups are independent, only the streams hashed to that group are affected. Check `/__ursula/metrics` on every node for that group's leader:
+
+- If multiple nodes briefly claim leader, election is flapping. Inspect peer reachability and CPU pressure.
+- If no node claims leader, fewer than ⌈n/2⌉+1 voters are reachable for that group. Restore reachability.
+
+### One follower lags behind
+
+State-machine apply runs on the follower's owner core for that group. If CPU is pinned, the follower's `last_applied` will trail. Investigate:
+
+- Per-core mailbox depth in metrics - sustained queueing means that core is saturated.
+- Disk pressure if you're using `--raft-log-dir` (fsync latency).
+- A pathological hot stream forcing constant cold flushes. Check `hot_bytes_total` per group.
+
+### Manually trigger a snapshot
+
+```bash
+curl -X POST http://NODE:4437/__ursula/raft/{group_id}/snapshot
+curl -X POST http://NODE:4437/__ursula/raft/{group_id}/purge
+```
+
+Purge is only safe after the snapshot has been replicated. Otherwise you risk losing log entries needed for a slow follower.
+
+## Cold flush issues
+
+### Writes succeed but data never reaches S3
+
+Likely causes:
+
+- `URSULA_COLD_BACKEND` not set (or set to `fs` while you expected `s3`).
+- IAM permissions missing. Required: `s3:GetObject`, `s3:PutObject`, `s3:ListBucket`, `s3:DeleteObject` on the bucket.
+- `URSULA_COLD_S3_ENDPOINT` points somewhere the node can't reach.
+- Cold flush worker is stalled. `cold_backpressure_events_total` in metrics will be climbing.
+
+If hot bytes are growing unbounded with no cold flushes happening, you'll eventually hit `URSULA_COLD_MAX_HOT_BYTES_PER_GROUP` and writes will start returning `503`. Fix the cold backend before that point.
+
+## Still stuck?
+
+Open a [GitHub issue](https://github.com/opendurability/ursula/issues) with:
+
+- `/__ursula/metrics` output from every node (with timestamps)
+- The CLI flags used to start each node
+- Relevant `URSULA_*` env vars (redact credentials)
+- The last ~200 log lines with `RUST_LOG=ursula_runtime=debug,ursula_raft=debug,ursula_http=info`

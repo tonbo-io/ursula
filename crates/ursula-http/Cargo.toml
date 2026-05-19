@@ -1,0 +1,30 @@
+[package]
+name = "ursula-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Minimal HTTP adapter for Ursula vNext runtime experiments."
+
+[features]
+tokio-console = ["dep:console-subscriber", "tokio/tracing"]
+
+[dependencies]
+axum = { version = "0.8" }
+base64 = "0.22"
+chrono = "0.4"
+console-subscriber = { version = "0.5.0", optional = true }
+futures-util = "0.3"
+openraft = { version = "0.10.0-alpha.20", default-features = false, features = ["tokio-rt", "type-alias", "serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.39", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+tonic = { version = "0.12", features = ["transport"] }
+tower = { version = "0.5", features = ["util"] }
+ursula-raft = { path = "../ursula-raft" }
+ursula-runtime = { path = "../ursula-runtime" }
+ursula-shard = { path = "../ursula-shard" }
+
+[dev-dependencies]

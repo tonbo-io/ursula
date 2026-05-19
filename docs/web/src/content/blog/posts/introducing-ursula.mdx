@@ -1,0 +1,99 @@
+---
+title: Introducing Ursula
+description: A distributed implementation of the Durable Streams Protocol, jointly built by Tonbo and Loro.
+date: 2026-05-13
+author: The Tonbo & Loro teams
+---
+
+Every modern application is quietly producing a timeline. A document accumulates edits. A session accumulates messages. An AI agent run accumulates tool calls and partial responses. A workflow accumulates execution steps. A collaborative whiteboard accumulates strokes. The shape is the same everywhere: an ordered, append-only sequence of changes that needs to be replayable from any point, durably retained, and live-tailable while it's still being written.
+
+The web has no first-class primitive for this. Each team rebuilds it from a different starting point: a database with a journal table, a message broker with consumer groups, or an object-storage bucket plus a polling loop. Each of those rebuilds reinvents the same offset-based replay semantics, the same recovery edge cases, the same live-tailing reconnection logic, in slightly different ways. The shape keeps recurring because the requirement keeps recurring, but there is no shared infrastructure for it.
+
+We kept hitting this shape in our own work, and our friends kept hitting it in theirs. After enough of those conversations we decided to stop working around it and build the shared piece properly, once. That's Ursula.
+
+## Durable Streams as the primitive
+
+We didn't invent the primitive. [Electric](https://electric-sql.com/) published the [Durable Streams Protocol](https://github.com/durable-streams/durable-streams), a minimal HTTP-native specification for exactly the shape above. The protocol is small: `PUT` creates a stream, `POST` appends bytes, `GET` reads from an offset or live-tails over Server-Sent Events. Streams are URL-addressable. Offsets are opaque tokens. Closure is explicit. There is no required client library. Any HTTP client works.
+
+The protocol is well-shaped. The challenge is the implementation. The reference server published alongside the protocol runs as a single process. It is easy to embed, easy to evaluate, easy to run on a laptop. But anyone who wants to run a fleet of durable streams in production needs something more: replicated writes that survive node failure, transparent leader forwarding so any reachable node can serve a request, snapshot-based recovery so new clients don't replay months of history, and a cold tier so streams that grow into gigabytes don't pin memory.
+
+Ursula is that something more, and it stays loyal to the protocol. Your clients see the same URLs, the same headers, the same SSE wire format. Three nodes (or five) sit underneath, acting as one durable streams server with leader-serialized appends per Raft group, quorum commits, transparent follower forwarding, and an S3-backed cold tier for long-tail data.
+
+## No three-way trade
+
+We didn't reach for a distributed implementation only because it didn't exist. We built one because every alternative we evaluated asks you to trade away one of three properties this primitive deserves to have all of.
+
+**Open-source self-hosting.** The Durable Streams reference server has it. S2 Lite has it. Managed S2 gives it up.
+
+**Low write latency.** S3-backed implementations either pay for S3 Express (~7× S3 Standard for hot bytes) or batch hard and accept 250ms+ p50.
+
+**Quorum-replicated durability.** Every common open-source shape we found runs as a single serving process. A single node loss is a data loss.
+
+None of the three trades is necessary. The protocol is small, the workloads are common, the engineering is well-understood. We believe this primitive belongs in the open, distributed by default, and fast on the write path. Ursula is what that looks like.
+
+## The hard part is the write path
+
+The obvious place to put per-resource durable timelines is on object storage. S3 is cheap, durable, and infinitely scalable. We tried, like everyone else, and ran into the same two walls.
+
+**S3 has no append operation.** Every write creates a new object. You can either pay per-PUT at high frequency, or batch writes and accept the latency that batching imposes. There is no middle ground at the storage layer.
+
+**S3's conditional writes are optimistic.** Under concurrent writers they degrade into retry storms. Most attempts conflict, clients back off and try again, and latency grows nonlinearly with contention. ([Chroma documented the mechanics well.](https://www.trychroma.com/engineering/wal3))
+
+S2 worked around the latency wall by writing through S3 Express One Zone, which sits at sub-50ms. Express storage costs roughly 7× S3 Standard, though, and the optimistic concurrency model is still there underneath. WarpStream went the other direction: batch hard to S3 Standard, accept 250ms+ p50 latency, and price-optimize for high-throughput ingest. Both are doing the best they can with the S3 write path. Neither shape fits "one durable HTTP stream per resource" with low-millisecond appends.
+
+Ursula sidesteps the S3 write-path trade-off by not putting S3 in the write path at all. Writes go to a Raft-replicated in-memory hot ring on the cluster's nodes. They are acknowledged after a majority of voters has persisted the entry, so a single node failure cannot lose an acknowledged write. Only later does a background flusher carry chunks to S3 for long-tail durability. From the client's perspective, every read works the same way: catch-up, long-poll, or SSE. Offsets are stable. The hot-to-cold boundary is invisible.
+
+## The implementation choices that matter
+
+Ursula's distinguishing implementation choices are deliberate, and they fall into three buckets.
+
+**Thread-per-core shard ownership.** Each node binds work to a fixed number of cores. Every stream is statically hashed to one specific core. The owner core handles all reads and writes for the streams placed on it, in order, with no cross-core synchronization on the hot path. This is the same architectural idea that Redpanda inherited from Seastar - the difference is that Ursula runs many small Raft groups per core on a `tokio::current_thread` runtime rather than strictly one per reactor. Group count can be tuned independently of core count.
+
+**Multi-Raft.** Instead of one Raft log for the whole node, Ursula runs hundreds to thousands of small Raft groups. Each stream is hashed to a group, each group is pinned to a core. Replication and leadership are per-group, so an unhealthy follower for one group does not stall traffic for another. Aggregate write throughput scales with the number of healthy cores across the cluster, not with the bandwidth of a single Raft leader.
+
+**Replaceable group engine.** A `GroupEngine` trait sits between the runtime and the group's storage / replication strategy. Three implementations ship today (in-memory non-replicated, OpenRaft over an in-memory log, OpenRaft over a per-group WAL plus per-core journal). This is what lets the same runtime route a request through any of those backends without changing client-facing semantics.
+
+We scope Ursula's API smaller than a message broker. There are no topics, partitions, or consumer groups. The primitive is one independently-addressable timeline per application resource: a document, a session, an agent run, a workflow execution. If you want pipeline-grade event distribution with consumer groups, you want Kafka or Redpanda. That is not what Ursula is for.
+
+## Why we are building this now
+
+A year ago, most applications could get away without a durable timeline. State lived in a database. Updates happened through polling or webhooks. If something got lost in transit, the user refreshed the page. That world is over for at least three categories.
+
+**AI agents.** When an agent takes a tool call on the user's behalf, other agents and the user both need to see it immediately and be able to replay the full history later. Traditional request-response APIs do not support subscribing to a feed of changes. WebSockets are real-time but ephemeral. They do not survive disconnects. What agents need is something in between: a persistent, ordered log they can write to and read from, ideally over a protocol they already understand. HTTP and SSE fit that bill exactly.
+
+**Collaborative apps.** The Notion/Figma model, where multiple users see each other's changes in real time, is now the default expectation for any tool involving shared state. Every team building one ends up assembling its own sync layer on top of WebSockets, CRDTs, or message queues. A durable stream is the primitive that makes those layers simpler: a single source of truth that supports both catch-up and live-tail.
+
+**Local-first software.** Apps that work offline and reconcile when reconnected need a backend that doesn't get in the way. Strong eventual consistency is the property. Per-document append-only logs are the shape. Object storage isn't ergonomic here. A broker is overkill. A per-document HTTP stream is exactly what the application model wants.
+
+These three categories share a primitive. They have been quietly converging on the same shape for the last 18 months. The Durable Streams Protocol is the formal name for it. If you have already built one of these by hand and would rather not do it again, Ursula is what to reach for.
+
+## Why Tonbo and Loro built this together
+
+[Loro](https://loro.dev/) builds CRDTs. Anyone shipping on top of Loro hits the same next question: *where does this CRDT actually live?* The library computes the merged state. Something else has to durably store the operations, serve them back when clients reconnect, and let new participants catch up.
+
+For a while the answer was "build your own backend, probably on S3, with some glue." That works for prototypes, not for a serious product. The Durable Streams Protocol is the right interface for the timeline a CRDT needs. What was missing was a distributed implementation.
+
+[Tonbo](https://tonbo.io/) builds data infrastructure for AI agents. The team's current product is [Sessions](https://sessions.tonbo.io/), a durable substrate for agent conversations and tool-call histories that lives outside the context window, so an agent's trajectory can be replayed, branched, and audited independently of any single sandbox or harness ([Ghost Outside the Shell](https://sessions.tonbo.io/blogs/ghost-outside-the-shell) goes into the framing). Sessions, like CRDT documents, are per-resource append-only timelines that need quorum-grade durability, low-latency appends, and live-tail readers.
+
+When the two teams compared notes, the primitive was identical. We had both ended up needing a Raft-replicated, HTTP-addressable, distributed implementation of Durable Streams, and we had both started independently sketching what it would look like. Rather than build it twice, we decided to build it once, together, and put it under an open protocol that neither team controls.
+
+## Where Ursula is today
+
+Ursula is at `v0.x`. The protocol surface is the asset we're committing to. The on-disk format and many of the operational details are still moving. Concrete near-term goals tracked in the repository's `docs/migration/` folder:
+
+1. **CPU saturation under `perf_compare`.** The migration target is to drive a node's available cores to full utilization on the [perf_compare write and mixed workloads](https://github.com/opendurability/ursula/blob/main/docs/migration/perf-compare-cpu-saturation.md). The prior implementation (`riverrun`) plateaus at three to four busy cores. Ursula's thread-per-core design exists to break that plateau.
+2. **Cold offload off the actor turn.** The read path computes a `StreamReadPlan` under the Raft state-machine lock and then offloads payload materialization (including S3 range reads) to a spawned task, so a slow cold fetch does not block other commands waiting on the same group. This is now landed.
+3. **Actor-purified watcher registry.** SSE watchers live inside the owning group actor, mutated only inside that actor's turn - no `Mutex`, no `.await` while holding any lock. This is now landed.
+4. **Bucket-level CRUD, on-disk format stability, and an explicit `v1.0` surface freeze.** Bucket existence is currently implicit. Bucket `GET` / `DELETE` and stream listing are part of the protocol but not yet implemented in Ursula. The full set of protocol gaps is tracked under `docs/migration/official-conformance.md`.
+
+We are intentionally publishing the protocol surface and runtime architecture earlier than the format guarantees. If your project pins to the HTTP and SSE surfaces, you're on stable ground. If you build directly against the WAL or Raft log on disk, expect those to change.
+
+## Try it
+
+Ursula is at [opendurability/ursula](https://github.com/opendurability/ursula), Apache-2.0. A `git clone` and a `cargo build -p ursula-http` puts a single node on your laptop in minutes. The [quick start](/docs/quick-start) walks through the first few curl commands, and [deploy a cluster](/docs/deploy-cluster) covers the three-voter shape when you're ready.
+
+If you are running CRDT, agent, or workflow workloads against durable-timeline infrastructure you wish you did not have to maintain, tell us what is in the way. [Open an issue](https://github.com/opendurability/ursula/issues) with the shape of your stack, what is not working in it, and what would have to be true for Ursula to replace the part you are tired of owning. We read every one.
+
+This is the start of the project, not the end. Come build it with us.
+
+The Tonbo & Loro teams
