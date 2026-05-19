@@ -193,11 +193,10 @@ async fn run_subscriber(
         let mut last_event_at = Instant::now();
         loop {
             let dl = deadline.get().copied();
-            if let Some(end) = dl {
-                if Instant::now() >= end + Duration::from_secs(2) {
+            if let Some(end) = dl
+                && Instant::now() >= end + Duration::from_secs(2) {
                     break;
                 }
-            }
             let to = match dl {
                 Some(end) => end.saturating_duration_since(Instant::now()) + Duration::from_secs(2),
                 None => idle,
@@ -217,8 +216,8 @@ async fn run_subscriber(
             buf.extend_from_slice(&chunk);
             while let Some(idx) = find_event_end(&buf) {
                 let raw = buf.split_to(idx + 2).freeze();
-                if let Some(payload) = parse_sse_data(&raw) {
-                    if let Some(sent_ns) = extract_send_ns(&payload) {
+                if let Some(payload) = parse_sse_data(&raw)
+                    && let Some(sent_ns) = extract_send_ns(&payload) {
                         let now_ns = unix_nanos_now();
                         let lat_ns = now_ns.saturating_sub(sent_ns);
                         let us_u128 = lat_ns / 1000;
@@ -229,7 +228,6 @@ async fn run_subscriber(
                         recv.fetch_add(1, Ordering::Relaxed);
                         last_event_at = Instant::now();
                     }
-                }
             }
         }
         Ok(())
