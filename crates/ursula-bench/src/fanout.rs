@@ -71,7 +71,13 @@ pub struct FanOutResult {
 
 pub async fn run(args: FanOutArgs) -> Result<FanOutResult> {
     let client = build_client(args.request_timeout_secs)?;
-    let backend = Backend::new(args.api_style, &args.target, &args.bucket, &args.basin, client);
+    let backend = Backend::new(
+        args.api_style,
+        &args.target,
+        &args.bucket,
+        &args.basin,
+        client,
+    );
     let stream = args.stream.clone();
 
     backend.ensure_namespace().await?;
@@ -115,7 +121,14 @@ pub async fn run(args: FanOutArgs) -> Result<FanOutResult> {
         let start = Instant::now();
         let dl = start + Duration::from_secs(writer_duration);
         let _ = deadline_setter.set(dl);
-        run_writer(&writer_backend, &writer_stream, writer_rate, writer_payload_size, dl).await
+        run_writer(
+            &writer_backend,
+            &writer_stream,
+            writer_rate,
+            writer_payload_size,
+            dl,
+        )
+        .await
     });
 
     let start = Instant::now();
@@ -339,14 +352,22 @@ fn parse_sse_data(raw: &[u8]) -> Option<Vec<u8>> {
     for line in raw.split(|b| *b == b'\n') {
         if line.starts_with(b"data:") {
             let rest = &line[5..];
-            let rest = if rest.starts_with(b" ") { &rest[1..] } else { rest };
+            let rest = if rest.starts_with(b" ") {
+                &rest[1..]
+            } else {
+                rest
+            };
             if !payload.is_empty() {
                 payload.push(b'\n');
             }
             payload.extend_from_slice(rest);
         }
     }
-    if payload.is_empty() { None } else { Some(payload) }
+    if payload.is_empty() {
+        None
+    } else {
+        Some(payload)
+    }
 }
 
 fn unix_nanos_now() -> u128 {

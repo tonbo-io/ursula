@@ -136,9 +136,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_after_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_log_dir_recovers_cold_manifest_after_restart() {
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
-        eprintln!(
-            "CARGO_BIN_EXE_ursula is not set; skipping CLI durable cold restart smoke test"
-        );
+        eprintln!("CARGO_BIN_EXE_ursula is not set; skipping CLI durable cold restart smoke test");
         return;
     };
     let port = free_port();
@@ -306,9 +304,7 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
-        eprintln!(
-            "CARGO_BIN_EXE_ursula is not set; skipping CLI durable late learner smoke test"
-        );
+        eprintln!("CARGO_BIN_EXE_ursula is not set; skipping CLI durable late learner smoke test");
         return;
     };
     let ports = [free_port(), free_port(), free_port()];
@@ -758,9 +754,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_cold_manifest_after_re
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_log_dir_background_cold_flush_bounds_hot_bytes_during_writes() {
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
-        eprintln!(
-            "CARGO_BIN_EXE_ursula is not set; skipping CLI durable cold steady-state test"
-        );
+        eprintln!("CARGO_BIN_EXE_ursula is not set; skipping CLI durable cold steady-state test");
         return;
     };
     let ports = [free_port(), free_port(), free_port()];
@@ -1183,9 +1177,7 @@ fn spawn_node_with_cluster_config_and_cold_fs(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     ChildGuard {
-        child: command
-            .spawn()
-            .expect("spawn durable cold ursula node"),
+        child: command.spawn().expect("spawn durable cold ursula node"),
     }
 }
 
@@ -1271,9 +1263,7 @@ fn spawn_node_with_cluster_config_and_cold_s3(
         }
     }
     ChildGuard {
-        child: command
-            .spawn()
-            .expect("spawn durable S3 cold ursula node"),
+        child: command.spawn().expect("spawn durable S3 cold ursula node"),
     }
 }
 

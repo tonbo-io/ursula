@@ -77,7 +77,13 @@ pub struct MultiStreamResult {
 
 pub async fn run(args: MultiStreamArgs) -> Result<MultiStreamResult> {
     let client = build_client(args.request_timeout_secs)?;
-    let backend = Backend::new(args.api_style, &args.target, &args.bucket, &args.basin, client);
+    let backend = Backend::new(
+        args.api_style,
+        &args.target,
+        &args.bucket,
+        &args.basin,
+        client,
+    );
 
     tracing::info!(
         api = args.api_style.as_str(),
@@ -110,7 +116,17 @@ pub async fn run(args: MultiStreamArgs) -> Result<MultiStreamResult> {
         let producer_id = format!("bench-{idx}");
         workers.push(tokio::spawn(async move {
             run_writer(
-                backend, idx, stream, payload, producer_id, rate, deadline, ok, bp, err, hist,
+                backend,
+                idx,
+                stream,
+                payload,
+                producer_id,
+                rate,
+                deadline,
+                ok,
+                bp,
+                err,
+                hist,
             )
             .await
         }));
@@ -193,7 +209,13 @@ async fn run_writer(
             None
         };
         let resp = backend
-            .append_request(base_idx, &stream, &payload, producer, "application/octet-stream")
+            .append_request(
+                base_idx,
+                &stream,
+                &payload,
+                producer,
+                "application/octet-stream",
+            )
             .send()
             .await;
         match resp {

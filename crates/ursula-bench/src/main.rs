@@ -8,7 +8,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "ursula-bench", version, about = "Ursula real-world workload benchmark client")]
+#[command(
+    name = "ursula-bench",
+    version,
+    about = "Ursula real-world workload benchmark client"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

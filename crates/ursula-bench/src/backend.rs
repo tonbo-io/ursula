@@ -316,7 +316,9 @@ impl Backend {
     ) -> Result<()> {
         let base = self.first_base();
         let url = match self.kind {
-            ApiStyle::Ursula => format!("{base}/{}/{}/snapshot/{offset_bytes}", self.bucket, stream),
+            ApiStyle::Ursula => {
+                format!("{base}/{}/{}/snapshot/{offset_bytes}", self.bucket, stream)
+            }
             ApiStyle::Durable => format!("{base}/v1/stream/{stream}/snapshot/{offset_bytes}"),
             ApiStyle::S2 => anyhow::bail!("S2 does not have a /snapshot endpoint"),
         };

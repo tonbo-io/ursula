@@ -124,9 +124,7 @@ fn init_tokio_console_if_enabled() {
         .init();
 
     #[cfg(not(feature = "tokio-console"))]
-    eprintln!(
-        "URSULA_TOKIO_CONSOLE is set, but ursula was built without tokio-console feature"
-    );
+    eprintln!("URSULA_TOKIO_CONSOLE is set, but ursula was built without tokio-console feature");
 }
 
 #[derive(Debug)]

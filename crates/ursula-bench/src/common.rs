@@ -59,7 +59,9 @@ pub fn fill_payload(size: usize, seed: u64) -> Vec<u8> {
     let mut buf = vec![0u8; size];
     let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
     for chunk in buf.chunks_mut(8) {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let bytes = state.to_le_bytes();
         chunk.copy_from_slice(&bytes[..chunk.len()]);
     }
@@ -68,7 +70,11 @@ pub fn fill_payload(size: usize, seed: u64) -> Vec<u8> {
 
 pub async fn ensure_bucket(client: &Client, base: &str, bucket: &str) -> Result<()> {
     let url = format!("{}/{}", base.trim_end_matches('/'), bucket);
-    let resp = client.put(&url).send().await.with_context(|| format!("PUT {url}"))?;
+    let resp = client
+        .put(&url)
+        .send()
+        .await
+        .with_context(|| format!("PUT {url}"))?;
     let status = resp.status();
     if !status.is_success() {
         anyhow::bail!("PUT {url} -> {status}");
@@ -76,7 +82,13 @@ pub async fn ensure_bucket(client: &Client, base: &str, bucket: &str) -> Result<
     Ok(())
 }
 
-pub async fn create_stream(client: &Client, base: &str, bucket: &str, stream: &str, content_type: &str) -> Result<()> {
+pub async fn create_stream(
+    client: &Client,
+    base: &str,
+    bucket: &str,
+    stream: &str,
+    content_type: &str,
+) -> Result<()> {
     let url = format!("{}/{}/{}", base.trim_end_matches('/'), bucket, stream);
     let resp = client
         .put(&url)

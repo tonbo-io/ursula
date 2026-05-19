@@ -11,9 +11,7 @@ use serde::Serialize;
 use tokio::sync::{Barrier, Mutex};
 
 use crate::backend::{ApiStyle, Backend};
-use crate::common::{
-    Counts, LatencySummary, build_client, fill_payload, new_histogram, summarize,
-};
+use crate::common::{Counts, LatencySummary, build_client, fill_payload, new_histogram, summarize};
 
 #[derive(Args, Debug, Clone)]
 pub struct BootstrapArgs {
@@ -76,7 +74,13 @@ pub struct BootstrapResult {
 
 pub async fn run(args: BootstrapArgs) -> Result<BootstrapResult> {
     let client = build_client(args.request_timeout_secs)?;
-    let backend = Backend::new(args.api_style, &args.target, &args.bucket, &args.basin, client);
+    let backend = Backend::new(
+        args.api_style,
+        &args.target,
+        &args.bucket,
+        &args.basin,
+        client,
+    );
 
     backend.ensure_namespace().await?;
 
