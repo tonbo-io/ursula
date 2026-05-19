@@ -47,11 +47,11 @@ Ursula sidesteps the S3 write-path trade-off by not putting S3 in the write path
 
 Ursula's distinguishing implementation choices are deliberate, and they fall into three buckets.
 
-**Thread-per-core shard ownership.** Each node binds work to a fixed number of cores. Every stream is statically hashed to one specific core. The owner core handles all reads and writes for the streams placed on it, in order, with no cross-core synchronization on the hot path. This is the same architectural idea that Redpanda inherited from Seastar - the difference is that Ursula runs many small Raft groups per core on a `tokio::current_thread` runtime rather than strictly one per reactor. Group count can be tuned independently of core count.
+**Thread-per-core shard ownership.** Each node binds work to a fixed number of CPU cores. Every stream is statically hashed to one specific core. The owner core handles all reads and writes for the streams placed on it, in order, with no cross-core synchronization on the hot path. Redpanda uses the same shape, with one Raft group per core. Ursula co-schedules many small Raft groups per core on a single-threaded async executor, so group count can be tuned independently of core count.
 
 **Multi-Raft.** Instead of one Raft log for the whole node, Ursula runs hundreds to thousands of small Raft groups. Each stream is hashed to a group, each group is pinned to a core. Replication and leadership are per-group, so an unhealthy follower for one group does not stall traffic for another. Aggregate write throughput scales with the number of healthy cores across the cluster, not with the bandwidth of a single Raft leader.
 
-**Replaceable group engine.** A `GroupEngine` trait sits between the runtime and the group's storage / replication strategy. Three implementations ship today (in-memory non-replicated, OpenRaft over an in-memory log, OpenRaft over a per-group WAL plus per-core journal). This is what lets the same runtime route a request through any of those backends without changing client-facing semantics.
+**Replaceable group engine.** A clean seam sits between the runtime and the group's storage and replication strategy. Three engines ship today (in-memory non-replicated, Raft over an in-memory log, Raft over a per-group write-ahead log plus per-core journal). The same routing layer can run any of them without changing client-facing semantics.
 
 We scope Ursula's API smaller than a message broker. There are no topics, partitions, or consumer groups. The primitive is one independently-addressable timeline per application resource: a document, a session, an agent run, a workflow execution. If you want pipeline-grade event distribution with consumer groups, you want Kafka or Redpanda. That is not what Ursula is for.
 
@@ -63,7 +63,7 @@ A year ago, most applications could get away without a durable timeline. State l
 
 **Collaborative apps.** The Notion/Figma model, where multiple users see each other's changes in real time, is now the default expectation for any tool involving shared state. Every team building one ends up assembling its own sync layer on top of WebSockets, CRDTs, or message queues. A durable stream is the primitive that makes those layers simpler: a single source of truth that supports both catch-up and live-tail.
 
-**Local-first software.** Apps that work offline and reconcile when reconnected need a backend that doesn't get in the way. Strong eventual consistency is the property. Per-document append-only logs are the shape. Object storage isn't ergonomic here. A broker is overkill. A per-document HTTP stream is exactly what the application model wants.
+**Local-first software.** Apps that keep working offline and reconcile their changes when the network returns need a backend that doesn't get in the way. Strong eventual consistency is the property. Per-document append-only logs are the shape. Object storage isn't ergonomic here. A broker is overkill. A per-document HTTP stream is exactly what the application model wants.
 
 These three categories share a primitive. They have been quietly converging on the same shape for the last 18 months. The Durable Streams Protocol is the formal name for it. If you have already built one of these by hand and would rather not do it again, Ursula is what to reach for.
 
@@ -79,12 +79,12 @@ When the two teams compared notes, the primitive was identical. We had both ende
 
 ## Where Ursula is today
 
-Ursula is at `v0.x`. The protocol surface is the asset we're committing to. The on-disk format and many of the operational details are still moving. Concrete near-term goals tracked in the repository's `docs/migration/` folder:
+Ursula is at `v0.x`. The protocol surface is the asset we're committing to. The on-disk format and many of the operational details are still moving. Concrete near-term goals:
 
-1. **CPU saturation under `perf_compare`.** The migration target is to drive a node's available cores to full utilization on the [perf_compare write and mixed workloads](https://github.com/tonbo-io/ursula/blob/main/docs/migration/perf-compare-cpu-saturation.md). The prior implementation (`riverrun`) plateaus at three to four busy cores. Ursula's thread-per-core design exists to break that plateau.
-2. **Cold offload off the actor turn.** The read path computes a `StreamReadPlan` under the Raft state-machine lock and then offloads payload materialization (including S3 range reads) to a spawned task, so a slow cold fetch does not block other commands waiting on the same group. This is now landed.
-3. **Actor-purified watcher registry.** SSE watchers live inside the owning group actor, mutated only inside that actor's turn - no `Mutex`, no `.await` while holding any lock. This is now landed.
-4. **Bucket-level CRUD, on-disk format stability, and an explicit `v1.0` surface freeze.** Bucket existence is currently implicit. Bucket `GET` / `DELETE` and stream listing are part of the protocol but not yet implemented in Ursula. The full set of protocol gaps is tracked under `docs/migration/official-conformance.md`.
+1. **CPU saturation under load.** Drive a node's available cores to full utilization on the write and mixed workloads in our [benchmark suite](/benchmark). The thread-per-core design exists to break the few-busy-cores plateau that conventional single-leader implementations hit.
+2. **Cold offload off the actor turn.** The read path computes a small plan under the Raft state-machine lock and then offloads payload materialization (including S3 range reads) to a separately spawned task, so a slow cold fetch does not block other commands waiting on the same group. Landed.
+3. **Lock-free watcher registry.** SSE watchers live inside the owning group actor and are mutated only inside that actor's turn, with no mutex and no awaiting while holding a lock. Landed.
+4. **Bucket-level CRUD, on-disk format stability, and an explicit `v1.0` surface freeze.** Bucket existence is currently implicit. Bucket `GET` / `DELETE` and stream listing are part of the protocol but not yet implemented in Ursula. Tracked publicly on the [GitHub issues board](https://github.com/tonbo-io/ursula/issues).
 
 We are intentionally publishing the protocol surface and runtime architecture earlier than the format guarantees. If your project pins to the HTTP and SSE surfaces, you're on stable ground. If you build directly against the WAL or Raft log on disk, expect those to change.
 

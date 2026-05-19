@@ -762,9 +762,8 @@ function BenchmarkPage() {
           <header>
             <h1>OSS HTTP Streams Benchmark</h1>
             <p className="benchmark-lead">
-              A focused EC2 comparison of Ursula, Durable Streams, and S2 Lite
-              across multi-stream writes, catch-up replay, and SSE live tail.
-              All backends driven by <code>crates/ursula-bench</code>.
+              A comparison of Ursula, Durable Streams, and S2 Lite across
+              multi-stream writes, catch-up replay, and SSE live tail.
             </p>
           </header>
           <aside className="benchmark-scoreboard" aria-label="Headline gaps">

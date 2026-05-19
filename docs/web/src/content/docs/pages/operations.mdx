@@ -1,31 +1,17 @@
 ---
 title: Operations
-description: Day-2 surface for Ursula - metrics, snapshots, cold flushes, and the EC2 helper.
+description: Day-2 surface for Ursula, covering metrics, snapshots, cold flushes, and the EC2 helper.
 ---
 
-Ursula's day-2 surface is intentionally narrow today. There is no orchestrator, no `ursulactl`, and no Prometheus scrape endpoint. Operating a cluster means three things:
-
-1. JSON metrics on every node
-2. A small set of admin HTTP endpoints under `/__ursula/`
-3. `scripts/ursula_ec2.py` for the EC2 deployment loop
+Operating Ursula today comes down to three things: JSON metrics, a small admin surface under `/__ursula/`, and `scripts/ursula_ec2.py` for the EC2 loop. There is no orchestrator, no `ursulactl`, no Prometheus scrape.
 
 ## Metrics
-
-Every node exposes runtime state as JSON:
 
 ```bash
 curl http://127.0.0.1:4437/__ursula/metrics | jq .
 ```
 
-The snapshot includes:
-
-- Per-core mailbox depth, append/read counts, latency histograms
-- Per-Raft-group leader info, last-applied index, hot/cold bytes, cold-flush backlog
-- HTTP request counters (status, method, route)
-- Live-read watcher counts and backpressure events
-- Cold-write admission state (the gate that returns `503` to clients when a group's hot ring fills up)
-
-This is the right starting point when triaging slowness, lag, or `503`s.
+The JSON snapshot covers per-core mailbox depth, append/read counters, latency histograms, per-group leader and `last_applied`, hot/cold bytes, cold-flush backlog, HTTP status counters, live-read watchers, and cold-write admission state. Start here when triaging slowness, lag, or `503`s.
 
 ## Admin endpoints
 
@@ -43,11 +29,11 @@ curl -X POST http://127.0.0.1:4437/__ursula/raft/42/purge
 curl -X POST http://127.0.0.1:4437/__ursula/raft/42/learners/4
 ```
 
-These run against the local node only. There is no cluster-wide fan-out today. To do something on every group you'd loop over the group IDs returned by metrics.
+Local-node only, with no cluster fan-out. To act on every group, loop over the IDs in metrics.
 
 ## EC2 helper
 
-For static multi-node clusters on EC2, `scripts/ursula_ec2.py` automates the common ops loop driven by a JSON manifest (instance IDs, IPs, port, binary path, cold env, peer list).
+`scripts/ursula_ec2.py` drives a static EC2 manifest (instance IDs, IPs, port, binary path, cold env, peer list).
 
 ```bash
 # Push a fresh binary to every server in the manifest
@@ -64,14 +50,12 @@ python3 scripts/ursula_ec2.py --config cluster.json status
 # Stop the cluster (kills the pid recorded in the configured pid file)
 python3 scripts/ursula_ec2.py --config cluster.json stop
 
-# Run perf_compare against the cluster from the configured client host
+# Drive the benchmark workload from the configured client host
 python3 scripts/ursula_ec2.py --config cluster.json perf-many \
   --processes 4 --bucket-prefix benchcmp-mp
 ```
 
-`perf-many` rotates Ursula entrypoints across configured service nodes by default; use `--target-mode first` only when reproducing a single-ingress-node run.
-
-`stop` deliberately kills only the recorded PID - it does not `pkill`, because broad patterns can match the SSH command performing the cleanup. If a node's pid file is stale, kill the process by hand.
+`perf-many` rotates entrypoints across service nodes by default; use `--target-mode first` only to reproduce a single-ingress run. `stop` kills only the recorded PID rather than running `pkill`, because broad patterns can match the SSH cleanup command itself. If a pid file is stale, kill by hand.
 
 ## Cleaning S3
 
@@ -80,41 +64,37 @@ python3 scripts/ursula_ec2.py --config cluster.json cleanup-s3 \
   --root ursula-test-20260518T000000Z
 ```
 
-Deletes everything under one `URSULA_COLD_ROOT` prefix in the bucket from the manifest. Run this after benchmark sweeps to keep the cold bucket tidy.
+Deletes everything under one `URSULA_COLD_ROOT` prefix in the manifest's bucket. Run after benchmark sweeps.
 
 ## Backup and disaster recovery
 
 <Warning>
-Ursula does not provide a backup or restore tool. There is no `--export` flag, no cluster-state dump, and no "restore from snapshot file" command. Plan recovery accordingly.
+Ursula has no backup or restore tool: no `--export`, no cluster dump, no "restore from snapshot file". Plan recovery accordingly.
 </Warning>
 
 What you can rely on:
 
-- **Quorum durability.** Acknowledged writes are durable as long as a majority of voters survives. With three voters across AZs, any single-AZ outage is recoverable.
-- **Cold-tier durability.** Once a chunk has been flushed to S3, it inherits S3-grade durability. The window of acknowledged-but-unflushed data is bounded by the configured flush interval (defaults to seconds).
-- **No on-disk migration.** Ursula is `v0.x`. On-disk formats are not promised stable across versions. The runtime will not refuse to start on stale data, but it also will not migrate anything. Cross-version upgrades currently mean rebuild + replay from external truth.
+- **Quorum durability.** Acknowledged writes survive as long as a majority of voters survives. Three voters across AZs tolerate any single-AZ outage.
+- **Cold-tier durability.** Once flushed to S3, a chunk inherits S3-grade durability. The unflushed window is bounded by the flush interval (seconds by default).
+- **No on-disk migration.** `v0.x` does not promise stable on-disk formats. The runtime won't refuse to start on stale data, but it won't migrate either. Cross-version upgrades currently mean rebuild + replay from external truth.
 
-For node-level loss: replace the host, give it the same `node_id` and cluster config, and start it back. It will rehydrate from the cluster.
-
-For total-cluster loss: the durable data on S3 is what you have. There is no tooling to materialize a fresh cluster from those objects yet. Treat full loss as needing a bespoke recovery procedure.
+Node-level loss: replace the host with the same `node_id` and cluster config; it rehydrates from peers. Total-cluster loss: the durable data on S3 is what you have, and there is no tooling yet to materialize a fresh cluster from those objects.
 
 ## Rolling restart (manual)
 
-There is no leader-transfer endpoint and no orchestrator. The pragmatic flow:
-
 1. Identify the leader from `/__ursula/metrics`.
-2. Restart a follower. Wait for its metrics to show it's caught up.
+2. Restart a follower; wait for its metrics to show it caught up.
 3. Repeat for the other follower.
-4. Restart the leader last. Raft will elect a new leader during the gap.
+4. Restart the leader last. Raft elects a new one during the gap.
 
-Plan for a short write-latency spike during the leader restart window. There is no zero-downtime path today.
+Expect a brief write-latency spike during the leader restart. No zero-downtime path today.
 
 ## Logs
 
-`RUST_LOG=ursula=info,ursula_runtime=info,ursula_raft=info` is the suggested baseline. Bump to `debug` for one of the crates when chasing a specific subsystem:
+`RUST_LOG=ursula=info,ursula_runtime=info,ursula_raft=info` is the baseline. Bump to `debug` for one crate when chasing a subsystem:
 
 ```bash
 RUST_LOG=ursula_raft=debug ./target/release/ursula ...
 ```
 
-`debug` is verbose. Redirect to a file under sustained load.
+`debug` is verbose under sustained load; redirect to a file.

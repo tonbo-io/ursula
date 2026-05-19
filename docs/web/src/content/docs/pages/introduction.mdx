@@ -10,17 +10,14 @@ Ursula is built by <a href="https://tonbo.io/" target="_blank" rel="noopener nor
 
 Ursula is an open-source implementation of the [Durable Streams Protocol](/docs/specs/durable-stream): URL-addressable, append-only byte streams that can be replayed, resumed, and tailed with plain HTTP.
 
-Run it as a single in-memory or WAL-backed node for local development, or as a static-membership Raft cluster for replicated writes, transparent leader forwarding, snapshot publication, and S3-backed cold storage.
+Ursula stores stream data directly on S3, with quorum-replicated in-memory front-ends giving you single-digit-millisecond appends and live tail on top of object-store durability, with no separate broker, no batched 250 ms commits, and no S3 Express bill.
 
 ## What it is
 
-**HTTP-native streams.** `PUT` creates buckets and streams, `POST` appends bytes, and `GET` reads from an offset or tails live with long-poll/SSE.
-
-**One timeline per resource.** Give each document, session, workflow, room, or agent run its own durable stream.
-
-**Distributed serving.** Ursula adds per-group Raft replication, leader-only reads with transparent follower forwarding, snapshot publication, and cold offload to S3 around the Durable Streams primitive.
-
-**Thread-per-core.** Streams are statically hashed to a Raft group, and each group is pinned to a specific core. Hot-path requests touch the owner core only. Cross-core synchronization is avoided by construction. See [architecture overview](/docs/architecture/overview) for the full layout.
+- **HTTP-native.** `PUT` creates, `POST` appends, `GET` replays or tails with long-poll/SSE. Any HTTP client is a valid client.
+- **One timeline per resource.** A stream per document, session, workflow, room, or agent run, instead of a few high-throughput pipelines.
+- **Thread-per-core × multi-Raft.** Each stream hashes to one Raft group and one owner core. Hot-path requests touch that core only, with no cross-core synchronization. Hundreds to thousands of small groups co-exist per node, so a slow follower for one group never stalls another.
+- **Hot ring + S3 cold tier.** Writes commit at Raft quorum in an in-memory ring. Older segments flush to S3 in the background. A single `GET` transparently spans both tiers.
 
 ## Run locally
 
@@ -49,9 +46,6 @@ curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
 
 ## Learn more
 
-- **[Quick Start](/docs/quick-start):** step-by-step walkthrough with WAL and SSE
-- **[Why Ursula](/docs/why-ursula):** the design intent and current trade-offs
-- **[Concepts](/docs/concepts/streams):** streams, buckets, offsets, read modes, snapshots
+- **[Why Ursula](/docs/why-ursula):** the per-entity timeline model and what it replaces
 - **[Architecture](/docs/architecture/overview):** thread-per-core, multi-Raft, hot/cold tiers
-- **[API Reference](/docs/api/overview):** the HTTP routes Ursula currently implements
-- **[Protocol Spec](/docs/specs/durable-stream):** the Durable Streams Protocol plus [Ursula's extensions](/docs/specs/extensions)
+- **[Protocol Spec](/docs/specs/durable-stream):** Durable Streams plus [Ursula's extensions](/docs/specs/extensions)
