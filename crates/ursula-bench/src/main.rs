@@ -16,11 +16,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Multi-stream concurrent write — proves multi-Raft sharding scales with stream count.
+    /// Multi-stream concurrent write - proves multi-Raft sharding scales with stream count.
     MultiStream(multi_stream::MultiStreamArgs),
-    /// SSE fan-out — single stream, many subscribers, measure per-event end-to-end latency.
+    /// SSE fan-out - single stream, many subscribers, measure per-event end-to-end latency.
     FanOut(fanout::FanOutArgs),
-    /// Bootstrap stampede — N clients hit /bootstrap simultaneously after a snapshot.
+    /// Bootstrap stampede - N clients hit /bootstrap simultaneously after a snapshot.
     Bootstrap(bootstrap::BootstrapArgs),
 }
 

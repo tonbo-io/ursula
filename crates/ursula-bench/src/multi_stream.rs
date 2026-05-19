@@ -24,7 +24,7 @@ pub struct MultiStreamArgs {
     #[arg(long, value_enum, default_value_t = ApiStyle::Ursula)]
     pub api_style: ApiStyle,
 
-    /// Bucket name (Ursula only — ignored by Durable / S2).
+    /// Bucket name (Ursula only - ignored by Durable / S2).
     #[arg(long, default_value = "bench-multistream")]
     pub bucket: String,
 

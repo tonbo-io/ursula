@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 description = "Ursula durable-stream server: thread-per-core, multi-Raft, HTTP front door."
 
 [features]

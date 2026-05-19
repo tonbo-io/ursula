@@ -57,7 +57,7 @@ function DocsTableOfContents({ contentRef }: DocsTableOfContentsProps) {
           return;
         }
 
-        // No heading intersecting the active region — fall back to the last one
+        // No heading intersecting the active region - fall back to the last one
         // whose top has already scrolled past the active band.
         const scrolledPast = entries
           .filter((entry) => entry.boundingClientRect.top < 0)

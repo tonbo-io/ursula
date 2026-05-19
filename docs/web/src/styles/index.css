@@ -447,7 +447,7 @@ button {
   flex-direction: column;
   min-height: 100vh;
   /* `clip` instead of `hidden` so this wrapper doesn't establish a scroll
-     container — `overflow-x: hidden` silently breaks `position: sticky` on
+     container - `overflow-x: hidden` silently breaks `position: sticky` on
      the docs sidebar + TOC. */
   overflow-x: clip;
   position: relative;
@@ -4838,7 +4838,7 @@ a.docs-card:focus-visible {
 }
 
 /* ============================================================
-   CodeGroup — tabbed code blocks (artifacts addition)
+   CodeGroup - tabbed code blocks (artifacts addition)
    ============================================================ */
 
 .docs-code-group {
@@ -4890,7 +4890,7 @@ a.docs-card:focus-visible {
 }
 
 /* ============================================================
-   Accordion — collapsible Q&A blocks (artifacts addition)
+   Accordion - collapsible Q&A blocks (artifacts addition)
    ============================================================ */
 
 .docs-accordion-group {

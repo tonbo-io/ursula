@@ -2866,7 +2866,7 @@ dependencies = [
 
 [[package]]
 name = "ursula"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum 0.8.9",
  "base64 0.22.1",
@@ -2887,7 +2887,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-bench"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2906,7 +2906,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "prost 0.13.5",
  "prost-build",
@@ -2916,7 +2916,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-raft"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-util",
  "openraft",
@@ -2935,7 +2935,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "opendal",
@@ -2948,7 +2948,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-shard"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "ursula-proto",
@@ -2956,7 +2956,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-stream"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",

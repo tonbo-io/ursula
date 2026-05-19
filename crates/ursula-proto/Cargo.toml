@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 description = "Shared protobuf schema types for Ursula durable stream semantics."
 
 [dependencies]

@@ -31,13 +31,13 @@ type MdxModule = {
 const docsModules = import.meta.glob<MdxModule>("./pages/**/*.mdx", { eager: true });
 
 const pageOrder: Record<string, { group: string; order: number; title?: string }> = {
-  // Getting Started — orient, try, decide, call.
+  // Getting Started - orient, try, decide, call.
   introduction: { group: "Getting Started", order: 1, title: "Introduction" },
   "quick-start": { group: "Getting Started", order: 2 },
   "why-ursula": { group: "Getting Started", order: 3 },
   clients: { group: "Getting Started", order: 4 },
 
-  // Concepts — encounter order: primitive, organization, reading, writing, long-stream, transport.
+  // Concepts - encounter order: primitive, organization, reading, writing, long-stream, transport.
   "concepts/streams": { group: "Concepts", order: 1 },
   "concepts/buckets": { group: "Concepts", order: 2 },
   "concepts/offsets": { group: "Concepts", order: 3 },
@@ -50,7 +50,7 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   "concepts/binary-sse": { group: "Concepts", order: 10 },
   "concepts/len-prefixed-framing": { group: "Concepts", order: 11 },
 
-  // API Reference — typical call order: setup, hot path, snapshots/bootstrap, lifecycle, compatibility.
+  // API Reference - typical call order: setup, hot path, snapshots/bootstrap, lifecycle, compatibility.
   "api/overview": { group: "API Reference", order: 1 },
   "api/create-bucket": { group: "API Reference", order: 2 },
   "api/create-stream": { group: "API Reference", order: 3 },
@@ -63,7 +63,7 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   "api/delete-stream": { group: "API Reference", order: 10 },
   "api/v1-compatibility": { group: "API Reference", order: 11 },
 
-  // Install & Deploy — deploy then operate.
+  // Install & Deploy - deploy then operate.
   install: { group: "Install & Deploy", order: 1 },
   "run-locally": { group: "Install & Deploy", order: 2 },
   configuration: { group: "Install & Deploy", order: 3 },
@@ -73,14 +73,14 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   operations: { group: "Install & Deploy", order: 7 },
   troubleshooting: { group: "Install & Deploy", order: 8 },
 
-  // Architecture — internals for users who want to dig deeper.
+  // Architecture - internals for users who want to dig deeper.
   "architecture/overview": { group: "Architecture", order: 1 },
 
-  // Protocol Specification — for protocol implementers.
+  // Protocol Specification - for protocol implementers.
   "specs/durable-stream": { group: "Protocol Specification", order: 1 },
   "specs/extensions": { group: "Protocol Specification", order: 2 },
 
-  // Comparisons — positioning.
+  // Comparisons - positioning.
   "competitive-comparison": { group: "Comparisons", order: 1 },
 };
 

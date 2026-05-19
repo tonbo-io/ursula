@@ -1,74 +1,74 @@
 # Ursula
 
-Ursula is the clean migration workspace for a thread-per-core, multi-Raft durable stream runtime.
+[![Crates.io](https://img.shields.io/crates/v/ursula.svg)](https://crates.io/crates/ursula)
+[![Documentation](https://docs.rs/ursula/badge.svg)](https://docs.rs/ursula)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-This repository starts as an architecture and scaffolding project. The migration target is not a direct line-by-line port of `riverrun`; the first milestone is to establish shard ownership, routing, runtime boundaries, and Raft-group placement before moving HTTP, storage, and protocol handlers.
+📖 Docs: **[ursula.tonbo.io](https://ursula.tonbo.io)**
 
-## Current Scope
+## What
 
-- Thread-per-core shard ownership model.
-- Multi-Raft placement and stream-to-group routing primitives.
-- Pure Durable Streams state-machine semantics for core bucket/stream lifecycle and catch-up read rules.
-- Thread-per-core and hosted-Tokio shard actor modes for validating ownership and metrics.
-- Replaceable group-engine boundary using the stream state machine, ready for a future OpenRaft adapter.
-- Optional per-Raft-group WAL/recovery prototype for exercising the same HTTP path with local persistence.
-- Minimal HTTP adapter for the `perf_compare`
-  create/append/read/head/SSE/mixed subset and runtime metrics inspection.
-- Runtime ecosystem evaluation, especially Tokio/axum versus monoio tradeoffs.
-- Migration notes from the existing `riverrun` implementation.
-- Benchmark-driven CPU saturation target for `perf_compare`.
+Ursula is a thread-per-core, multi-Raft server for the [Durable Streams Protocol](https://github.com/durable-streams/durable-streams): distributed, HTTP-native, append-only byte streams with quorum-replicated writes and optional S3-backed cold storage.
 
-## Commands
+## Why
 
-```bash
-just build
-just test
-just fmt-check
-just clippy
-```
+Every modern app produces a timeline: document edits, agent runs, workflow steps, collaborative strokes. The shape is always the same: ordered, append-only, replayable, live-tailable. There is no shared infrastructure for it. Teams keep rebuilding it on databases, brokers, or object stores, each time with the same recovery edge cases.
 
-Run the current HTTP prototype:
+The [Durable Streams Protocol](https://github.com/durable-streams/durable-streams) is the right primitive: small, HTTP-native, no required client library. But its reference server runs as a single process, so a node loss is data loss. The alternatives we evaluated each force you to give up one of three things this primitive deserves to keep:
 
-```bash
-cargo run -p ursula --bin ursula -- \
-  --listen 127.0.0.1:4437 \
-  --core-count 8 \
-  --raft-group-count 128
-```
+- **Open-source self-hosting.**
+- **Low write latency** (sub-50 ms appends without paying S3 Express prices or batching to 250 ms+).
+- **Quorum-replicated durability** (acknowledged writes survive a single-node failure).
 
-Run the same HTTP prototype with the WAL-backed group engine:
+Ursula is what it looks like to keep all three. Clients see the same URLs, headers, and SSE format the protocol specifies. Three or five nodes underneath act as one durable-streams server, with:
+
+- Per-group Raft replication, leader-serialized appends, transparent follower forwarding.
+- An in-memory hot ring on the write path so appends commit in low milliseconds. A background flusher carries chunks to S3 for long-tail durability. S3 is never in the hot path.
+- Thread-per-core, multi-Raft placement so aggregate throughput scales with the number of healthy cores across the cluster, not with the bandwidth of a single Raft leader.
+
+Full design intent: [Why Ursula](https://ursula.tonbo.io/docs/why-ursula) · [Architecture overview](https://ursula.tonbo.io/docs/architecture/overview).
+
+## How
+
+Run a single in-memory node (no persistence, good for kicking the tires):
 
 ```bash
 cargo run -p ursula --bin ursula -- \
   --listen 127.0.0.1:4437 \
-  --core-count 8 \
-  --raft-group-count 128 \
-  --wal-dir ./data/wal
-```
-
-Run the HTTP prototype through OpenRaft with an in-memory Raft log store:
-
-```bash
-cargo run -p ursula --bin ursula -- \
-  --listen 127.0.0.1:4437 \
-  --core-count 8 \
-  --raft-group-count 128 \
+  --core-count 4 \
+  --raft-group-count 64 \
   --raft-memory
 ```
 
-## Performance Target
+Create a bucket and stream, append bytes, read them back:
 
-The migration is successful only when Ursula can use the available CPU under
-`perf_compare` write and mixed workloads. The current `riverrun` implementation
-is known to plateau at roughly three to four busy cores, which indicates a
-global serialization point or shared contention. See
-`docs/migration/perf-compare-cpu-saturation.md` for the acceptance gate.
+```bash
+curl -X PUT http://127.0.0.1:4437/demo
+curl -X PUT http://127.0.0.1:4437/demo/hello
 
-## EC2 Operations Helper
+curl -X POST http://127.0.0.1:4437/demo/hello \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary 'hello world'
 
-The migration EC2 deployment loop is captured in `scripts/ursula_ec2.py` instead
-of one-off shell snippets. It can start/stop a static multi-Raft cluster, wait
-for group leaders, inspect metrics, run a configured `perf_compare` client, and
-clean an S3 cold-root prefix from a JSON manifest.
+curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
+```
 
-See `docs/operations/ec2-static-cluster.md` for the manifest shape and commands.
+Walkthroughs: [Quick Start](https://ursula.tonbo.io/docs/quick-start) · [Deploy a cluster](https://ursula.tonbo.io/docs/deploy-cluster) · [Configure S3](https://ursula.tonbo.io/docs/configure-s3).
+
+## Next steps
+
+The `v0.1.x` line is a working prototype. The roadmap from here:
+
+- **`if-match` conditional append.** Optimistic concurrency control on the append path. An `if-match: <offset>` header lets a writer commit only when the stream tip hasn't moved, so concurrent writers can coordinate without an external lock. Already implemented in `riverrun`, and the same semantics need to land in Ursula's HTTP adapter and Raft state machine.
+- **WASM stateless compute extension.** Implement the [Durable Streams WASM compute extension](https://github.com/durable-streams/durable-streams): bind a deterministic WASM module to a stream and let the server materialize per-stream state, enabling automatic compaction and `410 Gone` bootstrap recovery without application-side checkpointing.
+- **Dynamic membership.** Online voter / learner reconfiguration and orchestrated rolling membership changes (today's clusters are static).
+- **Backup and restore tooling.** A supported recovery path for total-cluster loss from the S3 cold tier (today there is none).
+- **Client SDKs.** Ergonomic Rust and TypeScript clients on top of the HTTP API.
+
+Current status across every checklist item: [final goal audit](docs/migration/final-goal-audit.md).
+
+## License
+
+Apache 2.0. See [LICENSE](LICENSE).
+
+Built by [Tonbo](https://tonbo.io/).

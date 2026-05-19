@@ -11,17 +11,19 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["The Ursula contributors"]
 repository = "https://github.com/tonbo-io/ursula"
+homepage = "https://ursula.tonbo.io"
+readme = "README.md"
 keywords = ["durable-streams", "raft", "thread-per-core", "multi-raft"]
 categories = ["database-implementations", "network-programming"]
 
 # NOTE: experimented with `lto = "fat"` and `lto = "thin"` + codegen-units = 1.
 # On the c7g benchmark cluster (3 × c7g.4xlarge, 256 B append workload),
-# write throughput regressed 10–13% at peak with either LTO setting — likely
+# write throughput regressed 10–13% at peak with either LTO setting - likely
 # loss of icache locality on tokio's deep async call paths. Replay (large
 # body, contiguous code) did benefit, but the write-path regression
 # dominated. Kept default profile until we have a profile-guided build.

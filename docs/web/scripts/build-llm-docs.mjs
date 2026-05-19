@@ -1,7 +1,7 @@
 // Generates agent-friendly endpoints from the source MDX:
-//   dist/docs/<slug>.md   — per-page raw markdown
-//   dist/llms.txt         — index with summaries
-//   dist/llms-full.txt    — every page concatenated
+//   dist/docs/<slug>.md   - per-page raw markdown
+//   dist/llms.txt         - index with summaries
+//   dist/llms-full.txt    - every page concatenated
 //
 // Runs after `vite build` in webpages/package.json. The transform unwraps
 // the JSX components we use (Card / CardGroup / Steps / Step / Note / Tip /
@@ -138,8 +138,8 @@ function transformMdxToMarkdown(body) {
       `${indent}**${title}**\n\n${indent}\`\`\`${lang}\n`,
   );
 
-  // <Card title="X" href="Y">Z</Card>  →  - [**X**](Y) — Z
-  // <Card title="X">Z</Card>            →  - **X** — Z
+  // <Card title="X" href="Y">Z</Card>  →  - [**X**](Y) - Z
+  // <Card title="X">Z</Card>            →  - **X** - Z
   // Eat any leading horizontal whitespace on the line so siblings inside a
   // CardGroup (which are 2-space-indented in the MDX source for legibility)
   // don't render as a nested markdown list.
@@ -152,7 +152,7 @@ function transformMdxToMarkdown(body) {
       const href = hrefMatch ? hrefMatch[1] : null;
       const compactInner = inner.trim().replace(/\s+\n\s+/g, " ").replace(/\n+/g, " ");
       const head = href ? `[**${title}**](${href})` : `**${title}**`;
-      return `- ${head}${compactInner ? " — " + compactInner : ""}`;
+      return `- ${head}${compactInner ? " - " + compactInner : ""}`;
     },
   );
 
@@ -283,7 +283,7 @@ async function main() {
     }
   }
 
-  // llms.txt — agent-friendly index.
+  // llms.txt - agent-friendly index.
   const grouped = new Map();
   for (const p of pages) {
     const list = grouped.get(p.group) ?? [];
@@ -315,9 +315,9 @@ async function main() {
     await writeOutputFile(output.dir, "llms.txt", llmsIndex.join("\n"));
   }
 
-  // llms-full.txt — every page concatenated.
+  // llms-full.txt - every page concatenated.
   const llmsFull = [
-    `# Ursula — full documentation`,
+    `# Ursula - full documentation`,
     ``,
     `> ${SUMMARY}`,
     ``,
