@@ -68,64 +68,9 @@ pub fn fill_payload(size: usize, seed: u64) -> Vec<u8> {
     buf
 }
 
-pub async fn ensure_bucket(client: &Client, base: &str, bucket: &str) -> Result<()> {
-    let url = format!("{}/{}", base.trim_end_matches('/'), bucket);
-    let resp = client
-        .put(&url)
-        .send()
-        .await
-        .with_context(|| format!("PUT {url}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        anyhow::bail!("PUT {url} -> {status}");
-    }
-    Ok(())
-}
-
-pub async fn create_stream(
-    client: &Client,
-    base: &str,
-    bucket: &str,
-    stream: &str,
-    content_type: &str,
-) -> Result<()> {
-    let url = format!("{}/{}/{}", base.trim_end_matches('/'), bucket, stream);
-    let resp = client
-        .put(&url)
-        .header(reqwest::header::CONTENT_TYPE, content_type)
-        .send()
-        .await
-        .with_context(|| format!("PUT {url}"))?;
-    let status = resp.status();
-    if !(status.is_success() || status == reqwest::StatusCode::CONFLICT) {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("PUT {url} -> {status}: {body}");
-    }
-    Ok(())
-}
-
-pub fn duration_secs_to_string(d: Duration) -> String {
-    let total = d.as_secs_f64();
-    if total < 1.0 {
-        format!("{:.0}ms", total * 1000.0)
-    } else if total < 60.0 {
-        format!("{:.2}s", total)
-    } else {
-        let mins = (total / 60.0).floor();
-        let secs = total - mins * 60.0;
-        format!("{mins:.0}m{secs:.0}s")
-    }
-}
-
 #[derive(Clone, Debug, Serialize)]
 pub struct Counts {
     pub ok: u64,
     pub backpressure: u64,
     pub other_err: u64,
-}
-
-impl Counts {
-    pub fn total(&self) -> u64 {
-        self.ok + self.backpressure + self.other_err
-    }
 }

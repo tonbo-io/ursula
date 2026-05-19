@@ -245,15 +245,6 @@ impl Backend {
         }
     }
 
-    pub fn bootstrap_url(&self, stream: &str) -> Option<String> {
-        let base = self.first_base();
-        match self.kind {
-            ApiStyle::Ursula => Some(format!("{base}/{}/{}/bootstrap", self.bucket, stream)),
-            ApiStyle::Durable => Some(format!("{base}/v1/stream/{stream}/bootstrap")),
-            ApiStyle::S2 => None,
-        }
-    }
-
     /// Returns the URL each backend uses to replay a stream from the start
     /// ("give me everything for this stream").
     ///
