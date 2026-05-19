@@ -1,37 +1,40 @@
 ---
 title: Overview
 sidebarTitle: Overview
-description: How Ursula realizes the Durable Streams protocol - thread-per-core shards, multi-Raft replication, and an in-memory hot ring with S3-backed cold storage.
+description: How Ursula realizes the Durable Streams protocol with thread-per-core shards, multi-Raft replication, and an in-memory hot ring backed by S3 cold storage.
 ---
 
 ## The problem
 
-If you want to build a collaborative app, a real-time AI agent, or anything that needs to push state changes to multiple clients the moment they happen, you need a durable stream. Something you can append to, read back from any point, and subscribe to for live updates.
-
-The obvious place to build this is directly on object storage. S3 is cheap, durable, and infinitely scalable. But if you've tried to build a low-latency write path on S3, you've probably hit two problems that no amount of clever engineering can fully hide.
-
-The first is that S3 has no append operation. Objects are immutable. Every write creates a new object, which means you either pay per-PUT at high frequency or you batch writes and accept the latency that comes with waiting for a batch to fill. The second is that S3's conditional writes are optimistic. Under concurrent writers, they degrade into retry storms where most attempts conflict, back off, and try again. Latency grows exponentially with contention. ([This post from Chroma](https://www.trychroma.com/engineering/wal3) explains the mechanics well.)
-
-[S2](https://s2.dev/blog/intro) addresses the latency problem by writing to S3 Express One Zone, which gets them under 50ms. But Express storage costs 7x more than Standard, and the optimistic concurrency model is still there underneath. [WarpStream](https://www.warpstream.com/blog/minimizing-s3-api-costs-with-warpstream) goes the other direction: batch everything to S3 Standard and keep costs low, but accept 250ms+ p50 latency as a consequence. Both are making the best of what the S3 write path allows.
-
-The fact that multiple teams are independently building the same thing tells you something: "append to a stream, read it back, subscribe for updates" is a general-purpose primitive, not an implementation detail of any one product.
+Building a durable stream directly on S3 hits two walls: S3 has no append (every write either pays per-PUT or batches and eats the latency), and its conditional writes are optimistic compare-and-set, so concurrent writers retry-storm with exponential latency ([Chroma's wal3 post](https://www.trychroma.com/engineering/wal3) covers the mechanics). The market splits on which wall to lean against: [S2](https://s2.dev/blog/intro) writes through S3 Express to get under 50 ms but pays around 7x per-GB; [WarpStream](https://www.warpstream.com/blog/minimizing-s3-api-costs-with-warpstream) batches to S3 Standard and accepts 250 ms+ p50.
 
 ## How Ursula works
 
-Ursula sidesteps the S3 write-path trade-off by not using S3 for the write path at all. Writes go to a cluster of nodes that coordinate through [Raft consensus](https://en.wikipedia.org/wiki/Raft_(algorithm)) (via [OpenRaft](https://github.com/databendlabs/openraft)). Once a majority of replicas have persisted a record, it's committed and the client receives a confirmed offset - no CAS races, no retry storms.
+Ursula keeps S3 off the write path entirely. Writes go to a cluster of nodes that coordinates through [Raft consensus](https://en.wikipedia.org/wiki/Raft_(algorithm)). Once a majority of replicas has persisted a record, it is committed, with no compare-and-set races and no retry storms. S3 is the cold tier.
 
-Two design choices set Ursula apart from a single-shard Raft service:
+Two structural choices shape the rest of the design:
 
-1. **Thread-per-core shard ownership.** Each Ursula process binds work to a fixed number of cores. Every stream is statically hashed to one specific core. The owner core handles all reads and writes for the streams placed on it, in order, with no cross-core synchronization on the hot path.
-2. **Multi-Raft.** Instead of one Raft log for the whole node, Ursula runs hundreds to thousands of small Raft groups. Each stream is hashed to a group, each group to a core. Replication and leadership are per-group, so an unhealthy follower for one group does not stall traffic for another.
+1. **Thread-per-core shard ownership.** Every stream is statically hashed to one specific CPU core on each node. That core handles all reads and writes for its streams, in order, with no cross-core synchronization on the hot path.
+2. **Multi-Raft.** Ursula runs hundreds to thousands of small Raft groups per cluster, not one log per node. Each stream hashes to a group, each group pins to a core. An unhealthy follower for one group does not stall traffic for another.
 
-The result is a cluster where write throughput scales with the number of healthy cores across nodes, not with the bandwidth of a single Raft leader.
+Together, write throughput scales with healthy cores across the cluster instead of with any single leader's bandwidth, and failure domains stay per-group rather than per-node.
 
-### The interface
+## The stack at a glance
 
-The API implements the [Durable Streams](https://durablestreams.com/) protocol, an open specification (MIT licensed) published by [Electric](https://electric-sql.com/). It defines the primitive: create a stream, append to it, read from any offset, and tail it in real time, with exactly-once semantics. The whole thing runs over plain HTTP with SSE for live subscriptions, so there is no custom binary protocol and no mandatory client library. See the [API overview](/docs/api/overview) for the routes Ursula currently implements and the [extensions spec](/docs/specs/extensions) for the append-batch path.
+Ursula is async Rust. The pieces that show up in the diagrams below:
 
-### Cluster topology
+- **axum** is the HTTP server library that terminates public client requests.
+- **tokio** is the async runtime. Each core runs its own single-threaded executor (`tokio::current_thread`) so work on that core never migrates.
+- **tonic** is the gRPC library used for peer-to-peer Raft traffic between nodes.
+- **OpenRaft** is the Raft consensus implementation Ursula plugs into.
+
+The Rust-named components in diagrams (`ShardRuntime`, `GroupActor`, `GroupEngine`, `StreamStateMachine`) are the structures inside one node, glossed in the sections below.
+
+## Interface
+
+The API is the [Durable Streams protocol](https://durablestreams.com/), an open MIT-licensed spec published by [Electric](https://electric-sql.com/): create a stream, append, read from any offset, tail in real time over Server-Sent Events (SSE), with exactly-once write semantics. Plain HTTP plus SSE, with no custom binary protocol or mandatory client library. See the [API overview](/docs/api/overview) and the [extensions spec](/docs/specs/extensions) for the append-batch path.
+
+## Cluster topology
 
 ```
                           Clients (HTTP / SSE)
@@ -52,9 +55,9 @@ The API implements the [Durable Streams](https://durablestreams.com/) protocol, 
                        └────────────────────────┘
 ```
 
-Every stream is replicated to all voting members of its Raft group. Hot data lives in memory on each replica. Cold data is flushed to a shared object store that any replica can read from on demand.
+Every stream is replicated to all voting members of its Raft group. Hot data lives in memory on each replica. Cold data lives in a shared object store any replica can read from on demand.
 
-### Inside a node
+## Inside a node
 
 ```
    Request enters axum HTTP front-end on the node.
@@ -85,19 +88,19 @@ Every stream is replicated to all voting members of its Raft group. Hot data liv
    core traffic only happens via shard_map routing on the way in.
 ```
 
-A request enters via axum, the runtime hashes its stream ID to `(core, raft_group_id)`, and the command is pushed into that core's mailbox. The core's event loop dispatches it to the owning `GroupActor`, which holds the group's Raft instance, state machine, and watcher registry. Group state is per-actor. Nothing crosses cores once the routing decision is made.
+A request enters the HTTP server, the routing layer (`ShardRuntime`) hashes the stream ID into `(core, raft_group_id)`, and the command lands in that core's bounded mailbox. The core's event loop dispatches it to the owning group actor, which holds the Raft instance, the state machine, and the watcher registry for that one group. State is per-actor, so nothing crosses cores after routing.
 
-### The replaceable group engine
+## The replaceable group engine
 
-The `GroupEngine` trait (in `ursula-runtime`) is the seam between the runtime and a group's storage / replication strategy. Three implementations ship today:
+The `GroupEngine` trait is the seam between the runtime and a group's storage and replication strategy. Three engines ship today:
 
-- **`InMemoryGroupEngine`** - non-replicated, in-process. Used in tests and as a perf baseline.
-- **WAL-backed `RaftGroupEngine`** (with `--wal-dir`) - OpenRaft-driven consensus over protobuf-framed per-group Raft log records plus a shared per-core journal for durable Raft state.
-- **Memory-log `RaftGroupEngine`** (with `--raft-memory`) - OpenRaft with an in-memory log store for fast iteration. Not durable across restarts.
+- **In-memory, non-replicated.** Used in tests and as a performance baseline.
+- **WAL-backed Raft engine** (`--wal-dir`). OpenRaft over a per-group write-ahead log of protobuf-framed records, plus a shared per-core journal. Durable across restarts.
+- **Memory-log Raft engine** (`--raft-memory`). OpenRaft with an in-memory log store. Fast iteration, no persistence.
 
-A factory selected at startup (`InMemoryGroupEngineFactory` / `WalGroupEngineFactory`) decides which engine each `GroupActor` opens. This keeps the runtime code identical across modes and gives a clean upgrade path to additional engines (e.g., cold-only read replicas) without changes to the request routing layer.
+A factory selected at startup picks which engine each group opens, leaving the runtime code identical across modes.
 
-### Write path
+## Write path
 
 ```
 HTTP ---> Runtime ---> core mailbox ---> GroupActor
@@ -120,9 +123,9 @@ HTTP ---> Runtime ---> core mailbox ---> GroupActor
                                 AppendResponse -> client
 ```
 
-Producer headers (`Producer-Id` + `Producer-Epoch` + `Producer-Seq`) are deduplicated inside the state machine, so retries of an already-applied append return the original offset rather than appending again. `Stream-Seq` provides a single-writer ordering guard for callers that prefer that style.
+The leader writes the entry to its write-ahead log (WAL), fsyncs, and replicates to followers in parallel. Once a quorum has persisted the entry, the state machine applies it and the response goes back to the client. Producer dedup headers ([exactly-once writes](/docs/concepts/exactly-once-writes)) are checked inside the state machine, so retries of an already-applied append return the original offset rather than appending again. `Stream-Seq` provides a single-writer ordering guard for callers that prefer that style ([conditional writes](/docs/concepts/conditional-writes)).
 
-### Read path and cold offload
+## Read path and cold offload
 
 ```
 HTTP ---> Runtime ---> core mailbox ---> GroupActor
@@ -142,25 +145,14 @@ HTTP ---> Runtime ---> core mailbox ---> GroupActor
                                 ReadStreamResponse -> client
 ```
 
-`read_stream_parts` is the fast path: under the Raft state-machine lock the runtime computes a `StreamReadPlan` (a list of hot segments and cold-chunk references) and exits immediately. Payload materialization - including any S3 `GetObject` range reads - happens in a separately spawned task, so a slow cold fetch never blocks other commands waiting on the same `GroupActor`. The owner-leader requirement still applies: followers transparently forward read requests to the group's leader, and the leader's `up_to_date` bit on the response tells the client whether any further committed data exists beyond `next_offset`.
+Under the state-machine lock the runtime computes only a read plan: which segments are still in the hot ring and which live as cold chunks in S3. Then it releases the lock. Materialization, including any S3 `GetObject` range reads, runs in a separately spawned task, so a slow cold fetch never blocks other commands waiting on the same group. Followers transparently forward reads to the leader; the `Stream-Up-To-Date` response header tells the client whether more committed data sits past `Stream-Next-Offset` (see [offsets](/docs/concepts/offsets)).
 
-### SSE live tailing
+## SSE live tailing
 
-SSE clients first issue a normal read. If it returns an empty payload with `up_to_date=true`, the runtime registers a watcher inside the owning `GroupActor`. The watcher map is per-actor and mutated only inside that actor's turn - no `Mutex`, no `.await` while holding any lock. When a subsequent append completes on the same group, `notify_read_watchers` runs in the same turn, deduplicates wakeups by request shape, and dispatches the materialization off to a spawned task using the same `read_stream_parts` fast path. Cancellations (the client disconnects) flow back as a group command and clean up the watcher locally.
+When a read finds no new data and the response carries `Stream-Up-To-Date: true`, the runtime registers a watcher inside the owning group actor. The watcher map is per-actor and mutated only inside that actor's turn, with no mutex and no awaiting while holding a lock. When a later append commits on the same group, the actor wakes the matching watchers in the same turn, deduplicates them by request shape, and dispatches materialization through the same fast path the read uses.
 
-### Hot and cold tiers
+## Hot and cold tiers
 
-Recent data sits in an in-memory ring on every replica. Once the ring exceeds its configured budget (`URSULA_COLD_MAX_HOT_BYTES_PER_GROUP`), the runtime flushes the oldest segments into an object-store chunk and replaces them in the read plan with a cold-segment reference. Reads then transparently fetch from hot memory and S3 in one response. Cold flushes are batched and rate-limited via the `ColdWriteAdmission` so a single burst cannot starve out other groups on the same core.
+Recent data sits in an in-memory ring on every replica. Once the ring exceeds its per-group budget (configured by `URSULA_COLD_MAX_HOT_BYTES_PER_GROUP`), the oldest segments flush into an object-store chunk and the read plan replaces them with a cold-segment reference. Reads then span hot memory and S3 in one response. Cold flushes are batched and rate-limited so a single burst cannot starve other groups on the same core.
 
-For deployment topology - voting layout across AZs and regions, non-voting replicas, S3 prefix layout - see the [operations guide](/docs/operations).
-
-## Status and trade-offs
-
-Ursula is a clean-room rewrite focused on saturating CPU under the [`perf_compare`](/docs/specs/extensions) workload. A few things to know about the current state:
-
-- **Static placement, no rebalance.** Stream-to-group and group-to-core mappings are decided by hash at startup and do not migrate. This keeps the routing layer lock-free at the cost of giving up dynamic hot-spot remediation.
-- **Leader-only reads.** All reads return data from the group's leader. There is no follower-served read mode. This trades read scalability for stronger consistency and a smaller invariant surface. Followers transparently forward, so clients do not need to know which node holds the leader.
-- **Co-scheduled groups within a core.** Multiple Raft groups share a single `tokio::current_thread` runtime per core. Cross-core isolation is real. Same-core groups cooperate through async scheduling rather than hardware-level isolation. Per-group execution is sequential but a stalled cold read or peer call on one group can yield the executor while another group runs.
-- **No bucket-level CRUD yet.** `PUT /{bucket}` is acknowledged but the protocol's `GET /{bucket}`, `DELETE /{bucket}`, and `GET /{bucket}/streams` endpoints are not implemented in the current build.
-
-The implementation is async Rust on top of `tokio`, `axum`, `tonic`, and `openraft`.
+For deployment topology (voting layout across availability zones, non-voting replicas, S3 prefix layout), see the [operations guide](/docs/operations).

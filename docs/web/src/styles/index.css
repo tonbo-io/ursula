@@ -4568,6 +4568,11 @@ a.docs-card:focus-visible {
   }
 }
 
+/* Toggle button is desktop-hidden; it only appears at the mobile breakpoint. */
+.docs-sidebar-toggle {
+  display: none;
+}
+
 @media (max-width: 960px) {
   .docs-page {
     grid-template-columns: 1fr;
@@ -4580,7 +4585,59 @@ a.docs-card:focus-visible {
     bottom: auto;
     left: auto;
     width: auto;
+    max-height: none;
     overflow-y: visible;
+  }
+
+  .docs-sidebar-toggle {
+    align-items: center;
+    background: var(--bg-base);
+    border: 1px solid var(--border-muted);
+    border-radius: 8px;
+    color: var(--text-primary);
+    cursor: pointer;
+    display: flex;
+    font: inherit;
+    font-weight: 500;
+    gap: 8px;
+    justify-content: space-between;
+    padding: 10px 14px;
+    text-align: left;
+    transition: border-color 140ms ease, background-color 140ms ease;
+    width: 100%;
+  }
+
+  .docs-sidebar-toggle:hover,
+  .docs-sidebar-toggle:focus-visible {
+    border-color: var(--border-strong, var(--text-soft));
+    outline: none;
+  }
+
+  .docs-sidebar-toggle-label {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .docs-sidebar-toggle-icon {
+    color: var(--text-soft);
+    display: inline-flex;
+    transition: transform 160ms ease;
+  }
+
+  .docs-sidebar-open .docs-sidebar-toggle-icon {
+    transform: rotate(-180deg);
+  }
+
+  .docs-sidebar-panel {
+    display: none;
+    padding-top: 16px;
+  }
+
+  .docs-sidebar-open .docs-sidebar-panel {
+    display: block;
   }
 
   .docs-content {

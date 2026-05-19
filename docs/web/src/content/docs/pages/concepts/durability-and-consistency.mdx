@@ -4,29 +4,25 @@ sidebarTitle: Durability and Consistency
 description: Understand Ursula's durability guarantees, linearizable writes, and hot-cold storage model.
 ---
 
-## When is a write durable?
+## Durability
 
-An append is acknowledged after a **majority of nodes** have replicated it. A single node failure cannot lose an acknowledged write. No write is ever acknowledged based on a single copy.
+An append is acknowledged once a **majority of voters** has replicated it. A single node failure cannot lose an acknowledged write. Acknowledged data lives in replicated hot state across the cluster, and a background worker flushes older segments to S3 on a configurable interval, after which the data inherits S3-grade durability.
 
-Acknowledged data is held in replicated hot state across the cluster. A background process then flushes data to S3 on a configurable interval, after which the data inherits S3-grade durability. In a cross-region deployment with a 5-second flush interval, Ursula provides approximately 9-10 nines of per-message durability. The window where acknowledged-but-unflushed data is at risk from a simultaneous multi-region failure is measured in seconds.
+In a cross-region deployment with a 5-second flush interval, per-message durability is approximately 9-10 nines. The window where acknowledged-but-unflushed data is at risk from a simultaneous multi-region failure is measured in seconds.
 
-## Consistency model
+## Consistency
 
-Ursula provides **linearizable writes and reads**. All appends are serialized through a single leader node per Raft group, which assigns a total order. Reads always observe data from the current leader: if a request lands on a follower, the follower transparently forwards it to the leader of that group, so the client sees the same view regardless of which node it talked to. There is no eventually-consistent follower-read mode.
+Writes and reads are **linearizable**. Each Raft group serializes appends through its current leader, which assigns a total order. Reads also go to the leader: if a request lands on a follower, the follower forwards it transparently, so the client sees the same view regardless of which node it talked to. There is no eventually-consistent follower-read mode.
 
-The `Stream-Up-To-Date` response header tells the client whether the read returned everything that was committed at the moment the leader served it. `true` means no further data exists past `next_offset` right now `false` means there is more data already committed beyond what this response carries, so the client should keep paging.
+`Stream-Up-To-Date` on each read tells the client whether more committed data exists past `next_offset`. `false` means keep paging.
 
-## Data lifecycle
+## Availability and durability (standard layout)
 
-Writes first enter replicated hot state across cluster nodes. This is where acknowledgment happens and where recent reads are served from. A background process flushes older data to S3 on a configurable interval. Once flushed, the data gains S3-grade durability and nodes can recover it without replaying the full history. Reads fall through transparently from hot to cold storage.
-
-## Availability and durability
-
-The estimates below assume a standard Ursula deployment: three voting replicas across availability zones, with two non-voting replicas in a second region.
+Three voting replicas across availability zones, plus two non-voting replicas in a second region.
 
 | Property | What it means |
 |---|---|
-| **Write availability** | Writes continue as long as a majority of voting replicas remain healthy. In this layout, that means the system maintains write quorum through any single voting-AZ failure. Non-voting replicas do not participate in write quorum, but they hold additional copies of acknowledged data for durability and read serving. |
-| **Read availability** | Any reachable replica accepts the request. Followers forward to the leader of the target Raft group, so reads succeed for any group whose leader is healthy. Read availability tracks write availability per group, not per cluster. |
-| **Per-message durability** | Approximately 9-10 nines with a 5-second flush interval. Writes are acknowledged after quorum replication in hot state. Full durability follows after background flush to S3. |
-| **Annual zero-loss probability** | Approximately 3-4 nines. The probability of experiencing no data-loss events over a full year. |
+| **Write availability** | Writes continue as long as a majority of voters is healthy. The layout tolerates any single voting-AZ failure. Non-voting replicas hold extra copies but do not vote. |
+| **Read availability** | Any reachable replica accepts the request; followers forward to the group's leader. Read availability tracks write availability per group, not per cluster. |
+| **Per-message durability** | ~9-10 nines with a 5-second flush interval. |
+| **Annual zero-loss probability** | ~3-4 nines. Probability of no data-loss events in a year. |

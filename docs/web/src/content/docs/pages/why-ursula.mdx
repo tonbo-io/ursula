@@ -4,31 +4,18 @@ sidebarTitle: Why Ursula
 description: Where Ursula fits as a durable, replayable stream layer for application state.
 ---
 
-Ursula is a durable, replayable stream layer for application state. Each document, session, task, room, or agent run gets its own ordered stream that supports recovery, replay, live updates, snapshots, and eventual expiry.
+Most event systems multiplex many entities into shared channels and rebuild per-entity state downstream. Ursula inverts that: each document, session, task, room, or agent run gets its own durable timeline. Writers append directly to it; readers resume from its offsets.
 
-You can think of it as a per-entity durable log runtime. It is purpose-built for this pattern, not a general-purpose event backbone or stream storage primitive.
+Treat it as a per-entity durable log runtime, purpose-built for that pattern rather than a general event backbone.
 
-## One stream per entity
+## What you get from one stream per entity
 
-Most event systems multiplex many entities into shared channels. Consumers reconstruct per-entity state downstream. Ursula inverts this: each entity owns its own durable timeline. Writers append directly to that stream, and readers resume from its offsets. Buckets group related streams under one namespace.
+- **Replayable recovery.** When a worker, sandbox, or agent restarts, replay its log and continue.
+- **Live tails with simple clients.** Catch-up reads, long-poll, or SSE, all over plain HTTP.
+- **Lifecycle in the same primitive.** Snapshots, bootstrap, and TTL ride the timeline instead of being separate infrastructure.
 
-This gives you:
+## The tradeoff
 
-- **Replayable recovery.** When a worker, sandbox, or agent restarts, replay the entity's log and continue.
-- **Live tails with simple clients.** Watch progress over HTTP with catch-up reads, long-poll, or SSE.
-- **Built-in lifecycle.** Snapshots, bootstrap, and TTL fit the same timeline model instead of becoming separate infrastructure.
+Ursula makes one timeline per entity cheap. In exchange, it isn't the most general primitive for cross-system event distribution or arbitrary stream processing. Keeping the per-entity model simple is what makes recovery, inspection, and operation tractable for long-running application state.
 
-## Tradeoffs
-
-Ursula makes one durable timeline per entity cheap and ergonomic. In exchange, it is not trying to be the most general abstraction for cross-system event distribution or arbitrary stream processing pipelines.
-
-That tradeoff is intentional: the simpler the per-entity model, the easier it is to recover, inspect, and operate long-running application state.
-
-For how the write path achieves low latency and strong durability without S3 on the hot path, see [Architecture](/docs/architecture/overview). For concrete latency and cost numbers, see [Competitive comparison](/docs/competitive-comparison).
-
-## Next steps
-
-- [Quick start](/docs/quick-start): create a stream and append data with curl
-- [Streams](/docs/concepts/streams): the core stream abstraction and lifecycle
-- [Architecture](/docs/architecture/overview): how the cluster works
-- [API overview](/docs/api/overview): the HTTP routes and request patterns
+For latency and durability numbers, see [Architecture](/docs/architecture/overview) and [Competitive comparison](/docs/competitive-comparison).
