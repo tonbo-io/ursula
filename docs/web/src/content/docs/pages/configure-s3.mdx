@@ -58,4 +58,4 @@ A typical benchmark profile drops the interval to `200ms`, raises concurrency to
 
 - The `URSULA_COLD_ROOT` prefix is appended to every cold key. Use a date-stamped value (`ursula-prod-20260518T000000Z`) when running benchmarks so you can clean up afterwards without touching production data.
 - `scripts/ursula_ec2.py --config cluster.json cleanup-s3 --root <prefix>` deletes a single root prefix from the bucket configured in the manifest. There is no built-in retention policy beyond Ursula's snapshot GC.
-- Cold reads are served by the leader. When a leader changes, the new leader fetches needed chunks from the same shared bucket on demand.
+- Cold reads can be served by any replica that has applied the stream metadata referencing the cold chunks. All replicas must point at the same shared bucket so follower reads and post-leadership-change reads can fetch the same objects on demand.

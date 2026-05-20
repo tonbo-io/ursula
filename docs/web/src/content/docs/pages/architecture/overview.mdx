@@ -145,7 +145,7 @@ HTTP ---> Runtime ---> core mailbox ---> GroupActor
                                 ReadStreamResponse -> client
 ```
 
-Under the state-machine lock the runtime computes only a read plan: which segments are still in the hot ring and which live as cold chunks in S3. Then it releases the lock. Materialization, including any S3 `GetObject` range reads, runs in a separately spawned task, so a slow cold fetch never blocks other commands waiting on the same group. Followers transparently forward reads to the leader; the `Stream-Up-To-Date` response header tells the client whether more committed data sits past `Stream-Next-Offset` (see [offsets](/docs/concepts/offsets)).
+Under the state-machine lock the runtime computes only a read plan: which segments are still in the hot ring and which live as cold chunks in S3. Then it releases the lock. Materialization, including any S3 `GetObject` range reads, runs in a separately spawned task, so a slow cold fetch never blocks other commands waiting on the same group. Followers serve replicated historical catch-up bytes from their local applied state when the read does not need a leader-owned access mutation. Tail-sensitive responses such as `HEAD`, open-stream `Stream-Up-To-Date: true`, and live reads stay on the leader path (see [offsets](/docs/concepts/offsets)).
 
 ## SSE live tailing
 

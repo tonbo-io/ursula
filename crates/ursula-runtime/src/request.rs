@@ -221,7 +221,7 @@ impl GroupReadStreamParts {
         })
     }
 
-    pub(crate) fn payload_is_empty(&self) -> bool {
+    pub fn payload_is_empty(&self) -> bool {
         match &self.body {
             GroupReadStreamBody::Materialized(payload) => payload.is_empty(),
             GroupReadStreamBody::Planned { plan, .. } => {

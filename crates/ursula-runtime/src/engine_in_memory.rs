@@ -1362,6 +1362,35 @@ impl InMemoryGroupEngine {
             .map_err(stream_response_error)
     }
 
+    pub fn head_stream_after_access(
+        &mut self,
+        request: &HeadStreamRequest,
+        placement: ShardPlacement,
+    ) -> Result<HeadStreamResponse, GroupEngineError> {
+        let Some(metadata) = self
+            .state_machine
+            .head_at(&request.stream_id, request.now_ms)
+        else {
+            return Err(GroupEngineError::stream(
+                StreamErrorCode::StreamNotFound,
+                format!("stream '{}' does not exist", request.stream_id),
+            ));
+        };
+        Ok(HeadStreamResponse {
+            placement,
+            content_type: metadata.content_type.clone(),
+            tail_offset: metadata.tail_offset,
+            closed: metadata.status == ursula_stream::StreamStatus::Closed,
+            stream_ttl_seconds: metadata.stream_ttl_seconds,
+            stream_expires_at_ms: metadata.stream_expires_at_ms,
+            snapshot_offset: self
+                .state_machine
+                .latest_snapshot(&request.stream_id)
+                .map_err(stream_response_error)?
+                .map(|snapshot| snapshot.offset),
+        })
+    }
+
     pub async fn read_payload_from_plan(
         cold_store: Option<&ColdStoreHandle>,
         stream_id: &BucketStreamId,
@@ -1744,28 +1773,7 @@ impl GroupEngine for InMemoryGroupEngine {
     ) -> GroupHeadStreamFuture<'a> {
         Box::pin(async move {
             self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
-            let Some(metadata) = self
-                .state_machine
-                .head_at(&request.stream_id, request.now_ms)
-            else {
-                return Err(GroupEngineError::stream(
-                    StreamErrorCode::StreamNotFound,
-                    format!("stream '{}' does not exist", request.stream_id),
-                ));
-            };
-            Ok(HeadStreamResponse {
-                placement,
-                content_type: metadata.content_type.clone(),
-                tail_offset: metadata.tail_offset,
-                closed: metadata.status == ursula_stream::StreamStatus::Closed,
-                stream_ttl_seconds: metadata.stream_ttl_seconds,
-                stream_expires_at_ms: metadata.stream_expires_at_ms,
-                snapshot_offset: self
-                    .state_machine
-                    .latest_snapshot(&request.stream_id)
-                    .map_err(stream_response_error)?
-                    .map(|snapshot| snapshot.offset),
-            })
+            self.head_stream_after_access(&request, placement)
         })
     }
 

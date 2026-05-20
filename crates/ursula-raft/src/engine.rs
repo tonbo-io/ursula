@@ -30,8 +30,8 @@ use ursula_runtime::{
     ReadStreamRequest, StreamErrorCode, TouchStreamAccessResponse,
 };
 use ursula_shard::BucketStreamId;
-use ursula_shard::RaftGroupId;
 use ursula_shard::CoreId;
+use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 
 use crate::codec::*;
@@ -706,7 +706,11 @@ impl GroupEngine for RaftGroupEngine {
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
             self.with_state_machine(move |state_machine| {
-                Box::pin(async move { state_machine.head_stream(request, placement).await })
+                Box::pin(async move {
+                    state_machine
+                        .engine
+                        .head_stream_after_access(&request, placement)
+                })
             })
             .await?
         })
@@ -731,30 +735,52 @@ impl GroupEngine for RaftGroupEngine {
         placement: ShardPlacement,
     ) -> GroupReadStreamPartsFuture<'a> {
         Box::pin(async move {
+            let original_request = request.clone();
             if !self.raft.is_leader()
-                && let Some(leader_node) = self.current_leader_node().await
+                && self
+                    .access_requires_write(request.stream_id.clone(), request.now_ms, true)
+                    .await?
             {
-                let response =
-                    forward_read_stream_to_leader(placement, &leader_node, request).await?;
-                return Ok(GroupReadStreamParts::from_response(response));
+                if let Some(leader_node) = self.current_leader_node().await {
+                    let response =
+                        forward_read_stream_to_leader(placement, &leader_node, request).await?;
+                    return Ok(GroupReadStreamParts::from_response(response));
+                }
+                self.require_local_leader_for_read("read_stream").await?;
             }
             let stream_id = request.stream_id.clone();
-            self.require_local_leader_for_read("read_stream").await?;
-            self.ensure_stream_access(request.stream_id.clone(), request.now_ms, true)
-                .await?;
+            if self.raft.is_leader() {
+                self.ensure_stream_access(request.stream_id.clone(), request.now_ms, true)
+                    .await?;
+            }
+            let read_request = request.clone();
             let plan = self
                 .with_state_machine(move |state_machine| {
-                    Box::pin(
-                        async move { state_machine.engine.read_stream_plan_after_access(&request) },
-                    )
+                    Box::pin(async move {
+                        state_machine
+                            .engine
+                            .read_stream_plan_after_access(&read_request)
+                    })
                 })
                 .await??;
-            Ok(GroupReadStreamParts::from_plan(
+            let mut parts = GroupReadStreamParts::from_plan(
                 placement,
                 stream_id,
                 plan,
                 self.cold_store.clone(),
-            ))
+            );
+            if !self.raft.is_leader() && parts.up_to_date && !parts.closed {
+                if parts.payload_is_empty()
+                    && let Some(leader_node) = self.current_leader_node().await
+                {
+                    let response =
+                        forward_read_stream_to_leader(placement, &leader_node, original_request)
+                            .await?;
+                    return Ok(GroupReadStreamParts::from_response(response));
+                }
+                parts.up_to_date = false;
+            }
+            Ok(parts)
         })
     }
 

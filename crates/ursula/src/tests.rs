@@ -3,17 +3,17 @@ use std::path::PathBuf;
 use axum::body::{Body, to_bytes};
 use axum::http::Request;
 use openraft::RaftNetworkV2;
-use ursula_raft::StaticGrpcRaftGroupEngineFactory;
-use ursula_runtime::{
-    ColdStore, ColdStoreHandle, InMemoryGroupEngineFactory, PlanGroupColdFlushRequest,
-    RuntimeConfig,
-};
 use openraft::error::ReplicationClosed;
 use openraft::network::RPCOption;
 use openraft::raft::SnapshotResponse;
 use openraft::rt::WatchReceiver;
 use tower::ServiceExt;
+use ursula_raft::StaticGrpcRaftGroupEngineFactory;
 use ursula_raft::UrsulaRaftTypeConfig;
+use ursula_runtime::{
+    ColdStore, ColdStoreHandle, InMemoryGroupEngineFactory, PlanGroupColdFlushRequest,
+    RuntimeConfig,
+};
 use ursula_shard::RaftGroupId;
 
 use super::*;
@@ -2121,6 +2121,109 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
                 .expect("wait for distributed leader");
         }
     }
+
+    for node in nodes {
+        node.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn static_grpc_follower_serves_replicated_catch_up_read_without_leader_proxy() {
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    for node_id in 1..=3u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        peers.push((node_id, format!("http://{addr}")));
+        listeners.push(listener);
+    }
+
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        nodes.push(
+            spawn_static_grpc_test_node(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                node_id == 1,
+                1,
+            )
+            .await,
+        );
+    }
+
+    for (index, node) in nodes.iter().enumerate().skip(1) {
+        tokio::time::timeout(Duration::from_secs(10), node.runtime.warm_all_groups())
+            .await
+            .unwrap_or_else(|_| panic!("warm follower node {} group timed out", index + 1))
+            .expect("warm follower group");
+    }
+    tokio::time::timeout(Duration::from_secs(10), nodes[0].runtime.warm_all_groups())
+        .await
+        .expect("warm leader group timed out")
+        .expect("warm leader group");
+
+    for node in &nodes {
+        let raft = node.registry.get(RaftGroupId(0)).expect("registered group");
+        raft.wait(Some(Duration::from_secs(5)))
+            .current_leader(1, "static gRPC Raft cluster should elect node 1")
+            .await
+            .expect("wait for shared leader");
+    }
+
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build reqwest client");
+    let stream = BucketStreamId::new("benchcmp", "follower-local-read");
+    let leader_base = peers[0].1.as_str();
+    let follower_base = peers[1].1.as_str();
+    let create = http_client
+        .put(format!("{leader_base}/benchcmp/follower-local-read"))
+        .header(CONTENT_TYPE, "text/plain")
+        .body("read-without-leader")
+        .send()
+        .await
+        .expect("create stream through leader");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let placement = nodes[1].runtime.locate(&stream);
+    wait_raft_state_machine_payload(
+        &nodes[1].registry,
+        placement,
+        &stream,
+        b"read-without-leader",
+        "follower replicated stream before local read",
+    )
+    .await;
+
+    let leader = nodes.remove(0);
+    leader.shutdown().await;
+
+    let read = http_client
+        .get(format!("{follower_base}/benchcmp/follower-local-read"))
+        .send()
+        .await
+        .expect("send follower local read after leader proxy is unavailable");
+    assert_eq!(read.status(), StatusCode::OK);
+    assert_eq!(
+        read.headers()
+            .get(HEADER_STREAM_NEXT_OFFSET)
+            .and_then(|value| value.to_str().ok()),
+        Some("00000000000000000019")
+    );
+    assert!(
+        read.headers().get(HEADER_STREAM_UP_TO_DATE).is_none(),
+        "follower local reads must not assert open-tail freshness"
+    );
+    assert_eq!(
+        &read.bytes().await.expect("follower local read body")[..],
+        b"read-without-leader"
+    );
 
     for node in nodes {
         node.shutdown().await;
