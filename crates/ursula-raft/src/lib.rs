@@ -8,10 +8,12 @@
 //!   that travels through the Raft state machine.
 //! - [`grpc`]: gRPC service ([`RaftGrpcService`]) and network factory
 //!   ([`GrpcRaftNetworkFactory`]) used for inter-node Raft RPCs.
-//! - [`log_store`]: in-memory and durable file-backed Raft log stores.
+//! - [`log_store`]: in-memory and durable file-backed Raft log stores (see
+//!   `log_store::memory` and `log_store::file`).
 //! - [`registry`]: [`RaftGroupHandleRegistry`] and the single-node test network.
 //! - [`state_machine`]: per-group [`RaftGroupStateMachine`] and snapshot builder.
-//! - [`engine`]: [`RaftGroupEngine`], the engine factories, and `GroupEngine` impl.
+//! - [`engine`]: [`RaftGroupEngine`] + `GroupEngine` impl, with the engine
+//!   factories under `engine::factory`.
 //! - [`forward`]: leader-forwarding helpers used by the engine when a node is a follower.
 
 pub mod raft_internal_proto {

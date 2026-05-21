@@ -12,8 +12,8 @@ use ursula_stream::{ColdChunkRef, ColdFlushCandidate, StreamErrorCode};
 use crate::cold_store::{ColdStoreHandle, new_cold_chunk_path};
 use crate::command::GroupSnapshot;
 use crate::core_worker::{CoreCommand, CoreMailbox, CoreWorker, WaitReadCancel};
+use crate::engine::in_memory::InMemoryGroupEngineFactory;
 use crate::engine::{GroupEngineError, GroupEngineFactory};
-use crate::engine_in_memory::InMemoryGroupEngineFactory;
 use crate::error::{RuntimeError, map_fork_source_ref_error};
 use crate::metrics::{
     COLD_FLUSH_GROUP_BATCH_MAX_CHUNKS, RuntimeMailboxSnapshot, RuntimeMetrics, RuntimeMetricsInner,
