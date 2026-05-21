@@ -1,6 +1,12 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto = "proto/raft_internal.proto";
     println!("cargo:rerun-if-changed={proto}");
+    // durable.proto is a symlink to ../ursula-proto/proto/durable.proto so the
+    // file ships inside the ursula-raft tarball (cargo follows symlinks on
+    // package). This keeps the .proto a single source of truth in
+    // ursula-proto while letting ursula-raft compile standalone from
+    // crates.io.
+    println!("cargo:rerun-if-changed=proto/durable.proto");
     // Build scripts run single-threaded for this crate, so setting PROTOC is scoped to
     // the current process and safe for tonic/prost code generation.
     unsafe {
@@ -18,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // values do not sit in steady-state memory, so the extra heap allocation lands
         // on the slow path (disk write, network frame) rather than the hot path.
         .boxed(".ursula.raft.v1.StoredLogEntryV1.payload.normal")
-        .compile_protos(&[proto], &["proto", "../ursula-proto/proto"])?;
+        .compile_protos(&[proto], &["proto"])?;
 
     Ok(())
 }

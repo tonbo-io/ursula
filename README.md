@@ -24,44 +24,60 @@ Full design intent: [Why Ursula](https://ursula.tonbo.io/docs/why-ursula) · [Ho
 
 ## Thread-per-core, multi-Raft, S3 as cold tier
 
-Three or five Ursula processes act as one durable-streams server. The structure that makes this scale is the same inside each node: cores own disjoint sets of Raft groups, and every group keeps its hot bytes in memory with S3 as the cold backstop.
+Three or five Ursula processes act as one durable-streams server. A stream hashes to one Raft group, that group has one replica on each voter node, and the same group ID is owned by a deterministic core on every node. Groups replicate independently; there is no cross-group transaction path.
 
 ```text
                   HTTP / SSE clients
-                          |
+        |                 |                 |
+        v                 v                 v
+  +-----------+     +-----------+     +-----------+
+  |  node 1   |<--->|  node 2   |<--->|  node 3   |
+  | HTTP/gRPC |     | HTTP/gRPC |     | HTTP/gRPC |
+  |           |     |           |     |           |
+  | core 0    |     | core 0    |     | core 0    |
+  |  group 0* |<--->|  group 0  |<--->|  group 0  |
+  |  group 3  |<--->|  group 3* |<--->|  group 3  |
+  |           |     |           |     |           |
+  | core 1    |     | core 1    |     | core 1    |
+  |  group 1  |<--->|  group 1* |<--->|  group 1  |
+  |  group 4* |<--->|  group 4  |<--->|  group 4  |
+  |           |     |           |     |           |
+  | core 2    |     | core 2    |     | core 2    |
+  |  group 2  |<--->|  group 2  |<--->|  group 2* |
+  |  group 5  |<--->|  group 5  |<--->|  group 5* |
+  +-----+-----+     +-----+-----+     +-----+-----+
+        |                 |                 |
+        +-----------------+-----------------+
+                          |  background flush
                           v
-  +-------------------------------------------------+
-  |             HTTP stateless front door           |
-  +---------+--------------+--------------+---------+
-            v              v              v
-          core 0         core 1         core 2     ...
-       +----------+   +----------+   +----------+
-       | Raft     |   | Raft     |   | Raft     |
-       | groups + |   | groups + |   | groups + |
-       | hot ring |   | hot ring |   | hot ring |
-       +-----+----+   +-----+----+   +-----+----+
-             |              |              |
-             +--------------+--------------+
-                            |  background flush
-                            v
-                    +----------------+
-                    |  S3 cold tier  |
-                    +----------------+
+                   +--------------+
+                   | S3 cold tier |
+                   +--------------+
+
+  * leader for that Raft group, leadership can differ per group.
 ```
 
 - **[Thread-per-core](https://seastar.io/shared-nothing/), [multi-Raft](https://tikv.org/deep-dive/scalability/multi-raft/).**
 
-  Each core owns a disjoint slice of Raft groups, with no shared mutable state across cores. Aggregate throughput scales with healthy cores in the cluster, not with the bandwidth of a single Raft leader.
+  Each stream hashes to one Raft group and owner core, so cores own disjoint groups with no shared mutable state on the hot path.
+
+- **Per-group node-to-node Raft.**
+
+  Every node hosts replicas for the same configured groups, and those replicas exchange gRPC Raft RPCs while non-leader HTTP writes forward to the current group leader.
 
 - **Hot ring on the write path.**
 
-  Appends commit into an in-memory ring and the local Raft log, a background flusher carries committed chunks to S3 for long-tail durability. S3 is never in the synchronous append latency.
+  Appends commit into an in-memory ring and Raft log while background flushers move older committed chunks to S3.
+
+- **Independent Raft groups.**
+
+  Each group has its own raft instance, log, state machine, hot ring, watchers, and cold-flush budget, with no cross-group commit protocol.
 
 - **Stateless HTTP front door.**
 
-  axum parses, routes, and renders the protocol; all stream state lives in the owning core. Follower nodes transparently forward writes to the group leader.
+  [axum](https://github.com/tokio-rs/axum) parses, routes, and renders the protocol while stream ownership and mutable state stay inside the owning group actor.
 
-Across nodes, each Raft group has peer replicas on its other voters; writes are leader-serialized within a group and acknowledged on a majority of peers. Full design: [Architecture overview](https://ursula.tonbo.io/docs/architecture/overview).
+Across nodes, writes are leader-serialized within one group and acknowledged after a majority of that group's replicas persist and apply the command. Full design: [Architecture overview](https://ursula.tonbo.io/docs/architecture/overview).
 
 ## Benchmark
 
