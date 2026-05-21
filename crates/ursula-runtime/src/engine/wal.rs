@@ -7,9 +7,8 @@ use serde::{Deserialize, Serialize};
 use ursula_shard::{BucketStreamId, ShardPlacement};
 use ursula_stream::{StreamCommand, StreamErrorCode, StreamSnapshot};
 
-use crate::cold_store::ColdStoreHandle;
-use crate::command::{GroupSnapshot, GroupWriteCommand};
-use crate::engine::{
+use super::in_memory::InMemoryGroupEngine;
+use super::{
     GroupAppendBatchFuture, GroupAppendFuture, GroupBootstrapStreamFuture, GroupCloseStreamFuture,
     GroupColdHotBacklogFuture, GroupCreateStreamFuture, GroupDeleteSnapshotFuture,
     GroupDeleteStreamFuture, GroupEngine, GroupEngineCreateFuture, GroupEngineError,
@@ -19,7 +18,8 @@ use crate::engine::{
     GroupReadSnapshotFuture, GroupReadStreamFuture, GroupSnapshotFuture,
     GroupTouchStreamAccessFuture, GroupWriteResponse,
 };
-use crate::engine_in_memory::InMemoryGroupEngine;
+use crate::cold_store::ColdStoreHandle;
+use crate::command::{GroupSnapshot, GroupWriteCommand};
 use crate::metrics::elapsed_ns;
 use crate::request::{
     AppendBatchRequest, AppendRequest, BootstrapStreamRequest, CloseStreamRequest,

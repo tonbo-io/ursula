@@ -10,7 +10,7 @@ use ursula_stream::{
 
 use crate::cold_store::{ColdStoreHandle, DEFAULT_CONTENT_TYPE};
 use crate::engine::GroupEngineError;
-use crate::engine_in_memory::InMemoryGroupEngine;
+use crate::engine::in_memory::InMemoryGroupEngine;
 use crate::error::RuntimeError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

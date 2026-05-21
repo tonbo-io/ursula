@@ -8,10 +8,9 @@
 //!   request values into the wire command consumed by `GroupEngine`.
 //! - [`error`]: runtime-level error type [`RuntimeError`].
 //! - [`engine`]: the `GroupEngine` trait, factory, metrics, and the boxed-future
-//!   type aliases that form the replaceable per-group engine boundary.
-//! - [`engine_in_memory`]: `InMemoryGroupEngine`, the hot-ring reference engine
-//!   used by tests and the `--raft-memory` cluster mode.
-//! - [`engine_wal`]: `WalGroupEngine`, the durable file-backed engine.
+//!   type aliases that form the replaceable per-group engine boundary, plus the
+//!   in-memory and WAL implementations under [`engine::in_memory`] and
+//!   [`engine::wal`].
 //! - [`runtime`]: `ShardRuntime`, `RuntimeConfig`, and per-core worker spawn.
 //! - [`core_worker`]: single-thread actor that owns groups for one core.
 //! - [`group_actor`]: per-group mailbox actor running inside a core worker.
@@ -21,8 +20,6 @@ mod cold_store;
 mod command;
 mod core_worker;
 mod engine;
-mod engine_in_memory;
-mod engine_wal;
 mod error;
 mod group_actor;
 mod metrics;
@@ -31,6 +28,8 @@ mod runtime;
 
 pub use cold_store::{ColdStore, ColdStoreHandle, new_cold_chunk_path, new_external_payload_path};
 pub use command::{GroupSnapshot, GroupWriteCommand};
+pub use engine::in_memory::{InMemoryGroupEngine, InMemoryGroupEngineFactory};
+pub use engine::wal::{WalGroupEngine, WalGroupEngineFactory};
 pub use engine::{
     GroupAppendBatchFuture, GroupAppendBatchResponse, GroupAppendFuture,
     GroupBootstrapStreamFuture, GroupCloseStreamFuture, GroupColdHotBacklogFuture,
@@ -42,8 +41,6 @@ pub use engine::{
     GroupReadStreamFuture, GroupReadStreamPartsFuture, GroupRequireLiveReadOwnerFuture,
     GroupSnapshotFuture, GroupTouchStreamAccessFuture, GroupWriteBatchFuture, GroupWriteResponse,
 };
-pub use engine_in_memory::{InMemoryGroupEngine, InMemoryGroupEngineFactory};
-pub use engine_wal::{WalGroupEngine, WalGroupEngineFactory};
 pub use error::RuntimeError;
 pub use metrics::{RuntimeMailboxSnapshot, RuntimeMetrics, RuntimeMetricsSnapshot};
 pub use request::{

@@ -12,7 +12,7 @@ use ursula_stream::{StreamReadSegment, StreamSnapshot, StreamStateMachine};
 
 use crate::cold_store::DEFAULT_CONTENT_TYPE;
 use crate::core_worker::{CoreWorker, ReadWatcher, ReadWatchers};
-use crate::engine_wal::group_log_path;
+use crate::engine::wal::group_log_path;
 use crate::metrics::{RuntimeMetricsInner, is_stale_cold_flush_candidate_error};
 
 fn runtime(core_count: usize, group_count: usize) -> ShardRuntime {

@@ -1,3 +1,6 @@
+pub mod in_memory;
+pub mod wal;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
