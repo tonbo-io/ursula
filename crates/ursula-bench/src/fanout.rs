@@ -194,9 +194,10 @@ async fn run_subscriber(
         loop {
             let dl = deadline.get().copied();
             if let Some(end) = dl
-                && Instant::now() >= end + Duration::from_secs(2) {
-                    break;
-                }
+                && Instant::now() >= end + Duration::from_secs(2)
+            {
+                break;
+            }
             let to = match dl {
                 Some(end) => end.saturating_duration_since(Instant::now()) + Duration::from_secs(2),
                 None => idle,
@@ -217,17 +218,18 @@ async fn run_subscriber(
             while let Some(idx) = find_event_end(&buf) {
                 let raw = buf.split_to(idx + 2).freeze();
                 if let Some(payload) = parse_sse_data(&raw)
-                    && let Some(sent_ns) = extract_send_ns(&payload) {
-                        let now_ns = unix_nanos_now();
-                        let lat_ns = now_ns.saturating_sub(sent_ns);
-                        let us_u128 = lat_ns / 1000;
-                        let us = us_u128.min(u128::from(local.high())) as u64;
-                        if us > 0 {
-                            let _ = local.record(us);
-                        }
-                        recv.fetch_add(1, Ordering::Relaxed);
-                        last_event_at = Instant::now();
+                    && let Some(sent_ns) = extract_send_ns(&payload)
+                {
+                    let now_ns = unix_nanos_now();
+                    let lat_ns = now_ns.saturating_sub(sent_ns);
+                    let us_u128 = lat_ns / 1000;
+                    let us = us_u128.min(u128::from(local.high())) as u64;
+                    if us > 0 {
+                        let _ = local.record(us);
                     }
+                    recv.fetch_add(1, Ordering::Relaxed);
+                    last_event_at = Instant::now();
+                }
             }
         }
         Ok(())

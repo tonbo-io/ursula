@@ -1,5 +1,5 @@
-use openraft::rt::WatchReceiver;
 use openraft::RaftNetworkV2;
+use openraft::rt::WatchReceiver;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;

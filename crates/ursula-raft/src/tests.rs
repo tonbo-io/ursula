@@ -1,8 +1,8 @@
+use openraft::RaftNetworkV2;
+use openraft::entry::RaftEntry;
 use openraft::rt::WatchReceiver;
 use openraft::storage::RaftLogStorage;
-use openraft::entry::RaftEntry;
 use openraft::vote::RaftLeaderId;
-use openraft::RaftNetworkV2;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::fs;

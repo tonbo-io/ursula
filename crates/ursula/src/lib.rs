@@ -51,11 +51,10 @@ use ursula_raft::{
 };
 use ursula_runtime::{
     AppendBatchRequest, AppendExternalRequest, AppendRequest, AppendResponse,
-    BootstrapStreamRequest, CloseStreamRequest, CreateStreamExternalRequest,
-    CreateStreamRequest, CreateStreamResponse, DeleteSnapshotRequest, DeleteStreamRequest,
-    ExternalPayloadRef, HeadStreamRequest, PlanColdFlushRequest,
-    ProducerRequest, PublishSnapshotRequest, ReadSnapshotRequest, ReadStreamRequest, RuntimeError,
-    ShardRuntime, new_external_payload_path,
+    BootstrapStreamRequest, CloseStreamRequest, CreateStreamExternalRequest, CreateStreamRequest,
+    CreateStreamResponse, DeleteSnapshotRequest, DeleteStreamRequest, ExternalPayloadRef,
+    HeadStreamRequest, PlanColdFlushRequest, ProducerRequest, PublishSnapshotRequest,
+    ReadSnapshotRequest, ReadStreamRequest, RuntimeError, ShardRuntime, new_external_payload_path,
 };
 use ursula_shard::{BucketStreamId, RaftGroupId};
 
@@ -90,7 +89,6 @@ const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_LONG_POLL_TIMEOUT_MS: u64 = 1_000;
 const MAX_LONG_POLL_TIMEOUT_MS: u64 = 60_000;
 const V1_DEFAULT_BUCKET: &str = "_default";
-
 
 struct CreateStreamHttpResponseInput<'a> {
     response: CreateStreamResponse,
@@ -575,12 +573,11 @@ fn router_from_state(state: HttpState) -> Router {
         .with_state(state)
 }
 
-
-
-
-
-
-pub(crate) fn should_externalize_payload(state: &HttpState, payload_len: usize, allowed: bool) -> bool {
+pub(crate) fn should_externalize_payload(
+    state: &HttpState,
+    payload_len: usize,
+    allowed: bool,
+) -> bool {
     allowed
         && payload_len > 0
         && state.runtime.has_cold_store()
@@ -2066,7 +2063,9 @@ pub(crate) fn request_content_type(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| DEFAULT_CONTENT_TYPE.to_owned())
 }
 
-pub(crate) fn stream_forked_from(headers: &HeaderMap) -> Result<Option<BucketStreamId>, BoxResponse> {
+pub(crate) fn stream_forked_from(
+    headers: &HeaderMap,
+) -> Result<Option<BucketStreamId>, BoxResponse> {
     let Some(raw) = header_value(headers, HEADER_STREAM_FORKED_FROM) else {
         return Ok(None);
     };
@@ -2107,7 +2106,9 @@ pub(crate) fn normalize_content_type(value: &str) -> String {
         .join("; ")
 }
 
-pub(crate) fn stream_lifetime(headers: &HeaderMap) -> Result<(Option<u64>, Option<u64>), BoxResponse> {
+pub(crate) fn stream_lifetime(
+    headers: &HeaderMap,
+) -> Result<(Option<u64>, Option<u64>), BoxResponse> {
     let ttl = header_value(headers, HEADER_STREAM_TTL)
         .map(parse_stream_ttl)
         .transpose()
@@ -2276,7 +2277,6 @@ fn forward_hop(headers: &HeaderMap) -> u8 {
         .and_then(|value| value.parse::<u8>().ok())
         .unwrap_or(0)
 }
-
 
 #[cfg(test)]
 mod tests;
