@@ -4,24 +4,18 @@ sidebarTitle: Quick Start
 description: Run Ursula locally, create a stream, append data, and subscribe with SSE.
 ---
 
-The Ursula HTTP binary lives in the `ursula` crate of the workspace. Start a local node with in-memory Raft (no on-disk state, good for kicking the tires):
+> For now, Ursula builds from Rust source. Pre-built release binaries are on the way.
+
+Start a local node from the workspace root. The default is in-memory (no on-disk state, good for kicking the tires):
 
 ```bash
-cargo run -p ursula --bin ursula -- \
-  --listen 127.0.0.1:4437 \
-  --core-count 4 \
-  --raft-group-count 64 \
-  --raft-memory
+cargo run --bin ursula
 ```
 
-For local WAL-backed persistence instead, point `--wal-dir` at an empty directory:
+It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses the in-memory engine. For local WAL-backed persistence instead, point `--wal-dir` at an empty directory:
 
 ```bash
-cargo run -p ursula --bin ursula -- \
-  --listen 127.0.0.1:4437 \
-  --core-count 4 \
-  --raft-group-count 64 \
-  --wal-dir ./data/wal
+cargo run --bin ursula -- --wal-dir ./data/wal
 ```
 
 Then drive the HTTP API with `curl` in another terminal.

@@ -13,6 +13,8 @@ description: "Extensions to the Durable Streams Protocol: bucket namespacing, sn
 
 This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, and multipart bootstrap delivery. It also documents Ursula-specific append batching as an implementation extension for high-throughput small-event writes.
 
+The snapshot and bootstrap design in sections 2 and 3 was proposed by [Loro](https://loro.dev/); Ursula adopts that design.
+
 All base protocol semantics remain in effect. Where this document is silent, the base protocol governs.
 
 ## Terminology

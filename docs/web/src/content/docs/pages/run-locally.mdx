@@ -5,30 +5,30 @@ description: Start a single-node Ursula server and verify the HTTP API.
 
 Ursula's HTTP server is the `ursula` binary. It takes its configuration from CLI flags and a small set of environment variables - there is no config file yet.
 
-## In-memory (fastest, volatile)
+## Default (in-process, non-replicated)
 
-Best for first-impression testing. Nothing is persisted to disk:
+With no storage flag, Ursula runs an in-process non-replicated default runtime (no Raft at all). Nothing is persisted. Best for state-machine smoke tests and first-impression testing:
 
 ```bash
-cargo run -p ursula --bin ursula -- \
-  --listen 127.0.0.1:4437 \
-  --core-count 4 \
-  --raft-group-count 64 \
-  --raft-memory
+cargo run --bin ursula
 ```
 
-Without `--raft-memory`, `--wal-dir`, or `--raft-log-dir`, Ursula runs an in-process non-replicated default runtime (no Raft at all). That's useful for state-machine smoke tests but not how production runs.
+It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses the in-memory engine.
+
+## In-memory Raft
+
+OpenRaft with an in-memory log. Fast iteration, no persistence, but the runtime exercises the real Raft path:
+
+```bash
+cargo run --bin ursula -- --raft-memory
+```
 
 ## WAL-backed single node
 
 Persistent local storage. Streams survive a restart:
 
 ```bash
-cargo run -p ursula --bin ursula -- \
-  --listen 127.0.0.1:4437 \
-  --core-count 4 \
-  --raft-group-count 64 \
-  --wal-dir ./data/wal
+cargo run --bin ursula -- --wal-dir ./data/wal
 ```
 
 The `--wal-dir` directory will contain protobuf-framed Raft log records per group plus a shared `journal.bin` per core. Removing the directory wipes state cleanly.

@@ -3,7 +3,7 @@ title: Install
 description: Build Ursula from source and prepare a host to run the server.
 ---
 
-Ursula is currently installed from source. There is no embedded KV dependency, so the build is plain Rust plus the standard C toolchain that Cargo expects.
+Ursula is currently installed from source. Pre-built release binaries are on the way. There is no embedded KV dependency, so the build is plain Rust plus the standard C toolchain that Cargo expects.
 
 ## Prerequisites
 
@@ -53,14 +53,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 ./target/release/ursula --help
 ```
 
-Should print the supported CLI flags. Then run a short smoke server:
+Should print the supported CLI flags. Then run a short smoke server (defaults to `127.0.0.1:4437`, in-memory engine, core count from your CPU):
 
 ```bash
-./target/release/ursula \
-  --listen 127.0.0.1:4437 \
-  --core-count 2 \
-  --raft-group-count 16 \
-  --raft-memory &
+./target/release/ursula &
 
 curl -X PUT http://127.0.0.1:4437/demo
 curl -X PUT http://127.0.0.1:4437/demo/hello

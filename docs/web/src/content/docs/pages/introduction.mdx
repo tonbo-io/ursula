@@ -1,18 +1,16 @@
 ---
 title: Ursula
 sidebarTitle: Introduction
-description: A thread-per-core, multi-Raft implementation of the Durable Streams protocol over HTTP, with S3-backed cold storage.
+description: A self-hosted, distributed server for append-only event timelines. Thread-per-core, multi-Raft, S3-backed.
 ---
 
 <Info>
 Ursula is built by <a href="https://tonbo.io/" target="_blank" rel="noopener noreferrer"><img src="/assets/tonbo.png" alt="" width="16" height="16" style={{verticalAlign: "-3px", borderRadius: "3px", marginRight: "4px"}} />Tonbo</a>.
 </Info>
 
-Ursula is an open-source implementation of the [Durable Streams Protocol](/docs/specs/durable-stream): URL-addressable, append-only byte streams that can be replayed, resumed, and tailed with plain HTTP.
+Ursula is a self-hosted, distributed server for the replayable, append-only event timelines behind document edits, agent runs, workflows, and chat. It speaks the [Durable Streams Protocol](/docs/specs/durable-stream) over plain HTTP and SSE.
 
-Ursula stores stream data directly on S3, with quorum-replicated in-memory front-ends giving you single-digit-millisecond appends and live tail on top of object-store durability, with no separate broker, no batched 250 ms commits, and no S3 Express bill.
-
-## What it is
+Quorum-replicated in-memory front-ends give you single-digit-millisecond appends and live tail on top of S3 durability, with no separate broker, no batched 250 ms commits, and no S3 Express bill.
 
 - **HTTP-native.** `PUT` creates, `POST` appends, `GET` replays or tails with long-poll/SSE. Any HTTP client is a valid client.
 - **One timeline per resource.** A stream per document, session, workflow, room, or agent run, instead of a few high-throughput pipelines.
@@ -21,14 +19,12 @@ Ursula stores stream data directly on S3, with quorum-replicated in-memory front
 
 ## Run locally
 
+For now, Ursula builds from Rust source. Pre-built release binaries are on the way.
+
 Start a single in-memory node (fast iteration, no persistence):
 
 ```bash
-cargo run -p ursula --bin ursula -- \
-  --listen 127.0.0.1:4437 \
-  --core-count 4 \
-  --raft-group-count 64 \
-  --raft-memory
+cargo run --bin ursula
 ```
 
 Create a stream, append bytes, and read them back:
@@ -46,6 +42,11 @@ curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
 
 ## Learn more
 
-- **[Why Ursula](/docs/why-ursula):** the per-entity timeline model and what it replaces
+- **[Why Ursula](/docs/why-ursula):** the four properties Ursula keeps that other servers force you to trade
 - **[Architecture](/docs/architecture/overview):** thread-per-core, multi-Raft, hot/cold tiers
 - **[Protocol Spec](/docs/specs/durable-stream):** Durable Streams plus [Ursula's extensions](/docs/specs/extensions)
+
+## Credits
+
+- **[ElectricSQL](https://electric-sql.com/)** for the original Durable Streams Protocol that Ursula implements.
+- **[Loro](https://loro.dev/)** for the snapshot and replay extension design that Ursula adopted on top of the base protocol.

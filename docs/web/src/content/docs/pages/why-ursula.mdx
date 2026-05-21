@@ -1,8 +1,23 @@
 ---
 title: Why Ursula
 sidebarTitle: Why Ursula
-description: Where Ursula fits as a durable, replayable stream layer for application state.
+description: The four properties Ursula keeps that other servers force you to trade, and the per-entity timeline model that makes the pattern simple to build on.
 ---
+
+## Self-hosted, low-latency, S3-backed, quorum-replicated
+
+A new generation of event streams lives outside the broker network. Document editors, agents, and durable workflows need timelines that browsers, mobile apps, and serverless functions can read, write, and tail over the public internet. That asks for HTTP-native, distributed, S3-backed infrastructure, not the SDK-locked, single-network shape Kafka-style brokers were built for.
+
+The [Durable Streams Protocol](/docs/specs/durable-stream) nails that wire format, but its reference server is a single process: a node loss is data loss. The other servers we evaluated each force you to give up one of four things this primitive deserves to keep:
+
+- **Open-source self-hosting.**
+- **Low write latency** (sub-50 ms appends, no batching window required).
+- **Plain S3 economics** (cold tier on standard S3, no S3 Express tier, no per-GB SaaS markup).
+- **Quorum-replicated durability** (acknowledged writes survive a single-node failure).
+
+Ursula keeps all four. For the head-to-head numbers, see [How Ursula compares](/docs/competitive-comparison).
+
+## One timeline per entity
 
 Most event systems multiplex many entities into shared channels and rebuild per-entity state downstream. Ursula inverts that: each document, session, task, room, or agent run gets its own durable timeline. Writers append directly to it; readers resume from its offsets.
 

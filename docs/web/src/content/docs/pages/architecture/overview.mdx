@@ -14,8 +14,8 @@ Ursula keeps S3 off the write path entirely. Writes go to a cluster of nodes tha
 
 Two structural choices shape the rest of the design:
 
-1. **Thread-per-core shard ownership.** Every stream is statically hashed to one specific CPU core on each node. That core handles all reads and writes for its streams, in order, with no cross-core synchronization on the hot path.
-2. **Multi-Raft.** Ursula runs hundreds to thousands of small Raft groups per cluster, not one log per node. Each stream hashes to a group, each group pins to a core. An unhealthy follower for one group does not stall traffic for another.
+1. **[Thread-per-core](https://seastar.io/shared-nothing/) shard ownership.** Every stream is statically hashed to one specific CPU core on each node. That core handles all reads and writes for its streams, in order, with no cross-core synchronization on the hot path.
+2. **[Multi-Raft](https://tikv.org/deep-dive/scalability/multi-raft/).** Ursula runs hundreds to thousands of small Raft groups per cluster, not one log per node. Each stream hashes to a group, each group pins to a core. An unhealthy follower for one group does not stall traffic for another.
 
 Together, write throughput scales with healthy cores across the cluster instead of with any single leader's bandwidth, and failure domains stay per-group rather than per-node.
 
