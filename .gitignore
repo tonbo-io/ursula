@@ -11,6 +11,9 @@ docs/web/public/llms*.txt
 docs/web/*.tsbuildinfo
 docs/web/vite.config.d.ts
 
+# Cloudflare Pages / Wrangler deploy cache
+.wrangler/
+
 # Local benchmark output
 .bench-results/
 

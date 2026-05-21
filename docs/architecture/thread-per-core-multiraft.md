@@ -415,14 +415,11 @@ fsync/replication latency and, for 1-byte cold flush, cold-manifest
 write-amplification. This is why EC2 and in-memory Raft-log conformance remain
 the current gates for multi-node protocol behavior, while local durable-log
 runs are treated as latency diagnostics.
-A separate `ursula-raw` diagnostic binary implements only the
-`perf_compare` create and append-batch subset over the same runtime. It exists
-to test ingress overhead and is not a replacement for the protocol adapter.
-The normal `ursula` binary can also be launched with `--raft-memory` for
-the OpenRaft in-memory log engine, `--wal-dir DIR` for the diagnostic per-group
-WAL engine, or `--raft-log-dir DIR` for the OpenRaft-backed file-log engine.
-These modes keep protocol handling in the same HTTP adapter while changing only
-the runtime's group-engine factory.
+The `ursula` binary can be launched with `--raft-memory` for the OpenRaft
+in-memory log engine, `--wal-dir DIR` for the diagnostic per-group WAL engine,
+or `--raft-log-dir DIR` for the OpenRaft-backed file-log engine. These modes
+keep protocol handling in the same HTTP adapter while changing only the
+runtime's group-engine factory.
 Append, close-only, and append-batch requests parse `Producer-Id`,
 `Producer-Epoch`, and `Producer-Seq` together and route them into the state
 machine. Successful producer requests echo epoch/sequence headers, producer

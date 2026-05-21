@@ -3,41 +3,81 @@
 [![Crates.io](https://img.shields.io/crates/v/ursula.svg)](https://crates.io/crates/ursula)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-📖 Docs: **[ursula.tonbo.io](https://ursula.tonbo.io)**
+Docs: **[ursula.tonbo.io](https://ursula.tonbo.io)**
 
-## What
+Ursula is a self-hosted, distributed server for the replayable, append-only event timelines behind document edits, agent runs, workflows, and chat. It speaks the [Durable Streams Protocol](https://github.com/durable-streams/durable-streams) over plain HTTP and SSE.
 
-Ursula is a thread-per-core, multi-Raft server for the [Durable Streams Protocol](https://github.com/durable-streams/durable-streams): distributed, HTTP-native, append-only byte streams with quorum-replicated writes and S3-backed cold storage.
+## Self-hosted, low-latency, S3-backed, quorum-replicated
 
-## Why
+Event streams live outside the broker network. Document editors, agents, and durable workflows need timelines that browsers, mobile apps, and serverless functions can read, write, and tail over the public internet. That asks for HTTP-native, distributed, S3-backed infrastructure, not the SDK-locked, single-network shape Kafka-style brokers were built for.
 
-Every modern app produces a timeline: document edits, agent runs, workflow steps, collaborative strokes. The shape is always the same: ordered, append-only, replayable, live-tailable. There is no shared infrastructure for it. Teams keep rebuilding it on databases, brokers, or object stores, each time with the same recovery edge cases.
-
-The [Durable Streams Protocol](https://github.com/durable-streams/durable-streams) is the right primitive: small, HTTP-native, no required client library. But its reference server runs as a single process, so a node loss is data loss. The alternatives we evaluated each force you to give up one of three things this primitive deserves to keep:
+The [Durable Streams Protocol](https://github.com/durable-streams/durable-streams) nails that wire format, but its reference server is a single process: a node loss is data loss. The other servers we evaluated each force you to give up one of four things this primitive deserves to keep:
 
 - **Open-source self-hosting.**
-- **Low write latency** (sub-50 ms appends without paying S3 Express prices or batching to 250 ms+).
+- **Low write latency** (sub-50 ms P99 appends, no batching window required).
+- **Plain S3 economics** (cold tier on standard S3, no S3 Express tier, no per-GB SaaS markup).
 - **Quorum-replicated durability** (acknowledged writes survive a single-node failure).
 
-Ursula is what it looks like to keep all three. Clients see the same URLs, headers, and SSE format the protocol specifies. Three or five nodes underneath act as one durable-streams server, with:
+Ursula keeps all four.
 
-- Per-group Raft replication, leader-serialized appends, transparent follower forwarding.
-- An in-memory hot ring on the write path so appends commit in low milliseconds. A background flusher carries chunks to S3 for long-tail durability. S3 is never in the hot path.
-- Thread-per-core, multi-Raft placement so aggregate throughput scales with the number of healthy cores across the cluster, not with the bandwidth of a single Raft leader.
+Full design intent: [Why Ursula](https://ursula.tonbo.io/docs/why-ursula) · [How Ursula compares](https://ursula.tonbo.io/docs/competitive-comparison).
 
-Full design intent: [Why Ursula](https://ursula.tonbo.io/docs/why-ursula) · [Architecture overview](https://ursula.tonbo.io/docs/architecture/overview).
+## Thread-per-core, multi-Raft, S3 as cold tier
 
-## How
+Three or five Ursula processes act as one durable-streams server. The structure that makes this scale is the same inside each node: cores own disjoint sets of Raft groups, and every group keeps its hot bytes in memory with S3 as the cold backstop.
+
+```text
+                  HTTP / SSE clients
+                          |
+                          v
+  +-------------------------------------------------+
+  |             HTTP stateless front door           |
+  +---------+--------------+--------------+---------+
+            v              v              v
+          core 0         core 1         core 2     ...
+       +----------+   +----------+   +----------+
+       | Raft     |   | Raft     |   | Raft     |
+       | groups + |   | groups + |   | groups + |
+       | hot ring |   | hot ring |   | hot ring |
+       +-----+----+   +-----+----+   +-----+----+
+             |              |              |
+             +--------------+--------------+
+                            |  background flush
+                            v
+                    +----------------+
+                    |  S3 cold tier  |
+                    +----------------+
+```
+
+- **[Thread-per-core](https://seastar.io/shared-nothing/), [multi-Raft](https://tikv.org/deep-dive/scalability/multi-raft/).**
+
+  Each core owns a disjoint slice of Raft groups, with no shared mutable state across cores. Aggregate throughput scales with healthy cores in the cluster, not with the bandwidth of a single Raft leader.
+
+- **Hot ring on the write path.**
+
+  Appends commit into an in-memory ring and the local Raft log, a background flusher carries committed chunks to S3 for long-tail durability. S3 is never in the synchronous append latency.
+
+- **Stateless HTTP front door.**
+
+  axum parses, routes, and renders the protocol; all stream state lives in the owning core. Follower nodes transparently forward writes to the group leader.
+
+Across nodes, each Raft group has peer replicas on its other voters; writes are leader-serialized within a group and acknowledged on a majority of peers. Full design: [Architecture overview](https://ursula.tonbo.io/docs/architecture/overview).
+
+## Benchmark
+
+On EC2 (3 × `c7g.4xlarge`, Raft quorum), Ursula sustains **35.2k appends/sec** at 500 streams (5.9× single-node Durable Streams, 5.2× S2 Lite, both on 1 × `c7g.4xlarge`) and delivers SSE fan-out to 1000 subscribers at **6.1 ms p99** (160× faster than Durable Streams, 18× faster than S2 Lite). Apples-to-apples methodology, full charts, replay and latency cuts: [ursula.tonbo.io/benchmark](https://ursula.tonbo.io/benchmark).
+
+## Quickstart
+
+> For now, Ursula builds from Rust source. Pre-built release binaries are on the way.
 
 Run a single in-memory node (no persistence, good for kicking the tires):
 
 ```bash
-cargo run -p ursula --bin ursula -- \
-  --listen 127.0.0.1:4437 \
-  --core-count 4 \
-  --raft-group-count 64 \
-  --raft-memory
+cargo run --bin ursula
 ```
+
+It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses an in-memory engine. Override with `--listen`, `--core-count`, `--raft-group-count`, or pick a persistent backend with `--wal-dir` / `--raft-log-dir`.
 
 Create a bucket and stream, append bytes, read them back:
 
@@ -52,20 +92,31 @@ curl -X POST http://127.0.0.1:4437/demo/hello \
 curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
 ```
 
+Tail the stream live over SSE, new appends arrive as `event: data` lines immediately:
+
+```bash
+curl -N 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
+```
+
 Walkthroughs: [Quick Start](https://ursula.tonbo.io/docs/quick-start) · [Deploy a cluster](https://ursula.tonbo.io/docs/deploy-cluster) · [Configure S3](https://ursula.tonbo.io/docs/configure-s3).
 
-## Next steps
+## Roadmap
 
-The `v0.1.x` line is a working prototype. The roadmap from here:
+The `v0.1.x` line is a working prototype. Next on deck:
 
-- **`if-match` conditional append.** Optimistic concurrency control on the append path. An `if-match: <offset>` header lets a writer commit only when the stream tip hasn't moved, so concurrent writers can coordinate without an external lock. Already implemented in `riverrun`, and the same semantics need to land in Ursula's HTTP adapter and Raft state machine.
-- **WASM stateless compute extension.** Implement the [Durable Streams WASM compute extension](https://github.com/durable-streams/durable-streams): bind a deterministic WASM module to a stream and let the server materialize per-stream state, enabling automatic compaction and `410 Gone` bootstrap recovery without application-side checkpointing.
+- **`if-match` conditional append.** Optimistic concurrency control on the append path. An `if-match: <offset>` header lets a writer commit only when the stream tip hasn't moved, so concurrent writers can coordinate without an external lock. The semantics need to land in Ursula's HTTP adapter and Raft state machine.
+- **Stateless WASM compute over streams.** A planned Ursula extension: bind a deterministic WASM module to a stream so the server can materialize per-stream state, enabling automatic compaction and `410 Gone` bootstrap recovery without application-side checkpointing.
 - **Dynamic membership.** Online voter / learner reconfiguration and orchestrated rolling membership changes (today's clusters are static).
 - **Backup and restore tooling.** A supported recovery path for total-cluster loss from the S3 cold tier (today there is none).
 - **Client SDKs.** Ergonomic Rust and TypeScript clients on top of the HTTP API.
+
+## Credits
+
+- **[ElectricSQL](https://electric-sql.com/)** for the original Durable Streams Protocol that Ursula implements.
+- **[Loro](https://loro.dev/)** for the snapshot and replay extension design that Ursula adopted on top of the base protocol.
 
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE).
 
-Built by [Tonbo](https://tonbo.io/).
+Built by [Tonbo](https://tonbo.io/), an open-source storage team.
