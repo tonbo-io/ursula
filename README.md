@@ -7,7 +7,7 @@ Docs: **[ursula.tonbo.io](https://ursula.tonbo.io)**
 
 Ursula is a self-hosted, distributed server for the replayable, append-only event timelines behind document edits, agent runs, workflows, and chat. It speaks the [Durable Streams Protocol](https://github.com/durable-streams/durable-streams) over plain HTTP and SSE.
 
-## Self-hosted, low-latency, S3-backed, quorum-replicated
+## What Ursula keeps
 
 Event streams live outside the broker network. Document editors, agents, and durable workflows need timelines that browsers, mobile apps, and serverless functions can read, write, and tail over the public internet. That asks for HTTP-native, distributed, S3-backed infrastructure, not the SDK-locked, single-network shape Kafka-style brokers were built for.
 
@@ -22,7 +22,40 @@ Ursula keeps all four.
 
 Full design intent: [Why Ursula](https://ursula.tonbo.io/docs/why-ursula) · [How Ursula compares](https://ursula.tonbo.io/docs/competitive-comparison).
 
-## Thread-per-core, multi-Raft, S3 as cold tier
+## Quickstart
+
+> For now, Ursula builds from Rust source. Pre-built release binaries are on the way.
+
+Run a single in-memory node (no persistence, good for kicking the tires):
+
+```bash
+cargo run --bin ursula
+```
+
+It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses an in-memory engine. Override with `--listen`, `--core-count`, `--raft-group-count`, or pick a persistent backend with `--wal-dir` / `--raft-log-dir`.
+
+Create a bucket and stream, append bytes, read them back:
+
+```bash
+curl -X PUT http://127.0.0.1:4437/demo
+curl -X PUT http://127.0.0.1:4437/demo/hello
+
+curl -X POST http://127.0.0.1:4437/demo/hello \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary 'hello world'
+
+curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
+```
+
+Tail the stream live over SSE, new appends arrive as `event: data` lines immediately:
+
+```bash
+curl -N 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
+```
+
+Walkthroughs: [Quick Start](https://ursula.tonbo.io/docs/quick-start) · [Deploy a cluster](https://ursula.tonbo.io/docs/deploy-cluster) · [Configure S3](https://ursula.tonbo.io/docs/configure-s3).
+
+## Architecture
 
 Three or five Ursula processes act as one durable-streams server. A stream hashes to one Raft group, that group has one replica on each voter node, and the same group ID is owned by a deterministic core on every node. Groups replicate independently; there is no cross-group transaction path.
 
@@ -82,39 +115,6 @@ Across nodes, writes are leader-serialized within one group and acknowledged aft
 ## Benchmark
 
 On EC2 (3 × `c7g.4xlarge`, Raft quorum), Ursula sustains **35.2k appends/sec** at 500 streams (5.9× single-node Durable Streams, 5.2× S2 Lite, both on 1 × `c7g.4xlarge`) and delivers SSE fan-out to 1000 subscribers at **6.1 ms p99** (160× faster than Durable Streams, 18× faster than S2 Lite). Apples-to-apples methodology, full charts, replay and latency cuts: [ursula.tonbo.io/benchmark](https://ursula.tonbo.io/benchmark).
-
-## Quickstart
-
-> For now, Ursula builds from Rust source. Pre-built release binaries are on the way.
-
-Run a single in-memory node (no persistence, good for kicking the tires):
-
-```bash
-cargo run --bin ursula
-```
-
-It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses an in-memory engine. Override with `--listen`, `--core-count`, `--raft-group-count`, or pick a persistent backend with `--wal-dir` / `--raft-log-dir`.
-
-Create a bucket and stream, append bytes, read them back:
-
-```bash
-curl -X PUT http://127.0.0.1:4437/demo
-curl -X PUT http://127.0.0.1:4437/demo/hello
-
-curl -X POST http://127.0.0.1:4437/demo/hello \
-  -H 'Content-Type: application/octet-stream' \
-  --data-binary 'hello world'
-
-curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
-```
-
-Tail the stream live over SSE, new appends arrive as `event: data` lines immediately:
-
-```bash
-curl -N 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
-```
-
-Walkthroughs: [Quick Start](https://ursula.tonbo.io/docs/quick-start) · [Deploy a cluster](https://ursula.tonbo.io/docs/deploy-cluster) · [Configure S3](https://ursula.tonbo.io/docs/configure-s3).
 
 ## Roadmap
 
