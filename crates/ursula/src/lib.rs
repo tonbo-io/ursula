@@ -544,6 +544,10 @@ fn router_from_state(state: HttpState) -> Router {
             post(add_raft_learner),
         )
         .route(
+            "/__ursula/raft/{raft_group_id}/nodes/{node_id}/allow-next-revert",
+            post(allow_raft_node_next_revert),
+        )
+        .route(
             "/v1/stream/{*path}",
             put(create_stream_v1)
                 .post(append_stream_v1)
@@ -907,6 +911,46 @@ pub(crate) async fn add_raft_learner(
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("add raft learner: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+pub(crate) async fn allow_raft_node_next_revert(
+    State(state): State<HttpState>,
+    Path((raft_group_id, node_id)): Path<(u64, u64)>,
+) -> Response {
+    let Some(registry) = state.raft_registry() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "raft registry is not configured for this server",
+        )
+            .into_response();
+    };
+    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
+    };
+    let Some(raft) = registry.get(raft_group_id) else {
+        return (StatusCode::NOT_FOUND, "raft group is not registered").into_response();
+    };
+    match raft.trigger().allow_next_revert(&node_id, true).await {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            format!(
+                "{{\"raft_group_id\":{},\"node_id\":{},\"allow_next_revert\":true}}",
+                raft_group_id.0, node_id
+            ),
+        )
+            .into_response(),
+        Ok(Err(err)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("allow raft node next revert: {err}"),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("allow raft node next revert: {err}"),
         )
             .into_response(),
     }

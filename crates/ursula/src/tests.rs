@@ -2231,6 +2231,194 @@ async fn static_grpc_follower_serves_replicated_catch_up_read_without_leader_pro
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn static_grpc_memory_node_rejoins_empty_after_allowed_log_revert() {
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    let mut addrs = Vec::new();
+    for node_id in 1..=3u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        peers.push((node_id, format!("http://{addr}")));
+        addrs.push(addr);
+        listeners.push(listener);
+    }
+
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        nodes.push(
+            spawn_static_grpc_test_node(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                node_id == 1,
+                1,
+            )
+            .await,
+        );
+    }
+
+    for (index, node) in nodes.iter().enumerate().skip(1) {
+        tokio::time::timeout(Duration::from_secs(10), node.runtime.warm_all_groups())
+            .await
+            .unwrap_or_else(|_| panic!("warm follower node {} group timed out", index + 1))
+            .expect("warm follower group");
+    }
+    tokio::time::timeout(Duration::from_secs(10), nodes[0].runtime.warm_all_groups())
+        .await
+        .expect("warm leader group timed out")
+        .expect("warm leader group");
+
+    for node in &nodes {
+        let raft = node.registry.get(RaftGroupId(0)).expect("registered group");
+        raft.wait(Some(Duration::from_secs(5)))
+            .current_leader(1, "static gRPC Raft cluster should elect node 1")
+            .await
+            .expect("wait for shared leader");
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build reqwest client");
+    let stream_id = BucketStreamId::new("benchcmp", "memory-rejoin-empty");
+    let leader_base = peers[0].1.as_str();
+    let create = client
+        .put(format!("{leader_base}/benchcmp/memory-rejoin-empty"))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body("before-restart")
+        .send()
+        .await
+        .expect("create stream through leader");
+    assert_eq!(create.status(), StatusCode::CREATED);
+
+    let placement = nodes[0].runtime.locate(&stream_id);
+    wait_raft_state_machine_payload(
+        &nodes[2].registry,
+        placement,
+        &stream_id,
+        b"before-restart",
+        "node 3 replicated initial payload before shutdown",
+    )
+    .await;
+
+    let stopped_node = nodes.remove(2);
+    stopped_node.shutdown().await;
+
+    let append_while_down = client
+        .post(format!("{leader_base}/benchcmp/memory-rejoin-empty"))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body("-while-down")
+        .send()
+        .await
+        .expect("append while node 3 is down");
+    assert_eq!(append_while_down.status(), StatusCode::NO_CONTENT);
+
+    let leader_raft = nodes[0].registry.get(RaftGroupId(0)).expect("leader group");
+    let snapshot_log_id = leader_raft
+        .metrics()
+        .borrow_watched()
+        .last_applied
+        .expect("leader applied write while node 3 was down");
+    leader_raft
+        .trigger()
+        .snapshot()
+        .await
+        .expect("trigger leader snapshot");
+    leader_raft
+        .wait(Some(Duration::from_secs(5)))
+        .snapshot(
+            snapshot_log_id,
+            "leader snapshot includes quorum-only write",
+        )
+        .await
+        .expect("wait for leader snapshot");
+    leader_raft
+        .trigger()
+        .purge_log(snapshot_log_id.index())
+        .await
+        .expect("trigger leader purge");
+    leader_raft
+        .wait(Some(Duration::from_secs(5)))
+        .purged(
+            Some(snapshot_log_id),
+            "leader purged snapshotted quorum-only write",
+        )
+        .await
+        .expect("wait for leader purge");
+
+    let allow_revert = client
+        .post(format!(
+            "{leader_base}/__ursula/raft/0/nodes/3/allow-next-revert"
+        ))
+        .send()
+        .await
+        .expect("allow node 3 log reversion through admin endpoint");
+    assert_eq!(allow_revert.status(), StatusCode::OK);
+
+    let restarted_listener = tokio::net::TcpListener::bind(addrs[2])
+        .await
+        .expect("rebind node 3 listener");
+    let restarted = spawn_static_grpc_test_node(
+        3,
+        restarted_listener,
+        peers.clone(),
+        peers.clone(),
+        false,
+        1,
+    )
+    .await;
+    restarted
+        .runtime
+        .warm_all_groups()
+        .await
+        .expect("warm restarted empty node 3 group");
+    let restarted_raft = restarted
+        .registry
+        .get(RaftGroupId(0))
+        .expect("restarted group");
+    restarted_raft
+        .wait(Some(Duration::from_secs(10)))
+        .snapshot(
+            snapshot_log_id,
+            "restarted empty node installed leader snapshot",
+        )
+        .await
+        .expect("wait for restarted node snapshot");
+
+    wait_raft_state_machine_payload(
+        &restarted.registry,
+        placement,
+        &stream_id,
+        b"before-restart-while-down",
+        "restarted empty memory node caught up from surviving quorum",
+    )
+    .await;
+
+    let rejoined_read = client
+        .get(format!(
+            "{}/benchcmp/memory-rejoin-empty?offset=0&max_bytes=64",
+            peers[2].1
+        ))
+        .send()
+        .await
+        .expect("read from restarted empty node");
+    assert_eq!(rejoined_read.status(), StatusCode::OK);
+    assert_eq!(
+        &rejoined_read.bytes().await.expect("rejoined node body")[..],
+        b"before-restart-while-down"
+    );
+
+    nodes.push(restarted);
+    for node in nodes {
+        node.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn static_grpc_raft_group_engine_replicates_between_routers() {
     let mut listeners = Vec::new();
     let mut peers = Vec::new();
