@@ -161,7 +161,7 @@ pub async fn run(args: BootstrapArgs) -> Result<BootstrapResult> {
         let hist = hist.clone();
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
-            run_client(&backend, &stream, pre_bytes, ok, bp, err, bytes_total, hist).await;
+            run_client(&backend, idx, &stream, pre_bytes, ok, bp, err, bytes_total, hist).await;
         }));
     }
 
@@ -201,6 +201,7 @@ pub async fn run(args: BootstrapArgs) -> Result<BootstrapResult> {
 #[allow(clippy::too_many_arguments)]
 async fn run_client(
     backend: &Backend,
+    base_idx: usize,
     stream: &str,
     pre_bytes: u64,
     ok: Arc<AtomicU64>,
@@ -210,7 +211,11 @@ async fn run_client(
     hist: Arc<Mutex<Histogram<u64>>>,
 ) {
     let started = Instant::now();
-    let req = match backend.replay_request(stream, pre_bytes.saturating_mul(2).max(64 * 1024)) {
+    let req = match backend.replay_request_for(
+        base_idx,
+        stream,
+        pre_bytes.saturating_mul(2).max(64 * 1024),
+    ) {
         Ok(r) => r,
         Err(_) => {
             err.fetch_add(1, Ordering::Relaxed);

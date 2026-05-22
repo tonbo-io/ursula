@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::error::Error as StdError;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -70,9 +72,16 @@ pub struct MultiStreamResult {
     pub rate_per_stream: u64,
     pub elapsed_secs: f64,
     pub counts: Counts,
+    pub errors: Vec<ErrorCount>,
     pub aggregate_ops_per_sec: f64,
     pub per_stream_ops_per_sec_mean: f64,
     pub latency_ms: LatencySummary,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ErrorCount {
+    pub error: String,
+    pub count: u64,
 }
 
 pub async fn run(args: MultiStreamArgs) -> Result<MultiStreamResult> {
@@ -98,6 +107,7 @@ pub async fn run(args: MultiStreamArgs) -> Result<MultiStreamResult> {
     let ok = Arc::new(AtomicU64::new(0));
     let bp = Arc::new(AtomicU64::new(0));
     let err = Arc::new(AtomicU64::new(0));
+    let errors = Arc::new(Mutex::new(BTreeMap::<String, u64>::new()));
     let hist = Arc::new(Mutex::new(new_histogram()));
 
     let deadline = Instant::now() + Duration::from_secs(args.duration_secs);
@@ -111,6 +121,7 @@ pub async fn run(args: MultiStreamArgs) -> Result<MultiStreamResult> {
         let ok = ok.clone();
         let bp = bp.clone();
         let err = err.clone();
+        let errors = errors.clone();
         let hist = hist.clone();
         let rate = args.rate_per_stream;
         let producer_id = format!("bench-{idx}");
@@ -126,6 +137,7 @@ pub async fn run(args: MultiStreamArgs) -> Result<MultiStreamResult> {
                 ok,
                 bp,
                 err,
+                errors,
                 hist,
             )
             .await
@@ -142,6 +154,15 @@ pub async fn run(args: MultiStreamArgs) -> Result<MultiStreamResult> {
         backpressure: bp.load(Ordering::Relaxed),
         other_err: err.load(Ordering::Relaxed),
     };
+    let errors = errors
+        .lock()
+        .await
+        .iter()
+        .map(|(error, count)| ErrorCount {
+            error: error.clone(),
+            count: *count,
+        })
+        .collect();
     let h = hist.lock().await;
     let latency = summarize(&h);
     let elapsed_secs = elapsed.as_secs_f64();
@@ -160,6 +181,7 @@ pub async fn run(args: MultiStreamArgs) -> Result<MultiStreamResult> {
         rate_per_stream: args.rate_per_stream,
         elapsed_secs,
         counts,
+        errors,
         aggregate_ops_per_sec: aggregate,
         per_stream_ops_per_sec_mean: per_stream_mean,
         latency_ms: latency,
@@ -178,6 +200,7 @@ async fn run_writer(
     ok: Arc<AtomicU64>,
     bp: Arc<AtomicU64>,
     err: Arc<AtomicU64>,
+    errors: Arc<Mutex<BTreeMap<String, u64>>>,
     hist: Arc<Mutex<Histogram<u64>>>,
 ) {
     let epoch: u64 = 0;
@@ -230,15 +253,36 @@ async fn run_writer(
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 } else {
                     err.fetch_add(1, Ordering::Relaxed);
+                    record_error(&errors, format!("http_status_{}", status.as_u16())).await;
                 }
             }
-            Err(_) => {
+            Err(e) => {
                 err.fetch_add(1, Ordering::Relaxed);
+                record_error(&errors, reqwest_error_chain(&e)).await;
             }
         }
     }
     let mut h = hist.lock().await;
     merge(&mut h, &local);
+}
+
+async fn record_error(errors: &Mutex<BTreeMap<String, u64>>, error: String) {
+    let mut errors = errors.lock().await;
+    *errors.entry(error).or_default() += 1;
+}
+
+fn reqwest_error_chain(error: &reqwest::Error) -> String {
+    let mut parts = Vec::new();
+    let mut source = error.source();
+    while let Some(err) = source {
+        parts.push(err.to_string());
+        source = err.source();
+    }
+    if parts.is_empty() {
+        error.to_string()
+    } else {
+        parts.join(" | caused by: ")
+    }
 }
 
 async fn create_streams(backend: &Backend, count: usize, concurrency: usize) -> Result<()> {
