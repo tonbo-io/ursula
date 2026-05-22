@@ -218,8 +218,8 @@ impl Backend {
         }
     }
 
-    pub fn sse_url(&self, stream: &str) -> (String, HeaderMap) {
-        let base = self.first_base();
+    pub fn sse_url_for(&self, base_idx: usize, stream: &str) -> (String, HeaderMap) {
+        let base = self.base_for(base_idx);
         match self.kind {
             ApiStyle::Ursula => (
                 format!("{base}/{}/{}?offset=now&live=sse", self.bucket, stream),
@@ -254,12 +254,13 @@ impl Backend {
     ///
     /// `total_bytes` lets the S2 caller cap the response size; it is ignored
     /// for Ursula / Durable.
-    pub fn replay_request(
+    pub fn replay_request_for(
         &self,
+        base_idx: usize,
         stream: &str,
         total_bytes: u64,
     ) -> Result<reqwest::RequestBuilder> {
-        let base = self.first_base();
+        let base = self.base_for(base_idx);
         match self.kind {
             ApiStyle::Ursula => {
                 let url = format!("{base}/{}/{}/bootstrap", self.bucket, stream);

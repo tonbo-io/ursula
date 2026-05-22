@@ -12,12 +12,12 @@ const backends: Record<
   ursula: {
     label: "Ursula",
     color: "#83a598",
-    note: "3 × c7g.4xlarge, Raft quorum",
+    note: "3 × c7g.4xlarge, Raft quorum + S3 cold flush",
   },
   durable: {
-    label: "Durable Streams (ref)",
+    label: "Durable Streams",
     color: "#fb4934",
-    note: "1 × c7g.4xlarge, file-backed store",
+    note: "1 × c7g.4xlarge, file-durable on EBS",
   },
   s2: {
     label: "S2 Lite",
@@ -49,14 +49,14 @@ type Scenario = {
 };
 
 // -----------------------------------------------------------------------------
-// MEASURED DATA (apples-to-apples, ursula-bench, c7g cluster, 2026-05-19)
+// MEASURED DATA (apples-to-apples, ursula-bench, c7g cluster, 2026-05-22)
 // -----------------------------------------------------------------------------
 
 const multiStreamThroughput: Scenario = {
   key: "ms-throughput",
   title: "Multi-stream write - aggregate throughput",
   subtitle:
-    "N independent streams, one writer per stream, 256 B payload, 30 s. All three systems run with persistent backends: Ursula commits to a 3-voter Raft quorum, Durable Streams runs its file-backed store, S2 Lite runs against S3.",
+    "N independent streams, one writer per stream, 256 B payload, 30 s. All three systems run with persistent backends: Ursula commits to a 3-voter Raft quorum with S3 cold flush enabled, Durable Streams runs file-durable storage on EBS, and S2 Lite runs against S3.",
   xLabel: "concurrent active streams",
   yLabel: "aggregate commits / s",
   yUnit: "ops/s",
@@ -66,66 +66,66 @@ const multiStreamThroughput: Scenario = {
     ursula: [
       {
         x: 100,
-        y: 24177,
-        label: "24.2k",
-        tooltip: ["100 streams", "24,177 ops/s", "p99 8.6 ms"],
+        y: 28697,
+        label: "28.7k",
+        tooltip: ["100 streams", "28,697 ops/s", "p99 7.4 ms"],
       },
       {
         x: 500,
-        y: 35241,
-        label: "35.2k",
-        tooltip: ["500 streams", "35,241 ops/s", "p99 32.6 ms"],
+        y: 41552,
+        label: "41.6k",
+        tooltip: ["500 streams", "41,552 ops/s", "p99 26.0 ms"],
       },
       {
         x: 2000,
-        y: 29395,
-        label: "29.4k",
-        tooltip: ["2k streams", "29,395 ops/s", "p99 139.6 ms"],
+        y: 38772,
+        label: "38.8k",
+        tooltip: ["2k streams", "38,772 ops/s", "p99 101.1 ms"],
       },
     ],
     durable: [
       {
         x: 100,
-        y: 6488,
-        label: "6.5k",
-        tooltip: ["100 streams", "6,488 ops/s", "p99 21.7 ms", "file-backed"],
+        y: 2760,
+        label: "2.8k",
+        tooltip: ["100 streams", "2,760 ops/s", "p99 79.7 ms", "file-durable on EBS"],
       },
       {
         x: 500,
-        y: 5991,
-        label: "6.0k",
-        tooltip: ["500 streams", "5,991 ops/s", "p99 136.6 ms"],
+        y: 3400,
+        label: "3.4k",
+        tooltip: ["500 streams", "3,400 ops/s", "p99 471.8 ms"],
       },
       {
         x: 2000,
-        y: 5221,
-        label: "5.2k",
-        tooltip: ["2k streams", "5,221 ops/s", "p99 497.7 ms", "262 errors"],
+        y: 3626,
+        label: "3.6k",
+        tooltip: ["2k streams", "3,626 ops/s", "p99 994.3 ms"],
       },
     ],
     s2: [
       {
         x: 100,
-        y: 1342,
-        label: "1.3k",
-        tooltip: ["100 streams", "1,342 ops/s", "p99 157.8 ms", "S3 PUT bound"],
+        y: 1416,
+        label: "1.4k",
+        tooltip: ["100 streams", "1,416 ops/s", "p99 160.1 ms", "S3 PUT bound"],
       },
       {
         x: 500,
-        y: 6816,
-        label: "6.8k",
-        tooltip: ["500 streams", "6,816 ops/s", "p99 179.6 ms"],
+        y: 6042,
+        label: "6.0k",
+        tooltip: ["500 streams", "6,042 ops/s", "p99 234.6 ms"],
       },
       {
         x: 2000,
-        y: 11733,
-        label: "11.7k",
-        tooltip: ["2k streams", "11,733 ops/s", "p99 366.8 ms"],
+        y: 12157,
+        label: "12.2k",
+        tooltip: ["2k streams", "12,157 ops/s", "p99 370.4 ms"],
       },
     ],
   },
   annotation:
-    "With all three running on persistent storage Ursula peaks above 35k commits/s, vs ~6k for the file-backed Durable Streams reference and 1.3k–11.7k for S3-backed S2 Lite. Ursula's multi-Raft layout puts writes for different streams on different cores and different nodes in parallel, whereas the two single-process systems are bounded by their single durable-write loop.",
+    "Ursula keeps every append on a 3-voter Raft quorum while asynchronously flushing cold chunks to S3; this run uploaded ~675 MiB through that background path. Durable Streams is shown on a real EBS-backed data directory; earlier tmpfs-backed file-durable numbers are excluded.",
 };
 
 const multiStreamLatency: Scenario = {
@@ -141,71 +141,71 @@ const multiStreamLatency: Scenario = {
     ursula: [
       {
         x: 100,
-        y: 8.6,
-        label: "8.6 ms",
-        tooltip: ["100 streams", "p50 3.7 ms", "p99 8.6 ms", "p999 50 ms"],
+        y: 7.4,
+        label: "7.4 ms",
+        tooltip: ["100 streams", "p50 3.0 ms", "p99 7.4 ms", "p999 51.5 ms"],
       },
       {
         x: 500,
-        y: 32.6,
-        label: "33 ms",
-        tooltip: ["500 streams", "p50 13.3 ms", "p99 32.6 ms", "p999 70 ms"],
+        y: 26.0,
+        label: "26 ms",
+        tooltip: ["500 streams", "p50 11.5 ms", "p99 26.0 ms", "p999 46.9 ms"],
       },
       {
         x: 2000,
-        y: 139.6,
-        label: "140 ms",
-        tooltip: ["2k streams", "p50 65.5 ms", "p99 139.6 ms", "p999 201 ms"],
+        y: 101.1,
+        label: "101 ms",
+        tooltip: ["2k streams", "p50 50.0 ms", "p99 101.1 ms", "p999 152.7 ms"],
       },
     ],
     durable: [
       {
         x: 100,
-        y: 21.7,
-        label: "22 ms",
-        tooltip: ["100 streams", "p50 15.1 ms", "p99 21.7 ms"],
+        y: 79.7,
+        label: "80 ms",
+        tooltip: ["100 streams", "p50 35.3 ms", "p99 79.7 ms"],
       },
       {
         x: 500,
-        y: 136.6,
-        label: "137 ms",
-        tooltip: ["500 streams", "p50 109 ms", "p99 137 ms"],
+        y: 471.8,
+        label: "472 ms",
+        tooltip: ["500 streams", "p50 119.4 ms", "p99 471.8 ms"],
       },
       {
         x: 2000,
-        y: 497.7,
-        label: "498 ms",
-        tooltip: ["2k streams", "p50 413 ms", "p99 498 ms"],
+        y: 994.3,
+        label: "994 ms",
+        tooltip: ["2k streams", "p50 505.9 ms", "p99 994.3 ms"],
       },
     ],
     s2: [
       {
         x: 100,
-        y: 157.8,
-        label: "158 ms",
+        y: 160.1,
+        label: "160 ms",
         tooltip: [
           "100 streams",
-          "p50 65.8 ms",
-          "p99 158 ms",
+          "p50 59.9 ms",
+          "p99 160 ms",
           "S3 latency bound",
         ],
       },
       {
         x: 500,
-        y: 179.6,
-        label: "180 ms",
-        tooltip: ["500 streams", "p50 58.1 ms", "p99 180 ms"],
+        y: 234.6,
+        label: "235 ms",
+        tooltip: ["500 streams", "p50 74.6 ms", "p99 235 ms"],
       },
       {
         x: 2000,
-        y: 366.8,
-        label: "367 ms",
-        tooltip: ["2k streams", "p50 161 ms", "p99 367 ms"],
+        y: 370.4,
+        label: "370 ms",
+        tooltip: ["2k streams", "p50 155.5 ms", "p99 370 ms"],
       },
     ],
   },
   annotation:
-    "S2 Lite's per-append latency is dominated by the S3 PUT round-trip (~50–100 ms baseline). Durable Streams' file-backed store starts comparable to Ursula at low concurrency but its single event loop falls behind quickly. Ursula's p99 grows with concurrency the same way the others' do, but stays at the bottom of the range while replicating to quorum.",
+    "S2 Lite's per-append latency is dominated by the S3 PUT round-trip. Durable Streams pays local EBS fdatasync on the file-durable path; Ursula pays the cross-node quorum cost plus background cold-flush pressure and remains below both at every measured concurrency.",
 };
 
 const fanoutLatency: Scenario = {
@@ -222,167 +222,91 @@ const fanoutLatency: Scenario = {
     ursula: [
       {
         x: 50,
-        y: 3.5,
-        label: "3.5 ms",
-        tooltip: ["50 subs", "75k delivered", "p99 3.5 ms"],
+        y: 1.5,
+        label: "1.5 ms",
+        tooltip: ["50 subs", "74.8k delivered", "p99 1.5 ms"],
       },
       {
         x: 200,
-        y: 4.4,
-        label: "4.4 ms",
-        tooltip: ["200 subs", "298k delivered", "p99 4.4 ms"],
+        y: 4.1,
+        label: "4.1 ms",
+        tooltip: ["200 subs", "297.9k delivered", "p99 4.1 ms"],
       },
       {
         x: 500,
-        y: 4.9,
-        label: "4.9 ms",
-        tooltip: ["500 subs", "718k delivered", "p99 4.9 ms"],
+        y: 5.1,
+        label: "5.1 ms",
+        tooltip: ["500 subs", "720.6k delivered", "p99 5.1 ms"],
       },
       {
         x: 1000,
-        y: 6.1,
-        label: "6.1 ms",
-        tooltip: ["1000 subs", "1.4M delivered", "p99 6.1 ms"],
+        y: 8.3,
+        label: "8.3 ms",
+        tooltip: ["1000 subs", "1.43M delivered", "p99 8.3 ms"],
       },
     ],
     durable: [
       {
         x: 50,
-        y: 35.0,
-        label: "35 ms",
-        tooltip: ["50 subs", "63.8k delivered", "p99 35 ms", "file-backed"],
+        y: 3.1,
+        label: "3.1 ms",
+        tooltip: ["50 subs", "75k delivered", "p99 3.1 ms", "file-durable on EBS"],
       },
       {
         x: 200,
-        y: 197.8,
-        label: "198 ms",
-        tooltip: ["200 subs", "37.2k delivered", "p99 198 ms"],
+        y: 3.4,
+        label: "3.4 ms",
+        tooltip: ["200 subs", "298.7k delivered", "p99 3.4 ms"],
       },
       {
         x: 500,
-        y: 516.1,
-        label: "516 ms",
-        tooltip: ["500 subs", "38k delivered", "p99 516 ms"],
+        y: 4.6,
+        label: "4.6 ms",
+        tooltip: ["500 subs", "747.1k delivered", "p99 4.6 ms"],
       },
       {
         x: 1000,
-        y: 980.0,
-        label: "980 ms",
-        tooltip: ["1000 subs", "39.5k delivered", "p99 980 ms"],
+        y: 6.5,
+        label: "6.5 ms",
+        tooltip: ["1000 subs", "1.44M delivered", "p99 6.5 ms"],
       },
     ],
     s2: [
       {
         x: 50,
-        y: 113.1,
-        label: "113 ms",
-        tooltip: ["50 subs", "27.5k delivered", "p99 113 ms", "S3 batch flush"],
+        y: 101.2,
+        label: "101 ms",
+        tooltip: ["50 subs", "27.9k delivered", "p99 101 ms", "S3 batch flush"],
       },
       {
         x: 200,
-        y: 115.9,
-        label: "116 ms",
-        tooltip: ["200 subs", "109k delivered", "p99 116 ms"],
+        y: 100.8,
+        label: "101 ms",
+        tooltip: ["200 subs", "112.9k delivered", "p99 101 ms"],
       },
       {
         x: 500,
-        y: 96.4,
-        label: "96 ms",
-        tooltip: ["500 subs", "277k delivered", "p99 96 ms"],
+        y: 112.2,
+        label: "112 ms",
+        tooltip: ["500 subs", "272.5k delivered", "p99 112 ms"],
       },
       {
         x: 1000,
-        y: 111.3,
-        label: "111 ms",
-        tooltip: ["1000 subs", "550k delivered", "p99 111 ms"],
+        y: 111.7,
+        label: "112 ms",
+        tooltip: ["1000 subs", "559.5k delivered", "p99 112 ms"],
       },
     ],
   },
   annotation:
-    "Ursula stays flat from 50 to 1,000 subscribers at 3.5–6.1 ms p99 - the watcher path is O(unique requests). S2 Lite with S3 backend is flat at ~100 ms (dominated by S3 round-trip on the read side). Durable Streams' file-backed store shows the linear O(N) wake curve, ending at 980 ms p99 at 1,000 subscribers - a 160× gap vs Ursula.",
-};
-
-const replayCompletion: Scenario = {
-  key: "replay-completion",
-  title: "Catch-up replay - completion rate",
-  subtitle:
-    "N clients, each on its own stream pre-filled with 200 events × 1 KiB. Every client asks for the full stream contents. Ursula uses GET /bootstrap (snapshot + tail-since-snapshot); DS and S2 Lite don't have a snapshot endpoint, so each client must read the full log. Y-axis is the share of clients that received valid data inside the 180 s timeout.",
-  xLabel: "concurrent clients (each on a unique stream)",
-  yLabel: "% of clients that successfully replayed",
-  yUnit: "%",
-  lowerIsBetter: false,
-  xLevels: [100, 500, 1000],
-  series: {
-    ursula: [
-      {
-        x: 100,
-        y: 100,
-        label: "100%",
-        tooltip: ["100 / 100 ok", "drain 0.01 s", "p99 6.8 ms"],
-      },
-      {
-        x: 500,
-        y: 100,
-        label: "100%",
-        tooltip: ["500 / 500 ok", "drain 0.25 s", "p99 271.6 ms"],
-      },
-      {
-        x: 1000,
-        y: 100,
-        label: "100%",
-        tooltip: ["1000 / 1000 ok", "drain 0.45 s", "p99 471 ms"],
-      },
-    ],
-    durable: [
-      {
-        x: 100,
-        y: 100,
-        label: "100%",
-        tooltip: ["100 / 100 ok", "drain 0.11 s", "p99 106.7 ms"],
-      },
-      {
-        x: 500,
-        y: 100,
-        label: "100%",
-        tooltip: ["500 / 500 ok", "drain 0.58 s", "p99 521.7 ms"],
-      },
-      {
-        x: 1000,
-        y: 100,
-        label: "100%",
-        tooltip: ["1000 / 1000 ok", "drain 1.01 s", "p99 828.4 ms"],
-      },
-    ],
-    s2: [
-      {
-        x: 100,
-        y: 100,
-        label: "100%",
-        tooltip: ["100 / 100 ok", "drain 0.04 s", "p99 35.4 ms"],
-      },
-      {
-        x: 500,
-        y: 97.4,
-        label: "97.4%",
-        tooltip: ["487 / 500 ok", "13 timeouts", "p99 346.9 ms among ok"],
-      },
-      {
-        x: 1000,
-        y: 65.9,
-        label: "65.9%",
-        tooltip: ["659 / 1000 ok", "341 timeouts", "p99 380 ms among ok"],
-      },
-    ],
-  },
-  annotation:
-    "This is the metric that p99 latency was hiding. Ursula and Durable Streams deliver to every client at every load point we measured; S2 Lite on S3 drops to 97.4% at 500 concurrent replays and to 65.9% at 1,000 - one in three clients never gets the document. The remaining clients on S2 Lite do come back at moderate p99 (380 ms) which made the latency-only chart look competitive, but production users see 341 broken sessions per 1,000 reconnects.",
+    "Ursula and Durable Streams both keep fan-out p99 in single-digit milliseconds through 1,000 subscribers. S2 Lite remains around 100 ms because the S3-backed path dominates the live-tail floor in this setup.",
 };
 
 const replayLatency: Scenario = {
   key: "replay-latency",
-  title: "Catch-up replay - p99 latency among successful clients",
+  title: "Catch-up replay - p99 latency",
   subtitle:
-    "Same workload, p99 measured only over clients that did receive their data. Failed clients are not in this distribution; see the completion-rate chart for what is missing.",
+    "N clients, each on its own stream pre-filled with 200 events × 1 KiB. Ursula uses GET /bootstrap (snapshot + tail-since-snapshot); DS and S2 Lite replay the full log in this harness.",
   xLabel: "concurrent clients (each on a unique stream)",
   yLabel: "p99 latency among ok clients",
   yUnit: "ms",
@@ -392,70 +316,70 @@ const replayLatency: Scenario = {
     ursula: [
       {
         x: 100,
-        y: 6.8,
-        label: "6.8 ms",
+        y: 96.3,
+        label: "96 ms",
         tooltip: [
           "100 / 100 ok",
-          "p99 6.8 ms",
+          "p99 96.3 ms",
           "172 KB body (snapshot 64 KB + tail)",
         ],
       },
       {
         x: 500,
-        y: 271.6,
-        label: "272 ms",
-        tooltip: ["500 / 500 ok", "p99 271.6 ms"],
+        y: 229.8,
+        label: "230 ms",
+        tooltip: ["500 / 500 ok", "p99 229.8 ms"],
       },
       {
         x: 1000,
-        y: 471.0,
-        label: "471 ms",
-        tooltip: ["1000 / 1000 ok", "p99 471 ms"],
+        y: 253.2,
+        label: "253 ms",
+        tooltip: ["1000 / 1000 ok", "p99 253.2 ms"],
       },
     ],
     durable: [
       {
         x: 100,
-        y: 106.7,
-        label: "107 ms",
-        tooltip: ["100 / 100 ok", "p99 106.7 ms", "200 KB body (full log)"],
+        y: 10.4,
+        label: "10 ms",
+        tooltip: ["100 / 100 ok", "p99 10.4 ms", "200 KB body (full log)"],
       },
       {
         x: 500,
-        y: 521.7,
-        label: "522 ms",
-        tooltip: ["500 / 500 ok", "p99 521.7 ms"],
+        y: 215.8,
+        label: "216 ms",
+        tooltip: ["500 / 500 ok", "p99 215.8 ms"],
       },
       {
         x: 1000,
-        y: 828.4,
-        label: "828 ms",
-        tooltip: ["1000 / 1000 ok", "p99 828.4 ms"],
+        y: 365.8,
+        label: "366 ms",
+        tooltip: ["1000 / 1000 ok", "p99 365.8 ms"],
       },
     ],
     s2: [
       {
         x: 100,
-        y: 35.4,
-        label: "35 ms",
-        tooltip: ["100 / 100 ok", "p99 35.4 ms", "471 KB body"],
+        y: 353.5,
+        label: "354 ms",
+        tooltip: ["100 / 100 ok", "p99 353.5 ms", "471 KB body"],
       },
       {
         x: 500,
-        y: 346.9,
-        label: "347 ms",
-        tooltip: ["487 / 500 ok - 13 timeouts not counted"],
+        y: 371.5,
+        label: "371 ms",
+        tooltip: ["500 / 500 ok", "p99 371.5 ms"],
       },
       {
         x: 1000,
-        y: 380.2,
-        label: "380 ms",
-        tooltip: ["659 / 1000 ok - 341 timeouts not counted"],
+        y: 794.1,
+        label: "794 ms",
+        tooltip: ["1000 / 1000 ok", "p99 794.1 ms"],
       },
     ],
   },
   annotation:
-    "Ursula's snapshot path keeps the body size smallest (172 KB) and the tail-among-ok latency lowest at 1,000 concurrent clients (471 ms vs DS 828 ms). S2 Lite's number looks competitive here but it is only describing the 65.9% of clients that did receive their replay - read this chart together with the completion-rate chart above.",
+    "At 1,000 concurrent clients, Ursula has the lowest replay p99 (253 ms) and the smallest response body (172 KB), ahead of Durable Streams at 366 ms and S2 Lite at 794 ms.",
 };
 
 // -----------------------------------------------------------------------------
@@ -773,18 +697,18 @@ function BenchmarkPage() {
               </div>
               <div className="benchmark-score-pair">
                 <div>
-                  <b>5.9×</b>
-                  <span>vs DS (file)</span>
+                  <b>41.6k</b>
+                  <span>Ursula ops/s</span>
                 </div>
                 <div>
-                  <b>5.2×</b>
+                  <b>6.9×</b>
                   <span>vs S2 Lite (S3)</span>
                 </div>
               </div>
               <div className="benchmark-score-foot">
                 <div>
-                  <b>35.2k</b>
-                  <span>Ursula ops/s peak</span>
+                  <b>3.4k</b>
+                  <span>DS single-node EBS file-durable</span>
                 </div>
                 <div>
                   <b>3 voter</b>
@@ -798,22 +722,22 @@ function BenchmarkPage() {
               </div>
               <div className="benchmark-score-pair">
                 <div>
-                  <b>160×</b>
-                  <span>vs DS p99</span>
+                  <b>8.3 ms</b>
+                  <span>Ursula p99</span>
                 </div>
                 <div>
-                  <b>18×</b>
+                  <b>13×</b>
                   <span>vs S2 Lite p99</span>
                 </div>
               </div>
               <div className="benchmark-score-foot">
                 <div>
-                  <b>6.1 ms</b>
-                  <span>Ursula p99</span>
+                  <b>6.5 ms</b>
+                  <span>DS p99</span>
                 </div>
                 <div>
-                  <b>980 ms</b>
-                  <span>DS p99 (O(N) wake)</span>
+                  <b>112 ms</b>
+                  <span>S2 Lite p99</span>
                 </div>
               </div>
             </article>
@@ -823,18 +747,18 @@ function BenchmarkPage() {
               </div>
               <div className="benchmark-score-pair">
                 <div>
-                  <b>2.4×</b>
+                  <b>1.8×</b>
                   <span>vs DS p99</span>
                 </div>
                 <div>
-                  <b>100%</b>
-                  <span>Ursula completion vs 66% on S2 Lite</span>
+                  <b>3.1×</b>
+                  <span>vs S2 Lite p99</span>
                 </div>
               </div>
               <div className="benchmark-score-foot">
                 <div>
-                  <b>471 ms</b>
-                  <span>Ursula p99 / 0.45 s drain</span>
+                  <b>253 ms</b>
+                  <span>Ursula p99</span>
                 </div>
                 <div>
                   <b>snapshot</b>
@@ -872,7 +796,8 @@ function BenchmarkPage() {
               <ul>
                 <li>3 × c7g.4xlarge, one voter per AZ</li>
                 <li>256 Raft groups, 16 cores per node</li>
-                <li>Every commit replicates to quorum (3 of 3)</li>
+                <li>Every commit replicates to a majority quorum (2 of 3)</li>
+                <li>S3 cold flush enabled; ~675 MiB uploaded in this run</li>
                 <li>Bench targets all 3 nodes via round-robin</li>
               </ul>
             </article>
@@ -888,13 +813,13 @@ function BenchmarkPage() {
                     marginRight: 6,
                   }}
                 />
-                Durable Streams ref
+                Durable Streams
               </h3>
               <ul>
-                <li>1 × c7g.4xlarge, single Node.js process</li>
-                <li>Reference impl from durable-streams/durable-streams</li>
-                <li>FileBackedStreamStore (dataDir on local disk)</li>
-                <li>/bootstrap not implemented; replay uses ?offset=-1</li>
+                <li>1 × c7g.4xlarge, single Rust server process</li>
+                <li>durable-streams-server v0.3.0</li>
+                <li>file-durable storage on the root EBS volume</li>
+                <li>Capacity limits raised above workload size; replay uses ?offset=-1</li>
               </ul>
             </article>
             <article>
@@ -922,12 +847,26 @@ function BenchmarkPage() {
           <p>
             <strong>All three backends are persistent in this run.</strong>{" "}
             Ursula commits each write to a 3-voter Raft quorum across three
-            c7g.4xlarge nodes; Durable Streams' file-backed store fsyncs to
-            local disk on a single node; S2 Lite writes through to S3 on a
-            single node. This is the durable-vs-durable comparison. Aggregate
-            throughput reflects Ursula getting 3× the hardware in exchange for
-            delivering quorum-replicated durability across AZs that the other
-            two do not provide here.
+            c7g.4xlarge nodes and runs background S3 cold flush; Durable
+            Streams' file-backed store fsyncs to the root EBS volume on a single node;
+            S2 Lite writes through to S3 on a single node. Ursula append
+            acknowledgements are not gated by the S3 flush, but this run did
+            exercise that background path. This is the durable-vs-durable
+            comparison. Aggregate throughput reflects Ursula getting 3× the
+            hardware in exchange for delivering quorum-replicated durability
+            across AZs that the other two do not provide here.
+          </p>
+          <p>
+            The OS file descriptor limit was set to 65,535 on the client and
+            servers. With S2 Lite artificially constrained to 256 fds, the same
+            harness reproduces connection failures as <code>Too many open files</code>;
+            those failures are excluded from the headline results.
+          </p>
+          <p>
+            Durable Streams' <code>max_memory_bytes</code> is a hard payload
+            capacity limit, not an eviction cache. It is raised here only to
+            avoid benchmark-induced 413 responses; the data directory is on EBS,
+            not <code>/tmp</code> tmpfs.
           </p>
         </section>
 
@@ -951,7 +890,8 @@ function BenchmarkPage() {
             One popular document with N concurrent SSE viewers and a steady-rate
             publisher. The bet: a server with an O(unique-request) wake path
             delivers each event to all viewers in one round; a naive O(N) wake
-            loop degrades linearly.
+            loop or storage-backed tail path can add latency as subscriber
+            count grows.
           </p>
           <ScenarioBlock scenario={fanoutLatency} />
         </section>
@@ -964,46 +904,34 @@ function BenchmarkPage() {
             of this stream". The mechanism differs by system: Ursula uses{" "}
             <code>/bootstrap</code> which returns a snapshot plus the tail since
             that snapshot, while DS and S2 Lite must replay the full log because
-            neither ships a snapshot endpoint. All three answer the same client
-            question. Read these two charts together - the first one shows
-            whether the system finished at all, the second shows how fast among
-            the clients that did finish.
+            neither ships a matching snapshot endpoint in this harness.
           </p>
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(420px, 1fr))",
-              gap: 24,
-            }}
-          >
-            <ScenarioBlock scenario={replayCompletion} />
-            <ScenarioBlock scenario={replayLatency} />
-          </div>
+          <ScenarioBlock scenario={replayLatency} />
         </section>
 
         <section className="benchmark-section">
           <h2>Takeaways</h2>
           <ul style={{ color: "#ebdbb2", lineHeight: 1.6, paddingLeft: 20 }}>
             <li>
-              <strong>Write throughput</strong> at 500 streams: Ursula 35.2k vs
-              DS 6.0k vs S2 Lite 6.8k (5.2–5.9× gap). Multi-Raft puts streams on
-              different cores and voters in parallel.
+              <strong>Write throughput</strong> at 500 streams: Ursula 41.6k
+              quorum commits/s vs S2 Lite 6.0k; Durable Streams reaches 3.4k
+              on its single-node EBS file-durable path.
             </li>
             <li>
-              <strong>SSE fan-out</strong> at 1,000 subscribers: Ursula 6.1 ms
-              p99 vs DS 980 ms (O(N) wake) vs S2 Lite 111 ms (S3 floor). 160× / 18×
-              gaps.
+              <strong>SSE fan-out</strong> at 1,000 subscribers: Ursula 8.3 ms
+              p99 and DS 6.5 ms p99 both stay in single-digit milliseconds; S2
+              Lite is 112 ms p99 on the S3-backed path.
             </li>
             <li>
-              <strong>Catch-up replay</strong> at 1,000 clients: completion is
-              the binding metric. Ursula and DS deliver 100%; S2 Lite only 65.9%.
-              Ursula's snapshot also keeps the body smallest (172 KB).
+              <strong>Catch-up replay</strong> at 1,000 clients: Ursula has
+              the lowest p99 at 253 ms and the smallest response body at 172 KB.
             </li>
             <li>
               <strong>Caveats:</strong> Ursula uses 3 × c7g vs DS / S2 Lite's 1 ×
-              c7g (deployment-shape comparison, not per-CPU). S2 Lite production
-              uses S3 Express which would cut its latency at ~7× the per-GB
-              cost.
+              c7g (deployment-shape comparison, not per-CPU). DS numbers use
+              file-durable on EBS with capacity limits raised above the benchmark
+              footprint, and S2 Lite uses S3 Standard with a 65,535-fd process
+              limit.
             </li>
           </ul>
         </section>
@@ -1014,8 +942,8 @@ function BenchmarkPage() {
             Throughput and latency are only fair to compare if the durability
             properties are clear. Here is what each system actually guarantees
             in this benchmark's configuration. Ursula pays a quorum round-trip
-            on every commit; S2 Lite pays an S3 PUT; the file-backed Durable Streams
-            reference fsyncs to a single EBS volume.
+            on every commit; S2 Lite pays an S3 PUT; the file-durable Durable
+            Streams server writes to a single EBS volume.
           </p>
           <div className="benchmark-table-wrap">
             <table>
@@ -1063,7 +991,7 @@ function BenchmarkPage() {
                         marginRight: 6,
                       }}
                     />
-                    Durable Streams ref (file)
+                    Durable Streams (file-durable)
                   </th>
                   <td>local disk on one EBS volume, one instance, one AZ</td>
                   <td>
@@ -1112,7 +1040,7 @@ function BenchmarkPage() {
           <p>
             Three different shapes of "durable". Ursula gives you replicated{" "}
             <em>availability</em> too - the cluster keeps serving on instance or
-            AZ loss. The DS reference is the weakest on both axes: data on one
+            AZ loss. Durable Streams is the weakest on availability: data on one
             disk, service on one process. S2 Lite has the best raw
             object-storage durability but its service front-end is
             single-instance, so an instance failure means downtime even though
@@ -1129,9 +1057,14 @@ function BenchmarkPage() {
 cargo build --release -p ursula -p ursula-bench
 
 # 2. Bring up each backend on identical hardware
+export URSULA_COLD_BACKEND=s3
+export URSULA_COLD_S3_BUCKET=<s3-bucket>
+export URSULA_COLD_S3_REGION=<region>
+export URSULA_COLD_FLUSH_MIN_HOT_BYTES=65536
+export URSULA_COLD_FLUSH_MAX_BYTES=65536
 python3 scripts/ursula_ec2.py --config <manifest>.json start
-~/.cargo/bin/s2 lite --port 4438 # S2 Lite on one node
-# DS: clone github.com/durable-streams/durable-streams + run example server
+~/.cargo/bin/s2 lite --bucket <s3-bucket> --path s2-lite --port 4439
+durable-streams-server --profile dev --config ds-ebs-file-durable.toml
 
 # 3. Run the same three scenarios against each
 for api in ursula durable s2; do

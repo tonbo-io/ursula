@@ -172,7 +172,7 @@ async fn run_subscriber(
     deadline: Arc<tokio::sync::OnceCell<Instant>>,
     idle: Duration,
 ) -> Result<()> {
-    let (url, headers) = backend.sse_url(stream);
+    let (url, headers) = backend.sse_url_for(_idx, stream);
     let resp = backend
         .client
         .get(&url)
