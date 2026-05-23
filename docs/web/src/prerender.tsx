@@ -9,6 +9,7 @@ import {
   DOCS_PAGE_PREFIX,
   DOCS_PATH,
   HOME_PATH,
+  STATUS_PATH,
 } from "./utils/navigation";
 
 const ORIGIN = "https://ursula.tonbo.io";
@@ -53,6 +54,16 @@ function getHeadForUrl(url: string): HeadData {
     return {
       title: "OSS HTTP Streams Benchmark | Ursula",
       description: "Uniform HTTP benchmark comparing Ursula, Durable Streams, and S2 Lite S3 on EC2.",
+      ogType: "website",
+      ogImage: DEFAULT_OG_IMAGE,
+      canonical,
+    };
+  }
+
+  if (url === STATUS_PATH) {
+    return {
+      title: "Chaos Status | Ursula",
+      description: "Live status for the continuous Ursula EC2 chaos test.",
       ogType: "website",
       ogImage: DEFAULT_OG_IMAGE,
       canonical,
@@ -118,6 +129,7 @@ export async function prerender(data: { url: string }) {
   const links = new Set<string>([
     DOCS_PATH,
     BENCHMARK_PATH,
+    STATUS_PATH,
     BLOG_PATH,
     ...docsPageLinks,
     ...blogPostLinks,

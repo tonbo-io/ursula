@@ -5,6 +5,7 @@ import BenchmarkPage from "./pages/BenchmarkPage";
 import BlogIndexPage from "./pages/BlogIndexPage";
 import BlogPostPage from "./pages/BlogPostPage";
 import DocsPage from "./pages/DocsPage";
+import StatusPage from "./pages/StatusPage";
 import {
   BENCHMARK_PATH,
   BLOG_PAGE_PREFIX,
@@ -12,6 +13,7 @@ import {
   DOCS_PAGE_PREFIX,
   DOCS_PATH,
   HOME_PATH,
+  STATUS_PATH,
   getCurrentAppPath,
 } from "./utils/navigation";
 
@@ -40,6 +42,11 @@ function App({ initialUrl }: AppProps) {
       return;
     }
 
+    if (currentPath === STATUS_PATH) {
+      document.title = "Chaos Status | Ursula";
+      return;
+    }
+
     if (currentPath === BLOG_PATH) {
       document.title = "Blog | Ursula";
       return;
@@ -61,6 +68,14 @@ function App({ initialUrl }: AppProps) {
     return (
       <div className="page-shell">
         <BenchmarkPage />
+      </div>
+    );
+  }
+
+  if (currentPath === STATUS_PATH) {
+    return (
+      <div className="page-shell">
+        <StatusPage />
       </div>
     );
   }

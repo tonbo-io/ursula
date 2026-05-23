@@ -55,6 +55,7 @@ class ClusterConfig:
     core_count: int
     raft_group_count: int
     raft_memory: bool
+    raft_log_prefix: str | None
     init_membership_per_group: bool
     cold_env: dict[str, str]
     perf_compare: str | None
@@ -110,6 +111,7 @@ def load_config(path: Path) -> ClusterConfig:
         core_count=int(raw.get("core_count", 16)),
         raft_group_count=int(raw.get("raft_group_count", 64)),
         raft_memory=bool(raw.get("raft_memory", True)),
+        raft_log_prefix=raw.get("raft_log_prefix"),
         init_membership_per_group=bool(raw.get("init_membership_per_group", True)),
         cold_env={str(k): str(v) for k, v in raw.get("cold_env", {}).items()},
         perf_compare=raw.get("perf_compare"),
@@ -188,6 +190,17 @@ class Ec2Ops:
     def chmod_executable(self, node: Node | ClientHost, remote: str) -> None:
         self.ssh(node, f"chmod +x {shlex.quote(remote)}")
 
+    def install_file(self, node: Node | ClientHost, local: Path, remote: str) -> None:
+        temp_remote = f"/tmp/{local.name}.{os.getpid()}.upload"
+        self.scp_to(node, local, temp_remote)
+        self.ssh(
+            node,
+            "set -euo pipefail\n"
+            f"sudo mkdir -p {shlex.quote(str(Path(remote).parent))}\n"
+            f"sudo install -m 0755 {shlex.quote(temp_remote)} {shlex.quote(remote)}\n"
+            f"rm -f {shlex.quote(temp_remote)}",
+        )
+
     def all_peer_flags(self) -> list[str]:
         flags: list[str] = []
         for node in self.config.nodes:
@@ -213,6 +226,18 @@ class Ec2Ops:
     def start_node(self, node: Node) -> None:
         self.stop_node(node)
         env_lines = "\n".join(f"export {key}={shlex.quote(value)}" for key, value in sorted(self.config.cold_env.items()))
+        command = "\n".join(
+            [
+                "set -euo pipefail",
+                f"test -x {shlex.quote(self.config.binary)}",
+                env_lines,
+                " ".join(shlex.quote(arg) for arg in self.node_command(node))
+                + f" > {shlex.quote(self.remote_log(node))} 2>&1 & echo $! > {shlex.quote(self.remote_pid(node))}",
+            ]
+        )
+        self.ssh(node, command)
+
+    def node_command(self, node: Node) -> list[str]:
         args = [
             self.config.binary,
             "--listen",
@@ -227,15 +252,46 @@ class Ec2Ops:
         ]
         if self.config.raft_memory:
             args.append("--raft-memory")
+        elif self.config.raft_log_prefix:
+            args += ["--raft-log-dir", f"{self.config.raft_log_prefix}-{node.id}"]
         if self.config.init_membership_per_group:
             args.append("--raft-init-membership-per-group")
+        return args
+
+    def install_service(self, node: Node) -> None:
+        env_lines = "\n".join(
+            f"Environment={key}={value}"
+            for key, value in sorted(self.config.cold_env.items())
+        )
+        exec_start = " ".join(shlex.quote(arg) for arg in self.node_command(node))
+        unit = f"""[Unit]
+Description=Ursula chaos node {node.id}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={self.config.ssh_user}
+WorkingDirectory=/tmp
+{env_lines}
+ExecStart={exec_start}
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+"""
         command = "\n".join(
             [
                 "set -euo pipefail",
                 f"test -x {shlex.quote(self.config.binary)}",
-                env_lines,
-                " ".join(shlex.quote(arg) for arg in args)
-                + f" > {shlex.quote(self.remote_log(node))} 2>&1 & echo $! > {shlex.quote(self.remote_pid(node))}",
+                "sudo tee /etc/systemd/system/ursula-chaos.service >/dev/null <<'EOF'",
+                unit,
+                "EOF",
+                "sudo systemctl daemon-reload",
+                "sudo systemctl enable ursula-chaos.service",
+                "sudo systemctl restart ursula-chaos.service",
             ]
         )
         self.ssh(node, command)
@@ -248,7 +304,12 @@ class Ec2Ops:
     def status(self) -> None:
         for node in self.config.nodes:
             pid = shlex.quote(self.remote_pid(node))
-            command = f"ps -p $(cat {pid} 2>/dev/null || echo 0) -o pid,stat,etime,pcpu,pmem,command 2>/dev/null || true"
+            command = (
+                "if systemctl list-unit-files ursula-chaos.service >/dev/null 2>&1; then "
+                "systemctl is-active ursula-chaos.service || true; "
+                f"else ps -p $(cat {pid} 2>/dev/null || echo 0) -o pid,stat,etime,pcpu,pmem,command 2>/dev/null || true; "
+                "fi"
+            )
             result = self.ssh(node, command, capture=True, check=False)
             print(f"== {node.name} ({node.public_ip}) ==")
             print(result.stdout.rstrip() or "not running")
@@ -276,16 +337,20 @@ class Ec2Ops:
                 snapshots = [self.metrics(node) for node in self.config.nodes]
                 group_counts = [len(item.get("raft_groups", [])) for item in snapshots]
                 leaders: list[int] = []
+                leader_counts: list[int] = []
                 for item in snapshots:
-                    leaders.extend(
+                    snapshot_leaders = [
                         group["current_leader"]
                         for group in item.get("raft_groups", [])
                         if group.get("current_leader") is not None
-                    )
+                    ]
+                    leaders.extend(snapshot_leaders)
+                    leader_counts.append(len(snapshot_leaders))
                 leader_set = set(leaders)
-                expected = {node.id for node in self.config.nodes}
                 last = (group_counts, {leader: leaders.count(leader) for leader in sorted(leader_set)})
-                if all(count == self.config.raft_group_count for count in group_counts) and expected.issubset(leader_set):
+                if all(count == self.config.raft_group_count for count in group_counts) and all(
+                    count == self.config.raft_group_count for count in leader_counts
+                ):
                     print(f"ready groups={group_counts} leaders={last[1]}")
                     return
             except Exception as exc:  # noqa: BLE001
@@ -397,6 +462,121 @@ class Ec2Ops:
             self.scp_to(target, local, remote)
             self.chmod_executable(target, remote)
 
+    def install_binary(self, args: argparse.Namespace) -> None:
+        local = args.local.expanduser().resolve()
+        if not local.is_file():
+            raise SystemExit(f"local binary does not exist: {local}")
+        targets: list[Node | ClientHost] = []
+        if args.target in {"servers", "all"}:
+            targets.extend(self.config.nodes)
+        if args.target in {"client", "all"}:
+            if self.config.client is None:
+                raise SystemExit("config does not define a client host")
+            targets.append(self.config.client)
+        for target in targets:
+            print(f"install {local} -> {target.name}:{args.remote}")
+            self.install_file(target, local, args.remote)
+
+    def install_services(self) -> None:
+        for node in self.config.nodes:
+            self.install_service(node)
+
+    def install_chaos_agent(self, args: argparse.Namespace) -> None:
+        if self.config.client is None:
+            raise SystemExit("config does not define a client host")
+        node_args: list[str] = []
+        for node in self.config.nodes:
+            node_args.extend(
+                [
+                    "--node",
+                    f"{node.name}={node.instance_id}=http://{node.private_ip}:{self.config.port}",
+                ]
+            )
+        command_parts = [
+            "/usr/bin/python3",
+            args.agent_path,
+            *node_args,
+            "--status-s3-uri",
+            args.status_s3_uri,
+            "--append-per-second",
+            str(args.append_per_second),
+            "--verify-every",
+            str(args.verify_every),
+            "--status-every",
+            str(args.status_every),
+            "--fault-min-secs",
+            str(args.fault_min_secs),
+            "--fault-max-secs",
+            str(args.fault_max_secs),
+            "--recovery-secs",
+            str(args.recovery_secs),
+        ]
+        exec_start = " ".join(shlex.quote(part) for part in command_parts)
+        unit = f"""[Unit]
+Description=Ursula chaos agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={self.config.ssh_user}
+WorkingDirectory=/tmp
+ExecStart={exec_start}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+        command = "\n".join(
+            [
+                "set -euo pipefail",
+                f"test -x {shlex.quote(args.agent_path)}",
+                "command -v aws >/dev/null",
+                "sudo tee /etc/systemd/system/ursula-chaos-agent.service >/dev/null <<'EOF'",
+                unit,
+                "EOF",
+                "sudo systemctl daemon-reload",
+                "sudo systemctl enable ursula-chaos-agent.service",
+                "sudo systemctl restart ursula-chaos-agent.service",
+            ]
+        )
+        self.ssh(self.config.client, command)
+
+    def chaos_agent_status(self) -> None:
+        if self.config.client is None:
+            raise SystemExit("config does not define a client host")
+        result = self.ssh(
+            self.config.client,
+            "sudo systemctl status ursula-chaos-agent.service --no-pager -l || true; "
+            "sudo journalctl -u ursula-chaos-agent.service -n 80 --no-pager || true",
+            capture=True,
+            check=False,
+        )
+        print(result.stdout.rstrip() or "no chaos agent status")
+
+    def service_status(self) -> None:
+        for node in self.config.nodes:
+            print(f"== {node.name} ({node.public_ip}) ==")
+            result = self.ssh(
+                node,
+                "sudo systemctl status ursula-chaos.service --no-pager -l || true",
+                capture=True,
+                check=False,
+            )
+            print(result.stdout.rstrip() or "no service status")
+
+    def logs(self, args: argparse.Namespace) -> None:
+        for node in self.config.nodes:
+            print(f"== {node.name} ({node.public_ip}) ==")
+            command = (
+                f"tail -n {int(args.lines)} {shlex.quote(self.remote_log(node))} 2>/dev/null "
+                f"|| sudo journalctl -u ursula-chaos.service -n {int(args.lines)} --no-pager 2>/dev/null "
+                "|| true"
+            )
+            result = self.ssh(node, command, capture=True, check=False)
+            print(result.stdout.rstrip() or "no log")
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Operate a static Ursula EC2 cluster")
@@ -405,8 +585,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("start")
+    sub.add_parser("install-service")
     sub.add_parser("stop")
     sub.add_parser("status")
+    logs = sub.add_parser("logs")
+    logs.add_argument("--lines", type=int, default=80)
+    sub.add_parser("service-status")
     ready = sub.add_parser("wait-ready")
     ready.add_argument("--timeout-secs", type=int, default=120)
     cleanup = sub.add_parser("cleanup-s3")
@@ -429,6 +613,20 @@ def build_parser() -> argparse.ArgumentParser:
     upload.add_argument("--local", required=True, type=Path)
     upload.add_argument("--remote", required=True)
     upload.add_argument("--target", choices=["servers", "client", "all"], default="servers")
+    install = sub.add_parser("install-binary")
+    install.add_argument("--local", required=True, type=Path)
+    install.add_argument("--remote", required=True)
+    install.add_argument("--target", choices=["servers", "client", "all"], default="servers")
+    chaos_agent = sub.add_parser("install-chaos-agent")
+    chaos_agent.add_argument("--agent-path", default="/opt/ursula/ursula_chaos_agent.py")
+    chaos_agent.add_argument("--status-s3-uri", default="s3://ursula-chaos-status-tonbo/status.json")
+    chaos_agent.add_argument("--append-per-second", type=int, default=20)
+    chaos_agent.add_argument("--verify-every", type=int, default=50)
+    chaos_agent.add_argument("--status-every", type=int, default=15)
+    chaos_agent.add_argument("--fault-min-secs", type=int, default=900)
+    chaos_agent.add_argument("--fault-max-secs", type=int, default=1800)
+    chaos_agent.add_argument("--recovery-secs", type=int, default=180)
+    sub.add_parser("chaos-agent-status")
     return parser
 
 
@@ -439,11 +637,17 @@ def main() -> int:
         if args.command == "start":
             for node in ops.config.nodes:
                 ops.start_node(node)
+        elif args.command == "install-service":
+            ops.install_services()
         elif args.command == "stop":
             for node in ops.config.nodes:
                 ops.stop_node(node)
         elif args.command == "status":
             ops.status()
+        elif args.command == "logs":
+            ops.logs(args)
+        elif args.command == "service-status":
+            ops.service_status()
         elif args.command == "wait-ready":
             ops.wait_ready(args.timeout_secs)
         elif args.command == "cleanup-s3":
@@ -454,6 +658,12 @@ def main() -> int:
             ops.run_perf_many(args)
         elif args.command == "upload-binary":
             ops.upload_binary(args)
+        elif args.command == "install-binary":
+            ops.install_binary(args)
+        elif args.command == "install-chaos-agent":
+            ops.install_chaos_agent(args)
+        elif args.command == "chaos-agent-status":
+            ops.chaos_agent_status()
         else:
             raise AssertionError(args.command)
     finally:

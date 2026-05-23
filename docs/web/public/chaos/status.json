@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "overall": "unknown",
+  "started_at": null,
+  "updated_at": null,
+  "summary": "Chaos status has not been published yet.",
+  "workload": {
+    "append_target_per_second": 0,
+    "append_success_total": 0,
+    "append_error_total": 0,
+    "last_append_offset": null
+  },
+  "integrity": {
+    "status": "unknown",
+    "checked_at": null,
+    "verified_offsets": 0,
+    "mismatch_count": 0,
+    "last_error": null
+  },
+  "chaos": {
+    "enabled": false,
+    "active_fault": null,
+    "last_fault": null,
+    "next_fault_after": null
+  },
+  "nodes": [],
+  "events": [
+    {
+      "time": null,
+      "level": "info",
+      "message": "Waiting for the 24/7 EC2 chaos runner to publish live status."
+    }
+  ]
+}

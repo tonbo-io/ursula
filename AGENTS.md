@@ -24,6 +24,8 @@ Prefer the direct Rust-native design over compatibility shims or legacy fallback
 
 Optimize for local readability and whole-system readability at the same time: keep changes scoped to the relevant module, avoid clever abstractions without a real payoff, and preserve clear boundaries between routing, runtime actors, Raft replication, stream state, and cold storage.
 
+For performance-oriented changes, add or update a focused micro benchmark that validates the expected benefit.
+
 ## Before Commit
 
 Run formatting and lint checks before committing:

@@ -17,6 +17,7 @@ function DocsPage({ page }: DocsPageProps) {
           { label: "Docs", href: "/docs", active: true },
           { label: "Blog", href: "/blog" },
           { label: "Benchmark", href: "/benchmark" },
+          { label: "Status", href: "/status" },
         ]}
         version={__URSULA_VERSION__}
         githubUrl="https://github.com/tonbo-io/ursula"

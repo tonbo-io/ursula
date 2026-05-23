@@ -32,6 +32,7 @@ function BlogPostPage({ post }: BlogPostPageProps) {
           { label: "Docs", href: "/docs" },
           { label: "Blog", href: "/blog", active: true },
           { label: "Benchmark", href: "/benchmark" },
+          { label: "Status", href: "/status" },
         ]}
         version={__URSULA_VERSION__}
         githubUrl="https://github.com/tonbo-io/ursula"
