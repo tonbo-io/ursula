@@ -26,7 +26,9 @@ mod metrics;
 mod request;
 mod runtime;
 
-pub use cold_store::{ColdStore, ColdStoreHandle, new_cold_chunk_path, new_external_payload_path};
+pub use cold_store::{
+    ColdReadCacheConfig, ColdStore, ColdStoreHandle, new_cold_chunk_path, new_external_payload_path,
+};
 pub use command::{GroupSnapshot, GroupWriteCommand};
 pub use engine::in_memory::{InMemoryGroupEngine, InMemoryGroupEngineFactory};
 pub use engine::wal::{WalGroupEngine, WalGroupEngineFactory};

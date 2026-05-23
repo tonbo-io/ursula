@@ -63,6 +63,9 @@ Three or five Ursula processes act as one durable-streams server. A stream hashe
                   HTTP / SSE clients
         |                 |                 |
         v                 v                 v
+        route(bucket_id, stream_id)
+        |
+        v
   +-----------+     +-----------+     +-----------+
   |  node 1   |<--->|  node 2   |<--->|  node 3   |
   | HTTP/gRPC |     | HTTP/gRPC |     | HTTP/gRPC |

@@ -60,35 +60,25 @@ Every stream is replicated to all voting members of its Raft group. Hot data liv
 ## Inside a node
 
 ```
-   Request enters axum HTTP front-end on the node.
-                          │
-                          v
-   ShardRuntime: shard_map.locate(stream_id) -> (core_id, group_id)
-                          │
-                          v
-   ┌──────────────────────────────────────────────────────────────┐
-   │ Core N  (OS thread + tokio current_thread executor)          │
-   │                                                              │
-   │   bounded mailbox (FIFO)                                     │
-   │           │                                                  │
-   │           v                                                  │
-   │   ┌──────────────────────────────────────────────────────┐   │
-   │   │ GroupActor(group=42)                                 │   │
-   │   │   - owns read_watchers, dedup state                  │   │
-   │   │   - engine: GroupEngine (replaceable)                │   │
-   │   │   - Raft.client_write -> quorum replicate            │   │
-   │   │   - StreamStateMachine (offsets, hot ring)           │   │
-   │   └──────────────────────────────────────────────────────┘   │
-   │   ┌──────────────────────────────────────────────────────┐   │
-   │   │ GroupActor(group=87)  ...                            │   │
-   │   └──────────────────────────────────────────────────────┘   │
-   └──────────────────────────────────────────────────────────────┘
-
-   Other cores run the same shape with disjoint Raft groups. Cross-
-   core traffic only happens via shard_map routing on the way in.
+   HTTP / SSE request
+          │
+          v
+   route(bucket_id, stream_id)
+          │
+          v
+   owner core
+          │
+          v
+   Raft group
+      │       │
+      │       └── replicate to peer nodes
+      │
+      ├── hot state and live watchers
+      │
+      └── cold chunks in S3 / fs
 ```
 
-A request enters the HTTP server, the routing layer (`ShardRuntime`) hashes the stream ID into `(core, raft_group_id)`, and the command lands in that core's bounded mailbox. The core's event loop dispatches it to the owning group actor, which holds the Raft instance, the state machine, and the watcher registry for that one group. State is per-actor, so nothing crosses cores after routing.
+A request enters the HTTP server, routing maps the bucket and stream name to one owner core and one Raft group, and the rest of the request runs inside that group. The group owns its hot bytes, live-tail watchers, producer dedup state, and Raft state machine, so mutable stream state does not cross cores after routing.
 
 ## The replaceable group engine
 
@@ -125,6 +115,33 @@ HTTP ---> Runtime ---> core mailbox ---> GroupActor
 
 The leader writes the entry to its write-ahead log (WAL), fsyncs, and replicates to followers in parallel. Once a quorum has persisted the entry, the state machine applies it and the response goes back to the client. Producer dedup headers ([exactly-once writes](/docs/concepts/exactly-once-writes)) are checked inside the state machine, so retries of an already-applied append return the original offset rather than appending again. `Stream-Seq` provides a single-writer ordering guard for callers that prefer that style ([conditional writes](/docs/concepts/conditional-writes)).
 
+## Storage layout
+
+Each Raft group has two storage planes: a replicated log and a stream state machine.
+
+```
+              Raft group
+                  │
+        ┌─────────┴─────────┐
+        v                   v
+  replicated log       state machine
+  command order        streams in this group
+  quorum durability    offsets / metadata / dedup
+                              │
+                    ┌─────────┴─────────┐
+                    v                   v
+              hot ring memory      cold chunk refs
+              recent bytes         S3 / fs objects
+```
+
+The Raft log is the ordering and durability boundary for writes. A write is acknowledged only after a majority of that group's replicas persist the entry. The entry carries the stream command and metadata needed to apply it deterministically.
+
+The stream data plane lives in the group's state machine. A group owns many streams, keyed by `(bucket_id, stream_id)`. For each stream it tracks metadata, offsets, producer dedup state, live snapshots, hot byte segments, and cold chunk references.
+
+Recent bytes stay in an in-memory hot ring on every replica. When a group's hot bytes exceed the configured cold-flush threshold, a background worker uploads older contiguous segments to the cold backend, usually S3. After upload succeeds, Ursula commits a metadata update through Raft that publishes the cold chunk reference and advances the stream's hot start offset.
+
+Reads assemble one logical stream from both tiers. The state machine first builds a read plan: which byte ranges are still hot and which ranges are cold chunk references. Hot bytes are copied from memory; cold ranges are fetched with object-store range reads. Any replica that has applied the cold chunk metadata can serve those cold reads, as long as all nodes point at the same S3 bucket/prefix.
+
 ## Read path and cold offload
 
 ```
@@ -150,9 +167,5 @@ Under the state-machine lock the runtime computes only a read plan: which segmen
 ## SSE live tailing
 
 When a read finds no new data and the response carries `Stream-Up-To-Date: true`, the runtime registers a watcher inside the owning group actor. The watcher map is per-actor and mutated only inside that actor's turn, with no mutex and no awaiting while holding a lock. When a later append commits on the same group, the actor wakes the matching watchers in the same turn, deduplicates them by request shape, and dispatches materialization through the same fast path the read uses.
-
-## Hot and cold tiers
-
-Recent data sits in an in-memory ring on every replica. Once the ring exceeds its per-group budget (configured by `URSULA_COLD_MAX_HOT_BYTES_PER_GROUP`), the oldest segments flush into an object-store chunk and the read plan replaces them with a cold-segment reference. Reads then span hot memory and S3 in one response. Cold flushes are batched and rate-limited so a single burst cannot starve other groups on the same core.
 
 For deployment topology (voting layout across availability zones, non-voting replicas, S3 prefix layout), see the [operations guide](/docs/operations).

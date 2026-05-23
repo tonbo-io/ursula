@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use ursula_shard::BucketStreamId;
 
@@ -18,14 +18,188 @@ use crate::validate::{validate_bucket_id, validate_stream_id};
 pub struct StreamStateMachine {
     buckets: HashSet<String>,
     streams: HashMap<BucketStreamId, StreamMetadata>,
-    payloads: HashMap<BucketStreamId, Vec<u8>>,
-    hot_segments: HashMap<BucketStreamId, Vec<HotPayloadSegment>>,
-    hot_start_offsets: HashMap<BucketStreamId, u64>,
+    hot_buffers: HashMap<BucketStreamId, HotBuffer>,
     cold_chunks: HashMap<BucketStreamId, Vec<ColdChunkRef>>,
     external_segments: HashMap<BucketStreamId, Vec<ObjectPayloadRef>>,
     message_records: HashMap<BucketStreamId, Vec<StreamMessageRecord>>,
     visible_snapshots: HashMap<BucketStreamId, StreamVisibleSnapshot>,
     producers: HashMap<BucketStreamId, HashMap<String, ProducerState>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct HotBuffer {
+    chunks: VecDeque<HotChunk>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HotChunk {
+    start_offset: u64,
+    end_offset: u64,
+    bytes: Vec<u8>,
+}
+
+impl HotBuffer {
+    fn from_payload(start_offset: u64, payload: Vec<u8>) -> Self {
+        if payload.is_empty() {
+            return Self::default();
+        }
+        let end_offset = start_offset
+            .saturating_add(u64::try_from(payload.len()).expect("payload len fits u64"));
+        let mut chunks = VecDeque::new();
+        chunks.push_back(HotChunk {
+            start_offset,
+            end_offset,
+            bytes: payload,
+        });
+        Self { chunks }
+    }
+
+    fn from_snapshot(payload: Vec<u8>, segments: &[HotPayloadSegment]) -> Self {
+        let mut chunks = VecDeque::with_capacity(segments.len());
+        for segment in segments {
+            chunks.push_back(HotChunk {
+                start_offset: segment.start_offset,
+                end_offset: segment.end_offset,
+                bytes: payload[segment.payload_start..segment.payload_end].to_vec(),
+            });
+        }
+        Self { chunks }
+    }
+
+    fn len(&self) -> usize {
+        self.chunks.iter().map(|chunk| chunk.bytes.len()).sum()
+    }
+
+    fn hot_start_offset(&self) -> u64 {
+        self.chunks
+            .front()
+            .map(|chunk| chunk.start_offset)
+            .unwrap_or(0)
+    }
+
+    fn payload(&self) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(self.len());
+        for chunk in &self.chunks {
+            payload.extend_from_slice(&chunk.bytes);
+        }
+        payload
+    }
+
+    fn hot_segments(&self) -> Vec<HotPayloadSegment> {
+        let mut payload_start = 0usize;
+        self.chunks
+            .iter()
+            .map(|chunk| {
+                let payload_end = payload_start + chunk.bytes.len();
+                let segment = HotPayloadSegment {
+                    start_offset: chunk.start_offset,
+                    end_offset: chunk.end_offset,
+                    payload_start,
+                    payload_end,
+                };
+                payload_start = payload_end;
+                segment
+            })
+            .collect()
+    }
+
+    fn push(&mut self, start_offset: u64, end_offset: u64, payload: &[u8]) {
+        if payload.is_empty() {
+            return;
+        }
+        self.chunks.push_back(HotChunk {
+            start_offset,
+            end_offset,
+            bytes: payload.to_vec(),
+        });
+    }
+
+    fn plan_cold_flush(
+        &self,
+        min_hot_bytes: usize,
+        max_flush_bytes: usize,
+    ) -> Option<(u64, u64, Vec<u8>)> {
+        let first = self.chunks.front()?;
+        let mut payload = Vec::new();
+        let mut end_offset = first.start_offset;
+        for chunk in &self.chunks {
+            if chunk.start_offset != end_offset || payload.len() >= max_flush_bytes {
+                break;
+            }
+            let remaining = max_flush_bytes - payload.len();
+            let take = chunk.bytes.len().min(remaining);
+            payload.extend_from_slice(&chunk.bytes[..take]);
+            end_offset = end_offset.saturating_add(u64::try_from(take).expect("take fits u64"));
+            if take < chunk.bytes.len() {
+                break;
+            }
+        }
+        if payload.len() < min_hot_bytes {
+            return None;
+        }
+        Some((first.start_offset, end_offset, payload))
+    }
+
+    fn read_segments(&self, offset: u64, next_offset: u64) -> Vec<(u64, StreamReadSegment)> {
+        let mut segments = Vec::new();
+        for chunk in &self.chunks {
+            let start = offset.max(chunk.start_offset);
+            let end = next_offset.min(chunk.end_offset);
+            if start < end {
+                let payload_start =
+                    usize::try_from(start - chunk.start_offset).expect("hot start fits usize");
+                let payload_end =
+                    usize::try_from(end - chunk.start_offset).expect("hot end fits usize");
+                segments.push((
+                    start,
+                    StreamReadSegment::Hot(chunk.bytes[payload_start..payload_end].to_vec()),
+                ));
+            }
+        }
+        segments
+    }
+
+    fn covers_prefix(&self, start_offset: u64, end_offset: u64) -> bool {
+        let Some(first) = self.chunks.front() else {
+            return false;
+        };
+        if first.start_offset != start_offset {
+            return false;
+        }
+        let mut covered_offset = start_offset;
+        for chunk in &self.chunks {
+            if chunk.start_offset != covered_offset {
+                return false;
+            }
+            if chunk.end_offset >= end_offset {
+                return true;
+            }
+            covered_offset = chunk.end_offset;
+        }
+        false
+    }
+
+    fn flush_prefix(&mut self, end_offset: u64) {
+        while self
+            .chunks
+            .front()
+            .is_some_and(|chunk| chunk.end_offset <= end_offset)
+        {
+            self.chunks.pop_front();
+        }
+        if let Some(front) = self.chunks.front_mut()
+            && front.start_offset < end_offset
+        {
+            let drain_len =
+                usize::try_from(end_offset - front.start_offset).expect("drain len fits usize");
+            front.bytes.drain(..drain_len);
+            front.start_offset = end_offset;
+        }
+    }
+
+    fn discard_before(&mut self, retained_offset: u64) {
+        self.flush_prefix(retained_offset);
+    }
 }
 
 impl StreamStateMachine {
@@ -216,7 +390,10 @@ impl StreamStateMachine {
     }
 
     pub fn hot_start_offset(&self, stream_id: &BucketStreamId) -> u64 {
-        self.hot_start_offsets.get(stream_id).copied().unwrap_or(0)
+        self.hot_buffers
+            .get(stream_id)
+            .map(HotBuffer::hot_start_offset)
+            .unwrap_or(0)
     }
 
     pub fn cold_chunks(&self, stream_id: &BucketStreamId) -> &[ColdChunkRef] {
@@ -233,11 +410,11 @@ impl StreamStateMachine {
             .unwrap_or(&[])
     }
 
-    pub fn hot_segments(&self, stream_id: &BucketStreamId) -> &[HotPayloadSegment] {
-        self.hot_segments
+    pub fn hot_segments(&self, stream_id: &BucketStreamId) -> Vec<HotPayloadSegment> {
+        self.hot_buffers
             .get(stream_id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+            .map(HotBuffer::hot_segments)
+            .unwrap_or_default()
     }
 
     pub fn hot_payload_len(&self, stream_id: &BucketStreamId) -> Result<u64, StreamResponse> {
@@ -254,14 +431,14 @@ impl StreamStateMachine {
             ));
         }
         let payload = self
-            .payloads
+            .hot_buffers
             .get(stream_id)
-            .expect("payload vector exists for stream metadata");
+            .expect("hot buffer exists for stream metadata");
         Ok(u64::try_from(payload.len()).expect("payload len fits u64"))
     }
 
     pub fn total_hot_payload_bytes(&self) -> u64 {
-        self.payloads
+        self.hot_buffers
             .values()
             .map(|payload| u64::try_from(payload.len()).expect("payload len fits u64"))
             .sum()
@@ -288,42 +465,19 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' is gone"),
             ));
         }
-        let Some(first_segment) = self.hot_segments(stream_id).first() else {
+        let Some(hot_buffer) = self.hot_buffers.get(stream_id) else {
             return Ok(None);
         };
-        let mut payload_end = first_segment.payload_start;
-        let mut end_offset = first_segment.start_offset;
-        let mut flush_len = 0usize;
-        for segment in self.hot_segments(stream_id) {
-            if segment.start_offset != end_offset || segment.payload_start != payload_end {
-                break;
-            }
-            let remaining = max_flush_bytes.saturating_sub(flush_len);
-            if remaining == 0 {
-                break;
-            }
-            let segment_len = segment.payload_end - segment.payload_start;
-            let take = segment_len.min(remaining);
-            flush_len += take;
-            payload_end += take;
-            end_offset = end_offset.saturating_add(u64::try_from(take).expect("take fits u64"));
-            if take < segment_len {
-                break;
-            }
-        }
-        if flush_len < min_hot_bytes {
+        let Some((start_offset, end_offset, payload)) =
+            hot_buffer.plan_cold_flush(min_hot_bytes, max_flush_bytes)
+        else {
             return Ok(None);
-        }
-        let payload = self
-            .payloads
-            .get(stream_id)
-            .expect("payload vector exists for stream metadata");
-        let start_offset = first_segment.start_offset;
+        };
         Ok(Some(ColdFlushCandidate {
             stream_id: stream_id.clone(),
             start_offset,
             end_offset,
-            payload: payload[first_segment.payload_start..payload_end].to_vec(),
+            payload,
         }))
     }
 
@@ -401,21 +555,17 @@ impl StreamStateMachine {
             .cloned()
             .map(|metadata| {
                 let stream_id = metadata.stream_id.clone();
-                let payload = self
-                    .payloads
+                let hot_buffer = self
+                    .hot_buffers
                     .get(&stream_id)
-                    .expect("payload vector exists for stream metadata")
-                    .clone();
+                    .expect("hot buffer exists for stream metadata");
+                let payload = hot_buffer.payload();
                 let producer_states = self.producer_snapshot(&stream_id);
                 StreamSnapshotEntry {
                     metadata,
-                    hot_start_offset: self.hot_start_offset(&stream_id),
+                    hot_start_offset: hot_buffer.hot_start_offset(),
                     payload,
-                    hot_segments: self
-                        .hot_segments
-                        .get(&stream_id)
-                        .cloned()
-                        .unwrap_or_default(),
+                    hot_segments: hot_buffer.hot_segments(),
                     cold_chunks: self
                         .cold_chunks
                         .get(&stream_id)
@@ -510,9 +660,10 @@ impl StreamStateMachine {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
             }
             let producer_states = restore_producer_states(&stream_id, entry.producer_states)?;
-            if !hot_segments.is_empty() {
-                machine.hot_segments.insert(stream_id.clone(), hot_segments);
-            }
+            machine.hot_buffers.insert(
+                stream_id.clone(),
+                HotBuffer::from_snapshot(entry.payload, &hot_segments),
+            );
             if !entry.cold_chunks.is_empty() {
                 machine
                     .cold_chunks
@@ -533,9 +684,7 @@ impl StreamStateMachine {
                     .visible_snapshots
                     .insert(stream_id.clone(), snapshot);
             }
-            machine.payloads.insert(stream_id.clone(), entry.payload);
             machine.producers.insert(stream_id.clone(), producer_states);
-            machine.refresh_hot_start_offset(&stream_id);
         }
 
         Ok(machine)
@@ -636,10 +785,6 @@ impl StreamStateMachine {
 
         let max_len_u64 = u64::try_from(max_len).unwrap_or(u64::MAX);
         let next_offset = stream.tail_offset.min(offset.saturating_add(max_len_u64));
-        let payload = self
-            .payloads
-            .get(stream_id)
-            .expect("payload vector exists for stream metadata");
         let mut segments = Vec::<(u64, StreamReadSegment)>::new();
         for chunk in self.cold_chunks(stream_id) {
             let start = offset.max(chunk.start_offset);
@@ -669,21 +814,8 @@ impl StreamStateMachine {
                 ));
             }
         }
-        for segment in self.hot_segments(stream_id) {
-            let start = offset.max(segment.start_offset);
-            let end = next_offset.min(segment.end_offset);
-            if start < end {
-                let payload_start = segment.payload_start
-                    + usize::try_from(start - segment.start_offset)
-                        .expect("hot segment start fits usize");
-                let payload_end = segment.payload_start
-                    + usize::try_from(end - segment.start_offset)
-                        .expect("hot segment end fits usize");
-                segments.push((
-                    start,
-                    StreamReadSegment::Hot(payload[payload_start..payload_end].to_vec()),
-                ));
-            }
+        if let Some(hot_buffer) = self.hot_buffers.get(stream_id) {
+            segments.extend(hot_buffer.read_segments(offset, next_offset));
         }
         segments.sort_by_key(|(start, _)| *start);
         if !segments_cover_range(&segments, offset, next_offset) {
@@ -924,119 +1056,37 @@ impl StreamStateMachine {
                 stream.tail_offset,
             );
         }
-        let segments = self.hot_segments(&stream_id);
-        let Some(segment_index) = segments
-            .iter()
-            .position(|segment| segment.start_offset == chunk.start_offset)
-        else {
+        let Some(hot_buffer) = self.hot_buffers.get(&stream_id) else {
             return StreamResponse::error_with_next_offset(
                 StreamErrorCode::InvalidColdFlush,
-                format!(
-                    "cold chunk for stream '{stream_id}' does not match the start of a hot payload segment"
-                ),
+                format!("cold chunk for stream '{stream_id}' does not match hot payload"),
                 stream.tail_offset,
             );
         };
-
-        let drain_start = segments[segment_index].payload_start;
-        let mut covered_offset = chunk.start_offset;
-        let mut flush_len = 0usize;
-        for segment in segments.iter().skip(segment_index) {
-            if segment.start_offset != covered_offset {
-                break;
-            }
-            let segment_cover_end = chunk.end_offset.min(segment.end_offset);
-            let segment_flush_len = match usize::try_from(segment_cover_end - segment.start_offset)
-            {
-                Ok(segment_flush_len) => segment_flush_len,
-                Err(_) => {
-                    return StreamResponse::error_with_next_offset(
-                        StreamErrorCode::InvalidColdFlush,
-                        "cold chunk length does not fit in memory",
-                        stream.tail_offset,
-                    );
-                }
-            };
-            let Some(expected_payload_start) = drain_start.checked_add(flush_len) else {
-                return StreamResponse::error_with_next_offset(
-                    StreamErrorCode::InvalidColdFlush,
-                    "cold chunk length does not fit in memory",
-                    stream.tail_offset,
-                );
-            };
-            if segment.payload_start != expected_payload_start {
-                return StreamResponse::error_with_next_offset(
-                    StreamErrorCode::InvalidColdFlush,
-                    format!("stream '{stream_id}' has non-contiguous hot payload metadata"),
-                    stream.tail_offset,
-                );
-            }
-            let segment_payload_len = segment.payload_end - segment.payload_start;
-            if segment_flush_len > segment_payload_len {
-                return StreamResponse::error_with_next_offset(
-                    StreamErrorCode::InvalidColdFlush,
-                    format!("cold chunk length exceeds stream '{stream_id}' hot segment metadata"),
-                    stream.tail_offset,
-                );
-            }
-            let Some(new_flush_len) = flush_len.checked_add(segment_flush_len) else {
-                return StreamResponse::error_with_next_offset(
-                    StreamErrorCode::InvalidColdFlush,
-                    "cold chunk length does not fit in memory",
-                    stream.tail_offset,
-                );
-            };
-            flush_len = new_flush_len;
-            covered_offset = segment_cover_end;
-            if covered_offset == chunk.end_offset {
-                break;
-            }
+        if hot_buffer.hot_start_offset() != chunk.start_offset {
+            return StreamResponse::error_with_next_offset(
+                StreamErrorCode::InvalidColdFlush,
+                format!("cold chunk for stream '{stream_id}' must start at the hot prefix"),
+                stream.tail_offset,
+            );
         }
-        if covered_offset != chunk.end_offset {
+        if !hot_buffer.covers_prefix(chunk.start_offset, chunk.end_offset) {
             return StreamResponse::error_with_next_offset(
                 StreamErrorCode::InvalidColdFlush,
                 format!(
-                    "cold chunk for stream '{stream_id}' does not cover contiguous hot payload segments"
+                    "cold chunk for stream '{stream_id}' does not cover contiguous hot payload"
                 ),
                 stream.tail_offset,
             );
         }
-        let Some(drain_end) = drain_start.checked_add(flush_len) else {
-            return StreamResponse::error_with_next_offset(
-                StreamErrorCode::InvalidColdFlush,
-                "cold chunk length does not fit in memory",
-                stream.tail_offset,
-            );
-        };
-        let payload_len = self
-            .payloads
-            .get(&stream_id)
-            .expect("payload vector exists for stream metadata")
-            .len();
-        if drain_end > payload_len {
-            return StreamResponse::error_with_next_offset(
-                StreamErrorCode::InvalidColdFlush,
-                format!("cold chunk length exceeds stream '{stream_id}' hot payload length"),
-                stream.tail_offset,
-            );
-        };
-
-        self.payloads
+        self.hot_buffers
             .get_mut(&stream_id)
-            .expect("payload vector exists for stream metadata")
-            .drain(drain_start..drain_end);
-        self.remove_drained_hot_range(
-            &stream_id,
-            segment_index,
-            chunk.end_offset,
-            drain_start,
-            flush_len,
-        );
+            .expect("hot buffer exists for stream metadata")
+            .flush_prefix(chunk.end_offset);
         self.cold_chunks
             .entry(stream_id.clone())
             .or_default()
             .push(chunk.clone());
-        self.refresh_hot_start_offset(&stream_id);
         StreamResponse::ColdFlushed {
             hot_start_offset: self.hot_start_offset(&stream_id),
         }
@@ -1159,18 +1209,11 @@ impl StreamStateMachine {
             fork_ref_count: 0,
         };
         self.streams.insert(input.stream_id.clone(), metadata);
-        self.payloads
-            .insert(input.stream_id.clone(), input.initial_payload);
+        self.hot_buffers.insert(
+            input.stream_id.clone(),
+            HotBuffer::from_payload(0, input.initial_payload),
+        );
         if initial_len > 0 {
-            self.hot_segments.insert(
-                input.stream_id.clone(),
-                vec![HotPayloadSegment {
-                    start_offset: 0,
-                    end_offset: initial_len,
-                    payload_start: 0,
-                    payload_end: usize::try_from(initial_len).expect("payload len fits usize"),
-                }],
-            );
             self.message_records.insert(
                 input.stream_id.clone(),
                 vec![StreamMessageRecord {
@@ -1291,7 +1334,8 @@ impl StreamStateMachine {
             fork_ref_count: 0,
         };
         self.streams.insert(input.stream_id.clone(), metadata);
-        self.payloads.insert(input.stream_id.clone(), Vec::new());
+        self.hot_buffers
+            .insert(input.stream_id.clone(), HotBuffer::default());
         self.external_segments.insert(
             input.stream_id.clone(),
             vec![ObjectPayloadRef {
@@ -1485,35 +1529,10 @@ impl StreamStateMachine {
                 producer: producer_ack,
             }
         } else {
-            let payload_store = self
-                .payloads
+            self.hot_buffers
                 .get_mut(&stream_id)
-                .expect("payload vector exists for stream metadata");
-            let payload_start = payload_store.len();
-            payload_store.extend_from_slice(payload);
-            let payload_end = payload_store.len();
-            self.hot_segments
-                .get_mut(&stream_id)
-                .map(|segments| {
-                    segments.push(HotPayloadSegment {
-                        start_offset: offset,
-                        end_offset: next_offset,
-                        payload_start,
-                        payload_end,
-                    })
-                })
-                .unwrap_or_else(|| {
-                    self.hot_segments.insert(
-                        stream_id.clone(),
-                        vec![HotPayloadSegment {
-                            start_offset: offset,
-                            end_offset: next_offset,
-                            payload_start,
-                            payload_end,
-                        }],
-                    );
-                });
-            self.refresh_hot_start_offset(&stream_id);
+                .expect("hot buffer exists for stream metadata")
+                .push(offset, next_offset, payload);
             self.message_records
                 .entry(stream_id.clone())
                 .or_default()
@@ -1774,23 +1793,13 @@ impl StreamStateMachine {
         if let Some(producer) = producer {
             self.record_producer_success(stream_id.clone(), producer, last.clone(), items.clone());
         }
-        let payload_store = self
-            .payloads
+        let hot_buffer = self
+            .hot_buffers
             .get_mut(&stream_id)
-            .expect("payload vector exists for stream metadata");
-        let hot_segments = self.hot_segments.entry(stream_id.clone()).or_default();
+            .expect("hot buffer exists for stream metadata");
         for (item, payload) in items.iter().zip(payloads.iter()) {
-            let payload_start = payload_store.len();
-            payload_store.extend_from_slice(payload);
-            let payload_end = payload_store.len();
-            hot_segments.push(HotPayloadSegment {
-                start_offset: item.start_offset,
-                end_offset: item.next_offset,
-                payload_start,
-                payload_end,
-            });
+            hot_buffer.push(item.start_offset, item.next_offset, payload);
         }
-        self.refresh_hot_start_offset(&stream_id);
         self.message_records
             .entry(stream_id.clone())
             .or_default()
@@ -1982,9 +1991,7 @@ impl StreamStateMachine {
 
     fn remove_stream_state(&mut self, stream_id: &BucketStreamId) -> bool {
         if self.streams.remove(stream_id).is_some() {
-            self.payloads.remove(stream_id);
-            self.hot_segments.remove(stream_id);
-            self.hot_start_offsets.remove(stream_id);
+            self.hot_buffers.remove(stream_id);
             self.cold_chunks.remove(stream_id);
             self.external_segments.remove(stream_id);
             self.message_records.remove(stream_id);
@@ -2059,98 +2066,9 @@ impl StreamStateMachine {
             }
         }
 
-        self.discard_hot_prefix_before(stream_id, retained_offset);
-    }
-
-    fn refresh_hot_start_offset(&mut self, stream_id: &BucketStreamId) {
-        let Some(hot_start_offset) = self
-            .hot_segments
-            .get(stream_id)
-            .and_then(|segments| segments.iter().map(|segment| segment.start_offset).min())
-        else {
-            self.hot_start_offsets.remove(stream_id);
-            return;
-        };
-        if hot_start_offset == 0 {
-            self.hot_start_offsets.remove(stream_id);
-        } else {
-            self.hot_start_offsets
-                .insert(stream_id.clone(), hot_start_offset);
+        if let Some(hot_buffer) = self.hot_buffers.get_mut(stream_id) {
+            hot_buffer.discard_before(retained_offset);
         }
-    }
-
-    fn remove_drained_hot_range(
-        &mut self,
-        stream_id: &BucketStreamId,
-        segment_index: usize,
-        new_start_offset: u64,
-        drain_start: usize,
-        drained_len: usize,
-    ) {
-        let Some(segments) = self.hot_segments.get_mut(stream_id) else {
-            self.hot_start_offsets.remove(stream_id);
-            return;
-        };
-        if segment_index >= segments.len() {
-            self.refresh_hot_start_offset(stream_id);
-            return;
-        }
-        let drain_end = drain_start + drained_len;
-        let mut updated_segments = Vec::with_capacity(segments.len());
-        for (index, mut segment) in segments.drain(..).enumerate() {
-            if index < segment_index || segment.payload_end <= drain_start {
-                updated_segments.push(segment);
-                continue;
-            }
-            if segment.payload_start >= drain_end {
-                segment.payload_start -= drained_len;
-                segment.payload_end -= drained_len;
-                updated_segments.push(segment);
-                continue;
-            }
-            if segment.payload_end <= drain_end {
-                continue;
-            }
-            segment.start_offset = new_start_offset;
-            segment.payload_start = drain_start;
-            segment.payload_end -= drained_len;
-            updated_segments.push(segment);
-        }
-        *segments = updated_segments;
-        if segments.is_empty() {
-            self.hot_segments.remove(stream_id);
-        }
-        self.refresh_hot_start_offset(stream_id);
-    }
-
-    fn discard_hot_prefix_before(&mut self, stream_id: &BucketStreamId, retained_offset: u64) {
-        while let Some(segment_index) = self
-            .hot_segments(stream_id)
-            .iter()
-            .position(|segment| segment.start_offset < retained_offset)
-        {
-            let segment = self.hot_segments(stream_id)[segment_index].clone();
-            let new_start_offset = retained_offset.min(segment.end_offset);
-            let drained_len = usize::try_from(new_start_offset - segment.start_offset)
-                .expect("drain len fits usize");
-            if drained_len == 0 {
-                break;
-            }
-            let drain_start = segment.payload_start;
-            let drain_end = drain_start + drained_len;
-            self.payloads
-                .get_mut(stream_id)
-                .expect("payload vector exists for stream metadata")
-                .drain(drain_start..drain_end);
-            self.remove_drained_hot_range(
-                stream_id,
-                segment_index,
-                new_start_offset,
-                drain_start,
-                drained_len,
-            );
-        }
-        self.refresh_hot_start_offset(stream_id);
     }
 
     fn producer_snapshot(&self, stream_id: &BucketStreamId) -> Vec<ProducerSnapshot> {

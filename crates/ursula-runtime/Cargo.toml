@@ -17,3 +17,18 @@ serde_json = "1.0"
 tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "sync", "time"] }
 ursula-shard = { path = "../ursula-shard", version = "0.1.0" }
 ursula-stream = { path = "../ursula-stream", version = "0.1.0" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "cold_cache"
+harness = false
+
+[[bench]]
+name = "hot_snapshot"
+harness = false
+
+[[bench]]
+name = "append_apply"
+harness = false

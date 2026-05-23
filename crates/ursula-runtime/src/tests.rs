@@ -4,13 +4,14 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{Notify, Semaphore, oneshot};
 use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardId, ShardPlacement};
-use ursula_stream::{StreamReadSegment, StreamSnapshot, StreamStateMachine};
+use ursula_stream::{ObjectPayloadRef, StreamReadSegment, StreamSnapshot, StreamStateMachine};
 
-use crate::cold_store::DEFAULT_CONTENT_TYPE;
+use crate::cold_store::{ColdReadCacheConfig, DEFAULT_CONTENT_TYPE};
 use crate::core_worker::{CoreWorker, ReadWatcher, ReadWatchers};
 use crate::engine::wal::group_log_path;
 use crate::metrics::{RuntimeMetricsInner, is_stale_cold_flush_candidate_error};
@@ -373,6 +374,54 @@ async fn cold_store_reads_only_requested_range() {
         .await
         .expect("read range");
     assert_eq!(bytes, b"cde");
+}
+
+#[tokio::test]
+async fn cold_store_prefetches_sequential_stream_blocks() {
+    let cold_store = ColdStore::memory()
+        .expect("memory cold store")
+        .with_read_cache(ColdReadCacheConfig {
+            max_bytes: 32,
+            block_bytes: 4,
+            max_readahead_blocks: 2,
+        });
+    let path = "benchcmp/cold-cache/chunks/000000.bin";
+    cold_store
+        .write_chunk(path, b"abcdefghijklmnop")
+        .await
+        .expect("write cold object");
+    let stream = BucketStreamId::new("benchcmp", "cold-cache");
+    let object = ObjectPayloadRef {
+        start_offset: 0,
+        end_offset: 16,
+        s3_path: path.to_owned(),
+        object_size: 16,
+    };
+
+    let first = cold_store
+        .read_object_range_for_stream(&stream, &object, 0, 4)
+        .await
+        .expect("read first block");
+    assert_eq!(first, b"abcd");
+    let second = cold_store
+        .read_object_range_for_stream(&stream, &object, 4, 4)
+        .await
+        .expect("read second block");
+    assert_eq!(second, b"efgh");
+
+    for _ in 0..20 {
+        if cold_store.cached_block_count() >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(cold_store.cached_block_count() >= 3);
+
+    cold_store
+        .delete_chunk(path)
+        .await
+        .expect("delete cold object");
+    assert_eq!(cold_store.cached_block_count(), 0);
 }
 
 #[tokio::test]

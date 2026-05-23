@@ -1409,7 +1409,12 @@ impl InMemoryGroupEngine {
                         ));
                     };
                     let bytes = cold_store
-                        .read_object_range(&segment.object, segment.read_start_offset, segment.len)
+                        .read_object_range_for_stream(
+                            stream_id,
+                            &segment.object,
+                            segment.read_start_offset,
+                            segment.len,
+                        )
                         .await
                         .map_err(|err| GroupEngineError::new(err.to_string()))?;
                     payload.extend_from_slice(&bytes);
