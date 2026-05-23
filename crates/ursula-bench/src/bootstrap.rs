@@ -161,7 +161,18 @@ pub async fn run(args: BootstrapArgs) -> Result<BootstrapResult> {
         let hist = hist.clone();
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
-            run_client(&backend, idx, &stream, pre_bytes, ok, bp, err, bytes_total, hist).await;
+            run_client(
+                &backend,
+                idx,
+                &stream,
+                pre_bytes,
+                ok,
+                bp,
+                err,
+                bytes_total,
+                hist,
+            )
+            .await;
         }));
     }
 

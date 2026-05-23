@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use ursula_runtime::ColdStore;
@@ -1084,8 +1086,19 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
 }
 
 fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind free port");
-    listener.local_addr().expect("local addr").port()
+    static RESERVED_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+
+    let reserved_ports = RESERVED_PORTS.get_or_init(|| Mutex::new(HashSet::new()));
+    for _ in 0..100 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind free port");
+        let port = listener.local_addr().expect("local addr").port();
+        let mut reserved_ports = reserved_ports.lock().expect("reserved port lock poisoned");
+        if reserved_ports.insert(port) {
+            return port;
+        }
+    }
+
+    panic!("failed to reserve a unique local port");
 }
 
 fn spawn_node(
@@ -1289,18 +1302,24 @@ fn write_cluster_config(path: &Path, node_id: u64, peers: &[(u64, String)], init
 }
 
 async fn wait_until_ready(client: &reqwest::Client, base_url: &str) {
-    for _ in 0..100 {
-        if let Ok(response) = client
+    let mut last_error = String::from("no attempts made");
+    for _ in 0..300 {
+        match client
             .get(format!("{base_url}/__ursula/metrics"))
             .send()
             .await
-            && response.status().is_success()
         {
-            return;
+            Ok(response) if response.status().is_success() => return,
+            Ok(response) => {
+                last_error = format!("HTTP {}", response.status());
+            }
+            Err(error) => {
+                last_error = error.to_string();
+            }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("node {base_url} did not become ready");
+    panic!("node {base_url} did not become ready: {last_error}");
 }
 
 async fn put_until_created(client: &reqwest::Client, url: &str) {
