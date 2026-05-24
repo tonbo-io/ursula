@@ -10,6 +10,7 @@
 //! - [`validate`]: bucket/stream id validation used by HTTP and Raft entry points.
 
 mod command;
+mod integrity;
 mod model;
 mod response;
 mod snapshot;
@@ -17,6 +18,7 @@ mod state_machine;
 mod validate;
 
 pub use command::StreamCommand;
+pub use integrity::{StreamIntegrityRecord, StreamIntegritySnapshot};
 pub use model::{
     AppendStreamInput, ColdChunkRef, ColdFlushCandidate, ExternalPayloadRef, HotPayloadSegment,
     ObjectPayloadRef, ProducerAppendRecord, ProducerRequest, ProducerSnapshot, StreamBatchAppend,

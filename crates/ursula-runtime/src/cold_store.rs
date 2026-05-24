@@ -1,7 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::fs;
 use std::io;
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,28 +17,36 @@ const DEFAULT_COLD_CACHE_READAHEAD_BLOCKS: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct ColdStore {
+    info: ColdStoreInfo,
     operator: Operator,
     read_cache: Option<Arc<ColdReadCache>>,
 }
 
 pub type ColdStoreHandle = Arc<ColdStore>;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColdStoreInfo {
+    pub backend: &'static str,
+    pub root: Option<String>,
+    pub bucket: Option<String>,
+    pub region: Option<String>,
+    pub endpoint: Option<String>,
+}
+
 impl ColdStore {
     pub fn memory() -> io::Result<Self> {
         let operator = Operator::via_iter(Scheme::Memory, [])
             .map_err(|err| io::Error::other(err.to_string()))?;
-        Ok(Self::new(operator))
-    }
-
-    pub fn fs(root: impl AsRef<Path>) -> io::Result<Self> {
-        let root = root.as_ref();
-        fs::create_dir_all(root)?;
-        let operator = Operator::via_iter(
-            Scheme::Fs,
-            [("root".to_owned(), root.to_string_lossy().to_string())],
-        )
-        .map_err(|err| io::Error::other(err.to_string()))?;
-        Ok(Self::new(operator))
+        Ok(Self::new(
+            operator,
+            ColdStoreInfo {
+                backend: "memory",
+                root: None,
+                bucket: None,
+                region: None,
+                endpoint: None,
+            },
+        ))
     }
 
     pub fn s3_from_env() -> io::Result<Self> {
@@ -62,24 +68,31 @@ impl ColdStore {
         }
 
         let mut builder = opendal::services::S3::default().bucket(&bucket);
+        let mut configured_root = None;
         if let Some(root) = root_override {
             if !root.trim().is_empty() {
                 builder = builder.root(root);
+                configured_root = Some(root.to_owned());
             }
         } else if let Ok(root) = std::env::var("URSULA_COLD_ROOT")
             && !root.trim().is_empty()
         {
             builder = builder.root(&root);
+            configured_root = Some(root);
         }
+        let mut configured_region = None;
         if let Ok(region) = std::env::var("URSULA_COLD_S3_REGION")
             && !region.trim().is_empty()
         {
             builder = builder.region(&region);
+            configured_region = Some(region);
         }
+        let mut configured_endpoint = None;
         if let Ok(endpoint) = std::env::var("URSULA_COLD_S3_ENDPOINT")
             && !endpoint.trim().is_empty()
         {
             builder = builder.endpoint(&endpoint);
+            configured_endpoint = Some(endpoint);
         }
         if let Ok(access_key_id) = std::env::var("URSULA_COLD_S3_ACCESS_KEY_ID")
             && !access_key_id.trim().is_empty()
@@ -101,6 +114,13 @@ impl ColdStore {
             Operator::new(builder)
                 .map_err(|err| io::Error::other(err.to_string()))?
                 .finish(),
+            ColdStoreInfo {
+                backend: "s3",
+                root: configured_root,
+                bucket: Some(bucket),
+                region: configured_region,
+                endpoint: configured_endpoint,
+            },
         ))
     }
 
@@ -108,14 +128,13 @@ impl ColdStore {
         let backend = std::env::var("URSULA_COLD_BACKEND")
             .unwrap_or_else(|_| "none".to_owned())
             .to_ascii_lowercase();
-        let store = match backend.as_str() {
+        Self::from_backend(&backend)
+    }
+
+    fn from_backend(backend: &str) -> io::Result<Option<ColdStoreHandle>> {
+        let store = match backend {
             "none" | "disabled" | "off" => return Ok(None),
             "memory" | "mem" | "inmem" => Self::memory()?,
-            "fs" => {
-                let root =
-                    std::env::var("URSULA_COLD_ROOT").unwrap_or_else(|_| "data/cold".to_owned());
-                Self::fs(root)?
-            }
             "s3" => Self::s3_from_env()?,
             other => {
                 return Err(io::Error::new(
@@ -127,11 +146,16 @@ impl ColdStore {
         Ok(Some(Arc::new(store)))
     }
 
-    fn new(operator: Operator) -> Self {
+    fn new(operator: Operator, info: ColdStoreInfo) -> Self {
         Self {
+            info,
             operator,
             read_cache: ColdReadCache::from_env().map(Arc::new),
         }
+    }
+
+    pub fn info(&self) -> &ColdStoreInfo {
+        &self.info
     }
 
     pub fn with_read_cache(mut self, config: ColdReadCacheConfig) -> Self {
@@ -663,4 +687,16 @@ pub fn new_external_payload_path(stream_id: &BucketStreamId) -> String {
         .unwrap_or(0);
     let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("{stream_id}/external/{unix_nanos:032x}-{sequence:016x}.bin")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ColdStore;
+
+    #[test]
+    fn fs_backend_is_not_supported() {
+        let err = ColdStore::from_backend("fs").expect_err("fs backend should be unsupported");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "unsupported URSULA_COLD_BACKEND 'fs'");
+    }
 }

@@ -1,7 +1,3 @@
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use ursula_runtime::{ColdReadCacheConfig, ColdStore};
 use ursula_shard::BucketStreamId;
@@ -16,8 +12,6 @@ const INTERLEAVED_STREAMS: usize = 4;
 const RANDOM_OBJECT_BYTES: usize = 128 * 1024 * 1024;
 const RANDOM_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const RANDOM_READS: usize = 512;
-
-static BENCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn cold_cache_benches(c: &mut Criterion) {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -166,9 +160,7 @@ async fn bench_store_with_config(
     cache_bytes: usize,
     cache_block_bytes: usize,
 ) -> BenchStore {
-    let root = unique_root(cache_enabled);
-    let _ = std::fs::remove_dir_all(&root);
-    let store = ColdStore::fs(&root).expect("fs cold store");
+    let store = ColdStore::memory().expect("memory cold store");
     let store = if cache_enabled {
         store.with_read_cache(ColdReadCacheConfig {
             max_bytes: cache_bytes,
@@ -270,18 +262,6 @@ fn random_offsets(object_bytes: usize, read_bytes: usize, count: usize) -> Vec<u
             u64::try_from(block_index * read_bytes).expect("offset fits u64")
         })
         .collect()
-}
-
-fn unique_root(cache_enabled: bool) -> PathBuf {
-    let unix_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let sequence = BENCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "ursula-cold-cache-bench-{}-{unix_nanos}-{sequence}",
-        if cache_enabled { "on" } else { "off" }
-    ))
 }
 
 criterion_group!(benches, cold_cache_benches);

@@ -81,6 +81,7 @@ pub fn spawn_static_grpc_raft_memory_runtime(
     .with_cold_store(cold_store.clone());
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
+    spawn_cold_flush_worker_if_configured(&runtime);
     Ok((runtime, registry))
 }
 
@@ -104,6 +105,7 @@ pub fn spawn_static_grpc_raft_memory_runtime_with_per_group_initializers(
     .with_cold_store(cold_store.clone());
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
+    spawn_cold_flush_worker_if_configured(&runtime);
     Ok((runtime, registry))
 }
 
@@ -128,6 +130,7 @@ pub fn spawn_static_grpc_raft_runtime(
     .with_raft_log_dir(raft_log_dir);
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
+    spawn_cold_flush_worker_if_configured(&runtime);
     Ok((runtime, registry))
 }
 
@@ -153,6 +156,7 @@ pub fn spawn_static_grpc_raft_runtime_with_per_group_initializers(
     .with_raft_log_dir(raft_log_dir);
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
+    spawn_cold_flush_worker_if_configured(&runtime);
     Ok((runtime, registry))
 }
 

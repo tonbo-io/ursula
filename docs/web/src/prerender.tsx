@@ -6,6 +6,7 @@ import {
   BENCHMARK_PATH,
   BLOG_PAGE_PREFIX,
   BLOG_PATH,
+  CHAOS_TEST_PATH,
   DOCS_PAGE_PREFIX,
   DOCS_PATH,
   HOME_PATH,
@@ -60,10 +61,10 @@ function getHeadForUrl(url: string): HeadData {
     };
   }
 
-  if (url === STATUS_PATH) {
+  if (url === CHAOS_TEST_PATH || url === STATUS_PATH) {
     return {
-      title: "Chaos Status | Ursula",
-      description: "Live status for the continuous Ursula EC2 chaos test.",
+      title: "Chaos Test | Ursula",
+      description: "Live view of Ursula's continuous EC2 chaos test.",
       ogType: "website",
       ogImage: DEFAULT_OG_IMAGE,
       canonical,
@@ -129,6 +130,7 @@ export async function prerender(data: { url: string }) {
   const links = new Set<string>([
     DOCS_PATH,
     BENCHMARK_PATH,
+    CHAOS_TEST_PATH,
     STATUS_PATH,
     BLOG_PATH,
     ...docsPageLinks,

@@ -9,7 +9,7 @@ use tokio::task::JoinSet;
 use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardId, ShardPlacement, StaticShardMap};
 use ursula_stream::{ColdChunkRef, ColdFlushCandidate, StreamErrorCode};
 
-use crate::cold_store::{ColdStoreHandle, new_cold_chunk_path};
+use crate::cold_store::{ColdStoreHandle, ColdStoreInfo, new_cold_chunk_path};
 use crate::command::GroupSnapshot;
 use crate::core_worker::{CoreCommand, CoreMailbox, CoreWorker, WaitReadCancel};
 use crate::engine::in_memory::InMemoryGroupEngineFactory;
@@ -142,6 +142,12 @@ impl ShardRuntime {
 
     pub fn cold_store(&self) -> Option<ColdStoreHandle> {
         self.cold_store.clone()
+    }
+
+    pub fn cold_store_info(&self) -> Option<ColdStoreInfo> {
+        self.cold_store
+            .as_ref()
+            .map(|cold_store| cold_store.info().clone())
     }
 
     pub async fn create_stream(
@@ -685,11 +691,7 @@ impl ShardRuntime {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        match self.flush_cold_candidates_batch(candidates).await {
-            Ok(responses) => Ok(responses),
-            Err(err) if is_stale_cold_flush_candidate_error(&err) => Ok(Vec::new()),
-            Err(err) => Err(err),
-        }
+        self.flush_cold_candidates_batch(candidates).await
     }
 
     async fn flush_cold_candidate(
@@ -747,76 +749,15 @@ impl ShardRuntime {
         &self,
         candidates: Vec<ColdFlushCandidate>,
     ) -> Result<Vec<FlushColdResponse>, RuntimeError> {
-        let Some(cold_store) = self.cold_store.as_ref() else {
-            return Err(RuntimeError::ColdStoreConfig {
-                message: "URSULA_COLD_BACKEND must be configured before flushing cold chunks"
-                    .to_owned(),
-            });
-        };
-        let mut requests = Vec::with_capacity(candidates.len());
-        let mut uploaded = Vec::with_capacity(candidates.len());
+        let mut responses = Vec::with_capacity(candidates.len());
         for candidate in candidates {
-            let path = new_cold_chunk_path(
-                &candidate.stream_id,
-                candidate.start_offset,
-                candidate.end_offset,
-            );
-            let upload_started_at = Instant::now();
-            let object_size = cold_store
-                .write_chunk(&path, &candidate.payload)
-                .await
-                .map_err(|err| RuntimeError::ColdStoreIo {
-                    message: err.to_string(),
-                })?;
-            self.metrics
-                .record_cold_upload(object_size, elapsed_ns(upload_started_at));
-            uploaded.push((path.clone(), object_size));
-            requests.push(FlushColdRequest {
-                stream_id: candidate.stream_id,
-                chunk: ColdChunkRef {
-                    start_offset: candidate.start_offset,
-                    end_offset: candidate.end_offset,
-                    s3_path: path,
-                    object_size,
-                },
-            });
-        }
-
-        let placement = self.shard_map.locate(&requests[0].stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        let publish_started_at = Instant::now();
-        let publish = self
-            .send_core_command(
-                mailbox,
-                CoreCommand::FlushColdBatch {
-                    requests,
-                    placement,
-                    response_tx,
-                },
-                response_rx,
-            )
-            .await;
-        match publish {
-            Ok(responses) => {
-                let publish_ns = elapsed_ns(publish_started_at);
-                let per_chunk_publish_ns =
-                    publish_ns / u64::try_from(uploaded.len()).expect("uploaded len fits u64");
-                for (_, object_size) in &uploaded {
-                    self.metrics
-                        .record_cold_publish(*object_size, per_chunk_publish_ns);
-                }
-                Ok(responses)
-            }
-            Err(err) => {
-                for (path, object_size) in uploaded {
-                    let cleanup_failed = cold_store.delete_chunk(&path).await.is_err();
-                    self.metrics
-                        .record_cold_orphan_cleanup(object_size, cleanup_failed);
-                }
-                Err(err)
+            match self.flush_cold_candidate(candidate).await {
+                Ok(response) => responses.push(response),
+                Err(err) if is_stale_cold_flush_candidate_error(&err) => {}
+                Err(err) => return Err(err),
             }
         }
+        Ok(responses)
     }
 
     pub async fn flush_cold_all_groups_once(

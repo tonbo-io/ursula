@@ -95,7 +95,7 @@ impl std::fmt::Display for RuntimeError {
                 ..
             } => write!(
                 f,
-                "core {} raft group {} append failed: {message}",
+                "core {} raft group {} operation failed: {message}",
                 core_id.0, raft_group_id.0
             ),
             Self::MailboxClosed { core_id } => {

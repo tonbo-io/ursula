@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use ursula_shard::BucketStreamId;
 
 use crate::command::StreamCommand;
+use crate::integrity::StreamIntegrity;
 use crate::model::{
     AppendExternalInput, AppendStreamInput, ColdChunkRef, ColdFlushCandidate, ExternalPayloadRef,
     HotPayloadSegment, ObjectPayloadRef, ProducerAppendRecord, ProducerRequest, ProducerSnapshot,
@@ -22,6 +23,7 @@ pub struct StreamStateMachine {
     cold_chunks: HashMap<BucketStreamId, Vec<ColdChunkRef>>,
     external_segments: HashMap<BucketStreamId, Vec<ObjectPayloadRef>>,
     message_records: HashMap<BucketStreamId, Vec<StreamMessageRecord>>,
+    integrities: HashMap<BucketStreamId, StreamIntegrity>,
     visible_snapshots: HashMap<BucketStreamId, StreamVisibleSnapshot>,
     producers: HashMap<BucketStreamId, HashMap<String, ProducerState>>,
 }
@@ -390,10 +392,13 @@ impl StreamStateMachine {
     }
 
     pub fn hot_start_offset(&self, stream_id: &BucketStreamId) -> u64 {
+        let Some(stream) = self.streams.get(stream_id) else {
+            return 0;
+        };
         self.hot_buffers
             .get(stream_id)
-            .map(HotBuffer::hot_start_offset)
-            .unwrap_or(0)
+            .and_then(|buffer| buffer.chunks.front().map(|chunk| chunk.start_offset))
+            .unwrap_or(stream.tail_offset)
     }
 
     pub fn cold_chunks(&self, stream_id: &BucketStreamId) -> &[ColdChunkRef] {
@@ -545,6 +550,29 @@ impl StreamStateMachine {
         self.buckets.contains(bucket_id)
     }
 
+    pub fn integrity_snapshot(
+        &self,
+        stream_id: &BucketStreamId,
+    ) -> Result<crate::integrity::StreamIntegritySnapshot, StreamResponse> {
+        let Some(stream) = self.streams.get(stream_id) else {
+            return Err(StreamResponse::error(
+                StreamErrorCode::StreamNotFound,
+                format!("stream '{stream_id}' does not exist"),
+            ));
+        };
+        if is_soft_deleted(stream) {
+            return Err(StreamResponse::error(
+                StreamErrorCode::StreamGone,
+                format!("stream '{stream_id}' is gone"),
+            ));
+        }
+        Ok(self
+            .integrities
+            .get(stream_id)
+            .expect("integrity exists for stream metadata")
+            .snapshot(self.earliest_retained_offset(stream_id), stream.tail_offset))
+    }
+
     pub fn snapshot(&self) -> StreamSnapshot {
         let mut buckets = self.buckets.iter().cloned().collect::<Vec<_>>();
         buckets.sort();
@@ -555,6 +583,7 @@ impl StreamStateMachine {
             .cloned()
             .map(|metadata| {
                 let stream_id = metadata.stream_id.clone();
+                let tail_offset = metadata.tail_offset;
                 let hot_buffer = self
                     .hot_buffers
                     .get(&stream_id)
@@ -581,6 +610,11 @@ impl StreamStateMachine {
                         .get(&stream_id)
                         .cloned()
                         .unwrap_or_default(),
+                    integrity: self
+                        .integrities
+                        .get(&stream_id)
+                        .expect("integrity exists for stream metadata")
+                        .snapshot(self.earliest_retained_offset(&stream_id), tail_offset),
                     visible_snapshot: self.visible_snapshots.get(&stream_id).cloned(),
                     producer_states,
                 }
@@ -652,6 +686,11 @@ impl StreamStateMachine {
             ) {
                 return Err(StreamSnapshotError::MessageBoundaryMismatch { stream_id });
             }
+            let integrity = StreamIntegrity::restore(entry.integrity).ok_or_else(|| {
+                StreamSnapshotError::IntegrityMismatch {
+                    stream_id: stream_id.clone(),
+                }
+            })?;
             if machine
                 .streams
                 .insert(entry.metadata.stream_id.clone(), entry.metadata)
@@ -679,6 +718,7 @@ impl StreamStateMachine {
                     .message_records
                     .insert(stream_id.clone(), entry.message_records);
             }
+            machine.integrities.insert(stream_id.clone(), integrity);
             if let Some(snapshot) = entry.visible_snapshot {
                 machine
                     .visible_snapshots
@@ -1213,6 +1253,16 @@ impl StreamStateMachine {
             input.stream_id.clone(),
             HotBuffer::from_payload(0, input.initial_payload),
         );
+        let mut integrity = StreamIntegrity::default();
+        if initial_len > 0 {
+            let payload = self
+                .hot_buffers
+                .get(&input.stream_id)
+                .expect("hot buffer exists for stream metadata")
+                .payload();
+            integrity.append_payload(&input.stream_id, 0, initial_len, &payload);
+        }
+        self.integrities.insert(input.stream_id.clone(), integrity);
         if initial_len > 0 {
             self.message_records.insert(
                 input.stream_id.clone(),
@@ -1345,6 +1395,22 @@ impl StreamStateMachine {
                 object_size: input.initial_payload.object_size,
             }],
         );
+        let mut integrity = StreamIntegrity::default();
+        if initial_len > 0 {
+            let object = self
+                .external_segments
+                .get(&input.stream_id)
+                .and_then(|objects| objects.first())
+                .expect("external segment exists for stream metadata");
+            integrity.append_external(
+                &input.stream_id,
+                object.start_offset,
+                object.end_offset,
+                &object.s3_path,
+                object.object_size,
+            );
+        }
+        self.integrities.insert(input.stream_id.clone(), integrity);
         self.message_records.insert(
             input.stream_id.clone(),
             vec![StreamMessageRecord {
@@ -1533,6 +1599,10 @@ impl StreamStateMachine {
                 .get_mut(&stream_id)
                 .expect("hot buffer exists for stream metadata")
                 .push(offset, next_offset, payload);
+            self.integrities
+                .get_mut(&stream_id)
+                .expect("integrity exists for stream metadata")
+                .append_payload(&stream_id, offset, next_offset, payload);
             self.message_records
                 .entry(stream_id.clone())
                 .or_default()
@@ -1678,6 +1748,21 @@ impl StreamStateMachine {
                 s3_path: payload.s3_path,
                 object_size: payload.object_size,
             });
+        let object = self
+            .external_segments
+            .get(&stream_id)
+            .and_then(|segments| segments.last())
+            .expect("external segment exists for stream metadata");
+        self.integrities
+            .get_mut(&stream_id)
+            .expect("integrity exists for stream metadata")
+            .append_external(
+                &stream_id,
+                object.start_offset,
+                object.end_offset,
+                &object.s3_path,
+                object.object_size,
+            );
         self.message_records
             .entry(stream_id.clone())
             .or_default()
@@ -1799,6 +1884,13 @@ impl StreamStateMachine {
             .expect("hot buffer exists for stream metadata");
         for (item, payload) in items.iter().zip(payloads.iter()) {
             hot_buffer.push(item.start_offset, item.next_offset, payload);
+        }
+        let integrity = self
+            .integrities
+            .get_mut(&stream_id)
+            .expect("integrity exists for stream metadata");
+        for (item, payload) in items.iter().zip(payloads.iter()) {
+            integrity.append_payload(&stream_id, item.start_offset, item.next_offset, payload);
         }
         self.message_records
             .entry(stream_id.clone())
@@ -1995,6 +2087,7 @@ impl StreamStateMachine {
             self.cold_chunks.remove(stream_id);
             self.external_segments.remove(stream_id);
             self.message_records.remove(stream_id);
+            self.integrities.remove(stream_id);
             self.visible_snapshots.remove(stream_id);
             self.producers.remove(stream_id);
             true
@@ -2052,6 +2145,9 @@ impl StreamStateMachine {
             if records.is_empty() {
                 self.message_records.remove(stream_id);
             }
+        }
+        if let Some(integrity) = self.integrities.get_mut(stream_id) {
+            integrity.evict_before(retained_offset);
         }
         if let Some(chunks) = self.cold_chunks.get_mut(stream_id) {
             chunks.retain(|chunk| chunk.end_offset > retained_offset);

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use ursula_shard::BucketStreamId;
 
+use crate::integrity::StreamIntegritySnapshot;
 use crate::model::{
     ColdChunkRef, HotPayloadSegment, ObjectPayloadRef, ProducerSnapshot, StreamMessageRecord,
     StreamMetadata, StreamVisibleSnapshot,
@@ -21,6 +22,7 @@ pub struct StreamSnapshotEntry {
     pub cold_chunks: Vec<ColdChunkRef>,
     pub external_segments: Vec<ObjectPayloadRef>,
     pub message_records: Vec<StreamMessageRecord>,
+    pub integrity: StreamIntegritySnapshot,
     pub visible_snapshot: Option<StreamVisibleSnapshot>,
     pub producer_states: Vec<ProducerSnapshot>,
 }
@@ -40,6 +42,9 @@ pub enum StreamSnapshotError {
         payload_len: usize,
     },
     MessageBoundaryMismatch {
+        stream_id: BucketStreamId,
+    },
+    IntegrityMismatch {
         stream_id: BucketStreamId,
     },
     SnapshotOffsetOutOfRange {
@@ -82,6 +87,10 @@ impl std::fmt::Display for StreamSnapshotError {
             Self::MessageBoundaryMismatch { stream_id } => write!(
                 f,
                 "snapshot stream '{stream_id}' has inconsistent message boundaries"
+            ),
+            Self::IntegrityMismatch { stream_id } => write!(
+                f,
+                "snapshot stream '{stream_id}' has inconsistent integrity setsums"
             ),
             Self::SnapshotOffsetOutOfRange {
                 stream_id,

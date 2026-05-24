@@ -126,11 +126,6 @@ pub(crate) enum CoreCommand {
         placement: ShardPlacement,
         response_tx: oneshot::Sender<Result<FlushColdResponse, RuntimeError>>,
     },
-    FlushColdBatch {
-        requests: Vec<FlushColdRequest>,
-        placement: ShardPlacement,
-        response_tx: oneshot::Sender<Result<Vec<FlushColdResponse>, RuntimeError>>,
-    },
     PlanColdFlush {
         request: PlanColdFlushRequest,
         placement: ShardPlacement,
@@ -262,6 +257,12 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
+                    let incoming_bytes =
+                        u64::try_from(request.initial_payload.len()).expect("payload len fits u64");
+                    if let Some(err) = self.early_cold_backpressure(placement, incoming_bytes) {
+                        let _ = response_tx.send(Err(err));
+                        continue;
+                    }
                     self.send_group_command(
                         placement,
                         GroupCommand::CreateStream {
@@ -496,21 +497,6 @@ impl CoreWorker {
                     )
                     .await;
                 }
-                CoreCommand::FlushColdBatch {
-                    requests,
-                    placement,
-                    response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::FlushColdBatch {
-                            requests,
-                            response_tx,
-                        },
-                    )
-                    .await;
-                }
                 CoreCommand::PlanColdFlush {
                     request,
                     placement,
@@ -564,6 +550,12 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
+                    if let Some(err) =
+                        self.early_cold_backpressure(placement, request.payload_len())
+                    {
+                        let _ = response_tx.send(Err(err));
+                        continue;
+                    }
                     self.send_group_command(
                         placement,
                         GroupCommand::Append {
@@ -594,6 +586,11 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
+                    let incoming_bytes = append_batch_payload_bytes(&request);
+                    if let Some(err) = self.early_cold_backpressure(placement, incoming_bytes) {
+                        let _ = response_tx.send(Err(err));
+                        continue;
+                    }
                     self.send_group_command(
                         placement,
                         GroupCommand::AppendBatch {
@@ -635,6 +632,35 @@ impl CoreWorker {
                 }
             }
         }
+    }
+
+    fn early_cold_backpressure(
+        &self,
+        placement: ShardPlacement,
+        incoming_bytes: u64,
+    ) -> Option<RuntimeError> {
+        let limit = self.cold_write_admission.max_hot_bytes_per_group?;
+        let current_hot_bytes = self
+            .metrics
+            .cold_hot_bytes_for_group(placement.raft_group_id);
+        if current_hot_bytes.saturating_add(incoming_bytes) <= limit {
+            return None;
+        }
+        self.metrics.record_cold_backpressure(
+            placement.core_id,
+            placement.raft_group_id,
+            incoming_bytes,
+            limit,
+        );
+        Some(RuntimeError::GroupEngine {
+            core_id: placement.core_id,
+            raft_group_id: placement.raft_group_id,
+            message: format!(
+                "ColdBackpressure: group hot bytes {current_hot_bytes} plus incoming {incoming_bytes} would exceed limit {limit}"
+            ),
+            next_offset: None,
+            leader_hint: None,
+        })
     }
 
     pub(crate) async fn send_group_command(
@@ -1127,93 +1153,6 @@ impl CoreWorker {
             .await;
         }
         response
-    }
-
-    pub(crate) async fn flush_cold_batch(
-        group: &mut Box<dyn GroupEngine>,
-        metrics: Arc<RuntimeMetricsInner>,
-        read_materialization: Arc<Semaphore>,
-        read_watchers: &mut ReadWatchers,
-        requests: Vec<FlushColdRequest>,
-        placement: ShardPlacement,
-    ) -> Result<Vec<FlushColdResponse>, RuntimeError> {
-        if requests.is_empty() {
-            return Ok(Vec::new());
-        }
-        let stream_ids = requests
-            .iter()
-            .map(|request| request.stream_id.clone())
-            .collect::<Vec<_>>();
-        let commands = requests
-            .into_iter()
-            .map(GroupWriteCommand::from)
-            .collect::<Vec<_>>();
-        let started_at = Instant::now();
-        let exec_started_at = Instant::now();
-        let response = group
-            .write_batch(vec![GroupWriteCommand::Batch { commands }], placement)
-            .await
-            .map_err(|err| RuntimeError::group_engine(placement, err));
-        metrics.record_group_engine_exec(
-            placement.core_id,
-            placement.raft_group_id,
-            elapsed_ns(exec_started_at),
-        );
-        let mut outer = response?;
-        let Some(batch_response) = outer.pop() else {
-            return Err(RuntimeError::group_engine(
-                placement,
-                GroupEngineError::new("cold flush batch returned no response"),
-            ));
-        };
-        let items =
-            match batch_response.map_err(|err| RuntimeError::group_engine(placement, err))? {
-                GroupWriteResponse::Batch(items) => items,
-                other => {
-                    return Err(RuntimeError::group_engine(
-                        placement,
-                        GroupEngineError::new(format!(
-                            "unexpected cold flush batch response: {other:?}"
-                        )),
-                    ));
-                }
-            };
-        let mut responses = Vec::with_capacity(items.len());
-        let mutation_ns = elapsed_ns(started_at);
-        for (index, item) in items.into_iter().enumerate() {
-            match item.map_err(|err| RuntimeError::group_engine(placement, err))? {
-                GroupWriteResponse::FlushCold(response) => {
-                    metrics.record_applied_mutation(
-                        placement.core_id,
-                        placement.raft_group_id,
-                        mutation_ns,
-                    );
-                    if let Some(stream_id) = stream_ids.get(index) {
-                        record_cold_hot_backlog(group, &metrics, stream_id.clone(), placement)
-                            .await;
-                        Self::notify_read_watchers(
-                            group,
-                            metrics.clone(),
-                            read_materialization.clone(),
-                            read_watchers,
-                            stream_id,
-                            placement,
-                        )
-                        .await;
-                    }
-                    responses.push(response);
-                }
-                other => {
-                    return Err(RuntimeError::group_engine(
-                        placement,
-                        GroupEngineError::new(format!(
-                            "unexpected cold flush batch item response: {other:?}"
-                        )),
-                    ));
-                }
-            }
-        }
-        Ok(responses)
     }
 
     pub(crate) async fn plan_cold_flush(

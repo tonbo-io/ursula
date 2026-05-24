@@ -296,22 +296,13 @@ adds the cold-path version of that shape: three static gRPC nodes with
 independent durable journals share a cold store, the leader writes and batch
 flushes cold metadata, and every node's Raft state machine reads the complete
 payload through the replicated cold manifest while retaining a non-empty core
-journal. `cli_static_grpc_raft_log_dir_replicates_cold_manifest` repeats the
-durable cold-manifest flow through real `ursula` processes, static cluster
-JSON files, independent `--raft-log-dir` roots, and a shared
-`URSULA_COLD_BACKEND=fs` root, and explicitly flushes until `cold_hot_bytes`
-reaches zero before readback. `cli_static_grpc_raft_log_dir_recovers_cold_manifest_after_restart`
-adds the single-node binary restart case for that cold-manifest path: the
-process writes, flushes to the cold root until `cold_hot_bytes` reaches zero,
-stops, restarts from the same durable log directory without reinitializing
-membership, and reads the cold-backed payload through HTTP. The same
-`cli_static_grpc_raft_log_dir_recovers_replicated_cold_manifest_after_restart`
-test extends that to three real processes with independent durable log roots:
-it replicates the cold manifest, stops all nodes, restarts without initial
-membership, and reads the cold-backed stream through a restarted follower. The
-gated `cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after_restart`
-test repeats that shape with real S3 cold storage and cleans up the unique S3
-root after readback. The binary also exposes narrow Raft admin endpoints under
+journal. The gated
+`cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after_restart`
+test covers the same shape through real `ursula` processes with independent
+durable log roots and shared S3 cold storage: it replicates the cold manifest,
+stops all nodes, restarts without initial membership, reads the cold-backed
+stream through a restarted follower, and cleans up the unique S3 root after
+readback. The binary also exposes narrow Raft admin endpoints under
 `/__ursula/raft/{group}` for validation workflows: trigger snapshot, trigger
 purge, and add a learner. `cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner`
 uses only real `ursula` processes plus those endpoints to prove a late

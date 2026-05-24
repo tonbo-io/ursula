@@ -69,6 +69,14 @@ const HEADER_STREAM_CURSOR: &str = "stream-cursor";
 const HEADER_STREAM_EXPIRES_AT: &str = "stream-expires-at";
 const HEADER_STREAM_FORK_OFFSET: &str = "stream-fork-offset";
 const HEADER_STREAM_FORKED_FROM: &str = "stream-forked-from";
+const HEADER_STREAM_INTEGRITY_EVICTED_RECORDS: &str = "stream-integrity-evicted-records";
+const HEADER_STREAM_INTEGRITY_EVICTED_SETSUM: &str = "stream-integrity-evicted-setsum";
+const HEADER_STREAM_INTEGRITY_LIVE_RECORDS: &str = "stream-integrity-live-records";
+const HEADER_STREAM_INTEGRITY_LIVE_SETSUM: &str = "stream-integrity-live-setsum";
+const HEADER_STREAM_INTEGRITY_LIVE_START_OFFSET: &str = "stream-integrity-live-start-offset";
+const HEADER_STREAM_INTEGRITY_TOTAL_RECORDS: &str = "stream-integrity-total-records";
+const HEADER_STREAM_INTEGRITY_TOTAL_SETSUM: &str = "stream-integrity-total-setsum";
+const HEADER_STREAM_COLD_HOT_START_OFFSET: &str = "stream-cold-hot-start-offset";
 const HEADER_STREAM_NEXT_OFFSET: &str = "stream-next-offset";
 const HEADER_STREAM_SNAPSHOT_OFFSET: &str = "stream-snapshot-offset";
 const HEADER_STREAM_SSE_DATA_ENCODING: &str = "stream-sse-data-encoding";
@@ -693,6 +701,7 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
             state.runtime.mailbox_snapshot(),
             state.http_metrics.snapshot(),
             &raft_groups,
+            state.runtime.cold_store_info().as_ref(),
         ),
     )
         .into_response()
@@ -1447,12 +1456,52 @@ pub(crate) async fn head_stream_by_id(
             insert_default_response_headers(&mut headers);
             insert_content_type(&mut headers, &response.content_type);
             insert_offset(&mut headers, response.tail_offset);
+            insert_u64_header(
+                &mut headers,
+                HEADER_STREAM_COLD_HOT_START_OFFSET,
+                response.cold_hot_start_offset,
+            );
             insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
             insert_cache_control(&mut headers, "no-store");
             insert_lifetime_headers(
                 &mut headers,
                 response.stream_ttl_seconds,
                 response.stream_expires_at_ms,
+            );
+            insert_header_str(
+                &mut headers,
+                HEADER_STREAM_INTEGRITY_LIVE_SETSUM,
+                &response.integrity.live_setsum,
+            );
+            insert_header_str(
+                &mut headers,
+                HEADER_STREAM_INTEGRITY_EVICTED_SETSUM,
+                &response.integrity.evicted_setsum,
+            );
+            insert_header_str(
+                &mut headers,
+                HEADER_STREAM_INTEGRITY_TOTAL_SETSUM,
+                &response.integrity.total_setsum,
+            );
+            insert_u64_header(
+                &mut headers,
+                HEADER_STREAM_INTEGRITY_LIVE_START_OFFSET,
+                response.integrity.live_start_offset,
+            );
+            insert_u64_header(
+                &mut headers,
+                HEADER_STREAM_INTEGRITY_LIVE_RECORDS,
+                response.integrity.live_records,
+            );
+            insert_u64_header(
+                &mut headers,
+                HEADER_STREAM_INTEGRITY_EVICTED_RECORDS,
+                response.integrity.evicted_records,
+            );
+            insert_u64_header(
+                &mut headers,
+                HEADER_STREAM_INTEGRITY_TOTAL_RECORDS,
+                response.integrity.total_records,
             );
             if let Some(snapshot_offset) = response.snapshot_offset {
                 insert_snapshot_offset(&mut headers, snapshot_offset);

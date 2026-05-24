@@ -1,4 +1,5 @@
 use super::*;
+use crate::integrity::StreamIntegritySnapshot;
 
 fn stream(id: &str) -> BucketStreamId {
     BucketStreamId::new("benchcmp", id)
@@ -43,6 +44,21 @@ fn producer(id: &str, epoch: u64, seq: u64) -> ProducerRequest {
         producer_id: id.to_owned(),
         producer_epoch: epoch,
         producer_seq: seq,
+    }
+}
+
+fn empty_integrity() -> StreamIntegritySnapshot {
+    let empty = setsum::Setsum::default().hexdigest();
+    StreamIntegritySnapshot {
+        live_setsum: empty.clone(),
+        evicted_setsum: empty.clone(),
+        total_setsum: empty,
+        live_start_offset: 0,
+        tail_offset: 0,
+        live_records: 0,
+        evicted_records: 0,
+        total_records: 0,
+        records: Vec::new(),
     }
 }
 
@@ -192,6 +208,15 @@ fn append_advances_offsets_and_checks_content_type() {
         }
     ));
     assert_eq!(machine.head(&stream("s-1")).expect("stream").tail_offset, 7);
+    let integrity = machine
+        .integrity_snapshot(&stream("s-1"))
+        .expect("integrity");
+    assert_eq!(integrity.live_start_offset, 0);
+    assert_eq!(integrity.tail_offset, 7);
+    assert_eq!(integrity.live_records, 1);
+    assert_eq!(integrity.evicted_records, 0);
+    assert_eq!(integrity.total_records, 1);
+    assert_eq!(integrity.live_setsum, integrity.total_setsum);
 }
 
 #[test]
@@ -389,7 +414,7 @@ fn flush_cold_can_coalesce_contiguous_hot_segments() {
             },
         }),
         StreamResponse::ColdFlushed {
-            hot_start_offset: 0,
+            hot_start_offset: 5,
         }
     );
     assert!(machine.hot_segments(&stream("cold-coalesced")).is_empty());
@@ -710,6 +735,42 @@ fn hot_payload_byte_metrics_follow_cold_flush() {
 }
 
 #[test]
+fn hot_start_offset_advances_to_tail_after_full_cold_flush() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    create_stream(&mut machine, "hot-start");
+    assert!(matches!(
+        machine.apply(StreamCommand::Append {
+            stream_id: stream("hot-start"),
+            content_type: Some("application/octet-stream".to_owned()),
+            payload: b"abcd".to_vec(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            now_ms: 0,
+        }),
+        StreamResponse::Appended { .. }
+    ));
+
+    assert_eq!(
+        machine.apply(StreamCommand::FlushCold {
+            stream_id: stream("hot-start"),
+            chunk: ColdChunkRef {
+                start_offset: 0,
+                end_offset: 4,
+                s3_path: "s3://bucket/hot-start/000000".to_owned(),
+                object_size: 4,
+            },
+        }),
+        StreamResponse::ColdFlushed {
+            hot_start_offset: 4,
+        }
+    );
+    assert_eq!(machine.hot_start_offset(&stream("hot-start")), 4);
+    assert_eq!(machine.hot_payload_len(&stream("hot-start")), Ok(0));
+}
+
+#[test]
 fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
     let mut machine = StreamStateMachine::new();
     create_bucket(&mut machine);
@@ -926,6 +987,7 @@ fn snapshot_restore_rejects_invalid_entries() {
                 cold_chunks: Vec::new(),
                 external_segments: Vec::new(),
                 message_records: Vec::new(),
+                integrity: empty_integrity(),
                 visible_snapshot: None,
                 producer_states: Vec::new(),
             }],
@@ -957,6 +1019,7 @@ fn snapshot_restore_rejects_invalid_entries() {
                 cold_chunks: Vec::new(),
                 external_segments: Vec::new(),
                 message_records: Vec::new(),
+                integrity: empty_integrity(),
                 visible_snapshot: None,
                 producer_states: Vec::new(),
             }],
@@ -988,6 +1051,7 @@ fn snapshot_restore_rejects_invalid_entries() {
                 cold_chunks: Vec::new(),
                 external_segments: Vec::new(),
                 message_records: Vec::new(),
+                integrity: empty_integrity(),
                 visible_snapshot: None,
                 producer_states: vec![
                     ProducerSnapshot {
@@ -1798,6 +1862,15 @@ fn publish_snapshot_advances_retention_on_message_boundary() {
     ));
     let read = machine.read(&stream("snap"), 3, 2).expect("retained read");
     assert_eq!(read.payload, b"de");
+    let integrity = machine
+        .integrity_snapshot(&stream("snap"))
+        .expect("integrity");
+    assert_eq!(integrity.live_start_offset, 3);
+    assert_eq!(integrity.tail_offset, 5);
+    assert_eq!(integrity.live_records, 1);
+    assert_eq!(integrity.evicted_records, 1);
+    assert_eq!(integrity.total_records, 2);
+    assert_ne!(integrity.live_setsum, integrity.total_setsum);
     let snapshot = machine
         .read_snapshot(&stream("snap"), 3)
         .expect("visible snapshot");
@@ -1814,6 +1887,13 @@ fn publish_snapshot_advances_retention_on_message_boundary() {
             start_offset: 3,
             end_offset: 5,
         }]
+    );
+    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
+    assert_eq!(
+        restored
+            .integrity_snapshot(&stream("snap"))
+            .expect("restored integrity"),
+        integrity
     );
 }
 

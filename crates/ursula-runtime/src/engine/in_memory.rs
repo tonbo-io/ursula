@@ -1376,18 +1376,29 @@ impl InMemoryGroupEngine {
                 format!("stream '{}' does not exist", request.stream_id),
             ));
         };
+        let content_type = metadata.content_type.clone();
+        let tail_offset = metadata.tail_offset;
+        let closed = metadata.status == ursula_stream::StreamStatus::Closed;
+        let stream_ttl_seconds = metadata.stream_ttl_seconds;
+        let stream_expires_at_ms = metadata.stream_expires_at_ms;
+        let _ = metadata;
         Ok(HeadStreamResponse {
             placement,
-            content_type: metadata.content_type.clone(),
-            tail_offset: metadata.tail_offset,
-            closed: metadata.status == ursula_stream::StreamStatus::Closed,
-            stream_ttl_seconds: metadata.stream_ttl_seconds,
-            stream_expires_at_ms: metadata.stream_expires_at_ms,
+            content_type,
+            tail_offset,
+            cold_hot_start_offset: self.state_machine.hot_start_offset(&request.stream_id),
+            closed,
+            stream_ttl_seconds,
+            stream_expires_at_ms,
             snapshot_offset: self
                 .state_machine
                 .latest_snapshot(&request.stream_id)
                 .map_err(stream_response_error)?
                 .map(|snapshot| snapshot.offset),
+            integrity: self
+                .state_machine
+                .integrity_snapshot(&request.stream_id)
+                .map_err(stream_response_error)?,
         })
     }
 

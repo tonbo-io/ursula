@@ -216,7 +216,9 @@ class Ec2Ops:
     def stop_node(self, node: Node) -> None:
         pid = shlex.quote(self.remote_pid(node))
         command = (
-            f"if [ -f {pid} ]; then "
+            "if systemctl list-unit-files ursula-chaos.service >/dev/null 2>&1; then "
+            "sudo systemctl stop ursula-chaos.service || true; "
+            f"elif [ -f {pid} ]; then "
             f"kill $(cat {pid}) 2>/dev/null || true; "
             f"rm -f {pid}; "
             "fi"
@@ -224,12 +226,19 @@ class Ec2Ops:
         self.ssh(node, command, check=False)
 
     def start_node(self, node: Node) -> None:
-        self.stop_node(node)
         env_lines = "\n".join(f"export {key}={shlex.quote(value)}" for key, value in sorted(self.config.cold_env.items()))
         command = "\n".join(
             [
                 "set -euo pipefail",
                 f"test -x {shlex.quote(self.config.binary)}",
+                "if systemctl list-unit-files ursula-chaos.service >/dev/null 2>&1; then",
+                "  sudo systemctl restart ursula-chaos.service",
+                "  exit 0",
+                "fi",
+                f"if [ -f {shlex.quote(self.remote_pid(node))} ]; then "
+                f"kill $(cat {shlex.quote(self.remote_pid(node))}) 2>/dev/null || true; "
+                f"rm -f {shlex.quote(self.remote_pid(node))}; "
+                "fi",
                 env_lines,
                 " ".join(shlex.quote(arg) for arg in self.node_command(node))
                 + f" > {shlex.quote(self.remote_log(node))} 2>&1 & echo $! > {shlex.quote(self.remote_pid(node))}",
@@ -258,7 +267,7 @@ class Ec2Ops:
             args.append("--raft-init-membership-per-group")
         return args
 
-    def install_service(self, node: Node) -> None:
+    def install_service(self, node: Node, restart: bool = True) -> None:
         env_lines = "\n".join(
             f"Environment={key}={value}"
             for key, value in sorted(self.config.cold_env.items())
@@ -291,9 +300,10 @@ WantedBy=multi-user.target
                 "EOF",
                 "sudo systemctl daemon-reload",
                 "sudo systemctl enable ursula-chaos.service",
-                "sudo systemctl restart ursula-chaos.service",
             ]
         )
+        if restart:
+            command = "\n".join([command, "sudo systemctl restart ursula-chaos.service"])
         self.ssh(node, command)
 
     def metrics(self, node: Node) -> dict[str, Any]:
@@ -477,13 +487,57 @@ WantedBy=multi-user.target
             print(f"install {local} -> {target.name}:{args.remote}")
             self.install_file(target, local, args.remote)
 
-    def install_services(self) -> None:
+    def deploy_chaos(self, args: argparse.Namespace) -> None:
+        if self.config.client is None:
+            raise SystemExit("config does not define a client host")
+        self.require_cold_store_for_chaos(args.allow_hot_only)
+        binary = args.binary.expanduser().resolve()
+        agent = args.agent.expanduser().resolve()
+        faultd = args.faultd.expanduser().resolve()
+        if not binary.is_file():
+            raise SystemExit(f"binary does not exist: {binary}")
+        if not agent.is_file():
+            raise SystemExit(f"agent does not exist: {agent}")
+        if not faultd.is_file():
+            raise SystemExit(f"faultd does not exist: {faultd}")
         for node in self.config.nodes:
-            self.install_service(node)
+            print(f"install {binary} -> {node.name}:{self.config.binary}")
+            self.install_file(node, binary, self.config.binary)
+            print(f"install {faultd} -> {node.name}:{args.faultd_path}")
+            self.install_file(node, faultd, args.faultd_path)
+        print(f"install {agent} -> {self.config.client.name}:{args.agent_path}")
+        self.install_file(self.config.client, agent, args.agent_path)
+        self.install_services(restart=not args.no_restart_services)
+        self.install_faultd(args)
+        self.install_chaos_agent(args)
+
+    def require_cold_store_for_chaos(self, allow_hot_only: bool) -> None:
+        if allow_hot_only:
+            return
+        backend = self.config.cold_env.get("URSULA_COLD_BACKEND", "none").strip().lower()
+        if backend in {"", "none", "disabled", "off"}:
+            raise SystemExit(
+                "chaos deployment requires cold_env. Set URSULA_COLD_BACKEND "
+                "(s3 for multi-node chaos) and cold flush/admission limits, or pass "
+                "--allow-hot-only for a deliberately hot-only smoke run."
+            )
+        if backend != "s3":
+            raise SystemExit(
+                "multi-node chaos deployment requires URSULA_COLD_BACKEND=s3. "
+                "Raft replicates cold manifests, so the referenced objects must be readable "
+                "from every node."
+            )
+        if not self.config.cold_env.get("URSULA_COLD_S3_BUCKET", "").strip():
+            raise SystemExit("cold_env must set URSULA_COLD_S3_BUCKET when URSULA_COLD_BACKEND=s3")
+
+    def install_services(self, restart: bool = True) -> None:
+        for node in self.config.nodes:
+            self.install_service(node, restart=restart)
 
     def install_chaos_agent(self, args: argparse.Namespace) -> None:
         if self.config.client is None:
             raise SystemExit("config does not define a client host")
+        self.require_cold_store_for_chaos(args.allow_hot_only)
         node_args: list[str] = []
         for node in self.config.nodes:
             node_args.extend(
@@ -498,19 +552,59 @@ WantedBy=multi-user.target
             *node_args,
             "--status-s3-uri",
             args.status_s3_uri,
+            "--stream-count",
+            str(args.stream_count),
             "--append-per-second",
             str(args.append_per_second),
+            "--payload-sizes",
+            args.payload_sizes,
+            "--payload-kinds",
+            args.payload_kinds,
+            "--producer-count",
+            str(args.producer_count),
+            "--epoch-bump-every",
+            str(args.epoch_bump_every),
+            "--producer-probe-every",
+            str(args.producer_probe_every),
+            "--reader-count",
+            str(args.reader_count),
+            "--verify-modes",
+            args.verify_modes,
             "--verify-every",
             str(args.verify_every),
+            "--old-sample-every",
+            str(args.old_sample_every),
+            "--burst-every",
+            str(args.burst_every),
+            "--burst-appends",
+            str(args.burst_appends),
+            "--backpressure-probe-every",
+            str(args.backpressure_probe_every),
+            "--backpressure-probe-bytes",
+            str(args.backpressure_probe_bytes),
+            "--backpressure-probe-max-appends",
+            str(args.backpressure_probe_max_appends),
             "--status-every",
             str(args.status_every),
             "--fault-min-secs",
             str(args.fault_min_secs),
             "--fault-max-secs",
             str(args.fault_max_secs),
+            "--fault-profile",
+            args.fault_profile,
             "--recovery-secs",
             str(args.recovery_secs),
+            "--recovery-slo-secs",
+            str(args.recovery_slo_secs),
+            "--repair-retry-secs",
+            str(args.repair_retry_secs),
+            "--max-repair-attempts",
+            str(args.max_repair_attempts),
         ]
+        if args.fault_scenarios:
+            command_parts.extend(["--fault-scenarios", args.fault_scenarios])
+        if args.first_fault_secs is not None:
+            command_parts.extend(["--first-fault-secs", str(args.first_fault_secs)])
         exec_start = " ".join(shlex.quote(part) for part in command_parts)
         unit = f"""[Unit]
 Description=Ursula chaos agent
@@ -543,6 +637,41 @@ WantedBy=multi-user.target
         )
         self.ssh(self.config.client, command)
 
+    def install_faultd(self, args: argparse.Namespace) -> None:
+        unit = f"""[Unit]
+Description=Ursula chaos node fault daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 {shlex.quote(args.faultd_path)} --port {int(args.faultd_port)} --dev {shlex.quote(args.faultd_dev)}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"""
+        command = "\n".join(
+            [
+                "set -euo pipefail",
+                f"test -x {shlex.quote(args.faultd_path)}",
+                "if ! command -v tc >/dev/null && ! test -x /usr/sbin/tc && ! test -x /sbin/tc; then "
+                "sudo dnf install -y iproute-tc iptables || sudo yum install -y iproute-tc iptables || true; "
+                "fi",
+                "command -v tc >/dev/null || test -x /usr/sbin/tc || test -x /sbin/tc",
+                "sudo tee /etc/systemd/system/ursula-chaos-faultd.service >/dev/null <<'EOF'",
+                unit,
+                "EOF",
+                "sudo systemctl daemon-reload",
+                "sudo systemctl enable ursula-chaos-faultd.service",
+                "sudo systemctl restart ursula-chaos-faultd.service",
+            ]
+        )
+        for node in self.config.nodes:
+            self.ssh(node, command)
+
     def chaos_agent_status(self) -> None:
         if self.config.client is None:
             raise SystemExit("config does not define a client host")
@@ -553,7 +682,8 @@ WantedBy=multi-user.target
             capture=True,
             check=False,
         )
-        print(result.stdout.rstrip() or "no chaos agent status")
+        output = result.stdout.rstrip() or result.stderr.rstrip()
+        print(output or "no chaos agent status")
 
     def service_status(self) -> None:
         for node in self.config.nodes:
@@ -564,7 +694,8 @@ WantedBy=multi-user.target
                 capture=True,
                 check=False,
             )
-            print(result.stdout.rstrip() or "no service status")
+            output = result.stdout.rstrip() or result.stderr.rstrip()
+            print(output or "no service status")
 
     def logs(self, args: argparse.Namespace) -> None:
         for node in self.config.nodes:
@@ -585,7 +716,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("start")
-    sub.add_parser("install-service")
+    install_service = sub.add_parser("install-service")
+    install_service.add_argument(
+        "--no-restart",
+        action="store_true",
+        help="Write and enable the systemd unit without restarting the currently running node process.",
+    )
     sub.add_parser("stop")
     sub.add_parser("status")
     logs = sub.add_parser("logs")
@@ -620,12 +756,100 @@ def build_parser() -> argparse.ArgumentParser:
     chaos_agent = sub.add_parser("install-chaos-agent")
     chaos_agent.add_argument("--agent-path", default="/opt/ursula/ursula_chaos_agent.py")
     chaos_agent.add_argument("--status-s3-uri", default="s3://ursula-chaos-status-tonbo/status.json")
+    chaos_agent.add_argument("--stream-count", type=int, default=24)
     chaos_agent.add_argument("--append-per-second", type=int, default=20)
+    chaos_agent.add_argument("--payload-sizes", default="128,1024,16384,65536")
+    chaos_agent.add_argument("--payload-kinds", default="ascii,binary,zero,utf8")
+    chaos_agent.add_argument("--producer-count", type=int, default=8)
+    chaos_agent.add_argument("--epoch-bump-every", type=int, default=5000)
+    chaos_agent.add_argument("--producer-probe-every", type=int, default=200)
+    chaos_agent.add_argument("--reader-count", type=int, default=2)
+    chaos_agent.add_argument("--verify-modes", default="latest,recent,old,cold")
     chaos_agent.add_argument("--verify-every", type=int, default=50)
+    chaos_agent.add_argument("--old-sample-every", type=int, default=128)
+    chaos_agent.add_argument("--burst-every", type=int, default=300)
+    chaos_agent.add_argument("--burst-appends", type=int, default=200)
+    chaos_agent.add_argument("--backpressure-probe-every", type=int, default=0)
+    chaos_agent.add_argument("--backpressure-probe-bytes", type=int, default=65535)
+    chaos_agent.add_argument("--backpressure-probe-max-appends", type=int, default=1024)
     chaos_agent.add_argument("--status-every", type=int, default=15)
     chaos_agent.add_argument("--fault-min-secs", type=int, default=900)
     chaos_agent.add_argument("--fault-max-secs", type=int, default=1800)
+    chaos_agent.add_argument(
+        "--fault-profile",
+        choices=["network", "revert-detection", "custom"],
+        default="network",
+    )
+    chaos_agent.add_argument(
+        "--fault-scenarios",
+        default=None,
+    )
+    chaos_agent.add_argument(
+        "--allow-hot-only",
+        action="store_true",
+        help="Allow chaos runs without cold_env; this is only a hot-only smoke run and can OOM under sustained load.",
+    )
+    chaos_agent.add_argument("--first-fault-secs", type=int)
     chaos_agent.add_argument("--recovery-secs", type=int, default=180)
+    chaos_agent.add_argument("--recovery-slo-secs", type=int, default=120)
+    chaos_agent.add_argument("--repair-retry-secs", type=int, default=180)
+    chaos_agent.add_argument("--max-repair-attempts", type=int, default=2)
+    faultd = sub.add_parser("install-faultd")
+    faultd.add_argument("--faultd-path", default="/opt/ursula/ursula_chaos_faultd.py")
+    faultd.add_argument("--faultd-port", type=int, default=4492)
+    faultd.add_argument("--faultd-dev", default="auto")
+    deploy_chaos = sub.add_parser("deploy-chaos")
+    deploy_chaos.add_argument("--binary", required=True, type=Path)
+    deploy_chaos.add_argument("--agent", default=Path("scripts/ursula_chaos_agent.py"), type=Path)
+    deploy_chaos.add_argument("--agent-path", default="/opt/ursula/ursula_chaos_agent.py")
+    deploy_chaos.add_argument("--faultd", default=Path("scripts/ursula_chaos_faultd.py"), type=Path)
+    deploy_chaos.add_argument("--faultd-path", default="/opt/ursula/ursula_chaos_faultd.py")
+    deploy_chaos.add_argument("--faultd-port", type=int, default=4492)
+    deploy_chaos.add_argument("--faultd-dev", default="auto")
+    deploy_chaos.add_argument(
+        "--no-restart-services",
+        action="store_true",
+        help="Install the future node service unit without restarting running nodes.",
+    )
+    deploy_chaos.add_argument("--status-s3-uri", default="s3://ursula-chaos-status-tonbo/status.json")
+    deploy_chaos.add_argument("--stream-count", type=int, default=24)
+    deploy_chaos.add_argument("--append-per-second", type=int, default=20)
+    deploy_chaos.add_argument("--payload-sizes", default="128,1024,16384,65536")
+    deploy_chaos.add_argument("--payload-kinds", default="ascii,binary,zero,utf8")
+    deploy_chaos.add_argument("--producer-count", type=int, default=8)
+    deploy_chaos.add_argument("--epoch-bump-every", type=int, default=5000)
+    deploy_chaos.add_argument("--producer-probe-every", type=int, default=200)
+    deploy_chaos.add_argument("--reader-count", type=int, default=2)
+    deploy_chaos.add_argument("--verify-modes", default="latest,recent,old,cold")
+    deploy_chaos.add_argument("--verify-every", type=int, default=50)
+    deploy_chaos.add_argument("--old-sample-every", type=int, default=128)
+    deploy_chaos.add_argument("--burst-every", type=int, default=300)
+    deploy_chaos.add_argument("--burst-appends", type=int, default=200)
+    deploy_chaos.add_argument("--backpressure-probe-every", type=int, default=0)
+    deploy_chaos.add_argument("--backpressure-probe-bytes", type=int, default=65535)
+    deploy_chaos.add_argument("--backpressure-probe-max-appends", type=int, default=1024)
+    deploy_chaos.add_argument("--status-every", type=int, default=15)
+    deploy_chaos.add_argument("--fault-min-secs", type=int, default=900)
+    deploy_chaos.add_argument("--fault-max-secs", type=int, default=1800)
+    deploy_chaos.add_argument(
+        "--fault-profile",
+        choices=["network", "revert-detection", "custom"],
+        default="network",
+    )
+    deploy_chaos.add_argument(
+        "--fault-scenarios",
+        default=None,
+    )
+    deploy_chaos.add_argument(
+        "--allow-hot-only",
+        action="store_true",
+        help="Allow chaos runs without cold_env; this is only a hot-only smoke run and can OOM under sustained load.",
+    )
+    deploy_chaos.add_argument("--first-fault-secs", type=int)
+    deploy_chaos.add_argument("--recovery-secs", type=int, default=180)
+    deploy_chaos.add_argument("--recovery-slo-secs", type=int, default=120)
+    deploy_chaos.add_argument("--repair-retry-secs", type=int, default=180)
+    deploy_chaos.add_argument("--max-repair-attempts", type=int, default=2)
     sub.add_parser("chaos-agent-status")
     return parser
 
@@ -638,7 +862,7 @@ def main() -> int:
             for node in ops.config.nodes:
                 ops.start_node(node)
         elif args.command == "install-service":
-            ops.install_services()
+            ops.install_services(restart=not args.no_restart)
         elif args.command == "stop":
             for node in ops.config.nodes:
                 ops.stop_node(node)
@@ -662,6 +886,10 @@ def main() -> int:
             ops.install_binary(args)
         elif args.command == "install-chaos-agent":
             ops.install_chaos_agent(args)
+        elif args.command == "install-faultd":
+            ops.install_faultd(args)
+        elif args.command == "deploy-chaos":
+            ops.deploy_chaos(args)
         elif args.command == "chaos-agent-status":
             ops.chaos_agent_status()
         else:

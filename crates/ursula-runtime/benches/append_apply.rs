@@ -21,6 +21,7 @@ fn append_apply_benches(c: &mut Criterion) {
         AppendScenario::ManyStreams,
         AppendScenario::AppendBatch,
         AppendScenario::ProducerDedup,
+        AppendScenario::SnapshotCompaction,
     ] {
         group.bench_with_input(
             BenchmarkId::from_parameter(scenario.name()),
@@ -47,6 +48,7 @@ enum AppendScenario {
     ManyStreams,
     AppendBatch,
     ProducerDedup,
+    SnapshotCompaction,
 }
 
 impl AppendScenario {
@@ -56,6 +58,7 @@ impl AppendScenario {
             Self::ManyStreams => "many_streams_append",
             Self::AppendBatch => "single_stream_append_batch_16",
             Self::ProducerDedup => "producer_dedup_retry",
+            Self::SnapshotCompaction => "snapshot_compaction_setsums",
         }
     }
 }
@@ -65,7 +68,8 @@ fn setup_machine(scenario: &AppendScenario) -> StreamStateMachine {
         AppendScenario::ManyStreams => STREAM_COUNT,
         AppendScenario::SingleStream
         | AppendScenario::AppendBatch
-        | AppendScenario::ProducerDedup => 1,
+        | AppendScenario::ProducerDedup
+        | AppendScenario::SnapshotCompaction => 1,
     };
     let mut machine = StreamStateMachine::new();
     assert!(matches!(
@@ -102,6 +106,7 @@ fn run_appends(machine: &mut StreamStateMachine, scenario: &AppendScenario, payl
         AppendScenario::ManyStreams => append_many_streams(machine, payload),
         AppendScenario::AppendBatch => append_batch(machine, payload),
         AppendScenario::ProducerDedup => producer_dedup(machine, payload),
+        AppendScenario::SnapshotCompaction => snapshot_compaction(machine, payload),
     }
 }
 
@@ -169,6 +174,25 @@ fn producer_dedup(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 {
         );
     }
     tail
+}
+
+fn snapshot_compaction(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 {
+    let stream_id = stream_id(0);
+    for _ in 0..APPENDS_PER_ITER {
+        append(machine, stream_id.clone(), payload.to_vec(), None);
+    }
+    let snapshot_offset =
+        u64::try_from(APPENDS_PER_ITER / 2 * payload.len()).expect("snapshot offset fits u64");
+    match machine.apply(StreamCommand::PublishSnapshot {
+        stream_id,
+        snapshot_offset,
+        content_type: "application/json".to_owned(),
+        payload: b"{}".to_vec(),
+        now_ms: 0,
+    }) {
+        StreamResponse::SnapshotPublished { snapshot_offset } => snapshot_offset,
+        response => panic!("publish snapshot failed: {response:?}"),
+    }
 }
 
 fn append(

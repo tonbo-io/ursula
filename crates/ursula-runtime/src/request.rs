@@ -5,7 +5,8 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use ursula_shard::{BucketStreamId, ShardPlacement};
 use ursula_stream::{
-    ColdChunkRef, ExternalPayloadRef, ProducerRequest, StreamReadPlan, StreamReadSegment,
+    ColdChunkRef, ExternalPayloadRef, ProducerRequest, StreamIntegritySnapshot, StreamReadPlan,
+    StreamReadSegment,
 };
 
 use crate::cold_store::{ColdStoreHandle, DEFAULT_CONTENT_TYPE};
@@ -104,10 +105,12 @@ pub struct HeadStreamResponse {
     pub placement: ShardPlacement,
     pub content_type: String,
     pub tail_offset: u64,
+    pub cold_hot_start_offset: u64,
     pub closed: bool,
     pub stream_ttl_seconds: Option<u64>,
     pub stream_expires_at_ms: Option<u64>,
     pub snapshot_offset: Option<u64>,
+    pub integrity: StreamIntegritySnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

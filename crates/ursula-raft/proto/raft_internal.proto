@@ -233,6 +233,14 @@ message HeadStreamResponsePayloadV1 {
   optional uint64 stream_ttl_seconds = 7;
   optional uint64 stream_expires_at_ms = 8;
   optional uint64 snapshot_offset = 9;
+  string integrity_live_setsum = 10;
+  string integrity_evicted_setsum = 11;
+  string integrity_total_setsum = 12;
+  uint64 integrity_live_start_offset = 13;
+  uint64 integrity_live_records = 14;
+  uint64 integrity_evicted_records = 15;
+  uint64 integrity_total_records = 16;
+  uint64 cold_hot_start_offset = 17;
 }
 
 message ReadStreamResponsePayloadV1 {

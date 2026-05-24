@@ -4,7 +4,8 @@ use ursula_runtime::{
     AppendResponse, CloseStreamResponse, CreateStreamResponse, DeleteStreamResponse,
     FlushColdResponse, ForkRefResponse, GroupAppendBatchResponse, GroupEngineError,
     GroupLeaderHint, GroupWriteCommand, GroupWriteResponse, HeadStreamResponse,
-    PublishSnapshotResponse, ReadStreamResponse, StreamErrorCode, TouchStreamAccessResponse,
+    PublishSnapshotResponse, ReadStreamResponse, StreamErrorCode, StreamIntegritySnapshot,
+    TouchStreamAccessResponse,
 };
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
@@ -563,6 +564,14 @@ pub(crate) fn head_stream_response_to_proto(
         stream_ttl_seconds: response.stream_ttl_seconds,
         stream_expires_at_ms: response.stream_expires_at_ms,
         snapshot_offset: response.snapshot_offset,
+        integrity_live_setsum: response.integrity.live_setsum,
+        integrity_evicted_setsum: response.integrity.evicted_setsum,
+        integrity_total_setsum: response.integrity.total_setsum,
+        integrity_live_start_offset: response.integrity.live_start_offset,
+        integrity_live_records: response.integrity.live_records,
+        integrity_evicted_records: response.integrity.evicted_records,
+        integrity_total_records: response.integrity.total_records,
+        cold_hot_start_offset: response.cold_hot_start_offset,
     }
 }
 
@@ -578,10 +587,22 @@ pub(crate) fn head_stream_response_from_proto(
         )?,
         content_type: response.content_type,
         tail_offset: response.tail_offset,
+        cold_hot_start_offset: response.cold_hot_start_offset,
         closed: response.closed,
         stream_ttl_seconds: response.stream_ttl_seconds,
         stream_expires_at_ms: response.stream_expires_at_ms,
         snapshot_offset: response.snapshot_offset,
+        integrity: StreamIntegritySnapshot {
+            live_setsum: response.integrity_live_setsum,
+            evicted_setsum: response.integrity_evicted_setsum,
+            total_setsum: response.integrity_total_setsum,
+            live_start_offset: response.integrity_live_start_offset,
+            tail_offset: response.tail_offset,
+            live_records: response.integrity_live_records,
+            evicted_records: response.integrity_evicted_records,
+            total_records: response.integrity_total_records,
+            records: Vec::new(),
+        },
     })
 }
 

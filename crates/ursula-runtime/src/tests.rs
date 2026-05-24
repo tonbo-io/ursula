@@ -14,7 +14,7 @@ use ursula_stream::{ObjectPayloadRef, StreamReadSegment, StreamSnapshot, StreamS
 use crate::cold_store::{ColdReadCacheConfig, DEFAULT_CONTENT_TYPE};
 use crate::core_worker::{CoreWorker, ReadWatcher, ReadWatchers};
 use crate::engine::wal::group_log_path;
-use crate::metrics::{RuntimeMetricsInner, is_stale_cold_flush_candidate_error};
+use crate::metrics::RuntimeMetricsInner;
 
 fn runtime(core_count: usize, group_count: usize) -> ShardRuntime {
     ShardRuntime::spawn(RuntimeConfig {
@@ -53,6 +53,21 @@ fn producer(id: &str, epoch: u64, seq: u64) -> ProducerRequest {
         producer_id: id.to_owned(),
         producer_epoch: epoch,
         producer_seq: seq,
+    }
+}
+
+fn empty_integrity() -> StreamIntegritySnapshot {
+    let empty = "00".repeat(32);
+    StreamIntegritySnapshot {
+        live_setsum: empty.clone(),
+        evicted_setsum: empty.clone(),
+        total_setsum: empty,
+        live_start_offset: 0,
+        tail_offset: 0,
+        live_records: 0,
+        evicted_records: 0,
+        total_records: 0,
+        records: Vec::new(),
     }
 }
 
@@ -1272,6 +1287,24 @@ async fn append_before_stream_setup_uses_stream_state_machine_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn group_engine_errors_use_operation_wording_for_non_append_paths() {
+    let runtime = runtime(2, 8);
+    let stream = BucketStreamId::new("benchcmp", "missing-read-stream");
+    let err = runtime
+        .read_stream(ReadStreamRequest {
+            stream_id: stream,
+            offset: 0,
+            max_len: 16,
+            now_ms: 0,
+        })
+        .await
+        .expect_err("missing stream read rejected");
+    let message = err.to_string();
+    assert!(message.contains("operation failed"), "message={message}");
+    assert!(!message.contains("append failed"), "message={message}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_stream_is_routed_and_idempotent_for_matching_metadata() {
     let runtime = runtime(2, 8);
     let stream = BucketStreamId::new("benchcmp", "create-stream");
@@ -1511,7 +1544,7 @@ async fn flush_cold_group_batch_once_publishes_multiple_chunks() {
             .iter()
             .map(|response| response.hot_start_offset)
             .collect::<Vec<_>>(),
-        vec![1, 2, 3, 0]
+        vec![1, 2, 3, 4]
     );
 
     let metrics = runtime.metrics().snapshot();
@@ -1594,11 +1627,11 @@ async fn stale_cold_flush_batch_after_delete_recreate_is_classified_for_cleanup(
         .await
         .expect("append recreated stream");
 
-    let err = runtime
+    let flushed = runtime
         .flush_cold_candidates_batch(candidates)
         .await
-        .expect_err("stale candidate should fail publish");
-    assert!(is_stale_cold_flush_candidate_error(&err));
+        .expect("stale candidate should be skipped");
+    assert!(flushed.is_empty());
     let metrics = runtime.metrics().snapshot();
     assert_eq!(metrics.cold_flush_uploads, 1);
     assert_eq!(metrics.cold_flush_publishes, 0);
@@ -3579,10 +3612,12 @@ impl GroupEngine for RecordingEngine {
                 placement,
                 content_type: DEFAULT_CONTENT_TYPE.to_owned(),
                 tail_offset: request.stream_id.stream_id.len() as u64,
+                cold_hot_start_offset: 0,
                 closed: false,
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
                 snapshot_offset: None,
+                integrity: empty_integrity(),
             })
         })
     }

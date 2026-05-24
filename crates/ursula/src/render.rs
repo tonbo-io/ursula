@@ -5,7 +5,7 @@ use axum::response::Response;
 use base64::Engine;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_runtime::{
-    AppendResponse, BootstrapStreamResponse, ProducerRequest, ReadSnapshotResponse,
+    AppendResponse, BootstrapStreamResponse, ColdStoreInfo, ProducerRequest, ReadSnapshotResponse,
     ReadStreamResponse, RuntimeError, RuntimeMailboxSnapshot, RuntimeMetricsSnapshot,
 };
 use ursula_shard::BucketStreamId;
@@ -182,6 +182,12 @@ pub(crate) fn insert_u64_header(headers: &mut HeaderMap, name: &'static str, val
     }
 }
 
+pub(crate) fn insert_header_str(headers: &mut HeaderMap, name: &'static str, value: &str) {
+    if let Ok(value) = HeaderValue::from_str(value) {
+        headers.insert(name, value);
+    }
+}
+
 pub(crate) fn insert_location(headers: &mut HeaderMap, stream_id: &BucketStreamId) {
     if let Ok(value) = HeaderValue::from_str(&format!("/{stream_id}")) {
         headers.insert(LOCATION, value);
@@ -277,6 +283,7 @@ pub(crate) fn render_metrics(
     mailbox: RuntimeMailboxSnapshot,
     http: HttpMetricsSnapshot,
     raft_groups: &[RaftGroupMetricsSnapshot],
+    cold_store: Option<&ColdStoreInfo>,
 ) -> String {
     let active_cores = active_count(&snapshot.per_core_appends);
     let active_groups = active_count(&snapshot.per_group_appends);
@@ -499,6 +506,8 @@ pub(crate) fn render_metrics(
     ));
     body.push_str(",\"cold_backpressure_bytes\":");
     body.push_str(&snapshot.cold_backpressure_bytes.to_string());
+    body.push_str(",\"cold_store\":");
+    body.push_str(&render_cold_store_info(cold_store));
     body.push_str(",\"mailbox_depths\":");
     body.push_str(&render_usize_array(&mailbox.depths));
     body.push_str(",\"mailbox_capacities\":");
@@ -507,6 +516,24 @@ pub(crate) fn render_metrics(
     body.push_str(&raft_groups.len().to_string());
     body.push_str(",\"raft_groups\":");
     body.push_str(&render_raft_group_metrics_array(raft_groups));
+    body.push('}');
+    body
+}
+
+pub(crate) fn render_cold_store_info(value: Option<&ColdStoreInfo>) -> String {
+    let Some(value) = value else {
+        return "{\"backend\":\"none\",\"root\":null,\"bucket\":null,\"region\":null,\"endpoint\":null}".to_owned();
+    };
+    let mut body = String::from("{\"backend\":");
+    push_json_string(&mut body, value.backend);
+    body.push_str(",\"root\":");
+    push_optional_json_string(&mut body, value.root.as_deref());
+    body.push_str(",\"bucket\":");
+    push_optional_json_string(&mut body, value.bucket.as_deref());
+    body.push_str(",\"region\":");
+    push_optional_json_string(&mut body, value.region.as_deref());
+    body.push_str(",\"endpoint\":");
+    push_optional_json_string(&mut body, value.endpoint.as_deref());
     body.push('}');
     body
 }
@@ -590,6 +617,31 @@ pub(crate) fn push_optional_u64(body: &mut String, value: Option<u64>) {
         Some(value) => body.push_str(&value.to_string()),
         None => body.push_str("null"),
     }
+}
+
+pub(crate) fn push_optional_json_string(body: &mut String, value: Option<&str>) {
+    match value {
+        Some(value) => push_json_string(body, value),
+        None => body.push_str("null"),
+    }
+}
+
+pub(crate) fn push_json_string(body: &mut String, value: &str) {
+    body.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => body.push_str("\\\""),
+            '\\' => body.push_str("\\\\"),
+            '\n' => body.push_str("\\n"),
+            '\r' => body.push_str("\\r"),
+            '\t' => body.push_str("\\t"),
+            ch if ch.is_control() => {
+                body.push_str(&format!("\\u{:04x}", u32::from(ch)));
+            }
+            ch => body.push(ch),
+        }
+    }
+    body.push('"');
 }
 
 pub(crate) fn should_base64_encode_sse_data(content_type: &str) -> bool {

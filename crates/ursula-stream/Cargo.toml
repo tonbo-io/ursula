@@ -11,6 +11,7 @@ description = "Durable Streams state machine for Ursula: bucket and stream comma
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
+setsum = "0.8.0"
 ursula-shard = { path = "../ursula-shard", version = "0.1.0" }
 ursula-proto = { path = "../ursula-proto", version = "0.1.0" }
 

@@ -2,6 +2,7 @@ export const HOME_PATH = "/";
 export const DOCS_PATH = "/docs";
 export const DOCS_PAGE_PREFIX = "/docs/";
 export const BENCHMARK_PATH = "/benchmark";
+export const CHAOS_TEST_PATH = "/chaos-test";
 export const STATUS_PATH = "/status";
 export const BLOG_PATH = "/blog";
 export const BLOG_PAGE_PREFIX = "/blog/";
@@ -34,8 +35,8 @@ export function getCurrentAppPath(pathname?: string) {
     return BENCHMARK_PATH;
   }
 
-  if (normalizedPath === STATUS_PATH) {
-    return STATUS_PATH;
+  if (normalizedPath === CHAOS_TEST_PATH || normalizedPath === STATUS_PATH) {
+    return CHAOS_TEST_PATH;
   }
 
   if (normalizedPath === BLOG_PATH) {

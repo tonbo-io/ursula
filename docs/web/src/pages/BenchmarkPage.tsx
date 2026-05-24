@@ -676,7 +676,7 @@ function BenchmarkPage() {
           { label: "Docs", href: "/docs" },
           { label: "Blog", href: "/blog" },
           { label: "Benchmark", href: "/benchmark", active: true },
-          { label: "Status", href: "/status" },
+          { label: "Chaos Test", href: "/chaos-test" },
         ]}
         version={__URSULA_VERSION__}
         githubUrl="https://github.com/tonbo-io/ursula"

@@ -3,7 +3,27 @@
   "overall": "unknown",
   "started_at": null,
   "updated_at": null,
-  "summary": "Chaos status has not been published yet.",
+  "summary": "Chaos test data has not been published yet.",
+  "health": {
+    "expected_nodes": 0,
+    "expected_raft_groups": 0,
+    "running_nodes": 0,
+    "metrics_ok": 0,
+    "full_raft_nodes": 0,
+    "append_success_delta": null,
+    "append_error_delta": null,
+    "workload_progressing": false,
+    "workload_clean": true,
+    "quorum_healthy": false,
+    "reasons": [
+      "chaos test data has not been published yet"
+    ]
+  },
+  "history": [],
+  "topology": {
+    "nodes": [],
+    "raft_groups": []
+  },
   "workload": {
     "append_target_per_second": 0,
     "append_success_total": 0,
@@ -15,20 +35,25 @@
     "checked_at": null,
     "verified_offsets": 0,
     "mismatch_count": 0,
+    "setsum_mismatch_count": 0,
+    "expected_live_setsum": null,
+    "server": null,
     "last_error": null
   },
   "chaos": {
     "enabled": false,
     "active_fault": null,
     "last_fault": null,
-    "next_fault_after": null
+    "next_fault_after": null,
+    "injection_count": 0,
+    "injections": []
   },
   "nodes": [],
   "events": [
     {
       "time": null,
       "level": "info",
-      "message": "Waiting for the 24/7 EC2 chaos runner to publish live status."
+      "message": "Waiting for the 24/7 EC2 chaos runner to publish live test data."
     }
   ]
 }

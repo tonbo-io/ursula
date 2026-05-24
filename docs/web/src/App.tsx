@@ -10,10 +10,10 @@ import {
   BENCHMARK_PATH,
   BLOG_PAGE_PREFIX,
   BLOG_PATH,
+  CHAOS_TEST_PATH,
   DOCS_PAGE_PREFIX,
   DOCS_PATH,
   HOME_PATH,
-  STATUS_PATH,
   getCurrentAppPath,
 } from "./utils/navigation";
 
@@ -42,8 +42,8 @@ function App({ initialUrl }: AppProps) {
       return;
     }
 
-    if (currentPath === STATUS_PATH) {
-      document.title = "Chaos Status | Ursula";
+    if (currentPath === CHAOS_TEST_PATH) {
+      document.title = "Chaos Test | Ursula";
       return;
     }
 
@@ -72,7 +72,7 @@ function App({ initialUrl }: AppProps) {
     );
   }
 
-  if (currentPath === STATUS_PATH) {
+  if (currentPath === CHAOS_TEST_PATH) {
     return (
       <div className="page-shell">
         <StatusPage />

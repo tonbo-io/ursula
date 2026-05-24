@@ -897,6 +897,11 @@ impl RuntimeMetricsInner {
             .fetch_max_relaxed(stream_hot_bytes);
     }
 
+    pub(crate) fn cold_hot_bytes_for_group(&self, group_id: RaftGroupId) -> u64 {
+        let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
+        self.per_group_cold_hot_bytes[group_index].load_relaxed()
+    }
+
     pub(crate) fn record_cold_backpressure(
         &self,
         core_id: CoreId,
@@ -970,6 +975,8 @@ pub(crate) fn is_stale_cold_flush_candidate_error(err: &RuntimeError) -> bool {
         || (message.contains("InvalidColdFlush")
             && (message.contains("beyond stream")
                 || message.contains("does not match the start of a hot payload segment")
+                || message.contains("must start at the hot prefix")
+                || message.contains("does not cover contiguous hot payload")
                 || message.contains("does not cover contiguous hot payload segments")
                 || message.contains("exceeds stream")
                 || message.contains("non-contiguous hot payload metadata")))

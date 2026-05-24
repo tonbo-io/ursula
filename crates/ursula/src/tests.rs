@@ -284,6 +284,33 @@ async fn create_append_read_and_head_match_perf_compare_subset() {
         "00000000000000000007"
     );
     assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "text/plain");
+    assert_eq!(
+        response
+            .headers()
+            .get(HEADER_STREAM_INTEGRITY_LIVE_RECORDS)
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(HEADER_STREAM_INTEGRITY_TOTAL_RECORDS)
+            .unwrap(),
+        "1"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(HEADER_STREAM_INTEGRITY_EVICTED_RECORDS)
+            .unwrap(),
+        "0"
+    );
+    assert!(
+        response
+            .headers()
+            .get(HEADER_STREAM_INTEGRITY_LIVE_SETSUM)
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -1112,6 +1139,7 @@ async fn metrics_expose_per_core_and_group_append_distribution() {
     assert!(body.contains("\"applied_mutations\":3"));
     assert!(body.contains("\"active_cores\":1"));
     assert!(body.contains("\"active_groups\":1"));
+    assert!(body.contains("\"cold_store\":{\"backend\":\"none\""));
     assert!(body.contains("\"per_core_appends\":["));
     assert!(body.contains("\"per_group_appends\":["));
     assert!(body.contains("\"per_core_applied_mutations\":["));
@@ -2419,6 +2447,275 @@ async fn static_grpc_memory_node_rejoins_empty_after_allowed_log_revert() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn static_grpc_memory_node_rejoins_all_groups_after_allowed_log_revert() {
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    let mut addrs = Vec::new();
+    for node_id in 1..=3u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        peers.push((node_id, format!("http://{addr}")));
+        addrs.push(addr);
+        listeners.push(listener);
+    }
+
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        nodes.push(
+            spawn_static_grpc_test_node_with_per_group_initializers(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                true,
+                6,
+            )
+            .await,
+        );
+    }
+
+    for (index, node) in nodes.iter().enumerate().skip(1) {
+        tokio::time::timeout(Duration::from_secs(10), node.runtime.warm_all_groups())
+            .await
+            .unwrap_or_else(|_| panic!("warm follower node {} groups timed out", index + 1))
+            .expect("warm follower groups");
+    }
+    tokio::time::timeout(Duration::from_secs(10), nodes[0].runtime.warm_all_groups())
+        .await
+        .expect("warm leader groups timed out")
+        .expect("warm leader groups");
+
+    for raw_group_id in 0..6 {
+        let expected_leader = u64::from(raw_group_id % 3) + 1;
+        for node in &nodes {
+            let raft = node
+                .registry
+                .get(RaftGroupId(raw_group_id))
+                .expect("registered group");
+            raft.wait(Some(Duration::from_secs(5)))
+                .current_leader(
+                    expected_leader,
+                    "per-group initializer should become group leader",
+                )
+                .await
+                .expect("wait for distributed leader");
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build reqwest client");
+    let leader_base = peers[0].1.as_str();
+    let mut streams_by_group: Vec<Option<BucketStreamId>> = vec![None; 6];
+    for candidate in 0..10_000 {
+        let stream_id = BucketStreamId::new("benchcmp", format!("memory-rejoin-group-{candidate}"));
+        let group_index = usize::try_from(nodes[0].runtime.locate(&stream_id).raft_group_id.0)
+            .expect("raft group id fits usize");
+        if streams_by_group[group_index].is_none() {
+            let create = client
+                .put(format!("{leader_base}/{}", stream_id))
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .body(format!("before-{group_index}"))
+                .send()
+                .await
+                .expect("create stream through leader");
+            assert_eq!(create.status(), StatusCode::CREATED);
+            streams_by_group[group_index] = Some(stream_id);
+        }
+        if streams_by_group.iter().all(Option::is_some) {
+            break;
+        }
+    }
+    let streams_by_group: Vec<BucketStreamId> = streams_by_group
+        .into_iter()
+        .map(|stream| stream.expect("found stream for raft group"))
+        .collect();
+
+    for (group_index, stream_id) in streams_by_group.iter().enumerate() {
+        let placement = nodes[2].runtime.locate(stream_id);
+        assert_eq!(placement.raft_group_id, RaftGroupId(group_index as u32));
+        wait_raft_state_machine_payload(
+            &nodes[2].registry,
+            placement,
+            stream_id,
+            format!("before-{group_index}").as_bytes(),
+            "node 3 replicated initial payload before shutdown",
+        )
+        .await;
+    }
+
+    let stopped_node = nodes.remove(2);
+    stopped_node.shutdown().await;
+
+    for (group_index, stream_id) in streams_by_group.iter().enumerate() {
+        let raft_group_id = RaftGroupId(group_index as u32);
+        let observer_raft = nodes[0]
+            .registry
+            .get(raft_group_id)
+            .expect("observer group");
+        observer_raft
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |metrics| {
+                    matches!(
+                        metrics.current_leader,
+                        Some(leader_id) if leader_id == 1 || leader_id == 2
+                    )
+                },
+                "group should elect a surviving leader after node 3 stops",
+            )
+            .await
+            .expect("wait for surviving leader before write");
+        let leader_id = observer_raft
+            .metrics()
+            .borrow_watched()
+            .current_leader
+            .expect("surviving leader elected");
+        let group_leader_base = peers
+            .iter()
+            .find(|(node_id, _)| *node_id == leader_id)
+            .map(|(_, base_url)| base_url.as_str())
+            .expect("leader peer base url");
+        let append_while_down = client
+            .post(format!("{group_leader_base}/{}", stream_id))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(format!("-after-stop-{group_index}"))
+            .send()
+            .await
+            .expect("append while node 3 is down");
+        assert_eq!(append_while_down.status(), StatusCode::NO_CONTENT);
+    }
+
+    for raw_group_id in 0..6 {
+        let raft_group_id = RaftGroupId(raw_group_id);
+        let observer_raft = nodes[0]
+            .registry
+            .get(raft_group_id)
+            .expect("observer group");
+        observer_raft
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |metrics| {
+                    matches!(
+                        metrics.current_leader,
+                        Some(leader_id) if leader_id == 1 || leader_id == 2
+                    )
+                },
+                "group should elect a surviving leader after node 3 stops",
+            )
+            .await
+            .expect("wait for surviving leader");
+        let leader_id = observer_raft
+            .metrics()
+            .borrow_watched()
+            .current_leader
+            .expect("surviving leader elected");
+        let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
+        let leader_node = nodes.get(leader_index).expect("leader node still running");
+        let leader_raft = leader_node
+            .registry
+            .get(raft_group_id)
+            .expect("leader group");
+        let snapshot_log_id = leader_raft
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .expect("leader applied write while node 3 was down");
+        leader_raft
+            .trigger()
+            .snapshot()
+            .await
+            .expect("trigger leader snapshot");
+        leader_raft
+            .wait(Some(Duration::from_secs(5)))
+            .snapshot(
+                snapshot_log_id,
+                "leader snapshot includes quorum-only write",
+            )
+            .await
+            .expect("wait for leader snapshot");
+        leader_raft
+            .trigger()
+            .purge_log(snapshot_log_id.index())
+            .await
+            .expect("trigger leader purge");
+        leader_raft
+            .wait(Some(Duration::from_secs(5)))
+            .purged(
+                Some(snapshot_log_id),
+                "leader purged snapshotted quorum-only write",
+            )
+            .await
+            .expect("wait for leader purge");
+
+        let leader_base = peers
+            .iter()
+            .find(|(node_id, _)| *node_id == leader_id)
+            .map(|(_, base_url)| base_url.as_str())
+            .expect("leader peer base url");
+        let allow_revert = client
+            .post(format!(
+                "{leader_base}/__ursula/raft/{raw_group_id}/nodes/3/allow-next-revert"
+            ))
+            .send()
+            .await
+            .expect("allow node 3 log reversion through admin endpoint");
+        assert_eq!(allow_revert.status(), StatusCode::OK);
+    }
+
+    let restarted_listener = tokio::net::TcpListener::bind(addrs[2])
+        .await
+        .expect("rebind node 3 listener");
+    let restarted = spawn_static_grpc_test_node_with_per_group_initializers(
+        3,
+        restarted_listener,
+        peers.clone(),
+        peers.clone(),
+        true,
+        6,
+    )
+    .await;
+    restarted
+        .runtime
+        .warm_all_groups()
+        .await
+        .expect("warm restarted empty node 3 groups");
+
+    for (group_index, stream_id) in streams_by_group.iter().enumerate() {
+        let raft_group_id = RaftGroupId(group_index as u32);
+        let restarted_raft = restarted
+            .registry
+            .get(raft_group_id)
+            .expect("restarted group");
+        restarted_raft
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |metrics| metrics.membership_config.voter_ids().any(|id| id == 3),
+                format!("restarted node 3 rejoined group {group_index}"),
+            )
+            .await
+            .expect("wait for restarted node membership");
+        wait_raft_state_machine_payload(
+            &restarted.registry,
+            restarted.runtime.locate(stream_id),
+            stream_id,
+            format!("before-{group_index}-after-stop-{group_index}").as_bytes(),
+            "restarted empty memory node caught up from surviving quorum",
+        )
+        .await;
+    }
+
+    nodes.push(restarted);
+    for node in nodes {
+        node.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn static_grpc_raft_group_engine_replicates_between_routers() {
     let mut listeners = Vec::new();
     let mut peers = Vec::new();
@@ -3438,6 +3735,7 @@ async fn cold_backpressure_returns_service_unavailable_and_metrics() {
     assert!(body.contains("\"cold_hot_bytes\":4"));
     assert!(body.contains("\"cold_backpressure_events\":1"));
     assert!(body.contains("\"cold_backpressure_bytes\":1"));
+    assert!(body.contains("\"cold_store\":{\"backend\":\"memory\""));
 }
 
 #[tokio::test]
