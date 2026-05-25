@@ -26,6 +26,9 @@ mod forward;
 mod grpc;
 mod log_store;
 mod registry;
+mod rt;
+#[cfg(madsim)]
+mod sim_runtime;
 mod state_machine;
 mod types;
 
@@ -41,7 +44,15 @@ pub use grpc::{
     raft_grpc_service,
 };
 pub use log_store::{RaftGroupFileLogStore, RaftGroupLogStore};
-pub use registry::{RaftGroupHandleRegistry, SingleNodeRaftNetwork, SingleNodeRaftNetworkFactory};
+pub use registry::{
+    InProcessRaftFaultAction, InProcessRaftFaultScript, InProcessRaftFaultStep,
+    InProcessRaftNetwork, InProcessRaftNetworkEvent, InProcessRaftNetworkFactory,
+    InProcessRaftNetworkPolicy, InProcessRaftNetworkPolicyEvent, InProcessRaftRegistry,
+    InProcessRaftRpcKind, RaftGroupHandleRegistry, SingleNodeRaftNetwork,
+    SingleNodeRaftNetworkFactory,
+};
+#[cfg(madsim)]
+pub use sim_runtime::MadsimOpenRaftRuntime;
 pub use state_machine::{RaftGroupSnapshotBuilder, RaftGroupStateMachine};
 pub use types::{
     RaftGroupCommand, RaftGroupMetricsSnapshot, RaftGroupResponse, RaftLogProgressSnapshot,

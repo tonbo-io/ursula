@@ -269,6 +269,28 @@ impl RaftGroupEngine {
             .map_err(|err| GroupEngineError::new(format!("shutdown OpenRaft group: {err}")))
     }
 
+    #[cfg(madsim)]
+    pub async fn sim_read_local_stream(
+        &self,
+        request: ReadStreamRequest,
+        placement: ShardPlacement,
+    ) -> Result<ursula_runtime::ReadStreamResponse, GroupEngineError> {
+        let stream_id = request.stream_id.clone();
+        let read_request = request.clone();
+        let plan = self
+            .with_state_machine(move |state_machine| {
+                Box::pin(async move {
+                    state_machine
+                        .engine
+                        .read_stream_plan_after_access(&read_request)
+                })
+            })
+            .await??;
+        GroupReadStreamParts::from_plan(placement, stream_id, plan, self.cold_store.clone())
+            .into_response()
+            .await
+    }
+
     pub(crate) async fn write(
         &self,
         command: GroupWriteCommand,
@@ -1089,6 +1111,10 @@ impl GroupEngine for RaftGroupEngine {
             })
             .await?
         })
+    }
+
+    fn shutdown<'a>(&'a mut self) -> ursula_runtime::GroupShutdownFuture<'a> {
+        Box::pin(async move { RaftGroupEngine::shutdown(self).await })
     }
 }
 

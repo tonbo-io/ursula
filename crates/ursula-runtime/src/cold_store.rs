@@ -1,7 +1,12 @@
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+#[cfg(not(madsim))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -15,14 +20,167 @@ const DEFAULT_COLD_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_COLD_CACHE_BLOCK_BYTES: usize = 1024 * 1024;
 const DEFAULT_COLD_CACHE_READAHEAD_BLOCKS: usize = 4;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ColdStore {
     info: ColdStoreInfo,
     operator: Operator,
     read_cache: Option<Arc<ColdReadCache>>,
+    observer: Arc<Mutex<Option<ColdStoreObserver>>>,
+    fault_policy: Arc<Mutex<Option<ColdStoreFaultPolicy>>>,
+    delay_fn: Arc<Mutex<ColdStoreDelayFn>>,
 }
 
 pub type ColdStoreHandle = Arc<ColdStore>;
+
+type ColdStoreObserver = Arc<dyn Fn(ColdStoreEvent) + Send + Sync>;
+type ColdStoreFaultPolicy =
+    Arc<dyn Fn(&ColdStoreFaultContext) -> Option<ColdStoreFaultEffect> + Send + Sync>;
+type ColdStoreDelayFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+type ColdStoreDelayFn = Arc<dyn Fn(Duration) -> ColdStoreDelayFuture + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColdStoreOperation {
+    WriteChunk,
+    DeleteChunk,
+    RemoveAll,
+    ReadObjectRange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColdStoreFaultContext {
+    pub operation: ColdStoreOperation,
+    pub stream_id: Option<BucketStreamId>,
+    pub path: String,
+    pub payload_len: Option<usize>,
+    pub read_start_offset: Option<u64>,
+    pub len: Option<usize>,
+    pub object_start: Option<u64>,
+    pub object_end: Option<u64>,
+    pub cached: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColdStoreFault {
+    pub message: String,
+}
+
+impl ColdStoreFault {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColdStoreFaultEffect {
+    pub delay: Option<Duration>,
+    pub error: Option<ColdStoreFault>,
+    pub truncate_read_to: Option<usize>,
+}
+
+impl ColdStoreFaultEffect {
+    pub fn delay(duration: Duration) -> Self {
+        Self {
+            delay: Some(duration),
+            error: None,
+            truncate_read_to: None,
+        }
+    }
+
+    pub fn fail(message: impl Into<String>) -> Self {
+        Self {
+            delay: None,
+            error: Some(ColdStoreFault::new(message)),
+            truncate_read_to: None,
+        }
+    }
+
+    pub fn delay_then_fail(duration: Duration, message: impl Into<String>) -> Self {
+        Self {
+            delay: Some(duration),
+            error: Some(ColdStoreFault::new(message)),
+            truncate_read_to: None,
+        }
+    }
+
+    pub fn truncate_read_to(len: usize) -> Self {
+        Self {
+            delay: None,
+            error: None,
+            truncate_read_to: Some(len),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColdStoreEvent {
+    WriteChunkBegin {
+        path: String,
+        payload_len: usize,
+    },
+    WriteChunkComplete {
+        path: String,
+        object_size: u64,
+    },
+    DeleteChunkBegin {
+        path: String,
+    },
+    DeleteChunkComplete {
+        path: String,
+    },
+    RemoveAllBegin {
+        path: String,
+    },
+    RemoveAllComplete {
+        path: String,
+    },
+    ReadObjectRangeBegin {
+        stream_id: Option<BucketStreamId>,
+        path: String,
+        read_start_offset: u64,
+        len: usize,
+        object_start: u64,
+        object_end: u64,
+        cached: bool,
+    },
+    ReadObjectRangeComplete {
+        stream_id: Option<BucketStreamId>,
+        path: String,
+        read_start_offset: u64,
+        len: usize,
+        returned_len: usize,
+        cached: bool,
+    },
+    FaultInjected {
+        operation: ColdStoreOperation,
+        stream_id: Option<BucketStreamId>,
+        path: String,
+        message: String,
+    },
+    DelayInjected {
+        operation: ColdStoreOperation,
+        stream_id: Option<BucketStreamId>,
+        path: String,
+        delay_ms: u64,
+    },
+    TruncateInjected {
+        stream_id: Option<BucketStreamId>,
+        path: String,
+        requested_len: usize,
+        returned_len: usize,
+    },
+}
+
+impl fmt::Debug for ColdStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ColdStore")
+            .field("info", &self.info)
+            .field("operator", &self.operator)
+            .field("read_cache", &self.read_cache)
+            .finish_non_exhaustive()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColdStoreInfo {
@@ -37,7 +195,7 @@ impl ColdStore {
     pub fn memory() -> io::Result<Self> {
         let operator = Operator::via_iter(Scheme::Memory, [])
             .map_err(|err| io::Error::other(err.to_string()))?;
-        Ok(Self::new(
+        Ok(Self::from_operator(
             operator,
             ColdStoreInfo {
                 backend: "memory",
@@ -110,7 +268,7 @@ impl ColdStore {
             builder = builder.session_token(&session_token);
         }
 
-        Ok(Self::new(
+        Ok(Self::from_operator(
             Operator::new(builder)
                 .map_err(|err| io::Error::other(err.to_string()))?
                 .finish(),
@@ -146,11 +304,14 @@ impl ColdStore {
         Ok(Some(Arc::new(store)))
     }
 
-    fn new(operator: Operator, info: ColdStoreInfo) -> Self {
+    pub fn from_operator(operator: Operator, info: ColdStoreInfo) -> Self {
         Self {
             info,
             operator,
             read_cache: ColdReadCache::from_env().map(Arc::new),
+            observer: Arc::new(Mutex::new(None)),
+            fault_policy: Arc::new(Mutex::new(None)),
+            delay_fn: Arc::new(Mutex::new(default_cold_store_delay_fn())),
         }
     }
 
@@ -168,6 +329,36 @@ impl ColdStore {
         self
     }
 
+    pub fn set_observer(&self, observer: impl Fn(ColdStoreEvent) + Send + Sync + 'static) {
+        *self.observer.lock().expect("cold store observer mutex") = Some(Arc::new(observer));
+    }
+
+    pub fn set_fault_policy(
+        &self,
+        policy: impl Fn(&ColdStoreFaultContext) -> Option<ColdStoreFaultEffect> + Send + Sync + 'static,
+    ) {
+        *self
+            .fault_policy
+            .lock()
+            .expect("cold store fault policy mutex") = Some(Arc::new(policy));
+    }
+
+    pub fn clear_fault_policy(&self) {
+        *self
+            .fault_policy
+            .lock()
+            .expect("cold store fault policy mutex") = None;
+    }
+
+    pub fn set_delay_fn<F, Fut>(&self, delay_fn: F)
+    where
+        F: Fn(Duration) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        *self.delay_fn.lock().expect("cold store delay fn mutex") =
+            Arc::new(move |duration| Box::pin(delay_fn(duration)));
+    }
+
     #[cfg(test)]
     pub(crate) fn cached_block_count(&self) -> usize {
         self.read_cache
@@ -183,11 +374,33 @@ impl ColdStore {
                 "cold chunk path must not be empty",
             ));
         }
+        self.notify(ColdStoreEvent::WriteChunkBegin {
+            path: path.to_owned(),
+            payload_len: payload.len(),
+        });
+        let _applied_fault = self
+            .maybe_apply_fault_effect(ColdStoreFaultContext {
+                operation: ColdStoreOperation::WriteChunk,
+                stream_id: None,
+                path: path.to_owned(),
+                payload_len: Some(payload.len()),
+                read_start_offset: None,
+                len: None,
+                object_start: None,
+                object_end: None,
+                cached: None,
+            })
+            .await?;
         self.operator
             .write(path, payload.to_vec())
             .await
             .map_err(|err| cold_store_io_error(path, err))?;
-        Ok(u64::try_from(payload.len()).expect("payload len fits u64"))
+        let object_size = u64::try_from(payload.len()).expect("payload len fits u64");
+        self.notify(ColdStoreEvent::WriteChunkComplete {
+            path: path.to_owned(),
+            object_size,
+        });
+        Ok(object_size)
     }
 
     pub async fn delete_chunk(&self, path: &str) -> io::Result<()> {
@@ -197,6 +410,22 @@ impl ColdStore {
                 "cold chunk path must not be empty",
             ));
         }
+        self.notify(ColdStoreEvent::DeleteChunkBegin {
+            path: path.to_owned(),
+        });
+        let _applied_fault = self
+            .maybe_apply_fault_effect(ColdStoreFaultContext {
+                operation: ColdStoreOperation::DeleteChunk,
+                stream_id: None,
+                path: path.to_owned(),
+                payload_len: None,
+                read_start_offset: None,
+                len: None,
+                object_start: None,
+                object_end: None,
+                cached: None,
+            })
+            .await?;
         self.operator
             .delete(path)
             .await
@@ -204,10 +433,29 @@ impl ColdStore {
         if let Some(cache) = &self.read_cache {
             cache.invalidate_path(path);
         }
+        self.notify(ColdStoreEvent::DeleteChunkComplete {
+            path: path.to_owned(),
+        });
         Ok(())
     }
 
     pub async fn remove_all(&self, path: &str) -> io::Result<()> {
+        self.notify(ColdStoreEvent::RemoveAllBegin {
+            path: path.to_owned(),
+        });
+        let _applied_fault = self
+            .maybe_apply_fault_effect(ColdStoreFaultContext {
+                operation: ColdStoreOperation::RemoveAll,
+                stream_id: None,
+                path: path.to_owned(),
+                payload_len: None,
+                read_start_offset: None,
+                len: None,
+                object_start: None,
+                object_end: None,
+                cached: None,
+            })
+            .await?;
         self.operator
             .remove_all(path)
             .await
@@ -215,6 +463,9 @@ impl ColdStore {
         if let Some(cache) = &self.read_cache {
             cache.invalidate_prefix(path);
         }
+        self.notify(ColdStoreEvent::RemoveAllComplete {
+            path: path.to_owned(),
+        });
         Ok(())
     }
 
@@ -293,20 +544,74 @@ impl ColdStore {
                 ),
             ));
         }
-        let Some(cache) = &self.read_cache else {
-            return self
-                .read_object_range_uncached(object, object_start, object_end, len)
-                .await;
-        };
-        let bytes = self
-            .read_object_range_cached(cache, object, object_start, object_end, len)
+        let cached = self.read_cache.is_some();
+        self.notify(ColdStoreEvent::ReadObjectRangeBegin {
+            stream_id: stream_id.cloned(),
+            path: object.s3_path.clone(),
+            read_start_offset,
+            len,
+            object_start,
+            object_end,
+            cached,
+        });
+        let applied_fault = self
+            .maybe_apply_fault_effect(ColdStoreFaultContext {
+                operation: ColdStoreOperation::ReadObjectRange,
+                stream_id: stream_id.cloned(),
+                path: object.s3_path.clone(),
+                payload_len: None,
+                read_start_offset: Some(read_start_offset),
+                len: Some(len),
+                object_start: Some(object_start),
+                object_end: Some(object_end),
+                cached: Some(cached),
+            })
             .await?;
-        if let Some(stream_id) = stream_id {
-            let readahead_blocks = cache.record_stream_read(stream_id, read_start_offset, len);
-            if readahead_blocks > 0 {
-                self.spawn_readahead(object.clone(), object_end, readahead_blocks);
+        let mut bytes = if let Some(cache) = &self.read_cache {
+            let bytes = self
+                .read_object_range_cached(cache, object, object_start, object_end, len)
+                .await?;
+            if let Some(stream_id) = stream_id {
+                let readahead_blocks = cache.record_stream_read(stream_id, read_start_offset, len);
+                if readahead_blocks > 0 {
+                    self.spawn_readahead(object.clone(), object_end, readahead_blocks);
+                }
             }
+            bytes
+        } else {
+            self.read_object_range_uncached(object, object_start, object_end, len)
+                .await?
+        };
+        if let Some(returned_len) = applied_fault.truncate_read_to {
+            let returned_len = returned_len.min(bytes.len());
+            bytes.truncate(returned_len);
+            self.notify(ColdStoreEvent::TruncateInjected {
+                stream_id: stream_id.cloned(),
+                path: object.s3_path.clone(),
+                requested_len: len,
+                returned_len,
+            });
         }
+        if bytes.len() != len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cold object '{}' returned {} bytes for requested range [{}..{})",
+                    object.s3_path,
+                    bytes.len(),
+                    object_start,
+                    object_end
+                ),
+            ));
+        }
+        self.notify(ColdStoreEvent::ReadObjectRangeComplete {
+            stream_id: stream_id.cloned(),
+            path: object.s3_path.clone(),
+            read_start_offset,
+            len,
+            returned_len: bytes.len(),
+            cached,
+        });
         Ok(bytes)
     }
 
@@ -434,7 +739,7 @@ impl ColdStore {
         let block_size = cache.block_size();
         let mut block_index = object_end.div_ceil(block_size);
         let store = self.clone();
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             for _ in 0..readahead_blocks {
                 let block_start = block_index * block_size;
                 if block_start >= object.object_size {
@@ -459,6 +764,89 @@ impl ColdStore {
             }
         });
     }
+
+    fn notify(&self, event: ColdStoreEvent) {
+        let observer = self
+            .observer
+            .lock()
+            .expect("cold store observer mutex")
+            .clone();
+        if let Some(observer) = observer {
+            observer(event);
+        }
+    }
+
+    async fn maybe_apply_fault_effect(
+        &self,
+        context: ColdStoreFaultContext,
+    ) -> io::Result<ColdStoreAppliedFault> {
+        let policy = self
+            .fault_policy
+            .lock()
+            .expect("cold store fault policy mutex")
+            .clone();
+        let Some(policy) = policy else {
+            return Ok(ColdStoreAppliedFault::default());
+        };
+        let Some(effect) = policy(&context) else {
+            return Ok(ColdStoreAppliedFault::default());
+        };
+        if let Some(delay) = effect.delay {
+            self.notify(ColdStoreEvent::DelayInjected {
+                operation: context.operation,
+                stream_id: context.stream_id.clone(),
+                path: context.path.clone(),
+                delay_ms: duration_ms(delay),
+            });
+            let delay_fn = self
+                .delay_fn
+                .lock()
+                .expect("cold store delay fn mutex")
+                .clone();
+            delay_fn(delay).await;
+        }
+        if let Some(fault) = effect.error {
+            self.notify(ColdStoreEvent::FaultInjected {
+                operation: context.operation,
+                stream_id: context.stream_id,
+                path: context.path.clone(),
+                message: fault.message.clone(),
+            });
+            return Err(io::Error::other(format!(
+                "cold store fault injected for {} '{}': {}",
+                context.operation.as_str(),
+                context.path,
+                fault.message
+            )));
+        }
+        Ok(ColdStoreAppliedFault {
+            truncate_read_to: effect.truncate_read_to,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct ColdStoreAppliedFault {
+    truncate_read_to: Option<usize>,
+}
+
+impl ColdStoreOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WriteChunk => "write_chunk",
+            Self::DeleteChunk => "delete_chunk",
+            Self::RemoveAll => "remove_all",
+            Self::ReadObjectRange => "read_object_range",
+        }
+    }
+}
+
+fn default_cold_store_delay_fn() -> ColdStoreDelayFn {
+    Arc::new(|duration| Box::pin(crate::rt::time::sleep(duration)))
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -665,15 +1053,25 @@ fn cold_store_io_error(path: &str, err: opendal::Error) -> io::Error {
     io::Error::other(format!("cold object '{path}': {err}"))
 }
 
+#[cfg(not(madsim))]
+fn cold_object_unix_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
+}
+
+#[cfg(madsim)]
+fn cold_object_unix_nanos() -> u128 {
+    0
+}
+
 pub fn new_cold_chunk_path(
     stream_id: &BucketStreamId,
     start_offset: u64,
     end_offset: u64,
 ) -> String {
-    let unix_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
+    let unix_nanos = cold_object_unix_nanos();
     let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!(
         "{stream_id}/chunks/{start_offset:016x}-{end_offset:016x}-{unix_nanos:032x}-{sequence:016x}.bin"
@@ -681,12 +1079,18 @@ pub fn new_cold_chunk_path(
 }
 
 pub fn new_external_payload_path(stream_id: &BucketStreamId) -> String {
-    let unix_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
+    let unix_nanos = cold_object_unix_nanos();
     let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("{stream_id}/external/{unix_nanos:032x}-{sequence:016x}.bin")
+}
+
+/// Reset the global cold-object sequence counter. Only available under
+/// `cfg(madsim)` so the simulator can clear state between scenarios when
+/// running multiple seeds in one process (e.g. `Runtime::check_determinism`).
+#[cfg(madsim)]
+#[allow(dead_code)]
+pub fn reset_cold_chunk_sequence_for_sim() {
+    COLD_CHUNK_SEQUENCE.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]

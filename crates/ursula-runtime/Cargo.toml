@@ -18,6 +18,9 @@ tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "sync", "ti
 ursula-shard = { path = "../ursula-shard", version = "0.1.0" }
 ursula-stream = { path = "../ursula-stream", version = "0.1.0" }
 
+[target.'cfg(madsim)'.dependencies]
+sim-tokio = { package = "madsim-tokio", version = "0.2.30", features = ["macros", "rt", "sync", "time"] }
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
 
@@ -32,3 +35,6 @@ harness = false
 [[bench]]
 name = "append_apply"
 harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }

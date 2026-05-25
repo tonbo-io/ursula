@@ -29,4 +29,10 @@ ursula-raft = { path = "../ursula-raft", version = "0.1.0" }
 ursula-runtime = { path = "../ursula-runtime", version = "0.1.0" }
 ursula-shard = { path = "../ursula-shard", version = "0.1.0" }
 
+[target.'cfg(madsim)'.dependencies]
+madsim = "0.2.34"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }
+
 [dev-dependencies]

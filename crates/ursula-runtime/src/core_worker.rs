@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use crate::rt::time::Instant;
 use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardPlacement};
 use ursula_stream::ColdFlushCandidate;
 
@@ -26,6 +25,7 @@ use crate::request::{
     PublishSnapshotResponse, ReadSnapshotRequest, ReadSnapshotResponse, ReadStreamRequest,
     ReadStreamResponse,
 };
+use crate::rt::sync::{Semaphore, mpsc, oneshot};
 
 #[derive(Debug, Clone)]
 pub(crate) struct CoreMailbox {
@@ -43,7 +43,6 @@ impl CoreMailbox {
     }
 }
 
-#[derive(Debug)]
 pub(crate) enum CoreCommand {
     CreateStream {
         request: CreateStreamRequest,
@@ -167,6 +166,17 @@ pub(crate) enum CoreCommand {
     },
     InstallGroupSnapshot {
         snapshot: GroupSnapshot,
+        response_tx: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    #[cfg(madsim)]
+    ShutdownGroupEngine {
+        placement: ShardPlacement,
+        response_tx: oneshot::Sender<Result<(), RuntimeError>>,
+    },
+    #[cfg(madsim)]
+    InstallGroupEngine {
+        placement: ShardPlacement,
+        engine: Box<dyn GroupEngine>,
         response_tx: oneshot::Sender<Result<(), RuntimeError>>,
     },
 }
@@ -630,6 +640,24 @@ impl CoreWorker {
                     )
                     .await;
                 }
+                #[cfg(madsim)]
+                CoreCommand::ShutdownGroupEngine {
+                    placement,
+                    response_tx,
+                } => {
+                    debug_assert_eq!(placement.core_id, self.core_id);
+                    self.shutdown_group_engine(placement, response_tx).await;
+                }
+                #[cfg(madsim)]
+                CoreCommand::InstallGroupEngine {
+                    placement,
+                    engine,
+                    response_tx,
+                } => {
+                    debug_assert_eq!(placement.core_id, self.core_id);
+                    let response = self.install_group_engine(placement, engine).await;
+                    let _ = response_tx.send(response);
+                }
             }
         }
     }
@@ -703,7 +731,7 @@ impl CoreWorker {
                 live_read_max_waiters_per_core: self.live_read_max_waiters_per_core,
                 read_materialization: self.read_materialization.clone(),
             };
-            tokio::spawn(actor.run());
+            crate::rt::spawn(actor.run());
             self.groups.insert(
                 placement.raft_group_id,
                 GroupMailbox {
@@ -718,6 +746,64 @@ impl CoreWorker {
             .get(&placement.raft_group_id)
             .expect("group was just inserted")
             .clone())
+    }
+
+    #[cfg(madsim)]
+    pub(crate) async fn shutdown_group_engine(
+        &mut self,
+        placement: ShardPlacement,
+        response_tx: oneshot::Sender<Result<(), RuntimeError>>,
+    ) {
+        let Some(group) = self.groups.remove(&placement.raft_group_id) else {
+            let _ = response_tx.send(Ok(()));
+            return;
+        };
+        if let Err(command) = group
+            .send(GroupCommand::ShutdownEngine { response_tx })
+            .await
+        {
+            (*command).send_error(RuntimeError::MailboxClosed {
+                core_id: placement.core_id,
+            });
+        }
+    }
+
+    #[cfg(madsim)]
+    pub(crate) async fn install_group_engine(
+        &mut self,
+        placement: ShardPlacement,
+        engine: Box<dyn GroupEngine>,
+    ) -> Result<(), RuntimeError> {
+        if self.groups.contains_key(&placement.raft_group_id) {
+            return Err(RuntimeError::GroupEngine {
+                core_id: placement.core_id,
+                raft_group_id: placement.raft_group_id,
+                message: "group engine already installed".to_owned(),
+                next_offset: None,
+                leader_hint: None,
+            });
+        }
+        let (tx, rx) = mpsc::channel(self.group_mailbox_capacity);
+        let actor = GroupActor {
+            placement,
+            engine,
+            rx,
+            read_watchers: HashMap::new(),
+            metrics: self.metrics.clone(),
+            cold_write_admission: self.cold_write_admission,
+            live_read_max_waiters_per_core: self.live_read_max_waiters_per_core,
+            read_materialization: self.read_materialization.clone(),
+        };
+        crate::rt::spawn(actor.run());
+        self.groups.insert(
+            placement.raft_group_id,
+            GroupMailbox {
+                group_id: placement.raft_group_id,
+                tx,
+                metrics: self.metrics.clone(),
+            },
+        );
+        Ok(())
     }
 
     pub(crate) async fn read_stream(
@@ -754,7 +840,7 @@ impl CoreWorker {
         parts: GroupReadStreamParts,
         response_tx: oneshot::Sender<Result<ReadStreamResponse, RuntimeError>>,
     ) {
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             let response = match read_materialization.acquire_owned().await {
                 Ok(_permit) => parts
                     .into_response()
@@ -774,7 +860,7 @@ impl CoreWorker {
         parts: GroupReadStreamParts,
         watchers: Vec<ReadWatcher>,
     ) {
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             let response = match read_materialization.acquire_owned().await {
                 Ok(_permit) => parts
                     .into_response()

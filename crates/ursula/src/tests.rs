@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::body::{Body, to_bytes};
 use axum::http::Request;
@@ -17,6 +19,17 @@ use ursula_runtime::{
 use ursula_shard::RaftGroupId;
 
 use super::*;
+
+#[derive(Clone)]
+struct TestWallClock {
+    now_ms: Arc<AtomicU64>,
+}
+
+impl WallClock for TestWallClock {
+    fn unix_time_ms(&self) -> u64 {
+        self.now_ms.load(Ordering::Relaxed)
+    }
+}
 
 async fn wait_raft_state_machine_payload(
     registry: &RaftGroupHandleRegistry,
@@ -4209,6 +4222,59 @@ async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
 
 fn test_router() -> Router {
     router(spawn_default_runtime(2, 8).expect("runtime"))
+}
+
+#[tokio::test]
+async fn http_state_wall_clock_drives_protocol_now_ms() {
+    let now_ms = Arc::new(AtomicU64::new(1_000));
+    let state = HttpState::new(spawn_default_runtime(1, 1).expect("runtime")).with_wall_clock(
+        TestWallClock {
+            now_ms: Arc::clone(&now_ms),
+        },
+    );
+    let app = router_with_http_state(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/clocked-stream")
+                .header(CONTENT_TYPE, "text/plain")
+                .header(HEADER_STREAM_TTL, "1")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    now_ms.store(1_999, Ordering::Relaxed);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/benchcmp/clocked-stream")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    now_ms.store(2_000, Ordering::Relaxed);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/benchcmp/clocked-stream")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 fn batch_body(payloads: &[&[u8]]) -> Vec<u8> {

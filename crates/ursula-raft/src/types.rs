@@ -12,12 +12,18 @@ use ursula_runtime::GroupWriteCommand;
 pub(crate) const CORE_LOG_GROUP_COMMIT_DELAY: Duration = Duration::from_micros(200);
 pub(crate) const CORE_LOG_GROUP_COMMIT_MAX_BATCH: usize = 1024;
 
+#[cfg(madsim)]
+type OpenRaftRuntime = crate::sim_runtime::MadsimOpenRaftRuntime;
+#[cfg(not(madsim))]
+type OpenRaftRuntime = openraft::impls::TokioRuntime;
+
 openraft::declare_raft_types!(
     pub UrsulaRaftTypeConfig:
         D = RaftGroupCommand,
         R = RaftGroupResponse,
         Node = openraft::BasicNode,
         SnapshotData = Cursor<Vec<u8>>,
+        AsyncRuntime = OpenRaftRuntime,
 );
 
 pub type UrsulaAppendEntriesRequest = AppendEntriesRequest<UrsulaRaftTypeConfig>;

@@ -4,7 +4,8 @@ use std::io;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::time::Instant;
+
+use crate::rt::time::Instant;
 
 use futures_util::Stream;
 use openraft::EntryPayload;

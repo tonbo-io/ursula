@@ -1,0 +1,605 @@
+[
+  {
+    "schema_version": 1,
+    "seed": 244,
+    "schedule": {
+      "seed": 244,
+      "scenario": "runtime_raft_network",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-244-runtime-raft-network-randomized-failure"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "runtime_raft_network_workload",
+            "action": {
+              "action": "run_runtime_raft_network_workload",
+              "plan": {
+                "stream_count": 1,
+                "append_batch_lens": [
+                  1
+                ],
+                "failover_batch_lens": [
+                  1
+                ],
+                "corrupt_read_expectation": true
+              }
+            }
+          }
+        ]
+      }
+    },
+    "invariant": "runtime_raft_network_read_your_write",
+    "panic": "invariant `runtime_raft_network_read_your_write` failed after `runtime_raft_network_read_verified`: stream benchcmp/ursula-sim-schedule-244-runtime-raft-network-randomized-failure expected 10 bytes/next_offset 10, read 9 bytes/next_offset 9"
+  },
+  {
+    "schema_version": 1,
+    "seed": 248,
+    "schedule": {
+      "seed": 248,
+      "scenario": "runtime_raft_network",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-248-runtime-raft-network-partial-read-failure"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "runtime_raft_network_workload",
+            "action": {
+              "action": "run_runtime_raft_network_workload",
+              "plan": {
+                "stream_count": 1,
+                "append_batch_lens": [
+                  1
+                ],
+                "failover_batch_lens": [
+                  1
+                ],
+                "partial_reads": true,
+                "corrupt_partial_read_expectation": true
+              }
+            }
+          }
+        ]
+      }
+    },
+    "invariant": "runtime_raft_network_partial_read_integrity",
+    "panic": "invariant `runtime_raft_network_partial_read_integrity` failed after `runtime_raft_network_read_verified`: partial read for stream benchcmp/ursula-sim-schedule-248-runtime-raft-network-partial-read-failure at offset 3 returned [98, 48, 58, 105, 48, 59], expected [98, 48, 58, 105, 48, 59, 33]"
+  },
+  {
+    "schema_version": 1,
+    "seed": 253,
+    "schedule": {
+      "seed": 253,
+      "scenario": "runtime_raft_network",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-253-runtime-raft-network-leader-failover-read-failure"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "after_runtime_read",
+            "action": {
+              "action": "stop_current_leader"
+            }
+          },
+          {
+            "phase": "after_failover_append",
+            "action": {
+              "action": "restart_stopped_leader"
+            }
+          },
+          {
+            "phase": "runtime_raft_network_workload",
+            "action": {
+              "action": "run_runtime_raft_network_workload",
+              "plan": {
+                "stream_count": 1,
+                "append_batch_lens": [
+                  1
+                ],
+                "failover_batch_lens": [
+                  1
+                ],
+                "corrupt_leader_failover_read_expectation": true
+              }
+            }
+          }
+        ]
+      }
+    },
+    "invariant": "runtime_raft_network_leader_failover_no_loss_or_dup",
+    "panic": "invariant `runtime_raft_network_leader_failover_no_loss_or_dup` failed after `runtime_raft_network_leader_failover_verified`: stream benchcmp/ursula-sim-schedule-253-runtime-raft-network-leader-failover-read-failure leader failover read returned 18 bytes/next_offset 18, expected 19 bytes/next_offset 19"
+  },
+  {
+    "schema_version": 1,
+    "seed": 222,
+    "schedule": {
+      "seed": 222,
+      "scenario": "runtime_raft_network",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-222-runtime-raft-network-cold-live-truncate-failure"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "after_recovery_read",
+            "action": {
+              "action": "verify_runtime_cold_live_reads"
+            }
+          },
+          {
+            "phase": "before_cold_read",
+            "action": {
+              "action": "truncate_next_cold_read",
+              "returned_len": 0
+            }
+          }
+        ]
+      }
+    },
+    "invariant": "runtime_raft_network_cold_live_read_integrity",
+    "panic": "invariant `runtime_raft_network_cold_live_read_integrity` failed after `runtime_raft_network_read_verified`: runtime raft network cold/live read for stream benchcmp/ursula-sim-schedule-222-runtime-raft-network-cold-live-truncate-failure failed with a truncated cold object read",
+    "panic_contains": [
+      "invariant `runtime_raft_network_cold_live_read_integrity` failed after `runtime_raft_network_read_verified`",
+      "runtime raft network cold/live read for stream benchcmp/ursula-sim-schedule-222-runtime-raft-network-cold-live-truncate-failure failed",
+      "returned 0 bytes for requested range [0..8)"
+    ]
+  },
+  {
+    "schema_version": 1,
+    "seed": 192,
+    "schedule": {
+      "seed": 192,
+      "scenario": "runtime_seeded_interleaving",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-192-runtime-seeded-interleaving"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "seeded_runtime_interleaving",
+            "action": {
+              "action": "run_runtime_seeded_interleaving",
+              "plan": {
+                "clients": [
+                  {
+                    "client_id": 0,
+                    "stream_index": 0,
+                    "first_append_delay_ms": 0,
+                    "second_append_delay_ms": 0
+                  }
+                ],
+                "flush_delay_ms": 0,
+                "read_verify_delay_ms": 0,
+                "flush_group_limit": 1,
+                "runtime_cold_write_failure": "seeded runtime cold write fault for seed 192"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "invariant": "runtime_interleaving_cold_write_integrity",
+    "panic": "invariant `runtime_interleaving_cold_write_integrity` failed after `runtime_interleaving_flush_completed`: final cold flush failed with a seeded runtime cold write fault",
+    "panic_contains": [
+      "invariant `runtime_interleaving_cold_write_integrity` failed after `runtime_interleaving_flush_completed`",
+      "final cold flush failed: cold store IO error",
+      "seeded runtime cold write fault for seed 192"
+    ]
+  },
+  {
+    "schema_version": 1,
+    "seed": 232,
+    "schedule": {
+      "seed": 232,
+      "scenario": "runtime_raft_snapshot_install",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-232-runtime-raft-snapshot-install-failure"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "after_snapshot_capture",
+            "action": {
+              "action": "corrupt_runtime_raft_snapshot_append_counts"
+            }
+          }
+        ]
+      }
+    },
+    "invariant": "runtime_raft_snapshot_install_integrity",
+    "panic": "invariant `runtime_raft_snapshot_install_integrity` failed after `runtime_raft_snapshot_captured`: restore append count 1, expected 3"
+  },
+  {
+    "schema_version": 1,
+    "seed": 262,
+    "schedule": {
+      "seed": 262,
+      "scenario": "http_producer_protocol_surface",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-262-http-producer-protocol-surface-failure"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "after_http_duplicate_retry",
+            "action": {
+              "action": "corrupt_http_producer_duplicate_expectation"
+            }
+          }
+        ]
+      }
+    },
+    "invariant": "http_producer_retry_idempotence",
+    "panic": "invariant `http_producer_retry_idempotence` failed after `http_producer_duplicate_retry`: duplicate producer retry returned 204 No Content, expected 200 OK"
+  },
+  {
+    "schema_version": 1,
+    "seed": 267,
+    "schedule": {
+      "seed": 267,
+      "scenario": "http_live_protocol_surface",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-267-http-live-protocol-surface-failure"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "after_http_sse_body",
+            "action": {
+              "action": "corrupt_http_live_sse_next_offset_expectation"
+            }
+          }
+        ]
+      }
+    },
+    "invariant": "http_live_sse_delivery",
+    "panic": "invariant `http_live_sse_delivery` failed after `http_sse_body_received`: SSE body did not contain expected next offset",
+    "panic_contains": [
+      "invariant `http_live_sse_delivery` failed after `http_sse_body_received`",
+      "SSE body did not contain expected next offset \"streamNextOffset\":\"00000000000000000008\"",
+      "data:sse",
+      "\"streamNextOffset\":\"00000000000000000007\"",
+      "\"streamClosed\":true"
+    ]
+  },
+  {
+    "schema_version": 1,
+    "seed": 272,
+    "schedule": {
+      "seed": 272,
+      "scenario": "http_live_limit_protocol_surface",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-272-http-live-limit-protocol-surface-failure"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "after_http_live_limit_metrics",
+            "action": {
+              "action": "corrupt_http_live_limit_backpressure_expectation"
+            }
+          }
+        ]
+      }
+    },
+    "invariant": "http_live_waiter_backpressure",
+    "panic": "invariant `http_live_waiter_backpressure` failed after `http_live_limit_metrics_received`: live-read backpressure metrics did not contain expected event count",
+    "panic_contains": [
+      "invariant `http_live_waiter_backpressure` failed after `http_live_limit_metrics_received`",
+      "live-read backpressure metrics did not contain expected event count \"live_read_backpressure_events\":2",
+      "\"live_read_waiters\":0",
+      "\"live_read_backpressure_events\":1",
+      "\"per_core_live_read_backpressure_events\":[1]"
+    ]
+  },
+  {
+    "schema_version": 1,
+    "seed": 297,
+    "schedule": {
+      "seed": 297,
+      "scenario": "http_protocol_surface_randomized",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-297-http-protocol-surface-randomized-failure"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "http_protocol_surface_workload",
+            "action": {
+              "action": "run_http_protocol_surface_workload",
+              "plan": {
+                "corrupt_final_read_expectation": true
+              }
+            }
+          }
+        ]
+      }
+    },
+    "invariant": "http_protocol_randomized_read_your_write",
+    "panic": "invariant `http_protocol_randomized_read_your_write` failed after `http_protocol_surface_randomized_final_read`: final HTTP read for stream benchcmp/ursula-sim-schedule-297-http-protocol-surface-randomized-failure returned 2 bytes, expected 3 bytes/next_offset 3"
+  },
+  {
+    "schema_version": 1,
+    "seed": 302,
+    "schedule": {
+      "seed": 302,
+      "scenario": "http_protocol_surface_randomized",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-302-http-protocol-surface-randomized-sse-failure"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "http_protocol_surface_workload",
+            "action": {
+              "action": "run_http_protocol_surface_workload",
+              "plan": {
+                "sse_close": true,
+                "corrupt_sse_next_offset_expectation": true
+              }
+            }
+          }
+        ]
+      }
+    },
+    "panic": "invariant `http_protocol_randomized_sse_delivery` failed after `http_protocol_surface_randomized_sse_body`: SSE body for stream benchcmp/ursula-sim-schedule-302-http-protocol-surface-randomized-sse-failure did not contain expected next offset 00000000000000000006",
+    "invariant": "http_protocol_randomized_sse_delivery"
+  },
+  {
+    "schema_version": 1,
+    "seed": 307,
+    "schedule": {
+      "seed": 307,
+      "scenario": "http_protocol_surface_randomized",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-307-http-protocol-surface-randomized-backpressure-failure"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "http_protocol_surface_workload",
+            "action": {
+              "action": "run_http_protocol_surface_workload",
+              "plan": {
+                "live_limit": true,
+                "corrupt_live_limit_backpressure_expectation": true
+              }
+            }
+          }
+        ]
+      }
+    },
+    "panic": "invariant `http_protocol_randomized_live_waiter_backpressure` failed after `http_protocol_surface_randomized_live_limit_metrics`: live-read backpressure metrics for stream benchcmp/ursula-sim-schedule-307-http-protocol-surface-randomized-backpressure-failure did not contain expected event count \"live_read_backpressure_events\":2: {\"accepted_appends\":2,\"active_cores\":1,\"active_groups\":1,\"per_core_appends\":[2],\"per_group_appends\":[2],\"applied_mutations\":3,\"per_core_applied_mutations\":[3],\"per_group_applied_mutations\":[3],\"mutation_apply_ns\":0,\"per_core_mutation_apply_ns\":[0],\"per_group_mutation_apply_ns\":[0],\"group_lock_wait_ns\":0,\"per_core_group_lock_wait_ns\":[0],\"per_group_group_lock_wait_ns\":[0],\"group_engine_exec_ns\":0,\"per_core_group_engine_exec_ns\":[0],\"per_group_group_engine_exec_ns\":[0],\"group_mailbox_depth\":0,\"per_group_group_mailbox_depth\":[0],\"group_mailbox_max_depth\":2,\"per_group_group_mailbox_max_depth\":[2],\"group_mailbox_full_events\":0,\"per_group_group_mailbox_full_events\":[0],\"raft_write_many_batches\":0,\"per_core_raft_write_many_batches\":[0],\"per_group_raft_write_many_batches\":[0],\"raft_write_many_commands\":0,\"per_core_raft_write_many_commands\":[0],\"per_group_raft_write_many_commands\":[0],\"raft_write_many_logical_commands\":0,\"per_core_raft_write_many_logical_commands\":[0],\"per_group_raft_write_many_logical_commands\":[0],\"raft_write_many_responses\":0,\"per_core_raft_write_many_responses\":[0],\"per_group_raft_write_many_responses\":[0],\"raft_write_many_submit_ns\":0,\"per_core_raft_write_many_submit_ns\":[0],\"per_group_raft_write_many_submit_ns\":[0],\"raft_write_many_response_ns\":0,\"per_core_raft_write_many_response_ns\":[0],\"per_group_raft_write_many_response_ns\":[0],\"raft_apply_entries\":0,\"per_core_raft_apply_entries\":[0],\"per_group_raft_apply_entries\":[0],\"raft_apply_ns\":0,\"per_core_raft_apply_ns\":[0],\"per_group_raft_apply_ns\":[0],\"live_read_waiters\":0,\"per_core_live_read_waiters\":[0],\"live_read_backpressure_events\":1,\"per_core_live_read_backpressure_events\":[1],\"sse_streams_opened\":0,\"sse_read_iterations\":0,\"sse_data_events\":0,\"sse_control_events\":0,\"sse_error_events\":0,\"routed_requests\":14,\"per_core_routed_requests\":[14],\"mailbox_send_wait_ns\":0,\"per_core_mailbox_send_wait_ns\":[0],\"mailbox_full_events\":0,\"per_core_mailbox_full_events\":[0],\"wal_batches\":0,\"per_core_wal_batches\":[0],\"per_group_wal_batches\":[0],\"wal_records\":0,\"per_core_wal_records\":[0],\"per_group_wal_records\":[0],\"wal_write_ns\":0,\"per_core_wal_write_ns\":[0],\"per_group_wal_write_ns\":[0],\"wal_sync_ns\":0,\"per_core_wal_sync_ns\":[0],\"per_group_wal_sync_ns\":[0],\"cold_flush_uploads\":0,\"cold_flush_upload_bytes\":0,\"cold_flush_upload_ns\":0,\"cold_flush_publishes\":0,\"cold_flush_publish_bytes\":0,\"cold_flush_publish_ns\":0,\"cold_orphan_cleanup_attempts\":0,\"cold_orphan_cleanup_errors\":0,\"cold_orphan_bytes\":0,\"cold_hot_bytes\":4,\"per_group_cold_hot_bytes\":[4],\"cold_hot_group_bytes_max\":4,\"per_group_cold_hot_bytes_max\":[4],\"cold_hot_stream_bytes_max\":4,\"cold_backpressure_events\":0,\"per_core_cold_backpressure_events\":[0],\"per_group_cold_backpressure_events\":[0],\"cold_backpressure_bytes\":0,\"cold_store\":{\"backend\":\"none\",\"root\":null,\"bucket\":null,\"region\":null,\"endpoint\":null},\"mailbox_depths\":[0],\"mailbox_capacities\":[1024],\"raft_group_count\":0,\"raft_groups\":[]}",
+    "invariant": "http_protocol_randomized_live_waiter_backpressure"
+  },
+  {
+    "schema_version": 1,
+    "seed": 312,
+    "schedule": {
+      "seed": 312,
+      "scenario": "runtime_raft_network",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-312-runtime-raft-network-cold-live-write-failure"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "after_recovery_read",
+            "action": {
+              "action": "verify_runtime_cold_live_reads"
+            }
+          },
+          {
+            "phase": "before_cold_write",
+            "action": {
+              "action": "fail_next_cold_write"
+            }
+          }
+        ]
+      }
+    },
+    "panic": "invariant `runtime_raft_network_cold_live_write_integrity` failed after `runtime_raft_network_read_verified`: runtime raft network cold flush failed after write fault: cold store IO error: cold store fault injected for write_chunk 'benchcmp/ursula-sim-schedule-312-runtime-raft-network-cold-live-write-failure/chunks/0000000000000000-0000000000000008-00000000000000001705900284f6e592-0000000000000006.bin': seeded runtime raft network cold write fault; uploads 0; publishes 0",
+    "invariant": "runtime_raft_network_cold_live_write_integrity",
+    "panic_contains": [
+      "invariant `runtime_raft_network_cold_live_write_integrity` failed after `runtime_raft_network_read_verified`",
+      "runtime raft network cold flush failed after write fault: cold store IO error",
+      "seeded runtime raft network cold write fault",
+      "uploads 0; publishes 0"
+    ]
+  },
+  {
+    "schema_version": 1,
+    "seed": 322,
+    "schedule": {
+      "seed": 322,
+      "scenario": "runtime_raft_network",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-322-runtime-raft-network-randomized-cold-read-failure"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "runtime_raft_network_workload",
+            "action": {
+              "action": "run_runtime_raft_network_workload",
+              "plan": {
+                "stream_count": 1,
+                "append_batch_lens": [
+                  1
+                ],
+                "failover_batch_lens": [
+                  1
+                ]
+              }
+            }
+          },
+          {
+            "phase": "after_recovery_read",
+            "action": {
+              "action": "verify_runtime_cold_live_reads"
+            }
+          },
+          {
+            "phase": "before_cold_read",
+            "action": {
+              "action": "truncate_next_cold_read",
+              "returned_len": 0
+            }
+          }
+        ]
+      }
+    },
+    "panic": "invariant `runtime_raft_network_cold_live_read_integrity` failed after `runtime_raft_network_read_verified`: runtime raft network cold/live read for stream benchcmp/ursula-sim-schedule-322-runtime-raft-network-randomized-cold-read-failure failed: core 0 raft group 0 operation failed: cold object 'benchcmp/ursula-sim-schedule-322-runtime-raft-network-randomized-cold-read-failure/chunks/0000000000000000-0000000000000008-000000000000000016f50cf19da4f21c-000000000000010a.bin' returned 0 bytes for requested range [0..8)",
+    "invariant": "runtime_raft_network_cold_live_read_integrity",
+    "panic_contains": [
+      "invariant `runtime_raft_network_cold_live_read_integrity` failed after `runtime_raft_network_read_verified`",
+      "runtime raft network cold/live read for stream benchcmp/ursula-sim-schedule-322-runtime-raft-network-randomized-cold-read-failure failed",
+      "returned 0 bytes for requested range"
+    ]
+  },
+  {
+    "schema_version": 1,
+    "seed": 332,
+    "schedule": {
+      "seed": 332,
+      "scenario": "http_protocol_surface",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-332-http-snapshot-protocol-surface-failure"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "after_http_snapshot_read",
+            "action": {
+              "action": "corrupt_http_snapshot_body_expectation"
+            }
+          }
+        ]
+      }
+    },
+    "panic": "invariant `http_snapshot_protocol_surface_read` failed after `http_snapshot_protocol_surface_read`: snapshot read for stream benchcmp/ursula-sim-schedule-332-http-snapshot-protocol-surface-failure returned 13 bytes, expected 19 bytes",
+    "invariant": "http_snapshot_protocol_surface_read"
+  },
+  {
+    "schema_version": 1,
+    "seed": 337,
+    "schedule": {
+      "seed": 337,
+      "scenario": "runtime_raft_network",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-337-runtime-raft-network-tail-read-failure"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "runtime_raft_network_workload",
+            "action": {
+              "action": "run_runtime_raft_network_workload",
+              "plan": {
+                "stream_count": 1,
+                "append_batch_lens": [
+                  1
+                ],
+                "failover_batch_lens": [
+                  1
+                ],
+                "tail_reads": true,
+                "corrupt_tail_read_expectation": true
+              }
+            }
+          }
+        ]
+      }
+    },
+    "panic": "invariant `runtime_raft_network_tail_read_empty` failed after `runtime_raft_network_read_verified`: tail read for stream benchcmp/ursula-sim-schedule-337-runtime-raft-network-tail-read-failure at offset 9 returned 0 bytes/next_offset 9, expected empty payload/next_offset 10",
+    "invariant": "runtime_raft_network_tail_read_empty"
+  },
+  {
+    "schema_version": 1,
+    "seed": 342,
+    "schedule": {
+      "seed": 342,
+      "scenario": "runtime_raft_network",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-342-runtime-raft-network-close-failure"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "runtime_raft_network_workload",
+            "action": {
+              "action": "run_runtime_raft_network_workload",
+              "plan": {
+                "stream_count": 1,
+                "append_batch_lens": [
+                  1
+                ],
+                "failover_batch_lens": [
+                  1
+                ],
+                "close_streams": true,
+                "corrupt_close_state_expectation": true
+              }
+            }
+          }
+        ]
+      }
+    },
+    "panic": "invariant `runtime_raft_network_close_state` failed after `runtime_raft_network_read_verified`: closed read for stream benchcmp/ursula-sim-schedule-342-runtime-raft-network-close-failure returned 9 bytes/next_offset 9/closed true, expected 9 bytes/next_offset 9/closed false",
+    "invariant": "runtime_raft_network_close_state"
+  },
+  {
+    "schema_version": 1,
+    "seed": 347,
+    "schedule": {
+      "seed": 347,
+      "scenario": "runtime_raft_network",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-347-runtime-raft-network-snapshot-failure"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "runtime_raft_network_workload",
+            "action": {
+              "action": "run_runtime_raft_network_workload",
+              "plan": {
+                "stream_count": 1,
+                "append_batch_lens": [
+                  1
+                ],
+                "failover_batch_lens": [
+                  1
+                ],
+                "publish_snapshots": true,
+                "corrupt_snapshot_expectation": true
+              }
+            }
+          }
+        ]
+      }
+    },
+    "invariant": "runtime_raft_network_snapshot_publish_read",
+    "panic": "invariant `runtime_raft_network_snapshot_publish_read` failed after `runtime_raft_network_read_verified`: read snapshot for stream benchcmp/ursula-sim-schedule-347-runtime-raft-network-snapshot-failure at None returned offset 9/next_offset 9/content_type application/octet-stream/26 bytes/up_to_date true, expected offset 9/next_offset 9/content_type application/octet-stream/27 bytes/up_to_date true"
+  }
+]

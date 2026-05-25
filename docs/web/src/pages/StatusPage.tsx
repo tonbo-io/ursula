@@ -62,6 +62,8 @@ type ChaosTopology = {
     name?: string | null;
     instance_state?: string | null;
     metrics_state?: string | null;
+    availability_zone?: string | null;
+    region?: string | null;
   }>;
   raft_groups?: TopologyGroup[];
 };
@@ -215,7 +217,7 @@ const REFRESH_OPTIONS = [
 ];
 const HISTORY_LEGEND: Array<{ status: StatusLevel; label: string }> = [
   { status: "operational", label: "healthy" },
-  { status: "degraded_performance", label: "degraded" },
+  { status: "degraded_performance", label: "fault active" },
   { status: "major_outage", label: "outage" },
   { status: "unknown", label: "unknown" },
 ];
@@ -271,6 +273,24 @@ function formatDuration(ms: number) {
   const hours = Math.floor(minutes / 60);
   const remMinutes = minutes % 60;
   return remMinutes ? `${hours}h ${remMinutes}m` : `${hours}h`;
+}
+
+function formatRunningFor(ms: number): { primary: string; secondary: string | null } {
+  if (ms < 60_000) {
+    return { primary: `${Math.max(0, Math.floor(ms / 1000))}s`, secondary: null };
+  }
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 60) {
+    return { primary: `${minutes}m`, secondary: null };
+  }
+  const hours = Math.floor(minutes / 60);
+  const remMin = minutes % 60;
+  if (hours < 24) {
+    return { primary: `${hours}h`, secondary: remMin ? `${remMin}m` : null };
+  }
+  const days = Math.floor(hours / 24);
+  const remHours = hours % 24;
+  return { primary: `${days}d`, secondary: remHours ? `${remHours}h` : null };
 }
 
 function statusLabel(status: string) {
@@ -562,7 +582,10 @@ function TopologyCanvas({ topology }: { topology?: ChaosTopology }) {
         });
       });
 
-      const nodePositions = new Map<number, { x: number; y: number; label: string; watermark: number | null }>();
+      const nodePositions = new Map<
+        number,
+        { x: number; y: number; label: string; watermark: number | null; az: string | null }
+      >();
       const nodeLayout =
         width < 620
           ? [
@@ -588,6 +611,7 @@ function TopologyCanvas({ topology }: { topology?: ChaosTopology }) {
             y: position.y,
             label: `node ${node.node_id}`,
             watermark: nodeWatermarks.get(node.node_id as number) ?? null,
+            az: typeof node.availability_zone === "string" ? node.availability_zone : null,
           });
         });
 
@@ -637,14 +661,19 @@ function TopologyCanvas({ topology }: { topology?: ChaosTopology }) {
       nodePositions.forEach((node) => {
         ctx.fillStyle = text;
         ctx.font = "600 13px IBM Plex Sans, sans-serif";
-        ctx.fillText(node.label, node.x, node.y - 4);
+        ctx.fillText(node.label, node.x, node.y - 10);
         ctx.fillStyle = secondary;
         ctx.font = "11px IBM Plex Mono, monospace";
         ctx.fillText(
           node.watermark == null ? "applied -" : `applied ${node.watermark.toLocaleString()}`,
           node.x,
-          node.y + 12,
+          node.y + 4,
         );
+        if (node.az) {
+          ctx.fillStyle = muted;
+          ctx.font = "11px IBM Plex Mono, monospace";
+          ctx.fillText(node.az, node.x, node.y + 18);
+        }
       });
 
       groupPositions.forEach(({ group, x, y }) => {
@@ -722,7 +751,7 @@ function StatusPage() {
   const stale = isStatusStale(status, refreshMs);
   const displayedOverall = stale ? "major_outage" : status?.overall ?? "unknown";
   const HEALTH_BUCKET_MS = 60 * 60 * 1000;
-  const HEALTH_BUCKET_COUNT = 72;
+  const HEALTH_BUCKET_COUNT = 7 * 24;
   const healthHistory = useMemo(
     () => bucketHistory(status?.history ?? [], HEALTH_BUCKET_MS, HEALTH_BUCKET_COUNT, now),
     [status, now],
@@ -736,6 +765,17 @@ function StatusPage() {
 
   const updatedRelative = formatRelative(status?.updated_at);
   void now;
+
+  const startedAtMs = status?.started_at ? new Date(status.started_at).getTime() : NaN;
+  const runtime = Number.isFinite(startedAtMs) ? formatRunningFor(Math.max(0, now - startedAtMs)) : null;
+
+  const chaosActive = Boolean(status?.chaos.enabled && status?.chaos.active_fault);
+  const heroPillLabel =
+    !stale &&
+    chaosActive &&
+    (displayedOverall === "degraded_performance" || displayedOverall === "partial_outage")
+      ? "fault active"
+      : undefined;
 
   const expectedNodes = status?.health?.expected_nodes;
   const runningNodes = status?.health?.running_nodes;
@@ -771,6 +811,21 @@ function StatusPage() {
       left.localeCompare(right),
     );
   }, [status]);
+  const topologyPlacement = useMemo(() => {
+    const regions = new Set<string>();
+    const azs = new Set<string>();
+    for (const node of status?.topology?.nodes ?? []) {
+      if (typeof node.region === "string" && node.region) regions.add(node.region);
+      if (typeof node.availability_zone === "string" && node.availability_zone) azs.add(node.availability_zone);
+    }
+    if (regions.size === 0 && azs.size === 0) return null;
+    if (regions.size === 1) {
+      const [region] = regions;
+      return `${region} · ${azs.size} AZ${azs.size === 1 ? "" : "s"}`;
+    }
+    if (regions.size > 1) return `${regions.size} regions · ${azs.size} AZs`;
+    return `${azs.size} AZ${azs.size === 1 ? "" : "s"}`;
+  }, [status]);
 
   return (
     <>
@@ -793,8 +848,16 @@ function StatusPage() {
               <h1>Chaos Test</h1>
             </div>
             <div className="status-hero-pill">
-              <StatusPill status={displayedOverall} />
-              {updatedRelative ? <span className="status-updated-relative">updated {updatedRelative}</span> : null}
+              {runtime ? (
+                <div className="status-hero-runtime" title={`started ${formatTime(status?.started_at ?? null)}`}>
+                  <span className="status-hero-runtime-label">continuously running for</span>
+                  <span className="status-hero-runtime-value">
+                    {runtime.primary}
+                    {runtime.secondary ? <span className="status-hero-runtime-sub">{runtime.secondary}</span> : null}
+                  </span>
+                </div>
+              ) : null}
+              <StatusPill status={displayedOverall} label={heroPillLabel} />
             </div>
           </div>
           <p className="status-summary">
@@ -808,27 +871,33 @@ function StatusPage() {
           </p>
           <div className="status-hero-controls">
             <div className="status-hero-meta">
-              started {formatRelative(status?.started_at) ?? "-"}
-              {streamCount ? <> · {streamCount.toLocaleString()} streams</> : null}
+              {streamCount ? <>{streamCount.toLocaleString()} streams</> : "-"}
               {producerCount ? <> · {producerCount.toLocaleString()} producers</> : null}
               {payloadRange ? <> · payloads {payloadRange}</> : null}
               {status?.chaos.recovery_slo_secs ? <> · recovery SLO {status.chaos.recovery_slo_secs}s</> : null}
             </div>
-            <label className="status-refresh-control">
-              <span>Refresh</span>
-              <select
-                aria-label="Chaos test refresh interval"
-                className="status-refresh-select"
-                value={refreshMs}
-                onChange={(event) => setRefreshMs(Number(event.target.value))}
-              >
-                {REFRESH_OPTIONS.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <div className="status-hero-refresh">
+              {updatedRelative ? (
+                <span className="status-updated-relative" title={formatTime(status?.updated_at ?? null)}>
+                  updated {updatedRelative}
+                </span>
+              ) : null}
+              <label className="status-refresh-control">
+                <span>Refresh</span>
+                <select
+                  aria-label="Chaos test refresh interval"
+                  className="status-refresh-select"
+                  value={refreshMs}
+                  onChange={(event) => setRefreshMs(Number(event.target.value))}
+                >
+                  {REFRESH_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
           </div>
         </section>
 
@@ -839,7 +908,10 @@ function StatusPage() {
 
         <section className="status-section">
           <div className="status-section-heading">
-            <h2>Health</h2>
+            <h2>
+              Health
+              <span className="status-section-subtitle">1 h per bar</span>
+            </h2>
             <div className="status-history-legend" role="list">
               {HISTORY_LEGEND.map((entry) => (
                 <span className="status-history-legend-item" key={entry.status} role="listitem">
@@ -871,8 +943,7 @@ function StatusPage() {
                 })}
               </div>
               <div className="status-history-axis">
-                <span>{HEALTH_BUCKET_COUNT}h ago</span>
-                <span className="status-history-axis-unit">1 h per bar</span>
+                <span>7d ago</span>
                 <span>now</span>
               </div>
             </>
@@ -881,7 +952,12 @@ function StatusPage() {
 
         <section className="status-section">
           <div className="status-section-heading">
-            <h2>Topology</h2>
+            <h2>
+              Topology
+              {topologyPlacement ? (
+                <span className="status-section-subtitle">{topologyPlacement}</span>
+              ) : null}
+            </h2>
             <div className="topology-legend">
               <span>
                 <span className="topology-legend-line topology-legend-line-leader" aria-hidden="true" />

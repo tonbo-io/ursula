@@ -1,7 +1,8 @@
 use futures_util::TryStreamExt;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-use std::time::Instant;
+
+use crate::rt::time::Instant;
 
 use openraft::BasicNode;
 use openraft::Raft;

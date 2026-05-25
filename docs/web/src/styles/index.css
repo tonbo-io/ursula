@@ -160,7 +160,41 @@ button {
   align-items: flex-end;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 10px;
+}
+
+.status-hero-runtime {
+  align-items: flex-end;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  line-height: 1;
+}
+
+.status-hero-runtime-label {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.status-hero-runtime-value {
+  align-items: baseline;
+  color: var(--text-primary);
+  display: inline-flex;
+  font-family: var(--font-mono);
+  font-size: 32px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  gap: 4px;
+  letter-spacing: -0.01em;
+}
+
+.status-hero-runtime-sub {
+  color: var(--text-secondary);
+  font-size: 20px;
+  font-weight: 500;
 }
 
 .status-updated-relative {
@@ -233,6 +267,13 @@ button {
   margin: 4px 0 0;
 }
 
+.status-hero-refresh {
+  align-items: center;
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 16px;
+}
+
 .status-refresh-control {
   align-items: center;
   display: inline-flex;
@@ -287,21 +328,15 @@ button {
 }
 
 .status-pill-degraded_performance,
-.status-pill-maintenance {
+.status-pill-maintenance,
+.status-pill-partial_outage {
   color: #fabd2f;
 }
 
 .status-pill-degraded_performance .status-pill-dot,
-.status-pill-maintenance .status-pill-dot {
-  background: #fabd2f;
-}
-
-.status-pill-partial_outage {
-  color: #fe8019;
-}
-
+.status-pill-maintenance .status-pill-dot,
 .status-pill-partial_outage .status-pill-dot {
-  background: #fe8019;
+  background: #fabd2f;
 }
 
 .status-pill-major_outage {
@@ -341,7 +376,18 @@ button {
 }
 
 .status-section-heading h2 {
+  align-items: baseline;
+  display: inline-flex;
   font-size: 17px;
+  gap: 10px;
+}
+
+.status-section-subtitle {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0.02em;
 }
 
 .status-section-heading p {
@@ -724,13 +770,14 @@ button {
 }
 
 .status-history-grid {
-  gap: 2px;
+  gap: 1px;
   grid-auto-flow: column;
   grid-auto-columns: minmax(0, 1fr);
   grid-template-columns: none;
 }
 
 .status-history-grid .history-day {
+  border-radius: 1px;
   height: 28px;
 }
 
@@ -767,12 +814,9 @@ button {
 }
 
 .history-day-degraded_performance,
-.history-day-maintenance {
-  background: #fabd2f;
-}
-
+.history-day-maintenance,
 .history-day-partial_outage {
-  background: #fe8019;
+  background: #fabd2f;
 }
 
 .history-day-major_outage {
@@ -1116,6 +1160,18 @@ button {
 
   .status-hero-pill {
     align-items: flex-start;
+  }
+
+  .status-hero-runtime {
+    align-items: flex-start;
+  }
+
+  .status-hero-runtime-value {
+    font-size: 26px;
+  }
+
+  .status-hero-runtime-sub {
+    font-size: 17px;
   }
 
   .status-hero h1 {

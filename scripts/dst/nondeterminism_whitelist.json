@@ -1,0 +1,44 @@
+[
+  {
+    "category": "system_time_now",
+    "path": "crates/ursula/src/lib.rs",
+    "snippet_contains": "SystemTime::now()",
+    "reason": "already-cfg-gated",
+    "plan": "no action: unix_time_ms() body is split into cfg(not(madsim)) (real wall clock) and cfg(madsim) (panic with explanation); SystemWallClock under cfg(madsim) panics on use, forcing every HttpState caller to inject WallClock via with_wall_clock(_handle)"
+  },
+  {
+    "category": "system_time_now",
+    "path": "crates/ursula-runtime/src/cold_store.rs",
+    "snippet_contains": "SystemTime::now()",
+    "reason": "already-cfg-gated",
+    "plan": "no action: cold_object_unix_nanos() is split — cfg(not(madsim)) calls SystemTime::now(); cfg(madsim) returns 0. Cold object uniqueness under cfg(madsim) is provided by COLD_CHUNK_SEQUENCE, and reset_cold_chunk_sequence_for_sim() lets the simulator clear the counter between scenarios for Runtime::check_determinism replay."
+  },
+  {
+    "category": "tokio_runtime_builder",
+    "path": "crates/ursula-runtime/src/runtime.rs",
+    "snippet_contains": "tokio::runtime::Builder::new_current_thread()",
+    "reason": "already-cfg-gated",
+    "plan": "no action: the call sits inside the cfg(not(madsim)) arm of spawn_core_worker; the enum variant RuntimeThreading::ThreadPerCore is itself cfg(not(madsim))-gated, so any attempt to select it under cfg(madsim) is a compile error"
+  },
+  {
+    "category": "std_thread_spawn",
+    "path": "crates/ursula-runtime/src/runtime.rs",
+    "snippet_contains": "std::thread::Builder::new()",
+    "reason": "already-cfg-gated",
+    "plan": "no action: paired with the tokio_runtime_builder entry above; the surrounding match arm and the enum variant are both cfg(not(madsim))-gated"
+  },
+  {
+    "category": "std_thread_spawn",
+    "path": "crates/ursula-raft/src/log_store/file.rs",
+    "snippet_contains": "std::thread::Builder::new()",
+    "reason": "already-cfg-gated",
+    "plan": "no action: CoreFileLogWriter::shared has split impls — cfg(not(madsim)) spawns the writer thread, cfg(madsim) panics with a message pointing simulator paths at memory-backed RaftGroupEngineFactory / RegisteredRaftGroupEngineFactory / MadsimScopedRaftGroupEngineFactory"
+  },
+  {
+    "category": "std_thread_sleep",
+    "path": "crates/ursula-raft/src/registry.rs",
+    "snippet_contains": "std::thread::sleep(delay)",
+    "reason": "already-cfg-gated",
+    "plan": "no action: the call sits inside #[cfg(not(madsim))] async fn sleep_in_process_raft_network and cannot reach the simulator; whitelist entry exists so the audit script doesn't false-positive on it"
+  }
+]

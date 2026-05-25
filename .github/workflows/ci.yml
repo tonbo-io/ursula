@@ -69,6 +69,601 @@ jobs:
       - name: Test workspace docs
         run: cargo test --workspace --doc
 
+  deterministic-simulation:
+    name: Deterministic simulation smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Audit DST guards (all 7 audits)
+        run: python3 -m scripts.dst all
+
+      - name: Run madsim smoke corpus and PR seed set
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim smoke_corpus_replays -- --nocapture
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --failure-dir target/ursula-sim-failures \
+            --seed-range 60..=64 \
+            --seed-range 137..=140 \
+            --seed-family http-protocol-surface-randomized \
+            --seed-family runtime-raft-network-cold-live-write-recovery \
+            --seed-family runtime-interleaving
+          mkdir -p target/ursula-sim-seed-146-cold-write-delay-minimize
+          jq '.[] | select(.schedule.seed == 146)' crates/ursula-sim/corpus/schedule-smoke.json \
+            > target/ursula-sim-seed-146-cold-write-delay-minimize/seed-146-record.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-seed-146-cold-write-delay-minimize/seed-146-record.json \
+            --event runtime_raft_network_cold_write_delay_verified \
+            --event-min-count 1 \
+            --output target/ursula-sim-seed-146-cold-write-delay-minimize/seed-146-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "passed"
+            and (.minimized.record != null)
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.stream_count == 1)
+            and (.minimized.schedule.fault_plan.steps[2].action.delay_ms == 1)
+          ' target/ursula-sim-seed-146-cold-write-delay-minimize/seed-146-minimized.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-assert-shape -- \
+            --artifact target/ursula-sim-seed-146-cold-write-delay-minimize/seed-146-minimized.json \
+            --steps-exact RunRuntimeRaftNetworkWorkload,VerifyRuntimeColdLiveReads,DelayNextColdWrite
+          jq '.minimized.record' target/ursula-sim-seed-146-cold-write-delay-minimize/seed-146-minimized.json \
+            > target/ursula-sim-seed-146-cold-write-delay-minimize/seed-146-minimized-record.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-seed-146-cold-write-delay-minimize/seed-146-minimized-record.json
+          mkdir -p target/ursula-sim-seed-147-cold-read-delay-minimize
+          jq '.[] | select(.schedule.seed == 147)' crates/ursula-sim/corpus/schedule-smoke.json \
+            > target/ursula-sim-seed-147-cold-read-delay-minimize/seed-147-record.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-seed-147-cold-read-delay-minimize/seed-147-record.json \
+            --event runtime_raft_network_cold_read_delay_verified \
+            --event-min-count 1 \
+            --output target/ursula-sim-seed-147-cold-read-delay-minimize/seed-147-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "passed"
+            and (.minimized.record != null)
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.stream_count == 1)
+            and (.minimized.schedule.fault_plan.steps[2].action.delay_ms == 1)
+          ' target/ursula-sim-seed-147-cold-read-delay-minimize/seed-147-minimized.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-assert-shape -- \
+            --artifact target/ursula-sim-seed-147-cold-read-delay-minimize/seed-147-minimized.json \
+            --steps-exact RunRuntimeRaftNetworkWorkload,VerifyRuntimeColdLiveReads,DelayNextColdRead
+          jq '.minimized.record' target/ursula-sim-seed-147-cold-read-delay-minimize/seed-147-minimized.json \
+            > target/ursula-sim-seed-147-cold-read-delay-minimize/seed-147-minimized-record.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-seed-147-cold-read-delay-minimize/seed-147-minimized-record.json
+          mkdir -p target/ursula-sim-seed-155-leader-cold-live-replay
+          jq '.[] | select(.schedule.seed == 155)' crates/ursula-sim/corpus/schedule-smoke.json \
+            > target/ursula-sim-seed-155-leader-cold-live-replay/seed-155-record.json
+          jq -e '
+            ([.schedule.fault_plan.steps[].action.action] | index("stop_current_leader") != null)
+            and ([.schedule.fault_plan.steps[].action.action] | index("restart_stopped_leader") != null)
+            and ([.schedule.fault_plan.steps[].action.action] | index("verify_runtime_cold_live_reads") != null)
+            and (.outcome.trace.events | any(.event == "runtime_raft_network_leader_failover_cold_live_read_verified" and .stream_count == 3 and .flushed_count == 12))
+            and ([.outcome.trace.events[] | select(.event == "runtime_raft_network_leader_failover_stage_reached") | .stage] == [
+              "old_leader_stopped",
+              "replacement_leader_installed",
+              "failover_appends_applied",
+              "old_leader_caught_up",
+              "cold_flush_started_after_failover",
+              "cold_flush_applied_after_failover"
+            ])
+          ' target/ursula-sim-seed-155-leader-cold-live-replay/seed-155-record.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-seed-155-leader-cold-live-replay/seed-155-record.json
+          mkdir -p target/ursula-sim-seed-155-leader-cold-live-minimize
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-seed-155-leader-cold-live-replay/seed-155-record.json \
+            --event runtime_raft_network_leader_failover_cold_live_read_verified \
+            --event-min-count 1 \
+            --output target/ursula-sim-seed-155-leader-cold-live-minimize/seed-155-minimized.json
+          # DoD #6: typed shape assertion. Renaming a SimFaultAction variant
+          # breaks the matches! pattern in ursula-sim-assert-shape at compile
+          # time, not just here at CI time. The jq -e left below only checks
+          # the report wrapper structure, never SimFaultAction discriminants.
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "passed"
+            and (.minimized.record != null)
+            and (.minimized.schedule.fault_plan.steps[2].action.plan.stream_count == 1)
+            and (.minimized.schedule.fault_plan.steps[2].action.plan.append_batch_lens == [1])
+            and (.minimized.schedule.fault_plan.steps[2].action.plan.failover_batch_lens == [1])
+            and (.minimized.record.outcome.trace.events | any(.event == "runtime_raft_network_leader_failover_cold_live_read_verified" and .stream_count == 1))
+          ' target/ursula-sim-seed-155-leader-cold-live-minimize/seed-155-minimized.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-assert-shape -- \
+            --artifact target/ursula-sim-seed-155-leader-cold-live-minimize/seed-155-minimized.json \
+            --shape seed_155_leader_cold_live_minimized
+          jq '.minimized.record' target/ursula-sim-seed-155-leader-cold-live-minimize/seed-155-minimized.json \
+            > target/ursula-sim-seed-155-leader-cold-live-minimize/seed-155-minimized-record.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-seed-155-leader-cold-live-minimize/seed-155-minimized-record.json
+
+      - name: Verify expected-failure replay and minimization
+        run: |
+          assert_minimized_failure_trace() {
+            artifact="$1"
+            invariant="$2"
+            jq -e --arg invariant "$invariant" '
+              .minimized.outcome.target_preserved == true
+              and .minimized.outcome.status == "reproduced_panic"
+              and (.minimized.failure != null)
+              and (.minimized.failure.stable_trace.events | length > 0)
+              and (.minimized.failure.stable_trace.events | any(.event == "invariant_failed" and .invariant == $invariant))
+              and ((.minimized.failure.raw_event_log | length) >= (.minimized.failure.stable_trace.events | length))
+            ' "$artifact"
+          }
+
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family runtime-interleaving-write-failures \
+            --expect-failures \
+            --failure-dir target/ursula-sim-runtime-interleaving-write-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-runtime-interleaving-write-expected-failures/seed-192-failure.json \
+            --invariant runtime_interleaving_cold_write_integrity \
+            --output target/ursula-sim-runtime-interleaving-write-expected-failures/seed-192-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+            and ([.minimized.schedule.fault_plan.steps[].action.action] == ["run_runtime_seeded_interleaving"])
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.clients | length == 1)
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.clients[0].client_id == 0)
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.clients[0].stream_index == 0)
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.clients[0].first_append_delay_ms == 0)
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.clients[0].second_append_delay_ms == 0)
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.flush_delay_ms == 0)
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.read_verify_delay_ms == 0)
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.flush_group_limit == 1)
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.runtime_cold_write_failure == "seeded runtime cold write fault for seed 192")
+          ' target/ursula-sim-runtime-interleaving-write-expected-failures/seed-192-minimized.json
+          assert_minimized_failure_trace target/ursula-sim-runtime-interleaving-write-expected-failures/seed-192-minimized.json runtime_interleaving_cold_write_integrity
+          jq '.minimized.failure' target/ursula-sim-runtime-interleaving-write-expected-failures/seed-192-minimized.json \
+            > target/ursula-sim-runtime-interleaving-write-expected-failures/seed-192-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-runtime-interleaving-write-expected-failures/seed-192-minimized-failure.json \
+            --expect-invariant runtime_interleaving_cold_write_integrity
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family pipeline-smoke-runtime-raft-network-randomized-read-corruption \
+            --expect-failures \
+            --failure-dir target/ursula-sim-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-expected-failures/seed-244-failure.json \
+            --invariant runtime_raft_network_read_your_write \
+            --output target/ursula-sim-expected-failures/seed-244-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+            and ([.minimized.schedule.fault_plan.steps[].action.action] == ["run_runtime_raft_network_workload"])
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.corrupt_read_expectation == true)
+          ' target/ursula-sim-expected-failures/seed-244-minimized.json
+          assert_minimized_failure_trace target/ursula-sim-expected-failures/seed-244-minimized.json runtime_raft_network_read_your_write
+          jq '.minimized.failure' target/ursula-sim-expected-failures/seed-244-minimized.json \
+            > target/ursula-sim-expected-failures/seed-244-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-expected-failures/seed-244-minimized-failure.json \
+            --expect-invariant runtime_raft_network_read_your_write
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family pipeline-smoke-runtime-raft-network-partial-read-corruption \
+            --expect-failures \
+            --failure-dir target/ursula-sim-partial-read-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-partial-read-expected-failures/seed-248-failure.json \
+            --invariant runtime_raft_network_partial_read_integrity \
+            --output target/ursula-sim-partial-read-expected-failures/seed-248-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+            and ([.minimized.schedule.fault_plan.steps[].action.action] == ["run_runtime_raft_network_workload"])
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.partial_reads == true)
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.corrupt_partial_read_expectation == true)
+          ' target/ursula-sim-partial-read-expected-failures/seed-248-minimized.json
+          assert_minimized_failure_trace target/ursula-sim-partial-read-expected-failures/seed-248-minimized.json runtime_raft_network_partial_read_integrity
+          jq '.minimized.failure' target/ursula-sim-partial-read-expected-failures/seed-248-minimized.json \
+            > target/ursula-sim-partial-read-expected-failures/seed-248-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-partial-read-expected-failures/seed-248-minimized-failure.json \
+            --expect-invariant runtime_raft_network_partial_read_integrity
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family pipeline-smoke-runtime-raft-network-tail-read-corruption \
+            --expect-failures \
+            --failure-dir target/ursula-sim-tail-read-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-tail-read-expected-failures/seed-337-failure.json \
+            --invariant runtime_raft_network_tail_read_empty \
+            --output target/ursula-sim-tail-read-expected-failures/seed-337-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+          ' target/ursula-sim-tail-read-expected-failures/seed-337-minimized.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-assert-shape -- \
+            --artifact target/ursula-sim-tail-read-expected-failures/seed-337-minimized.json \
+            --shape seed_337_runtime_raft_network_tail_read_corruption_minimized
+          assert_minimized_failure_trace target/ursula-sim-tail-read-expected-failures/seed-337-minimized.json runtime_raft_network_tail_read_empty
+          jq '.minimized.failure' target/ursula-sim-tail-read-expected-failures/seed-337-minimized.json \
+            > target/ursula-sim-tail-read-expected-failures/seed-337-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-tail-read-expected-failures/seed-337-minimized-failure.json \
+            --expect-invariant runtime_raft_network_tail_read_empty
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family pipeline-smoke-runtime-raft-network-close-state-corruption \
+            --expect-failures \
+            --failure-dir target/ursula-sim-close-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-close-expected-failures/seed-342-failure.json \
+            --invariant runtime_raft_network_close_state \
+            --output target/ursula-sim-close-expected-failures/seed-342-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+          ' target/ursula-sim-close-expected-failures/seed-342-minimized.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-assert-shape -- \
+            --artifact target/ursula-sim-close-expected-failures/seed-342-minimized.json \
+            --shape seed_342_runtime_raft_network_close_state_corruption_minimized
+          assert_minimized_failure_trace target/ursula-sim-close-expected-failures/seed-342-minimized.json runtime_raft_network_close_state
+          jq '.minimized.failure' target/ursula-sim-close-expected-failures/seed-342-minimized.json \
+            > target/ursula-sim-close-expected-failures/seed-342-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-close-expected-failures/seed-342-minimized-failure.json \
+            --expect-invariant runtime_raft_network_close_state
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family pipeline-smoke-runtime-raft-network-snapshot-corruption \
+            --expect-failures \
+            --failure-dir target/ursula-sim-snapshot-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-snapshot-expected-failures/seed-347-failure.json \
+            --invariant runtime_raft_network_snapshot_publish_read \
+            --output target/ursula-sim-snapshot-expected-failures/seed-347-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+            and ([.minimized.schedule.fault_plan.steps[].action.action] == ["run_runtime_raft_network_workload"])
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.publish_snapshots == true)
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.corrupt_snapshot_expectation == true)
+          ' target/ursula-sim-snapshot-expected-failures/seed-347-minimized.json
+          assert_minimized_failure_trace target/ursula-sim-snapshot-expected-failures/seed-347-minimized.json runtime_raft_network_snapshot_publish_read
+          jq '.minimized.failure' target/ursula-sim-snapshot-expected-failures/seed-347-minimized.json \
+            > target/ursula-sim-snapshot-expected-failures/seed-347-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-snapshot-expected-failures/seed-347-minimized-failure.json \
+            --expect-invariant runtime_raft_network_snapshot_publish_read
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family pipeline-smoke-runtime-raft-network-leader-failover-read-corruption \
+            --expect-failures \
+            --failure-dir target/ursula-sim-leader-failover-read-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-leader-failover-read-expected-failures/seed-253-failure.json \
+            --invariant runtime_raft_network_leader_failover_no_loss_or_dup \
+            --output target/ursula-sim-leader-failover-read-expected-failures/seed-253-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+            and (.minimized.schedule.fault_plan.steps[2].action.plan.corrupt_leader_failover_read_expectation == true)
+          ' target/ursula-sim-leader-failover-read-expected-failures/seed-253-minimized.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-assert-shape -- \
+            --artifact target/ursula-sim-leader-failover-read-expected-failures/seed-253-minimized.json \
+            --steps-exact StopCurrentLeader,RestartStoppedLeader,RunRuntimeRaftNetworkWorkload
+          assert_minimized_failure_trace target/ursula-sim-leader-failover-read-expected-failures/seed-253-minimized.json runtime_raft_network_leader_failover_no_loss_or_dup
+          jq '.minimized.failure' target/ursula-sim-leader-failover-read-expected-failures/seed-253-minimized.json \
+            > target/ursula-sim-leader-failover-read-expected-failures/seed-253-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-leader-failover-read-expected-failures/seed-253-minimized-failure.json \
+            --expect-invariant runtime_raft_network_leader_failover_no_loss_or_dup
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family runtime-raft-network-leader-failover-cold-live-read-failures \
+            --expect-failures \
+            --failure-dir target/ursula-sim-leader-failover-cold-live-read-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-leader-failover-cold-live-read-expected-failures/seed-327-failure.json \
+            --invariant runtime_raft_network_leader_failover_cold_live_read_integrity \
+            --output target/ursula-sim-leader-failover-cold-live-read-expected-failures/seed-327-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+            and (.minimized.schedule.fault_plan.steps[2].action.plan.stream_count == 1)
+            and (.minimized.schedule.fault_plan.steps[2].action.plan.append_batch_lens == [1])
+            and (.minimized.schedule.fault_plan.steps[2].action.plan.failover_batch_lens == [1])
+            and (.minimized.schedule.fault_plan.steps[4].action.returned_len == 0)
+            and (.minimized.failure.stable_trace.events | any(.event == "invariant_failed" and .invariant == "runtime_raft_network_leader_failover_cold_live_read_integrity"))
+            and ([.minimized.failure.stable_trace.events[] | select(.event == "runtime_raft_network_leader_failover_stage_reached") | .stage] == [
+              "old_leader_stopped",
+              "replacement_leader_installed",
+              "failover_appends_applied",
+              "old_leader_caught_up",
+              "cold_flush_started_after_failover",
+              "cold_flush_applied_after_failover"
+            ])
+            and ((.minimized.failure.raw_event_log | length) > (.minimized.failure.stable_trace.events | length))
+          ' target/ursula-sim-leader-failover-cold-live-read-expected-failures/seed-327-minimized.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-assert-shape -- \
+            --artifact target/ursula-sim-leader-failover-cold-live-read-expected-failures/seed-327-minimized.json \
+            --steps-exact StopCurrentLeader,RestartStoppedLeader,RunRuntimeRaftNetworkWorkload,VerifyRuntimeColdLiveReads,TruncateNextColdRead
+          assert_minimized_failure_trace target/ursula-sim-leader-failover-cold-live-read-expected-failures/seed-327-minimized.json runtime_raft_network_leader_failover_cold_live_read_integrity
+          jq '.minimized.failure' target/ursula-sim-leader-failover-cold-live-read-expected-failures/seed-327-minimized.json \
+            > target/ursula-sim-leader-failover-cold-live-read-expected-failures/seed-327-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-leader-failover-cold-live-read-expected-failures/seed-327-minimized-failure.json \
+            --expect-invariant runtime_raft_network_leader_failover_cold_live_read_integrity
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family runtime-raft-network-cold-live-truncate-failures \
+            --expect-failures \
+            --failure-dir target/ursula-sim-cold-live-truncate-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-cold-live-truncate-expected-failures/seed-222-failure.json \
+            --invariant runtime_raft_network_cold_live_read_integrity \
+            --output target/ursula-sim-cold-live-truncate-expected-failures/seed-222-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+            and (.minimized.schedule.fault_plan.steps[1].action.returned_len == 0)
+          ' target/ursula-sim-cold-live-truncate-expected-failures/seed-222-minimized.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-assert-shape -- \
+            --artifact target/ursula-sim-cold-live-truncate-expected-failures/seed-222-minimized.json \
+            --steps-exact VerifyRuntimeColdLiveReads,TruncateNextColdRead
+          assert_minimized_failure_trace target/ursula-sim-cold-live-truncate-expected-failures/seed-222-minimized.json runtime_raft_network_cold_live_read_integrity
+          jq '.minimized.failure' target/ursula-sim-cold-live-truncate-expected-failures/seed-222-minimized.json \
+            > target/ursula-sim-cold-live-truncate-expected-failures/seed-222-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-cold-live-truncate-expected-failures/seed-222-minimized-failure.json \
+            --expect-invariant runtime_raft_network_cold_live_read_integrity
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family runtime-raft-network-randomized-cold-read-failures \
+            --expect-failures \
+            --failure-dir target/ursula-sim-randomized-cold-read-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-randomized-cold-read-expected-failures/seed-322-failure.json \
+            --invariant runtime_raft_network_cold_live_read_integrity \
+            --output target/ursula-sim-randomized-cold-read-expected-failures/seed-322-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+            and (.minimized.schedule.fault_plan.steps[2].action.returned_len == 0)
+          ' target/ursula-sim-randomized-cold-read-expected-failures/seed-322-minimized.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-assert-shape -- \
+            --artifact target/ursula-sim-randomized-cold-read-expected-failures/seed-322-minimized.json \
+            --steps-exact RunRuntimeRaftNetworkWorkload,VerifyRuntimeColdLiveReads,TruncateNextColdRead
+          assert_minimized_failure_trace target/ursula-sim-randomized-cold-read-expected-failures/seed-322-minimized.json runtime_raft_network_cold_live_read_integrity
+          jq '.minimized.failure' target/ursula-sim-randomized-cold-read-expected-failures/seed-322-minimized.json \
+            > target/ursula-sim-randomized-cold-read-expected-failures/seed-322-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-randomized-cold-read-expected-failures/seed-322-minimized-failure.json \
+            --expect-invariant runtime_raft_network_cold_live_read_integrity
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family runtime-raft-snapshot-install-failures \
+            --expect-failures \
+            --failure-dir target/ursula-sim-snapshot-install-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-snapshot-install-expected-failures/seed-232-failure.json \
+            --invariant runtime_raft_snapshot_install_integrity \
+            --output target/ursula-sim-snapshot-install-expected-failures/seed-232-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+            and ([.minimized.schedule.fault_plan.steps[].action.action] == ["corrupt_runtime_raft_snapshot_append_counts"])
+          ' target/ursula-sim-snapshot-install-expected-failures/seed-232-minimized.json
+          assert_minimized_failure_trace target/ursula-sim-snapshot-install-expected-failures/seed-232-minimized.json runtime_raft_snapshot_install_integrity
+          jq '.minimized.failure' target/ursula-sim-snapshot-install-expected-failures/seed-232-minimized.json \
+            > target/ursula-sim-snapshot-install-expected-failures/seed-232-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-snapshot-install-expected-failures/seed-232-minimized-failure.json \
+            --expect-invariant runtime_raft_snapshot_install_integrity
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family pipeline-smoke-http-producer-retry-corruption \
+            --expect-failures \
+            --failure-dir target/ursula-sim-http-producer-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-http-producer-expected-failures/seed-262-failure.json \
+            --invariant http_producer_retry_idempotence \
+            --output target/ursula-sim-http-producer-expected-failures/seed-262-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+            and ([.minimized.schedule.fault_plan.steps[].action.action] == ["corrupt_http_producer_duplicate_expectation"])
+          ' target/ursula-sim-http-producer-expected-failures/seed-262-minimized.json
+          assert_minimized_failure_trace target/ursula-sim-http-producer-expected-failures/seed-262-minimized.json http_producer_retry_idempotence
+          jq '.minimized.failure' target/ursula-sim-http-producer-expected-failures/seed-262-minimized.json \
+            > target/ursula-sim-http-producer-expected-failures/seed-262-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-http-producer-expected-failures/seed-262-minimized-failure.json \
+            --expect-invariant http_producer_retry_idempotence
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family pipeline-smoke-http-live-sse-corruption \
+            --expect-failures \
+            --failure-dir target/ursula-sim-http-live-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-http-live-expected-failures/seed-267-failure.json \
+            --invariant http_live_sse_delivery \
+            --output target/ursula-sim-http-live-expected-failures/seed-267-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+            and ([.minimized.schedule.fault_plan.steps[].action.action] == ["corrupt_http_live_sse_next_offset_expectation"])
+          ' target/ursula-sim-http-live-expected-failures/seed-267-minimized.json
+          assert_minimized_failure_trace target/ursula-sim-http-live-expected-failures/seed-267-minimized.json http_live_sse_delivery
+          jq '.minimized.failure' target/ursula-sim-http-live-expected-failures/seed-267-minimized.json \
+            > target/ursula-sim-http-live-expected-failures/seed-267-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-http-live-expected-failures/seed-267-minimized-failure.json \
+            --expect-invariant http_live_sse_delivery
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family pipeline-smoke-http-live-waiter-corruption \
+            --expect-failures \
+            --failure-dir target/ursula-sim-http-live-limit-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-http-live-limit-expected-failures/seed-272-failure.json \
+            --invariant http_live_waiter_backpressure \
+            --output target/ursula-sim-http-live-limit-expected-failures/seed-272-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+            and ([.minimized.schedule.fault_plan.steps[].action.action] == ["corrupt_http_live_limit_backpressure_expectation"])
+          ' target/ursula-sim-http-live-limit-expected-failures/seed-272-minimized.json
+          assert_minimized_failure_trace target/ursula-sim-http-live-limit-expected-failures/seed-272-minimized.json http_live_waiter_backpressure
+          jq '.minimized.failure' target/ursula-sim-http-live-limit-expected-failures/seed-272-minimized.json \
+            > target/ursula-sim-http-live-limit-expected-failures/seed-272-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-http-live-limit-expected-failures/seed-272-minimized-failure.json \
+            --expect-invariant http_live_waiter_backpressure
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family pipeline-smoke-http-snapshot-body-corruption \
+            --expect-failures \
+            --failure-dir target/ursula-sim-http-snapshot-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-http-snapshot-expected-failures/seed-332-failure.json \
+            --invariant http_snapshot_protocol_surface_read \
+            --output target/ursula-sim-http-snapshot-expected-failures/seed-332-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+            and ([.minimized.schedule.fault_plan.steps[].action.action] == ["corrupt_http_snapshot_body_expectation"])
+          ' target/ursula-sim-http-snapshot-expected-failures/seed-332-minimized.json
+          assert_minimized_failure_trace target/ursula-sim-http-snapshot-expected-failures/seed-332-minimized.json http_snapshot_protocol_surface_read
+          jq '.minimized.failure' target/ursula-sim-http-snapshot-expected-failures/seed-332-minimized.json \
+            > target/ursula-sim-http-snapshot-expected-failures/seed-332-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-http-snapshot-expected-failures/seed-332-minimized-failure.json \
+            --expect-invariant http_snapshot_protocol_surface_read
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family pipeline-smoke-http-protocol-surface-randomized-corruption \
+            --expect-failures \
+            --failure-dir target/ursula-sim-http-protocol-randomized-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-http-protocol-randomized-expected-failures/seed-297-failure.json \
+            --invariant http_protocol_randomized_read_your_write \
+            --output target/ursula-sim-http-protocol-randomized-expected-failures/seed-297-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+            and ([.minimized.schedule.fault_plan.steps[].action.action] == ["run_http_protocol_surface_workload"])
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.corrupt_final_read_expectation == true)
+          ' target/ursula-sim-http-protocol-randomized-expected-failures/seed-297-minimized.json
+          assert_minimized_failure_trace target/ursula-sim-http-protocol-randomized-expected-failures/seed-297-minimized.json http_protocol_randomized_read_your_write
+          jq '.minimized.failure' target/ursula-sim-http-protocol-randomized-expected-failures/seed-297-minimized.json \
+            > target/ursula-sim-http-protocol-randomized-expected-failures/seed-297-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-http-protocol-randomized-expected-failures/seed-297-minimized-failure.json \
+            --expect-invariant http_protocol_randomized_read_your_write
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family pipeline-smoke-http-protocol-surface-randomized-sse-corruption \
+            --expect-failures \
+            --failure-dir target/ursula-sim-http-protocol-randomized-sse-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-http-protocol-randomized-sse-expected-failures/seed-302-failure.json \
+            --invariant http_protocol_randomized_sse_delivery \
+            --output target/ursula-sim-http-protocol-randomized-sse-expected-failures/seed-302-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+            and ([.minimized.schedule.fault_plan.steps[].action.action] == ["run_http_protocol_surface_workload"])
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.sse_close == true)
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.corrupt_sse_next_offset_expectation == true)
+          ' target/ursula-sim-http-protocol-randomized-sse-expected-failures/seed-302-minimized.json
+          assert_minimized_failure_trace target/ursula-sim-http-protocol-randomized-sse-expected-failures/seed-302-minimized.json http_protocol_randomized_sse_delivery
+          jq '.minimized.failure' target/ursula-sim-http-protocol-randomized-sse-expected-failures/seed-302-minimized.json \
+            > target/ursula-sim-http-protocol-randomized-sse-expected-failures/seed-302-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-http-protocol-randomized-sse-expected-failures/seed-302-minimized-failure.json \
+            --expect-invariant http_protocol_randomized_sse_delivery
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family pipeline-smoke-http-protocol-surface-randomized-backpressure-corruption \
+            --expect-failures \
+            --failure-dir target/ursula-sim-http-protocol-randomized-backpressure-expected-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-http-protocol-randomized-backpressure-expected-failures/seed-307-failure.json \
+            --invariant http_protocol_randomized_live_waiter_backpressure \
+            --output target/ursula-sim-http-protocol-randomized-backpressure-expected-failures/seed-307-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+            and ([.minimized.schedule.fault_plan.steps[].action.action] == ["run_http_protocol_surface_workload"])
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.live_limit == true)
+            and (.minimized.schedule.fault_plan.steps[0].action.plan.corrupt_live_limit_backpressure_expectation == true)
+          ' target/ursula-sim-http-protocol-randomized-backpressure-expected-failures/seed-307-minimized.json
+          assert_minimized_failure_trace target/ursula-sim-http-protocol-randomized-backpressure-expected-failures/seed-307-minimized.json http_protocol_randomized_live_waiter_backpressure
+          jq '.minimized.failure' target/ursula-sim-http-protocol-randomized-backpressure-expected-failures/seed-307-minimized.json \
+            > target/ursula-sim-http-protocol-randomized-backpressure-expected-failures/seed-307-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-http-protocol-randomized-backpressure-expected-failures/seed-307-minimized-failure.json \
+            --expect-invariant http_protocol_randomized_live_waiter_backpressure
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+            --seed-family runtime-raft-network-cold-live-write-failures \
+            --expect-failures \
+            --failure-dir target/ursula-sim-runtime-raft-cold-live-write-failures
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+            --artifact target/ursula-sim-runtime-raft-cold-live-write-failures/seed-312-failure.json \
+            --invariant runtime_raft_network_cold_live_write_integrity \
+            --output target/ursula-sim-runtime-raft-cold-live-write-failures/seed-312-minimized.json
+          jq -e '
+            .minimized.outcome.target_preserved == true
+            and .minimized.outcome.status == "reproduced_panic"
+            and (.minimized.failure != null)
+          ' target/ursula-sim-runtime-raft-cold-live-write-failures/seed-312-minimized.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-assert-shape -- \
+            --artifact target/ursula-sim-runtime-raft-cold-live-write-failures/seed-312-minimized.json \
+            --shape seed_312_runtime_raft_network_cold_live_write_failure_minimized
+          assert_minimized_failure_trace target/ursula-sim-runtime-raft-cold-live-write-failures/seed-312-minimized.json runtime_raft_network_cold_live_write_integrity
+          jq '.minimized.failure' target/ursula-sim-runtime-raft-cold-live-write-failures/seed-312-minimized.json \
+            > target/ursula-sim-runtime-raft-cold-live-write-failures/seed-312-minimized-failure.json
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+            --artifact target/ursula-sim-runtime-raft-cold-live-write-failures/seed-312-minimized-failure.json \
+            --expect-invariant runtime_raft_network_cold_live_write_integrity
+
+      - name: Upload simulation failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ursula-sim-failures
+          path: |
+            target/ursula-sim-failures
+            target/ursula-sim-seed-146-cold-write-delay-minimize
+            target/ursula-sim-seed-147-cold-read-delay-minimize
+            target/ursula-sim-seed-155-leader-cold-live-replay
+            target/ursula-sim-seed-155-leader-cold-live-minimize
+            target/ursula-sim-runtime-interleaving-write-expected-failures
+            target/ursula-sim-expected-failures
+            target/ursula-sim-partial-read-expected-failures
+            target/ursula-sim-tail-read-expected-failures
+            target/ursula-sim-close-expected-failures
+            target/ursula-sim-snapshot-expected-failures
+            target/ursula-sim-leader-failover-read-expected-failures
+            target/ursula-sim-leader-failover-cold-live-read-expected-failures
+            target/ursula-sim-cold-live-truncate-expected-failures
+            target/ursula-sim-randomized-cold-read-expected-failures
+            target/ursula-sim-snapshot-install-expected-failures
+            target/ursula-sim-http-producer-expected-failures
+            target/ursula-sim-http-live-expected-failures
+            target/ursula-sim-http-live-limit-expected-failures
+            target/ursula-sim-http-snapshot-expected-failures
+            target/ursula-sim-http-protocol-randomized-expected-failures
+            target/ursula-sim-http-protocol-randomized-sse-expected-failures
+            target/ursula-sim-http-protocol-randomized-backpressure-expected-failures
+            target/ursula-sim-runtime-raft-cold-live-write-failures
+            target/ursula-sim-runtime-raft-cold-live-write-recovery
+          if-no-files-found: ignore
+
   docs:
     name: Docs build
     runs-on: ubuntu-24.04

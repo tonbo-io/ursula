@@ -1,8 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Instant;
 
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use crate::rt::time::Instant;
 use ursula_shard::{BucketStreamId, RaftGroupId, ShardPlacement};
 use ursula_stream::ColdFlushCandidate;
 
@@ -21,6 +20,7 @@ use crate::request::{
     PublishSnapshotResponse, ReadSnapshotRequest, ReadSnapshotResponse, ReadStreamRequest,
     ReadStreamResponse,
 };
+use crate::rt::sync::{Semaphore, mpsc, oneshot};
 
 #[derive(Clone)]
 pub(crate) struct GroupMailbox {
@@ -58,7 +58,6 @@ pub(crate) struct PendingAppendBatch {
     pub(crate) started_at: Instant,
 }
 
-#[derive(Debug)]
 pub(crate) enum GroupCommand {
     CreateStream {
         request: CreateStreamRequest,
@@ -157,6 +156,10 @@ pub(crate) enum GroupCommand {
         snapshot: GroupSnapshot,
         response_tx: oneshot::Sender<Result<(), RuntimeError>>,
     },
+    #[cfg(madsim)]
+    ShutdownEngine {
+        response_tx: oneshot::Sender<Result<(), RuntimeError>>,
+    },
 }
 
 impl GroupCommand {
@@ -224,6 +227,10 @@ impl GroupCommand {
                 let _ = response_tx.send(Err(err));
             }
             Self::InstallGroupSnapshot { response_tx, .. } => {
+                let _ = response_tx.send(Err(err));
+            }
+            #[cfg(madsim)]
+            Self::ShutdownEngine { response_tx } => {
                 let _ = response_tx.send(Err(err));
             }
         }
@@ -604,6 +611,16 @@ impl GroupActor {
                     )
                     .await;
                     let _ = response_tx.send(response);
+                }
+                #[cfg(madsim)]
+                GroupCommand::ShutdownEngine { response_tx } => {
+                    let response = self
+                        .engine
+                        .shutdown()
+                        .await
+                        .map_err(|err| RuntimeError::group_engine(self.placement, err));
+                    let _ = response_tx.send(response);
+                    break;
                 }
             }
         }

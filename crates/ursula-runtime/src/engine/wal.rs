@@ -1,8 +1,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
+use crate::rt::time::Instant;
 use serde::{Deserialize, Serialize};
 use ursula_shard::{BucketStreamId, ShardPlacement};
 use ursula_stream::{StreamCommand, StreamErrorCode, StreamSnapshot};

@@ -66,6 +66,8 @@ pub type GroupSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = Result<GroupSnapshot, GroupEngineError>> + Send + 'a>>;
 pub type GroupInstallSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), GroupEngineError>> + Send + 'a>>;
+pub type GroupShutdownFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), GroupEngineError>> + Send + 'a>>;
 pub type GroupWriteBatchFuture<'a> = Pin<
     Box<
         dyn Future<
@@ -381,6 +383,10 @@ pub trait GroupEngine: Send + 'static {
         &'a mut self,
         snapshot: GroupSnapshot,
     ) -> GroupInstallSnapshotFuture<'a>;
+
+    fn shutdown<'a>(&'a mut self) -> GroupShutdownFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
 
     fn write_batch<'a>(
         &'a mut self,

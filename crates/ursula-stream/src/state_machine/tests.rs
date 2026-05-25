@@ -1,5 +1,8 @@
 use super::*;
 use crate::integrity::StreamIntegritySnapshot;
+use proptest::collection::vec;
+use proptest::prelude::*;
+use std::collections::HashMap;
 
 fn stream(id: &str) -> BucketStreamId {
     BucketStreamId::new("benchcmp", id)
@@ -1979,4 +1982,867 @@ fn snapshot_restore_preserves_visible_snapshot_and_message_records() {
             end_offset: 5,
         }]
     );
+}
+
+fn payload_strategy() -> impl Strategy<Value = Vec<u8>> {
+    vec(any::<u8>(), 1..=16)
+}
+
+fn payloads_strategy() -> impl Strategy<Value = Vec<Vec<u8>>> {
+    vec(payload_strategy(), 1..=24)
+}
+
+fn append_payload(
+    machine: &mut StreamStateMachine,
+    stream_name: &str,
+    payload: Vec<u8>,
+    close_after: bool,
+    producer: Option<ProducerRequest>,
+) -> StreamResponse {
+    machine.apply(StreamCommand::Append {
+        stream_id: stream(stream_name),
+        content_type: Some("application/octet-stream".to_owned()),
+        payload,
+        close_after,
+        stream_seq: None,
+        producer,
+        now_ms: 0,
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    #[test]
+    fn prop_appends_are_offset_monotonic_and_snapshot_round_trips(
+        initial in vec(any::<u8>(), 0..=16),
+        payloads in payloads_strategy(),
+    ) {
+        let mut machine = StreamStateMachine::new();
+        create_bucket(&mut machine);
+        let stream_id = stream("prop-offsets");
+        prop_assert_eq!(
+            machine.apply(StreamCommand::CreateStream {
+                stream_id: stream_id.clone(),
+                content_type: "application/octet-stream".to_owned(),
+                initial_payload: initial.clone(),
+                close_after: false,
+                stream_seq: None,
+                producer: None,
+                stream_ttl_seconds: None,
+                stream_expires_at_ms: None,
+                forked_from: None,
+                fork_offset: None,
+                now_ms: 0,
+            }),
+            StreamResponse::Created {
+                stream_id: stream_id.clone(),
+                next_offset: u64::try_from(initial.len()).unwrap(),
+                closed: false,
+            }
+        );
+
+        let mut expected = initial;
+        let mut expected_tail = u64::try_from(expected.len()).unwrap();
+        for payload in payloads {
+            let payload_len = u64::try_from(payload.len()).unwrap();
+            prop_assert_eq!(
+                append_payload(&mut machine, "prop-offsets", payload.clone(), false, None),
+                StreamResponse::Appended {
+                    offset: expected_tail,
+                    next_offset: expected_tail + payload_len,
+                    closed: false,
+                    deduplicated: false,
+                    producer: None,
+                }
+            );
+            expected_tail += payload_len;
+            expected.extend_from_slice(&payload);
+
+            let head = machine.head(&stream_id).expect("stream head");
+            prop_assert_eq!(head.tail_offset, expected_tail);
+            let read = machine
+                .read(&stream_id, 0, expected.len())
+                .expect("read appended payload");
+            prop_assert_eq!(read.next_offset, expected_tail);
+            prop_assert_eq!(read.payload, expected.clone());
+            prop_assert!(read.up_to_date);
+        }
+
+        let restored =
+            StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
+        let restored_read = restored
+            .read(&stream_id, 0, expected.len())
+            .expect("restored read");
+        prop_assert_eq!(restored_read.next_offset, expected_tail);
+        prop_assert_eq!(restored_read.payload, expected);
+        prop_assert_eq!(
+            restored
+                .integrity_snapshot(&stream_id)
+                .expect("restored integrity")
+                .tail_offset,
+            expected_tail
+        );
+    }
+
+    #[test]
+    fn prop_producer_retries_are_idempotent_and_stale_epochs_are_fenced(
+        first_payload in payload_strategy(),
+        retry_payload in payload_strategy(),
+        next_payload in payload_strategy(),
+    ) {
+        let mut machine = StreamStateMachine::new();
+        create_bucket(&mut machine);
+        create_stream(&mut machine, "prop-producer");
+        let stream_id = stream("prop-producer");
+
+        let first_len = u64::try_from(first_payload.len()).unwrap();
+        prop_assert_eq!(
+            append_payload(
+                &mut machine,
+                "prop-producer",
+                first_payload.clone(),
+                false,
+                Some(producer("writer-1", 0, 0)),
+            ),
+            StreamResponse::Appended {
+                offset: 0,
+                next_offset: first_len,
+                closed: false,
+                deduplicated: false,
+                producer: Some(producer("writer-1", 0, 0)),
+            }
+        );
+
+        prop_assert_eq!(
+            append_payload(
+                &mut machine,
+                "prop-producer",
+                retry_payload,
+                false,
+                Some(producer("writer-1", 0, 0)),
+            ),
+            StreamResponse::Appended {
+                offset: 0,
+                next_offset: first_len,
+                closed: false,
+                deduplicated: true,
+                producer: Some(producer("writer-1", 0, 0)),
+            }
+        );
+        prop_assert_eq!(
+            machine
+                .read(&stream_id, 0, usize::try_from(first_len).unwrap())
+                .expect("read after duplicate")
+                .payload,
+            first_payload
+        );
+
+        let next_len = u64::try_from(next_payload.len()).unwrap();
+        prop_assert_eq!(
+            append_payload(
+                &mut machine,
+                "prop-producer",
+                next_payload,
+                false,
+                Some(producer("writer-1", 1, 0)),
+            ),
+            StreamResponse::Appended {
+                offset: first_len,
+                next_offset: first_len + next_len,
+                closed: false,
+                deduplicated: false,
+                producer: Some(producer("writer-1", 1, 0)),
+            }
+        );
+        let stale_response = append_payload(
+            &mut machine,
+            "prop-producer",
+            b"stale".to_vec(),
+            false,
+            Some(producer("writer-1", 0, 1)),
+        );
+        prop_assert!(
+            matches!(
+                stale_response,
+                StreamResponse::Error {
+                    code: StreamErrorCode::ProducerEpochStale,
+                    ..
+                }
+            ),
+            "unexpected stale producer response: {:?}",
+            stale_response
+        );
+        prop_assert_eq!(
+            machine.head(&stream_id).expect("head").tail_offset,
+            first_len + next_len
+        );
+    }
+
+    #[test]
+    fn prop_producer_batch_state_survives_snapshot_restore(
+        first_payloads in vec(payload_strategy(), 1..=8),
+        retry_payloads in vec(payload_strategy(), 1..=8),
+        next_payloads in vec(payload_strategy(), 1..=8),
+        duplicate_epoch_payloads in vec(payload_strategy(), 1..=8),
+    ) {
+        let mut machine = StreamStateMachine::new();
+        create_bucket(&mut machine);
+        create_stream(&mut machine, "prop-producer-batch");
+        let stream_id = stream("prop-producer-batch");
+
+        let first_refs = first_payloads
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        let first = machine
+            .append_batch_borrowed(
+                stream_id.clone(),
+                Some("application/octet-stream"),
+                &first_refs,
+                Some(producer("writer-1", 0, 0)),
+                0,
+            )
+            .expect("first producer batch");
+        prop_assert!(!first.deduplicated);
+        prop_assert_eq!(first.items.len(), first_payloads.len());
+
+        let mut expected = Vec::new();
+        let mut expected_items = Vec::with_capacity(first_payloads.len());
+        for (item, payload) in first.items.iter().zip(first_payloads.iter()) {
+            let start_offset = u64::try_from(expected.len()).expect("payload len fits u64");
+            expected.extend_from_slice(payload);
+            let next_offset = u64::try_from(expected.len()).expect("payload len fits u64");
+            prop_assert_eq!(item.offset, start_offset);
+            prop_assert_eq!(item.next_offset, next_offset);
+            prop_assert!(!item.closed);
+            prop_assert!(!item.deduplicated);
+            expected_items.push(StreamBatchAppendItem {
+                offset: start_offset,
+                next_offset,
+                closed: false,
+                deduplicated: true,
+            });
+        }
+
+        let snapshot = machine.snapshot();
+        let producer_state = snapshot.streams[0]
+            .producer_states
+            .iter()
+            .find(|state| state.producer_id == "writer-1")
+            .expect("producer state in snapshot");
+        prop_assert_eq!(producer_state.last_items.len(), first_payloads.len());
+        let mut restored = StreamStateMachine::restore(snapshot).expect("restore snapshot");
+
+        let retry_refs = retry_payloads
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        let duplicate = restored
+            .append_batch_borrowed(
+                stream_id.clone(),
+                Some("application/octet-stream"),
+                &retry_refs,
+                Some(producer("writer-1", 0, 0)),
+                0,
+            )
+            .expect("duplicate producer batch after restore");
+        prop_assert!(duplicate.deduplicated);
+        prop_assert_eq!(duplicate.items, expected_items);
+        prop_assert_eq!(
+            restored
+                .read(&stream_id, 0, expected.len())
+                .expect("read after duplicate producer batch")
+                .payload,
+            expected.clone()
+        );
+
+        let next_refs = next_payloads
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        let next = restored
+            .append_batch_borrowed(
+                stream_id.clone(),
+                Some("application/octet-stream"),
+                &next_refs,
+                Some(producer("writer-1", 1, 0)),
+                0,
+        )
+        .expect("new producer epoch batch after restore");
+        prop_assert!(!next.deduplicated);
+        let next_start = u64::try_from(expected.len()).expect("payload len fits u64");
+        for (item, payload) in next.items.iter().zip(next_payloads.iter()) {
+            let start_offset = u64::try_from(expected.len()).expect("payload len fits u64");
+            expected.extend_from_slice(payload);
+            let next_offset = u64::try_from(expected.len()).expect("payload len fits u64");
+            prop_assert_eq!(item.offset, start_offset);
+            prop_assert_eq!(item.next_offset, next_offset);
+            prop_assert!(!item.deduplicated);
+        }
+        prop_assert_eq!(next.items[0].offset, next_start);
+
+        let mut restored =
+            StreamStateMachine::restore(restored.snapshot()).expect("restore after epoch batch");
+        let duplicate_epoch_refs = duplicate_epoch_payloads
+            .iter()
+            .map(Vec::as_slice)
+            .collect::<Vec<_>>();
+        let duplicate_epoch = restored
+            .append_batch_borrowed(
+                stream_id.clone(),
+                Some("application/octet-stream"),
+                &duplicate_epoch_refs,
+                Some(producer("writer-1", 1, 0)),
+                0,
+            )
+            .expect("duplicate producer epoch batch");
+        prop_assert!(duplicate_epoch.deduplicated);
+        prop_assert_eq!(duplicate_epoch.items.len(), next.items.len());
+        for (duplicate_item, original_item) in duplicate_epoch.items.iter().zip(next.items.iter()) {
+            prop_assert_eq!(duplicate_item.offset, original_item.offset);
+            prop_assert_eq!(duplicate_item.next_offset, original_item.next_offset);
+            prop_assert_eq!(duplicate_item.closed, original_item.closed);
+            prop_assert!(duplicate_item.deduplicated);
+        }
+
+        let stale_response = restored.append_batch_borrowed(
+            stream_id.clone(),
+            Some("application/octet-stream"),
+            &duplicate_epoch_refs,
+            Some(producer("writer-1", 0, 1)),
+            0,
+        );
+        prop_assert!(
+            matches!(
+                stale_response,
+                Err(StreamResponse::Error {
+                    code: StreamErrorCode::ProducerEpochStale,
+                    ..
+                })
+            ),
+            "unexpected stale producer batch response: {:?}",
+            stale_response
+        );
+        prop_assert_eq!(
+            restored.head(&stream_id).expect("head").tail_offset,
+            u64::try_from(expected.len()).expect("payload len fits u64")
+        );
+        prop_assert_eq!(
+            restored
+                .read(&stream_id, 0, expected.len())
+                .expect("final producer batch read")
+                .payload,
+            expected
+        );
+    }
+
+    #[test]
+    fn prop_ttl_expiry_uses_generated_wall_clock(
+        start_ms in 0_u64..10_000,
+        ttl_seconds in 1_u64..60,
+        touch_delta_ms in 0_u64..1_000,
+        payload in payload_strategy(),
+    ) {
+        let mut machine = StreamStateMachine::new();
+        create_bucket(&mut machine);
+        let stream_id = stream("prop-ttl");
+        let ttl_ms = ttl_seconds * 1_000;
+        let touch_ms = start_ms + touch_delta_ms.min(ttl_ms - 1);
+        let expire_ms = touch_ms + ttl_ms;
+
+        let create_response = machine.apply(StreamCommand::CreateStream {
+                stream_id: stream_id.clone(),
+                content_type: "application/octet-stream".to_owned(),
+                initial_payload: payload,
+                close_after: false,
+                stream_seq: None,
+                producer: None,
+                stream_ttl_seconds: Some(ttl_seconds),
+                stream_expires_at_ms: None,
+                forked_from: None,
+                fork_offset: None,
+                now_ms: start_ms,
+            });
+        prop_assert!(
+            matches!(create_response, StreamResponse::Created { .. }),
+            "unexpected create response: {:?}",
+            create_response
+        );
+        prop_assert!(machine.read_plan_at(&stream_id, 0, 16, touch_ms).is_ok());
+        prop_assert_eq!(
+            machine.apply(StreamCommand::TouchStreamAccess {
+                stream_id: stream_id.clone(),
+                now_ms: touch_ms,
+                renew_ttl: true,
+            }),
+            StreamResponse::Accessed {
+                changed: touch_ms != start_ms,
+                expired: false,
+            }
+        );
+        prop_assert!(machine.read_plan_at(&stream_id, 0, 16, expire_ms - 1).is_ok());
+        let expired_read = machine.read_plan_at(&stream_id, 0, 16, expire_ms);
+        prop_assert!(
+            matches!(
+                expired_read,
+                Err(StreamResponse::Error {
+                    code: StreamErrorCode::StreamNotFound,
+                    ..
+                })
+            ),
+            "unexpected expired read response: {:?}",
+            expired_read
+        );
+        prop_assert_eq!(
+            machine.apply(StreamCommand::TouchStreamAccess {
+                stream_id,
+                now_ms: expire_ms,
+                renew_ttl: true,
+            }),
+            StreamResponse::Accessed {
+                changed: true,
+                expired: true,
+            }
+        );
+    }
+
+    #[test]
+    fn prop_cold_flush_preserves_tail_and_retained_hot_suffix(
+        payloads in payloads_strategy(),
+        max_flush_bytes in 1_usize..=64,
+    ) {
+        let mut machine = StreamStateMachine::new();
+        create_bucket(&mut machine);
+        create_stream(&mut machine, "prop-cold");
+        let stream_id = stream("prop-cold");
+        let mut expected = Vec::new();
+        for payload in payloads {
+            expected.extend_from_slice(&payload);
+            let append_response = append_payload(&mut machine, "prop-cold", payload, false, None);
+            prop_assert!(
+                matches!(append_response, StreamResponse::Appended { .. }),
+                "unexpected append response: {:?}",
+                append_response
+            );
+        }
+        let before = machine
+            .read(&stream_id, 0, expected.len())
+            .expect("pre-flush read");
+        prop_assert_eq!(before.payload, expected.clone());
+
+        let candidate = machine
+            .plan_cold_flush(&stream_id, 1, max_flush_bytes)
+            .expect("plan cold flush")
+            .expect("flush candidate");
+        prop_assert_eq!(candidate.start_offset, 0);
+        prop_assert!(!candidate.payload.is_empty());
+        prop_assert!(candidate.payload.len() <= max_flush_bytes);
+        prop_assert_eq!(
+            candidate.payload.as_slice(),
+            &expected[..candidate.payload.len()]
+        );
+
+        let flush_len = candidate.payload.len();
+        prop_assert_eq!(
+            machine.apply(StreamCommand::FlushCold {
+                stream_id: stream_id.clone(),
+                chunk: ColdChunkRef {
+                    start_offset: candidate.start_offset,
+                    end_offset: candidate.end_offset,
+                    s3_path: "s3://bucket/prop-cold/000000".to_owned(),
+                    object_size: u64::try_from(candidate.payload.len()).unwrap(),
+                },
+            }),
+            StreamResponse::ColdFlushed {
+                hot_start_offset: candidate.end_offset,
+            }
+        );
+
+        prop_assert_eq!(machine.head(&stream_id).expect("head").tail_offset, u64::try_from(expected.len()).unwrap());
+        prop_assert_eq!(machine.hot_start_offset(&stream_id), u64::try_from(flush_len).unwrap());
+        prop_assert_eq!(machine.cold_chunks(&stream_id).len(), 1);
+        let suffix = &expected[flush_len..];
+        let hot_read = machine
+            .read(&stream_id, u64::try_from(flush_len).unwrap(), suffix.len())
+            .expect("hot suffix read");
+        prop_assert_eq!(hot_read.payload, suffix);
+
+        let plan = machine
+            .read_plan(&stream_id, 0, expected.len())
+            .expect("post-flush read plan");
+        prop_assert_eq!(plan.next_offset, u64::try_from(expected.len()).unwrap());
+        prop_assert!(matches!(plan.segments.first(), Some(StreamReadSegment::Object(_))));
+
+        let restored =
+            StreamStateMachine::restore(machine.snapshot()).expect("restore cold snapshot");
+        let restored_suffix = restored
+            .read(&stream_id, u64::try_from(flush_len).unwrap(), suffix.len())
+            .expect("restored hot suffix read");
+        prop_assert_eq!(restored_suffix.payload, suffix);
+        prop_assert_eq!(restored.cold_chunks(&stream_id), machine.cold_chunks(&stream_id));
+    }
+
+    #[test]
+    fn prop_visible_snapshot_and_cold_flush_survive_restore(
+        payloads in vec(payload_strategy(), 2..=24),
+        snapshot_index_seed in 0_usize..24,
+        max_flush_bytes in 1_usize..=64,
+        snapshot_payload in vec(any::<u8>(), 0..=32),
+    ) {
+        let mut machine = StreamStateMachine::new();
+        create_bucket(&mut machine);
+        create_stream(&mut machine, "prop-snapshot-cold");
+        let stream_id = stream("prop-snapshot-cold");
+
+        let mut expected = Vec::new();
+        let mut boundaries = Vec::with_capacity(payloads.len());
+        for payload in &payloads {
+            let append_response = append_payload(
+                &mut machine,
+                "prop-snapshot-cold",
+                payload.clone(),
+                false,
+                None,
+            );
+            prop_assert!(
+                matches!(append_response, StreamResponse::Appended { .. }),
+                "unexpected append response: {:?}",
+                append_response
+            );
+            let start_offset = u64::try_from(expected.len()).expect("payload len fits u64");
+            expected.extend_from_slice(payload);
+            let end_offset = u64::try_from(expected.len()).expect("payload len fits u64");
+            boundaries.push(StreamMessageRecord {
+                start_offset,
+                end_offset,
+            });
+        }
+
+        let snapshot_message_count = 1 + (snapshot_index_seed % (payloads.len() - 1));
+        let snapshot_offset = boundaries[snapshot_message_count - 1].end_offset;
+        prop_assert_eq!(
+            machine.apply(StreamCommand::PublishSnapshot {
+                stream_id: stream_id.clone(),
+                snapshot_offset,
+                content_type: "application/octet-stream".to_owned(),
+                payload: snapshot_payload.clone(),
+                now_ms: 0,
+            }),
+            StreamResponse::SnapshotPublished { snapshot_offset }
+        );
+
+        let prefix_read = machine.read_plan(&stream_id, 0, 1);
+        prop_assert!(
+            matches!(
+                prefix_read,
+                Err(StreamResponse::Error {
+                    code: StreamErrorCode::StreamGone,
+                    next_offset: Some(next_offset),
+                    ..
+                }) if next_offset == snapshot_offset
+            ),
+            "unexpected prefix read response after snapshot: {:?}",
+            prefix_read
+        );
+        prop_assert_eq!(machine.hot_start_offset(&stream_id), snapshot_offset);
+
+        let candidate = machine
+            .plan_cold_flush(&stream_id, 1, max_flush_bytes)
+            .expect("plan cold flush")
+            .expect("flush candidate after visible snapshot");
+        prop_assert_eq!(candidate.start_offset, snapshot_offset);
+        prop_assert!(!candidate.payload.is_empty());
+        prop_assert!(candidate.payload.len() <= max_flush_bytes);
+        let candidate_start = usize::try_from(candidate.start_offset).expect("offset fits usize");
+        let candidate_end = usize::try_from(candidate.end_offset).expect("offset fits usize");
+        prop_assert_eq!(candidate.payload.as_slice(), &expected[candidate_start..candidate_end]);
+
+        prop_assert_eq!(
+            machine.apply(StreamCommand::FlushCold {
+                stream_id: stream_id.clone(),
+                chunk: ColdChunkRef {
+                    start_offset: candidate.start_offset,
+                    end_offset: candidate.end_offset,
+                    s3_path: "s3://bucket/prop-snapshot-cold/000000".to_owned(),
+                    object_size: u64::try_from(candidate.payload.len()).expect("payload len fits u64"),
+                },
+            }),
+            StreamResponse::ColdFlushed {
+                hot_start_offset: candidate.end_offset,
+            }
+        );
+
+        let tail_offset = u64::try_from(expected.len()).expect("payload len fits u64");
+        prop_assert_eq!(machine.head(&stream_id).expect("head").tail_offset, tail_offset);
+        prop_assert_eq!(machine.hot_start_offset(&stream_id), candidate.end_offset);
+        prop_assert_eq!(machine.cold_chunks(&stream_id).len(), 1);
+        let cold_chunk = &machine.cold_chunks(&stream_id)[0];
+        prop_assert_eq!(cold_chunk.start_offset, candidate.start_offset);
+        prop_assert_eq!(cold_chunk.end_offset, candidate.end_offset);
+
+        let retained_plan = machine
+            .read_plan(
+                &stream_id,
+                snapshot_offset,
+                usize::try_from(tail_offset - snapshot_offset).expect("read len fits usize"),
+            )
+            .expect("retained read plan");
+        prop_assert_eq!(retained_plan.next_offset, tail_offset);
+        prop_assert!(matches!(
+            retained_plan.segments.first(),
+            Some(StreamReadSegment::Object(_))
+        ));
+
+        let bootstrap = machine.bootstrap_plan(&stream_id).expect("bootstrap plan");
+        let expected_snapshot = Some(StreamVisibleSnapshot {
+            offset: snapshot_offset,
+            content_type: "application/octet-stream".to_owned(),
+            payload: snapshot_payload.clone(),
+        });
+        prop_assert_eq!(
+            bootstrap.snapshot.as_ref(),
+            expected_snapshot.as_ref()
+        );
+        prop_assert_eq!(
+            bootstrap.updates.as_slice(),
+            &boundaries[snapshot_message_count..]
+        );
+        prop_assert_eq!(bootstrap.next_offset, tail_offset);
+
+        let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
+        prop_assert_eq!(
+            restored.latest_snapshot(&stream_id).expect("latest snapshot"),
+            bootstrap.snapshot.clone()
+        );
+        prop_assert_eq!(restored.cold_chunks(&stream_id), machine.cold_chunks(&stream_id));
+        prop_assert_eq!(restored.hot_start_offset(&stream_id), candidate.end_offset);
+        prop_assert_eq!(restored.bootstrap_plan(&stream_id).expect("restored bootstrap"), bootstrap);
+        prop_assert_eq!(
+            restored
+                .integrity_snapshot(&stream_id)
+                .expect("restored integrity")
+                .tail_offset,
+            tail_offset
+        );
+    }
+
+    #[test]
+    fn prop_stale_cold_flush_after_delete_recreate_does_not_mutate_new_stream(
+        new_payload in vec(any::<u8>(), 1..=32),
+        old_extra in vec(any::<u8>(), 1..=32),
+    ) {
+        let mut machine = StreamStateMachine::new();
+        create_bucket(&mut machine);
+        create_stream(&mut machine, "prop-stale-cold");
+        let stream_id = stream("prop-stale-cold");
+
+        let mut old_payload = new_payload.clone();
+        old_payload.extend_from_slice(&old_extra);
+        let old_tail = u64::try_from(old_payload.len()).expect("payload len fits u64");
+        let new_tail = u64::try_from(new_payload.len()).expect("payload len fits u64");
+
+        let append_response = append_payload(
+            &mut machine,
+            "prop-stale-cold",
+            old_payload.clone(),
+            false,
+            None,
+        );
+        prop_assert!(
+            matches!(append_response, StreamResponse::Appended { next_offset, .. } if next_offset == old_tail),
+            "unexpected old append response: {:?}",
+            append_response
+        );
+        let candidate = machine
+            .plan_cold_flush(&stream_id, old_payload.len(), old_payload.len())
+            .expect("plan old cold flush")
+            .expect("old cold flush candidate");
+        prop_assert_eq!(candidate.start_offset, 0);
+        prop_assert_eq!(candidate.end_offset, old_tail);
+        prop_assert_eq!(candidate.payload.as_slice(), old_payload.as_slice());
+
+        let delete_response = machine.apply(StreamCommand::DeleteStream {
+            stream_id: stream_id.clone(),
+        });
+        prop_assert!(
+            matches!(
+                delete_response,
+                StreamResponse::Deleted {
+                    hard_deleted: true,
+                    ..
+                }
+            ),
+            "unexpected delete response: {:?}",
+            delete_response
+        );
+        create_stream(&mut machine, "prop-stale-cold");
+        let append_response = append_payload(
+            &mut machine,
+            "prop-stale-cold",
+            new_payload.clone(),
+            false,
+            None,
+        );
+        prop_assert!(
+            matches!(append_response, StreamResponse::Appended { next_offset, .. } if next_offset == new_tail),
+            "unexpected new append response: {:?}",
+            append_response
+        );
+
+        let stale_flush = machine.apply(StreamCommand::FlushCold {
+            stream_id: stream_id.clone(),
+            chunk: ColdChunkRef {
+                start_offset: candidate.start_offset,
+                end_offset: candidate.end_offset,
+                s3_path: "s3://bucket/prop-stale-cold/old-candidate".to_owned(),
+                object_size: u64::try_from(candidate.payload.len()).expect("payload len fits u64"),
+            },
+        });
+        prop_assert!(
+            matches!(
+                stale_flush,
+                StreamResponse::Error {
+                    code: StreamErrorCode::InvalidColdFlush,
+                    next_offset: Some(next_offset),
+                    ..
+                } if next_offset == new_tail
+            ),
+            "unexpected stale flush response: {:?}",
+            stale_flush
+        );
+        prop_assert_eq!(machine.hot_start_offset(&stream_id), 0);
+        prop_assert!(machine.cold_chunks(&stream_id).is_empty());
+        prop_assert_eq!(
+            machine
+                .read(&stream_id, 0, new_payload.len())
+                .expect("new stream read")
+                .payload,
+            new_payload.clone()
+        );
+
+        let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
+        prop_assert_eq!(restored.hot_start_offset(&stream_id), 0);
+        prop_assert!(restored.cold_chunks(&stream_id).is_empty());
+        prop_assert_eq!(
+            restored
+                .read(&stream_id, 0, new_payload.len())
+                .expect("restored new stream read")
+                .payload,
+            new_payload
+        );
+    }
+
+    #[test]
+    fn prop_cold_flush_batch_is_deterministic_and_preview_only(
+        z_payloads in payloads_strategy(),
+        a_payloads in payloads_strategy(),
+        m_payloads in payloads_strategy(),
+        min_hot_bytes in 1_usize..=32,
+        max_flush_bytes in 1_usize..=32,
+        max_candidates in 1_usize..=24,
+    ) {
+        let mut machine = StreamStateMachine::new();
+        create_bucket(&mut machine);
+
+        let streams = [
+            ("z-prop-batch", z_payloads),
+            ("a-prop-batch", a_payloads),
+            ("m-prop-batch", m_payloads),
+        ];
+        let mut expected_payloads = HashMap::new();
+        for (stream_name, payloads) in streams {
+            create_stream(&mut machine, stream_name);
+            let mut expected = Vec::new();
+            for payload in payloads {
+                expected.extend_from_slice(&payload);
+                let append_response = append_payload(&mut machine, stream_name, payload, false, None);
+                prop_assert!(
+                    matches!(append_response, StreamResponse::Appended { .. }),
+                    "unexpected append response: {:?}",
+                    append_response
+                );
+            }
+            expected_payloads.insert(stream(stream_name), expected);
+        }
+
+        let candidates = machine
+            .plan_next_cold_flush_batch(min_hot_bytes, max_flush_bytes, max_candidates)
+            .expect("plan cold flush batch");
+
+        let mut previous_stream = None::<BucketStreamId>;
+        let mut next_start_by_stream = Vec::<(BucketStreamId, u64)>::new();
+        for candidate in &candidates {
+            if let Some(previous_stream) = &previous_stream {
+                prop_assert!(
+                    compare_stream_ids(previous_stream, &candidate.stream_id)
+                        != std::cmp::Ordering::Greater,
+                    "flush batch stream order regressed from {previous_stream} to {}",
+                    candidate.stream_id
+                );
+            }
+            previous_stream = Some(candidate.stream_id.clone());
+
+            let expected_start = next_start_by_stream
+                .iter()
+                .find(|(stream_id, _)| stream_id == &candidate.stream_id)
+                .map(|(_, next_start)| *next_start)
+                .unwrap_or(0);
+            prop_assert_eq!(candidate.start_offset, expected_start);
+            prop_assert!(candidate.end_offset > candidate.start_offset);
+            prop_assert!(candidate.payload.len() <= max_flush_bytes);
+
+            let expected = expected_payloads
+                .get(&candidate.stream_id)
+                .expect("candidate stream should exist");
+            let start = usize::try_from(candidate.start_offset).expect("offset fits usize");
+            let end = usize::try_from(candidate.end_offset).expect("offset fits usize");
+            prop_assert_eq!(candidate.payload.as_slice(), &expected[start..end]);
+            if let Some((_, next_start)) = next_start_by_stream
+                .iter_mut()
+                .find(|(stream_id, _)| stream_id == &candidate.stream_id)
+            {
+                *next_start = candidate.end_offset;
+            } else {
+                next_start_by_stream.push((candidate.stream_id.clone(), candidate.end_offset));
+            }
+        }
+
+        for stream_id in expected_payloads.keys() {
+            prop_assert_eq!(machine.hot_start_offset(stream_id), 0);
+            prop_assert!(machine.cold_chunks(stream_id).is_empty());
+        }
+
+        for (index, candidate) in candidates.iter().enumerate() {
+            prop_assert_eq!(
+                machine.apply(StreamCommand::FlushCold {
+                    stream_id: candidate.stream_id.clone(),
+                    chunk: ColdChunkRef {
+                        start_offset: candidate.start_offset,
+                        end_offset: candidate.end_offset,
+                        s3_path: format!("s3://bucket/prop-batch/{index:06}"),
+                        object_size: u64::try_from(candidate.payload.len())
+                            .expect("payload len fits u64"),
+                    },
+                }),
+                StreamResponse::ColdFlushed {
+                    hot_start_offset: candidate.end_offset,
+                }
+            );
+        }
+
+        for (stream_id, expected_start) in next_start_by_stream {
+            prop_assert_eq!(machine.hot_start_offset(&stream_id), expected_start);
+        }
+
+        let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
+        for (stream_id, expected) in expected_payloads {
+            prop_assert_eq!(
+                restored.head(&stream_id).expect("restored head").tail_offset,
+                u64::try_from(expected.len()).expect("payload len fits u64")
+            );
+            prop_assert_eq!(restored.cold_chunks(&stream_id), machine.cold_chunks(&stream_id));
+            prop_assert_eq!(restored.hot_start_offset(&stream_id), machine.hot_start_offset(&stream_id));
+        }
+    }
 }

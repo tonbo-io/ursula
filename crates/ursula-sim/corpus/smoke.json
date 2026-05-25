@@ -1,0 +1,141 @@
+[
+  {
+    "schema_version": 1,
+    "scenario": "no_fault_baseline",
+    "seed": 29,
+    "stream": {
+      "bucket_id": "benchcmp",
+      "stream_id": "ursula-sim-no-fault"
+    },
+    "outcome": {
+      "seed": 29,
+      "leader_id": 1,
+      "target_node_id": null,
+      "appended_log_index": 2,
+      "trace": {
+        "events": [
+          { "event": "cluster_built", "seed": 29 },
+          { "event": "leader_elected", "leader_id": 1 },
+          { "event": "stream_created", "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-no-fault" } },
+          { "event": "append_committed", "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-no-fault" }, "log_index": 2 },
+          { "event": "all_nodes_applied", "log_index": 2 },
+          { "event": "all_nodes_read_verified", "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-no-fault" } }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "scenario": "partition_heal",
+    "seed": 11,
+    "stream": {
+      "bucket_id": "benchcmp",
+      "stream_id": "ursula-sim-partition-heal"
+    },
+    "outcome": {
+      "seed": 11,
+      "leader_id": 1,
+      "target_node_id": 2,
+      "appended_log_index": 2,
+      "trace": {
+        "events": [
+          { "event": "cluster_built", "seed": 11 },
+          { "event": "leader_elected", "leader_id": 1 },
+          { "event": "fault_applied", "phase": "before_append" },
+          { "event": "stream_created", "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-partition-heal" } },
+          { "event": "append_committed", "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-partition-heal" }, "log_index": 2 },
+          { "event": "majority_applied", "log_index": 2 },
+          { "event": "isolated_follower_lagged", "node_id": 2, "log_index": 2 },
+          { "event": "fault_applied", "phase": "after_isolated_lag" },
+          { "event": "follower_caught_up", "node_id": 2, "log_index": 2 },
+          { "event": "follower_read_verified", "node_id": 2, "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-partition-heal" } }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "scenario": "snapshot_catch_up",
+    "seed": 43,
+    "stream": {
+      "bucket_id": "benchcmp",
+      "stream_id": "ursula-sim-snapshot-catch-up"
+    },
+    "outcome": {
+      "seed": 43,
+      "leader_id": 1,
+      "target_node_id": 3,
+      "appended_log_index": 2,
+      "trace": {
+        "events": [
+          { "event": "cluster_built", "seed": 43 },
+          { "event": "leader_elected", "leader_id": 1 },
+          { "event": "stream_created", "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-snapshot-catch-up" } },
+          { "event": "append_committed", "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-snapshot-catch-up" }, "log_index": 2 },
+          { "event": "majority_applied", "log_index": 2 },
+          { "event": "snapshot_created", "log_index": 2 },
+          { "event": "log_purged", "log_index": 2 },
+          { "event": "learner_added", "node_id": 3, "log_index": 4 },
+          { "event": "full_snapshot_transferred", "node_id": 3, "count": 1 },
+          { "event": "follower_caught_up", "node_id": 3, "log_index": 4 },
+          { "event": "snapshot_catch_up_read_verified", "node_id": 3, "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-snapshot-catch-up" } }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "scenario": "restart_follower",
+    "seed": 47,
+    "stream": {
+      "bucket_id": "benchcmp",
+      "stream_id": "ursula-sim-restart-follower"
+    },
+    "outcome": {
+      "seed": 47,
+      "leader_id": 1,
+      "target_node_id": 2,
+      "appended_log_index": 2,
+      "trace": {
+        "events": [
+          { "event": "cluster_built", "seed": 47 },
+          { "event": "leader_elected", "leader_id": 1 },
+          { "event": "node_stopped", "node_id": 2 },
+          { "event": "stream_created", "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-restart-follower" } },
+          { "event": "append_committed", "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-restart-follower" }, "log_index": 2 },
+          { "event": "majority_applied", "log_index": 2 },
+          { "event": "node_restarted", "node_id": 2 },
+          { "event": "follower_caught_up", "node_id": 2, "log_index": 2 },
+          { "event": "restarted_node_read_verified", "node_id": 2, "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-restart-follower" } }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "scenario": "cold_live_read",
+    "seed": 53,
+    "stream": {
+      "bucket_id": "benchcmp",
+      "stream_id": "ursula-sim-cold-live"
+    },
+    "outcome": {
+      "seed": 53,
+      "leader_id": 1,
+      "target_node_id": null,
+      "appended_log_index": 3,
+      "trace": {
+        "events": [
+          { "event": "cluster_built", "seed": 53 },
+          { "event": "leader_elected", "leader_id": 1 },
+          { "event": "stream_created", "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-cold-live" } },
+          { "event": "cold_chunk_written", "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-cold-live" }, "start_offset": 0, "end_offset": 4 },
+          { "event": "cold_flushed", "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-cold-live" }, "hot_start_offset": 4, "log_index": 3 },
+          { "event": "cold_live_read_verified", "node_id": 1, "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-cold-live" } },
+          { "event": "cold_live_read_verified", "node_id": 2, "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-cold-live" } },
+          { "event": "cold_live_read_verified", "node_id": 3, "stream": { "bucket_id": "benchcmp", "stream_id": "ursula-sim-cold-live" } }
+        ]
+      }
+    }
+  }
+]

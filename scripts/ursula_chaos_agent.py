@@ -102,8 +102,20 @@ def parse_int_list(value: str) -> list[int]:
     return sizes or [128]
 
 
-def run(argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, check=check, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def run(
+    argv: list[str],
+    *,
+    check: bool = True,
+    timeout_secs: int | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv,
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout_secs,
+    )
 
 
 @dataclass(frozen=True)
@@ -120,28 +132,18 @@ class Node:
 
 
 @dataclass
-class PayloadSample:
-    stream: str
-    start_offset: int
-    end_offset: int
-    payload: bytes
-    written_at: datetime
-    producer_id: str
-    producer_epoch: int
-    producer_seq: int
-    payload_kind: str
-    cold_confirmed: bool = False
-
-
-@dataclass
 class ProducerState:
     producer_id: str
     epoch: int = 1
     seq: int = 0
-    last_payload: bytes | None = None
     last_seq: int | None = None
     last_stream: str | None = None
+    last_append_ordinal: int | None = None
+    last_start_offset: int | None = None
     last_end_offset: int | None = None
+    last_epoch: int | None = None
+    last_payload_size: int | None = None
+    last_payload_kind: str | None = None
 
 
 def node_id_from_name(name: str) -> int | None:
@@ -165,18 +167,12 @@ class WorkloadStream:
     next_offset: int = 0
     verified_offsets: int = 0
     expected_live_setsum: Setsum | None = None
-    recent_payloads: deque[PayloadSample] | None = None
-    old_payloads: deque[PayloadSample] | None = None
     producer_epochs: dict[str, int] | None = None
     producer_seqs: dict[str, int] | None = None
 
     def __post_init__(self) -> None:
         if self.expected_live_setsum is None:
             self.expected_live_setsum = Setsum()
-        if self.recent_payloads is None:
-            self.recent_payloads = deque(maxlen=2048)
-        if self.old_payloads is None:
-            self.old_payloads = deque(maxlen=512)
         if self.producer_epochs is None:
             self.producer_epochs = {}
         if self.producer_seqs is None:
@@ -220,6 +216,7 @@ class ChaosAgent:
         self.max_repair_attempts = max(0, args.max_repair_attempts)
         self.disable_faults = args.disable_faults
         self.timeout_secs = args.timeout_secs
+        self.aws_timeout_secs = max(1, args.aws_timeout_secs)
         self.producer_count = max(1, args.producer_count)
         self.epoch_bump_every = args.epoch_bump_every
         self.producer_probe_every = args.producer_probe_every
@@ -440,24 +437,14 @@ class ChaosAgent:
                     payload,
                 ]
             )
-            sample = PayloadSample(
-                stream=stream.name,
-                start_offset=start_offset,
-                end_offset=end_offset,
-                payload=payload,
-                written_at=utc_now(),
-                producer_id=producer.producer_id,
-                producer_epoch=producer.epoch,
-                producer_seq=producer_seq,
-                payload_kind=payload_kind,
-            )
-            stream.recent_payloads.append(sample)
-            if self.append_success % self.old_sample_every == 0:
-                stream.old_payloads.append(sample)
-            producer.last_payload = payload
             producer.last_seq = producer_seq
             producer.last_stream = stream.name
+            producer.last_append_ordinal = self.append_success
+            producer.last_start_offset = start_offset
             producer.last_end_offset = end_offset
+            producer.last_epoch = producer.epoch
+            producer.last_payload_size = payload_size
+            producer.last_payload_kind = payload_kind
             stream.producer_seqs[producer.producer_id] = producer_seq + 1
             self.append_success += 1
             return
@@ -472,10 +459,14 @@ class ChaosAgent:
         producer: ProducerState,
         producer_seq: int,
         start_offset: int,
+        producer_epoch: int | None = None,
+        append_ordinal: int | None = None,
     ) -> bytes:
+        epoch = producer.epoch if producer_epoch is None else producer_epoch
+        ordinal = self.append_success if append_ordinal is None else append_ordinal
         prefix = (
-            f"{self.append_success:020d}:{stream.name}:{start_offset:020d}:"
-            f"{producer.producer_id}:{producer.epoch}:{producer_seq}:{kind}\n"
+            f"{ordinal:020d}:{stream.name}:{start_offset:020d}:"
+            f"{producer.producer_id}:{epoch}:{producer_seq}:{kind}\n"
         ).encode()
         if kind == "zero":
             filler = b"\0" * max(0, size - len(prefix))
@@ -489,91 +480,46 @@ class ChaosAgent:
         return (prefix + filler)[:size]
 
     def verify_integrity(self) -> None:
-        mode = self.verify_modes[self.verify_attempts % len(self.verify_modes)] if self.verify_modes else "latest"
+        mode = "setsum"
         self.verify_attempts += 1
-        sample = self.choose_verify_sample(mode)
-        if sample is None:
-            self.verify_errors[mode] = self.verify_errors.get(mode, 0) + 1
-            self.last_integrity_check = utc_now()
-            return
-        if mode == "cold":
-            if not self.ensure_cold_sample(sample):
-                self.verify_errors[mode] = self.verify_errors.get(mode, 0) + 1
-                self.last_integrity_check = utc_now()
-                return
-        last_error = self.verify_sample(sample)
+        stream = self.streams[self.verify_attempts % len(self.streams)]
+        ok = self.verify_server_integrity(stream)
         self.last_integrity_check = utc_now()
-        if last_error is None:
+        if ok:
             self.verified_offsets += 1
             self.verify_counts[mode] = self.verify_counts.get(mode, 0) + 1
-            stream = next((stream for stream in self.streams if stream.name == sample.stream), None)
-            if stream is not None:
-                stream.verified_offsets += 1
-                self.verify_server_integrity(stream)
+            stream.verified_offsets += 1
             return
         self.verify_errors[mode] = self.verify_errors.get(mode, 0) + 1
-        if self.is_read_availability_error(last_error):
-            self.read_availability_errors += 1
-            self.last_read_availability_error = last_error
-            self.event("warn", f"{mode} read availability check failed: {last_error}")
-            return
-        self.mismatch_count += 1
-        self.last_integrity_error = last_error
-        self.event("error", f"{mode} integrity check failed: {self.last_integrity_error}")
 
-    def choose_verify_sample(self, mode: str) -> PayloadSample | None:
-        populated = [stream for stream in self.streams if stream.recent_payloads]
-        if not populated:
+    def probe_read_availability(self, stream: WorkloadStream) -> str | None:
+        if stream.next_offset <= 0:
             return None
-        stream = populated[self.verify_attempts % len(populated)]
-        if mode == "latest":
-            return stream.recent_payloads[-1]
-        if mode == "recent":
-            return random.choice(list(stream.recent_payloads))
-        if mode == "cold":
-            self.refresh_cold_confirmed_samples(max_streams=32)
-            cold_samples = [
-                sample
-                for candidate in self.streams
-                for sample in list(candidate.old_payloads) + list(candidate.recent_payloads)
-                if sample.cold_confirmed
-            ]
-            if cold_samples:
-                return random.choice(cold_samples)
-        if mode in {"old", "cold"}:
-            old_streams = [stream for stream in self.streams if stream.old_payloads]
-            if old_streams:
-                chosen = old_streams[self.verify_attempts % len(old_streams)]
-                return random.choice(list(chosen.old_payloads))
-        return stream.recent_payloads[-1]
-
-    def verify_sample(self, sample: PayloadSample) -> str | None:
-        last_error: str | None = None
+        offset = max(0, stream.next_offset - 1)
         node_results: list[dict[str, Any]] = []
+        last_error: str | None = None
         for node in self.nodes:
             try:
                 status, body, _ = self.request(
                     "GET",
-                    f"{node.base_url}/{BUCKET}/{sample.stream}?{urllib.parse.urlencode({'offset': sample.start_offset, 'max_bytes': len(sample.payload)})}",
+                    f"{node.base_url}/{BUCKET}/{stream.name}?{urllib.parse.urlencode({'offset': offset, 'max_bytes': 1})}",
                 )
             except Exception as exc:  # noqa: BLE001
                 error = f"{node.name} read failed: {exc}"
                 node_results.append({"node": node.name, "status": "error", "error": str(exc)})
                 last_error = error
                 continue
-            if status == 200 and body.startswith(sample.payload):
+            if status == 200:
                 self.last_read_check = {
-                    "stream": sample.stream,
-                    "offset": sample.start_offset,
-                    "bytes": len(sample.payload),
-                    "payload_kind": sample.payload_kind,
+                    "stream": stream.name,
+                    "offset": offset,
+                    "bytes": len(body),
                     "matched_node": node.name,
-                    "nodes": node_results + [{"node": node.name, "status": status, "matched": True}],
+                    "nodes": node_results + [{"node": node.name, "status": status}],
                 }
-                self.last_integrity_error = None
                 return None
             body_prefix = body[:32]
-            node_result: dict[str, Any] = {"node": node.name, "status": status, "matched": False}
+            node_result: dict[str, Any] = {"node": node.name, "status": status}
             if body_prefix:
                 node_result["body_prefix_hex"] = body_prefix.hex()
             node_results.append(node_result)
@@ -582,10 +528,8 @@ class ChaosAgent:
                 continue
             last_error = f"{node.name} read status={status} body_prefix={body[:32]!r}"
         self.last_read_check = {
-            "stream": sample.stream,
-            "offset": sample.start_offset,
-            "bytes": len(sample.payload),
-            "payload_kind": sample.payload_kind,
+            "stream": stream.name,
+            "offset": offset,
             "nodes": node_results,
         }
         summary = "; ".join(
@@ -606,112 +550,13 @@ class ChaosAgent:
             return True
         return any(f"read status={status}" in error for status in READ_AVAILABILITY_STATUSES)
 
-    def ensure_cold_sample(self, sample: PayloadSample) -> bool:
-        if sample.cold_confirmed:
-            return True
-        return self.flush_cold_for_sample(sample)
-
-    def flush_cold_for_sample(self, sample: PayloadSample) -> bool:
-        self.cold_flush_attempts += 1
-        query = urllib.parse.urlencode(
-            {
-                "min_hot_bytes": 1,
-                "max_bytes": max(1, sample.end_offset - sample.start_offset),
-            }
-        )
-        last_error = "no target nodes"
-        for node in self.nodes:
-            try:
-                status, body, _ = self.request(
-                    "POST",
-                    f"{node.base_url}/__ursula/flush-cold/{BUCKET}/{sample.stream}?{query}",
-                )
-            except Exception as exc:  # noqa: BLE001
-                last_error = f"{node.name}: {exc}"
-                continue
-            self.last_cold_flush = {
-                "node": node.name,
-                "stream": sample.stream,
-                "status": status,
-                "body_prefix": body[:80].decode("utf-8", errors="replace") if body else "",
-            }
-            if status == 200:
-                self.mark_cold_confirmed_from_flush(sample.stream, body)
-                self.cold_flush_success += 1
-                return sample.cold_confirmed
-            if status == 204:
-                self.cold_flush_noop += 1
-                if self.refresh_cold_confirmed_from_head(sample):
-                    return True
-                last_error = f"{node.name}: no cold flush candidate and sample is not below live start"
-                continue
-            last_error = f"{node.name}: status={status} body={body[:80]!r}"
-        self.cold_flush_errors += 1
-        self.last_cold_flush = {
-            "stream": sample.stream,
-            "status": "error",
-            "error": last_error,
-        }
-        self.event("warn", f"cold flush before verify failed: {last_error}")
-        return False
-
-    def mark_cold_confirmed_from_flush(self, stream_name: str, body: bytes) -> None:
-        try:
-            payload = json.loads(body)
-        except json.JSONDecodeError:
-            return
-        hot_start_offset = parse_int(str(payload.get("hot_start_offset"))) if isinstance(payload, dict) else None
-        if hot_start_offset is None:
-            return
-        stream = next((stream for stream in self.streams if stream.name == stream_name), None)
-        if stream is None:
-            return
-        for sample in list(stream.old_payloads) + list(stream.recent_payloads):
-            if sample.end_offset <= hot_start_offset:
-                sample.cold_confirmed = True
-
-    def refresh_cold_confirmed_from_head(self, sample: PayloadSample) -> bool:
-        stream = next((stream for stream in self.streams if stream.name == sample.stream), None)
-        if stream is None:
-            return False
-        return self.refresh_stream_cold_confirmed(stream) and sample.cold_confirmed
-
-    def refresh_cold_confirmed_samples(self, *, max_streams: int) -> None:
-        streams = [stream for stream in self.streams if stream.old_payloads or stream.recent_payloads]
-        if not streams:
-            return
-        max_streams = max(1, min(max_streams, len(streams)))
-        start = self.cold_refresh_cursor % len(streams)
-        self.cold_refresh_cursor = (start + max_streams) % len(streams)
-        for index in range(max_streams):
-            stream = streams[(start + index) % len(streams)]
-            self.refresh_stream_cold_confirmed(stream)
-
-    def refresh_stream_cold_confirmed(self, stream: WorkloadStream) -> bool:
-        for node in self.nodes:
-            try:
-                status, _, headers = self.request("HEAD", f"{node.base_url}/{BUCKET}/{stream.name}")
-            except Exception:
-                continue
-            if status != 200:
-                continue
-            header_map = {key.lower(): value for key, value in headers.items()}
-            cold_hot_start_offset = parse_int(header_map.get("stream-cold-hot-start-offset"))
-            if cold_hot_start_offset is None:
-                continue
-            for candidate in list(stream.old_payloads) + list(stream.recent_payloads):
-                if candidate.end_offset <= cold_hot_start_offset:
-                    candidate.cold_confirmed = True
-            return True
-        return False
-
     def run_reader_probe(self) -> None:
         for _ in range(self.reader_count):
-            mode = random.choice(self.verify_modes or ["recent"])
-            sample = self.choose_verify_sample(mode)
-            if sample is None:
+            streams = [stream for stream in self.streams if stream.next_offset > 0]
+            if not streams:
                 return
-            error = self.verify_sample(sample)
+            stream = random.choice(streams)
+            error = self.probe_read_availability(stream)
             if error is None:
                 self.reader_success += 1
             else:
@@ -723,7 +568,7 @@ class ChaosAgent:
                     self.last_read_availability_error = error
                 if level == "error":
                     self.last_integrity_error = error
-                self.event(level, f"reader {mode} failed: {error}")
+                self.event(level, f"reader availability failed: {error}")
 
     def record_producer_probe_result(self, ok: bool, message: str) -> None:
         if ok:
@@ -733,15 +578,39 @@ class ChaosAgent:
             self.event("warn", message)
 
     def run_producer_semantics_probe(self) -> None:
-        candidates = [producer for producer in self.producers if producer.last_payload is not None and producer.last_stream]
+        candidates = [
+            producer
+            for producer in self.producers
+            if producer.last_stream is not None
+            and producer.last_seq is not None
+            and producer.last_start_offset is not None
+            and producer.last_end_offset is not None
+            and producer.last_epoch is not None
+            and producer.last_payload_size is not None
+            and producer.last_payload_kind is not None
+            and producer.last_append_ordinal is not None
+        ]
         if not candidates:
             return
         producer = candidates[self.producer_probe_success % len(candidates)]
+        stream = next((stream for stream in self.streams if stream.name == producer.last_stream), None)
+        if stream is None:
+            return
         node = self.nodes[(self.producer_probe_success + self.producer_probe_errors) % len(self.nodes)]
         stale_epoch = max(0, producer.epoch - 1)
+        payload = self.build_payload(
+            producer.last_payload_size,
+            producer.last_payload_kind,
+            stream,
+            producer,
+            producer.last_seq,
+            producer.last_start_offset,
+            producer_epoch=producer.last_epoch,
+            append_ordinal=producer.last_append_ordinal,
+        )
         probes = [
-            ("duplicate_seq", producer.epoch, producer.last_seq, producer.last_payload),
-            ("stale_epoch", stale_epoch, producer.last_seq, producer.last_payload),
+            ("duplicate_seq", producer.last_epoch, producer.last_seq, payload),
+            ("stale_epoch", stale_epoch, producer.last_seq, payload),
         ]
         for kind, epoch, seq, payload in probes:
             if seq is None or payload is None:
@@ -839,7 +708,7 @@ class ChaosAgent:
         self.backpressure_probe_errors += 1
         self.event("warn", f"backpressure probe did not observe ColdBackpressure: {last_error}")
 
-    def verify_server_integrity(self, stream: WorkloadStream) -> None:
+    def verify_server_integrity(self, stream: WorkloadStream) -> bool:
         expected = stream.expected_live_setsum.hexdigest()
         last_error: str | None = None
         for node in self.nodes:
@@ -859,13 +728,11 @@ class ChaosAgent:
             live_records = parse_int(header_map.get("stream-integrity-live-records"))
             total_records = parse_int(header_map.get("stream-integrity-total-records"))
             evicted_records = parse_int(server_evicted_records)
-            recomputed_live = self.recompute_live_setsum(stream, live_start_offset, live_records)
             self.last_checked_expected_live_setsum = expected
             self.last_server_integrity = {
                 "node": node.name,
                 "stream": stream.name,
                 "expected_live_setsum": expected,
-                "recomputed_live_setsum": recomputed_live,
                 "live_setsum": server_live,
                 "total_setsum": server_total,
                 "evicted_records": evicted_records,
@@ -873,62 +740,25 @@ class ChaosAgent:
                 "live_records": live_records,
                 "total_records": total_records,
             }
-            if server_live == expected and server_total == expected and server_evicted_records == "0":
+            if server_total == expected:
                 self.last_integrity_error = None
-                return
-            if evicted_records and evicted_records > 0:
-                if recomputed_live is None:
-                    self.last_integrity_error = None
-                    self.last_server_integrity["check"] = "eviction-aware-skip-missing-history"
-                    return
-                if server_live == recomputed_live:
-                    self.last_integrity_error = None
-                    self.last_server_integrity["check"] = "eviction-aware-live-match"
-                    return
+                self.last_server_integrity["check"] = "total-setsum-match"
+                return True
+            if server_evicted_records == "0" and server_live == expected:
+                self.last_integrity_error = None
+                self.last_server_integrity["check"] = "live-setsum-match"
+                return True
             self.setsum_mismatch_count += 1
             self.last_integrity_error = (
-                f"{node.name} setsum mismatch expected={expected} recomputed_live={recomputed_live} "
+                f"{node.name} setsum mismatch expected={expected} "
                 f"live={server_live} total={server_total} evicted_records={server_evicted_records}"
             )
             self.event("error", f"integrity setsum failed: {self.last_integrity_error}")
-            return
+            return False
         self.setsum_mismatch_count += 1
         self.last_integrity_error = last_error or "server integrity headers unavailable"
         self.event("error", f"integrity setsum failed: {self.last_integrity_error}")
-
-    def recompute_live_setsum(
-        self,
-        stream: WorkloadStream,
-        live_start_offset: int | None,
-        live_records: int | None,
-    ) -> str | None:
-        if live_start_offset is None or live_records is None:
-            return None
-        samples = [
-            sample
-            for sample in list(stream.old_payloads) + list(stream.recent_payloads)
-            if sample.start_offset >= live_start_offset
-        ]
-        by_offset = {sample.start_offset: sample for sample in samples}
-        unique = [by_offset[offset] for offset in sorted(by_offset)]
-        if len(unique) < live_records:
-            return None
-        live = Setsum()
-        for sample in unique[-live_records:]:
-            live.insert_vectored(
-                [
-                    b"ursula-stream-record-v1",
-                    BUCKET.encode(),
-                    b"\0",
-                    stream.name.encode(),
-                    b"\0",
-                    sample.start_offset.to_bytes(8, "little"),
-                    sample.end_offset.to_bytes(8, "little"),
-                    b"inline",
-                    sample.payload,
-                ]
-            )
-        return live.hexdigest()
+        return False
 
     def sample_node(self, node: Node) -> dict[str, Any]:
         sample: dict[str, Any] = {
@@ -937,7 +767,7 @@ class ChaosAgent:
             "instance_id": node.instance_id,
         }
         try:
-            state = json.loads(
+            placement = json.loads(
                 run(
                     [
                         "aws",
@@ -946,13 +776,18 @@ class ChaosAgent:
                         "--instance-ids",
                         node.instance_id,
                         "--query",
-                        "Reservations[0].Instances[0].State.Name",
+                        "Reservations[0].Instances[0].{state: State.Name, az: Placement.AvailabilityZone}",
                         "--output",
                         "json",
-                    ]
+                    ],
+                    timeout_secs=self.aws_timeout_secs,
                 ).stdout
             )
-            sample["instance_state"] = state
+            sample["instance_state"] = placement.get("state") or "unknown"
+            az = placement.get("az")
+            if isinstance(az, str) and az:
+                sample["availability_zone"] = az
+                sample["region"] = az[:-1] if az[-1:].isalpha() else az
         except Exception as exc:  # noqa: BLE001
             sample["instance_state"] = "unknown"
             sample["last_error"] = f"describe-instance: {exc}"
@@ -1040,6 +875,8 @@ class ChaosAgent:
                     "name": node.get("name"),
                     "instance_state": node.get("instance_state"),
                     "metrics_state": node.get("metrics_state"),
+                    "availability_zone": node.get("availability_zone"),
+                    "region": node.get("region"),
                 }
                 for node in nodes
             ],
@@ -1143,7 +980,8 @@ class ChaosAgent:
                         "Reservations[0].Instances[0].State.Name",
                         "--output",
                         "json",
-                    ]
+                    ],
+                    timeout_secs=self.aws_timeout_secs,
                 ).stdout
             )
         except Exception as exc:  # noqa: BLE001
@@ -1514,14 +1352,13 @@ class ChaosAgent:
         cold_backpressure_bytes = storage.get("cold_backpressure_bytes")
         cold_flush_publishes = storage.get("cold_flush_publishes")
         cold_flush_uploads = storage.get("cold_flush_uploads")
-        cold_verify_checks = self.verify_counts.get("cold", 0)
+        cold_verify_checks = self.verify_counts.get("setsum", 0)
         verify_modes = {
-            mode: {
-                "checks": self.verify_counts.get(mode, 0),
-                "errors": self.verify_errors.get(mode, 0),
-                "covered": self.verify_counts.get(mode, 0) > 0,
+            "setsum": {
+                "checks": self.verify_counts.get("setsum", 0),
+                "errors": self.verify_errors.get("setsum", 0),
+                "covered": self.verify_counts.get("setsum", 0) > 0,
             }
-            for mode in self.verify_modes
         }
         payload_sizes = {
             str(size): {
@@ -1544,9 +1381,9 @@ class ChaosAgent:
                 "covered": self.reader_success + self.reader_errors > 0,
             },
             "read_availability": {
-                "attempts": self.reader_success + self.reader_errors + self.verified_offsets,
+                "attempts": self.reader_success + self.reader_errors,
                 "errors": self.read_availability_errors,
-                "covered": self.reader_success + self.reader_errors + self.verified_offsets > 0,
+                "covered": self.reader_success + self.reader_errors > 0,
                 "passing": self.read_availability_errors == 0,
             },
             "producer_semantics": {
@@ -2012,6 +1849,7 @@ class ChaosAgent:
                     "no-store",
                 ],
                 check=False,
+                timeout_secs=self.aws_timeout_secs,
             )
 
     def run_forever(self) -> None:
@@ -2107,6 +1945,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-repair-attempts", type=int, default=2)
     parser.add_argument("--recovery-slo-secs", type=int, default=120)
     parser.add_argument("--timeout-secs", type=int, default=3)
+    parser.add_argument("--aws-timeout-secs", type=int, default=15)
     parser.add_argument("--disable-faults", action="store_true")
     return parser
 

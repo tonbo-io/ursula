@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::mpsc;
-use std::time::Instant;
+
+use crate::rt::time::Instant;
 
 use openraft::OptionalSend;
 use openraft::alias::EntryOf;
@@ -192,6 +193,7 @@ impl RaftGroupFileLogStore {
 }
 
 impl CoreFileLogWriter {
+    #[cfg(not(madsim))]
     pub(crate) fn shared(journal_path: impl Into<PathBuf>) -> Result<Arc<Self>, io::Error> {
         let journal_path = journal_path.into();
         if let Some(parent) = journal_path.parent() {
@@ -207,6 +209,15 @@ impl CoreFileLogWriter {
             .spawn(move || run_core_file_log_writer(journal_path, rx))
             .map_err(|err| io::Error::other(format!("spawn core file log writer: {err}")))?;
         Ok(writer)
+    }
+
+    #[cfg(madsim)]
+    pub(crate) fn shared(_journal_path: impl Into<PathBuf>) -> Result<Arc<Self>, io::Error> {
+        panic!(
+            "CoreFileLogWriter::shared spawns an OS thread and is unavailable under cfg(madsim); \
+             the simulator must use memory-backed log stores via RaftGroupEngineFactory / \
+             RegisteredRaftGroupEngineFactory / MadsimScopedRaftGroupEngineFactory"
+        );
     }
 
     pub(crate) fn journal_path(&self) -> &Path {

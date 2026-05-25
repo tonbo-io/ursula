@@ -1,11 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
+use crate::rt::time::Instant;
 use bytes::Bytes;
-use tokio::sync::{Semaphore, mpsc, oneshot};
-use tokio::task::JoinSet;
 use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardId, ShardPlacement, StaticShardMap};
 use ursula_stream::{ColdChunkRef, ColdFlushCandidate, StreamErrorCode};
 
@@ -29,6 +27,10 @@ use crate::request::{
     PublishSnapshotResponse, ReadSnapshotRequest, ReadSnapshotResponse, ReadStreamRequest,
     ReadStreamResponse,
 };
+use crate::rt::sync::{Semaphore, mpsc, oneshot};
+
+#[cfg(not(madsim))]
+use tokio::task::JoinSet;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -42,11 +44,15 @@ pub struct RuntimeConfig {
 
 impl RuntimeConfig {
     pub fn new(core_count: usize, raft_group_count: usize) -> Self {
+        #[cfg(not(madsim))]
+        let threading = RuntimeThreading::ThreadPerCore;
+        #[cfg(madsim)]
+        let threading = RuntimeThreading::HostedTokio;
         Self {
             core_count,
             raft_group_count,
             mailbox_capacity: 1024,
-            threading: RuntimeThreading::ThreadPerCore,
+            threading,
             cold_max_hot_bytes_per_group: None,
             live_read_max_waiters_per_core: Some(65_536),
         }
@@ -65,6 +71,7 @@ impl RuntimeConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeThreading {
+    #[cfg(not(madsim))]
     ThreadPerCore,
     HostedTokio,
 }
@@ -760,6 +767,14 @@ impl ShardRuntime {
         Ok(responses)
     }
 
+    #[cfg(madsim)]
+    pub async fn flush_cold_candidates_batch_for_simulation(
+        &self,
+        candidates: Vec<ColdFlushCandidate>,
+    ) -> Result<Vec<FlushColdResponse>, RuntimeError> {
+        self.flush_cold_candidates_batch(candidates).await
+    }
+
     pub async fn flush_cold_all_groups_once(
         &self,
         request: PlanGroupColdFlushRequest,
@@ -776,41 +791,48 @@ impl ShardRuntime {
         if max_concurrency == 1 {
             return self.flush_cold_all_groups_once_serial(request).await;
         }
-        let mut flushed = 0;
-        let mut next_group_id = 0;
-        let group_count = self.shard_map.raft_group_count();
-        let mut tasks = JoinSet::new();
+        #[cfg(madsim)]
+        {
+            return self.flush_cold_all_groups_once_serial(request).await;
+        }
+        #[cfg(not(madsim))]
+        {
+            let mut flushed = 0;
+            let mut next_group_id = 0;
+            let group_count = self.shard_map.raft_group_count();
+            let mut tasks = JoinSet::new();
 
-        while next_group_id < group_count || !tasks.is_empty() {
-            while next_group_id < group_count && tasks.len() < max_concurrency {
-                let runtime = self.clone();
-                let request = request.clone();
-                let group_id = RaftGroupId(next_group_id);
-                next_group_id += 1;
-                tasks.spawn(async move {
-                    runtime
-                        .flush_cold_group_batch_once(
-                            group_id,
-                            request,
-                            COLD_FLUSH_GROUP_BATCH_MAX_CHUNKS,
-                        )
-                        .await
-                        .map(|responses| responses.len())
-                });
-            }
-            if let Some(result) = tasks.join_next().await {
-                match result {
-                    Ok(Ok(count)) => flushed += count,
-                    Ok(Err(err)) => return Err(err),
-                    Err(err) => {
-                        return Err(RuntimeError::ColdStoreIo {
-                            message: format!("cold flush task failed: {err}"),
-                        });
+            while next_group_id < group_count || !tasks.is_empty() {
+                while next_group_id < group_count && tasks.len() < max_concurrency {
+                    let runtime = self.clone();
+                    let request = request.clone();
+                    let group_id = RaftGroupId(next_group_id);
+                    next_group_id += 1;
+                    tasks.spawn(async move {
+                        runtime
+                            .flush_cold_group_batch_once(
+                                group_id,
+                                request,
+                                COLD_FLUSH_GROUP_BATCH_MAX_CHUNKS,
+                            )
+                            .await
+                            .map(|responses| responses.len())
+                    });
+                }
+                if let Some(result) = tasks.join_next().await {
+                    match result {
+                        Ok(Ok(count)) => flushed += count,
+                        Ok(Err(err)) => return Err(err),
+                        Err(err) => {
+                            return Err(RuntimeError::ColdStoreIo {
+                                message: format!("cold flush task failed: {err}"),
+                            });
+                        }
                     }
                 }
             }
+            Ok(flushed)
         }
-        Ok(flushed)
     }
 
     async fn flush_cold_all_groups_once_serial(
@@ -907,6 +929,58 @@ impl ShardRuntime {
             mailbox,
             CoreCommand::InstallGroupSnapshot {
                 snapshot,
+                response_tx,
+            },
+            response_rx,
+        )
+        .await
+    }
+
+    #[cfg(madsim)]
+    pub async fn shutdown_group_engine_for_simulation(
+        &self,
+        placement: ShardPlacement,
+    ) -> Result<(), RuntimeError> {
+        let expected = self.placement_for_group(placement.raft_group_id)?;
+        if placement != expected {
+            return Err(RuntimeError::SnapshotPlacementMismatch {
+                expected,
+                actual: placement,
+            });
+        }
+        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send_core_command(
+            mailbox,
+            CoreCommand::ShutdownGroupEngine {
+                placement,
+                response_tx,
+            },
+            response_rx,
+        )
+        .await
+    }
+
+    #[cfg(madsim)]
+    pub async fn install_group_engine_for_simulation(
+        &self,
+        placement: ShardPlacement,
+        engine: Box<dyn crate::engine::GroupEngine>,
+    ) -> Result<(), RuntimeError> {
+        let expected = self.placement_for_group(placement.raft_group_id)?;
+        if placement != expected {
+            return Err(RuntimeError::SnapshotPlacementMismatch {
+                expected,
+                actual: placement,
+            });
+        }
+        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send_core_command(
+            mailbox,
+            CoreCommand::InstallGroupEngine {
+                placement,
+                engine,
                 response_tx,
             },
             response_rx,
@@ -1017,25 +1091,28 @@ impl ShardRuntime {
 }
 
 fn spawn_core_worker(threading: RuntimeThreading, worker: CoreWorker) -> Result<(), RuntimeError> {
-    let core_id = worker.core_id;
     match threading {
         RuntimeThreading::HostedTokio => {
-            tokio::spawn(worker.run());
+            crate::rt::spawn(worker.run());
             Ok(())
         }
-        RuntimeThreading::ThreadPerCore => std::thread::Builder::new()
-            .name(format!("ursula-core-{}", core_id.0))
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("build per-core tokio runtime");
-                runtime.block_on(worker.run());
-            })
-            .map(|_| ())
-            .map_err(|err| RuntimeError::SpawnCoreThread {
-                core_id,
-                message: err.to_string(),
-            }),
+        #[cfg(not(madsim))]
+        RuntimeThreading::ThreadPerCore => {
+            let core_id = worker.core_id;
+            std::thread::Builder::new()
+                .name(format!("ursula-core-{}", core_id.0))
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build per-core tokio runtime");
+                    runtime.block_on(worker.run());
+                })
+                .map(|_| ())
+                .map_err(|err| RuntimeError::SpawnCoreThread {
+                    core_id,
+                    message: err.to_string(),
+                })
+        }
     }
 }

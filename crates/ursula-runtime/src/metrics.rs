@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+
+use crate::rt::time::Instant;
 
 use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardPlacement};
 

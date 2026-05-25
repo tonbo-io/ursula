@@ -141,8 +141,8 @@ pub enum GroupReadStreamBody {
     },
     #[cfg(test)]
     Blocking {
-        entered: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
+        entered: Arc<crate::rt::sync::Notify>,
+        release: Arc<crate::rt::sync::Notify>,
         payload: Vec<u8>,
     },
 }

@@ -11,6 +11,7 @@ description = "OpenRaft integration for Ursula's per-group multi-Raft replicatio
 
 [dependencies]
 futures-util = "0.3"
+openraft-rt = "0.10.0-alpha.20"
 openraft = { version = "0.10.0-alpha.20", default-features = false, features = ["tokio-rt", "type-alias", "serde"] }
 prost = "0.13"
 serde = { version = "1.0", features = ["derive"] }
@@ -25,5 +26,14 @@ ursula-shard = { path = "../ursula-shard", version = "0.1.0" }
 protoc-bin-vendored = "3"
 tonic-build = { version = "0.12", features = ["prost"] }
 
+[target.'cfg(madsim)'.dependencies]
+madsim = "0.2.34"
+pin-project-lite = "0.2"
+rand = { version = "0.10", features = ["std", "std_rng", "thread_rng"], default-features = false }
+sim-tokio = { package = "madsim-tokio", version = "0.2.30", features = ["macros", "rt", "sync", "time"] }
+
 [dev-dependencies]
 tokio = { version = "1.39", features = ["macros", "rt"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }

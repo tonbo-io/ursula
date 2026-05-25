@@ -24,10 +24,12 @@ mod error;
 mod group_actor;
 mod metrics;
 mod request;
+mod rt;
 mod runtime;
 
 pub use cold_store::{
-    ColdReadCacheConfig, ColdStore, ColdStoreHandle, ColdStoreInfo, new_cold_chunk_path,
+    ColdReadCacheConfig, ColdStore, ColdStoreEvent, ColdStoreFault, ColdStoreFaultContext,
+    ColdStoreFaultEffect, ColdStoreHandle, ColdStoreInfo, ColdStoreOperation, new_cold_chunk_path,
     new_external_payload_path,
 };
 pub use command::{GroupSnapshot, GroupWriteCommand};
@@ -42,7 +44,8 @@ pub use engine::{
     GroupLeaderHint, GroupPlanColdFlushFuture, GroupPlanNextColdFlushBatchFuture,
     GroupPlanNextColdFlushFuture, GroupPublishSnapshotFuture, GroupReadSnapshotFuture,
     GroupReadStreamFuture, GroupReadStreamPartsFuture, GroupRequireLiveReadOwnerFuture,
-    GroupSnapshotFuture, GroupTouchStreamAccessFuture, GroupWriteBatchFuture, GroupWriteResponse,
+    GroupShutdownFuture, GroupSnapshotFuture, GroupTouchStreamAccessFuture, GroupWriteBatchFuture,
+    GroupWriteResponse,
 };
 pub use error::RuntimeError;
 pub use metrics::{RuntimeMailboxSnapshot, RuntimeMetrics, RuntimeMetricsSnapshot};

@@ -1,0 +1,3683 @@
+[
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 54,
+      "scenario": "http_producer_protocol_surface",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-54-http-producer-protocol-surface"
+      },
+      "fault_plan": {
+        "steps": []
+      }
+    },
+    "outcome": {
+      "seed": 54,
+      "leader_id": 0,
+      "target_node_id": null,
+      "appended_log_index": 0,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 54
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-54-http-producer-protocol-surface"
+            }
+          },
+          {
+            "event": "http_producer_protocol_surface_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-54-http-producer-protocol-surface"
+            },
+            "producer_count": 2,
+            "final_next_offset": 6,
+            "gap_expected_seq": 1,
+            "stale_epoch": 0
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 146,
+      "scenario": "runtime_raft_network",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-146-runtime-raft-network-randomized"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "runtime_raft_network_workload",
+            "action": {
+              "action": "run_runtime_raft_network_workload",
+              "plan": {
+                "stream_count": 2,
+                "append_batch_lens": [
+                  3,
+                  2
+                ],
+                "failover_batch_lens": [
+                  2,
+                  2
+                ],
+                "producer_sessions": true,
+                "concurrent_producers": true
+              }
+            }
+          },
+          {
+            "phase": "after_recovery_read",
+            "action": {
+              "action": "verify_runtime_cold_live_reads"
+            }
+          },
+          {
+            "phase": "before_cold_write",
+            "action": {
+              "action": "delay_next_cold_write",
+              "delay_ms": 125
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 146,
+      "leader_id": 1,
+      "target_node_id": null,
+      "appended_log_index": 11,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 146
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-146-runtime-raft-network-randomized"
+            }
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-146-runtime-raft-network-randomized-s1"
+            }
+          },
+          {
+            "event": "runtime_raft_network_built",
+            "core_count": 1,
+            "raft_group_count": 1,
+            "raft_node_count": 3,
+            "leader_id": 1
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-146-runtime-raft-network-randomized"
+            },
+            "start_offset": 0,
+            "next_offset": 27,
+            "group_commit_index": 5
+          },
+          {
+            "event": "runtime_raft_network_producer_duplicate_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-146-runtime-raft-network-randomized"
+            },
+            "producer_id": "sim-writer-146-0",
+            "producer_seq": 0,
+            "item_count": 3
+          },
+          {
+            "event": "runtime_raft_network_concurrent_producers_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-146-runtime-raft-network-randomized"
+            },
+            "producer_count": 2,
+            "start_offset": 27,
+            "next_offset": 45
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-146-runtime-raft-network-randomized"
+            },
+            "start_offset": 27,
+            "next_offset": 45,
+            "group_commit_index": 7
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-146-runtime-raft-network-randomized-s1"
+            },
+            "start_offset": 0,
+            "next_offset": 18,
+            "group_commit_index": 9
+          },
+          {
+            "event": "runtime_raft_network_producer_duplicate_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-146-runtime-raft-network-randomized-s1"
+            },
+            "producer_id": "sim-writer-146-1",
+            "producer_seq": 0,
+            "item_count": 2
+          },
+          {
+            "event": "runtime_raft_network_concurrent_producers_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-146-runtime-raft-network-randomized-s1"
+            },
+            "producer_count": 2,
+            "start_offset": 18,
+            "next_offset": 36
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-146-runtime-raft-network-randomized-s1"
+            },
+            "start_offset": 18,
+            "next_offset": 36,
+            "group_commit_index": 11
+          },
+          {
+            "event": "runtime_raft_network_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-146-runtime-raft-network-randomized"
+            },
+            "next_offset": 45,
+            "raft_write_many_batches": 7,
+            "raft_apply_entries": 19,
+            "delivered_rpc_count": 1
+          },
+          {
+            "event": "runtime_raft_network_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-146-runtime-raft-network-randomized-s1"
+            },
+            "next_offset": 36,
+            "raft_write_many_batches": 7,
+            "raft_apply_entries": 19,
+            "delivered_rpc_count": 1
+          },
+          {
+            "event": "fault_applied",
+            "phase": "before_cold_write"
+          },
+          {
+            "event": "runtime_raft_network_cold_write_delay_verified",
+            "stream_count": 2,
+            "delay_ms": 125,
+            "upload_count": 8,
+            "publish_count": 8
+          },
+          {
+            "event": "runtime_raft_network_cold_live_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-146-runtime-raft-network-randomized"
+            },
+            "next_offset": 45,
+            "flushed_count": 8,
+            "upload_count": 8,
+            "publish_count": 8
+          },
+          {
+            "event": "runtime_raft_network_cold_live_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-146-runtime-raft-network-randomized-s1"
+            },
+            "next_offset": 36,
+            "flushed_count": 8,
+            "upload_count": 8,
+            "publish_count": 8
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 55,
+      "scenario": "http_live_limit_protocol_surface",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-55-http-live-limit-protocol-surface"
+      },
+      "fault_plan": {
+        "steps": []
+      }
+    },
+    "outcome": {
+      "seed": 55,
+      "leader_id": 0,
+      "target_node_id": null,
+      "appended_log_index": 0,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 55
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-55-http-live-limit-protocol-surface"
+            }
+          },
+          {
+            "event": "http_live_limit_protocol_surface_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-55-http-live-limit-protocol-surface"
+            },
+            "timeout_next_offset": 0,
+            "backpressure_events": 1
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 56,
+      "scenario": "http_live_protocol_surface",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-56-http-live-protocol-surface"
+      },
+      "fault_plan": {
+        "steps": []
+      }
+    },
+    "outcome": {
+      "seed": 56,
+      "leader_id": 0,
+      "target_node_id": null,
+      "appended_log_index": 0,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 56
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-56-http-live-protocol-surface"
+            }
+          },
+          {
+            "event": "http_live_protocol_surface_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-56-http-live-protocol-surface"
+            },
+            "long_poll_next_offset": 4,
+            "sse_next_offset": 7
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 57,
+      "scenario": "http_protocol_surface",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-57-http-protocol-surface"
+      },
+      "fault_plan": {
+        "steps": []
+      }
+    },
+    "outcome": {
+      "seed": 57,
+      "leader_id": 0,
+      "target_node_id": null,
+      "appended_log_index": 0,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 57
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-57-http-protocol-surface"
+            }
+          },
+          {
+            "event": "http_snapshot_protocol_surface_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-57-http-protocol-surface"
+            },
+            "snapshot_offset": 1,
+            "next_offset": 2
+          },
+          {
+            "event": "http_protocol_surface_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-57-http-protocol-surface"
+            },
+            "next_offset": 2,
+            "expired_at_ms": 2000
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 58,
+      "scenario": "cold_delete_fault",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-58-cold-delete-fault"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "before_cold_cleanup",
+            "action": {
+              "action": "fail_next_cold_delete"
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 58,
+      "leader_id": 0,
+      "target_node_id": null,
+      "appended_log_index": 0,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 58
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-58-cold-delete-fault"
+            }
+          },
+          {
+            "event": "fault_applied",
+            "phase": "before_cold_cleanup"
+          },
+          {
+            "event": "cold_delete_fault_observed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-58-cold-delete-fault"
+            },
+            "cleanup_attempts": 1,
+            "cleanup_errors": 1
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 59,
+      "scenario": "cold_write_delay",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-59-cold-write-delay"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "before_cold_write",
+            "action": {
+              "action": "delay_next_cold_write",
+              "delay_ms": 250
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 59,
+      "leader_id": 1,
+      "target_node_id": 1,
+      "appended_log_index": 3,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 59
+          },
+          {
+            "event": "leader_elected",
+            "leader_id": 1
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-59-cold-write-delay"
+            }
+          },
+          {
+            "event": "fault_applied",
+            "phase": "before_cold_write"
+          },
+          {
+            "event": "cold_write_delay_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-59-cold-write-delay"
+            },
+            "delay_ms": 250
+          },
+          {
+            "event": "cold_chunk_written",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-59-cold-write-delay"
+            },
+            "start_offset": 0,
+            "end_offset": 4
+          },
+          {
+            "event": "cold_flushed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-59-cold-write-delay"
+            },
+            "hot_start_offset": 4,
+            "log_index": 3
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 60,
+      "scenario": "no_fault_baseline",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-60-no-fault"
+      },
+      "fault_plan": {
+        "steps": []
+      }
+    },
+    "outcome": {
+      "seed": 60,
+      "leader_id": 1,
+      "target_node_id": null,
+      "appended_log_index": 2,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 60
+          },
+          {
+            "event": "leader_elected",
+            "leader_id": 1
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-60-no-fault"
+            }
+          },
+          {
+            "event": "append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-60-no-fault"
+            },
+            "log_index": 2
+          },
+          {
+            "event": "all_nodes_applied",
+            "log_index": 2
+          },
+          {
+            "event": "all_nodes_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-60-no-fault"
+            }
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 61,
+      "scenario": "partition_heal",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-61-partition-heal"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "before_append",
+            "action": {
+              "action": "partition_seeded_follower"
+            }
+          },
+          {
+            "phase": "after_isolated_lag",
+            "action": {
+              "action": "heal_seeded_follower"
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 61,
+      "leader_id": 1,
+      "target_node_id": 2,
+      "appended_log_index": 2,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 61
+          },
+          {
+            "event": "leader_elected",
+            "leader_id": 1
+          },
+          {
+            "event": "fault_applied",
+            "phase": "before_append"
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-61-partition-heal"
+            }
+          },
+          {
+            "event": "append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-61-partition-heal"
+            },
+            "log_index": 2
+          },
+          {
+            "event": "majority_applied",
+            "log_index": 2
+          },
+          {
+            "event": "isolated_follower_lagged",
+            "node_id": 2,
+            "log_index": 2
+          },
+          {
+            "event": "fault_applied",
+            "phase": "after_isolated_lag"
+          },
+          {
+            "event": "follower_caught_up",
+            "node_id": 2,
+            "log_index": 2
+          },
+          {
+            "event": "follower_read_verified",
+            "node_id": 2,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-61-partition-heal"
+            }
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 62,
+      "scenario": "snapshot_catch_up",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-62-snapshot-catch-up"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "after_append",
+            "action": {
+              "action": "create_leader_snapshot"
+            }
+          },
+          {
+            "phase": "after_snapshot",
+            "action": {
+              "action": "purge_leader_log"
+            }
+          },
+          {
+            "phase": "after_purge",
+            "action": {
+              "action": "add_lagging_learner",
+              "node_id": 3
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 62,
+      "leader_id": 1,
+      "target_node_id": 3,
+      "appended_log_index": 2,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 62
+          },
+          {
+            "event": "leader_elected",
+            "leader_id": 1
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-62-snapshot-catch-up"
+            }
+          },
+          {
+            "event": "append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-62-snapshot-catch-up"
+            },
+            "log_index": 2
+          },
+          {
+            "event": "majority_applied",
+            "log_index": 2
+          },
+          {
+            "event": "snapshot_created",
+            "log_index": 2
+          },
+          {
+            "event": "log_purged",
+            "log_index": 2
+          },
+          {
+            "event": "learner_added",
+            "node_id": 3,
+            "log_index": 4
+          },
+          {
+            "event": "full_snapshot_transferred",
+            "node_id": 3,
+            "count": 1
+          },
+          {
+            "event": "follower_caught_up",
+            "node_id": 3,
+            "log_index": 4
+          },
+          {
+            "event": "snapshot_catch_up_read_verified",
+            "node_id": 3,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-62-snapshot-catch-up"
+            }
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 63,
+      "scenario": "restart_follower",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-63-restart-follower"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "before_append",
+            "action": {
+              "action": "stop_seeded_follower"
+            }
+          },
+          {
+            "phase": "after_majority_commit",
+            "action": {
+              "action": "restart_stopped_follower"
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 63,
+      "leader_id": 1,
+      "target_node_id": 2,
+      "appended_log_index": 2,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 63
+          },
+          {
+            "event": "leader_elected",
+            "leader_id": 1
+          },
+          {
+            "event": "node_stopped",
+            "node_id": 2
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-63-restart-follower"
+            }
+          },
+          {
+            "event": "append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-63-restart-follower"
+            },
+            "log_index": 2
+          },
+          {
+            "event": "majority_applied",
+            "log_index": 2
+          },
+          {
+            "event": "node_restarted",
+            "node_id": 2
+          },
+          {
+            "event": "follower_caught_up",
+            "node_id": 2,
+            "log_index": 2
+          },
+          {
+            "event": "restarted_node_read_verified",
+            "node_id": 2,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-63-restart-follower"
+            }
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 64,
+      "scenario": "cold_live_read",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-64-cold-live-read"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "after_append",
+            "action": {
+              "action": "write_cold_chunk",
+              "start_offset": 0,
+              "end_offset": 4
+            }
+          },
+          {
+            "phase": "after_cold_write",
+            "action": {
+              "action": "publish_cold_flush",
+              "start_offset": 0,
+              "end_offset": 4
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 64,
+      "leader_id": 1,
+      "target_node_id": null,
+      "appended_log_index": 3,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 64
+          },
+          {
+            "event": "leader_elected",
+            "leader_id": 1
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-64-cold-live-read"
+            }
+          },
+          {
+            "event": "cold_chunk_written",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-64-cold-live-read"
+            },
+            "start_offset": 0,
+            "end_offset": 4
+          },
+          {
+            "event": "cold_flushed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-64-cold-live-read"
+            },
+            "hot_start_offset": 4,
+            "log_index": 3
+          },
+          {
+            "event": "cold_live_read_verified",
+            "node_id": 1,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-64-cold-live-read"
+            }
+          },
+          {
+            "event": "cold_live_read_verified",
+            "node_id": 2,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-64-cold-live-read"
+            }
+          },
+          {
+            "event": "cold_live_read_verified",
+            "node_id": 3,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-64-cold-live-read"
+            }
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 65,
+      "scenario": "cold_read_fault",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-65-cold-read-fault"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "after_append",
+            "action": {
+              "action": "write_cold_chunk",
+              "start_offset": 0,
+              "end_offset": 4
+            }
+          },
+          {
+            "phase": "after_cold_write",
+            "action": {
+              "action": "publish_cold_flush",
+              "start_offset": 0,
+              "end_offset": 4
+            }
+          },
+          {
+            "phase": "before_cold_read",
+            "action": {
+              "action": "fail_next_cold_read"
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 65,
+      "leader_id": 1,
+      "target_node_id": 1,
+      "appended_log_index": 3,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 65
+          },
+          {
+            "event": "leader_elected",
+            "leader_id": 1
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-65-cold-read-fault"
+            }
+          },
+          {
+            "event": "cold_chunk_written",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-65-cold-read-fault"
+            },
+            "start_offset": 0,
+            "end_offset": 4
+          },
+          {
+            "event": "cold_flushed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-65-cold-read-fault"
+            },
+            "hot_start_offset": 4,
+            "log_index": 3
+          },
+          {
+            "event": "fault_applied",
+            "phase": "before_cold_read"
+          },
+          {
+            "event": "cold_read_fault_observed",
+            "node_id": 1,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-65-cold-read-fault"
+            },
+            "message": "cold store fault injected for read_object_range 'benchcmp/ursula-sim-schedule-65-cold-read-fault/chunks/seed-65-fault-000000.bin': seeded cold read fault"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 66,
+      "scenario": "cold_write_fault",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-66-cold-write-fault"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "before_cold_write",
+            "action": {
+              "action": "fail_next_cold_write"
+            }
+          },
+          {
+            "phase": "after_cold_write_failure",
+            "action": {
+              "action": "verify_hot_read_after_cold_write_failure"
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 66,
+      "leader_id": 1,
+      "target_node_id": null,
+      "appended_log_index": 2,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 66
+          },
+          {
+            "event": "leader_elected",
+            "leader_id": 1
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-66-cold-write-fault"
+            }
+          },
+          {
+            "event": "append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-66-cold-write-fault"
+            },
+            "log_index": 2
+          },
+          {
+            "event": "fault_applied",
+            "phase": "before_cold_write"
+          },
+          {
+            "event": "cold_write_fault_observed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-66-cold-write-fault"
+            },
+            "path": "benchcmp/ursula-sim-schedule-66-cold-write-fault/chunks/seed-66-write-fault-000000.bin",
+            "message": "cold store fault injected for write_chunk 'benchcmp/ursula-sim-schedule-66-cold-write-fault/chunks/seed-66-write-fault-000000.bin': seeded cold write fault"
+          },
+          {
+            "event": "hot_read_after_cold_write_failure_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-66-cold-write-fault"
+            }
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 67,
+      "scenario": "cold_read_delay",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-67-cold-read-delay"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "after_append",
+            "action": {
+              "action": "write_cold_chunk",
+              "start_offset": 0,
+              "end_offset": 4
+            }
+          },
+          {
+            "phase": "after_cold_write",
+            "action": {
+              "action": "publish_cold_flush",
+              "start_offset": 0,
+              "end_offset": 4
+            }
+          },
+          {
+            "phase": "before_cold_read",
+            "action": {
+              "action": "delay_next_cold_read",
+              "delay_ms": 250
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 67,
+      "leader_id": 1,
+      "target_node_id": 1,
+      "appended_log_index": 3,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 67
+          },
+          {
+            "event": "leader_elected",
+            "leader_id": 1
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-67-cold-read-delay"
+            }
+          },
+          {
+            "event": "cold_chunk_written",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-67-cold-read-delay"
+            },
+            "start_offset": 0,
+            "end_offset": 4
+          },
+          {
+            "event": "cold_flushed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-67-cold-read-delay"
+            },
+            "hot_start_offset": 4,
+            "log_index": 3
+          },
+          {
+            "event": "fault_applied",
+            "phase": "before_cold_read"
+          },
+          {
+            "event": "cold_read_delay_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-67-cold-read-delay"
+            },
+            "delay_ms": 250
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 68,
+      "scenario": "cold_read_truncate",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-68-cold-read-truncate"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "after_append",
+            "action": {
+              "action": "write_cold_chunk",
+              "start_offset": 0,
+              "end_offset": 4
+            }
+          },
+          {
+            "phase": "after_cold_write",
+            "action": {
+              "action": "publish_cold_flush",
+              "start_offset": 0,
+              "end_offset": 4
+            }
+          },
+          {
+            "phase": "before_cold_read",
+            "action": {
+              "action": "truncate_next_cold_read",
+              "returned_len": 2
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 68,
+      "leader_id": 1,
+      "target_node_id": 1,
+      "appended_log_index": 3,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 68
+          },
+          {
+            "event": "leader_elected",
+            "leader_id": 1
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-68-cold-read-truncate"
+            }
+          },
+          {
+            "event": "cold_chunk_written",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-68-cold-read-truncate"
+            },
+            "start_offset": 0,
+            "end_offset": 4
+          },
+          {
+            "event": "cold_flushed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-68-cold-read-truncate"
+            },
+            "hot_start_offset": 4,
+            "log_index": 3
+          },
+          {
+            "event": "fault_applied",
+            "phase": "before_cold_read"
+          },
+          {
+            "event": "cold_read_truncate_observed",
+            "node_id": 1,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-68-cold-read-truncate"
+            },
+            "requested_len": 4,
+            "returned_len": 2,
+            "message": "cold object 'benchcmp/ursula-sim-schedule-68-cold-read-truncate/chunks/seed-68-truncate-000000.bin' returned 2 bytes for requested range [0..4)"
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 69,
+      "scenario": "runtime_actor_scheduling",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-69-runtime-actor-scheduling"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "before_append",
+            "action": {
+              "action": "start_runtime_wait_read"
+            }
+          },
+          {
+            "phase": "before_append",
+            "action": {
+              "action": "delay_runtime_append",
+              "delay_ms": 50
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 69,
+      "leader_id": 0,
+      "target_node_id": null,
+      "appended_log_index": 2,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 69
+          },
+          {
+            "event": "runtime_actors_built",
+            "core_count": 2,
+            "raft_group_count": 4
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-69-runtime-actor-scheduling"
+            }
+          },
+          {
+            "event": "runtime_wait_read_started",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-69-runtime-actor-scheduling"
+            },
+            "offset": 0,
+            "max_len": 3
+          },
+          {
+            "event": "runtime_append_after_delay",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-69-runtime-actor-scheduling"
+            },
+            "delay_ms": 50
+          },
+          {
+            "event": "runtime_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-69-runtime-actor-scheduling"
+            },
+            "start_offset": 0,
+            "next_offset": 3
+          },
+          {
+            "event": "runtime_wait_read_satisfied",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-69-runtime-actor-scheduling"
+            },
+            "payload_len": 3
+          },
+          {
+            "event": "runtime_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-69-runtime-actor-scheduling"
+            },
+            "next_offset": 3
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 70,
+      "scenario": "runtime_multi_client_actors",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "before_concurrent_clients",
+            "action": {
+              "action": "start_runtime_concurrent_clients",
+              "client_count": 4
+            }
+          },
+          {
+            "phase": "during_concurrent_clients",
+            "action": {
+              "action": "delay_runtime_client_appends",
+              "base_delay_ms": 10
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 70,
+      "leader_id": 0,
+      "target_node_id": null,
+      "appended_log_index": 3,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 70
+          },
+          {
+            "event": "runtime_multi_client_actors_built",
+            "stream_count": 4,
+            "core_count": 2,
+            "raft_group_count": 4
+          },
+          {
+            "event": "runtime_multi_client_stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-0"
+            },
+            "core_id": 1,
+            "raft_group_id": 1
+          },
+          {
+            "event": "runtime_multi_client_stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-1"
+            },
+            "core_id": 0,
+            "raft_group_id": 2
+          },
+          {
+            "event": "runtime_multi_client_stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-2"
+            },
+            "core_id": 1,
+            "raft_group_id": 3
+          },
+          {
+            "event": "runtime_multi_client_stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-3"
+            },
+            "core_id": 0,
+            "raft_group_id": 0
+          },
+          {
+            "event": "runtime_multi_client_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-0"
+            },
+            "client_id": 0,
+            "append_index": 0,
+            "start_offset": 0,
+            "next_offset": 10
+          },
+          {
+            "event": "runtime_multi_client_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-0"
+            },
+            "client_id": 0,
+            "expected_len": 10,
+            "next_offset": 10
+          },
+          {
+            "event": "runtime_multi_client_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-0"
+            },
+            "client_id": 0,
+            "append_index": 1,
+            "start_offset": 10,
+            "next_offset": 20
+          },
+          {
+            "event": "runtime_multi_client_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-0"
+            },
+            "client_id": 0,
+            "expected_len": 20,
+            "next_offset": 20
+          },
+          {
+            "event": "runtime_multi_client_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-1"
+            },
+            "client_id": 1,
+            "append_index": 0,
+            "start_offset": 0,
+            "next_offset": 10
+          },
+          {
+            "event": "runtime_multi_client_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-1"
+            },
+            "client_id": 1,
+            "expected_len": 10,
+            "next_offset": 10
+          },
+          {
+            "event": "runtime_multi_client_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-1"
+            },
+            "client_id": 1,
+            "append_index": 1,
+            "start_offset": 10,
+            "next_offset": 20
+          },
+          {
+            "event": "runtime_multi_client_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-1"
+            },
+            "client_id": 1,
+            "expected_len": 20,
+            "next_offset": 20
+          },
+          {
+            "event": "runtime_multi_client_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-2"
+            },
+            "client_id": 2,
+            "append_index": 0,
+            "start_offset": 0,
+            "next_offset": 10
+          },
+          {
+            "event": "runtime_multi_client_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-2"
+            },
+            "client_id": 2,
+            "expected_len": 10,
+            "next_offset": 10
+          },
+          {
+            "event": "runtime_multi_client_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-2"
+            },
+            "client_id": 2,
+            "append_index": 1,
+            "start_offset": 10,
+            "next_offset": 20
+          },
+          {
+            "event": "runtime_multi_client_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-2"
+            },
+            "client_id": 2,
+            "expected_len": 20,
+            "next_offset": 20
+          },
+          {
+            "event": "runtime_multi_client_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-3"
+            },
+            "client_id": 3,
+            "append_index": 0,
+            "start_offset": 0,
+            "next_offset": 10
+          },
+          {
+            "event": "runtime_multi_client_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-3"
+            },
+            "client_id": 3,
+            "expected_len": 10,
+            "next_offset": 10
+          },
+          {
+            "event": "runtime_multi_client_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-3"
+            },
+            "client_id": 3,
+            "append_index": 1,
+            "start_offset": 10,
+            "next_offset": 20
+          },
+          {
+            "event": "runtime_multi_client_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-70-runtime-multi-client-actors-client-3"
+            },
+            "client_id": 3,
+            "expected_len": 20,
+            "next_offset": 20
+          },
+          {
+            "event": "runtime_multi_client_verified",
+            "stream_count": 4,
+            "total_appends": 8
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 71,
+      "scenario": "runtime_cold_flush_worker",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-71-runtime-cold-flush-worker"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "after_appends",
+            "action": {
+              "action": "run_runtime_cold_flush_all_groups",
+              "min_hot_bytes": 4,
+              "max_flush_bytes": 4
+            }
+          },
+          {
+            "phase": "after_flush",
+            "action": {
+              "action": "verify_runtime_cold_live_reads"
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 71,
+      "leader_id": 0,
+      "target_node_id": null,
+      "appended_log_index": 2,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 71
+          },
+          {
+            "event": "runtime_cold_flush_actors_built",
+            "stream_count": 2,
+            "core_count": 2,
+            "raft_group_count": 4
+          },
+          {
+            "event": "runtime_cold_flush_stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-71-runtime-cold-flush-worker-client-0"
+            },
+            "core_id": 0,
+            "raft_group_id": 2
+          },
+          {
+            "event": "runtime_cold_flush_stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-71-runtime-cold-flush-worker-client-1"
+            },
+            "core_id": 1,
+            "raft_group_id": 1
+          },
+          {
+            "event": "runtime_cold_flush_completed",
+            "flushed_count": 2,
+            "upload_count": 2,
+            "publish_count": 2
+          },
+          {
+            "event": "runtime_cold_live_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-71-runtime-cold-flush-worker-client-0"
+            },
+            "next_offset": 6
+          },
+          {
+            "event": "runtime_cold_live_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-71-runtime-cold-flush-worker-client-1"
+            },
+            "next_offset": 6
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 72,
+      "scenario": "runtime_seeded_interleaving",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-72-runtime-seeded-interleaving"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "seeded_runtime_interleaving",
+            "action": {
+              "action": "run_runtime_seeded_interleaving",
+              "plan": {
+                "clients": [
+                  {
+                    "client_id": 0,
+                    "stream_index": 0,
+                    "first_append_delay_ms": 9,
+                    "second_append_delay_ms": 26
+                  },
+                  {
+                    "client_id": 1,
+                    "stream_index": 1,
+                    "first_append_delay_ms": 20,
+                    "second_append_delay_ms": 25
+                  },
+                  {
+                    "client_id": 2,
+                    "stream_index": 2,
+                    "first_append_delay_ms": 39,
+                    "second_append_delay_ms": 15
+                  }
+                ],
+                "flush_delay_ms": 31,
+                "read_verify_delay_ms": 12
+              }
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 72,
+      "leader_id": 0,
+      "target_node_id": null,
+      "appended_log_index": 4,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 72
+          },
+          {
+            "event": "runtime_interleaving_actors_built",
+            "client_count": 3,
+            "stream_count": 3,
+            "core_count": 2,
+            "raft_group_count": 4
+          },
+          {
+            "event": "runtime_interleaving_plan_selected",
+            "flush_delay_ms": 31,
+            "read_verify_delay_ms": 12
+          },
+          {
+            "event": "runtime_interleaving_client_planned",
+            "client_id": 0,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-72-runtime-seeded-interleaving-client-0"
+            },
+            "first_append_delay_ms": 9,
+            "second_append_delay_ms": 26,
+            "core_id": 0,
+            "raft_group_id": 0
+          },
+          {
+            "event": "runtime_interleaving_client_planned",
+            "client_id": 1,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-72-runtime-seeded-interleaving-client-1"
+            },
+            "first_append_delay_ms": 20,
+            "second_append_delay_ms": 25,
+            "core_id": 1,
+            "raft_group_id": 3
+          },
+          {
+            "event": "runtime_interleaving_client_planned",
+            "client_id": 2,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-72-runtime-seeded-interleaving-client-2"
+            },
+            "first_append_delay_ms": 39,
+            "second_append_delay_ms": 15,
+            "core_id": 0,
+            "raft_group_id": 2
+          },
+          {
+            "event": "runtime_interleaving_flush_completed",
+            "flushed_count": 2,
+            "upload_count": 2,
+            "publish_count": 2
+          },
+          {
+            "event": "runtime_interleaving_append_committed",
+            "client_id": 0,
+            "append_index": 0,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-72-runtime-seeded-interleaving-client-0"
+            },
+            "start_offset": 0,
+            "next_offset": 4
+          },
+          {
+            "event": "runtime_interleaving_append_committed",
+            "client_id": 0,
+            "append_index": 1,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-72-runtime-seeded-interleaving-client-0"
+            },
+            "start_offset": 4,
+            "next_offset": 8
+          },
+          {
+            "event": "runtime_interleaving_append_committed",
+            "client_id": 1,
+            "append_index": 0,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-72-runtime-seeded-interleaving-client-1"
+            },
+            "start_offset": 0,
+            "next_offset": 4
+          },
+          {
+            "event": "runtime_interleaving_append_committed",
+            "client_id": 1,
+            "append_index": 1,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-72-runtime-seeded-interleaving-client-1"
+            },
+            "start_offset": 4,
+            "next_offset": 8
+          },
+          {
+            "event": "runtime_interleaving_append_committed",
+            "client_id": 2,
+            "append_index": 0,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-72-runtime-seeded-interleaving-client-2"
+            },
+            "start_offset": 0,
+            "next_offset": 4
+          },
+          {
+            "event": "runtime_interleaving_append_committed",
+            "client_id": 2,
+            "append_index": 1,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-72-runtime-seeded-interleaving-client-2"
+            },
+            "start_offset": 4,
+            "next_offset": 8
+          },
+          {
+            "event": "runtime_interleaving_read_verified",
+            "client_id": 0,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-72-runtime-seeded-interleaving-client-0"
+            },
+            "expected_len": 8,
+            "next_offset": 8
+          },
+          {
+            "event": "runtime_interleaving_read_verified",
+            "client_id": 1,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-72-runtime-seeded-interleaving-client-1"
+            },
+            "expected_len": 8,
+            "next_offset": 8
+          },
+          {
+            "event": "runtime_interleaving_read_verified",
+            "client_id": 2,
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-72-runtime-seeded-interleaving-client-2"
+            },
+            "expected_len": 8,
+            "next_offset": 8
+          },
+          {
+            "event": "runtime_interleaving_verified",
+            "client_count": 3,
+            "total_appends": 6
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 277,
+      "scenario": "http_protocol_surface_randomized",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-277-http-protocol-surface-randomized"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "http_protocol_surface_workload",
+            "action": {
+              "action": "run_http_protocol_surface_workload",
+              "plan": {
+                "ttl": true,
+                "long_poll": true
+              }
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 277,
+      "leader_id": 0,
+      "target_node_id": null,
+      "appended_log_index": 0,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 277
+          },
+          {
+            "event": "http_protocol_surface_randomized_plan_selected",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-277-http-protocol-surface-randomized"
+            },
+            "ttl": true,
+            "producer_sessions": false,
+            "producer_epoch_bump": false,
+            "long_poll": true,
+            "sse_close": false,
+            "live_limit": false
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-277-http-protocol-surface-randomized"
+            }
+          },
+          {
+            "event": "http_protocol_surface_randomized_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-277-http-protocol-surface-randomized"
+            },
+            "final_next_offset": 4,
+            "ttl_checked": true,
+            "producer_sessions": false,
+            "long_poll": true,
+            "sse_close": false,
+            "live_limit": false
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 285,
+      "scenario": "http_protocol_surface_randomized",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-285-http-protocol-surface-randomized"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "http_protocol_surface_workload",
+            "action": {
+              "action": "run_http_protocol_surface_workload",
+              "plan": {
+                "ttl": true,
+                "producer_sessions": true,
+                "producer_sequence_gap": true,
+                "concurrent_producers": true,
+                "long_poll": true,
+                "live_limit": true,
+                "partial_reads": true
+              }
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 285,
+      "leader_id": 0,
+      "target_node_id": null,
+      "appended_log_index": 0,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 285
+          },
+          {
+            "event": "http_protocol_surface_randomized_plan_selected",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-285-http-protocol-surface-randomized"
+            },
+            "ttl": true,
+            "producer_sessions": true,
+            "producer_sequence_gap": true,
+            "producer_epoch_bump": false,
+            "concurrent_producers": true,
+            "long_poll": true,
+            "sse_close": false,
+            "live_limit": true,
+            "partial_reads": true
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-285-http-protocol-surface-randomized"
+            }
+          },
+          {
+            "event": "http_protocol_surface_randomized_producer_gap_rejected",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-285-http-protocol-surface-randomized"
+            },
+            "expected_seq": 1,
+            "received_seq": 2
+          },
+          {
+            "event": "http_protocol_surface_randomized_concurrent_producers_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-285-http-protocol-surface-randomized"
+            },
+            "producer_count": 2,
+            "next_offset": 6
+          },
+          {
+            "event": "http_protocol_surface_randomized_partial_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-285-http-protocol-surface-randomized"
+            },
+            "offset": 1,
+            "max_bytes": 3,
+            "next_offset": 4
+          },
+          {
+            "event": "http_protocol_surface_randomized_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-285-http-protocol-surface-randomized"
+            },
+            "final_next_offset": 8,
+            "ttl_checked": true,
+            "producer_sessions": true,
+            "producer_sequence_gap": true,
+            "concurrent_producers": true,
+            "long_poll": true,
+            "sse_close": false,
+            "live_limit": true,
+            "partial_reads": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 281,
+      "scenario": "http_protocol_surface_randomized",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-281-http-protocol-surface-randomized"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "http_protocol_surface_workload",
+            "action": {
+              "action": "run_http_protocol_surface_workload",
+              "plan": {
+                "ttl": true,
+                "producer_sessions": true,
+                "producer_epoch_bump": true,
+                "concurrent_producers": true,
+                "long_poll": true,
+                "sse_close": true,
+                "live_timeout": true,
+                "partial_reads": true
+              }
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 281,
+      "leader_id": 0,
+      "target_node_id": null,
+      "appended_log_index": 0,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 281
+          },
+          {
+            "event": "http_protocol_surface_randomized_plan_selected",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-281-http-protocol-surface-randomized"
+            },
+            "ttl": true,
+            "producer_sessions": true,
+            "producer_sequence_gap": false,
+            "producer_epoch_bump": true,
+            "concurrent_producers": true,
+            "long_poll": true,
+            "sse_close": true,
+            "live_limit": false,
+            "live_timeout": true,
+            "partial_reads": true
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-281-http-protocol-surface-randomized"
+            }
+          },
+          {
+            "event": "http_protocol_surface_randomized_concurrent_producers_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-281-http-protocol-surface-randomized"
+            },
+            "producer_count": 2,
+            "next_offset": 8
+          },
+          {
+            "event": "http_protocol_surface_randomized_live_timeout_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-281-http-protocol-surface-randomized"
+            },
+            "timeout_ms": 25
+          },
+          {
+            "event": "http_protocol_surface_randomized_partial_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-281-http-protocol-surface-randomized"
+            },
+            "offset": 1,
+            "max_bytes": 3,
+            "next_offset": 4
+          },
+          {
+            "event": "http_protocol_surface_randomized_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-281-http-protocol-surface-randomized"
+            },
+            "final_next_offset": 13,
+            "ttl_checked": false,
+            "producer_sessions": true,
+            "producer_sequence_gap": false,
+            "concurrent_producers": true,
+            "long_poll": true,
+            "sse_close": true,
+            "live_limit": false,
+            "live_timeout": true,
+            "partial_reads": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 317,
+      "scenario": "runtime_raft_network",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-317-runtime-raft-network-cold-live-write-recovery"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "before_append",
+            "action": {
+              "action": "partition_seeded_follower"
+            }
+          },
+          {
+            "phase": "after_isolated_lag",
+            "action": {
+              "action": "heal_seeded_follower"
+            }
+          },
+          {
+            "phase": "after_recovery_read",
+            "action": {
+              "action": "verify_runtime_cold_live_reads"
+            }
+          },
+          {
+            "phase": "before_cold_write",
+            "action": {
+              "action": "fail_next_cold_write"
+            }
+          },
+          {
+            "phase": "after_cold_write_failure",
+            "action": {
+              "action": "retry_cold_write_after_failure"
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 317,
+      "leader_id": 1,
+      "target_node_id": 2,
+      "appended_log_index": 3,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 317
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-317-runtime-raft-network-cold-live-write-recovery"
+            }
+          },
+          {
+            "event": "runtime_raft_network_built",
+            "core_count": 1,
+            "raft_group_count": 1,
+            "raft_node_count": 3,
+            "leader_id": 1
+          },
+          {
+            "event": "fault_applied",
+            "phase": "before_append"
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-317-runtime-raft-network-cold-live-write-recovery"
+            },
+            "start_offset": 0,
+            "next_offset": 18,
+            "group_commit_index": 3
+          },
+          {
+            "event": "isolated_follower_lagged",
+            "node_id": 2,
+            "log_index": 3
+          },
+          {
+            "event": "fault_applied",
+            "phase": "after_isolated_lag"
+          },
+          {
+            "event": "follower_caught_up",
+            "node_id": 2,
+            "log_index": 3
+          },
+          {
+            "event": "runtime_raft_network_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-317-runtime-raft-network-cold-live-write-recovery"
+            },
+            "next_offset": 18,
+            "raft_write_many_batches": 1,
+            "raft_apply_entries": 6,
+            "delivered_rpc_count": 1
+          },
+          {
+            "event": "fault_applied",
+            "phase": "before_cold_write"
+          },
+          {
+            "event": "runtime_raft_network_cold_write_fault_recovered",
+            "stream_count": 1,
+            "upload_count_before_retry": 0,
+            "publish_count_before_retry": 0
+          },
+          {
+            "event": "runtime_raft_network_cold_live_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-317-runtime-raft-network-cold-live-write-recovery"
+            },
+            "next_offset": 18,
+            "flushed_count": 3,
+            "upload_count": 3,
+            "publish_count": 3
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 137,
+      "scenario": "runtime_raft_network",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "before_append",
+            "action": {
+              "action": "partition_seeded_follower"
+            }
+          },
+          {
+            "phase": "after_isolated_lag",
+            "action": {
+              "action": "heal_seeded_follower"
+            }
+          },
+          {
+            "phase": "runtime_raft_network_workload",
+            "action": {
+              "action": "run_runtime_raft_network_workload",
+              "plan": {
+                "stream_count": 2,
+                "append_batch_lens": [
+                  2,
+                  1
+                ],
+                "failover_batch_lens": [
+                  1,
+                  1
+                ],
+                "producer_sessions": true,
+                "concurrent_producers": true,
+                "partial_reads": true
+              }
+            }
+          },
+          {
+            "phase": "after_recovery_read",
+            "action": {
+              "action": "verify_runtime_cold_live_reads"
+            }
+          },
+          {
+            "phase": "before_cold_write",
+            "action": {
+              "action": "fail_next_cold_write"
+            }
+          },
+          {
+            "phase": "after_cold_write_failure",
+            "action": {
+              "action": "retry_cold_write_after_failure"
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 137,
+      "leader_id": 1,
+      "target_node_id": 2,
+      "appended_log_index": 9,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 137
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized"
+            }
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized-s1"
+            }
+          },
+          {
+            "event": "runtime_raft_network_built",
+            "core_count": 1,
+            "raft_group_count": 1,
+            "raft_node_count": 3,
+            "leader_id": 1
+          },
+          {
+            "event": "fault_applied",
+            "phase": "before_append"
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized"
+            },
+            "start_offset": 0,
+            "next_offset": 18,
+            "group_commit_index": 4
+          },
+          {
+            "event": "runtime_raft_network_producer_duplicate_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized"
+            },
+            "producer_id": "sim-writer-137-0",
+            "producer_seq": 0,
+            "item_count": 2
+          },
+          {
+            "event": "runtime_raft_network_concurrent_producers_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized"
+            },
+            "producer_count": 2,
+            "start_offset": 18,
+            "next_offset": 36
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized"
+            },
+            "start_offset": 18,
+            "next_offset": 36,
+            "group_commit_index": 6
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized-s1"
+            },
+            "start_offset": 0,
+            "next_offset": 9,
+            "group_commit_index": 7
+          },
+          {
+            "event": "runtime_raft_network_producer_duplicate_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized-s1"
+            },
+            "producer_id": "sim-writer-137-1",
+            "producer_seq": 0,
+            "item_count": 1
+          },
+          {
+            "event": "runtime_raft_network_concurrent_producers_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized-s1"
+            },
+            "producer_count": 2,
+            "start_offset": 9,
+            "next_offset": 27
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized-s1"
+            },
+            "start_offset": 9,
+            "next_offset": 27,
+            "group_commit_index": 9
+          },
+          {
+            "event": "isolated_follower_lagged",
+            "node_id": 2,
+            "log_index": 11
+          },
+          {
+            "event": "fault_applied",
+            "phase": "after_isolated_lag"
+          },
+          {
+            "event": "follower_caught_up",
+            "node_id": 2,
+            "log_index": 11
+          },
+          {
+            "event": "runtime_raft_network_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized"
+            },
+            "next_offset": 36,
+            "raft_write_many_batches": 7,
+            "raft_apply_entries": 30,
+            "delivered_rpc_count": 1
+          },
+          {
+            "event": "runtime_raft_network_partial_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized"
+            },
+            "after_event": "runtime_raft_network_read_verified",
+            "offset": 12,
+            "max_len": 7,
+            "next_offset": 19
+          },
+          {
+            "event": "runtime_raft_network_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized-s1"
+            },
+            "next_offset": 27,
+            "raft_write_many_batches": 7,
+            "raft_apply_entries": 30,
+            "delivered_rpc_count": 1
+          },
+          {
+            "event": "runtime_raft_network_partial_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized-s1"
+            },
+            "after_event": "runtime_raft_network_read_verified",
+            "offset": 9,
+            "max_len": 7,
+            "next_offset": 16
+          },
+          {
+            "event": "fault_applied",
+            "phase": "before_cold_write"
+          },
+          {
+            "event": "runtime_raft_network_cold_write_fault_recovered",
+            "stream_count": 2,
+            "upload_count_before_retry": 0,
+            "publish_count_before_retry": 0
+          },
+          {
+            "event": "runtime_raft_network_cold_live_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized"
+            },
+            "next_offset": 36,
+            "flushed_count": 8,
+            "upload_count": 8,
+            "publish_count": 8
+          },
+          {
+            "event": "runtime_raft_network_partial_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized"
+            },
+            "after_event": "runtime_raft_network_cold_live_read_verified",
+            "offset": 12,
+            "max_len": 7,
+            "next_offset": 19
+          },
+          {
+            "event": "runtime_raft_network_cold_live_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized-s1"
+            },
+            "next_offset": 27,
+            "flushed_count": 8,
+            "upload_count": 8,
+            "publish_count": 8
+          },
+          {
+            "event": "runtime_raft_network_partial_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-137-runtime-raft-network-randomized-s1"
+            },
+            "after_event": "runtime_raft_network_cold_live_read_verified",
+            "offset": 9,
+            "max_len": 7,
+            "next_offset": 16
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 155,
+      "scenario": "runtime_raft_network",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "after_runtime_read",
+            "action": {
+              "action": "stop_current_leader"
+            }
+          },
+          {
+            "phase": "after_failover_append",
+            "action": {
+              "action": "restart_stopped_leader"
+            }
+          },
+          {
+            "phase": "runtime_raft_network_workload",
+            "action": {
+              "action": "run_runtime_raft_network_workload",
+              "plan": {
+                "stream_count": 3,
+                "append_batch_lens": [
+                  1,
+                  1,
+                  2
+                ],
+                "failover_batch_lens": [
+                  2,
+                  2,
+                  2
+                ],
+                "producer_sessions": true,
+                "producer_epoch_bumps": true,
+                "concurrent_producers": true
+              }
+            }
+          },
+          {
+            "phase": "after_recovery_read",
+            "action": {
+              "action": "verify_runtime_cold_live_reads"
+            }
+          },
+          {
+            "phase": "before_cold_write",
+            "action": {
+              "action": "fail_next_cold_write"
+            }
+          },
+          {
+            "phase": "after_cold_write_failure",
+            "action": {
+              "action": "retry_cold_write_after_failure"
+            }
+          },
+          {
+            "phase": "before_cold_read",
+            "action": {
+              "action": "truncate_next_cold_read",
+              "returned_len": 0
+            }
+          },
+          {
+            "phase": "after_cold_read_failure",
+            "action": {
+              "action": "retry_cold_read_after_failure"
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 155,
+      "leader_id": 3,
+      "target_node_id": 1,
+      "appended_log_index": 22,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 155
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized"
+            }
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s1"
+            }
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s2"
+            }
+          },
+          {
+            "event": "runtime_raft_network_built",
+            "core_count": 1,
+            "raft_group_count": 1,
+            "raft_node_count": 3,
+            "leader_id": 1
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized"
+            },
+            "start_offset": 0,
+            "next_offset": 9,
+            "group_commit_index": 4
+          },
+          {
+            "event": "runtime_raft_network_producer_duplicate_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized"
+            },
+            "producer_id": "sim-writer-155-0",
+            "producer_seq": 0,
+            "item_count": 1
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized"
+            },
+            "start_offset": 9,
+            "next_offset": 18,
+            "group_commit_index": 5
+          },
+          {
+            "event": "runtime_raft_network_producer_stale_epoch_rejected",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized"
+            },
+            "producer_id": "sim-writer-155-0",
+            "producer_epoch": 1,
+            "producer_seq": 1
+          },
+          {
+            "event": "runtime_raft_network_concurrent_producers_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized"
+            },
+            "producer_count": 2,
+            "start_offset": 18,
+            "next_offset": 36
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized"
+            },
+            "start_offset": 18,
+            "next_offset": 36,
+            "group_commit_index": 7
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s1"
+            },
+            "start_offset": 0,
+            "next_offset": 9,
+            "group_commit_index": 8
+          },
+          {
+            "event": "runtime_raft_network_producer_duplicate_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s1"
+            },
+            "producer_id": "sim-writer-155-1",
+            "producer_seq": 0,
+            "item_count": 1
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s1"
+            },
+            "start_offset": 9,
+            "next_offset": 18,
+            "group_commit_index": 9
+          },
+          {
+            "event": "runtime_raft_network_producer_stale_epoch_rejected",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s1"
+            },
+            "producer_id": "sim-writer-155-1",
+            "producer_epoch": 1,
+            "producer_seq": 1
+          },
+          {
+            "event": "runtime_raft_network_concurrent_producers_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s1"
+            },
+            "producer_count": 2,
+            "start_offset": 18,
+            "next_offset": 36
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s1"
+            },
+            "start_offset": 18,
+            "next_offset": 36,
+            "group_commit_index": 11
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s2"
+            },
+            "start_offset": 0,
+            "next_offset": 18,
+            "group_commit_index": 13
+          },
+          {
+            "event": "runtime_raft_network_producer_duplicate_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s2"
+            },
+            "producer_id": "sim-writer-155-2",
+            "producer_seq": 0,
+            "item_count": 2
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s2"
+            },
+            "start_offset": 18,
+            "next_offset": 27,
+            "group_commit_index": 14
+          },
+          {
+            "event": "runtime_raft_network_producer_stale_epoch_rejected",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s2"
+            },
+            "producer_id": "sim-writer-155-2",
+            "producer_epoch": 1,
+            "producer_seq": 1
+          },
+          {
+            "event": "runtime_raft_network_concurrent_producers_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s2"
+            },
+            "producer_count": 2,
+            "start_offset": 27,
+            "next_offset": 45
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s2"
+            },
+            "start_offset": 27,
+            "next_offset": 45,
+            "group_commit_index": 16
+          },
+          {
+            "event": "runtime_raft_network_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized"
+            },
+            "next_offset": 36,
+            "raft_write_many_batches": 15,
+            "raft_apply_entries": 63,
+            "delivered_rpc_count": 1
+          },
+          {
+            "event": "runtime_raft_network_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s1"
+            },
+            "next_offset": 36,
+            "raft_write_many_batches": 15,
+            "raft_apply_entries": 63,
+            "delivered_rpc_count": 1
+          },
+          {
+            "event": "runtime_raft_network_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s2"
+            },
+            "next_offset": 45,
+            "raft_write_many_batches": 15,
+            "raft_apply_entries": 63,
+            "delivered_rpc_count": 1
+          },
+          {
+            "event": "fault_applied",
+            "phase": "after_runtime_read"
+          },
+          {
+            "event": "node_stopped",
+            "node_id": 1
+          },
+          {
+            "event": "runtime_raft_network_leader_failover_stage_reached",
+            "stage": "old_leader_stopped",
+            "old_leader_id": 1,
+            "current_leader_id": null,
+            "log_index": null
+          },
+          {
+            "event": "leader_elected",
+            "leader_id": 3
+          },
+          {
+            "event": "runtime_raft_network_leader_failover_stage_reached",
+            "stage": "replacement_leader_installed",
+            "old_leader_id": 1,
+            "current_leader_id": 3,
+            "log_index": null
+          },
+          {
+            "event": "runtime_raft_network_leader_failover_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized"
+            },
+            "old_leader_id": 1,
+            "new_leader_id": 3,
+            "next_offset": 54,
+            "group_commit_index": 18
+          },
+          {
+            "event": "runtime_raft_network_producer_duplicate_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized"
+            },
+            "producer_id": "sim-writer-155-0",
+            "producer_seq": 1,
+            "item_count": 2
+          },
+          {
+            "event": "runtime_raft_network_leader_failover_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s1"
+            },
+            "old_leader_id": 1,
+            "new_leader_id": 3,
+            "next_offset": 54,
+            "group_commit_index": 20
+          },
+          {
+            "event": "runtime_raft_network_producer_duplicate_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s1"
+            },
+            "producer_id": "sim-writer-155-1",
+            "producer_seq": 1,
+            "item_count": 2
+          },
+          {
+            "event": "runtime_raft_network_leader_failover_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s2"
+            },
+            "old_leader_id": 1,
+            "new_leader_id": 3,
+            "next_offset": 63,
+            "group_commit_index": 22
+          },
+          {
+            "event": "runtime_raft_network_producer_duplicate_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s2"
+            },
+            "producer_id": "sim-writer-155-2",
+            "producer_seq": 1,
+            "item_count": 2
+          },
+          {
+            "event": "fault_applied",
+            "phase": "after_failover_append"
+          },
+          {
+            "event": "node_restarted",
+            "node_id": 1
+          },
+          {
+            "event": "runtime_raft_network_leader_failover_stage_reached",
+            "stage": "failover_appends_applied",
+            "old_leader_id": 1,
+            "current_leader_id": 3,
+            "log_index": 29
+          },
+          {
+            "event": "follower_caught_up",
+            "node_id": 1,
+            "log_index": 29
+          },
+          {
+            "event": "runtime_raft_network_leader_failover_stage_reached",
+            "stage": "old_leader_caught_up",
+            "old_leader_id": 1,
+            "current_leader_id": 3,
+            "log_index": 29
+          },
+          {
+            "event": "runtime_raft_network_leader_failover_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized"
+            },
+            "next_offset": 54
+          },
+          {
+            "event": "runtime_raft_network_leader_failover_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s1"
+            },
+            "next_offset": 54
+          },
+          {
+            "event": "runtime_raft_network_leader_failover_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s2"
+            },
+            "next_offset": 63
+          },
+          {
+            "event": "fault_applied",
+            "phase": "before_cold_write"
+          },
+          {
+            "event": "runtime_raft_network_leader_failover_stage_reached",
+            "stage": "cold_flush_started_after_failover",
+            "old_leader_id": 1,
+            "current_leader_id": 3,
+            "log_index": null
+          },
+          {
+            "event": "runtime_raft_network_cold_write_fault_recovered",
+            "stream_count": 3,
+            "upload_count_before_retry": 0,
+            "publish_count_before_retry": 0
+          },
+          {
+            "event": "runtime_raft_network_leader_failover_stage_reached",
+            "stage": "cold_flush_applied_after_failover",
+            "old_leader_id": 1,
+            "current_leader_id": 3,
+            "log_index": 41
+          },
+          {
+            "event": "fault_applied",
+            "phase": "before_cold_read"
+          },
+          {
+            "event": "runtime_raft_network_cold_read_fault_recovered",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized"
+            },
+            "returned_len": 0
+          },
+          {
+            "event": "runtime_raft_network_cold_live_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized"
+            },
+            "next_offset": 54,
+            "flushed_count": 12,
+            "upload_count": 12,
+            "publish_count": 12
+          },
+          {
+            "event": "runtime_raft_network_cold_live_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s1"
+            },
+            "next_offset": 54,
+            "flushed_count": 12,
+            "upload_count": 12,
+            "publish_count": 12
+          },
+          {
+            "event": "runtime_raft_network_cold_live_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s2"
+            },
+            "next_offset": 63,
+            "flushed_count": 12,
+            "upload_count": 12,
+            "publish_count": 12
+          },
+          {
+            "event": "runtime_raft_network_leader_failover_cold_live_read_verified",
+            "stream_count": 3,
+            "old_leader_id": 1,
+            "current_leader_id": 3,
+            "flushed_count": 12
+          }
+        ]
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 147,
+      "scenario": "runtime_raft_network",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized"
+      },
+      "fault_plan": {
+        "steps": [
+          {
+            "phase": "runtime_raft_network_workload",
+            "action": {
+              "action": "run_runtime_raft_network_workload",
+              "plan": {
+                "stream_count": 3,
+                "append_batch_lens": [
+                  1,
+                  1,
+                  1
+                ],
+                "failover_batch_lens": [
+                  2,
+                  1,
+                  1
+                ],
+                "producer_sessions": true,
+                "producer_epoch_bumps": true,
+                "partial_reads": true,
+                "tail_reads": true
+              }
+            }
+          },
+          {
+            "phase": "after_recovery_read",
+            "action": {
+              "action": "verify_runtime_cold_live_reads"
+            }
+          },
+          {
+            "phase": "before_cold_read",
+            "action": {
+              "action": "delay_next_cold_read",
+              "delay_ms": 125
+            }
+          }
+        ]
+      }
+    },
+    "outcome": {
+      "seed": 147,
+      "leader_id": 1,
+      "target_node_id": null,
+      "appended_log_index": 9,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 147
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized"
+            }
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s1"
+            }
+          },
+          {
+            "event": "stream_created",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s2"
+            }
+          },
+          {
+            "event": "runtime_raft_network_built",
+            "core_count": 1,
+            "raft_group_count": 1,
+            "raft_node_count": 3,
+            "leader_id": 1
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized"
+            },
+            "start_offset": 0,
+            "next_offset": 9,
+            "group_commit_index": 4
+          },
+          {
+            "event": "runtime_raft_network_producer_duplicate_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized"
+            },
+            "producer_id": "sim-writer-147-0",
+            "producer_seq": 0,
+            "item_count": 1
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized"
+            },
+            "start_offset": 9,
+            "next_offset": 18,
+            "group_commit_index": 5
+          },
+          {
+            "event": "runtime_raft_network_producer_stale_epoch_rejected",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized"
+            },
+            "producer_id": "sim-writer-147-0",
+            "producer_epoch": 0,
+            "producer_seq": 1
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s1"
+            },
+            "start_offset": 0,
+            "next_offset": 9,
+            "group_commit_index": 6
+          },
+          {
+            "event": "runtime_raft_network_producer_duplicate_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s1"
+            },
+            "producer_id": "sim-writer-147-1",
+            "producer_seq": 0,
+            "item_count": 1
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s1"
+            },
+            "start_offset": 9,
+            "next_offset": 18,
+            "group_commit_index": 7
+          },
+          {
+            "event": "runtime_raft_network_producer_stale_epoch_rejected",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s1"
+            },
+            "producer_id": "sim-writer-147-1",
+            "producer_epoch": 0,
+            "producer_seq": 1
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s2"
+            },
+            "start_offset": 0,
+            "next_offset": 9,
+            "group_commit_index": 8
+          },
+          {
+            "event": "runtime_raft_network_producer_duplicate_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s2"
+            },
+            "producer_id": "sim-writer-147-2",
+            "producer_seq": 0,
+            "item_count": 1
+          },
+          {
+            "event": "runtime_raft_engine_append_committed",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s2"
+            },
+            "start_offset": 9,
+            "next_offset": 18,
+            "group_commit_index": 9
+          },
+          {
+            "event": "runtime_raft_network_producer_stale_epoch_rejected",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s2"
+            },
+            "producer_id": "sim-writer-147-2",
+            "producer_epoch": 0,
+            "producer_seq": 1
+          },
+          {
+            "event": "runtime_raft_network_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized"
+            },
+            "next_offset": 18,
+            "raft_write_many_batches": 12,
+            "raft_apply_entries": 43,
+            "delivered_rpc_count": 1
+          },
+          {
+            "event": "runtime_raft_network_partial_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized"
+            },
+            "after_event": "runtime_raft_network_read_verified",
+            "offset": 6,
+            "max_len": 7,
+            "next_offset": 13
+          },
+          {
+            "event": "runtime_raft_network_tail_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized"
+            },
+            "after_event": "runtime_raft_network_read_verified",
+            "offset": 18,
+            "next_offset": 18
+          },
+          {
+            "event": "runtime_raft_network_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s1"
+            },
+            "next_offset": 18,
+            "raft_write_many_batches": 12,
+            "raft_apply_entries": 43,
+            "delivered_rpc_count": 1
+          },
+          {
+            "event": "runtime_raft_network_partial_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s1"
+            },
+            "after_event": "runtime_raft_network_read_verified",
+            "offset": 6,
+            "max_len": 7,
+            "next_offset": 13
+          },
+          {
+            "event": "runtime_raft_network_tail_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s1"
+            },
+            "after_event": "runtime_raft_network_read_verified",
+            "offset": 18,
+            "next_offset": 18
+          },
+          {
+            "event": "runtime_raft_network_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s2"
+            },
+            "next_offset": 18,
+            "raft_write_many_batches": 12,
+            "raft_apply_entries": 43,
+            "delivered_rpc_count": 1
+          },
+          {
+            "event": "runtime_raft_network_partial_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s2"
+            },
+            "after_event": "runtime_raft_network_read_verified",
+            "offset": 6,
+            "max_len": 7,
+            "next_offset": 13
+          },
+          {
+            "event": "runtime_raft_network_tail_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s2"
+            },
+            "after_event": "runtime_raft_network_read_verified",
+            "offset": 18,
+            "next_offset": 18
+          },
+          {
+            "event": "fault_applied",
+            "phase": "before_cold_read"
+          },
+          {
+            "event": "runtime_raft_network_cold_read_delay_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized"
+            },
+            "delay_ms": 125
+          },
+          {
+            "event": "runtime_raft_network_cold_live_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized"
+            },
+            "next_offset": 18,
+            "flushed_count": 9,
+            "upload_count": 9,
+            "publish_count": 9
+          },
+          {
+            "event": "runtime_raft_network_partial_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized"
+            },
+            "after_event": "runtime_raft_network_cold_live_read_verified",
+            "offset": 6,
+            "max_len": 7,
+            "next_offset": 13
+          },
+          {
+            "event": "runtime_raft_network_tail_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized"
+            },
+            "after_event": "runtime_raft_network_cold_live_read_verified",
+            "offset": 18,
+            "next_offset": 18
+          },
+          {
+            "event": "runtime_raft_network_cold_live_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s1"
+            },
+            "next_offset": 18,
+            "flushed_count": 9,
+            "upload_count": 9,
+            "publish_count": 9
+          },
+          {
+            "event": "runtime_raft_network_partial_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s1"
+            },
+            "after_event": "runtime_raft_network_cold_live_read_verified",
+            "offset": 6,
+            "max_len": 7,
+            "next_offset": 13
+          },
+          {
+            "event": "runtime_raft_network_tail_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s1"
+            },
+            "after_event": "runtime_raft_network_cold_live_read_verified",
+            "offset": 18,
+            "next_offset": 18
+          },
+          {
+            "event": "runtime_raft_network_cold_live_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s2"
+            },
+            "next_offset": 18,
+            "flushed_count": 9,
+            "upload_count": 9,
+            "publish_count": 9
+          },
+          {
+            "event": "runtime_raft_network_partial_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s2"
+            },
+            "after_event": "runtime_raft_network_cold_live_read_verified",
+            "offset": 6,
+            "max_len": 7,
+            "next_offset": 13
+          },
+          {
+            "event": "runtime_raft_network_tail_read_verified",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-147-runtime-raft-network-randomized-s2"
+            },
+            "after_event": "runtime_raft_network_cold_live_read_verified",
+            "offset": 18,
+            "next_offset": 18
+          }
+        ]
+      }
+    }
+  }
+]

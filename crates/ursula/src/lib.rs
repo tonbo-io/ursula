@@ -7,6 +7,12 @@
 //! - [`bootstrap`]: env-driven `spawn_*_runtime` constructors and cold-flush worker.
 
 mod bootstrap;
+mod http_time {
+    #[cfg(madsim)]
+    pub use madsim::time::timeout;
+    #[cfg(not(madsim))]
+    pub use tokio::time::timeout;
+}
 mod render;
 
 pub use bootstrap::{
@@ -23,7 +29,9 @@ use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(not(madsim))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
@@ -109,12 +117,26 @@ struct CreateStreamHttpResponseInput<'a> {
     request_headers: &'a HeaderMap,
 }
 
+pub trait WallClock: Send + Sync + 'static {
+    fn unix_time_ms(&self) -> u64;
+}
+
+#[derive(Debug, Default)]
+pub struct SystemWallClock;
+
+impl WallClock for SystemWallClock {
+    fn unix_time_ms(&self) -> u64 {
+        unix_time_ms()
+    }
+}
+
 #[derive(Clone)]
 pub struct HttpState {
     runtime: ShardRuntime,
     raft_registry: Option<RaftGroupHandleRegistry>,
     client_write_router: Option<ClientWriteLeaderRouter>,
     http_metrics: Arc<HttpMetrics>,
+    wall_clock: Arc<dyn WallClock>,
 }
 
 impl HttpState {
@@ -124,6 +146,7 @@ impl HttpState {
             raft_registry: None,
             client_write_router: None,
             http_metrics: Arc::new(HttpMetrics::default()),
+            wall_clock: Arc::new(SystemWallClock),
         }
     }
 
@@ -136,6 +159,7 @@ impl HttpState {
             raft_registry: Some(raft_registry),
             client_write_router: None,
             http_metrics: Arc::new(HttpMetrics::default()),
+            wall_clock: Arc::new(SystemWallClock),
         }
     }
 
@@ -149,7 +173,18 @@ impl HttpState {
             raft_registry: Some(raft_registry),
             client_write_router: Some(ClientWriteLeaderRouter::new(peers)),
             http_metrics: Arc::new(HttpMetrics::default()),
+            wall_clock: Arc::new(SystemWallClock),
         }
+    }
+
+    pub fn with_wall_clock(mut self, wall_clock: impl WallClock) -> Self {
+        self.wall_clock = Arc::new(wall_clock);
+        self
+    }
+
+    pub fn with_wall_clock_handle(mut self, wall_clock: Arc<dyn WallClock>) -> Self {
+        self.wall_clock = wall_clock;
+        self
     }
 
     pub fn runtime(&self) -> &ShardRuntime {
@@ -162,6 +197,10 @@ impl HttpState {
 
     pub fn client_write_router(&self) -> Option<&ClientWriteLeaderRouter> {
         self.client_write_router.as_ref()
+    }
+
+    pub fn unix_time_ms(&self) -> u64 {
+        self.wall_clock.unix_time_ms()
     }
 }
 
@@ -505,6 +544,10 @@ pub fn router_with_static_raft_cluster(
         raft_registry,
         peers,
     ))
+}
+
+pub fn router_with_http_state(state: HttpState) -> Router {
+    router_from_state(state)
 }
 
 fn router_from_state(state: HttpState) -> Router {
@@ -1033,7 +1076,7 @@ pub(crate) async fn create_stream_by_id(
             .runtime
             .head_stream(HeadStreamRequest {
                 stream_id: source_id.clone(),
-                now_ms: unix_time_ms(),
+                now_ms: state.unix_time_ms(),
             })
             .await
         {
@@ -1047,7 +1090,7 @@ pub(crate) async fn create_stream_by_id(
     };
     let mut request = CreateStreamRequest::new(stream_id.clone(), content_type.clone());
     request.content_type_explicit = content_type_explicit;
-    request.now_ms = unix_time_ms();
+    request.now_ms = state.unix_time_ms();
     request.initial_payload = match normalize_http_write_payload(&content_type, body.clone(), true)
     {
         Ok(payload) => payload,
@@ -1200,7 +1243,7 @@ pub(crate) async fn append_stream_by_id(
                 stream_id,
                 stream_seq: stream_seq(&headers),
                 producer: producer.clone(),
-                now_ms: unix_time_ms(),
+                now_ms: state.unix_time_ms(),
             })
             .await
         {
@@ -1242,7 +1285,7 @@ pub(crate) async fn append_stream_by_id(
     request.content_type = content_type;
     request.close_after = close_after;
     request.stream_seq = stream_seq(&headers);
-    request.now_ms = unix_time_ms();
+    request.now_ms = state.unix_time_ms();
     let producer = match producer_request(&headers) {
         Ok(producer) => producer,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
@@ -1333,7 +1376,7 @@ pub(crate) async fn append_batch(
     let mut request = AppendBatchRequest::new(stream_id, payloads);
     request.content_type = content_type;
     request.producer = producer.clone();
-    request.now_ms = unix_time_ms();
+    request.now_ms = state.unix_time_ms();
     let response = match state.runtime.append_batch(request).await {
         Ok(response) => response,
         Err(err) => {
@@ -1447,7 +1490,7 @@ pub(crate) async fn head_stream_by_id(
         .runtime
         .head_stream(HeadStreamRequest {
             stream_id,
-            now_ms: unix_time_ms(),
+            now_ms: state.unix_time_ms(),
         })
         .await
     {
@@ -1634,7 +1677,7 @@ pub(crate) async fn read_stream_by_id(
             stream_id,
             offset,
             max_len,
-            now_ms: unix_time_ms(),
+            now_ms: state.unix_time_ms(),
         })
         .await
     {
@@ -1671,7 +1714,7 @@ pub(crate) async fn publish_snapshot(
         snapshot_offset,
         content_type: request_content_type(&headers),
         payload: body.clone(),
-        now_ms: unix_time_ms(),
+        now_ms: state.unix_time_ms(),
     };
     match state.runtime.publish_snapshot(request).await {
         Ok(response) => {
@@ -1705,7 +1748,7 @@ pub(crate) async fn read_latest_snapshot(
         .runtime
         .head_stream(HeadStreamRequest {
             stream_id,
-            now_ms: unix_time_ms(),
+            now_ms: state.unix_time_ms(),
         })
         .await
     {
@@ -1749,7 +1792,7 @@ pub(crate) async fn read_snapshot(
         .read_snapshot(ReadSnapshotRequest {
             stream_id,
             snapshot_offset: Some(snapshot_offset),
-            now_ms: unix_time_ms(),
+            now_ms: state.unix_time_ms(),
         })
         .await
     {
@@ -1784,7 +1827,7 @@ pub(crate) async fn delete_snapshot(
         .delete_snapshot(DeleteSnapshotRequest {
             stream_id,
             snapshot_offset,
-            now_ms: unix_time_ms(),
+            now_ms: state.unix_time_ms(),
         })
         .await
     {
@@ -1830,7 +1873,7 @@ pub(crate) async fn bootstrap_stream(
         .runtime
         .bootstrap_stream(BootstrapStreamRequest {
             stream_id,
-            now_ms: unix_time_ms(),
+            now_ms: state.unix_time_ms(),
         })
         .await
     {
@@ -1872,7 +1915,7 @@ pub(crate) async fn read_offset(
             .runtime
             .head_stream(HeadStreamRequest {
                 stream_id: stream_id.clone(),
-                now_ms: unix_time_ms(),
+                now_ms: state.unix_time_ms(),
             })
             .await
         {
@@ -1911,9 +1954,9 @@ pub(crate) async fn long_poll_stream(
         stream_id: stream_id.clone(),
         offset,
         max_len: max_len.max(1),
-        now_ms: unix_time_ms(),
+        now_ms: state.unix_time_ms(),
     });
-    match tokio::time::timeout(Duration::from_millis(timeout_ms), read).await {
+    match http_time::timeout(Duration::from_millis(timeout_ms), read).await {
         Ok(Ok(response)) if response.payload.is_empty() && response.up_to_date => {
             long_poll_no_content_response(&response, query.get("cursor").map(String::as_str))
         }
@@ -1937,7 +1980,7 @@ pub(crate) async fn long_poll_stream(
             .runtime
             .head_stream(HeadStreamRequest {
                 stream_id: stream_id.clone(),
-                now_ms: unix_time_ms(),
+                now_ms: state.unix_time_ms(),
             })
             .await
         {
@@ -1971,10 +2014,11 @@ pub(crate) async fn long_poll_stream(
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct SseState {
     runtime: ShardRuntime,
     http_metrics: Arc<HttpMetrics>,
+    wall_clock: Arc<dyn WallClock>,
     stream_id: BucketStreamId,
     offset: u64,
     max_len: usize,
@@ -1996,7 +2040,7 @@ pub(crate) async fn sse_stream(
         .runtime
         .head_stream(HeadStreamRequest {
             stream_id: stream_id.clone(),
-            now_ms: unix_time_ms(),
+            now_ms: state.unix_time_ms(),
         })
         .await
     {
@@ -2022,6 +2066,7 @@ pub(crate) async fn sse_stream(
     let sse_state = SseState {
         runtime: state.runtime,
         http_metrics: state.http_metrics,
+        wall_clock: state.wall_clock,
         stream_id,
         offset,
         max_len: max_len.max(1),
@@ -2042,7 +2087,7 @@ pub(crate) async fn sse_stream(
             stream_id: state.stream_id.clone(),
             offset: state.offset,
             max_len: state.max_len,
-            now_ms: unix_time_ms(),
+            now_ms: state.wall_clock.unix_time_ms(),
         };
         let read = if state.initial_read {
             state.initial_read = false;
@@ -2097,11 +2142,20 @@ pub(crate) fn long_poll_timeout_ms(query: &HashMap<String, String>) -> u64 {
         .clamp(1, MAX_LONG_POLL_TIMEOUT_MS)
 }
 
+#[cfg(not(madsim))]
 pub(crate) fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(madsim)]
+pub(crate) fn unix_time_ms() -> u64 {
+    panic!(
+        "unix_time_ms() / SystemWallClock is non-deterministic under cfg(madsim); \
+         inject a deterministic WallClock via HttpState::with_wall_clock (or _handle)"
+    );
 }
 
 pub(crate) fn v1_stream_id(path: &str) -> Result<BucketStreamId, BoxResponse> {
