@@ -204,7 +204,9 @@ pub(super) async fn run_partition_heal_inner(
     }
 }
 
-pub(super) async fn run_snapshot_catch_up_inner(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
+pub(super) async fn run_snapshot_catch_up_inner(
+    config: ThreeNodeRaftSimConfig,
+) -> ThreeNodeRaftSimOutcome {
     let mut trace = SimTrace::default();
     let policy = sim_network_policy();
     let (registry, mut engines, leader_id) = build_lagging_learner_snapshot_cluster(policy).await;
@@ -370,7 +372,9 @@ pub(super) async fn run_snapshot_catch_up_inner(config: ThreeNodeRaftSimConfig) 
     }
 }
 
-pub(super) async fn run_restart_follower_inner(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
+pub(super) async fn run_restart_follower_inner(
+    config: ThreeNodeRaftSimConfig,
+) -> ThreeNodeRaftSimOutcome {
     let mut trace = SimTrace::default();
     let policy = sim_network_policy();
     let (registry, mut engines, log_stores, raft_config, leader_id) =
@@ -511,7 +515,9 @@ pub(super) async fn run_restart_follower_inner(config: ThreeNodeRaftSimConfig) -
     }
 }
 
-pub(super) async fn run_leader_failover_inner(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
+pub(super) async fn run_leader_failover_inner(
+    config: ThreeNodeRaftSimConfig,
+) -> ThreeNodeRaftSimOutcome {
     let mut trace = SimTrace::default();
     let policy = sim_network_policy();
     let (registry, mut engines, log_stores, raft_config, old_leader_id) =

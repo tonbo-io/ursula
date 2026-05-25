@@ -715,7 +715,8 @@ fn parse_seed_family(family: &str) -> Result<Vec<ScheduleSeed>, Box<dyn Error>> 
         "pipeline-smoke-http-protocol-surface-randomized-sse-corruption" => Ok((302..=306)
             .map(ScheduleSeed::http_protocol_surface_randomized_sse_failure)
             .collect()),
-        "pipeline-smoke-http-protocol-surface-randomized-backpressure-corruption" => Ok((307..=311)
+        "pipeline-smoke-http-protocol-surface-randomized-backpressure-corruption" => Ok((307
+            ..=311)
             .map(ScheduleSeed::http_protocol_surface_randomized_backpressure_failure)
             .collect()),
         "pipeline-smoke-runtime-raft-network-randomized-read-corruption" => Ok((242..=246)

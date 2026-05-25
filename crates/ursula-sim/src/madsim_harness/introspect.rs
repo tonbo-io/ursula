@@ -32,7 +32,9 @@ pub(super) fn http_protocol_surface_plan_from_fault_plan(
     })
 }
 
-pub(super) fn corrupt_cold_live_read_node_from_fault_plan(fault_plan: &SimFaultPlan) -> Option<u64> {
+pub(super) fn corrupt_cold_live_read_node_from_fault_plan(
+    fault_plan: &SimFaultPlan,
+) -> Option<u64> {
     fault_plan.steps.iter().find_map(|step| match &step.action {
         SimFaultAction::CorruptColdLiveReadExpectation { node_id } => Some(*node_id),
         _ => None,
@@ -188,7 +190,9 @@ pub(super) fn has_corrupt_http_live_limit_backpressure_expectation_in_fault_plan
     })
 }
 
-pub(super) fn has_corrupt_http_snapshot_body_expectation_in_fault_plan(fault_plan: &SimFaultPlan) -> bool {
+pub(super) fn has_corrupt_http_snapshot_body_expectation_in_fault_plan(
+    fault_plan: &SimFaultPlan,
+) -> bool {
     fault_plan.steps.iter().any(|step| {
         matches!(
             step.action,

@@ -101,7 +101,9 @@ pub(super) async fn run_runtime_actor_scheduling_inner(
     }
 }
 
-pub(super) async fn run_runtime_raft_engine_inner(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
+pub(super) async fn run_runtime_raft_engine_inner(
+    config: ThreeNodeRaftSimConfig,
+) -> ThreeNodeRaftSimOutcome {
     let mut trace = SimTrace::default();
     let mut runtime_config = RuntimeConfig::new(1, 1);
     runtime_config.threading = RuntimeThreading::HostedTokio;

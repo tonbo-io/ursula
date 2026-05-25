@@ -244,10 +244,12 @@ fn cold_write_fault_workload_replays_with_same_seed_and_trace() {
             .any(|event| matches!(event, SimEvent::ColdWriteFaultObserved { .. }))
     );
     assert!(
-        first.outcome.trace.events.iter().any(|event| matches!(
-            event,
-            SimEvent::HotReadAfterColdWriteFailureVerified { .. }
-        ))
+        first
+            .outcome
+            .trace
+            .events
+            .iter()
+            .any(|event| matches!(event, SimEvent::HotReadAfterColdWriteFailureVerified { .. }))
     );
 }
 
@@ -389,12 +391,14 @@ fn http_live_protocol_surface_workload_replays_with_same_seed_and_trace() {
 #[ignore = "diagnostic: madsim process-global state makes scenario tests safer to run individually"]
 fn http_protocol_surface_workload_replays_with_same_seed_and_trace() {
     let _guard = sim_test_guard();
-    let first = ThreeNodeRaftSim::run_http_protocol_surface_report(
-        ThreeNodeRaftSimConfig::new(57, "ursula-sim-http-protocol"),
-    );
-    let second = ThreeNodeRaftSim::run_http_protocol_surface_report(
-        ThreeNodeRaftSimConfig::new(57, "ursula-sim-http-protocol"),
-    );
+    let first = ThreeNodeRaftSim::run_http_protocol_surface_report(ThreeNodeRaftSimConfig::new(
+        57,
+        "ursula-sim-http-protocol",
+    ));
+    let second = ThreeNodeRaftSim::run_http_protocol_surface_report(ThreeNodeRaftSimConfig::new(
+        57,
+        "ursula-sim-http-protocol",
+    ));
 
     assert_eq!(first, second);
     assert_eq!(first.scenario, SimScenario::HttpProtocolSurface);
@@ -490,9 +494,10 @@ fn cold_read_truncate_workload_replays_with_same_seed_and_trace() {
 #[ignore = "diagnostic: madsim process-global state makes scenario tests safer to run individually"]
 fn runtime_actor_scheduling_workload_replays_with_same_seed_and_trace() {
     let _guard = sim_test_guard();
-    let first = ThreeNodeRaftSim::run_runtime_actor_scheduling_report(
-        ThreeNodeRaftSimConfig::new(69, "ursula-sim-runtime-actor-scheduling"),
-    );
+    let first = ThreeNodeRaftSim::run_runtime_actor_scheduling_report(ThreeNodeRaftSimConfig::new(
+        69,
+        "ursula-sim-runtime-actor-scheduling",
+    ));
     let second = ThreeNodeRaftSim::run_runtime_actor_scheduling_report(
         ThreeNodeRaftSimConfig::new(69, "ursula-sim-runtime-actor-scheduling"),
     );
@@ -652,9 +657,10 @@ fn runtime_raft_network_workload_replays_with_same_seed_and_trace() {
         102,
         "ursula-sim-runtime-raft-network",
     ));
-    let second = ThreeNodeRaftSim::run_runtime_raft_network_report(
-        ThreeNodeRaftSimConfig::new(102, "ursula-sim-runtime-raft-network"),
-    );
+    let second = ThreeNodeRaftSim::run_runtime_raft_network_report(ThreeNodeRaftSimConfig::new(
+        102,
+        "ursula-sim-runtime-raft-network",
+    ));
 
     assert_eq!(first, second);
     assert_eq!(first.scenario, SimScenario::RuntimeRaftNetwork);
@@ -701,10 +707,12 @@ fn runtime_raft_snapshot_install_workload_replays_with_same_seed_and_trace() {
             .any(|event| matches!(event, SimEvent::RuntimeRaftSnapshotCaptured { .. }))
     );
     assert!(
-        first.outcome.trace.events.iter().any(|event| matches!(
-            event,
-            SimEvent::RuntimeRaftSnapshotInstalledVerified { .. }
-        ))
+        first
+            .outcome
+            .trace
+            .events
+            .iter()
+            .any(|event| matches!(event, SimEvent::RuntimeRaftSnapshotInstalledVerified { .. }))
     );
 }
 
@@ -921,8 +929,8 @@ fn scheduled_record_round_trips_and_replays() {
     let record = SimScheduledRecord::new(schedule.clone(), schedule.run());
 
     let encoded = serde_json::to_string_pretty(&record).expect("serialize schedule record");
-    let decoded = serde_json::from_str::<SimScheduledRecord>(&encoded)
-        .expect("deserialize schedule record");
+    let decoded =
+        serde_json::from_str::<SimScheduledRecord>(&encoded).expect("deserialize schedule record");
 
     assert_eq!(decoded, record);
     decoded.assert_replays();
@@ -1022,9 +1030,7 @@ fn assert_runtime_raft_randomized_seed_sets_cover_key_branches() {
     assert_eq!(cold_read_delay_seeds(137..=156), vec![147]);
 }
 
-fn runtime_raft_network_workload_plan(
-    schedule: &SimSchedule,
-) -> &RuntimeRaftNetworkWorkloadPlan {
+fn runtime_raft_network_workload_plan(schedule: &SimSchedule) -> &RuntimeRaftNetworkWorkloadPlan {
     schedule
         .fault_plan
         .steps
@@ -1116,9 +1122,8 @@ fn failure_corpus_covers_expected_invariants_and_seeds() {
 
 fn assert_failure_corpus_covers_expected_invariants_and_seeds() {
     let failure_corpus = include_str!("../../corpus/failure-smoke.json");
-    let failure_records =
-        serde_json::from_str::<Vec<SimFailureRegressionRecord>>(failure_corpus)
-            .expect("parse failure smoke corpus");
+    let failure_records = serde_json::from_str::<Vec<SimFailureRegressionRecord>>(failure_corpus)
+        .expect("parse failure smoke corpus");
     let actual = failure_records
         .iter()
         .map(|record| (record.seed, record.invariant.as_str()))
@@ -1599,9 +1604,8 @@ fn smoke_corpus_replays() {
     }
 
     let failure_corpus = include_str!("../../corpus/failure-smoke.json");
-    let failure_records =
-        serde_json::from_str::<Vec<SimFailureRegressionRecord>>(failure_corpus)
-            .expect("parse failure smoke corpus");
+    let failure_records = serde_json::from_str::<Vec<SimFailureRegressionRecord>>(failure_corpus)
+        .expect("parse failure smoke corpus");
     assert_eq!(failure_records.len(), 18);
     for record in failure_records {
         record.assert_replays();

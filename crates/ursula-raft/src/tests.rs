@@ -905,7 +905,10 @@ async fn in_process_raft_network_minority_leader_append_does_not_ack() {
         engine
             .raft
             .wait(Some(Duration::from_secs(5)))
-            .metrics(|m| m.current_leader.is_some(), "leader reachable after heal")
+            .metrics(
+                |m| m.current_leader.is_some(),
+                "leader reachable after heal",
+            )
             .await
             .expect("wait for leader after heal");
     }
@@ -944,7 +947,10 @@ async fn in_process_raft_network_minority_leader_append_does_not_ack() {
     }
 
     for engine in &engines {
-        engine.shutdown().await.expect("shutdown minority-leader node");
+        engine
+            .shutdown()
+            .await
+            .expect("shutdown minority-leader node");
     }
 }
 

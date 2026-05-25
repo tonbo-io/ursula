@@ -269,22 +269,9 @@ pub const RUNTIME_RAFT_NETWORK_COLD_LIVE_TRUNCATE_FAILURE_SEEDS: std::ops::Range
     222..=226;
 pub const RUNTIME_RAFT_SNAPSHOT_INSTALL_FAILURE_SEEDS: std::ops::RangeInclusive<u64> = 232..=236;
 
-
-
-
-
-
-
-
-
-
-
-
 fn is_false(value: &bool) -> bool {
     !*value
 }
-
-
 
 fn default_runtime_flush_group_limit() -> usize {
     2
@@ -293,7 +280,6 @@ fn default_runtime_flush_group_limit() -> usize {
 fn is_default_runtime_flush_group_limit(value: &usize) -> bool {
     *value == default_runtime_flush_group_limit()
 }
-
 
 fn runtime_cold_read_delay_ms_from_seed(seed: u64) -> Option<u64> {
     if seed >= 73 && seed.is_multiple_of(5) {
@@ -311,8 +297,6 @@ fn runtime_corrupt_read_client_id(seed: u64, plan: &RuntimeInterleavingPlan) -> 
 fn runtime_cold_read_truncate_len(seed: u64) -> usize {
     usize::try_from(seed % 3).expect("truncate len fits usize")
 }
-
-
 
 #[derive(Debug, Clone)]
 struct SplitMix64 {
@@ -469,8 +453,8 @@ impl SimFailureRegressionRecord {
 mod trace;
 pub use self::trace::{SimEvent, SimTrace};
 
-mod generators;
 mod cold_path;
+mod generators;
 use cold_path::*;
 mod http;
 use http::*;
@@ -484,38 +468,12 @@ mod dispatch;
 mod introspect;
 pub(self) use introspect::*;
 
-
 pub fn stable_replay_outcome(mut outcome: ThreeNodeRaftSimOutcome) -> ThreeNodeRaftSimOutcome {
     outcome.trace = outcome.trace.stable_replay();
     outcome
 }
 
 pub struct ThreeNodeRaftSim;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 pub(super) fn http_offset(offset: u64) -> String {
     format!("{offset:020}")
@@ -1340,10 +1298,6 @@ impl GroupEngine for MadsimScopedGroupEngine {
     }
 }
 
-
-
-
-
 fn network_rpc_kind_name(kind: InProcessRaftRpcKind) -> &'static str {
     match kind {
         InProcessRaftRpcKind::AppendEntries => "append_entries",
@@ -1355,30 +1309,6 @@ fn network_rpc_kind_name(kind: InProcessRaftRpcKind) -> &'static str {
 pub(super) fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 pub(super) fn assert_runtime_interleaving_read_your_write(
     client_id: usize,
@@ -1457,8 +1387,6 @@ pub(super) fn assert_runtime_raft_read_consistency(
     }
 }
 
-
-
 pub(super) fn assert_runtime_raft_leader_failover_read_consistency(
     stream: &BucketStreamId,
     actual: &[u8],
@@ -1485,7 +1413,10 @@ pub(super) fn assert_runtime_raft_leader_failover_read_consistency(
     }
 }
 
-pub(super) fn runtime_raft_network_streams(base: &BucketStreamId, stream_count: usize) -> Vec<BucketStreamId> {
+pub(super) fn runtime_raft_network_streams(
+    base: &BucketStreamId,
+    stream_count: usize,
+) -> Vec<BucketStreamId> {
     let stream_count = stream_count.max(1);
     (0..stream_count)
         .map(|stream_index| {
@@ -2002,7 +1933,10 @@ pub(super) async fn wait_all_nodes_applied(
     }
 }
 
-pub(super) async fn verify_all_nodes_can_read(engines: &mut [RaftGroupEngine], stream: &BucketStreamId) {
+pub(super) async fn verify_all_nodes_can_read(
+    engines: &mut [RaftGroupEngine],
+    stream: &BucketStreamId,
+) {
     verify_all_nodes_can_read_payload(engines, stream, b"simulated").await;
 }
 

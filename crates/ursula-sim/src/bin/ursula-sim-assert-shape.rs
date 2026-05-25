@@ -22,7 +22,9 @@ use std::error::Error;
 #[cfg(not(madsim))]
 fn main() -> ExitCode {
     eprintln!("ursula-sim-assert-shape requires `--cfg madsim`. Re-run with");
-    eprintln!("  RUSTFLAGS=\"--cfg madsim\" cargo run -p ursula-sim --bin ursula-sim-assert-shape -- ...");
+    eprintln!(
+        "  RUSTFLAGS=\"--cfg madsim\" cargo run -p ursula-sim --bin ursula-sim-assert-shape -- ..."
+    );
     ExitCode::from(2)
 }
 
@@ -44,8 +46,7 @@ fn main() -> ExitCode {
                     shape = Some(args.next().ok_or("--shape requires a value")?);
                 }
                 "--steps-exact" => {
-                    steps_exact =
-                        Some(args.next().ok_or("--steps-exact requires a value")?);
+                    steps_exact = Some(args.next().ok_or("--steps-exact requires a value")?);
                 }
                 "--json-pointer" => {
                     json_pointer = args.next().ok_or("--json-pointer requires a value")?;
@@ -188,9 +189,7 @@ mod madsim_shapes {
             "PartitionSeededFollower" => {
                 Box::new(|a| matches!(a, SimFaultAction::PartitionSeededFollower))
             }
-            "HealSeededFollower" => {
-                Box::new(|a| matches!(a, SimFaultAction::HealSeededFollower))
-            }
+            "HealSeededFollower" => Box::new(|a| matches!(a, SimFaultAction::HealSeededFollower)),
             "CreateLeaderSnapshot" => {
                 Box::new(|a| matches!(a, SimFaultAction::CreateLeaderSnapshot))
             }
@@ -198,39 +197,33 @@ mod madsim_shapes {
             "AddLaggingLearner" => {
                 Box::new(|a| matches!(a, SimFaultAction::AddLaggingLearner { .. }))
             }
-            "StopSeededFollower" => {
-                Box::new(|a| matches!(a, SimFaultAction::StopSeededFollower))
-            }
+            "StopSeededFollower" => Box::new(|a| matches!(a, SimFaultAction::StopSeededFollower)),
             "RestartStoppedFollower" => {
                 Box::new(|a| matches!(a, SimFaultAction::RestartStoppedFollower))
             }
-            "StopCurrentLeader" => {
-                Box::new(|a| matches!(a, SimFaultAction::StopCurrentLeader))
-            }
+            "StopCurrentLeader" => Box::new(|a| matches!(a, SimFaultAction::StopCurrentLeader)),
             "RestartStoppedLeader" => {
                 Box::new(|a| matches!(a, SimFaultAction::RestartStoppedLeader))
             }
-            "CorruptRuntimeRaftSnapshotAppendCounts" => Box::new(|a| {
-                matches!(a, SimFaultAction::CorruptRuntimeRaftSnapshotAppendCounts)
-            }),
-            "CorruptHttpProducerDuplicateExpectation" => Box::new(|a| {
-                matches!(a, SimFaultAction::CorruptHttpProducerDuplicateExpectation)
-            }),
-            "CorruptHttpLiveSseNextOffsetExpectation" => Box::new(|a| {
-                matches!(a, SimFaultAction::CorruptHttpLiveSseNextOffsetExpectation)
-            }),
+            "CorruptRuntimeRaftSnapshotAppendCounts" => {
+                Box::new(|a| matches!(a, SimFaultAction::CorruptRuntimeRaftSnapshotAppendCounts))
+            }
+            "CorruptHttpProducerDuplicateExpectation" => {
+                Box::new(|a| matches!(a, SimFaultAction::CorruptHttpProducerDuplicateExpectation))
+            }
+            "CorruptHttpLiveSseNextOffsetExpectation" => {
+                Box::new(|a| matches!(a, SimFaultAction::CorruptHttpLiveSseNextOffsetExpectation))
+            }
             "CorruptHttpLiveLimitBackpressureExpectation" => Box::new(|a| {
                 matches!(
                     a,
                     SimFaultAction::CorruptHttpLiveLimitBackpressureExpectation
                 )
             }),
-            "CorruptHttpSnapshotBodyExpectation" => Box::new(|a| {
-                matches!(a, SimFaultAction::CorruptHttpSnapshotBodyExpectation)
-            }),
-            "WriteColdChunk" => {
-                Box::new(|a| matches!(a, SimFaultAction::WriteColdChunk { .. }))
+            "CorruptHttpSnapshotBodyExpectation" => {
+                Box::new(|a| matches!(a, SimFaultAction::CorruptHttpSnapshotBodyExpectation))
             }
+            "WriteColdChunk" => Box::new(|a| matches!(a, SimFaultAction::WriteColdChunk { .. })),
             "PublishColdFlush" => {
                 Box::new(|a| matches!(a, SimFaultAction::PublishColdFlush { .. }))
             }
@@ -251,15 +244,13 @@ mod madsim_shapes {
             "TruncateNextColdRead" => {
                 Box::new(|a| matches!(a, SimFaultAction::TruncateNextColdRead { .. }))
             }
-            "FailNextColdDelete" => {
-                Box::new(|a| matches!(a, SimFaultAction::FailNextColdDelete))
+            "FailNextColdDelete" => Box::new(|a| matches!(a, SimFaultAction::FailNextColdDelete)),
+            "RunRuntimeRaftNetworkWorkload" => {
+                Box::new(|a| matches!(a, SimFaultAction::RunRuntimeRaftNetworkWorkload { .. }))
             }
-            "RunRuntimeRaftNetworkWorkload" => Box::new(|a| {
-                matches!(a, SimFaultAction::RunRuntimeRaftNetworkWorkload { .. })
-            }),
-            "RunRuntimeSeededInterleaving" => Box::new(|a| {
-                matches!(a, SimFaultAction::RunRuntimeSeededInterleaving { .. })
-            }),
+            "RunRuntimeSeededInterleaving" => {
+                Box::new(|a| matches!(a, SimFaultAction::RunRuntimeSeededInterleaving { .. }))
+            }
             "RunRuntimeColdFlushAllGroups" => {
                 Box::new(|a| matches!(a, SimFaultAction::RunRuntimeColdFlushAllGroups { .. }))
             }
@@ -281,12 +272,12 @@ mod madsim_shapes {
             "VerifyRuntimeColdLiveReads" => {
                 Box::new(|a| matches!(a, SimFaultAction::VerifyRuntimeColdLiveReads))
             }
-            "VerifyHotReadAfterColdWriteFailure" => Box::new(|a| {
-                matches!(a, SimFaultAction::VerifyHotReadAfterColdWriteFailure)
-            }),
-            "CorruptColdLiveReadExpectation" => Box::new(|a| {
-                matches!(a, SimFaultAction::CorruptColdLiveReadExpectation { .. })
-            }),
+            "VerifyHotReadAfterColdWriteFailure" => {
+                Box::new(|a| matches!(a, SimFaultAction::VerifyHotReadAfterColdWriteFailure))
+            }
+            "CorruptColdLiveReadExpectation" => {
+                Box::new(|a| matches!(a, SimFaultAction::CorruptColdLiveReadExpectation { .. }))
+            }
             other => {
                 return Err(format!(
                     "unknown SimFaultAction variant name {other:?} in --steps-exact; \

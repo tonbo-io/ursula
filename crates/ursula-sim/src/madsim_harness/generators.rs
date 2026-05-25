@@ -5,7 +5,6 @@
 use super::*;
 
 impl SimSchedule {
-
     pub fn generate_runtime_interleaving_failure(seed: u64) -> Self {
         let mut schedule = Self::for_scenario(seed, SimScenario::RuntimeSeededInterleaving);
         for step in &mut schedule.fault_plan.steps {
@@ -15,7 +14,6 @@ impl SimSchedule {
         }
         schedule
     }
-
 
     pub fn generate_runtime_interleaving_truncate_failure(seed: u64) -> Self {
         let mut schedule = Self::for_scenario(seed, SimScenario::RuntimeSeededInterleaving);
@@ -27,7 +25,6 @@ impl SimSchedule {
         schedule
     }
 
-
     pub fn generate_runtime_interleaving_write_failure(seed: u64) -> Self {
         let mut schedule = Self::for_scenario(seed, SimScenario::RuntimeSeededInterleaving);
         for step in &mut schedule.fault_plan.steps {
@@ -38,7 +35,6 @@ impl SimSchedule {
         }
         schedule
     }
-
 
     pub fn generate_http_producer_protocol_surface_failure(seed: u64) -> Self {
         let mut schedule = Self::for_scenario(seed, SimScenario::HttpProducerProtocolSurface);
@@ -53,7 +49,6 @@ impl SimSchedule {
         schedule
     }
 
-
     pub fn generate_http_live_protocol_surface_failure(seed: u64) -> Self {
         let mut schedule = Self::for_scenario(seed, SimScenario::HttpLiveProtocolSurface);
         schedule.stream = BucketStreamId::new(
@@ -66,7 +61,6 @@ impl SimSchedule {
         });
         schedule
     }
-
 
     pub fn generate_http_live_limit_protocol_surface_failure(seed: u64) -> Self {
         let mut schedule = Self::for_scenario(seed, SimScenario::HttpLiveLimitProtocolSurface);
@@ -81,7 +75,6 @@ impl SimSchedule {
         schedule
     }
 
-
     pub fn generate_http_snapshot_protocol_surface_failure(seed: u64) -> Self {
         let mut schedule = Self::for_scenario(seed, SimScenario::HttpProtocolSurface);
         schedule.stream = BucketStreamId::new(
@@ -94,7 +87,6 @@ impl SimSchedule {
         });
         schedule
     }
-
 
     pub fn generate_http_protocol_surface_randomized(seed: u64) -> Self {
         let stream = BucketStreamId::new(
@@ -116,7 +108,6 @@ impl SimSchedule {
         }
     }
 
-
     pub fn generate_http_protocol_surface_randomized_failure(seed: u64) -> Self {
         let mut schedule = Self::generate_http_protocol_surface_randomized(seed);
         schedule.stream = BucketStreamId::new(
@@ -130,7 +121,6 @@ impl SimSchedule {
         }
         schedule
     }
-
 
     pub fn generate_http_protocol_surface_randomized_sse_failure(seed: u64) -> Self {
         let mut schedule = Self::generate_http_protocol_surface_randomized(seed);
@@ -146,7 +136,6 @@ impl SimSchedule {
         }
         schedule
     }
-
 
     pub fn generate_http_protocol_surface_randomized_backpressure_failure(seed: u64) -> Self {
         let mut schedule = Self::generate_http_protocol_surface_randomized(seed);
@@ -164,7 +153,6 @@ impl SimSchedule {
         }
         schedule
     }
-
 
     pub fn generate_raft_partition_failure(seed: u64) -> Self {
         let stream = BucketStreamId::new(
@@ -184,7 +172,6 @@ impl SimSchedule {
         }
     }
 
-
     pub fn generate_runtime_raft_network_partition_failure(seed: u64) -> Self {
         let stream = BucketStreamId::new(
             "benchcmp",
@@ -202,7 +189,6 @@ impl SimSchedule {
             },
         }
     }
-
 
     pub fn generate_runtime_raft_network_recovery(seed: u64) -> Self {
         let stream = BucketStreamId::new(
@@ -227,7 +213,6 @@ impl SimSchedule {
             },
         }
     }
-
 
     pub fn generate_runtime_raft_network_cold_live_recovery(seed: u64) -> Self {
         let stream = BucketStreamId::new(
@@ -256,7 +241,6 @@ impl SimSchedule {
             },
         }
     }
-
 
     pub fn generate_runtime_raft_network_cold_live_restart(seed: u64) -> Self {
         let stream = BucketStreamId::new(
@@ -294,7 +278,6 @@ impl SimSchedule {
         }
     }
 
-
     pub fn generate_runtime_raft_network_cold_live_write_recovery(seed: u64) -> Self {
         let stream = BucketStreamId::new(
             "benchcmp",
@@ -331,7 +314,6 @@ impl SimSchedule {
         }
     }
 
-
     pub fn generate_runtime_raft_network_leader_failover(seed: u64) -> Self {
         let stream = BucketStreamId::new(
             "benchcmp",
@@ -355,7 +337,6 @@ impl SimSchedule {
             },
         }
     }
-
 
     pub fn generate_runtime_raft_network_randomized(seed: u64) -> Self {
         let stream = BucketStreamId::new(
@@ -471,7 +452,6 @@ impl SimSchedule {
         }
     }
 
-
     pub fn generate_runtime_raft_network_randomized_failure(seed: u64) -> Self {
         let mut schedule = Self::generate_runtime_raft_network_randomized(seed);
         schedule.stream = BucketStreamId::new(
@@ -485,7 +465,6 @@ impl SimSchedule {
         }
         schedule
     }
-
 
     pub fn generate_runtime_raft_network_partial_read_failure(seed: u64) -> Self {
         let mut schedule = Self::generate_runtime_raft_network_randomized(seed);
@@ -502,7 +481,6 @@ impl SimSchedule {
         schedule
     }
 
-
     pub fn generate_runtime_raft_network_tail_read_failure(seed: u64) -> Self {
         let mut schedule = Self::generate_runtime_raft_network_randomized(seed);
         schedule.stream = BucketStreamId::new(
@@ -517,7 +495,6 @@ impl SimSchedule {
         }
         schedule
     }
-
 
     pub fn generate_runtime_raft_network_close_failure(seed: u64) -> Self {
         let mut schedule = Self::generate_runtime_raft_network_randomized(seed);
@@ -534,7 +511,6 @@ impl SimSchedule {
         schedule
     }
 
-
     pub fn generate_runtime_raft_network_snapshot_failure(seed: u64) -> Self {
         let mut schedule = Self::generate_runtime_raft_network_randomized(seed);
         schedule.stream = BucketStreamId::new(
@@ -549,7 +525,6 @@ impl SimSchedule {
         }
         schedule
     }
-
 
     pub fn generate_runtime_raft_network_leader_failover_read_failure(seed: u64) -> Self {
         let mut schedule = Self::generate_runtime_raft_network_randomized(seed);
@@ -574,7 +549,6 @@ impl SimSchedule {
         }
         schedule
     }
-
 
     pub fn generate_runtime_raft_network_leader_failover_cold_live_read_failure(seed: u64) -> Self {
         let stream = BucketStreamId::new(
@@ -633,7 +607,6 @@ impl SimSchedule {
         }
     }
 
-
     pub fn generate_runtime_raft_network_randomized_cold_read_failure(seed: u64) -> Self {
         let mut schedule = Self::generate_runtime_raft_network_randomized(seed);
         schedule.stream = BucketStreamId::new(
@@ -659,7 +632,6 @@ impl SimSchedule {
         });
         schedule
     }
-
 
     pub fn generate_runtime_raft_network_cold_live_truncate_failure(seed: u64) -> Self {
         let stream = BucketStreamId::new(
@@ -693,7 +665,6 @@ impl SimSchedule {
         }
     }
 
-
     pub fn generate_runtime_raft_network_cold_live_write_failure(seed: u64) -> Self {
         let stream = BucketStreamId::new(
             "benchcmp",
@@ -726,7 +697,6 @@ impl SimSchedule {
         }
     }
 
-
     pub fn generate_runtime_raft_snapshot_install_failure(seed: u64) -> Self {
         let stream = BucketStreamId::new(
             "benchcmp",
@@ -744,5 +714,4 @@ impl SimSchedule {
             },
         }
     }
-
 }
