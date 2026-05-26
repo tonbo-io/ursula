@@ -550,10 +550,13 @@ pub fn router_with_http_state(state: HttpState) -> Router {
     router_from_state(state)
 }
 
-fn router_from_state(state: HttpState) -> Router {
+/// Cluster-plane routes: inter-node gRPC carrying Raft RPCs, snapshot
+/// transfer, and HTTP-write forwarding to the leader. In a dual-listener
+/// deployment these bind to the private (VPC) interface so chaos applied to
+/// the public face never disrupts consensus.
+pub fn cluster_router_from_state(state: HttpState) -> Router {
     let raft_registry = state.raft_registry.clone().unwrap_or_default();
     Router::new()
-        .route("/__ursula/metrics", get(metrics))
         .route_service(
             RAFT_GRPC_APPEND_PATH,
             raft_grpc_service(state.clone(), raft_registry.clone()),
@@ -578,6 +581,17 @@ fn router_from_state(state: HttpState) -> Router {
             RAFT_GRPC_GROUP_READ_PATH,
             raft_grpc_service(state.clone(), raft_registry),
         )
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+        .with_state(state)
+}
+
+/// Client-plane routes: HTTP append/read/admin endpoints used by external
+/// callers (producers, readers, operators). In a dual-listener deployment
+/// these bind to the public interface; failure injection against the public
+/// face only affects this plane.
+pub fn client_router_from_state(state: HttpState) -> Router {
+    Router::new()
+        .route("/__ursula/metrics", get(metrics))
         .route(
             "/__ursula/flush-cold/{bucket}/{stream}",
             post(flush_cold_stream),
@@ -597,6 +611,10 @@ fn router_from_state(state: HttpState) -> Router {
         .route(
             "/__ursula/raft/{raft_group_id}/nodes/{node_id}/allow-next-revert",
             post(allow_raft_node_next_revert),
+        )
+        .route(
+            "/__ursula/raft/{raft_group_id}/leader/transfer/{node_id}",
+            post(transfer_raft_leader),
         )
         .route(
             "/v1/stream/{*path}",
@@ -626,6 +644,13 @@ fn router_from_state(state: HttpState) -> Router {
         .route("/{bucket}/{stream}/append-batch", post(append_batch))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state)
+}
+
+/// Single-listener router that serves both planes from one bind. Kept for
+/// in-process tests and backward-compatible deployments that don't separate
+/// the public and cluster network paths.
+fn router_from_state(state: HttpState) -> Router {
+    cluster_router_from_state(state.clone()).merge(client_router_from_state(state))
 }
 
 pub(crate) fn should_externalize_payload(
@@ -1006,6 +1031,74 @@ pub(crate) async fn allow_raft_node_next_revert(
         )
             .into_response(),
     }
+}
+
+pub(crate) async fn transfer_raft_leader(
+    State(state): State<HttpState>,
+    Path((raft_group_id, node_id)): Path<(u64, u64)>,
+) -> Response {
+    let Some(registry) = state.raft_registry() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "raft registry is not configured for this server",
+        )
+            .into_response();
+    };
+    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
+    };
+    let Some(raft) = registry.get(raft_group_id) else {
+        return (StatusCode::NOT_FOUND, "raft group is not registered").into_response();
+    };
+    let metrics_before = raft.metrics().borrow_watched().clone();
+    let current_leader = metrics_before.current_leader;
+    let self_id = metrics_before.id;
+    if current_leader != Some(self_id) {
+        return (
+            StatusCode::CONFLICT,
+            [("content-type", "application/json")],
+            format!(
+                "{{\"raft_group_id\":{},\"current_leader\":{},\"transferred\":false,\"reason\":\"not leader\"}}",
+                raft_group_id.0,
+                optional_u64_json(current_leader)
+            ),
+        )
+            .into_response();
+    }
+    if node_id == self_id {
+        return (
+            StatusCode::BAD_REQUEST,
+            "target node_id is the current leader",
+        )
+            .into_response();
+    }
+    if !metrics_before
+        .membership_config
+        .voter_ids()
+        .any(|voter| voter == node_id)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "target node_id is not a voter in this raft group",
+        )
+            .into_response();
+    }
+    if let Err(err) = raft.trigger().transfer_leader(node_id).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("trigger raft transfer leader: {err}"),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        [("content-type", "application/json")],
+        format!(
+            "{{\"raft_group_id\":{},\"from\":{},\"to\":{},\"transferred\":true}}",
+            raft_group_id.0, self_id, node_id
+        ),
+    )
+        .into_response()
 }
 
 pub(crate) fn parse_raft_group_id(raw: u64) -> Result<RaftGroupId, std::num::TryFromIntError> {

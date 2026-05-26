@@ -322,9 +322,15 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             let config = Arc::new(
                 Config {
                     cluster_name: format!("ursula-group-{}", placement.raft_group_id.0),
-                    heartbeat_interval: 100,
-                    election_timeout_min: 300,
-                    election_timeout_max: 600,
+                    // Timeouts tuned for a multi-AZ EC2 cluster carrying chaos faults.
+                    // The chaos test injects netem_delay 250ms±75ms; under that load,
+                    // the previous 100/300/600 produced 100s+ of spurious elections
+                    // (term 200-600 in 30 min). Heartbeat must stay well below
+                    // election_timeout_min, and election_timeout_min must stay above
+                    // worst-case fault-induced inter-heartbeat arrival.
+                    heartbeat_interval: 250,
+                    election_timeout_min: 1500,
+                    election_timeout_max: 3000,
                     ..Default::default()
                 }
                 .validate()

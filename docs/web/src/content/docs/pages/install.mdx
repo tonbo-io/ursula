@@ -1,9 +1,14 @@
 ---
 title: Install
-description: Build Ursula from source and prepare a host to run the server.
+description: Build Ursula from source. Ships two binaries — the `ursula` server and the `ursulactl` operator CLI.
 ---
 
-Ursula is currently installed from source. Pre-built release binaries are on the way. There is no embedded KV dependency, so the build is plain Rust plus the standard C toolchain that Cargo expects.
+Ursula is currently installed from source. Pre-built release binaries are on the way. The build is plain Rust plus the standard C toolchain that Cargo expects — no embedded KV dependency.
+
+Ursula ships **two binaries** you will use side by side:
+
+- **`ursula`** — the server daemon. Runs on every node in the cluster.
+- **`ursulactl`** — the operator CLI. Lives on your control machine and talks to each node's HTTP surface. See [ursulactl](/docs/cli) for the verbs it exposes.
 
 ## Prerequisites
 
@@ -32,10 +37,10 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```bash
 git clone https://github.com/tonbo-io/ursula.git
 cd ursula
-cargo build --release -p ursula --bin ursula
+cargo build --release -p ursula -p ursula-ctl
 ```
 
-The resulting binary lives at `target/release/ursula` and is what you ship to production hosts.
+The resulting binaries land at `target/release/ursula` and `target/release/ursulactl`. Ship `ursula` to every node; keep `ursulactl` wherever you run operational tooling (laptop, CI runner, bastion host).
 
 To work on the whole workspace:
 
@@ -45,19 +50,34 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-`cargo build --workspace` compiles every crate. For just the HTTP server use the `cargo build -p ursula` form above.
+`cargo build --workspace` compiles every crate. For just the server use `cargo build -p ursula`; for just the CLI use `cargo build -p ursula-ctl`.
 
 ## Verify
 
 ```bash
 ./target/release/ursula --help
+./target/release/ursulactl --help
 ```
 
-Should print the supported CLI flags. Then run a short smoke server (defaults to `127.0.0.1:4437`, in-memory engine, core count from your CPU):
+Both should print supported CLI flags. Then run a short smoke server (defaults to `127.0.0.1:4437`, in-memory engine, core count from your CPU):
 
 ```bash
 ./target/release/ursula &
+```
 
+For a single local node, `ursulactl` needs a one-node manifest to talk to:
+
+```bash
+cat > /tmp/local.json <<'JSON'
+{"nodes": [{"id": 1, "http_url": "http://127.0.0.1:4437", "host": "127.0.0.1"}]}
+JSON
+
+./target/release/ursulactl status --config /tmp/local.json
+```
+
+Or, for a quick eyeball without writing a manifest, hit the HTTP surface directly:
+
+```bash
 curl -X PUT http://127.0.0.1:4437/demo
 curl -X PUT http://127.0.0.1:4437/demo/hello
 curl -X POST -H 'Content-Type: text/plain' --data 'hi' http://127.0.0.1:4437/demo/hello
@@ -68,6 +88,8 @@ Kill the background process when you're done.
 
 ## Next
 
-- [Run locally](/docs/run-locally) - durability modes and flags
-- [Deploy a cluster](/docs/deploy-cluster) - static gRPC Raft cluster
-- [Configure S3](/docs/configure-s3) - shared cold storage
+- [Quick start](/docs/quick-start) — drive the HTTP API end-to-end
+- [Run locally](/docs/run-locally) — durability modes and flags
+- [Deploy a cluster](/docs/deploy-cluster) — static gRPC Raft cluster
+- [ursulactl](/docs/cli) — the verbs you'll use once the cluster is up
+- [Configure S3](/docs/configure-s3) — shared cold storage

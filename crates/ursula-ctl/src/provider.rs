@@ -1,0 +1,150 @@
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use url::Url;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeInfo {
+    pub id: u64,
+    pub http_url: Url,
+    /// Host string used for {host} template interpolation in --restart-cmd.
+    /// Typically equals http_url's host but may differ when ursulactl talks to
+    /// a public address while the restart command targets a private one.
+    pub host: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[allow(async_fn_in_trait)]
+pub trait NodeProvider {
+    async fn list_nodes(&self) -> Result<Vec<NodeInfo>>;
+}
+
+/// File-backed provider. The JSON shape is intentionally tolerant of the
+/// `scripts/ursula_ec2.py` `nodes.json` already in use: it accepts either an
+/// explicit `http_url` or the legacy `public_ip`/`private_ip` + `http_port`
+/// combination.
+#[derive(Debug, Clone)]
+pub struct StaticNodeProvider {
+    nodes: Vec<NodeInfo>,
+}
+
+impl StaticNodeProvider {
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let bytes =
+            std::fs::read(path).with_context(|| format!("read node config {}", path.display()))?;
+        Self::from_bytes(&bytes).with_context(|| format!("parse node config {}", path.display()))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let raw: RawConfig = serde_json::from_slice(bytes)?;
+        let nodes = raw.into_nodes()?;
+        Ok(Self { nodes })
+    }
+
+    pub fn from_nodes(nodes: Vec<NodeInfo>) -> Self {
+        Self { nodes }
+    }
+}
+
+impl NodeProvider for StaticNodeProvider {
+    async fn list_nodes(&self) -> Result<Vec<NodeInfo>> {
+        Ok(self.nodes.clone())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawConfig {
+    Wrapped { nodes: Vec<RawNode> },
+    Bare(Vec<RawNode>),
+}
+
+impl RawConfig {
+    fn into_nodes(self) -> Result<Vec<NodeInfo>> {
+        let raws = match self {
+            RawConfig::Wrapped { nodes } => nodes,
+            RawConfig::Bare(nodes) => nodes,
+        };
+        raws.into_iter().map(RawNode::into_node).collect()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawNode {
+    id: u64,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    http_url: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    public_ip: Option<String>,
+    #[serde(default)]
+    private_ip: Option<String>,
+    #[serde(default)]
+    http_port: Option<u16>,
+}
+
+impl RawNode {
+    fn into_node(self) -> Result<NodeInfo> {
+        let (http_url, host) = if let Some(url) = self.http_url.as_deref() {
+            let parsed = Url::parse(url)
+                .with_context(|| format!("invalid http_url for node {}", self.id))?;
+            let host = self
+                .host
+                .clone()
+                .or_else(|| parsed.host_str().map(str::to_owned))
+                .with_context(|| format!("node {} has no host", self.id))?;
+            (parsed, host)
+        } else {
+            let host_ip = self
+                .public_ip
+                .as_deref()
+                .or(self.private_ip.as_deref())
+                .with_context(|| {
+                    format!("node {} requires http_url or public_ip/private_ip", self.id)
+                })?;
+            let port = self.http_port.unwrap_or(8080);
+            let parsed = Url::parse(&format!("http://{host_ip}:{port}"))
+                .with_context(|| format!("synthesize http_url for node {}", self.id))?;
+            let host = self.host.clone().unwrap_or_else(|| host_ip.to_owned());
+            (parsed, host)
+        };
+        Ok(NodeInfo {
+            id: self.id,
+            http_url,
+            host,
+            name: self.name,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn static_provider_accepts_explicit_url() {
+        let json = br#"{"nodes":[{"id":1,"http_url":"http://10.0.0.5:8080","host":"10.0.0.5"}]}"#;
+        let provider = StaticNodeProvider::from_bytes(json).unwrap();
+        let nodes = provider.list_nodes().await.unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].id, 1);
+        assert_eq!(nodes[0].host, "10.0.0.5");
+        assert_eq!(nodes[0].http_url.as_str(), "http://10.0.0.5:8080/");
+    }
+
+    #[tokio::test]
+    async fn static_provider_synthesizes_url_from_legacy_fields() {
+        let json = br#"[{"id":2,"public_ip":"203.0.113.10","http_port":9090,"name":"n2"}]"#;
+        let provider = StaticNodeProvider::from_bytes(json).unwrap();
+        let nodes = provider.list_nodes().await.unwrap();
+        assert_eq!(nodes[0].http_url.as_str(), "http://203.0.113.10:9090/");
+        assert_eq!(nodes[0].host, "203.0.113.10");
+        assert_eq!(nodes[0].name.as_deref(), Some("n2"));
+    }
+}

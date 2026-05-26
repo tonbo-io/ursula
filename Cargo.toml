@@ -7,6 +7,7 @@ members = [
     "crates/ursula-shard",
     "crates/ursula-stream",
     "crates/ursula-bench",
+    "crates/ursula-ctl",
     "crates/ursula-sim",
 ]
 resolver = "3"

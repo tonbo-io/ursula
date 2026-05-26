@@ -30,9 +30,9 @@ use ursula_runtime::{
     GroupPublishSnapshotFuture, GroupReadSnapshotFuture, GroupReadStreamFuture,
     GroupReadStreamPartsFuture, GroupRequireLiveReadOwnerFuture, GroupShutdownFuture,
     GroupSnapshot, GroupSnapshotFuture, GroupTouchStreamAccessFuture, GroupWriteBatchFuture,
-    GroupWriteCommand, InMemoryGroupEngineFactory, PlanColdFlushRequest, PlanGroupColdFlushRequest,
-    ProducerRequest, PublishSnapshotRequest, ReadSnapshotRequest, ReadStreamRequest, RuntimeConfig,
-    RuntimeError, RuntimeThreading, ShardRuntime,
+    GroupWriteCommand, HeadStreamRequest, InMemoryGroupEngineFactory, PlanColdFlushRequest,
+    PlanGroupColdFlushRequest, ProducerRequest, PublishSnapshotRequest, ReadSnapshotRequest,
+    ReadStreamRequest, RuntimeConfig, RuntimeError, RuntimeThreading, ShardRuntime,
 };
 use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardId, ShardPlacement};
 
@@ -466,7 +466,9 @@ mod faults_inner;
 pub use faults_inner::*;
 mod dispatch;
 mod introspect;
-pub(self) use introspect::*;
+use introspect::*;
+#[cfg(test)]
+mod rolling_restart;
 
 pub fn stable_replay_outcome(mut outcome: ThreeNodeRaftSimOutcome) -> ThreeNodeRaftSimOutcome {
     outcome.trace = outcome.trace.stable_replay();

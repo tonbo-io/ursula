@@ -2375,6 +2375,7 @@ async fn fork_ref_keeps_deleted_source_gone_until_last_fork_delete() {
     }
 }
 
+#[cfg(not(madsim))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn thread_per_core_runtime_reaches_all_configured_cores() {
     let mut config = RuntimeConfig::new(4, 32);

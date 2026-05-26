@@ -20,6 +20,15 @@ export default defineConfig({
   define: {
     __URSULA_VERSION__: JSON.stringify(workspaceVersion),
   },
+  server: {
+    proxy: {
+      "/__chaos-proxy/status.json": {
+        target: "https://ursula-chaos-status-tonbo.s3.amazonaws.com",
+        changeOrigin: true,
+        rewrite: (path) => path.replace("/__chaos-proxy", ""),
+      },
+    },
+  },
   plugins: [
     {
       enforce: "pre",

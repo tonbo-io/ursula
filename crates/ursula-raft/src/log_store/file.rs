@@ -66,6 +66,12 @@ pub(crate) struct CoreFileLogWriter {
     tx: mpsc::Sender<CoreFileLogWrite>,
 }
 
+// File-log writer machinery is only reachable under cfg(not(madsim)) — the
+// simulator's `CoreFileLogWriter::shared` panics rather than spawning a
+// writer thread (DoD #1). The type still exists under both cfgs because
+// `CoreFileLogWriter` holds an `mpsc::Sender<CoreFileLogWrite>` field, but
+// no values flow through under cfg(madsim), hence the allow(dead_code).
+#[cfg_attr(madsim, allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct CoreFileLogWrite {
     group_id: u32,
@@ -245,6 +251,7 @@ impl CoreFileLogWriter {
     }
 }
 
+#[cfg_attr(madsim, allow(dead_code))]
 pub(crate) fn run_core_file_log_writer(
     journal_path: PathBuf,
     rx: mpsc::Receiver<CoreFileLogWrite>,
@@ -289,6 +296,7 @@ pub(crate) fn run_core_file_log_writer(
     }
 }
 
+#[cfg_attr(madsim, allow(dead_code))]
 pub(crate) fn write_core_log_batch(
     journal_path: &Path,
     journal_handle: &mut RaftGroupFileLogHandle,

@@ -143,7 +143,7 @@ mod madsim_shapes {
     /// without updating this match is a compile error.
     pub fn assert_steps_exact(spec: &str, schedule: &SimSchedule) -> Result<(), Box<dyn Error>> {
         let names: Vec<&str> = spec.split(',').map(|s| s.trim()).collect();
-        let predicates: Vec<Box<dyn Fn(&SimFaultAction) -> bool>> = names
+        let predicates: Vec<Box<StepPredicate>> = names
             .iter()
             .map(|n| parse_variant_predicate(n))
             .collect::<Result<Vec<_>, _>>()?;
@@ -178,14 +178,12 @@ mod madsim_shapes {
     /// Single source of truth for variant-name → matches!-predicate. The match
     /// arm covers every SimFaultAction variant; renaming/removing a variant
     /// breaks compilation here, which is the DoD #6 guarantee.
-    fn parse_variant_predicate(
-        name: &str,
-    ) -> Result<Box<dyn Fn(&SimFaultAction) -> bool>, Box<dyn Error>> {
+    fn parse_variant_predicate(name: &str) -> Result<Box<StepPredicate>, Box<dyn Error>> {
         // NOTE: keep this arm aligned with crates/ursula-sim/src/madsim_harness.rs
         // `pub enum SimFaultAction`. Adding a variant there without adding it
         // here means a CI assertion can't reference the new variant — desired,
         // because new CI assertions should go through this list.
-        let predicate: Box<dyn Fn(&SimFaultAction) -> bool> = match name {
+        let predicate: Box<StepPredicate> = match name {
             "PartitionSeededFollower" => {
                 Box::new(|a| matches!(a, SimFaultAction::PartitionSeededFollower))
             }
@@ -261,7 +259,7 @@ mod madsim_shapes {
                 Box::new(|a| matches!(a, SimFaultAction::StartRuntimeConcurrentClients { .. }))
             }
             "StartRuntimeWaitRead" => {
-                Box::new(|a| matches!(a, SimFaultAction::StartRuntimeWaitRead { .. }))
+                Box::new(|a| matches!(a, SimFaultAction::StartRuntimeWaitRead))
             }
             "DelayRuntimeAppend" => {
                 Box::new(|a| matches!(a, SimFaultAction::DelayRuntimeAppend { .. }))
@@ -412,10 +410,10 @@ mod madsim_shapes {
         predicate: impl Fn(&ursula_sim::RuntimeRaftNetworkWorkloadPlan) -> bool,
     ) -> Result<(), Box<dyn Error>> {
         for step in &schedule.fault_plan.steps {
-            if let SimFaultAction::RunRuntimeRaftNetworkWorkload { plan } = &step.action {
-                if predicate(plan) {
-                    return Ok(());
-                }
+            if let SimFaultAction::RunRuntimeRaftNetworkWorkload { plan } = &step.action
+                && predicate(plan)
+            {
+                return Ok(());
             }
         }
         Err(format!(

@@ -63,15 +63,18 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   "api/delete-stream": { group: "API Reference", order: 10 },
   "api/v1-compatibility": { group: "API Reference", order: 11 },
 
-  // Install & Deploy - deploy then operate.
+  // Install & Deploy - get the binaries, get the cluster running.
   install: { group: "Install & Deploy", order: 1 },
   "run-locally": { group: "Install & Deploy", order: 2 },
   configuration: { group: "Install & Deploy", order: 3 },
   "configure-s3": { group: "Install & Deploy", order: 4 },
   "deploy-cluster": { group: "Install & Deploy", order: 5 },
   security: { group: "Install & Deploy", order: 6 },
-  operations: { group: "Install & Deploy", order: 7 },
-  troubleshooting: { group: "Install & Deploy", order: 8 },
+
+  // Operate - day-2 entrypoints. `ursulactl` is the first one to reach for.
+  cli: { group: "Operate", order: 1, title: "ursulactl" },
+  operations: { group: "Operate", order: 2 },
+  troubleshooting: { group: "Operate", order: 3 },
 
   // Architecture - internals for users who want to dig deeper.
   "architecture/overview": { group: "Architecture", order: 1 },
@@ -131,6 +134,7 @@ const groupOrder = [
   "Concepts",
   "API Reference",
   "Install & Deploy",
+  "Operate",
   "Protocol Specification",
   "Reference",
 ];

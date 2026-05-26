@@ -1,0 +1,137 @@
+---
+title: ursulactl
+description: The operator CLI for an Ursula cluster. Raft-aware rolling restarts, status, and readiness gates over plain HTTP.
+---
+
+`ursulactl` is the first interface to reach for once a cluster is running. It speaks only to each node's HTTP surface (`/__ursula/*`), so it needs neither SSH keys nor a control-plane daemon. Its verbs encode the safety properties an operator otherwise has to remember manually:
+
+- before restarting a node, transfer every Raft group it leads to a healthy successor;
+- after a restart, refuse to move on until `last_applied_index` has caught up to peers' `committed_index`;
+- abort the rollout rather than corner a group with no leader.
+
+The same orchestration is exercised under [deterministic simulation](/docs/architecture/overview) so the failure modes — leader transfer timing out, the target node entering a crash loop, a partition during drain — produce a clean abort instead of a half-rolled cluster.
+
+## When to use ursulactl vs. the other surfaces
+
+| Task | Tool |
+|------|------|
+| Day-2 cluster operations — restart, observe, gate on readiness | **`ursulactl`** |
+| Push binaries, write systemd units, EC2 Instance Connect, S3 cleanup | `scripts/ursula_ec2.py` |
+| One-off introspection or scripting against a single node | `curl /__ursula/metrics` |
+| Custom operator tooling | The HTTP endpoints listed under [Underlying HTTP surface](#underlying-http-surface) |
+
+## Install
+
+Build from the workspace alongside the server:
+
+```bash
+cargo build --release -p ursula-ctl --bin ursulactl
+```
+
+The binary lands at `target/release/ursulactl`. Drop it on your control machine; it does not need to run on the Ursula hosts themselves.
+
+## Manifest format
+
+Most verbs accept `--config <path>`, a JSON manifest describing the cluster. The shape is compatible with `scripts/ursula_ec2.py`'s `cluster.json` (the same `nodes` array is reused), so you can point both tools at the same file. Minimum fields:
+
+```json
+{
+  "nodes": [
+    { "id": 1, "http_url": "http://10.0.0.1:4437", "host": "10.0.0.1" },
+    { "id": 2, "http_url": "http://10.0.0.2:4437", "host": "10.0.0.2" },
+    { "id": 3, "http_url": "http://10.0.0.3:4437", "host": "10.0.0.3" }
+  ]
+}
+```
+
+Legacy `public_ip` / `private_ip` / `http_port` fields from the EC2 helper are accepted; if `http_url` is missing it is synthesised from those plus the port. `host` is the value substituted into `--restart-cmd` templates and defaults to the URL's host string.
+
+## `restart`
+
+Safe rolling restart. Per target node, in manifest order (or `--only` order):
+
+1. Snapshot every node's `/__ursula/metrics`.
+2. For every Raft group the target leads, pick the most-caught-up voter as successor and call `POST /__ursula/raft/{group}/leader/transfer/{successor}`.
+3. Poll until the target leads zero groups, or abort on drain timeout.
+4. Run `--restart-cmd` with `{node_id}` / `{host}` / `{http_url}` / `{name}` substituted.
+5. Poll until the target is back as a voter in every group and its `last_applied_index` is within `--lag-tolerance` of peers' `committed_index`, or abort on readiness timeout.
+6. Move to the next node only on success. Any abort stops the rollout.
+
+```bash
+ursulactl restart \
+  --config cluster.json \
+  --restart-cmd 'ssh ec2-user@{host} sudo systemctl restart ursula-chaos.service' \
+  --drain-timeout-secs 60 \
+  --ready-timeout-secs 180 \
+  --lag-tolerance 16
+```
+
+`--restart-cmd` runs in `sh -c` on the control machine. SSH, AWS SSM, `kubectl exec`, `nomad alloc exec` — anything that can take a templated host argument fits. Add `--dry-run` to print the drain plan and skip the actual transfers.
+
+Restrict the rollout with `--only`:
+
+```bash
+ursulactl restart --config cluster.json --restart-cmd '...' --only 2,3
+```
+
+<Warning>
+The naive manual procedure — "restart followers, then leader" — does **not** wait for `applied_index` to catch up between steps. Under `--raft-memory` mode a target can come back as a voter while still missing committed entries, and a second restart pointed at a different node can corner the group with no live leader. `ursulactl restart` is the path that closes this gap.
+</Warning>
+
+## `status`
+
+Per-node summary of Raft group count and leadership distribution, sourced from every node's `/__ursula/metrics`. Nodes whose metrics fail are reported with `metrics unavailable — …` rather than aborting the report — `status` is meant to surface partial cluster health.
+
+```bash
+ursulactl status --config cluster.json
+```
+
+Sample output:
+
+```
+node 1 (10.0.0.1): groups=4 leaders={1: 2, 2: 2}
+node 2 (10.0.0.2): groups=4 leaders={1: 2, 2: 2}
+node 3 (10.0.0.3): groups=4 leaders={1: 2, 2: 2}
+```
+
+`leaders={…}` is the count of groups each node is leading from this reporter's perspective. Healthy clusters report the same distribution from every node.
+
+## `wait-ready`
+
+Block until every node reports `--expected-groups` Raft groups, each with a leader. Useful in CI / scripts after `start` or a config change.
+
+```bash
+ursulactl wait-ready --config cluster.json --expected-groups 4
+```
+
+Exits non-zero with a one-line reason if the timeout passes (`cluster not ready after 120s: node 3 has 1 group(s) without a leader`).
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | All target nodes finished successfully (`restart`), readiness reached (`wait-ready`), or status report rendered (`status`). |
+| `2` | `restart`: at least one node aborted (drain timeout, restart command non-zero, or readiness timeout). Subsequent nodes were not touched. |
+| Non-zero (other) | Configuration or transport error. The error message is single-line and machine-greppable. |
+
+## Roadmap: verbs not yet migrated
+
+These still live in `scripts/ursula_ec2.py` because they require SSH or AWS APIs and benefit from the same EC2 Instance Connect plumbing that the script already does:
+
+- `upload-binary`, `install-binary` — push and stage release artefacts.
+- `install-service`, `install-chaos-agent`, `install-faultd`, `deploy-chaos` — write/refresh systemd units.
+- `cleanup-s3`, `perf` / `perf-many` — AWS S3 and benchmark drivers.
+
+They will move to `ursulactl` once a `NodeProvider`-backed SSH transport lands; the AWS deployment scaffolding (IAM / EC2 lifecycle / security groups) stays in Python permanently.
+
+## Underlying HTTP surface
+
+For custom tooling, every verb maps onto a small set of HTTP endpoints on each node:
+
+| Verb | Endpoint |
+|------|----------|
+| `status`, `wait-ready` | `GET /__ursula/metrics` |
+| `restart` (drain step) | `POST /__ursula/raft/{raft_group_id}/leader/transfer/{node_id}` |
+| `restart` (readiness step) | `GET /__ursula/metrics` polled across all peers |
+
+The transfer endpoint refuses with `409 Conflict` if the receiving node isn't the current leader of the group, and `400` if the target node isn't a voter. ursulactl uses this to refuse to attempt a transfer it cannot reason about.

@@ -53,16 +53,34 @@ ursula \
 
 Same command, same JSON file with `node_id` adjusted to 2 and 3 respectively. Use `--raft-memory` instead of `--raft-log-dir` if you want a non-durable test cluster.
 
-## Verify
+## Verify with ursulactl
+
+Once daemons are up on every node, point [`ursulactl`](/docs/cli) at a one-file manifest of the cluster and block until each Raft group has elected a leader:
 
 ```bash
-# Each node should answer metrics
+cat > cluster-manifest.json <<'JSON'
+{
+  "nodes": [
+    {"id": 1, "http_url": "http://10.0.0.1:4437", "host": "10.0.0.1"},
+    {"id": 2, "http_url": "http://10.0.0.2:4437", "host": "10.0.0.2"},
+    {"id": 3, "http_url": "http://10.0.0.3:4437", "host": "10.0.0.3"}
+  ]
+}
+JSON
+
+ursulactl wait-ready --config cluster-manifest.json --expected-groups 256
+ursulactl status      --config cluster-manifest.json
+```
+
+`wait-ready` returns non-zero with a single-line reason if the timeout elapses. `status` prints one line per node showing the raft group count and per-leader group counts as observed from that node's metrics. Healthy clusters report the same distribution from every reporter.
+
+If you don't have `ursulactl` handy, the raw metrics endpoint works as a fallback:
+
+```bash
 for host in 10.0.0.1 10.0.0.2 10.0.0.3; do
   curl -s "http://$host:4437/__ursula/metrics" | jq '.raft_groups | length'
 done
 ```
-
-If you have access to the EC2 helper described in [operations](/docs/operations), `python3 scripts/ursula_ec2.py --config cluster.json wait-ready` polls the cluster until every Raft group has elected a leader.
 
 ## Storage exclusivity
 
@@ -87,17 +105,25 @@ See [configure S3](/docs/configure-s3) for the full set of `URSULA_COLD_*` varia
 
 ## Operating the cluster
 
-There is no dedicated control CLI yet. Day-to-day operations use:
+The first tool for day-2 work is [`ursulactl`](/docs/cli):
 
-- `scripts/ursula_ec2.py` - start/stop/upload/perf-test against a static manifest of EC2 hosts. See [operations](/docs/operations)
-- `/__ursula/metrics` - per-node JSON snapshot
-- `POST /__ursula/raft/{group_id}/snapshot` - manually trigger a Raft snapshot for one group
-- `POST /__ursula/raft/{group_id}/purge` - purge stale log entries for one group
-- `POST /__ursula/raft/{group_id}/learners/{node_id}` - add a learner (non-voting) replica
-- `POST /__ursula/flush-cold/{bucket}/{stream}` - force a cold flush for one stream
+- `ursulactl restart` — drain-aware rolling restart with applied-index catch-up gates.
+- `ursulactl status` — leadership distribution per node.
+- `ursulactl wait-ready` — gate scripts on group + leader counts.
+
+For SSH/AWS-side plumbing — pushing binaries, writing systemd units, EC2 Instance Connect, S3 cleanup — use `scripts/ursula_ec2.py`. See [operations](/docs/operations) for the full split.
+
+The HTTP admin surface underneath both tools is small and stable enough to script against directly:
+
+- `GET /__ursula/metrics` — per-node JSON snapshot.
+- `POST /__ursula/raft/{group_id}/snapshot` — manually trigger a Raft snapshot.
+- `POST /__ursula/raft/{group_id}/purge` — purge stale log entries.
+- `POST /__ursula/raft/{group_id}/learners/{node_id}` — add a learner (non-voting) replica.
+- `POST /__ursula/raft/{group_id}/leader/transfer/{node_id}` — hand off leadership to another voter (the primitive `ursulactl restart` builds on).
+- `POST /__ursula/flush-cold/{bucket}/{stream}` — force a cold flush for one stream.
 
 ## Limits in the current build
 
 - Membership changes (adding/removing voters after bootstrap) are not yet exposed as a routine workflow. Learners can be added via the admin endpoint above.
-- Rolling restart and version upgrade tooling is not yet packaged. Stop each node in turn and start it back with the same `--raft-cluster-config`.
+- `ursulactl restart` packages the safe rolling restart loop (drain → restart-cmd → wait-ready); version-upgrade tooling that diffs binaries before restart is not yet packaged.
 - There is no zero-downtime config reload. Restart the process to pick up new flags or env vars.

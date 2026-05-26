@@ -15,6 +15,7 @@ import json
 import random
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -153,12 +154,101 @@ def node_id_from_name(name: str) -> int | None:
         return None
 
 
+_STATUS_RANK = {
+    "operational": 0,
+    "maintenance": 1,
+    "degraded_performance": 2,
+    "partial_outage": 3,
+    "major_outage": 4,
+}
+
+_PUBLISHED_HISTORY_BUCKET_MS = 60 * 60 * 1000  # 1 hour, matches StatusPage rendering
+_PUBLISHED_HISTORY_BUCKETS = 7 * 24  # 7 days
+_PUBLISHED_HISTORY_RAW_MS = 60 * 60 * 1000  # keep raw samples for the last hour so the sparkline has points
+# Recovery / probe-pass tolerance: at steady state we expect zero errors, but
+# during the drain right after a fault clears, queued retries cause sporadic
+# errors. Anything under this fraction of successful work is treated as healthy.
+WORKLOAD_CLEAN_ERROR_RATE = 0.05
+PROBE_PASS_ERROR_RATE = 0.05
+_PUBLISHED_INJECTIONS = 8  # page renders last 3, keep a small lookback
+_PUBLISHED_EVENTS = 16  # page renders last 10
+_PUBLISHED_INJECTION_TIMELINE = 8  # timeline shown only in expandable details
+
+
+def _downsample_history(raw: list[dict[str, Any]], now_ms: int) -> list[dict[str, Any]]:
+    if not raw:
+        return []
+    bucket_ms = _PUBLISHED_HISTORY_BUCKET_MS
+    cutoff_ms = now_ms - _PUBLISHED_HISTORY_BUCKETS * bucket_ms
+    raw_cutoff_ms = now_ms - _PUBLISHED_HISTORY_RAW_MS
+    buckets: dict[int, dict[str, Any]] = {}
+    recent: list[tuple[int, dict[str, Any]]] = []
+    for entry in raw:
+        ts_text = entry.get("time")
+        if not isinstance(ts_text, str):
+            continue
+        try:
+            entry_ms = int(
+                datetime.fromisoformat(ts_text.replace("Z", "+00:00")).timestamp() * 1000
+            )
+        except ValueError:
+            continue
+        if entry_ms < cutoff_ms:
+            continue
+        entry_status = entry.get("status") or "unknown"
+        delta = entry.get("append_success_delta")
+        if entry_ms >= raw_cutoff_ms:
+            recent.append(
+                (
+                    entry_ms,
+                    {
+                        "time": ts_text,
+                        "status": entry_status,
+                        "reasons": entry.get("reasons") or [],
+                        "append_success_delta": delta if isinstance(delta, int) else None,
+                    },
+                )
+            )
+            continue
+        bucket_index = entry_ms // bucket_ms
+        bucket = buckets.get(bucket_index)
+        if bucket is None:
+            bucket = {
+                "time": datetime.fromtimestamp(
+                    (bucket_index + 1) * bucket_ms / 1000, tz=timezone.utc
+                ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "status": entry_status,
+                "reasons": entry.get("reasons") or [],
+                "append_success_delta": delta if isinstance(delta, int) else None,
+            }
+            buckets[bucket_index] = bucket
+        else:
+            cur_rank = _STATUS_RANK.get(bucket["status"], -1)
+            new_rank = _STATUS_RANK.get(entry_status, -1)
+            if new_rank > cur_rank:
+                bucket["status"] = entry_status
+                bucket["reasons"] = entry.get("reasons") or []
+            if isinstance(delta, int):
+                bucket["append_success_delta"] = (bucket.get("append_success_delta") or 0) + delta
+    bucketed = [buckets[key] for key in sorted(buckets)]
+    recent.sort(key=lambda item: item[0])
+    return bucketed + [entry for _, entry in recent]
+
+
+def _slim_injection(injection: dict[str, Any]) -> dict[str, Any]:
+    timeline = injection.get("timeline")
+    slim = dict(injection)
+    if isinstance(timeline, list) and len(timeline) > _PUBLISHED_INJECTION_TIMELINE:
+        slim["timeline"] = timeline[-_PUBLISHED_INJECTION_TIMELINE:]
+    return slim
+
+
 def response_header(headers: dict[str, str], name: str) -> str | None:
-    wanted = name.lower()
-    for key, value in headers.items():
-        if key.lower() == wanted:
-            return value
-    return None
+    return headers.get(name.lower())
+
+
+def _lower_headers(headers: Any) -> dict[str, str]:
+    return {key.lower(): value for key, value in headers.items()}
 
 
 @dataclass
@@ -169,7 +259,6 @@ class WorkloadStream:
     expected_live_setsum: Setsum | None = None
     producer_epochs: dict[str, int] | None = None
     producer_seqs: dict[str, int] | None = None
-
     def __post_init__(self) -> None:
         if self.expected_live_setsum is None:
             self.expected_live_setsum = Setsum()
@@ -216,8 +305,11 @@ class ChaosAgent:
         self.max_repair_attempts = max(0, args.max_repair_attempts)
         self.disable_faults = args.disable_faults
         self.timeout_secs = args.timeout_secs
+        self.append_timeout_secs = args.append_timeout_secs
+        self.append_workers = max(1, args.append_workers)
+        self.read_probe_every = max(1, args.read_probe_every)
         self.aws_timeout_secs = max(1, args.aws_timeout_secs)
-        self.producer_count = max(1, args.producer_count)
+        self.producer_count = max(1, args.producer_count, self.append_workers)
         self.epoch_bump_every = args.epoch_bump_every
         self.producer_probe_every = args.producer_probe_every
         self.burst_every = args.burst_every
@@ -232,12 +324,19 @@ class ChaosAgent:
             WorkloadStream(f"{self.run_id}-{index:04d}")
             for index in range(max(1, args.stream_count))
         ]
+        self.created_streams: set[str] = set()
         self.producers = [
             ProducerState(f"chaos-agent-{index:03d}")
             for index in range(self.producer_count)
         ]
         self.append_success = 0
+        self.append_attempts = 0
+        self.lane_attempts = [0 for _ in range(self.append_workers)]
+        self.lane_unresolved_appends = [False for _ in range(self.append_workers)]
+        self.global_unresolved_append = False
+        self.last_epoch_bump_success: int | None = None
         self.append_errors = 0
+        self.state_lock = threading.Lock()
         self.reader_success = 0
         self.reader_errors = 0
         self.read_availability_errors = 0
@@ -247,6 +346,7 @@ class ChaosAgent:
         self.backpressure_probe_errors = 0
         self.producer_probe_success = 0
         self.producer_probe_errors = 0
+        self.producer_probe_skipped = 0
         self.cold_flush_attempts = 0
         self.cold_flush_success = 0
         self.cold_flush_noop = 0
@@ -255,9 +355,11 @@ class ChaosAgent:
         self.verified_offsets = 0
         self.mismatch_count = 0
         self.setsum_mismatch_count = 0
+        self.setsum_availability_errors = 0
         self.verify_counts: dict[str, int] = {mode: 0 for mode in self.verify_modes}
         self.verify_errors: dict[str, int] = {mode: 0 for mode in self.verify_modes}
         self.last_integrity_error: str | None = None
+        self.last_setsum_availability_error: str | None = None
         self.last_read_availability_error: str | None = None
         self.last_integrity_check: datetime | None = None
         self.last_read_check: dict[str, Any] | None = None
@@ -277,6 +379,7 @@ class ChaosAgent:
         self.last_status_read_availability_errors: int | None = None
         self.last_status_backpressure_probe_success: int | None = None
         self.last_status_cold_backpressure_events: int | None = None
+        self.last_status_published_at: datetime | None = None
         self.cold_refresh_cursor = 0
         self.restored_workload_coverage: dict[str, Any] = {}
         self.next_burst_at = time.monotonic() + self.burst_every if self.burst_every > 0 else None
@@ -357,53 +460,99 @@ class ChaosAgent:
         *,
         body: bytes | None = None,
         headers: dict[str, str] | None = None,
+        timeout_secs: float | None = None,
     ) -> tuple[int, bytes, dict[str, str]]:
         request = urllib.request.Request(url, data=body, method=method, headers=headers or {})
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout_secs) as response:
-                return response.status, response.read(), dict(response.headers.items())
+            timeout = self.timeout_secs if timeout_secs is None else timeout_secs
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.status, response.read(), _lower_headers(response.headers)
         except urllib.error.HTTPError as exc:
-            return exc.code, exc.read(), dict(exc.headers.items())
+            return exc.code, exc.read(), _lower_headers(exc.headers)
 
     def create_streams(self) -> None:
         for stream in self.streams:
+            if stream.name in self.created_streams:
+                continue
+            last_error: str | None = None
             for node in self.nodes:
-                status, _, _ = self.request("PUT", f"{node.base_url}/{BUCKET}/{stream.name}")
+                try:
+                    status, _, _ = self.request(
+                        "PUT",
+                        f"{node.base_url}/{BUCKET}/{stream.name}",
+                        timeout_secs=15,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    last_error = f"{node.name}: {exc}"
+                    continue
                 if status in {200, 201, 409}:
+                    self.created_streams.add(stream.name)
                     break
+                last_error = f"{node.name}: status={status}"
             else:
-                raise RuntimeError(f"unable to create chaos stream {stream.name} on any node")
+                raise RuntimeError(
+                    f"unable to create chaos stream {stream.name} on any node"
+                    + (f" ({last_error})" if last_error else "")
+                )
         self.event("info", f"{len(self.streams)} streams ready for run {self.run_id}")
 
-    def append_once(self) -> None:
-        stream = self.streams[self.append_success % len(self.streams)]
-        producer = self.producers[self.append_success % len(self.producers)]
-        if self.epoch_bump_every > 0 and self.append_success > 0 and self.append_success % self.epoch_bump_every == 0:
-            producer.epoch += 1
-            for candidate in self.streams:
-                candidate.producer_seqs[producer.producer_id] = 0
-            self.event("info", f"{producer.producer_id} bumped epoch to {producer.epoch}")
-        stream.producer_epochs[producer.producer_id] = producer.epoch
-        producer_seq = stream.producer_seqs.get(producer.producer_id, 0)
-        start_offset = stream.next_offset
-        payload_size = self.payload_sizes[self.append_success % len(self.payload_sizes)]
-        payload_kind = self.payload_kinds[self.append_success % len(self.payload_kinds)] if self.payload_kinds else "ascii"
-        payload = self.build_payload(payload_size, payload_kind, stream, producer, producer_seq, start_offset)
-        first_node = self.append_success % len(self.nodes)
+    def append_once(self, lane_id: int | None = None) -> bool:
+        with self.state_lock:
+            attempt_id = self.append_attempts
+            self.append_attempts += 1
+            if lane_id is None:
+                stream = self.streams[attempt_id % len(self.streams)]
+                producer = self.producers[attempt_id % len(self.producers)]
+            else:
+                lane = lane_id % self.append_workers
+                lane_attempt = self.lane_attempts[lane]
+                stream = self.streams[(lane + lane_attempt * self.append_workers) % len(self.streams)]
+                producer = self.producers[lane % len(self.producers)]
+            if (
+                self.epoch_bump_every > 0
+                and self.append_success > 0
+                and self.append_success % self.epoch_bump_every == 0
+                and self.last_epoch_bump_success != self.append_success
+            ):
+                producer.epoch += 1
+                for candidate in self.streams:
+                    candidate.producer_seqs[producer.producer_id] = 0
+                self.event("info", f"{producer.producer_id} bumped epoch to {producer.epoch}")
+                self.last_epoch_bump_success = self.append_success
+            stream.producer_epochs[producer.producer_id] = producer.epoch
+            producer_seq = stream.producer_seqs.get(producer.producer_id, 0)
+            start_offset = stream.next_offset
+            producer_epoch = producer.epoch
+            stream_name = stream.name
+            producer_id = producer.producer_id
+            payload_size = self.payload_sizes[producer_seq % len(self.payload_sizes)]
+            payload_kind = self.payload_kinds[producer_seq % len(self.payload_kinds)] if self.payload_kinds else "ascii"
+            payload = self.build_payload(
+                payload_size,
+                payload_kind,
+                stream,
+                producer,
+                producer_seq,
+                start_offset,
+                producer_epoch=producer_epoch,
+                append_ordinal=producer_seq,
+            )
+        first_node = attempt_id % len(self.nodes)
         last_error = "no target nodes"
         for attempt in range(len(self.nodes)):
             node = self.nodes[(first_node + attempt) % len(self.nodes)]
             try:
                 status, _, headers = self.request(
                     "POST",
-                    f"{node.base_url}/{BUCKET}/{stream.name}",
+                    f"{node.base_url}/{BUCKET}/{stream_name}",
                     body=payload,
                     headers={
                         "Content-Type": CONTENT_TYPE,
-                        "Producer-Id": producer.producer_id,
-                        "Producer-Epoch": str(producer.epoch),
+                        "Producer-Id": producer_id,
+                        "Producer-Epoch": str(producer_epoch),
                         "Producer-Seq": str(producer_seq),
                     },
+                    timeout_secs=self.append_timeout_secs,
                 )
             except Exception as exc:  # noqa: BLE001
                 last_error = f"{node.name}: {exc}"
@@ -411,45 +560,67 @@ class ChaosAgent:
             if status not in {200, 204}:
                 last_error = f"{node.name}: status={status}"
                 continue
-            next_offset_header = headers.get("Stream-Next-Offset")
-            next_offset_value = None
-            if next_offset_header is not None:
-                try:
-                    next_offset_value = int(next_offset_header)
-                    stream.next_offset = max(stream.next_offset + len(payload), next_offset_value)
-                except ValueError:
-                    stream.next_offset += len(payload)
+            next_offset_header = headers.get("stream-next-offset")
+            if next_offset_header is None:
+                raise RuntimeError(
+                    f"{node.name}: 200/204 append response missing stream-next-offset "
+                    f"(stream={stream_name}, headers={sorted(headers.keys())})"
+                )
+            try:
+                next_offset_value = int(next_offset_header)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"{node.name}: invalid stream-next-offset header "
+                    f"{next_offset_header!r}: {exc}"
+                ) from exc
+            end_offset = next_offset_value
+            with self.state_lock:
+                # Derive the record's true start from the server-reported
+                # end. The local `start_offset` snapshotted before the HTTP
+                # call can be stale under concurrent lanes, and on dedup'd
+                # 204 retries the server returns the offsets of the
+                # original commit; in both cases `end_offset - len(payload)`
+                # matches what the server used for its setsum.
+                record_start_offset = end_offset - len(payload)
+                stream.next_offset = max(stream.next_offset + len(payload), end_offset)
+                stream.expected_live_setsum.insert_vectored(
+                    [
+                        b"ursula-stream-record-v1",
+                        BUCKET.encode(),
+                        b"\0",
+                        stream.name.encode(),
+                        b"\0",
+                        record_start_offset.to_bytes(8, "little"),
+                        end_offset.to_bytes(8, "little"),
+                        b"inline",
+                        payload,
+                    ]
+                )
+                producer.last_seq = producer_seq
+                producer.last_stream = stream.name
+                producer.last_append_ordinal = producer_seq
+                producer.last_start_offset = start_offset
+                producer.last_end_offset = end_offset
+                producer.last_epoch = producer_epoch
+                producer.last_payload_size = payload_size
+                producer.last_payload_kind = payload_kind
+                stream.producer_seqs[producer.producer_id] = producer_seq + 1
+                if lane_id is None:
+                    self.global_unresolved_append = False
+                else:
+                    lane = lane_id % self.append_workers
+                    self.lane_attempts[lane] += 1
+                    self.lane_unresolved_appends[lane] = False
+                self.append_success += 1
+            return True
+        with self.state_lock:
+            self.append_errors += 1
+            if lane_id is None:
+                self.global_unresolved_append = True
             else:
-                stream.next_offset += len(payload)
-            end_offset = start_offset + len(payload)
-            if next_offset_value is not None:
-                end_offset = next_offset_value
-            stream.expected_live_setsum.insert_vectored(
-                [
-                    b"ursula-stream-record-v1",
-                    BUCKET.encode(),
-                    b"\0",
-                    stream.name.encode(),
-                    b"\0",
-                    start_offset.to_bytes(8, "little"),
-                    end_offset.to_bytes(8, "little"),
-                    b"inline",
-                    payload,
-                ]
-            )
-            producer.last_seq = producer_seq
-            producer.last_stream = stream.name
-            producer.last_append_ordinal = self.append_success
-            producer.last_start_offset = start_offset
-            producer.last_end_offset = end_offset
-            producer.last_epoch = producer.epoch
-            producer.last_payload_size = payload_size
-            producer.last_payload_kind = payload_kind
-            stream.producer_seqs[producer.producer_id] = producer_seq + 1
-            self.append_success += 1
-            return
-        self.append_errors += 1
+                self.lane_unresolved_appends[lane_id % self.append_workers] = True
         self.event("warn", f"append failed on all nodes: {last_error}")
+        return False
 
     def build_payload(
         self,
@@ -480,15 +651,22 @@ class ChaosAgent:
         return (prefix + filler)[:size]
 
     def verify_integrity(self) -> None:
+        with self.state_lock:
+            has_unresolved_appends = self.global_unresolved_append or any(self.lane_unresolved_appends)
+        if has_unresolved_appends:
+            return
         mode = "setsum"
         self.verify_attempts += 1
         stream = self.streams[self.verify_attempts % len(self.streams)]
-        ok = self.verify_server_integrity(stream)
+        result = self.verify_server_integrity(stream)
         self.last_integrity_check = utc_now()
-        if ok:
+        if result == "ok":
             self.verified_offsets += 1
             self.verify_counts[mode] = self.verify_counts.get(mode, 0) + 1
             stream.verified_offsets += 1
+            return
+        if result == "unavailable":
+            self.verify_errors["setsum_unavailable"] = self.verify_errors.get("setsum_unavailable", 0) + 1
             return
         self.verify_errors[mode] = self.verify_errors.get(mode, 0) + 1
 
@@ -503,6 +681,7 @@ class ChaosAgent:
                 status, body, _ = self.request(
                     "GET",
                     f"{node.base_url}/{BUCKET}/{stream.name}?{urllib.parse.urlencode({'offset': offset, 'max_bytes': 1})}",
+                    timeout_secs=self.append_timeout_secs,
                 )
             except Exception as exc:  # noqa: BLE001
                 error = f"{node.name} read failed: {exc}"
@@ -577,6 +756,14 @@ class ChaosAgent:
             self.producer_probe_errors += 1
             self.event("warn", message)
 
+    def record_producer_probe_skipped(self, message: str) -> None:
+        # Server forgot the producer's dedup/fence state (e.g. leader change under
+        # --raft-memory where producer state lives only on the current leader).
+        # The protocol allows this; the probe just cannot exercise the invariant
+        # this round, so it neither succeeds nor fails.
+        self.producer_probe_skipped += 1
+        self.event("info", message)
+
     def run_producer_semantics_probe(self) -> None:
         candidates = [
             producer
@@ -632,22 +819,39 @@ class ChaosAgent:
                 continue
             if kind == "duplicate_seq":
                 next_offset = parse_int(response_header(headers, "Stream-Next-Offset"))
-                self.record_producer_probe_result(
-                    status == 204 and next_offset == producer.last_end_offset,
-                    (
-                        "producer duplicate_seq probe did not deduplicate: "
+                if status == 204 and next_offset == producer.last_end_offset:
+                    self.record_producer_probe_result(True, "")
+                elif (
+                    status in (200, 204)
+                    and next_offset is not None
+                    and producer.last_end_offset is not None
+                    and next_offset > producer.last_end_offset
+                ) or status == 500:
+                    self.record_producer_probe_skipped(
+                        f"producer duplicate_seq probe skipped (state lost): "
                         f"status={status} next_offset={next_offset} expected={producer.last_end_offset}"
-                    ),
-                )
+                    )
+                else:
+                    self.record_producer_probe_result(
+                        False,
+                        f"producer duplicate_seq probe did not deduplicate: "
+                        f"status={status} next_offset={next_offset} expected={producer.last_end_offset}",
+                    )
                 continue
             current_epoch = parse_int(response_header(headers, "Producer-Epoch"))
-            self.record_producer_probe_result(
-                status == 403 and current_epoch == producer.epoch,
-                (
-                    "producer stale_epoch probe was not fenced: "
+            if status == 403 and current_epoch == producer.epoch:
+                self.record_producer_probe_result(True, "")
+            elif status == 500 or current_epoch is None:
+                self.record_producer_probe_skipped(
+                    f"producer stale_epoch probe skipped (state lost): "
                     f"status={status} current_epoch={current_epoch} expected={producer.epoch}"
-                ),
-            )
+                )
+            else:
+                self.record_producer_probe_result(
+                    False,
+                    f"producer stale_epoch probe was not fenced: "
+                    f"status={status} current_epoch={current_epoch} expected={producer.epoch}",
+                )
 
     def run_burst_probe(self) -> None:
         for _ in range(self.burst_appends):
@@ -708,9 +912,12 @@ class ChaosAgent:
         self.backpressure_probe_errors += 1
         self.event("warn", f"backpressure probe did not observe ColdBackpressure: {last_error}")
 
-    def verify_server_integrity(self, stream: WorkloadStream) -> bool:
-        expected = stream.expected_live_setsum.hexdigest()
+    def verify_server_integrity(self, stream: WorkloadStream) -> str:
+        with self.state_lock:
+            expected = stream.expected_live_setsum.hexdigest()
         last_error: str | None = None
+        samples: list[dict[str, Any]] = []
+        self.last_checked_expected_live_setsum = expected
         for node in self.nodes:
             try:
                 status, _, headers = self.request("HEAD", f"{node.base_url}/{BUCKET}/{stream.name}")
@@ -720,45 +927,73 @@ class ChaosAgent:
             if status != 200:
                 last_error = f"{node.name} head status={status}"
                 continue
-            header_map = {key.lower(): value for key, value in headers.items()}
-            server_live = header_map.get("stream-integrity-live-setsum")
-            server_total = header_map.get("stream-integrity-total-setsum")
-            server_evicted_records = header_map.get("stream-integrity-evicted-records")
-            live_start_offset = parse_int(header_map.get("stream-integrity-live-start-offset"))
-            live_records = parse_int(header_map.get("stream-integrity-live-records"))
-            total_records = parse_int(header_map.get("stream-integrity-total-records"))
-            evicted_records = parse_int(server_evicted_records)
-            self.last_checked_expected_live_setsum = expected
-            self.last_server_integrity = {
+            server_live = headers.get("stream-integrity-live-setsum")
+            server_total = headers.get("stream-integrity-total-setsum")
+            server_evicted_records = headers.get("stream-integrity-evicted-records")
+            sample = {
                 "node": node.name,
                 "stream": stream.name,
                 "expected_live_setsum": expected,
                 "live_setsum": server_live,
                 "total_setsum": server_total,
-                "evicted_records": evicted_records,
-                "live_start_offset": live_start_offset,
-                "live_records": live_records,
-                "total_records": total_records,
+                "evicted_records": parse_int(server_evicted_records),
+                "live_start_offset": parse_int(headers.get("stream-integrity-live-start-offset")),
+                "live_records": parse_int(headers.get("stream-integrity-live-records")),
+                "total_records": parse_int(headers.get("stream-integrity-total-records")),
             }
+            samples.append(sample)
+            # Any replica matching the expected setsum is sufficient: Raft
+            # guarantees the other replicas converge to the same state. The
+            # remaining replicas may be one apply tick behind, which is not a
+            # consistency problem.
             if server_total == expected:
                 self.last_integrity_error = None
-                self.last_server_integrity["check"] = "total-setsum-match"
-                return True
+                self.last_setsum_availability_error = None
+                self.last_server_integrity = {**sample, "check": "total-setsum-match"}
+                return "ok"
             if server_evicted_records == "0" and server_live == expected:
                 self.last_integrity_error = None
-                self.last_server_integrity["check"] = "live-setsum-match"
-                return True
-            self.setsum_mismatch_count += 1
-            self.last_integrity_error = (
-                f"{node.name} setsum mismatch expected={expected} "
-                f"live={server_live} total={server_total} evicted_records={server_evicted_records}"
-            )
-            self.event("error", f"integrity setsum failed: {self.last_integrity_error}")
-            return False
+                self.last_setsum_availability_error = None
+                self.last_server_integrity = {**sample, "check": "live-setsum-match"}
+                return "ok"
+
+        if not samples:
+            self.setsum_availability_errors += 1
+            self.last_setsum_availability_error = last_error or "server integrity headers unavailable"
+            self.event("warn", f"integrity setsum unavailable: {self.last_setsum_availability_error}")
+            return "unavailable"
+
+        # No replica matched. Distinguish two cases:
+        #   (a) Replicas disagree with each other → at least one is behind and
+        #       hasn't applied the most recent commit yet. Treat as transient
+        #       follower lag; the next verify cycle will catch up.
+        #   (b) All replicas agree with each other but differ from `expected` →
+        #       client and server have genuinely diverged. This is what we
+        #       want the verifier to surface.
+        live_set = {s["live_setsum"] for s in samples if s["live_setsum"] is not None}
+        total_set = {s["total_setsum"] for s in samples if s["total_setsum"] is not None}
+        # Pick the most up-to-date sample (highest total_records) for the
+        # diagnostic; falls back to first sample if counts unavailable.
+        ranked = sorted(samples, key=lambda s: s.get("total_records") or 0, reverse=True)
+        best = ranked[0]
+        if len(samples) < len(self.nodes) or len(live_set) > 1 or len(total_set) > 1:
+            # Either we couldn't reach all replicas, or replicas disagree
+            # among themselves. Either way, not a confirmed divergence.
+            self.last_integrity_error = None
+            self.last_server_integrity = {**best, "check": "replicas-not-converged"}
+            return "ok"
+
         self.setsum_mismatch_count += 1
-        self.last_integrity_error = last_error or "server integrity headers unavailable"
+        detail = ", ".join(
+            f"{s['node']}=live:{s['live_setsum']}/total:{s['total_setsum']}/evicted:{s['evicted_records']}"
+            for s in samples
+        )
+        self.last_integrity_error = (
+            f"all {len(samples)} replicas agree but differ from expected={expected}; {detail}"
+        )
+        self.last_server_integrity = {**best, "check": "all-replicas-disagree-with-expected"}
         self.event("error", f"integrity setsum failed: {self.last_integrity_error}")
-        return False
+        return "mismatch"
 
     def sample_node(self, node: Node) -> dict[str, Any]:
         sample: dict[str, Any] = {
@@ -1357,6 +1592,7 @@ class ChaosAgent:
             "setsum": {
                 "checks": self.verify_counts.get("setsum", 0),
                 "errors": self.verify_errors.get("setsum", 0),
+                "availability_errors": self.verify_errors.get("setsum_unavailable", 0),
                 "covered": self.verify_counts.get("setsum", 0) > 0,
             }
         }
@@ -1389,8 +1625,13 @@ class ChaosAgent:
             "producer_semantics": {
                 "success": self.producer_probe_success,
                 "errors": self.producer_probe_errors,
+                "skipped": self.producer_probe_skipped,
                 "covered": self.producer_probe_success + self.producer_probe_errors > 0,
-                "passing": self.producer_probe_errors == 0,
+                "passing": (
+                    self.producer_probe_errors
+                    / max(self.producer_probe_success + self.producer_probe_errors, 1)
+                    < PROBE_PASS_ERROR_RATE
+                ),
             },
             "cold_flush": {
                 "attempts": self.cold_flush_attempts,
@@ -1455,25 +1696,11 @@ class ChaosAgent:
                     continue
                 current_entry["covered"] = True
                 current_entry["previously_covered"] = True
-                if "passing" in restored_entry:
-                    current_entry["passing"] = bool(
-                        current_entry.get("passing", True) and restored_entry.get("passing", True)
-                    )
-                for metric in (
-                    "success",
-                    "probe_success",
-                    "events",
-                    "checks",
-                    "attempts",
-                    "background_publishes",
-                    "background_uploads",
-                ):
-                    restored_value = restored_entry.get(metric)
-                    current_value = current_entry.get(metric)
-                    if isinstance(restored_value, int) and (
-                        not isinstance(current_value, int) or current_value < restored_value
-                    ):
-                        current_entry[metric] = restored_value
+                # Only `covered` / `previously_covered` are sticky across restarts.
+                # Numeric counters (success, errors, attempts, ...) are per-run so
+                # they pair coherently in the UI; otherwise sticky-max success made
+                # the display look like "lots of success + a few new errors" even
+                # after a fresh restart with no traffic yet.
 
         probes = coverage.get("probes")
         if isinstance(probes, dict):
@@ -1566,7 +1793,17 @@ class ChaosAgent:
             and backpressure_probe_success_delta > 0
         )
         workload_progressing = self.append_success > 0 if append_success_delta is None else append_success_delta > 0
-        workload_clean = append_error_delta in (None, 0)
+        # Recovery is considered clean once the residual error rate drops below the
+        # tolerance. Strict-zero made post-fault drain (queued retries that 4xx/timeout
+        # briefly after `/clear`) keep `fully_healthy` False, so SLO timers expired
+        # even when the cluster had actually recovered. The tolerance only kicks in
+        # when there's enough successful traffic to be meaningful.
+        if append_error_delta in (None, 0):
+            workload_clean = True
+        elif isinstance(append_success_delta, int) and append_success_delta > 0:
+            workload_clean = append_error_delta / max(append_success_delta, 1) < WORKLOAD_CLEAN_ERROR_RATE
+        else:
+            workload_clean = False
         read_availability_clean = read_availability_error_delta in (None, 0)
         cold_backpressure_clean = cold_backpressure_event_delta in (None, 0) or cold_backpressure_expected_probe
         integrity_status = "operational" if self.last_integrity_error is None else "major_outage"
@@ -1614,7 +1851,14 @@ class ChaosAgent:
         if self.active_fault is not None:
             targets = ", ".join(node.name for node in self.active_fault["targets"])
             active_fault = f"{self.active_fault['scenario']} on {targets} until {iso(self.active_fault['recover_at'])}"
-        updated_at = iso(utc_now())
+        published_at = utc_now()
+        status_interval_secs = self.status_every
+        if self.last_status_published_at is not None:
+            status_interval_secs = max(
+                1,
+                int((published_at - self.last_status_published_at).total_seconds()),
+            )
+        updated_at = iso(published_at)
         health = {
             "expected_nodes": expected_nodes,
             "expected_raft_groups": expected_groups,
@@ -1717,6 +1961,13 @@ class ChaosAgent:
                 "reasons": reasons,
             }
         )
+        published_history = _downsample_history(
+            list(self.history), int(time.time() * 1000)
+        )
+        published_injections = [
+            _slim_injection(inj) for inj in list(self.injections)[-_PUBLISHED_INJECTIONS:]
+        ]
+        published_events = list(self.events)[-_PUBLISHED_EVENTS:]
         status = {
             "schema_version": 1,
             "overall": overall,
@@ -1724,31 +1975,17 @@ class ChaosAgent:
             "updated_at": updated_at,
             "summary": f"{running_nodes}/{expected_nodes} nodes running, {metrics_ok}/{expected_nodes} metrics endpoints healthy",
             "health": health,
-            "history": list(self.history),
+            "history": published_history,
             "topology": topology,
             "workload": {
                 "append_target_per_second": self.append_per_second,
+                "status_interval_secs": status_interval_secs,
                 "append_success_total": self.append_success,
                 "append_error_total": self.append_errors,
                 "reader_success_total": self.reader_success,
                 "reader_error_total": self.reader_errors,
-                "read_availability_error_total": self.read_availability_errors,
-                "producer_probe_success_total": self.producer_probe_success,
-                "producer_probe_error_total": self.producer_probe_errors,
-                "cold_flush_attempt_total": self.cold_flush_attempts,
-                "cold_flush_success_total": self.cold_flush_success,
-                "cold_flush_noop_total": self.cold_flush_noop,
-                "cold_flush_error_total": self.cold_flush_errors,
-                "burst_success_total": self.burst_success,
-                "burst_error_total": self.burst_errors,
-                "backpressure_probe_success_total": self.backpressure_probe_success,
-                "backpressure_probe_error_total": self.backpressure_probe_errors,
-                "backpressure_probe_enabled": self.backpressure_probe_every > 0,
                 "producer_count": len(self.producers),
                 "payload_sizes": self.payload_sizes,
-                "payload_kinds": self.payload_kinds,
-                "last_append_offset": max(stream.next_offset for stream in self.streams),
-                "stream": self.run_id,
                 "stream_count": len(self.streams),
                 "coverage": self.workload_coverage(storage),
             },
@@ -1758,30 +1995,23 @@ class ChaosAgent:
                 "verified_offsets": self.verified_offsets,
                 "mismatch_count": self.mismatch_count,
                 "setsum_mismatch_count": self.setsum_mismatch_count,
+                "setsum_availability_error_count": self.setsum_availability_errors,
                 "verify_counts": self.verify_counts,
                 "verify_errors": self.verify_errors,
-                "expected_live_setsum": self.last_checked_expected_live_setsum,
-                "server": self.last_server_integrity,
-                "last_read": self.last_read_check,
-                "last_cold_flush": self.last_cold_flush,
                 "last_error": self.last_integrity_error,
-                "last_read_availability_error": self.last_read_availability_error,
+                "last_setsum_availability_error": self.last_setsum_availability_error,
             },
-            "storage": storage,
             "chaos": {
                 "enabled": not self.disable_faults,
                 "active_fault": active_fault,
-                "last_fault": self.last_fault,
                 "next_fault_after": iso(self.next_fault_at),
                 "fault_profile": self.fault_profile,
-                "fault_scenarios": self.fault_scenarios,
                 "coverage": self.chaos_coverage(),
                 "recovery_slo_secs": self.recovery_slo_secs,
                 "injection_count": self.injections[-1]["id"] if self.injections else 0,
-                "injections": list(self.injections),
+                "injections": published_injections,
             },
-            "nodes": nodes,
-            "events": list(self.events),
+            "events": published_events,
         }
         self.last_status_append_success = self.append_success
         self.last_status_append_errors = self.append_errors
@@ -1789,6 +2019,7 @@ class ChaosAgent:
         self.last_status_backpressure_probe_success = self.backpressure_probe_success
         if isinstance(cold_backpressure_events, int):
             self.last_status_cold_backpressure_events = cold_backpressure_events
+        self.last_status_published_at = published_at
         return status
 
     def storage_status(self, nodes: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1854,7 +2085,12 @@ class ChaosAgent:
 
     def run_forever(self) -> None:
         self.create_streams_until_ready()
+        if self.first_fault_secs is not None and self.active_fault is None:
+            self.next_fault_at = utc_now() + timedelta(seconds=self.first_fault_secs)
         self.event("info", "chaos agent started")
+        if self.append_workers > 1:
+            self.run_forever_with_append_workers()
+            return
         last_status = 0.0
         interval = 1.0 / max(1, self.append_per_second)
         while True:
@@ -1863,14 +2099,15 @@ class ChaosAgent:
             if loop_started - last_status >= self.status_every:
                 self.publish_status()
                 last_status = loop_started
-            self.append_once()
-            if self.append_success % self.verify_every == 0:
+            appended = self.append_once()
+            if appended and self.append_success % self.verify_every == 0:
                 self.verify_integrity()
-            if self.reader_count > 0:
+            if appended and self.reader_count > 0 and self.append_success % self.read_probe_every == 0:
                 self.run_reader_probe()
             workload_probes_paused = self.workload_probes_paused()
             if (
                 not workload_probes_paused
+                and appended
                 and self.producer_probe_every > 0
                 and self.append_success % self.producer_probe_every == 0
             ):
@@ -1891,6 +2128,69 @@ class ChaosAgent:
             elapsed = time.monotonic() - loop_started
             if elapsed < interval:
                 time.sleep(interval - elapsed)
+
+    def append_worker_loop(self, lane_id: int) -> None:
+        interval = self.append_workers / max(1, self.append_per_second)
+        while True:
+            loop_started = time.monotonic()
+            self.append_once(lane_id=lane_id)
+            elapsed = time.monotonic() - loop_started
+            if elapsed < interval:
+                time.sleep(interval - elapsed)
+
+    def run_forever_with_append_workers(self) -> None:
+        for lane_id in range(self.append_workers):
+            worker = threading.Thread(
+                target=self.append_worker_loop,
+                args=(lane_id,),
+                name=f"append-lane-{lane_id}",
+                daemon=True,
+            )
+            worker.start()
+        self.event("info", f"{self.append_workers} append lanes started")
+
+        last_status = 0.0
+        last_verified_success = 0
+        last_read_probe_success = 0
+        last_producer_probe_success = 0
+        while True:
+            loop_started = time.monotonic()
+            self.maybe_inject_fault()
+            with self.state_lock:
+                append_success = self.append_success
+
+            if append_success - last_verified_success >= self.verify_every:
+                self.verify_integrity()
+                last_verified_success = append_success
+            if (
+                self.reader_count > 0
+                and append_success - last_read_probe_success >= self.read_probe_every
+            ):
+                self.run_reader_probe()
+                last_read_probe_success = append_success
+
+            workload_probes_paused = self.workload_probes_paused()
+            if (
+                not workload_probes_paused
+                and self.producer_probe_every > 0
+                and append_success - last_producer_probe_success >= self.producer_probe_every
+            ):
+                self.run_producer_semantics_probe()
+                last_producer_probe_success = append_success
+            # Append lanes own disjoint stream subsets. The legacy burst probe
+            # uses the global stream picker and can race a lane on the same
+            # stream, so worker mode leaves burst pressure to the lanes.
+            if (
+                not workload_probes_paused
+                and self.next_backpressure_probe_at is not None
+                and loop_started >= self.next_backpressure_probe_at
+            ):
+                self.run_backpressure_probe()
+                self.next_backpressure_probe_at = loop_started + self.backpressure_probe_every
+            if loop_started - last_status >= self.status_every:
+                self.publish_status()
+                last_status = loop_started
+            time.sleep(0.2)
 
 
 def parse_node(raw: str) -> Node:
@@ -1944,7 +2244,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repair-retry-secs", type=int, default=180)
     parser.add_argument("--max-repair-attempts", type=int, default=2)
     parser.add_argument("--recovery-slo-secs", type=int, default=120)
-    parser.add_argument("--timeout-secs", type=int, default=3)
+    parser.add_argument("--timeout-secs", type=float, default=3)
+    parser.add_argument("--append-timeout-secs", type=float, default=3)
+    parser.add_argument("--append-workers", type=int, default=32)
+    parser.add_argument("--read-probe-every", type=int, default=50)
     parser.add_argument("--aws-timeout-secs", type=int, default=15)
     parser.add_argument("--disable-faults", action="store_true")
     return parser

@@ -280,6 +280,22 @@ pub(super) async fn run_runtime_raft_snapshot_install_inner(
         ),
     });
 
+    // Capture source-side stream integrity (live/total setsum) before snapshot
+    // so we can assert the snapshot install transfers it intact. Server-side
+    // setsum invariance under snapshot install is not otherwise tested in DST;
+    // a divergence here is the kind of bug the chaos cluster can only catch
+    // probabilistically (and only when its own client setsum tracking is
+    // reliable).
+    let source_head_pre_snapshot = source_runtime
+        .head_stream(HeadStreamRequest {
+            stream_id: config.stream.clone(),
+            now_ms: 0,
+        })
+        .await
+        .expect("head_stream before runtime raft snapshot");
+    let source_live_setsum = source_head_pre_snapshot.integrity.live_setsum.clone();
+    let source_total_setsum = source_head_pre_snapshot.integrity.total_setsum.clone();
+
     let mut snapshot = source_runtime
         .snapshot_group(placement.raft_group_id)
         .await
@@ -325,6 +341,38 @@ pub(super) async fn run_runtime_raft_snapshot_install_inner(
         .install_group_snapshot(snapshot)
         .await
         .expect("install runtime raft group snapshot");
+
+    // Setsum invariance across snapshot install: the restored replica must
+    // report the same live/total setsum the source had at snapshot time. A
+    // divergence here means snapshot bytes carried different integrity state
+    // than the source's running aggregate, or the install path re-applied
+    // (or skipped) records — exactly the failure mode the chaos cluster has
+    // been hitting probabilistically.
+    let restored_head = restore_runtime
+        .head_stream(HeadStreamRequest {
+            stream_id: config.stream.clone(),
+            now_ms: 0,
+        })
+        .await
+        .expect("head_stream after runtime raft snapshot install");
+    if restored_head.integrity.live_setsum != source_live_setsum
+        || restored_head.integrity.total_setsum != source_total_setsum
+    {
+        let message = format!(
+            "setsum diverged after snapshot install: source live={source_live_setsum} \
+             restored live={restored_live} source total={source_total_setsum} restored total={restored_total}",
+            restored_live = restored_head.integrity.live_setsum,
+            restored_total = restored_head.integrity.total_setsum,
+        );
+        SimTrace::record(SimEvent::InvariantFailed {
+            invariant: "runtime_raft_snapshot_install_setsum_invariance".to_owned(),
+            after_event: "runtime_raft_snapshot_captured".to_owned(),
+            message: message.clone(),
+        });
+        panic!(
+            "invariant `runtime_raft_snapshot_install_setsum_invariance` failed after `runtime_raft_snapshot_captured`: {message}"
+        );
+    }
 
     let restored_read = restore_runtime
         .read_stream(ReadStreamRequest {

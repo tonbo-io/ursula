@@ -4,6 +4,15 @@
 This intentionally stays close to the deployment shape used by the migration
 benchmarks: existing EC2 instances, EC2 Instance Connect for short-lived SSH
 keys, static Raft peers, and one optional benchmark client.
+
+Operational verbs are progressively migrating to `crates/ursula-ctl`
+(`ursulactl`), which talks to the raft-aware HTTP surface directly and runs
+the same drain / wait-ready safety checks under madsim DST. As of today the
+Rust CLI covers `restart`, `status`, and `wait-ready`; the SSH-dependent
+verbs (`upload-binary`, `install-binary`, `install-chaos-agent`, `deploy-
+chaos`, ...) still live here because they require host-level filesystem
+access. AWS deployment scaffolding (IAM / EC2 lifecycle / security groups)
+stays in this script permanently.
 """
 
 from __future__ import annotations

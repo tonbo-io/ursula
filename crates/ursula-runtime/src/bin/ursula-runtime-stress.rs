@@ -1,16 +1,31 @@
+// The stress binary exercises the production ThreadPerCore runtime; that
+// variant is cfg(not(madsim))-only by design (DoD #1). Under cfg(madsim) the
+// bin is a no-op so workspace builds stay green.
+
+#[cfg(madsim)]
+fn main() {}
+
+#[cfg(not(madsim))]
 use std::sync::Arc;
+#[cfg(not(madsim))]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(madsim))]
 use std::time::{Duration, Instant};
 
+#[cfg(not(madsim))]
 use tokio::task::JoinSet;
+#[cfg(not(madsim))]
 use ursula_runtime::{
     AppendBatchRequest, AppendRequest, CreateStreamRequest, RuntimeConfig, RuntimeThreading,
     ShardRuntime,
 };
+#[cfg(not(madsim))]
 use ursula_shard::BucketStreamId;
 
+#[cfg(not(madsim))]
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 
+#[cfg(not(madsim))]
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse()?;
@@ -115,6 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
+#[cfg(not(madsim))]
 async fn create_streams(
     runtime: &ShardRuntime,
     streams: &[BucketStreamId],
@@ -147,6 +163,7 @@ async fn create_streams(
 }
 
 #[derive(Debug, Clone)]
+#[cfg(not(madsim))]
 struct Args {
     core_count: usize,
     raft_group_count: usize,
@@ -160,6 +177,7 @@ struct Args {
     mode: StressMode,
 }
 
+#[cfg(not(madsim))]
 impl Args {
     fn parse() -> Result<Self, String> {
         let core_count = std::thread::available_parallelism()
@@ -243,6 +261,7 @@ impl Args {
     }
 }
 
+#[cfg(not(madsim))]
 fn parse_next<T: std::str::FromStr>(
     args: &mut impl Iterator<Item = String>,
     name: &str,
@@ -258,11 +277,13 @@ where
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(not(madsim))]
 enum StressMode {
     Append,
     Batch,
 }
 
+#[cfg(not(madsim))]
 impl StressMode {
     fn as_str(self) -> &'static str {
         match self {
@@ -272,6 +293,7 @@ impl StressMode {
     }
 }
 
+#[cfg(not(madsim))]
 impl std::str::FromStr for StressMode {
     type Err = String;
 
@@ -284,6 +306,7 @@ impl std::str::FromStr for StressMode {
     }
 }
 
+#[cfg(not(madsim))]
 fn help() -> String {
     "usage: ursula-runtime-stress [--mode append|batch] [--core-count N] [--raft-group-count N] [--stream-count N] [--producer-count N] [--setup-concurrency N] [--mailbox-capacity N] [--batch-size N] [--payload-bytes N] [--duration-secs N]".to_owned()
 }

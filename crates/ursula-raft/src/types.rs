@@ -9,7 +9,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use ursula_proto as raft_app_proto;
 use ursula_runtime::GroupWriteCommand;
 
+// Used only by the cfg(not(madsim)) file-log writer thread in
+// log_store/file.rs::run_core_file_log_writer.
+#[cfg_attr(madsim, allow(dead_code))]
 pub(crate) const CORE_LOG_GROUP_COMMIT_DELAY: Duration = Duration::from_micros(200);
+#[cfg_attr(madsim, allow(dead_code))]
 pub(crate) const CORE_LOG_GROUP_COMMIT_MAX_BATCH: usize = 1024;
 
 #[cfg(madsim)]

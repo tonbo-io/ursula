@@ -31,6 +31,7 @@ jobs:
 
       - name: Audit DST guards (all 7 audits) + write seed/nondet reports
         run: |
+          mkdir -p target
           python3 -m scripts.dst all
           python3 -m scripts.dst nondeterminism --report \
             > target/dst-nondeterminism-report.md

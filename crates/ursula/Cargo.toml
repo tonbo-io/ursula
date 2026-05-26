@@ -18,6 +18,7 @@ base64 = "0.22"
 chrono = "0.4"
 console-subscriber = { version = "0.5.0", optional = true }
 futures-util = "0.3"
+mimalloc = { version = "0.1", default-features = false }
 openraft = { version = "0.10.0-alpha.20", default-features = false, features = ["tokio-rt", "type-alias", "serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }

@@ -4225,6 +4225,108 @@ fn test_router() -> Router {
 }
 
 #[tokio::test]
+async fn client_router_does_not_serve_cluster_plane_via_grpc_service() {
+    // The gRPC path `/ursula.raft.v1.RaftInternal/Append` has the same shape
+    // as a client `/{bucket}/{stream}` URL, so axum's wildcard does match it
+    // on the client router — but it lands in the regular `append_stream`
+    // handler, not the gRPC RaftInternalServer. That handler returns a plain
+    // 4xx because Producer headers are missing. The cluster router, by
+    // contrast, dispatches it through the gRPC service whose error wire
+    // format produces a different status. We assert the cluster router gives
+    // a tonic-style response (200/415/501) while the client router stays in
+    // HTTP append's error space (4xx, never 200).
+    let state = HttpState::new(spawn_default_runtime(1, 1).expect("runtime"));
+    let client = client_router_from_state(state.clone());
+    let response = client
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(RAFT_GRPC_APPEND_PATH)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    assert!(
+        (400..500).contains(&status),
+        "cluster-plane gRPC path should land in client wildcard error path, got {status}"
+    );
+    let ct = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        !ct.contains("application/grpc"),
+        "client router must not respond with a gRPC content-type, got {ct}"
+    );
+}
+
+#[tokio::test]
+async fn cluster_router_does_not_expose_client_plane_routes() {
+    let state = HttpState::new(spawn_default_runtime(1, 1).expect("runtime"));
+    let cluster = cluster_router_from_state(state.clone());
+    // A normal client append must be 404 on the cluster router.
+    let response = cluster
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/some-bucket/some-stream")
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(b"payload".to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status().as_u16(),
+        404,
+        "client-plane route leaked into cluster router"
+    );
+}
+
+#[tokio::test]
+async fn merged_router_serves_both_planes() {
+    // The single-listener router (backwards compat / in-process tests) must
+    // still answer both client and cluster routes from one bind.
+    let state = HttpState::new(spawn_default_runtime(1, 1).expect("runtime"));
+    let merged = router_with_http_state(state);
+    let merged_for_cluster = merged.clone();
+
+    // Client-plane: HEAD on an unknown stream returns 404 (route mounted).
+    let head = merged
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/some-bucket/unknown-stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(head.status().as_u16(), 405, "client HEAD route missing");
+
+    // Cluster-plane: the gRPC path is reachable (not 404). It will fail later
+    // due to missing protobuf headers, but the route itself must be mounted.
+    let grpc = merged_for_cluster
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(RAFT_GRPC_APPEND_PATH)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        grpc.status().as_u16(),
+        404,
+        "merged router missing cluster gRPC path"
+    );
+}
+
+#[tokio::test]
 async fn http_state_wall_clock_drives_protocol_now_ms() {
     let now_ms = Arc::new(AtomicU64::new(1_000));
     let state = HttpState::new(spawn_default_runtime(1, 1).expect("runtime")).with_wall_clock(

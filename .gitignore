@@ -10,6 +10,7 @@ docs/web/public/docs/
 docs/web/public/llms*.txt
 docs/web/*.tsbuildinfo
 docs/web/vite.config.d.ts
+docs/web/target/
 
 # Cloudflare Pages / Wrangler deploy cache
 .wrangler/

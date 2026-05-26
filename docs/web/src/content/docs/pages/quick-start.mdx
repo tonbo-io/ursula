@@ -68,14 +68,27 @@ curl -N 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
 
 ## Inspect runtime state
 
-Each node exposes a JSON metrics endpoint that is handy when checking that work landed on the right cores:
+For a multi-node cluster the canonical day-2 tool is [`ursulactl`](/docs/cli) — it speaks to every node, summarises leadership, and is what you'll use for rolling restarts. For a single local node you can either point it at a one-line manifest:
+
+```bash
+cat > /tmp/local.json <<'JSON'
+{"nodes": [{"id": 1, "http_url": "http://127.0.0.1:4437", "host": "127.0.0.1"}]}
+JSON
+
+ursulactl status --config /tmp/local.json
+```
+
+Or hit the underlying JSON endpoint directly:
 
 ```bash
 curl http://127.0.0.1:4437/__ursula/metrics
 ```
 
+The raw endpoint is also what `ursulactl` consumes; reach for it when you want the full snapshot or are building custom tooling.
+
 ## Next steps
 
+- [ursulactl](/docs/cli): the operator CLI you'll use once a cluster is up
 - [Run locally](/docs/run-locally): flags, environment variables, and durability modes
 - [Deploy a cluster](/docs/deploy-cluster): static gRPC Raft cluster shape
 - [Configure S3](/docs/configure-s3): shared cold storage for clusters

@@ -3,15 +3,23 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use axum::Router;
 use serde::Deserialize;
 use ursula::{
-    router, router_with_static_raft_cluster, spawn_cold_flush_worker_if_configured,
-    spawn_default_runtime, spawn_raft_memory_runtime, spawn_raft_runtime,
-    spawn_static_grpc_raft_memory_runtime,
+    HttpState, client_router_from_state, cluster_router_from_state,
+    spawn_cold_flush_worker_if_configured, spawn_default_runtime, spawn_raft_memory_runtime,
+    spawn_raft_runtime, spawn_static_grpc_raft_memory_runtime,
     spawn_static_grpc_raft_memory_runtime_with_per_group_initializers,
     spawn_static_grpc_raft_runtime, spawn_static_grpc_raft_runtime_with_per_group_initializers,
     spawn_wal_runtime,
 };
+
+// glibc malloc held ~1 GB of cached arena chunks under the chaos workload
+// (16+ per-thread arenas of 64 MB each, freed memory never returned to the OS).
+// mimalloc trims aggressively and uses one segment-per-thread instead, which
+// keeps steady-state RSS proportional to live working set.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -48,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let app = if static_grpc_raft {
+    let state: HttpState = if static_grpc_raft {
         let node_id = args
             .raft_node_id
             .expect("static gRPC Raft validation required node id");
@@ -91,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         runtime.warm_all_groups().await?;
         spawn_cold_flush_worker_if_configured(&runtime);
-        router_with_static_raft_cluster(runtime, registry, args.raft_peers.clone())
+        HttpState::with_static_raft_cluster(runtime, registry, args.raft_peers.clone())
     } else {
         let runtime = match (args.wal_dir, args.raft_log_dir, args.raft_memory) {
             (Some(wal_dir), None, false) => {
@@ -106,10 +114,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             (None, None, false) => spawn_default_runtime(args.core_count, args.raft_group_count)?,
             _ => unreachable!("storage mode exclusivity is checked above"),
         };
-        router(runtime)
+        HttpState::new(runtime)
     };
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    axum::serve(listener, app).await?;
+
+    if let Some(cluster_addr) = args.cluster_listen {
+        // Dual-listener mode: client API on `--listen`, Raft / inter-node
+        // gRPC on `--cluster-listen`. Failures applied to the public face
+        // never disturb consensus traffic on the cluster face.
+        let client_app = client_router_from_state(state.clone());
+        let cluster_app = cluster_router_from_state(state);
+        let client_listener = tokio::net::TcpListener::bind(args.listen).await?;
+        let cluster_listener = tokio::net::TcpListener::bind(cluster_addr).await?;
+        let client_task =
+            tokio::spawn(async move { axum::serve(client_listener, client_app).await });
+        let cluster_task =
+            tokio::spawn(async move { axum::serve(cluster_listener, cluster_app).await });
+        tokio::select! {
+            res = client_task => res??,
+            res = cluster_task => res??,
+        }
+    } else {
+        let app: Router = ursula::router_with_http_state(state);
+        let listener = tokio::net::TcpListener::bind(args.listen).await?;
+        axum::serve(listener, app).await?;
+    }
     Ok(())
 }
 
@@ -130,6 +158,11 @@ fn init_tokio_console_if_enabled() {
 #[derive(Debug)]
 struct Args {
     listen: SocketAddr,
+    /// Optional separate bind for the cluster plane (Raft / inter-node gRPC).
+    /// In production this should point at a private VPC interface so chaos /
+    /// load / abuse on the public client plane never disrupts consensus.
+    /// When None, both planes share `listen`.
+    cluster_listen: Option<SocketAddr>,
     core_count: usize,
     raft_group_count: usize,
     wal_dir: Option<PathBuf>,
@@ -151,6 +184,7 @@ impl Args {
         let mut listen = "127.0.0.1:4437"
             .parse::<SocketAddr>()
             .expect("default listen addr is valid");
+        let mut cluster_listen: Option<SocketAddr> = None;
         let mut core_count = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(4);
@@ -174,6 +208,14 @@ impl Args {
                     listen = raw
                         .parse()
                         .map_err(|err| format!("invalid --listen address '{raw}': {err}"))?;
+                }
+                "--cluster-listen" => {
+                    let raw = args
+                        .next()
+                        .ok_or_else(|| "--cluster-listen requires an address".to_owned())?;
+                    cluster_listen = Some(raw.parse().map_err(|err| {
+                        format!("invalid --cluster-listen address '{raw}': {err}")
+                    })?);
                 }
                 "--core-count" => {
                     let raw = args
@@ -259,8 +301,15 @@ impl Args {
             }
         }
 
+        if let Some(cluster) = cluster_listen
+            && cluster == listen
+        {
+            return Err("--cluster-listen and --listen must use distinct addresses".to_owned());
+        }
+
         Ok(Self {
             listen,
+            cluster_listen,
             core_count,
             raft_group_count,
             wal_dir,
@@ -284,7 +333,7 @@ impl Args {
 }
 
 fn help() -> String {
-    "usage: ursula [--listen ADDR] [--core-count N] [--raft-group-count N] [--raft-memory | --wal-dir DIR | --raft-log-dir DIR] [--raft-cluster-config FILE | --raft-node-id ID --raft-peer ID=URL ... --raft-init-membership | --raft-init-membership-per-group]"
+    "usage: ursula [--listen ADDR] [--cluster-listen ADDR] [--core-count N] [--raft-group-count N] [--raft-memory | --wal-dir DIR | --raft-log-dir DIR] [--raft-cluster-config FILE | --raft-node-id ID --raft-peer ID=URL ... --raft-init-membership | --raft-init-membership-per-group]"
         .to_owned()
 }
 
@@ -589,5 +638,40 @@ mod tests {
             .expect_err("raft peer URL without scheme should be rejected");
 
         assert!(err.contains("URL must start with http:// or https://"));
+    }
+
+    #[test]
+    fn parses_separate_cluster_listen() {
+        let args = Args::parse_from([
+            "--listen",
+            "0.0.0.0:4491",
+            "--cluster-listen",
+            "10.0.0.1:4495",
+        ])
+        .expect("dual listener args should parse");
+        assert_eq!(args.listen.to_string(), "0.0.0.0:4491");
+        assert_eq!(
+            args.cluster_listen.map(|a| a.to_string()),
+            Some("10.0.0.1:4495".to_owned())
+        );
+    }
+
+    #[test]
+    fn defaults_cluster_listen_to_none() {
+        let args = Args::parse_from(["--listen", "0.0.0.0:4491"])
+            .expect("single listener args should parse");
+        assert!(args.cluster_listen.is_none());
+    }
+
+    #[test]
+    fn rejects_cluster_listen_equal_to_listen() {
+        let err = Args::parse_from([
+            "--listen",
+            "127.0.0.1:4437",
+            "--cluster-listen",
+            "127.0.0.1:4437",
+        ])
+        .expect_err("identical listen and cluster-listen must be rejected");
+        assert!(err.contains("distinct addresses"), "got: {err}");
     }
 }

@@ -158,6 +158,7 @@ type ChaosStatus = {
   topology?: ChaosTopology;
   workload: {
     append_target_per_second: number;
+    status_interval_secs?: number;
     append_success_total: number;
     append_error_total: number;
     reader_success_total?: number;
@@ -176,6 +177,7 @@ type ChaosStatus = {
     verified_offsets: number;
     mismatch_count: number;
     setsum_mismatch_count?: number;
+    setsum_availability_error_count?: number;
     verify_counts?: Record<string, number>;
     verify_errors?: Record<string, number>;
     expected_live_setsum?: string;
@@ -189,6 +191,7 @@ type ChaosStatus = {
       total_records?: number | null;
     } | null;
     last_error: string | null;
+    last_setsum_availability_error?: string | null;
   };
   chaos: {
     enabled: boolean;
@@ -208,7 +211,9 @@ type ChaosStatus = {
 
 const STATUS_URL =
   (import.meta.env.VITE_CHAOS_STATUS_URL as string | undefined) ||
-  "https://ursula-chaos-status-tonbo.s3.amazonaws.com/status.json";
+  (import.meta.env.DEV
+    ? "/__chaos-proxy/status.json"
+    : "https://ursula-chaos-status-tonbo.s3.amazonaws.com/status.json");
 const REFRESH_OPTIONS = [
   { label: "10s", value: 10_000 },
   { label: "30s", value: 30_000 },
@@ -219,7 +224,6 @@ const HISTORY_LEGEND: Array<{ status: StatusLevel; label: string }> = [
   { status: "operational", label: "healthy" },
   { status: "degraded_performance", label: "fault active" },
   { status: "major_outage", label: "outage" },
-  { status: "unknown", label: "unknown" },
 ];
 
 function formatTime(value: string | null) {
@@ -386,17 +390,21 @@ function bucketHistory(
   return cells;
 }
 
-function appendRateSamples(history: HealthHistoryPoint[]): Array<{ time: string | null; rate: number }> {
-  const samples: Array<{ time: string | null; rate: number }> = [];
+type ActivitySample = { time: string; rate: number; errorDelta: number };
+
+function appendRateSamples(history: HealthHistoryPoint[]): ActivitySample[] {
+  const samples: ActivitySample[] = [];
   for (let i = 1; i < history.length; i++) {
     const prev = history[i - 1];
     const cur = history[i];
     const delta = cur.append_success_delta;
     if (typeof delta !== "number") continue;
+    if (!cur.time) continue;
     const prevTime = new Date(prev.time ?? "").getTime();
-    const curTime = new Date(cur.time ?? "").getTime();
+    const curTime = new Date(cur.time).getTime();
     if (Number.isNaN(prevTime) || Number.isNaN(curTime) || curTime <= prevTime) continue;
-    samples.push({ time: cur.time, rate: delta / ((curTime - prevTime) / 1000) });
+    const errorDelta = typeof cur.append_error_delta === "number" ? cur.append_error_delta : 0;
+    samples.push({ time: cur.time, rate: delta / ((curTime - prevTime) / 1000), errorDelta });
   }
   return samples;
 }
@@ -482,52 +490,292 @@ function eventLevelClass(level: string) {
   }
 }
 
-function Sparkline({
+type BandState = "met" | "missed" | "active";
+type InjectionBand = {
+  id: number;
+  scenario: string | null;
+  state: BandState;
+  startMs: number;
+  endMs: number;
+};
+
+function injectionBandState(injection: ChaosInjection): BandState {
+  if (injection.slo_met === true) return "met";
+  if (injection.slo_met === false) return "missed";
+  return "active";
+}
+
+function injectionWindow(injection: ChaosInjection, fallbackEndMs: number): { startMs: number; endMs: number } | null {
+  const startRaw = injection.injected_at ?? injection.stop_requested_at ?? injection.stopped_at;
+  if (!startRaw) return null;
+  const startMs = new Date(startRaw).getTime();
+  if (Number.isNaN(startMs)) return null;
+  const endRaw = injection.recovered_at ?? null;
+  const endMs = endRaw ? new Date(endRaw).getTime() : fallbackEndMs;
+  if (Number.isNaN(endMs) || endMs < startMs) return null;
+  return { startMs, endMs };
+}
+
+function ActivityChart({
   samples,
   target,
+  recentRate,
+  injections,
+  selectedInjectionId,
+  onSelectInjection,
+  integrityMark,
+  now,
 }: {
-  samples: Array<{ time: string | null; rate: number }>;
+  samples: ActivitySample[];
   target: number;
+  recentRate: number | null;
+  injections: ChaosInjection[];
+  selectedInjectionId: number | null;
+  onSelectInjection: (id: number | null) => void;
+  integrityMark: { time: string; ok: boolean; message: string } | null;
+  now: number;
 }) {
+  const formatRate = (rate: number) =>
+    rate > 0 && rate < 1 ? "<1/s" : `${Math.round(rate).toLocaleString()}/s`;
+
   if (samples.length < 2) {
-    return <div className="status-sparkline-empty">No rate samples yet.</div>;
+    if (typeof recentRate === "number") {
+      return (
+        <div className="activity-chart-empty">
+          {formatRate(recentRate)} · waiting for time-series samples
+        </div>
+      );
+    }
+    return <div className="activity-chart-empty">No rate samples yet.</div>;
   }
+
   const width = 600;
-  const height = 72;
+  const height = 96;
+  const t0 = new Date(samples[0].time).getTime();
+  const lastSampleMs = new Date(samples[samples.length - 1].time).getTime();
+  const t1 = Math.max(lastSampleMs, now);
+  const span = t1 - t0;
+  if (!Number.isFinite(span) || span <= 0) {
+    return <div className="activity-chart-empty">No rate samples yet.</div>;
+  }
+
+  const xOf = (timeMs: number) => ((timeMs - t0) / span) * width;
   const peak = Math.max(target, ...samples.map((s) => s.rate)) || 1;
   const ceiling = peak * 1.1;
-  const stepX = width / (samples.length - 1);
-  const points = samples
-    .map((s, i) => `${(i * stepX).toFixed(2)},${(height - (s.rate / ceiling) * height).toFixed(2)}`)
+  const yOf = (rate: number) => height - (rate / ceiling) * height;
+
+  const linePoints = samples
+    .map((s) => `${xOf(new Date(s.time).getTime()).toFixed(2)},${yOf(s.rate).toFixed(2)}`)
     .join(" ");
-  const targetY = target > 0 ? height - (target / ceiling) * height : null;
+  const targetY = target > 0 ? yOf(target) : null;
+  const displayedRecentRate = recentRate ?? samples[samples.length - 1].rate;
+
+  const bands: InjectionBand[] = injections
+    .map((inj) => {
+      const win = injectionWindow(inj, t1);
+      if (!win) return null;
+      if (win.endMs < t0 || win.startMs > t1) return null;
+      return {
+        id: inj.id,
+        scenario: inj.scenario ?? null,
+        state: injectionBandState(inj),
+        startMs: Math.max(win.startMs, t0),
+        endMs: Math.min(win.endMs, t1),
+      };
+    })
+    .filter((b): b is InjectionBand => b !== null);
+
+  const errorPoints = samples
+    .map((s) =>
+      s.errorDelta > 0 ? { x: xOf(new Date(s.time).getTime()), y: yOf(s.rate) } : null,
+    )
+    .filter((p): p is { x: number; y: number } => p !== null);
+
+  const integrityX = (() => {
+    if (!integrityMark) return null;
+    const ms = new Date(integrityMark.time).getTime();
+    if (Number.isNaN(ms) || ms < t0 || ms > t1) return null;
+    return xOf(ms);
+  })();
+
+  const fmtTime = (ms: number) =>
+    new Date(ms).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+
   return (
-    <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" className="status-sparkline">
-      {targetY != null ? (
-        <line x1={0} x2={width} y1={targetY} y2={targetY} className="status-sparkline-target" />
-      ) : null}
-      <polyline points={points} className="status-sparkline-line" />
-    </svg>
+    <div className="activity-chart">
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        preserveAspectRatio="none"
+        className="activity-chart-svg"
+      >
+        {bands.map((band) => {
+          const x = xOf(band.startMs);
+          const w = Math.max(1, xOf(band.endMs) - x);
+          const selected = band.id === selectedInjectionId;
+          return (
+            <rect
+              key={band.id}
+              x={x}
+              y={0}
+              width={w}
+              height={height}
+              className={`activity-band activity-band-${band.state}${
+                selected ? " activity-band-selected" : ""
+              }`}
+              onClick={() => onSelectInjection(selected ? null : band.id)}
+            >
+              <title>{`#${band.id} ${band.scenario ?? "fault"} · ${band.state}`}</title>
+            </rect>
+          );
+        })}
+        {targetY != null ? (
+          <line x1={0} x2={width} y1={targetY} y2={targetY} className="activity-target" />
+        ) : null}
+        <polyline points={linePoints} className="activity-line" />
+        {errorPoints.map((p, i) => (
+          <circle key={i} cx={p.x} cy={p.y} r={2.4} className="activity-error-dot" />
+        ))}
+        {integrityX != null && integrityMark ? (
+          <g className="activity-integrity">
+            <line
+              x1={integrityX}
+              x2={integrityX}
+              y1={height - 8}
+              y2={height}
+              className={`activity-integrity-tick activity-integrity-tick-${
+                integrityMark.ok ? "ok" : "bad"
+              }`}
+            />
+            <title>{integrityMark.message}</title>
+          </g>
+        ) : null}
+      </svg>
+      <div className="activity-chart-rate">
+        <span className="activity-chart-rate-now">{formatRate(displayedRecentRate)}</span>
+        {target > 0 ? (
+          <span className="activity-chart-rate-target">/ target {formatRate(target)}</span>
+        ) : null}
+      </div>
+      <div className="activity-chart-axis">
+        <span>{fmtTime(t0)}</span>
+        <span>{Math.abs(now - lastSampleMs) < 60_000 ? `${fmtTime(t1)} now` : fmtTime(t1)}</span>
+      </div>
+    </div>
   );
 }
 
-function PhaseBar({ phases }: { phases: Array<{ key: PhaseKey; label: string; ms: number }> }) {
-  if (phases.length === 0) {
-    return <div className="injection-phases injection-phases-pending">awaiting first event</div>;
+function RecoveryMeter({
+  durationMs,
+  phases,
+  sloSecs,
+  sloMet,
+}: {
+  durationMs: number | null;
+  phases: Array<{ key: PhaseKey; label: string; ms: number }>;
+  sloSecs: number | null;
+  sloMet: boolean | null;
+}) {
+  if (durationMs == null) {
+    return <div className="recovery-meter recovery-meter-pending">awaiting recovery</div>;
   }
+  const sloMs = sloSecs && sloSecs > 0 ? sloSecs * 1000 : null;
+  const met = sloMet ?? (sloMs != null ? durationMs <= sloMs : true);
+  const scaleMs = sloMs != null ? Math.max(sloMs * 1.2, durationMs * 1.05) : durationMs * 1.05;
+  const sloPct = sloMs != null ? Math.min(100, (sloMs / scaleMs) * 100) : null;
+
   return (
-    <div className="injection-phases">
-      {phases.map((phase, i) => (
-        <div
-          className={`injection-phase injection-phase-${phase.key}`}
-          key={`${phase.key}-${i}`}
-          style={{ flex: phase.ms }}
-          title={`${phase.label} · ${formatDuration(phase.ms)}`}
-        >
-          <span className="injection-phase-duration">{formatDuration(phase.ms)}</span>
-        </div>
-      ))}
+    <div className="recovery-meter">
+      <div className={`recovery-meter-track${met ? "" : " recovery-meter-track-missed"}`}>
+        {phases.map((phase, i) => (
+          <div
+            className={`recovery-meter-phase recovery-meter-phase-${phase.key}`}
+            key={`${phase.key}-${i}`}
+            style={{ flex: phase.ms }}
+            title={`${phase.label} · ${formatDuration(phase.ms)}`}
+          />
+        ))}
+        {sloPct != null ? (
+          <div
+            className="recovery-meter-slo-marker"
+            style={{ left: `${sloPct}%` }}
+            title={`SLO ${sloSecs}s`}
+          />
+        ) : null}
+      </div>
+      <div className="recovery-meter-axis">
+        <span>0s</span>
+        {phases.length > 1 ? (
+          <span className="recovery-meter-phase-legend">
+            {phases.map((phase, i) => (
+              <span className="recovery-meter-phase-chip" key={`${phase.key}-${i}`}>
+                <span
+                  aria-hidden="true"
+                  className={`recovery-meter-phase-dot recovery-meter-phase-${phase.key}`}
+                />
+                {phase.label} {formatDuration(phase.ms)}
+              </span>
+            ))}
+          </span>
+        ) : null}
+        <span>{formatDuration(scaleMs)}</span>
+      </div>
     </div>
+  );
+}
+
+function InjectionDetail({
+  injection,
+  recoverySloSecs,
+}: {
+  injection: ChaosInjection;
+  recoverySloSecs: number | null;
+}) {
+  const pill = injectionPill(injection);
+  const durationMs = injectionDurationMs(injection);
+  const phases = injectionPhases(injection);
+  const targetLabel = injection.target_nodes?.length
+    ? injection.target_nodes.join(", ")
+    : injection.node_name ?? `node ${injection.node_id ?? "-"}`;
+  return (
+    <article className="injection-item" key={injection.id}>
+      <div className="injection-item-header">
+        <div className="injection-item-title">
+          <span className="injection-id">#{injection.id}</span>
+          {injection.scenario ? (
+            <span className="injection-scenario">{injection.scenario.replace(/_/g, " ")}</span>
+          ) : null}
+          <span className="injection-target-arrow">→</span>
+          <span className="injection-target-name">{targetLabel}</span>
+          {durationMs != null ? (
+            <span className="injection-meta">· {formatDuration(durationMs)}</span>
+          ) : null}
+          {injection.expected_result === "revert_detection" ? (
+            <span className="injection-meta">· revert detection</span>
+          ) : null}
+        </div>
+        <StatusPill status={pill.status} label={pill.label} />
+      </div>
+      <RecoveryMeter
+        durationMs={durationMs}
+        phases={phases}
+        sloSecs={injection.recovery_slo_secs ?? recoverySloSecs}
+        sloMet={injection.slo_met ?? null}
+      />
+      {(injection.timeline?.length ?? 0) > 0 ? (
+        <details className="injection-timeline-details">
+          <summary>Timeline</summary>
+          <div className="injection-timeline">
+            {(injection.timeline ?? []).map((event, index) => (
+              <div className="injection-timeline-step" key={`${event.time ?? "event"}-${index}`}>
+                <span>{event.status}</span>
+                <time>{formatShortTime(event.time)}</time>
+                <p>{event.message}</p>
+              </div>
+            ))}
+          </div>
+        </details>
+      ) : null}
+    </article>
   );
 }
 
@@ -630,7 +878,7 @@ function TopologyCanvas({ topology }: { topology?: ChaosTopology }) {
       const nodeRadius = 24;
       const groupRadius = 14;
 
-      ctx.lineCap = "round";
+      ctx.lineCap = "butt";
       groupPositions.forEach(({ group, x, y }) => {
         (group.replicas ?? []).forEach((replica) => {
           const nodeId = replica.node_id;
@@ -647,12 +895,11 @@ function TopologyCanvas({ topology }: { topology?: ChaosTopology }) {
           const startY = y + uy * groupRadius;
           const endX = node.x - ux * nodeRadius;
           const endY = node.y - uy * nodeRadius;
-          ctx.strokeStyle = isLeader ? "rgba(184, 187, 38, 0.7)" : voter;
-          ctx.lineWidth = isLeader ? 1.6 : 0.8;
+          ctx.strokeStyle = isLeader ? "rgba(184, 187, 38, 0.85)" : voter;
+          ctx.lineWidth = isLeader ? 1.5 : 0.7;
           ctx.beginPath();
           ctx.moveTo(startX, startY);
-          const midY = (startY + endY) / 2;
-          ctx.bezierCurveTo(startX, midY, endX, midY, endX, endY);
+          ctx.lineTo(endX, endY);
           ctx.stroke();
         });
       });
@@ -712,6 +959,7 @@ function StatusPage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [refreshMs, setRefreshMs] = useState(30_000);
   const [now, setNow] = useState(() => Date.now());
+  const [selectedInjectionId, setSelectedInjectionId] = useState<number | null>(null);
 
   useEffect(() => {
     let closed = false;
@@ -757,10 +1005,46 @@ function StatusPage() {
     [status, now],
   );
   const rateSamples = useMemo(() => appendRateSamples(status?.history ?? []).slice(-80), [status]);
-  const injections = useMemo(
-    () => status?.chaos.injections?.slice().reverse().slice(0, 3) ?? [],
-    [status],
+  const currentAppendRate = useMemo(() => {
+    const delta = status?.health?.append_success_delta;
+    if (typeof delta !== "number") return null;
+    const interval = status?.workload.status_interval_secs ?? 15;
+    if (interval <= 0) return null;
+    return delta / interval;
+  }, [status]);
+  const allInjections = useMemo(() => status?.chaos.injections ?? [], [status]);
+  const windowStartMs = rateSamples.length >= 2 ? new Date(rateSamples[0].time).getTime() : null;
+  const windowEndMs = (() => {
+    const last = rateSamples.length >= 2 ? new Date(rateSamples[rateSamples.length - 1].time).getTime() : null;
+    if (last == null) return null;
+    return Math.max(last, now);
+  })();
+  const windowInjections = useMemo(() => {
+    if (windowStartMs == null || windowEndMs == null) return [];
+    return allInjections.filter((inj) => {
+      const win = injectionWindow(inj, windowEndMs);
+      if (!win) return false;
+      return win.endMs >= windowStartMs && win.startMs <= windowEndMs;
+    });
+  }, [allInjections, windowStartMs, windowEndMs]);
+  const earlierInjectionCount = Math.max(0, allInjections.length - windowInjections.length);
+  const selectedInjection = useMemo(
+    () => allInjections.find((inj) => inj.id === selectedInjectionId) ?? null,
+    [allInjections, selectedInjectionId],
   );
+  const activeInjection = useMemo(
+    () => allInjections.find((inj) => inj.status && inj.status !== "recovered") ?? null,
+    [allInjections],
+  );
+  const defaultDetailInjection =
+    selectedInjection ?? activeInjection ?? windowInjections[windowInjections.length - 1] ?? null;
+  const integrityMark = useMemo(() => {
+    const checked = status?.integrity.checked_at;
+    if (!checked) return null;
+    const message = status?.integrity.last_error ?? null;
+    if (!message) return null;
+    return { time: checked, ok: false, message };
+  }, [status]);
   const events = useMemo(() => status?.events?.slice().reverse().slice(0, 10) ?? [], [status]);
 
   const updatedRelative = formatRelative(status?.updated_at);
@@ -784,7 +1068,6 @@ function StatusPage() {
       ? `${runningNodes} / ${expectedNodes}`
       : "-";
   const streamCount = status?.workload.stream_count ?? null;
-  const recentRate = rateSamples.length > 0 ? Math.round(rateSamples[rateSamples.length - 1].rate) : null;
   const producerCount = status?.workload.producer_count ?? null;
   const payloadSizes = status?.workload.payload_sizes ?? null;
   const payloadRange = useMemo(() => {
@@ -799,12 +1082,28 @@ function StatusPage() {
   const verifyModes = useMemo(() => {
     const ok = status?.integrity.verify_counts ?? {};
     const errors = status?.integrity.verify_errors ?? {};
-    const names = Array.from(new Set([...Object.keys(ok), ...Object.keys(errors)])).sort();
-    return names.map((name) => ({
-      name,
-      ok: ok[name] ?? 0,
-      errors: errors[name] ?? 0,
-    }));
+    // Filter out suffixed bookkeeping keys (`_unavailable`, `_skipped`) — they
+    // belong to the parent mode's badge, not their own row.
+    const isAuxKey = (name: string) =>
+      name.endsWith("_unavailable") || name.endsWith("_skipped");
+    const names = Array.from(
+      new Set([
+        ...Object.keys(ok).filter((name) => !isAuxKey(name)),
+        ...Object.keys(errors).filter((name) => !isAuxKey(name)),
+      ]),
+    ).sort();
+    return names
+      .map((name) => ({
+        name,
+        ok: ok[name] ?? 0,
+        errors: errors[name] ?? 0,
+        unavailable: errors[`${name}_unavailable`] ?? 0,
+        skipped: ok[`${name}_skipped`] ?? 0,
+      }))
+      .filter(
+        (mode) =>
+          mode.ok > 0 || mode.errors > 0 || mode.unavailable > 0 || mode.skipped > 0,
+      );
   }, [status]);
   const workloadProbes = useMemo(() => {
     return Object.entries(status?.workload.coverage?.probes ?? {}).sort(([left], [right]) =>
@@ -864,10 +1163,8 @@ function StatusPage() {
             {status?.summary ?? "Waiting for the EC2 chaos runner to publish live test data."}
           </p>
           <p className="status-hero-blurb">
-            A 3-node Ursula cluster runs on EC2 around the clock. The runner mixes writes, readers,
-            old-offset checks, producer fencing probes, burst phases, and scheduled fault scenarios.
-            The page reports what is covered by the current run and whether the cluster returns to
-            full health inside the recovery SLO.
+            A 3-node cluster on EC2 takes continuous reads and writes while a scheduler injects faults
+            and verifies the cluster recovers inside the SLO.
           </p>
           <div className="status-hero-controls">
             <div className="status-hero-meta">
@@ -978,27 +1275,28 @@ function StatusPage() {
 
         <section className="status-section">
           <div className="status-section-heading">
-            <h2>Workload</h2>
+            <h2>
+              Activity
+              {status?.chaos.recovery_slo_secs ? (
+                <span className="status-section-subtitle">
+                  recovery SLO {status.chaos.recovery_slo_secs}s
+                </span>
+              ) : null}
+            </h2>
             <div className="status-section-stats">
               <span>
                 <em>nodes</em>
                 {nodeSummary}
               </span>
               <span>
-                <em>target</em>
-                {numberValue(status?.workload.append_target_per_second)}/s
-              </span>
-              <span>
-                <em>recent</em>
-                {recentRate == null ? "-" : `${recentRate.toLocaleString()}/s`}
-              </span>
-              <span>
-                <em>total</em>
+                <em>appends</em>
                 {numberValue(status?.workload.append_success_total)}
               </span>
-              <span className={
-                (status?.workload.append_error_total ?? 0) > 0 ? "status-section-stat-bad" : undefined
-              }>
+              <span
+                className={
+                  (status?.workload.append_error_total ?? 0) > 0 ? "status-section-stat-bad" : undefined
+                }
+              >
                 <em>errors</em>
                 {numberValue(status?.workload.append_error_total)}
               </span>
@@ -1006,47 +1304,169 @@ function StatusPage() {
                 <em>reads</em>
                 {numberValue(status?.workload.reader_success_total)}
               </span>
-              <span className={
-                (status?.workload.reader_error_total ?? 0) > 0 ? "status-section-stat-bad" : undefined
-              }>
+              <span
+                className={
+                  (status?.workload.reader_error_total ?? 0) > 0 ? "status-section-stat-bad" : undefined
+                }
+              >
                 <em>read errors</em>
                 {numberValue(status?.workload.reader_error_total)}
               </span>
+              <span>
+                <em>faults</em>
+                {numberValue(status?.chaos.injection_count)}
+              </span>
+              <span title={formatTime(status?.chaos.next_fault_after ?? null)}>
+                <em>next</em>
+                {formatScheduleDelta(status?.chaos.next_fault_after) ?? "-"}
+              </span>
             </div>
           </div>
-          <div className="status-sparkline-wrap">
-            <Sparkline samples={rateSamples} target={status?.workload.append_target_per_second ?? 0} />
-          </div>
-          {workloadProbes.length > 0 ? (
-            <div className="workload-coverage-row" role="list" aria-label="workload coverage">
-              {workloadProbes.map(([name, probe]) => {
-                const disabled = probe.enabled === false;
-                const state = disabled
-                  ? "disabled"
-                  : probe.passing === false
-                    ? "failed"
-                    : probe.covered
-                      ? "covered"
-                      : "pending";
-                const count = probeCount(probe);
-                const errorCount = probe.errors ?? probe.probe_errors ?? 0;
-                const title = disabled
-                  ? `${probeLabel(name)} is disabled in this run`
-                  : `${probeLabel(name)}: ${probe.covered ? "covered" : "not covered"}${errorCount ? ` · ${errorCount} errors` : ""}`;
+          <ActivityChart
+            samples={rateSamples}
+            target={status?.workload.append_target_per_second ?? 0}
+            recentRate={currentAppendRate}
+            injections={windowInjections}
+            selectedInjectionId={selectedInjectionId}
+            onSelectInjection={setSelectedInjectionId}
+            integrityMark={integrityMark}
+            now={now}
+          />
+          {windowInjections.length > 0 || earlierInjectionCount > 0 ? (
+            <div className="activity-band-legend">
+              {windowInjections.map((inj) => {
+                const state = injectionBandState(inj);
+                const selected = inj.id === selectedInjectionId;
                 return (
-                  <span
-                    className={`workload-probe workload-probe-${state}`}
-                    key={name}
-                    role="listitem"
-                    title={title}
+                  <button
+                    key={inj.id}
+                    type="button"
+                    className={`activity-band-chip activity-band-chip-${state}${
+                      selected ? " activity-band-chip-selected" : ""
+                    }`}
+                    onClick={() =>
+                      setSelectedInjectionId(selected ? null : inj.id)
+                    }
+                    title={`#${inj.id} ${inj.scenario ?? "fault"} · ${state}`}
                   >
-                    <span aria-hidden="true" className={`workload-probe-dot workload-probe-dot-${state}`} />
-                    {probeLabel(name)}
-                    {count > 0 ? <em>{count.toLocaleString()}</em> : null}
-                  </span>
+                    <span className="activity-band-chip-id">#{inj.id}</span>
+                    {inj.scenario ? (
+                      <span className="activity-band-chip-scenario">
+                        {inj.scenario.replace(/_/g, " ")}
+                      </span>
+                    ) : null}
+                  </button>
                 );
               })}
+              {earlierInjectionCount > 0 ? (
+                <span
+                  className="activity-band-earlier"
+                  title="injections that fall before the current chart window"
+                >
+                  +{earlierInjectionCount} earlier
+                </span>
+              ) : null}
             </div>
+          ) : null}
+          {defaultDetailInjection ? (
+            <InjectionDetail
+              injection={defaultDetailInjection}
+              recoverySloSecs={status?.chaos.recovery_slo_secs ?? null}
+            />
+          ) : allInjections.length === 0 ? (
+            <div className="injection-empty">
+              No injection has run yet. Next fault is scheduled for{" "}
+              <time title={formatTime(status?.chaos.next_fault_after ?? null)}>
+                {formatTime(status?.chaos.next_fault_after ?? null)}
+              </time>
+              .
+            </div>
+          ) : null}
+          {workloadProbes.length > 0 || coverageScenarios.length > 0 ? (
+            <details className="activity-coverage">
+              <summary>
+                Coverage
+                <span className="activity-coverage-summary">
+                  {workloadProbes.length} probes · {coverageScenarios.length} scenarios
+                </span>
+              </summary>
+              {workloadProbes.length > 0 ? (
+                <div className="activity-coverage-group">
+                  <div className="activity-coverage-group-label">Probes</div>
+                  <div className="activity-coverage-row" role="list" aria-label="workload coverage">
+                    {workloadProbes.map(([name, probe]) => {
+                      const disabled = probe.enabled === false;
+                      const state = disabled
+                        ? "disabled"
+                        : probe.passing === false
+                          ? "failed"
+                          : probe.covered
+                            ? "covered"
+                            : "pending";
+                      const count = probeCount(probe);
+                      const errorCount = probe.errors ?? probe.probe_errors ?? 0;
+                      const title = disabled
+                        ? `${probeLabel(name)} is disabled in this run`
+                        : `${probeLabel(name)}: ${probe.covered ? "covered" : "not covered"}${
+                            errorCount ? ` · ${errorCount} errors` : ""
+                          }`;
+                      return (
+                        <span
+                          className={`activity-coverage-pill activity-coverage-pill-${state}`}
+                          key={name}
+                          role="listitem"
+                          title={title}
+                        >
+                          {probeLabel(name)}
+                          {count > 0 ? <em>{count.toLocaleString()}</em> : null}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
+              {coverageScenarios.length > 0 ? (
+                <div className="activity-coverage-group">
+                  <div className="activity-coverage-group-label">Scenarios</div>
+                  <div className="activity-coverage-row" role="list" aria-label="fault scenario coverage">
+                    {coverageScenarios.map(([scenario, entry]) => {
+                      const attempts = entry.attempts ?? 0;
+                      const failed = entry.failed ?? 0;
+                      const active = entry.active ?? 0;
+                      const recovered = entry.recovered ?? 0;
+                      const detected = entry.detected ?? 0;
+                      const state =
+                        failed > 0
+                          ? "failed"
+                          : active > 0
+                            ? "active"
+                            : attempts > 0
+                              ? "covered"
+                              : "pending";
+                      const tooltip =
+                        attempts === 0
+                          ? `${scenario.replace(/_/g, " ")}: not yet exercised`
+                          : `${scenario.replace(/_/g, " ")}: ${attempts} run${
+                              attempts === 1 ? "" : "s"
+                            } · ${recovered} recovered · ${detected} detected · ${failed} failed${
+                              active ? ` · ${active} active` : ""
+                            }`;
+                      return (
+                        <span
+                          className={`activity-coverage-pill activity-coverage-pill-${state}`}
+                          key={scenario}
+                          role="listitem"
+                          title={tooltip}
+                        >
+                          {scenario.replace(/_/g, " ")}
+                          {attempts > 0 ? <em>{attempts}</em> : null}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
+            </details>
           ) : null}
         </section>
 
@@ -1066,6 +1486,10 @@ function StatusPage() {
                 {numberValue(status?.integrity.setsum_mismatch_count)}
               </span>
               <span>
+                <em>unavailable</em>
+                {numberValue(status?.integrity.setsum_availability_error_count)}
+              </span>
+              <span>
                 <em>checked</em>
                 {formatRelative(status?.integrity.checked_at) ?? "-"}
               </span>
@@ -1074,155 +1498,50 @@ function StatusPage() {
           {status?.integrity.last_error ? (
             <div className="status-callout">{status.integrity.last_error}</div>
           ) : null}
+          {status?.integrity.last_setsum_availability_error ? (
+            <div className="status-callout status-callout-muted">
+              {status.integrity.last_setsum_availability_error}
+            </div>
+          ) : null}
           {verifyModes.length > 0 ? (
             <div className="integrity-modes-row" role="list" aria-label="read check modes">
               {verifyModes.map((mode) => {
                 const bad = mode.errors > 0;
+                const unavailable = mode.unavailable > 0;
+                const skipped = mode.skipped > 0;
+                const titleParts = [`${mode.ok.toLocaleString()} ok`];
+                if (bad) titleParts.push(`${mode.errors.toLocaleString()} errors`);
+                if (unavailable) titleParts.push(`${mode.unavailable.toLocaleString()} unavailable`);
+                if (skipped) titleParts.push(`${mode.skipped.toLocaleString()} skipped (stream setsum-dirty)`);
                 return (
                   <span
-                    className={`integrity-mode${bad ? " integrity-mode-bad" : ""}`}
+                    className={`integrity-mode${bad ? " integrity-mode-bad" : ""}${
+                      !bad && unavailable ? " integrity-mode-warn" : ""
+                    }`}
                     key={mode.name}
                     role="listitem"
-                    title={`${mode.name.replace(/_/g, " ")}: ${mode.ok.toLocaleString()} ok${bad ? `, ${mode.errors.toLocaleString()} errors` : ""}`}
+                    title={`${mode.name.replace(/_/g, " ")}: ${titleParts.join(", ")}`}
                   >
                     <span
                       aria-hidden="true"
-                      className={`integrity-mode-dot ${bad ? "integrity-mode-dot-bad" : "integrity-mode-dot-ok"}`}
+                      className={`integrity-mode-dot ${
+                        bad
+                          ? "integrity-mode-dot-bad"
+                          : unavailable
+                            ? "integrity-mode-dot-warn"
+                            : "integrity-mode-dot-ok"
+                      }`}
                     />
                     <span className="integrity-mode-name">{mode.name.replace(/_/g, " ")}</span>
                     <em>{mode.ok.toLocaleString()}</em>
                     {bad ? <strong>{mode.errors.toLocaleString()} err</strong> : null}
+                    {!bad && unavailable ? <strong>{mode.unavailable.toLocaleString()} unavailable</strong> : null}
+                    {!bad && skipped ? <em className="integrity-mode-aux">{mode.skipped.toLocaleString()} skipped</em> : null}
                   </span>
                 );
               })}
             </div>
           ) : null}
-        </section>
-
-        <section className="status-section">
-          <div className="status-section-heading">
-            <h2>Fault injection</h2>
-            <div className="status-section-stats">
-              <span className={status?.chaos.enabled ? undefined : "status-section-stat-dim"}>
-                <em>state</em>
-                {status?.chaos.enabled ? "enabled" : "disabled"}
-              </span>
-              <span>
-                <em>profile</em>
-                {status?.chaos.fault_profile ?? "custom"}
-              </span>
-              <span>
-                <em>runs</em>
-                {numberValue(status?.chaos.injection_count)}
-              </span>
-              <span title={formatTime(status?.chaos.next_fault_after ?? null)}>
-                <em>next</em>
-                {formatScheduleDelta(status?.chaos.next_fault_after) ?? "-"}
-              </span>
-              <span className="injection-phase-legend" aria-label="phase legend">
-                <span className="injection-phase injection-phase-stopping" aria-hidden="true" />
-                stopping
-                <span className="injection-phase injection-phase-down" aria-hidden="true" />
-                down
-                <span className="injection-phase injection-phase-recovering" aria-hidden="true" />
-                recovering
-              </span>
-            </div>
-          </div>
-          {coverageScenarios.length > 0 ? (
-            <div className="fault-coverage-row" role="list" aria-label="fault scenario coverage">
-              {coverageScenarios.map(([scenario, entry]) => {
-                const attempts = entry.attempts ?? 0;
-                const failed = entry.failed ?? 0;
-                const active = entry.active ?? 0;
-                const recovered = entry.recovered ?? 0;
-                const detected = entry.detected ?? 0;
-                const state =
-                  failed > 0
-                    ? "failed"
-                    : active > 0
-                      ? "active"
-                      : attempts > 0
-                        ? "covered"
-                        : "pending";
-                const tooltip =
-                  attempts === 0
-                    ? `${scenario.replace(/_/g, " ")}: not yet exercised`
-                    : `${scenario.replace(/_/g, " ")}: ${attempts} run${attempts === 1 ? "" : "s"} · ${recovered} recovered · ${detected} detected · ${failed} failed${active ? ` · ${active} active` : ""}`;
-                return (
-                  <span
-                    className={`fault-coverage-pill fault-coverage-pill-${state}`}
-                    key={scenario}
-                    role="listitem"
-                    title={tooltip}
-                  >
-                    <span
-                      aria-hidden="true"
-                      className={`fault-coverage-dot fault-coverage-dot-${state}`}
-                    />
-                    {scenario.replace(/_/g, " ")}
-                    {attempts > 0 ? <em>{attempts}</em> : null}
-                  </span>
-                );
-              })}
-            </div>
-          ) : null}
-          <div className="injection-list">
-            {injections.length > 0 ? (
-              injections.map((injection) => {
-                const pill = injectionPill(injection);
-                const durationMs = injectionDurationMs(injection);
-                const phases = injectionPhases(injection);
-                const targetLabel = injection.target_nodes?.length
-                  ? injection.target_nodes.join(", ")
-                  : injection.node_name ?? `node ${injection.node_id ?? "-"}`;
-                return (
-                  <article className="injection-item" key={injection.id}>
-                    <div className="injection-item-header">
-                      <div className="injection-item-title">
-                        <span className="injection-id">#{injection.id}</span>
-                        {injection.scenario ? <span>{injection.scenario.replace(/_/g, " ")}</span> : null}
-                        <span className="injection-target-name">{targetLabel}</span>
-                        {injection.expected_result === "revert_detection" ? <span>revert detection</span> : null}
-                        {durationMs != null ? (
-                          <span className="injection-duration">{formatDuration(durationMs)}</span>
-                        ) : null}
-                        {typeof injection.slo_met === "boolean" ? (
-                          <span className={injection.slo_met ? undefined : "status-section-stat-bad"}>
-                            SLO {injection.slo_met ? "met" : "missed"}
-                          </span>
-                        ) : null}
-                      </div>
-                      <StatusPill status={pill.status} label={pill.label} />
-                    </div>
-                    <PhaseBar phases={phases} />
-                    {(injection.timeline?.length ?? 0) > 0 ? (
-                      <details className="injection-timeline-details">
-                        <summary>Timeline</summary>
-                        <div className="injection-timeline">
-                          {(injection.timeline ?? []).map((event, index) => (
-                            <div className="injection-timeline-step" key={`${event.time ?? "event"}-${index}`}>
-                              <span>{event.status}</span>
-                              <time>{formatShortTime(event.time)}</time>
-                              <p>{event.message}</p>
-                            </div>
-                          ))}
-                        </div>
-                      </details>
-                    ) : null}
-                  </article>
-                );
-              })
-            ) : (
-              <div className="injection-empty">
-                No injection has run yet. Next fault is scheduled for{" "}
-                <time title={formatTime(status?.chaos.next_fault_after ?? null)}>
-                  {formatTime(status?.chaos.next_fault_after ?? null)}
-                </time>
-                .
-              </div>
-            )}
-          </div>
         </section>
 
         <section className="status-section">
