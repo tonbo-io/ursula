@@ -10,8 +10,9 @@ use ursula_raft::{
 };
 use ursula_runtime::{
     ColdStore, InMemoryGroupEngineFactory, PlanGroupColdFlushRequest, RuntimeConfig, RuntimeError,
-    ShardRuntime, WalGroupEngineFactory,
+    ShardRuntime, SharedSnapshotStore, WalGroupEngineFactory, snapshot_store_from_env,
 };
+use ursula_shard::RaftGroupId;
 
 pub fn spawn_default_runtime(
     core_count: usize,
@@ -70,6 +71,7 @@ pub fn spawn_static_grpc_raft_memory_runtime(
     initialize_membership: bool,
 ) -> Result<(ShardRuntime, RaftGroupHandleRegistry), RuntimeError> {
     let cold_store = cold_store_from_env()?;
+    let snapshot_store = snapshot_store_from_env_or_error()?;
     let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
     let registry = RaftGroupHandleRegistry::default();
     let factory = StaticGrpcRaftGroupEngineFactory::new(
@@ -78,10 +80,12 @@ pub fn spawn_static_grpc_raft_memory_runtime(
         initialize_membership,
         registry.clone(),
     )
-    .with_cold_store(cold_store.clone());
+    .with_cold_store(cold_store.clone())
+    .with_snapshot_store(snapshot_store);
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
     spawn_cold_flush_worker_if_configured(&runtime);
+    spawn_snapshot_driver_if_configured(&runtime, &registry);
     Ok((runtime, registry))
 }
 
@@ -93,6 +97,7 @@ pub fn spawn_static_grpc_raft_memory_runtime_with_per_group_initializers(
     initialize_membership: bool,
 ) -> Result<(ShardRuntime, RaftGroupHandleRegistry), RuntimeError> {
     let cold_store = cold_store_from_env()?;
+    let snapshot_store = snapshot_store_from_env_or_error()?;
     let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
     let registry = RaftGroupHandleRegistry::default();
     let factory = StaticGrpcRaftGroupEngineFactory::new(
@@ -102,10 +107,12 @@ pub fn spawn_static_grpc_raft_memory_runtime_with_per_group_initializers(
         registry.clone(),
     )
     .with_per_group_membership_initializers(true)
-    .with_cold_store(cold_store.clone());
+    .with_cold_store(cold_store.clone())
+    .with_snapshot_store(snapshot_store);
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
     spawn_cold_flush_worker_if_configured(&runtime);
+    spawn_snapshot_driver_if_configured(&runtime, &registry);
     Ok((runtime, registry))
 }
 
@@ -118,6 +125,7 @@ pub fn spawn_static_grpc_raft_runtime(
     raft_log_dir: impl Into<PathBuf>,
 ) -> Result<(ShardRuntime, RaftGroupHandleRegistry), RuntimeError> {
     let cold_store = cold_store_from_env()?;
+    let snapshot_store = snapshot_store_from_env_or_error()?;
     let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
     let registry = RaftGroupHandleRegistry::default();
     let factory = StaticGrpcRaftGroupEngineFactory::new(
@@ -127,10 +135,12 @@ pub fn spawn_static_grpc_raft_runtime(
         registry.clone(),
     )
     .with_cold_store(cold_store.clone())
-    .with_raft_log_dir(raft_log_dir);
+    .with_raft_log_dir(raft_log_dir)
+    .with_snapshot_store(snapshot_store);
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
     spawn_cold_flush_worker_if_configured(&runtime);
+    spawn_snapshot_driver_if_configured(&runtime, &registry);
     Ok((runtime, registry))
 }
 
@@ -143,6 +153,7 @@ pub fn spawn_static_grpc_raft_runtime_with_per_group_initializers(
     raft_log_dir: impl Into<PathBuf>,
 ) -> Result<(ShardRuntime, RaftGroupHandleRegistry), RuntimeError> {
     let cold_store = cold_store_from_env()?;
+    let snapshot_store = snapshot_store_from_env_or_error()?;
     let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
     let registry = RaftGroupHandleRegistry::default();
     let factory = StaticGrpcRaftGroupEngineFactory::new(
@@ -153,10 +164,12 @@ pub fn spawn_static_grpc_raft_runtime_with_per_group_initializers(
     )
     .with_per_group_membership_initializers(true)
     .with_cold_store(cold_store.clone())
-    .with_raft_log_dir(raft_log_dir);
+    .with_raft_log_dir(raft_log_dir)
+    .with_snapshot_store(snapshot_store);
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
     spawn_cold_flush_worker_if_configured(&runtime);
+    spawn_snapshot_driver_if_configured(&runtime, &registry);
     Ok((runtime, registry))
 }
 
@@ -174,6 +187,12 @@ pub fn spawn_raft_runtime(
     )?;
     spawn_cold_flush_worker_if_configured(&runtime);
     Ok(runtime)
+}
+
+fn snapshot_store_from_env_or_error() -> Result<Option<SharedSnapshotStore>, RuntimeError> {
+    snapshot_store_from_env().map_err(|err| RuntimeError::ColdStoreConfig {
+        message: err.to_string(),
+    })
 }
 
 fn cold_store_from_env() -> Result<Option<ursula_runtime::ColdStoreHandle>, RuntimeError> {
@@ -202,7 +221,22 @@ fn runtime_config_from_env(
             ));
         }
     }
+    if let Some(raft_max_uncommitted) =
+        env_optional_usize("URSULA_RAFT_MAX_UNCOMMITTED_BYTES_PER_GROUP")
+    {
+        config = config.with_raft_max_uncommitted_bytes_per_group(if raft_max_uncommitted == 0 {
+            None
+        } else {
+            Some(u64::try_from(raft_max_uncommitted).unwrap_or(u64::MAX))
+        });
+    }
     config
+}
+
+fn env_optional_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
 }
 
 pub fn spawn_cold_flush_worker_if_configured(runtime: &ShardRuntime) {
@@ -231,6 +265,63 @@ pub fn spawn_cold_flush_worker_if_configured(runtime: &ShardRuntime) {
                 .await
             {
                 eprintln!("cold flush worker error: {err}");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+/// Drives raft snapshots manually after first draining each group's hot tail to
+/// cold. The drain makes the resulting snapshot's `payload` field empty (no
+/// uncommitted hot bytes), shrinking the manifest install_snapshot has to ship.
+///
+/// When `URSULA_SNAPSHOT_DRIVE_INTERVAL_MS` is unset or zero this is a no-op
+/// and openraft's automatic [`SnapshotPolicy::LogsSinceLast`] still drives
+/// snapshot timing.
+pub fn spawn_snapshot_driver_if_configured(
+    runtime: &ShardRuntime,
+    registry: &RaftGroupHandleRegistry,
+) {
+    let interval_ms = env_usize("URSULA_SNAPSHOT_DRIVE_INTERVAL_MS", 0);
+    if interval_ms == 0 {
+        return;
+    }
+    let max_concurrency = env_usize("URSULA_SNAPSHOT_DRIVE_FLUSH_CONCURRENCY", 4).max(1);
+    let runtime = runtime.clone();
+    let registry = registry.clone();
+    tokio::spawn(async move {
+        let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX));
+        loop {
+            // Drain every group's hot tail to cold via the existing raft-
+            // replicated flush path. `min_hot_bytes=1` makes "any hot bytes"
+            // eligible; `max_flush_bytes` is left wide so a single tick can
+            // catch up if the background worker is lagging.
+            if runtime.has_cold_store()
+                && let Err(err) = runtime
+                    .flush_cold_all_groups_once_bounded(
+                        PlanGroupColdFlushRequest {
+                            min_hot_bytes: 1,
+                            max_flush_bytes: 64 * 1024 * 1024,
+                        },
+                        max_concurrency,
+                    )
+                    .await
+            {
+                eprintln!("snapshot driver pre-flush error: {err}");
+            }
+            // Trigger snapshot per registered group; openraft will dedup if a
+            // snapshot is already in flight and the call is otherwise cheap.
+            for snapshot in registry.metrics_snapshot() {
+                let group_id = RaftGroupId(snapshot.raft_group_id);
+                let Some(raft) = registry.get(group_id) else {
+                    continue;
+                };
+                if let Err(err) = raft.trigger().snapshot().await {
+                    eprintln!(
+                        "snapshot driver trigger group {} error: {err}",
+                        snapshot.raft_group_id,
+                    );
+                }
             }
             tokio::time::sleep(interval).await;
         }

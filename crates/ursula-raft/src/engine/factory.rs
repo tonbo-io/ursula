@@ -7,7 +7,7 @@ use openraft::BasicNode;
 use openraft::Config;
 use ursula_runtime::{
     ColdStoreHandle, GroupEngine, GroupEngineCreateFuture, GroupEngineError, GroupEngineFactory,
-    GroupEngineMetrics,
+    GroupEngineMetrics, SharedSnapshotStore,
 };
 use ursula_shard::{CoreId, RaftGroupId, ShardPlacement};
 
@@ -240,6 +240,7 @@ pub struct StaticGrpcRaftGroupEngineFactory {
     registry: RaftGroupHandleRegistry,
     cold_store: Option<ColdStoreHandle>,
     log_stores: Option<DurableRaftLogStoreFactory>,
+    snapshot_store: Option<SharedSnapshotStore>,
 }
 
 impl StaticGrpcRaftGroupEngineFactory {
@@ -257,6 +258,7 @@ impl StaticGrpcRaftGroupEngineFactory {
             registry,
             cold_store: None,
             log_stores: None,
+            snapshot_store: None,
         }
     }
 
@@ -271,6 +273,11 @@ impl StaticGrpcRaftGroupEngineFactory {
 
     pub fn with_raft_log_dir(mut self, root: impl Into<PathBuf>) -> Self {
         self.log_stores = Some(DurableRaftLogStoreFactory::new(root));
+        self
+    }
+
+    pub fn with_snapshot_store(mut self, snapshot_store: Option<SharedSnapshotStore>) -> Self {
+        self.snapshot_store = snapshot_store;
         self
     }
 
@@ -337,7 +344,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 .map_err(|err| GroupEngineError::new(format!("invalid OpenRaft config: {err}")))?,
             );
             let engine = if let Some(log_stores) = &self.log_stores {
-                RaftGroupEngine::new_node_with_log_store_and_network(
+                RaftGroupEngine::new_node_full(
                     placement,
                     self.node_id,
                     config,
@@ -345,10 +352,11 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     log_stores.open(placement, metrics.clone())?,
                     Some(metrics),
                     self.cold_store.clone(),
+                    self.snapshot_store.clone(),
                 )
                 .await?
             } else {
-                RaftGroupEngine::new_node_with_log_store_and_network(
+                RaftGroupEngine::new_node_full(
                     placement,
                     self.node_id,
                     config,
@@ -356,6 +364,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     RaftGroupLogStore::shared(),
                     Some(metrics),
                     self.cold_store.clone(),
+                    self.snapshot_store.clone(),
                 )
                 .await?
             };

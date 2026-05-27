@@ -31,7 +31,8 @@ use ursula_runtime::{
     GroupReadStreamParts, GroupReadStreamPartsFuture, GroupSnapshot, GroupSnapshotFuture,
     GroupTouchStreamAccessFuture, GroupWriteBatchFuture, GroupWriteCommand, GroupWriteResponse,
     HeadStreamRequest, PlanColdFlushRequest, PlanGroupColdFlushRequest, PublishSnapshotRequest,
-    ReadSnapshotRequest, ReadStreamRequest, StreamErrorCode, TouchStreamAccessResponse,
+    ReadSnapshotRequest, ReadStreamRequest, SharedSnapshotStore, StreamErrorCode,
+    TouchStreamAccessResponse, default_snapshot_store,
 };
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
@@ -163,7 +164,7 @@ impl RaftGroupEngine {
     where
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
-        let engine = Self::new_node_with_log_store_and_network(
+        let engine = Self::new_node_full(
             placement,
             node_id,
             config,
@@ -171,6 +172,7 @@ impl RaftGroupEngine {
             log_store,
             metrics,
             cold_store,
+            None,
         )
         .await?;
 
@@ -207,15 +209,45 @@ impl RaftGroupEngine {
         NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
+        Self::new_node_full(
+            placement,
+            node_id,
+            config,
+            network_factory,
+            log_store,
+            metrics,
+            cold_store,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_node_full<NF, LS>(
+        placement: ShardPlacement,
+        node_id: u64,
+        config: Arc<Config>,
+        network_factory: NF,
+        log_store: LS,
+        metrics: Option<GroupEngineMetrics>,
+        cold_store: Option<ColdStoreHandle>,
+        snapshot_store: Option<SharedSnapshotStore>,
+    ) -> Result<Self, GroupEngineError>
+    where
+        NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
+        LS: RaftLogStorage<UrsulaRaftTypeConfig>,
+    {
+        let snapshot_store = snapshot_store.unwrap_or_else(default_snapshot_store);
         let raft = Raft::<UrsulaRaftTypeConfig, RaftGroupStateMachine>::new(
             node_id,
             config,
             network_factory,
             log_store,
-            RaftGroupStateMachine::new_with_metrics_and_cold_store(
+            RaftGroupStateMachine::new_with_stores(
                 placement,
                 metrics.clone(),
                 cold_store.clone(),
+                snapshot_store,
             ),
         )
         .await

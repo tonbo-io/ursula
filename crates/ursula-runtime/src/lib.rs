@@ -16,6 +16,7 @@
 //! - [`group_actor`]: per-group mailbox actor running inside a core worker.
 //! - [`metrics`]: runtime metrics shared across cores; lock-free counters.
 
+mod admission;
 mod cold_store;
 mod command;
 mod core_worker;
@@ -26,7 +27,9 @@ mod metrics;
 mod request;
 mod rt;
 mod runtime;
+mod snapshot_store;
 
+pub use admission::RaftUncommittedAdmission;
 pub use cold_store::{
     ColdReadCacheConfig, ColdStore, ColdStoreEvent, ColdStoreFault, ColdStoreFaultContext,
     ColdStoreFaultEffect, ColdStoreHandle, ColdStoreInfo, ColdStoreOperation, new_cold_chunk_path,
@@ -61,6 +64,13 @@ pub use request::{
     ReadStreamResponse, StreamAppendCount, TouchStreamAccessResponse,
 };
 pub use runtime::{RuntimeConfig, RuntimeThreading, ShardRuntime};
+pub use snapshot_store::{
+    InlineSnapshotStore, SharedSnapshotStore, SnapshotKey, SnapshotLocation, SnapshotPointer,
+    SnapshotStore, SnapshotStoreError, SnapshotStoreFuture, default_snapshot_store,
+    snapshot_store_from_env,
+};
+#[cfg(not(madsim))]
+pub use snapshot_store::{LocalSnapshotStore, S3SnapshotStore};
 
 pub use ursula_stream::{
     ColdChunkRef, ColdFlushCandidate, ExternalPayloadRef, ProducerRequest, StreamErrorCode,

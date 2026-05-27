@@ -23,7 +23,7 @@ use ursula_runtime::{
     DeleteSnapshotRequest, GroupEngine, GroupEngineError, GroupEngineMetrics, GroupSnapshot,
     HeadStreamRequest, HeadStreamResponse, InMemoryGroupEngine, PlanColdFlushRequest,
     PlanGroupColdFlushRequest, ReadSnapshotRequest, ReadSnapshotResponse, ReadStreamRequest,
-    ReadStreamResponse,
+    ReadStreamResponse, SharedSnapshotStore, SnapshotKey, SnapshotPointer, default_snapshot_store,
 };
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
@@ -36,7 +36,10 @@ use crate::types::*;
 #[derive(Debug, Clone)]
 pub(crate) struct CurrentSnapshot {
     pub(crate) meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
-    data: Vec<u8>,
+    /// Bytes that ride through openraft's `SnapshotData`. With the default
+    /// [`ursula_runtime::InlineSnapshotStore`] this is the full snapshot; with
+    /// out-of-line backends (Local/S3) this is a tiny [`SnapshotPointer`].
+    pointer_bytes: Vec<u8>,
 }
 
 pub struct RaftGroupStateMachine {
@@ -46,6 +49,7 @@ pub struct RaftGroupStateMachine {
     pub(crate) last_applied_log_id: Option<LogIdOf<UrsulaRaftTypeConfig>>,
     pub(crate) last_membership: StoredMembershipOf<UrsulaRaftTypeConfig>,
     pub(crate) current_snapshot: Arc<Mutex<Option<CurrentSnapshot>>>,
+    pub(crate) snapshot_store: SharedSnapshotStore,
 }
 
 impl RaftGroupStateMachine {
@@ -65,6 +69,15 @@ impl RaftGroupStateMachine {
         metrics: Option<GroupEngineMetrics>,
         cold_store: Option<ColdStoreHandle>,
     ) -> Self {
+        Self::new_with_stores(placement, metrics, cold_store, default_snapshot_store())
+    }
+
+    pub(crate) fn new_with_stores(
+        placement: ShardPlacement,
+        metrics: Option<GroupEngineMetrics>,
+        cold_store: Option<ColdStoreHandle>,
+        snapshot_store: SharedSnapshotStore,
+    ) -> Self {
         Self {
             placement,
             engine: match cold_store {
@@ -75,6 +88,7 @@ impl RaftGroupStateMachine {
             last_applied_log_id: None,
             last_membership: StoredMembershipOf::<UrsulaRaftTypeConfig>::default(),
             current_snapshot: Arc::new(Mutex::new(None)),
+            snapshot_store,
         }
     }
 
@@ -318,9 +332,11 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             .await
             .expect("in-memory group snapshot should not fail");
         RaftGroupSnapshotBuilder {
+            placement: self.placement,
             snapshot,
             meta: self.snapshot_meta(),
             current_snapshot: self.current_snapshot.clone(),
+            snapshot_store: self.snapshot_store.clone(),
         }
     }
 
@@ -335,8 +351,16 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         meta: &SnapshotMetaOf<UrsulaRaftTypeConfig>,
         snapshot: SnapshotDataOf<UrsulaRaftTypeConfig>,
     ) -> Result<(), io::Error> {
+        let pointer_bytes = snapshot.into_inner();
+        let pointer = SnapshotPointer::decode(&pointer_bytes)
+            .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
+        let snapshot_bytes = self
+            .snapshot_store
+            .download(&pointer.location)
+            .await
+            .map_err(|err| err.into_io())?;
         let group_snapshot: GroupSnapshot =
-            serde_json::from_slice(snapshot.get_ref()).map_err(invalid_data)?;
+            serde_json::from_slice(&snapshot_bytes).map_err(invalid_data)?;
         self.engine
             .install_snapshot(group_snapshot)
             .await
@@ -345,7 +369,7 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         self.last_membership = meta.last_membership.clone();
         *self.current_snapshot.lock().expect("snapshot mutex") = Some(CurrentSnapshot {
             meta: meta.clone(),
-            data: snapshot.into_inner(),
+            pointer_bytes,
         });
         Ok(())
     }
@@ -360,27 +384,95 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             .as_ref()
             .map(|snapshot| SnapshotOf::<UrsulaRaftTypeConfig> {
                 meta: snapshot.meta.clone(),
-                snapshot: Cursor::new(snapshot.data.clone()),
+                snapshot: Cursor::new(snapshot.pointer_bytes.clone()),
             }))
     }
 }
 
 pub struct RaftGroupSnapshotBuilder {
+    placement: ShardPlacement,
     snapshot: GroupSnapshot,
     pub(crate) meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
     current_snapshot: Arc<Mutex<Option<CurrentSnapshot>>>,
+    snapshot_store: SharedSnapshotStore,
 }
 
 impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<UrsulaRaftTypeConfig>, io::Error> {
-        let data = serde_json::to_vec(&self.snapshot).map_err(invalid_data)?;
-        *self.current_snapshot.lock().expect("snapshot mutex") = Some(CurrentSnapshot {
-            meta: self.meta.clone(),
-            data: data.clone(),
-        });
+        let body = serde_json::to_vec(&self.snapshot).map_err(invalid_data)?;
+        let key = SnapshotKey {
+            raft_group_id: self.placement.raft_group_id.0,
+            snapshot_id: self.meta.snapshot_id.clone(),
+        };
+        let location = self
+            .snapshot_store
+            .upload(key, body)
+            .await
+            .map_err(|err| err.into_io())?;
+        let pointer = SnapshotPointer {
+            snapshot_id: self.meta.snapshot_id.clone(),
+            location,
+        };
+        let pointer_bytes = pointer.encode().map_err(|err| err.into_io())?;
+        let previous = {
+            let mut guard = self.current_snapshot.lock().expect("snapshot mutex");
+            guard.replace(CurrentSnapshot {
+                meta: self.meta.clone(),
+                pointer_bytes: pointer_bytes.clone(),
+            })
+        };
+        schedule_previous_snapshot_gc(self.snapshot_store.clone(), previous);
         Ok(SnapshotOf::<UrsulaRaftTypeConfig> {
             meta: self.meta.clone(),
-            snapshot: Cursor::new(data),
+            snapshot: Cursor::new(pointer_bytes),
         })
     }
+}
+
+/// Number of seconds to wait before deleting the previous snapshot's bytes
+/// after a new one has been published. Lets in-flight `install_snapshot`
+/// downloads complete before the underlying object disappears.
+#[cfg(not(madsim))]
+fn snapshot_gc_grace_secs() -> u64 {
+    std::env::var("URSULA_SNAPSHOT_GC_GRACE_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(300)
+}
+
+#[cfg(not(madsim))]
+fn schedule_previous_snapshot_gc(
+    store: ursula_runtime::SharedSnapshotStore,
+    previous: Option<CurrentSnapshot>,
+) {
+    let Some(previous) = previous else { return };
+    let Ok(prev_pointer) = SnapshotPointer::decode(&previous.pointer_bytes) else {
+        return;
+    };
+    // Inline locations are kept in-pointer; nothing to GC out-of-line.
+    if matches!(
+        prev_pointer.location,
+        ursula_runtime::SnapshotLocation::Inline { .. }
+    ) {
+        return;
+    }
+    let grace = std::time::Duration::from_secs(snapshot_gc_grace_secs());
+    tokio::spawn(async move {
+        tokio::time::sleep(grace).await;
+        if let Err(err) = store.delete(&prev_pointer.location).await {
+            eprintln!(
+                "ursula raft snapshot gc: delete of previous {} failed: {err}",
+                prev_pointer.snapshot_id,
+            );
+        }
+    });
+}
+
+#[cfg(madsim)]
+fn schedule_previous_snapshot_gc(
+    _store: ursula_runtime::SharedSnapshotStore,
+    _previous: Option<CurrentSnapshot>,
+) {
+    // madsim has no fs/network store path that needs deferred GC; the inline
+    // backend keeps everything in-pointer so this is always a no-op there.
 }

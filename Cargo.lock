@@ -3559,6 +3559,7 @@ dependencies = [
  "opendal",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "ursula-shard",
  "ursula-stream",
