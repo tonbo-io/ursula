@@ -31,6 +31,21 @@ BUCKET = "chaos"
 CONTENT_TYPE = "application/octet-stream"
 READ_AVAILABILITY_STATUSES = {204, 404, 410, 502, 503}
 REVERT_DETECTION_SCENARIOS = {"no_allow_stop"}
+# Scenarios applied as faultd impairments (tc qdisc / iptables) rather than by
+# stopping the instance. Their recovery MUST clear the impairment via faultd
+# (/clear): using "start_instances" is a no-op on a running node that leaves the
+# qdisc / iptables rule in place, permanently impairing the node long after the
+# fault has "recovered" (the cluster only looks healthy because leadership moved
+# away). Keep this in sync with apply_fault_scenario's faultd branches.
+IMPAIRMENT_SCENARIOS = {
+    "netem_delay",
+    "netem_loss",
+    "asymmetric_partition",
+    "cluster_netem_delay",
+    "cluster_netem_loss",
+    "cluster_partition",
+    "s3_unavailable",
+}
 # The public --raft-memory chaos run should keep a surviving quorum. Dropping
 # two nodes in a three-node cluster tests data-loss behavior rather than
 # recovery, especially when the leader is among the stopped nodes.
@@ -363,6 +378,12 @@ class ChaosAgent:
         self.global_unresolved_append = False
         self.last_epoch_bump_success: int | None = None
         self.append_errors = 0
+        # Appends rejected on every node solely with `503 ColdBackpressure`
+        # are a clean pre-commit load-shed (the server is protecting the hot
+        # byte budget), not a workload failure. Tracked separately so they do
+        # not inflate `append_errors`, mirroring `read_availability_errors`.
+        self.append_shed = 0
+        self.last_append_shed_error: str | None = None
         self.state_lock = threading.Lock()
         self.reader_success = 0
         self.reader_errors = 0
@@ -558,6 +579,8 @@ class ChaosAgent:
             )
         first_node = attempt_id % len(self.nodes)
         last_error = "no target nodes"
+        saw_cold_backpressure = False
+        saw_hard_error = False
         for attempt in range(len(self.nodes)):
             node = self.nodes[(first_node + attempt) % len(self.nodes)]
             try:
@@ -575,10 +598,15 @@ class ChaosAgent:
                 )
             except Exception as exc:  # noqa: BLE001
                 last_error = f"{node.name}: {exc}"
+                saw_hard_error = True
                 continue
             if status not in {200, 204}:
                 body_preview = body[:160].decode("utf-8", errors="replace").strip()
                 last_error = f"{node.name}: status={status} body={body_preview!r}"
+                if status == 503 and "ColdBackpressure" in body_preview:
+                    saw_cold_backpressure = True
+                else:
+                    saw_hard_error = True
                 continue
             next_offset_header = headers.get("stream-next-offset")
             if next_offset_header is None:
@@ -633,13 +661,29 @@ class ChaosAgent:
                     self.lane_unresolved_appends[lane] = False
                 self.append_success += 1
             return True
+        # Pure ColdBackpressure across all nodes (no timeout / non-503 error)
+        # is a clean pre-commit rejection: the record definitively did not
+        # commit, so the append is resolved (not unknown) and is recorded as a
+        # shed rather than a workload error.
+        is_pure_shed = saw_cold_backpressure and not saw_hard_error
         with self.state_lock:
-            self.append_errors += 1
-            if lane_id is None:
-                self.global_unresolved_append = True
+            if is_pure_shed:
+                self.append_shed += 1
+                self.last_append_shed_error = last_error
+                if lane_id is None:
+                    self.global_unresolved_append = False
+                else:
+                    self.lane_unresolved_appends[lane_id % self.append_workers] = False
             else:
-                self.lane_unresolved_appends[lane_id % self.append_workers] = True
-        self.event("warn", f"append failed on all nodes: {last_error}")
+                self.append_errors += 1
+                if lane_id is None:
+                    self.global_unresolved_append = True
+                else:
+                    self.lane_unresolved_appends[lane_id % self.append_workers] = True
+        if is_pure_shed:
+            self.event("warn", f"append shed (ColdBackpressure) on all nodes: {last_error}")
+        else:
+            self.event("warn", f"append failed on all nodes: {last_error}")
         return False
 
     def build_payload(
@@ -1318,7 +1362,7 @@ class ChaosAgent:
         )
         injection_id = (self.injections[-1]["id"] + 1) if self.injections else 1
         self.active_injection_id = injection_id
-        cleanup = "clear_impairment" if scenario.startswith("netem") or scenario == "asymmetric_partition" else "start_instances"
+        cleanup = "clear_impairment" if scenario in IMPAIRMENT_SCENARIOS else "start_instances"
         self.injections.append(
             {
                 "id": injection_id,
@@ -1861,7 +1905,16 @@ class ChaosAgent:
         else:
             workload_clean = False
         read_availability_clean = read_availability_error_delta in (None, 0)
-        cold_backpressure_clean = cold_backpressure_event_delta in (None, 0)
+        # Cold write backpressure is the server shedding writes to protect the
+        # per-group hot byte budget. While a fault is active (e.g. netem loss
+        # stalling the cold flush) this shedding is the system behaving as
+        # designed, not a health regression, so it must not block
+        # `fully_healthy` / the recovery SLO timer (which runs from injection
+        # time). In steady state, with no active fault, it still signals a real
+        # problem.
+        cold_backpressure_clean = (
+            cold_backpressure_event_delta in (None, 0) or self.active_fault is not None
+        )
         integrity_status = "operational" if self.last_integrity_error is None else "major_outage"
 
         reasons = []
@@ -2036,6 +2089,7 @@ class ChaosAgent:
                 "status_interval_secs": status_interval_secs,
                 "append_success_total": self.append_success,
                 "append_error_total": self.append_errors,
+                "append_shed_total": self.append_shed,
                 "reader_success_total": self.reader_success,
                 "reader_error_total": self.reader_errors,
                 "producer_count": len(self.producers),
