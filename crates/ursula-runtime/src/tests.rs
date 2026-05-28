@@ -23,6 +23,7 @@ fn runtime(core_count: usize, group_count: usize) -> ShardRuntime {
         mailbox_capacity: 128,
         threading: RuntimeThreading::HostedTokio,
         cold_max_hot_bytes_per_group: None,
+        raft_max_uncommitted_bytes_per_group: None,
         live_read_max_waiters_per_core: Some(65_536),
     })
     .expect("spawn runtime")
@@ -1088,6 +1089,7 @@ async fn mailbox_snapshot_reports_per_core_depths_and_capacities() {
         mailbox_capacity: 7,
         threading: RuntimeThreading::HostedTokio,
         cold_max_hot_bytes_per_group: None,
+        raft_max_uncommitted_bytes_per_group: None,
         live_read_max_waiters_per_core: Some(65_536),
     })
     .expect("spawn runtime");
@@ -1714,6 +1716,59 @@ async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raft_uncommitted_admission_disabled_by_default_lets_writes_through() {
+    // Disabled admission must not interfere with the existing accept path
+    // (acceptance criterion 6: existing cold behaviour unchanged when the
+    // raft admission is disabled).
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        RuntimeConfig::new(2, 4).with_raft_max_uncommitted_bytes_per_group(None),
+        InMemoryGroupEngineFactory::default(),
+    )
+    .expect("spawn runtime");
+    let stream = BucketStreamId::new("benchcmp", "raft-uncommitted-disabled");
+    create_stream(&runtime, &stream).await;
+    for _ in 0..4 {
+        runtime
+            .append(AppendRequest::from_bytes(
+                stream.clone(),
+                b"payload".to_vec(),
+            ))
+            .await
+            .expect("append succeeds with admission disabled");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raft_uncommitted_admission_rejects_when_incoming_would_exceed_limit() {
+    // With a 4-byte cap and a 5-byte append on an empty stream, the
+    // CoreWorker-level admission rejects the request before reaching the
+    // actor since `current (0) + incoming (5) > limit (4)`.
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        RuntimeConfig::new(2, 4).with_raft_max_uncommitted_bytes_per_group(Some(4)),
+        InMemoryGroupEngineFactory::default(),
+    )
+    .expect("spawn runtime");
+    let stream = BucketStreamId::new("benchcmp", "raft-uncommitted-trip");
+    create_stream(&runtime, &stream).await;
+
+    let err = runtime
+        .append(AppendRequest::from_bytes(stream.clone(), vec![b'x'; 5]))
+        .await
+        .expect_err("oversized append should trip raft uncommitted admission");
+    match err {
+        RuntimeError::GroupEngine { message, .. }
+            if message.contains("RaftUncommittedBackpressure") => {}
+        other => panic!("expected raft uncommitted backpressure, got {other:?}"),
+    }
+
+    // A within-budget append still succeeds.
+    runtime
+        .append(AppendRequest::from_bytes(stream.clone(), b"abcd".to_vec()))
+        .await
+        .expect("append at the limit succeeds");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_write_admission_rejects_append_batch_without_partial_mutation() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
@@ -2137,6 +2192,7 @@ async fn notify_read_watchers_shares_identical_reads_across_watchers() {
             mailbox_capacity: 8,
             threading: RuntimeThreading::HostedTokio,
             cold_max_hot_bytes_per_group: None,
+            raft_max_uncommitted_bytes_per_group: None,
             live_read_max_waiters_per_core: Some(65_536),
         },
         factory.clone(),
@@ -2415,6 +2471,7 @@ async fn custom_group_engine_is_created_once_per_touched_group_on_owner_core() {
             mailbox_capacity: 128,
             threading: RuntimeThreading::HostedTokio,
             cold_max_hot_bytes_per_group: None,
+            raft_max_uncommitted_bytes_per_group: None,
             live_read_max_waiters_per_core: Some(65_536),
         },
         factory.clone(),
@@ -2460,6 +2517,7 @@ async fn background_cold_flush_skips_groups_that_cannot_accept_local_writes() {
             mailbox_capacity: 128,
             threading: RuntimeThreading::HostedTokio,
             cold_max_hot_bytes_per_group: None,
+            raft_max_uncommitted_bytes_per_group: None,
             live_read_max_waiters_per_core: Some(65_536),
         },
         factory.clone(),
@@ -2495,6 +2553,7 @@ async fn warm_group_instantiates_engine_on_owner_core_without_stream_mutation() 
             mailbox_capacity: 128,
             threading: RuntimeThreading::HostedTokio,
             cold_max_hot_bytes_per_group: None,
+            raft_max_uncommitted_bytes_per_group: None,
             live_read_max_waiters_per_core: Some(65_536),
         },
         factory.clone(),
@@ -2545,6 +2604,7 @@ async fn core_worker_dispatches_other_groups_while_one_group_waits() {
             mailbox_capacity: 128,
             threading: RuntimeThreading::HostedTokio,
             cold_max_hot_bytes_per_group: None,
+            raft_max_uncommitted_bytes_per_group: None,
             live_read_max_waiters_per_core: Some(65_536),
         },
         factory.clone(),
@@ -2584,6 +2644,7 @@ async fn runtime_read_uses_group_read_parts_fast_path() {
             mailbox_capacity: 128,
             threading: RuntimeThreading::HostedTokio,
             cold_max_hot_bytes_per_group: None,
+            raft_max_uncommitted_bytes_per_group: None,
             live_read_max_waiters_per_core: Some(65_536),
         },
         factory.clone(),
@@ -2704,6 +2765,7 @@ async fn group_engine_errors_include_group_context_and_do_not_record_success_met
             mailbox_capacity: 128,
             threading: RuntimeThreading::HostedTokio,
             cold_max_hot_bytes_per_group: None,
+            raft_max_uncommitted_bytes_per_group: None,
             live_read_max_waiters_per_core: Some(65_536),
         },
         FailingFactory,
@@ -2740,6 +2802,7 @@ async fn mailbox_full_events_record_owner_core_backpressure() {
             mailbox_capacity: 1,
             threading: RuntimeThreading::HostedTokio,
             cold_max_hot_bytes_per_group: None,
+            raft_max_uncommitted_bytes_per_group: None,
             live_read_max_waiters_per_core: Some(65_536),
         },
         factory.clone(),
@@ -2800,6 +2863,7 @@ async fn group_mailbox_full_events_record_inner_actor_backpressure() {
             mailbox_capacity: 1,
             threading: RuntimeThreading::HostedTokio,
             cold_max_hot_bytes_per_group: None,
+            raft_max_uncommitted_bytes_per_group: None,
             live_read_max_waiters_per_core: Some(65_536),
         },
         factory.clone(),
@@ -2876,6 +2940,7 @@ async fn wal_group_engine_recovers_multiple_groups_from_per_group_logs() {
         mailbox_capacity: 128,
         threading: RuntimeThreading::HostedTokio,
         cold_max_hot_bytes_per_group: None,
+        raft_max_uncommitted_bytes_per_group: None,
         live_read_max_waiters_per_core: Some(65_536),
     };
 
@@ -2987,6 +3052,7 @@ async fn wal_group_engine_batches_append_records_and_recovers() {
         mailbox_capacity: 128,
         threading: RuntimeThreading::HostedTokio,
         cold_max_hot_bytes_per_group: None,
+        raft_max_uncommitted_bytes_per_group: None,
         live_read_max_waiters_per_core: Some(65_536),
     };
     let stream = BucketStreamId::new("benchcmp", "wal-batch");
@@ -3084,6 +3150,7 @@ async fn wal_group_engine_persists_installed_snapshot() {
         mailbox_capacity: 128,
         threading: RuntimeThreading::HostedTokio,
         cold_max_hot_bytes_per_group: None,
+        raft_max_uncommitted_bytes_per_group: None,
         live_read_max_waiters_per_core: Some(65_536),
     };
     let stream = BucketStreamId::new("benchcmp", "wal-installed-snapshot");
@@ -3156,6 +3223,7 @@ async fn wal_group_engine_recovers_producer_dedup_state() {
         mailbox_capacity: 128,
         threading: RuntimeThreading::HostedTokio,
         cold_max_hot_bytes_per_group: None,
+        raft_max_uncommitted_bytes_per_group: None,
         live_read_max_waiters_per_core: Some(65_536),
     };
     let stream = BucketStreamId::new("benchcmp", "wal-producer");
@@ -3225,6 +3293,7 @@ async fn wal_group_engine_recovers_producer_append_batch_dedup_state() {
         mailbox_capacity: 128,
         threading: RuntimeThreading::HostedTokio,
         cold_max_hot_bytes_per_group: None,
+        raft_max_uncommitted_bytes_per_group: None,
         live_read_max_waiters_per_core: Some(65_536),
     };
     let stream = BucketStreamId::new("benchcmp", "wal-producer-batch");

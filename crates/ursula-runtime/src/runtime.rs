@@ -7,6 +7,7 @@ use bytes::Bytes;
 use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardId, ShardPlacement, StaticShardMap};
 use ursula_stream::{ColdChunkRef, ColdFlushCandidate, StreamErrorCode};
 
+use crate::admission::{RaftUncommittedAdmission, RaftUncommittedBytesTracker};
 use crate::cold_store::{ColdStoreHandle, ColdStoreInfo, new_cold_chunk_path};
 use crate::command::GroupSnapshot;
 use crate::core_worker::{CoreCommand, CoreMailbox, CoreWorker, WaitReadCancel};
@@ -39,6 +40,10 @@ pub struct RuntimeConfig {
     pub mailbox_capacity: usize,
     pub threading: RuntimeThreading,
     pub cold_max_hot_bytes_per_group: Option<u64>,
+    /// Per-group cap on raft-submitted-but-not-yet-applied payload bytes.
+    /// `None` disables the admission (default). Catches "raft replication slow"
+    /// before in-memory queues grow unbounded.
+    pub raft_max_uncommitted_bytes_per_group: Option<u64>,
     pub live_read_max_waiters_per_core: Option<u64>,
 }
 
@@ -54,12 +59,18 @@ impl RuntimeConfig {
             mailbox_capacity: 1024,
             threading,
             cold_max_hot_bytes_per_group: None,
+            raft_max_uncommitted_bytes_per_group: None,
             live_read_max_waiters_per_core: Some(65_536),
         }
     }
 
     pub fn with_cold_max_hot_bytes_per_group(mut self, value: Option<u64>) -> Self {
         self.cold_max_hot_bytes_per_group = value;
+        self
+    }
+
+    pub fn with_raft_max_uncommitted_bytes_per_group(mut self, value: Option<u64>) -> Self {
+        self.raft_max_uncommitted_bytes_per_group = value;
         self
     }
 
@@ -110,6 +121,12 @@ impl ShardRuntime {
         let cold_write_admission = ColdWriteAdmission {
             max_hot_bytes_per_group: config.cold_max_hot_bytes_per_group,
         };
+        let raft_uncommitted_admission = RaftUncommittedAdmission {
+            max_uncommitted_bytes_per_group: config.raft_max_uncommitted_bytes_per_group,
+        };
+        let raft_uncommitted_bytes = Arc::new(RaftUncommittedBytesTracker::new(
+            usize::try_from(shard_map.raft_group_count()).expect("u32 fits usize"),
+        ));
         let engine_factory: Arc<dyn GroupEngineFactory> = Arc::new(engine_factory);
         let read_materialization = Arc::new(Semaphore::new(config.mailbox_capacity.max(1)));
         let mut mailboxes = Vec::with_capacity(usize::from(shard_map.core_count()));
@@ -124,6 +141,8 @@ impl ShardRuntime {
                 metrics: metrics.clone(),
                 group_mailbox_capacity: config.mailbox_capacity.max(1),
                 cold_write_admission,
+                raft_uncommitted_admission,
+                raft_uncommitted_bytes: raft_uncommitted_bytes.clone(),
                 live_read_max_waiters_per_core: config.live_read_max_waiters_per_core,
                 read_materialization: read_materialization.clone(),
             };

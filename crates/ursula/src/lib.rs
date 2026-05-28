@@ -41,6 +41,7 @@ use axum::http::header::{
     TRANSFER_ENCODING,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 
@@ -137,6 +138,7 @@ pub struct HttpState {
     client_write_router: Option<ClientWriteLeaderRouter>,
     http_metrics: Arc<HttpMetrics>,
     wall_clock: Arc<dyn WallClock>,
+    node_memory_admission: NodeMemoryAdmission,
 }
 
 impl HttpState {
@@ -147,6 +149,7 @@ impl HttpState {
             client_write_router: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
+            node_memory_admission: NodeMemoryAdmission::from_env(),
         }
     }
 
@@ -160,6 +163,7 @@ impl HttpState {
             client_write_router: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
+            node_memory_admission: NodeMemoryAdmission::from_env(),
         }
     }
 
@@ -171,9 +175,10 @@ impl HttpState {
         Self {
             runtime,
             raft_registry: Some(raft_registry),
-            client_write_router: Some(ClientWriteLeaderRouter::new(peers)),
+            client_write_router: Some(ClientWriteLeaderRouter::with_env_inflight_cap(peers)),
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
+            node_memory_admission: NodeMemoryAdmission::from_env(),
         }
     }
 
@@ -234,14 +239,55 @@ struct HttpMetricsSnapshot {
     sse_error_events: u64,
 }
 
+/// Per-peer forward-queue admission. When set, this node refuses to forward
+/// a new HTTP write to a remote leader once `inflight_forward_bytes_for(peer)`
+/// already exceeds the limit. Independent from cold and raft admissions; this
+/// one catches the "leader is wedged so the forward channel piles up" failure
+/// mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ForwardQueueAdmission {
+    pub max_inflight_bytes_per_peer: Option<u64>,
+}
+
+impl ForwardQueueAdmission {
+    fn from_env() -> Self {
+        Self {
+            max_inflight_bytes_per_peer: env_u64_optional(
+                "URSULA_FORWARD_MAX_INFLIGHT_BYTES_PER_PEER",
+            ),
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self.max_inflight_bytes_per_peer.is_some()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
     peers: Arc<BTreeMap<u64, String>>,
     channels: Arc<Mutex<BTreeMap<u64, Channel>>>,
+    forward_admission: ForwardQueueAdmission,
+    inflight_forward_bytes: Arc<Mutex<HashMap<u64, Arc<AtomicU64>>>>,
 }
 
 impl ClientWriteLeaderRouter {
     pub fn new(peers: impl IntoIterator<Item = (u64, String)>) -> Self {
+        Self::with_admission(peers, ForwardQueueAdmission::default())
+    }
+
+    /// Same as [`Self::new`] but reads
+    /// `URSULA_FORWARD_MAX_INFLIGHT_BYTES_PER_PEER` to configure the
+    /// per-peer inflight cap. Used by the production binary path; tests
+    /// stay on [`Self::new`] for a disabled admission.
+    pub fn with_env_inflight_cap(peers: impl IntoIterator<Item = (u64, String)>) -> Self {
+        Self::with_admission(peers, ForwardQueueAdmission::from_env())
+    }
+
+    pub fn with_admission(
+        peers: impl IntoIterator<Item = (u64, String)>,
+        forward_admission: ForwardQueueAdmission,
+    ) -> Self {
         Self {
             peers: Arc::new(
                 peers
@@ -250,7 +296,48 @@ impl ClientWriteLeaderRouter {
                     .collect(),
             ),
             channels: Arc::new(Mutex::new(BTreeMap::new())),
+            forward_admission,
+            inflight_forward_bytes: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    fn inflight_slot(&self, peer_id: u64) -> Arc<AtomicU64> {
+        let mut guard = self
+            .inflight_forward_bytes
+            .lock()
+            .expect("forward inflight bytes mutex poisoned");
+        guard
+            .entry(peer_id)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone()
+    }
+
+    /// Returns Some(503-response) if accepting `body_len` bytes would push
+    /// inflight bytes for `peer_id` past the configured cap. Otherwise None
+    /// and the caller may proceed (acquiring a guard separately via
+    /// `acquire_forward_guard`).
+    fn check_forward_admission(&self, peer_id: u64, body_len: u64) -> Option<Response> {
+        let limit = self.forward_admission.max_inflight_bytes_per_peer?;
+        let slot = self.inflight_slot(peer_id);
+        let current = slot.load(Ordering::Relaxed);
+        if current.saturating_add(body_len) <= limit {
+            return None;
+        }
+        Some(forward_backpressure_response(
+            peer_id, current, body_len, limit,
+        ))
+    }
+
+    fn acquire_forward_guard(&self, peer_id: u64, body_len: u64) -> Option<ForwardInflightGuard> {
+        if !self.forward_admission.is_enabled() {
+            return None;
+        }
+        let slot = self.inflight_slot(peer_id);
+        slot.fetch_add(body_len, Ordering::Relaxed);
+        Some(ForwardInflightGuard {
+            slot,
+            bytes: body_len,
+        })
     }
 
     fn leader_base(&self, err: &RuntimeError) -> Option<(u64, String)> {
@@ -278,6 +365,13 @@ impl ClientWriteLeaderRouter {
         body: Bytes,
     ) -> Option<Response> {
         let (leader_id, leader_base) = self.leader_base(err)?;
+        let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+        if let Some(rejected) = self.check_forward_admission(leader_id, body_len) {
+            return Some(rejected);
+        }
+        // Hold the guard for the duration of the gRPC call; on success or
+        // error it decrements the inflight counter when dropped.
+        let _forward_guard = self.acquire_forward_guard(leader_id, body_len);
         let channel = match self.leader_channel(leader_id, &leader_base).await {
             Ok(channel) => channel,
             Err(err) => {
@@ -351,6 +445,177 @@ impl ClientWriteLeaderRouter {
         insert_u64_header(&mut headers, HEADER_URSULA_RAFT_LEADER_ID, leader_id);
         Some((StatusCode::TEMPORARY_REDIRECT, headers, err.to_string()).into_response())
     }
+}
+
+/// RAII handle that decrements a peer's inflight-forward byte counter on drop.
+struct ForwardInflightGuard {
+    slot: Arc<AtomicU64>,
+    bytes: u64,
+}
+
+impl Drop for ForwardInflightGuard {
+    fn drop(&mut self) {
+        let mut current = self.slot.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(self.bytes);
+            match self.slot.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+fn forward_backpressure_response(
+    peer_id: u64,
+    inflight_bytes: u64,
+    incoming_bytes: u64,
+    limit: u64,
+) -> Response {
+    let mut headers = HeaderMap::new();
+    insert_default_response_headers(&mut headers);
+    insert_u64_header(&mut headers, HEADER_URSULA_RAFT_LEADER_ID, peer_id);
+    let body = format!(
+        "ForwardBackpressure: peer {peer_id} inflight {inflight_bytes} bytes plus incoming {incoming_bytes} would exceed limit {limit}"
+    );
+    (StatusCode::SERVICE_UNAVAILABLE, headers, body).into_response()
+}
+
+/// Process-wide RSS soft-cap admission. Independent from cold/raft/forward
+/// admissions; this one sheds writes when the entire process is approaching
+/// OOM regardless of which downstream is misbehaving. Read-only routes are
+/// not gated by this admission.
+#[derive(Clone)]
+pub struct NodeMemoryAdmission {
+    soft_cap_bytes: Option<u64>,
+    last_rss_bytes: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for NodeMemoryAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeMemoryAdmission")
+            .field("soft_cap_bytes", &self.soft_cap_bytes)
+            .field(
+                "last_rss_bytes",
+                &self.last_rss_bytes.load(Ordering::Relaxed),
+            )
+            .finish()
+    }
+}
+
+impl NodeMemoryAdmission {
+    pub fn disabled() -> Self {
+        Self {
+            soft_cap_bytes: None,
+            last_rss_bytes: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        let admission = Self {
+            soft_cap_bytes: env_u64_optional("URSULA_NODE_MEMORY_SOFT_CAP_BYTES"),
+            last_rss_bytes: Arc::new(AtomicU64::new(0)),
+        };
+        // Always sample RSS so the /__ursula/metrics endpoint can report
+        // process memory even when the admission itself is disabled. The
+        // sampler is the only path that observes OOM trajectories under
+        // chaos faults — when SSM exec dies post-OOM, this remains the
+        // sole real-time signal available via the status.json pipeline.
+        admission.spawn_rss_sampler();
+        admission
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.soft_cap_bytes.is_some()
+    }
+
+    pub fn last_rss_bytes(&self) -> u64 {
+        self.last_rss_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn soft_cap_bytes(&self) -> Option<u64> {
+        self.soft_cap_bytes
+    }
+
+    #[cfg(madsim)]
+    fn spawn_rss_sampler(&self) {
+        // Deterministic simulation: never report RSS. The admission stays
+        // installed for plumbing parity but never trips.
+    }
+
+    #[cfg(not(madsim))]
+    fn spawn_rss_sampler(&self) {
+        let last_rss_bytes = self.last_rss_bytes.clone();
+        let abort_cap = env_u64_optional("URSULA_NODE_MEMORY_ABORT_CAP_BYTES");
+        tokio::spawn(async move {
+            loop {
+                if let Some(rss) = read_proc_self_status_vm_rss_bytes() {
+                    last_rss_bytes.store(rss, Ordering::Relaxed);
+                    if let Some(cap) = abort_cap
+                        && rss > cap
+                    {
+                        // Last-resort safety net: ingress admissions (cold,
+                        // raft uncommitted, forward, concurrency) should bound
+                        // memory under normal load. If we still overshoot, the
+                        // unaccounted growth (allocator slack, framework
+                        // overhead) is unbounded — process::abort lets
+                        // systemd restart from a clean state instead of
+                        // riding OOM-killer into kernel-level shutdown that
+                        // also takes SSM agent / cloud-init credentials with
+                        // it.
+                        eprintln!("ursula: RSS {rss} bytes exceeded abort cap {cap}, aborting");
+                        std::process::abort();
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        });
+    }
+}
+
+/// Returns Some(503-response) if the admission is enabled and the current
+/// RSS sample is over the soft cap; None otherwise. Read paths skip this.
+fn node_memory_admission_response(admission: &NodeMemoryAdmission) -> Option<Response> {
+    let limit = admission.soft_cap_bytes?;
+    let rss = admission.last_rss_bytes.load(Ordering::Relaxed);
+    if rss <= limit {
+        return None;
+    }
+    let mut headers = HeaderMap::new();
+    insert_default_response_headers(&mut headers);
+    headers.insert(
+        axum::http::header::RETRY_AFTER,
+        HeaderValue::from_static("1"),
+    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let body = format!(
+        "{{\"error\":\"NodeMemoryBackpressure\",\"rss_bytes\":{rss},\"soft_cap_bytes\":{limit}}}"
+    );
+    Some((StatusCode::SERVICE_UNAVAILABLE, headers, body).into_response())
+}
+
+#[cfg(not(madsim))]
+fn read_proc_self_status_vm_rss_bytes() -> Option<u64> {
+    // Linux-only: parse `VmRSS:    NNN kB` from /proc/self/status.
+    let raw = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
+
+fn env_u64_optional(name: &str) -> Option<u64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
 }
 
 #[derive(Clone)]
@@ -590,6 +855,7 @@ pub fn cluster_router_from_state(state: HttpState) -> Router {
 /// these bind to the public interface; failure injection against the public
 /// face only affects this plane.
 pub fn client_router_from_state(state: HttpState) -> Router {
+    let memory_admission = state.node_memory_admission.clone();
     Router::new()
         .route("/__ursula/metrics", get(metrics))
         .route(
@@ -643,7 +909,87 @@ pub fn client_router_from_state(state: HttpState) -> Router {
         )
         .route("/{bucket}/{stream}/append-batch", post(append_batch))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            memory_admission,
+            node_memory_admission_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            ConcurrencyLimiter::from_env(),
+            concurrency_limit_middleware,
+        ))
         .with_state(state)
+}
+
+/// Synchronous concurrent-request cap on the client plane. Bounds the worst-
+/// case in-flight ingress memory: `concurrency × max_body_bytes` is the hard
+/// upper bound on bytes held in axum/hyper accept buffers at any moment.
+/// Bytes per request are not tracked separately — we conservatively count
+/// every accepted request against the same budget.
+///
+/// Disabled when `URSULA_MAX_CONCURRENT_REQUESTS` is unset. When the cap is
+/// reached, new requests are rejected with 503 + Retry-After: 1 immediately,
+/// no queueing (the queue itself would be unbounded ingress memory).
+#[derive(Clone)]
+struct ConcurrencyLimiter {
+    semaphore: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+impl ConcurrencyLimiter {
+    fn from_env() -> Self {
+        let limit = env_u64_optional("URSULA_MAX_CONCURRENT_REQUESTS")
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n > 0);
+        Self {
+            semaphore: limit.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
+        }
+    }
+}
+
+async fn concurrency_limit_middleware(
+    State(limiter): State<ConcurrencyLimiter>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(sem) = limiter.semaphore.as_ref() else {
+        return next.run(request).await;
+    };
+    match sem.clone().try_acquire_owned() {
+        Ok(_permit) => next.run(request).await,
+        Err(_) => {
+            let mut headers = HeaderMap::new();
+            insert_default_response_headers(&mut headers);
+            headers.insert(
+                axum::http::header::RETRY_AFTER,
+                HeaderValue::from_static("1"),
+            );
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            let body = "{\"error\":\"ConcurrencyLimitReached\"}";
+            (StatusCode::SERVICE_UNAVAILABLE, headers, body).into_response()
+        }
+    }
+}
+
+/// axum middleware that short-circuits write-method requests (PUT/POST/PATCH/
+/// DELETE) with a 503 + Retry-After when the per-process RSS is over the
+/// configured soft cap. Reads (GET/HEAD/OPTIONS) bypass the check so a
+/// memory-pressured node still serves cached data and metrics.
+async fn node_memory_admission_middleware(
+    State(admission): State<NodeMemoryAdmission>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if !admission.is_enabled() {
+        return next.run(request).await;
+    }
+    let method = request.method();
+    let is_write = matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
+    if is_write && let Some(rejected) = node_memory_admission_response(&admission) {
+        return rejected;
+    }
+    next.run(request).await
 }
 
 /// Single-listener router that serves both planes from one bind. Kept for
@@ -761,18 +1107,30 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         .raft_registry()
         .map(RaftGroupHandleRegistry::metrics_snapshot)
         .unwrap_or_default();
-    (
-        StatusCode::OK,
-        headers,
-        render_metrics(
-            state.runtime.metrics().snapshot(),
-            state.runtime.mailbox_snapshot(),
-            state.http_metrics.snapshot(),
-            &raft_groups,
-            state.runtime.cold_store_info().as_ref(),
-        ),
-    )
-        .into_response()
+    let mut body = render_metrics(
+        state.runtime.metrics().snapshot(),
+        state.runtime.mailbox_snapshot(),
+        state.http_metrics.snapshot(),
+        &raft_groups,
+        state.runtime.cold_store_info().as_ref(),
+    );
+    // Splice process-level memory observability onto the metrics JSON so
+    // a chaos node's RSS trajectory is visible from any HTTP client (the
+    // status-publishing pipeline survives SSM exec failures).
+    let rss = state.node_memory_admission.last_rss_bytes();
+    let cap = state
+        .node_memory_admission
+        .soft_cap_bytes()
+        .unwrap_or_default();
+    if body.ends_with('}') {
+        body.truncate(body.len() - 1);
+        body.push_str(",\"process_rss_bytes\":");
+        body.push_str(&rss.to_string());
+        body.push_str(",\"node_memory_soft_cap_bytes\":");
+        body.push_str(&cap.to_string());
+        body.push('}');
+    }
+    (StatusCode::OK, headers, body).into_response()
 }
 
 pub(crate) async fn flush_cold_stream(

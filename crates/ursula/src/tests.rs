@@ -4387,3 +4387,69 @@ fn batch_body(payloads: &[&[u8]]) -> Vec<u8> {
     }
     body
 }
+
+#[test]
+fn forward_queue_admission_disabled_passes_check() {
+    let router = ClientWriteLeaderRouter::new(vec![(1u64, "http://10.0.0.1:4437".to_owned())]);
+    // Without an explicit cap, even an arbitrarily large incoming size must
+    // be accepted: the admission only consults its configured limit.
+    assert!(router.check_forward_admission(1, 1024 * 1024).is_none());
+}
+
+#[test]
+fn forward_queue_admission_rejects_when_inflight_plus_incoming_exceeds_limit() {
+    let admission = ForwardQueueAdmission {
+        max_inflight_bytes_per_peer: Some(8),
+    };
+    let router = ClientWriteLeaderRouter::with_admission(
+        vec![(1u64, "http://10.0.0.1:4437".to_owned())],
+        admission,
+    );
+
+    // Initially the peer has zero inflight; a small request must fit.
+    assert!(router.check_forward_admission(1, 4).is_none());
+
+    // Hold a guard that accounts for 8 bytes of inflight; any further byte
+    // must be rejected with a 503 + ForwardBackpressure message.
+    let guard = router
+        .acquire_forward_guard(1, 8)
+        .expect("guard issued when admission is enabled");
+    let response = router
+        .check_forward_admission(1, 1)
+        .expect("admission rejects when inflight + incoming exceeds limit");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    // Releasing the guard restores capacity.
+    drop(guard);
+    assert!(router.check_forward_admission(1, 8).is_none());
+}
+
+#[test]
+fn node_memory_admission_disabled_returns_no_response() {
+    let admission = NodeMemoryAdmission::disabled();
+    assert!(node_memory_admission_response(&admission).is_none());
+    assert!(!admission.is_enabled());
+}
+
+#[test]
+fn node_memory_admission_trips_when_sampled_rss_over_soft_cap() {
+    let admission = NodeMemoryAdmission {
+        soft_cap_bytes: Some(1024),
+        last_rss_bytes: Arc::new(AtomicU64::new(2048)),
+    };
+    let response =
+        node_memory_admission_response(&admission).expect("over-cap RSS should be rejected");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let retry_after = response
+        .headers()
+        .get(axum::http::header::RETRY_AFTER)
+        .expect("Retry-After header set");
+    assert_eq!(retry_after.to_str().expect("ascii retry-after"), "1");
+
+    // Under-cap RSS leaves the request alone.
+    let under = NodeMemoryAdmission {
+        soft_cap_bytes: Some(4096),
+        last_rss_bytes: Arc::new(AtomicU64::new(2048)),
+    };
+    assert!(node_memory_admission_response(&under).is_none());
+}

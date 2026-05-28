@@ -5,6 +5,7 @@ use crate::rt::time::Instant;
 use ursula_shard::{BucketStreamId, RaftGroupId, ShardPlacement};
 use ursula_stream::ColdFlushCandidate;
 
+use crate::admission::UncommittedBytesGuard;
 use crate::command::GroupSnapshot;
 use crate::core_worker::{AppendBatchRuntime, CoreWorker, ReadWatcher, ReadWatchers};
 use crate::engine::GroupEngine;
@@ -51,17 +52,33 @@ impl GroupMailbox {
     }
 }
 
+/// (request, response channel, optional raft-uncommitted credit) tuple
+/// passed through the append-batch hot path. Aliased to keep clippy's
+/// type-complexity lint happy.
+pub(crate) type AppendBatchEntry = (
+    AppendBatchRequest,
+    oneshot::Sender<Result<AppendBatchResponse, RuntimeError>>,
+    Option<UncommittedBytesGuard>,
+);
+
 pub(crate) struct PendingAppendBatch {
     pub(crate) stream_id: BucketStreamId,
     pub(crate) incoming_bytes: u64,
     pub(crate) response_tx: oneshot::Sender<Result<AppendBatchResponse, RuntimeError>>,
     pub(crate) started_at: Instant,
+    /// Released when this pending entry resolves (success or error), so the
+    /// per-group raft uncommitted-bytes counter decrements once apply
+    /// completes. The field is "unused" — its Drop is the load-bearing side
+    /// effect.
+    #[allow(dead_code)]
+    pub(crate) raft_uncommitted: Option<UncommittedBytesGuard>,
 }
 
 pub(crate) enum GroupCommand {
     CreateStream {
         request: CreateStreamRequest,
         response_tx: oneshot::Sender<Result<CreateStreamResponse, RuntimeError>>,
+        raft_uncommitted: Option<UncommittedBytesGuard>,
     },
     CreateExternal {
         request: CreateStreamExternalRequest,
@@ -140,6 +157,7 @@ pub(crate) enum GroupCommand {
     Append {
         request: AppendRequest,
         response_tx: oneshot::Sender<Result<AppendResponse, RuntimeError>>,
+        raft_uncommitted: Option<UncommittedBytesGuard>,
     },
     AppendExternal {
         request: AppendExternalRequest,
@@ -148,6 +166,7 @@ pub(crate) enum GroupCommand {
     AppendBatch {
         request: AppendBatchRequest,
         response_tx: oneshot::Sender<Result<AppendBatchResponse, RuntimeError>>,
+        raft_uncommitted: Option<UncommittedBytesGuard>,
     },
     SnapshotGroup {
         response_tx: oneshot::Sender<Result<GroupSnapshot, RuntimeError>>,
@@ -259,6 +278,7 @@ impl GroupActor {
                 GroupCommand::CreateStream {
                     request,
                     response_tx,
+                    raft_uncommitted,
                 } => {
                     let response = CoreWorker::create_stream(
                         &mut self.engine,
@@ -268,6 +288,7 @@ impl GroupActor {
                         self.cold_write_admission,
                     )
                     .await;
+                    drop(raft_uncommitted);
                     let _ = response_tx.send(response);
                 }
                 GroupCommand::CreateExternal {
@@ -524,6 +545,7 @@ impl GroupActor {
                 GroupCommand::Append {
                     request,
                     response_tx,
+                    raft_uncommitted,
                 } => {
                     let response = CoreWorker::apply_append(
                         &mut self.engine,
@@ -535,6 +557,7 @@ impl GroupActor {
                         self.cold_write_admission,
                     )
                     .await;
+                    drop(raft_uncommitted);
                     let _ = response_tx.send(response);
                 }
                 GroupCommand::AppendExternal {
@@ -555,41 +578,25 @@ impl GroupActor {
                 GroupCommand::AppendBatch {
                     request,
                     response_tx,
+                    raft_uncommitted,
                 } => {
-                    let mut batch = vec![(request, response_tx)];
+                    let mut batch = vec![(request, response_tx, raft_uncommitted)];
                     self.collect_append_batch_commands(&mut pending, &mut batch);
-                    if self.cold_write_admission.is_enabled() {
-                        let (requests, pending_batch) =
-                            CoreWorker::prepare_append_batch_requests(batch);
-                        CoreWorker::apply_prepared_append_batch_requests_with_cold_admission(
-                            &mut self.engine,
-                            AppendBatchRuntime {
-                                metrics: self.metrics.clone(),
-                                read_materialization: self.read_materialization.clone(),
-                                placement: self.placement,
-                            },
-                            &mut self.read_watchers,
-                            pending_batch,
-                            requests,
-                            self.cold_write_admission,
-                        )
-                        .await;
-                    } else {
-                        let (commands, pending_batch) =
-                            CoreWorker::prepare_append_batch_commands(batch);
-                        CoreWorker::apply_prepared_append_batch_commands(
-                            &mut self.engine,
-                            AppendBatchRuntime {
-                                metrics: self.metrics.clone(),
-                                read_materialization: self.read_materialization.clone(),
-                                placement: self.placement,
-                            },
-                            &mut self.read_watchers,
-                            pending_batch,
-                            commands,
-                        )
-                        .await;
-                    }
+                    let (requests, pending_batch) =
+                        CoreWorker::prepare_append_batch_requests(batch);
+                    CoreWorker::apply_prepared_append_batch_requests(
+                        &mut self.engine,
+                        AppendBatchRuntime {
+                            metrics: self.metrics.clone(),
+                            read_materialization: self.read_materialization.clone(),
+                            placement: self.placement,
+                        },
+                        &mut self.read_watchers,
+                        pending_batch,
+                        requests,
+                        self.cold_write_admission,
+                    )
+                    .await;
                 }
                 GroupCommand::SnapshotGroup { response_tx } => {
                     let response = CoreWorker::snapshot_group(
@@ -646,10 +653,7 @@ impl GroupActor {
     pub(crate) fn collect_append_batch_commands(
         &mut self,
         pending: &mut VecDeque<GroupCommand>,
-        batch: &mut Vec<(
-            AppendBatchRequest,
-            oneshot::Sender<Result<AppendBatchResponse, RuntimeError>>,
-        )>,
+        batch: &mut Vec<AppendBatchEntry>,
     ) {
         while batch.len() < GROUP_ACTOR_MAX_WRITE_BATCH {
             let command = match pending.pop_front() {
@@ -667,7 +671,8 @@ impl GroupActor {
                 Some(GroupCommand::AppendBatch {
                     request,
                     response_tx,
-                }) => batch.push((request, response_tx)),
+                    raft_uncommitted,
+                }) => batch.push((request, response_tx, raft_uncommitted)),
                 Some(other) => {
                     pending.push_front(other);
                     break;
