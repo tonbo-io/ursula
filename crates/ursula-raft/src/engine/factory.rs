@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use openraft::BasicNode;
 use openraft::Config;
+use openraft::SnapshotPolicy;
 use ursula_runtime::{
     ColdStoreHandle, GroupEngine, GroupEngineCreateFuture, GroupEngineError, GroupEngineFactory,
     GroupEngineMetrics, SharedSnapshotStore,
@@ -30,6 +31,18 @@ fn rejoin_leader_probe_timeout() -> Duration {
         .filter(|ms| *ms > 0)
         .unwrap_or(6000);
     Duration::from_millis(ms)
+}
+
+/// Whether the manual snapshot driver is configured. When it is, snapshots are
+/// fully driver-driven and gated on S3 health, so openraft must not run its own
+/// size-based snapshot policy: an auto-triggered `build_snapshot` during a local
+/// S3 outage returns a `StorageError`, which openraft treats as fatal and kills
+/// the raft group. Without the driver, openraft's default policy still applies.
+fn snapshot_driver_configured() -> bool {
+    std::env::var("URSULA_SNAPSHOT_DRIVE_INTERVAL_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .is_some_and(|ms| ms > 0)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -341,23 +354,31 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     self.node_id
                 )));
             }
-            let config = Arc::new(
-                Config {
-                    cluster_name: format!("ursula-group-{}", placement.raft_group_id.0),
-                    // Timeouts tuned for a multi-AZ EC2 cluster carrying chaos faults.
-                    // The chaos test injects netem_delay 250ms±75ms; under that load,
-                    // the previous 100/300/600 produced 100s+ of spurious elections
-                    // (term 200-600 in 30 min). Heartbeat must stay well below
-                    // election_timeout_min, and election_timeout_min must stay above
-                    // worst-case fault-induced inter-heartbeat arrival.
-                    heartbeat_interval: 250,
-                    election_timeout_min: 1500,
-                    election_timeout_max: 3000,
-                    ..Default::default()
-                }
-                .validate()
-                .map_err(|err| GroupEngineError::new(format!("invalid OpenRaft config: {err}")))?,
-            );
+            let mut raft_config = Config {
+                cluster_name: format!("ursula-group-{}", placement.raft_group_id.0),
+                // Timeouts tuned for a multi-AZ EC2 cluster carrying chaos faults.
+                // The chaos test injects netem_delay 250ms±75ms; under that load,
+                // the previous 100/300/600 produced 100s+ of spurious elections
+                // (term 200-600 in 30 min). Heartbeat must stay well below
+                // election_timeout_min, and election_timeout_min must stay above
+                // worst-case fault-induced inter-heartbeat arrival.
+                heartbeat_interval: 250,
+                election_timeout_min: 1500,
+                election_timeout_max: 3000,
+                ..Default::default()
+            };
+            // With the manual snapshot driver, snapshots are driver-driven and
+            // gated on S3 health; openraft must not auto-trigger its own snapshot
+            // because a build_snapshot failure during an S3 outage is fatal to
+            // the group (it kills the raft core, so leadership can no longer be
+            // yielded and only a process restart recovers it).
+            if snapshot_driver_configured() {
+                raft_config.snapshot_policy = SnapshotPolicy::Never;
+            }
+            let config =
+                Arc::new(raft_config.validate().map_err(|err| {
+                    GroupEngineError::new(format!("invalid OpenRaft config: {err}"))
+                })?);
             let engine = if let Some(log_stores) = &self.log_stores {
                 RaftGroupEngine::new_node_full(
                     placement,

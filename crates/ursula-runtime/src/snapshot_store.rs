@@ -153,6 +153,15 @@ pub trait SnapshotStore: Send + Sync + Debug {
 
     /// Best-effort delete; missing is not an error.
     fn delete<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()>;
+
+    /// Lightweight liveness probe for the backend, used by the snapshot driver
+    /// to detect local S3 loss WITHOUT triggering a `build_snapshot` (whose
+    /// failure openraft treats as fatal). The default is "always healthy":
+    /// in-memory and local-filesystem backends cannot be remotely unavailable.
+    /// The S3 backend overrides this with a cheap `stat`.
+    fn health_check(&self) -> SnapshotStoreFuture<'_, ()> {
+        Box::pin(async move { Ok(()) })
+    }
 }
 
 pub type SharedSnapshotStore = Arc<dyn SnapshotStore>;
@@ -370,6 +379,21 @@ mod s3 {
                 };
                 match self.operator.delete(key).await {
                     Ok(()) => Ok(()),
+                    Err(err) if matches!(err.kind(), opendal::ErrorKind::NotFound) => Ok(()),
+                    Err(err) => Err(SnapshotStoreError::Backend(err.to_string())),
+                }
+            })
+        }
+
+        fn health_check(&self) -> SnapshotStoreFuture<'_, ()> {
+            Box::pin(async move {
+                // A `stat` on a probe key is a single cheap round-trip that goes
+                // through the same TimeoutLayer/RetryLayer as real writes, so it
+                // reports unreachable S3 (timeout / connection error) without
+                // building a snapshot. `NotFound` means S3 answered — healthy.
+                let probe = format!("{}/.health-probe", self.prefix);
+                match self.operator.stat(&probe).await {
+                    Ok(_) => Ok(()),
                     Err(err) if matches!(err.kind(), opendal::ErrorKind::NotFound) => Ok(()),
                     Err(err) => Err(SnapshotStoreError::Backend(err.to_string())),
                 }
