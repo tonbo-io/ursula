@@ -10,7 +10,8 @@ use ursula_raft::{
 };
 use ursula_runtime::{
     ColdStore, InMemoryGroupEngineFactory, PlanGroupColdFlushRequest, RuntimeConfig, RuntimeError,
-    ShardRuntime, SharedSnapshotStore, WalGroupEngineFactory, snapshot_store_from_env,
+    ShardRuntime, SharedSnapshotStore, WalGroupEngineFactory, default_snapshot_store,
+    snapshot_store_from_env,
 };
 use ursula_shard::RaftGroupId;
 
@@ -81,11 +82,11 @@ pub fn spawn_static_grpc_raft_memory_runtime(
         registry.clone(),
     )
     .with_cold_store(cold_store.clone())
-    .with_snapshot_store(snapshot_store);
+    .with_snapshot_store(snapshot_store.clone());
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
     spawn_cold_flush_worker_if_configured(&runtime);
-    spawn_snapshot_driver_if_configured(&runtime, &registry);
+    spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
     Ok((runtime, registry))
 }
 
@@ -108,11 +109,11 @@ pub fn spawn_static_grpc_raft_memory_runtime_with_per_group_initializers(
     )
     .with_per_group_membership_initializers(true)
     .with_cold_store(cold_store.clone())
-    .with_snapshot_store(snapshot_store);
+    .with_snapshot_store(snapshot_store.clone());
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
     spawn_cold_flush_worker_if_configured(&runtime);
-    spawn_snapshot_driver_if_configured(&runtime, &registry);
+    spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
     Ok((runtime, registry))
 }
 
@@ -136,11 +137,11 @@ pub fn spawn_static_grpc_raft_runtime(
     )
     .with_cold_store(cold_store.clone())
     .with_raft_log_dir(raft_log_dir)
-    .with_snapshot_store(snapshot_store);
+    .with_snapshot_store(snapshot_store.clone());
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
     spawn_cold_flush_worker_if_configured(&runtime);
-    spawn_snapshot_driver_if_configured(&runtime, &registry);
+    spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
     Ok((runtime, registry))
 }
 
@@ -165,11 +166,11 @@ pub fn spawn_static_grpc_raft_runtime_with_per_group_initializers(
     .with_per_group_membership_initializers(true)
     .with_cold_store(cold_store.clone())
     .with_raft_log_dir(raft_log_dir)
-    .with_snapshot_store(snapshot_store);
+    .with_snapshot_store(snapshot_store.clone());
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
     spawn_cold_flush_worker_if_configured(&runtime);
-    spawn_snapshot_driver_if_configured(&runtime, &registry);
+    spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
     Ok((runtime, registry))
 }
 
@@ -281,20 +282,24 @@ pub fn spawn_cold_flush_worker_if_configured(runtime: &ShardRuntime) {
 pub fn spawn_snapshot_driver_if_configured(
     runtime: &ShardRuntime,
     registry: &RaftGroupHandleRegistry,
+    snapshot_store: Option<SharedSnapshotStore>,
 ) {
     let interval_ms = env_usize("URSULA_SNAPSHOT_DRIVE_INTERVAL_MS", 0);
     if interval_ms == 0 {
         return;
     }
+    // Falls back to the inline (always-healthy) store when no external snapshot
+    // backend is configured, so the S3-health probe is simply a no-op there.
+    let snapshot_store = snapshot_store.unwrap_or_else(default_snapshot_store);
     let max_concurrency = env_usize("URSULA_SNAPSHOT_DRIVE_FLUSH_CONCURRENCY", 4).max(1);
-    // Per-group snapshot trigger is bounded by this driver-side deadline so a
-    // single S3-stalled group cannot make the whole tick (and thus S3-health
-    // detection) drag on for the full TimeoutLayer+RetryLayer budget.
+    // The S3-health probe is a single cheap `stat`, bounded by this deadline so
+    // a stalled S3 surfaces as "unhealthy" within one tick instead of dragging
+    // on for the full TimeoutLayer+RetryLayer budget.
     let probe_timeout = Duration::from_millis(
         u64::try_from(env_usize("URSULA_S3_PROBE_TIMEOUT_MS", 2_000)).unwrap_or(2_000),
     );
-    // Consecutive ticks where a majority of snapshot triggers fail before this
-    // node declares its own S3 unhealthy and yields leadership.
+    // Consecutive ticks where the S3-health probe fails before this node
+    // declares its own S3 unhealthy and yields leadership.
     let unhealthy_ticks = env_usize("URSULA_S3_UNHEALTHY_TICKS", 1).max(1);
     let runtime = runtime.clone();
     let registry = registry.clone();
@@ -309,46 +314,18 @@ pub fn spawn_snapshot_driver_if_configured(
         let mut consecutive_bad = 0usize;
         let mut yielded = false;
         loop {
-            // S3-health probe + snapshot trigger, run in parallel and each
-            // bounded by a hard per-probe deadline. `trigger().snapshot()`
-            // awaits the build, so an S3 write failure (or a hang capped by the
-            // deadline) is this node's S3-health signal. Running this before the
-            // (possibly slow) cold flush keeps leadership-yield detection fast.
+            // Cheap S3-health probe: a single `stat` round-trip. Crucially this
+            // does NOT build a snapshot — a failed `build_snapshot` returns a
+            // StorageError that openraft treats as fatal, killing the raft core
+            // (after which leadership can no longer be yielded). Probing before
+            // the snapshot triggers and the (possibly slow) cold flush keeps
+            // leadership-yield detection fast.
             let snaps = registry.metrics_snapshot();
-            let total = snaps.len();
-            let mut probes = tokio::task::JoinSet::new();
-            for snapshot in &snaps {
-                let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) else {
-                    continue;
-                };
-                let gid = snapshot.raft_group_id;
-                probes.spawn(async move {
-                    match tokio::time::timeout(probe_timeout, raft.trigger().snapshot()).await {
-                        Ok(Ok(())) => false,
-                        Ok(Err(err)) => {
-                            eprintln!("snapshot driver trigger group {gid} error: {err}");
-                            true
-                        }
-                        Err(_) => {
-                            eprintln!(
-                                "snapshot driver trigger group {gid} timed out after {probe_timeout:?}"
-                            );
-                            true
-                        }
-                    }
-                });
-            }
-            let mut failures = 0usize;
-            while let Some(result) = probes.join_next().await {
-                if matches!(result, Ok(true)) {
-                    failures += 1;
-                }
-            }
-
-            // A tick is "bad" when a majority of this node's snapshot triggers
-            // failed — i.e. this node's own S3 is down (a single-group blip does
-            // not trip it).
-            let bad_tick = total > 0 && failures * 2 > total;
+            let healthy = matches!(
+                tokio::time::timeout(probe_timeout, snapshot_store.health_check()).await,
+                Ok(Ok(()))
+            );
+            let bad_tick = !healthy;
             if bad_tick {
                 consecutive_bad += 1;
             } else {
@@ -394,6 +371,27 @@ pub fn spawn_snapshot_driver_if_configured(
                     }
                 }
                 eprintln!("s3-healthy: node re-enabled elections after S3 recovery");
+            }
+
+            // Drive snapshots (log compaction) only while S3 is healthy. With
+            // SnapshotPolicy::Never these driver triggers are the only snapshots,
+            // so skipping them during an outage keeps the raft core alive: the
+            // in-memory log grows until S3 returns (bounded by the outage), then
+            // the next healthy tick compacts it.
+            if healthy {
+                let mut triggers = tokio::task::JoinSet::new();
+                for snapshot in &snaps {
+                    let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) else {
+                        continue;
+                    };
+                    let gid = snapshot.raft_group_id;
+                    triggers.spawn(async move {
+                        if let Err(err) = raft.trigger().snapshot().await {
+                            eprintln!("snapshot driver trigger group {gid} error: {err}");
+                        }
+                    });
+                }
+                while triggers.join_next().await.is_some() {}
             }
 
             // Drain every group's hot tail to cold AFTER the health decision so
