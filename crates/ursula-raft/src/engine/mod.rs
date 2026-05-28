@@ -290,6 +290,21 @@ impl RaftGroupEngine {
             .map_err(|err| GroupEngineError::new(format!("wait for OpenRaft leadership: {err}")))
     }
 
+    /// Returns true if this group observes an established raft leader within
+    /// `timeout`. Used at startup to distinguish a fresh bootstrap (no leader
+    /// can appear until someone initializes) from a restart rejoining an
+    /// existing cluster (peers re-elect a leader that then contacts us).
+    pub async fn observe_any_leader(&self, timeout: Duration) -> bool {
+        self.raft
+            .wait(Some(timeout))
+            .metrics(
+                |metrics| metrics.current_leader.is_some(),
+                "observe an existing raft leader before bootstrap",
+            )
+            .await
+            .is_ok()
+    }
+
     pub fn raft_handle(&self) -> Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine> {
         self.raft.clone()
     }

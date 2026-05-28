@@ -285,9 +285,11 @@ mod s3 {
             {
                 builder = builder.session_token(&token);
             }
-            let operator = Operator::new(builder)
-                .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?
-                .finish();
+            let operator = crate::cold_store::with_s3_resilience(
+                Operator::new(builder)
+                    .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?
+                    .finish(),
+            );
             let prefix = std::env::var("URSULA_SNAPSHOT_S3_PREFIX")
                 .unwrap_or_else(|_| "snapshots".to_owned());
             Ok(Self::new(operator, prefix))

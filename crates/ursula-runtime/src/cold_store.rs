@@ -10,6 +10,7 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use opendal::layers::{RetryLayer, TimeoutLayer};
 use opendal::{Operator, Scheme};
 use ursula_shard::BucketStreamId;
 use ursula_stream::{ColdChunkRef, ObjectPayloadRef};
@@ -19,6 +20,48 @@ static COLD_CHUNK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const DEFAULT_COLD_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_COLD_CACHE_BLOCK_BYTES: usize = 1024 * 1024;
 const DEFAULT_COLD_CACHE_READAHEAD_BLOCKS: usize = 4;
+const DEFAULT_S3_OP_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_S3_MAX_RETRIES: usize = 3;
+
+/// Wrap an S3 (opendal) operator with the resilience every external
+/// object-store call needs.
+///
+/// 1. **Per-attempt timeout** ([`TimeoutLayer`], inner): a blackholed endpoint
+///    — chaos `s3_unavailable`, or a "busy ESTAB" TCP socket whose future never
+///    gets polled again — otherwise hangs the caller until
+///    `net.ipv4.tcp_retries2` (~15 min). That is the original freeze: the raft
+///    state-machine worker awaits S3 inside `install_snapshot` (`&mut self`),
+///    and openraft type-level-serializes `apply` with it, so an unbounded S3
+///    stall freezes apply. Bounding every attempt keeps the worker progressing.
+/// 2. **Bounded retries** ([`RetryLayer`], outer): S3 answers `503 SlowDown`
+///    while a fresh key prefix warms up (and on transient network blips). These
+///    are `is_temporary()` errors; without retries a single 503 fails a
+///    snapshot upload/download, stalling a restarted node's rejoin/catch-up.
+///    Retries are bounded, so a sustained outage still fails fast enough (each
+///    attempt is timeout-bounded) and the cluster keeps progressing on quorum.
+///
+/// Timeout is applied before retry so each retry attempt is itself bounded
+/// (per opendal's layer-ordering requirement). Tunable via `URSULA_S3_TIMEOUT_MS`
+/// and `URSULA_S3_MAX_RETRIES`.
+pub(crate) fn with_s3_resilience(operator: Operator) -> Operator {
+    let timeout_ms = std::env::var("URSULA_S3_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(DEFAULT_S3_OP_TIMEOUT_MS);
+    let timeout = Duration::from_millis(timeout_ms);
+    let max_retries = std::env::var("URSULA_S3_MAX_RETRIES")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_S3_MAX_RETRIES);
+    operator
+        .layer(
+            TimeoutLayer::new()
+                .with_timeout(timeout)
+                .with_io_timeout(timeout),
+        )
+        .layer(RetryLayer::new().with_max_times(max_retries).with_jitter())
+}
 
 #[derive(Clone)]
 pub struct ColdStore {
@@ -269,9 +312,11 @@ impl ColdStore {
         }
 
         Ok(Self::from_operator(
-            Operator::new(builder)
-                .map_err(|err| io::Error::other(err.to_string()))?
-                .finish(),
+            with_s3_resilience(
+                Operator::new(builder)
+                    .map_err(|err| io::Error::other(err.to_string()))?
+                    .finish(),
+            ),
             ColdStoreInfo {
                 backend: "s3",
                 root: configured_root,

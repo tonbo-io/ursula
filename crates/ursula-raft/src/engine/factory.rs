@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use openraft::BasicNode;
 use openraft::Config;
@@ -16,6 +17,20 @@ use crate::log_store::{CoreFileLogWriter, RaftGroupFileLogStore, RaftGroupLogSto
 use crate::registry::RaftGroupHandleRegistry;
 
 use super::RaftGroupEngine;
+
+/// How long a restarting bootstrap node waits to observe an already-established
+/// (or freshly re-elected) leader before deciding the group is truly new and
+/// bootstrapping it. Must exceed the election window so peers that lost this
+/// node as their leader have time to elect a replacement. Tunable via
+/// `URSULA_RAFT_REJOIN_PROBE_MS`.
+fn rejoin_leader_probe_timeout() -> Duration {
+    let ms = std::env::var("URSULA_RAFT_REJOIN_PROBE_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(6000);
+    Duration::from_millis(ms)
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RaftGroupEngineFactory;
@@ -370,7 +385,23 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             };
             self.registry.register(placement, engine.raft_handle());
             if self.should_initialize_membership(placement.raft_group_id) {
-                engine.initialize_membership(self.peer_nodes()).await?;
+                // A designated bootstrap node must not re-bootstrap a group it
+                // restarts into. With an in-memory raft log a restarted
+                // initializer has empty state, so a naive `initialize()` would
+                // create a conflicting fresh membership (term 1) and wedge the
+                // group with no leader. Only a configured persistent snapshot
+                // store makes restart-recovery meaningful; when present, wait
+                // briefly for peers to surface an existing or re-elected leader
+                // and, if one appears, rejoin as a follower (the leader streams
+                // us the latest snapshot from S3) instead of bootstrapping.
+                let recovery_possible = self.snapshot_store.is_some();
+                let rejoin_existing_cluster = recovery_possible
+                    && engine
+                        .observe_any_leader(rejoin_leader_probe_timeout())
+                        .await;
+                if !rejoin_existing_cluster {
+                    engine.initialize_membership(self.peer_nodes()).await?;
+                }
             }
             let engine: Box<dyn GroupEngine> = Box::new(engine);
             Ok(engine)

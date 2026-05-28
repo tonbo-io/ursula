@@ -287,15 +287,119 @@ pub fn spawn_snapshot_driver_if_configured(
         return;
     }
     let max_concurrency = env_usize("URSULA_SNAPSHOT_DRIVE_FLUSH_CONCURRENCY", 4).max(1);
+    // Per-group snapshot trigger is bounded by this driver-side deadline so a
+    // single S3-stalled group cannot make the whole tick (and thus S3-health
+    // detection) drag on for the full TimeoutLayer+RetryLayer budget.
+    let probe_timeout = Duration::from_millis(
+        u64::try_from(env_usize("URSULA_S3_PROBE_TIMEOUT_MS", 2_000)).unwrap_or(2_000),
+    );
+    // Consecutive ticks where a majority of snapshot triggers fail before this
+    // node declares its own S3 unhealthy and yields leadership.
+    let unhealthy_ticks = env_usize("URSULA_S3_UNHEALTHY_TICKS", 1).max(1);
     let runtime = runtime.clone();
     let registry = registry.clone();
     tokio::spawn(async move {
         let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX));
+        // S3-health-aware leadership yield: a node whose own S3 is unavailable
+        // cannot flush cold or persist snapshots, so it must not keep leading
+        // groups (it would reject every append on them while healthy peers sit
+        // idle). On sustained local S3 failure it transfers leadership away and
+        // disables its own elections; once its S3 recovers it re-enables
+        // elections and rejoins/catches up normally (self-heal).
+        let mut consecutive_bad = 0usize;
+        let mut yielded = false;
         loop {
-            // Drain every group's hot tail to cold via the existing raft-
-            // replicated flush path. `min_hot_bytes=1` makes "any hot bytes"
-            // eligible; `max_flush_bytes` is left wide so a single tick can
-            // catch up if the background worker is lagging.
+            // S3-health probe + snapshot trigger, run in parallel and each
+            // bounded by a hard per-probe deadline. `trigger().snapshot()`
+            // awaits the build, so an S3 write failure (or a hang capped by the
+            // deadline) is this node's S3-health signal. Running this before the
+            // (possibly slow) cold flush keeps leadership-yield detection fast.
+            let snaps = registry.metrics_snapshot();
+            let total = snaps.len();
+            let mut probes = tokio::task::JoinSet::new();
+            for snapshot in &snaps {
+                let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) else {
+                    continue;
+                };
+                let gid = snapshot.raft_group_id;
+                probes.spawn(async move {
+                    match tokio::time::timeout(probe_timeout, raft.trigger().snapshot()).await {
+                        Ok(Ok(())) => false,
+                        Ok(Err(err)) => {
+                            eprintln!("snapshot driver trigger group {gid} error: {err}");
+                            true
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "snapshot driver trigger group {gid} timed out after {probe_timeout:?}"
+                            );
+                            true
+                        }
+                    }
+                });
+            }
+            let mut failures = 0usize;
+            while let Some(result) = probes.join_next().await {
+                if matches!(result, Ok(true)) {
+                    failures += 1;
+                }
+            }
+
+            // A tick is "bad" when a majority of this node's snapshot triggers
+            // failed — i.e. this node's own S3 is down (a single-group blip does
+            // not trip it).
+            let bad_tick = total > 0 && failures * 2 > total;
+            if bad_tick {
+                consecutive_bad += 1;
+            } else {
+                consecutive_bad = 0;
+            }
+
+            if !yielded && consecutive_bad >= unhealthy_ticks {
+                // Local S3 is unhealthy: stop campaigning everywhere and hand
+                // off any group we currently lead to a healthy peer so the
+                // cluster keeps serving appends on those groups.
+                yielded = true;
+                for snapshot in &snaps {
+                    let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) else {
+                        continue;
+                    };
+                    raft.runtime_config().elect(false);
+                    if snapshot.current_leader == Some(snapshot.node_id)
+                        && let Some(target) = snapshot
+                            .voter_ids
+                            .iter()
+                            .copied()
+                            .find(|voter| *voter != snapshot.node_id)
+                    {
+                        match raft.trigger().transfer_leader(target).await {
+                            Ok(()) => eprintln!(
+                                "s3-unhealthy: node {} yielded leadership of group {} to node {}",
+                                snapshot.node_id, snapshot.raft_group_id, target,
+                            ),
+                            Err(err) => eprintln!(
+                                "s3-unhealthy: transfer_leader group {} -> {} failed: {err}",
+                                snapshot.raft_group_id, target,
+                            ),
+                        }
+                    }
+                }
+            } else if yielded && !bad_tick {
+                // Local S3 recovered: re-enable elections so this node rejoins
+                // normal raft participation and catches up (self-heal).
+                yielded = false;
+                for snapshot in &snaps {
+                    if let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) {
+                        raft.runtime_config().elect(true);
+                    }
+                }
+                eprintln!("s3-healthy: node re-enabled elections after S3 recovery");
+            }
+
+            // Drain every group's hot tail to cold AFTER the health decision so
+            // a slow/stalled flush never delays the leadership yield above.
+            // `min_hot_bytes=1` makes any hot bytes eligible; `max_flush_bytes`
+            // is left wide so a single tick can catch up a lagging worker.
             if runtime.has_cold_store()
                 && let Err(err) = runtime
                     .flush_cold_all_groups_once_bounded(
@@ -307,22 +411,9 @@ pub fn spawn_snapshot_driver_if_configured(
                     )
                     .await
             {
-                eprintln!("snapshot driver pre-flush error: {err}");
+                eprintln!("snapshot driver flush error: {err}");
             }
-            // Trigger snapshot per registered group; openraft will dedup if a
-            // snapshot is already in flight and the call is otherwise cheap.
-            for snapshot in registry.metrics_snapshot() {
-                let group_id = RaftGroupId(snapshot.raft_group_id);
-                let Some(raft) = registry.get(group_id) else {
-                    continue;
-                };
-                if let Err(err) = raft.trigger().snapshot().await {
-                    eprintln!(
-                        "snapshot driver trigger group {} error: {err}",
-                        snapshot.raft_group_id,
-                    );
-                }
-            }
+
             tokio::time::sleep(interval).await;
         }
     });
