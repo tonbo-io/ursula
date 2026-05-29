@@ -541,6 +541,13 @@ class ChaosAgent:
                     exc.read(),
                     _lower_headers(exc.headers),
                 )
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                # Timeout / connection failure (e.g. probing an impaired node).
+                # Return a sentinel 0 so every caller handles it as an ordinary
+                # failed request instead of an exception propagating up and
+                # killing the main loop (which would freeze status publishing
+                # and fault recovery — masking correct server behavior).
+                return 0, str(exc).encode(), {}
             if status in {307, 308} and resp_headers.get("location"):
                 url = urllib.parse.urljoin(url, resp_headers["location"])
                 continue
@@ -2337,7 +2344,12 @@ class ChaosAgent:
         interval = self.append_workers / max(1, self.append_per_second)
         while True:
             loop_started = time.monotonic()
-            self.append_once(lane_id=lane_id)
+            try:
+                self.append_once(lane_id=lane_id)
+            except Exception as exc:  # noqa: BLE001
+                # A worker thread must never die: that would silently drop a
+                # lane's load and skew the workload for the rest of the run.
+                self.event("warn", f"append lane {lane_id} error: {exc}")
             elapsed = time.monotonic() - loop_started
             if elapsed < interval:
                 time.sleep(interval - elapsed)
@@ -2359,37 +2371,45 @@ class ChaosAgent:
         last_producer_probe_success = 0
         while True:
             loop_started = time.monotonic()
-            self.maybe_inject_fault()
-            with self.state_lock:
-                append_success = self.append_success
+            # The whole tick is guarded: an exception in any probe/fault step
+            # must not kill the control loop, or status publishing and fault
+            # recovery would freeze (which previously masked the cluster's real
+            # behavior as a permanent "ops 0"). A skipped op simply retries next
+            # tick (~0.2s later).
+            try:
+                self.maybe_inject_fault()
+                with self.state_lock:
+                    append_success = self.append_success
 
-            if append_success - last_verified_success >= self.verify_every:
-                self.verify_integrity()
-                last_verified_success = append_success
-            if (
-                self.reader_count > 0
-                and append_success - last_read_probe_success >= self.read_probe_every
-            ):
-                self.run_reader_probe()
-                last_read_probe_success = append_success
+                if append_success - last_verified_success >= self.verify_every:
+                    self.verify_integrity()
+                    last_verified_success = append_success
+                if (
+                    self.reader_count > 0
+                    and append_success - last_read_probe_success >= self.read_probe_every
+                ):
+                    self.run_reader_probe()
+                    last_read_probe_success = append_success
 
-            workload_probes_paused = self.workload_probes_paused()
-            if (
-                not workload_probes_paused
-                and self.producer_probe_every > 0
-                and append_success - last_producer_probe_success >= self.producer_probe_every
-            ):
-                self.run_producer_semantics_probe()
-                last_producer_probe_success = append_success
-            if (
-                self.gc_churn_every > 0
-                and append_success - self.last_gc_churn_success >= self.gc_churn_every
-            ):
-                self.run_gc_churn()
-                self.last_gc_churn_success = append_success
-            if loop_started - last_status >= self.status_every:
-                self.publish_status()
-                last_status = loop_started
+                workload_probes_paused = self.workload_probes_paused()
+                if (
+                    not workload_probes_paused
+                    and self.producer_probe_every > 0
+                    and append_success - last_producer_probe_success >= self.producer_probe_every
+                ):
+                    self.run_producer_semantics_probe()
+                    last_producer_probe_success = append_success
+                if (
+                    self.gc_churn_every > 0
+                    and append_success - self.last_gc_churn_success >= self.gc_churn_every
+                ):
+                    self.run_gc_churn()
+                    self.last_gc_churn_success = append_success
+                if loop_started - last_status >= self.status_every:
+                    self.publish_status()
+                    last_status = loop_started
+            except Exception as exc:  # noqa: BLE001
+                self.event("warn", f"control loop tick error: {exc}")
             time.sleep(0.2)
 
 
