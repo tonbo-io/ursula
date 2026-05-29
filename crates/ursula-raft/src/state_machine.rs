@@ -19,11 +19,12 @@ use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
 use ursula_runtime::{
     AppendBatchRequest, AppendRequest, BootstrapStreamRequest, BootstrapStreamResponse,
-    ColdFlushCandidate, ColdHotBacklog, ColdStoreHandle, ColdWriteAdmission, CreateStreamRequest,
-    DeleteSnapshotRequest, GroupEngine, GroupEngineError, GroupEngineMetrics, GroupSnapshot,
-    HeadStreamRequest, HeadStreamResponse, InMemoryGroupEngine, PlanColdFlushRequest,
-    PlanGroupColdFlushRequest, ReadSnapshotRequest, ReadSnapshotResponse, ReadStreamRequest,
-    ReadStreamResponse, SharedSnapshotStore, SnapshotKey, SnapshotPointer, default_snapshot_store,
+    ColdFlushCandidate, ColdGcEntry, ColdHotBacklog, ColdStoreHandle, ColdWriteAdmission,
+    CreateStreamRequest, DeleteSnapshotRequest, GroupEngine, GroupEngineError, GroupEngineMetrics,
+    GroupSnapshot, HeadStreamRequest, HeadStreamResponse, InMemoryGroupEngine,
+    PlanColdFlushRequest, PlanGroupColdFlushRequest, ReadSnapshotRequest, ReadSnapshotResponse,
+    ReadStreamRequest, ReadStreamResponse, SharedSnapshotStore, SnapshotKey, SnapshotPointer,
+    default_snapshot_store,
 };
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
@@ -182,6 +183,14 @@ impl RaftGroupStateMachine {
         placement: ShardPlacement,
     ) -> Result<ColdHotBacklog, GroupEngineError> {
         self.engine.cold_hot_backlog(stream_id, placement).await
+    }
+
+    pub async fn plan_cold_gc(
+        &mut self,
+        max: usize,
+        placement: ShardPlacement,
+    ) -> Result<Vec<ColdGcEntry>, GroupEngineError> {
+        self.engine.plan_cold_gc(max, placement).await
     }
 
     pub async fn check_create_stream_cold_admission(

@@ -1055,6 +1055,8 @@ async fn install_group_snapshot_rejects_mismatched_placement_before_routing() {
         stream_snapshot: StreamSnapshot {
             buckets: Vec::new(),
             streams: Vec::new(),
+            pending_cold_gc: Vec::new(),
+            next_cold_gc_seq: 0,
         },
         stream_append_counts: Vec::new(),
     };
@@ -1580,6 +1582,86 @@ async fn flush_cold_group_batch_once_publishes_multiple_chunks() {
         .expect("read cold chunks");
     assert_eq!(read.payload, b"abcd");
     assert_eq!(read.next_offset, 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_gc_worker_physically_reclaims_deleted_stream_chunks() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        RuntimeConfig::new(2, 8),
+        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
+        Some(cold_store.clone()),
+    )
+    .expect("spawn runtime");
+    let stream = BucketStreamId::new("benchcmp", "cold-gc");
+    let placement = runtime.locate(&stream);
+    create_stream(&runtime, &stream).await;
+    runtime
+        .append(AppendRequest::from_bytes(stream.clone(), b"abcd".to_vec()))
+        .await
+        .expect("append");
+    runtime
+        .flush_cold_group_batch_once(
+            placement.raft_group_id,
+            PlanGroupColdFlushRequest {
+                min_hot_bytes: 1,
+                max_flush_bytes: 4,
+            },
+            4,
+        )
+        .await
+        .expect("flush batch");
+
+    // Capture the on-disk chunk before deleting so we can prove it is gone after GC.
+    let snapshot = runtime
+        .snapshot_group(placement.raft_group_id)
+        .await
+        .expect("snapshot group");
+    let chunk = snapshot
+        .stream_snapshot
+        .streams
+        .iter()
+        .find(|entry| entry.metadata.stream_id == stream)
+        .and_then(|entry| entry.cold_chunks.first().cloned())
+        .expect("cold chunk present");
+    assert!(
+        cold_store
+            .read_chunk_range(&chunk, chunk.start_offset, 4)
+            .await
+            .is_ok(),
+        "chunk must exist before GC"
+    );
+
+    runtime
+        .delete_stream(DeleteStreamRequest {
+            stream_id: stream.clone(),
+        })
+        .await
+        .expect("delete stream");
+
+    // A GC tick reclaims exactly the one queued prefix and drains the queue.
+    let reclaimed = runtime
+        .run_cold_gc_all_groups_once(256)
+        .await
+        .expect("run cold gc");
+    assert_eq!(reclaimed, 1);
+    assert_eq!(runtime.metrics().snapshot().cold_gc_reclaimed, 1);
+
+    // The physical object is gone, and a second tick finds nothing to do.
+    assert!(
+        cold_store
+            .read_chunk_range(&chunk, chunk.start_offset, 4)
+            .await
+            .is_err(),
+        "chunk must be physically reclaimed after GC"
+    );
+    assert_eq!(
+        runtime
+            .run_cold_gc_all_groups_once(256)
+            .await
+            .expect("idempotent gc tick"),
+        0
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3633,6 +3715,8 @@ impl GroupEngine for BlockingReadEngine {
                 stream_snapshot: StreamSnapshot {
                     buckets: Vec::new(),
                     streams: Vec::new(),
+                    pending_cold_gc: Vec::new(),
+                    next_cold_gc_seq: 0,
                 },
                 stream_append_counts: Vec::new(),
             })
@@ -3867,6 +3951,8 @@ impl GroupEngine for RecordingEngine {
                 stream_snapshot: StreamSnapshot {
                     buckets: Vec::new(),
                     streams: Vec::new(),
+                    pending_cold_gc: Vec::new(),
+                    next_cold_gc_seq: 0,
                 },
                 stream_append_counts: Vec::new(),
             })

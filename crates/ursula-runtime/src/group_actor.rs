@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::rt::time::Instant;
 use ursula_shard::{BucketStreamId, RaftGroupId, ShardPlacement};
-use ursula_stream::ColdFlushCandidate;
+use ursula_stream::{ColdFlushCandidate, ColdGcEntry};
 
 use crate::admission::UncommittedBytesGuard;
 use crate::command::GroupSnapshot;
@@ -12,12 +12,12 @@ use crate::engine::GroupEngine;
 use crate::error::RuntimeError;
 use crate::metrics::{GROUP_ACTOR_MAX_WRITE_BATCH, RuntimeMetricsInner};
 use crate::request::{
-    AppendBatchRequest, AppendBatchResponse, AppendExternalRequest, AppendRequest, AppendResponse,
-    BootstrapStreamRequest, BootstrapStreamResponse, CloseStreamRequest, CloseStreamResponse,
-    ColdWriteAdmission, CreateStreamExternalRequest, CreateStreamRequest, CreateStreamResponse,
-    DeleteSnapshotRequest, DeleteStreamRequest, DeleteStreamResponse, FlushColdRequest,
-    FlushColdResponse, ForkRefResponse, HeadStreamRequest, HeadStreamResponse,
-    PlanColdFlushRequest, PlanGroupColdFlushRequest, PublishSnapshotRequest,
+    AckColdGcResponse, AppendBatchRequest, AppendBatchResponse, AppendExternalRequest,
+    AppendRequest, AppendResponse, BootstrapStreamRequest, BootstrapStreamResponse,
+    CloseStreamRequest, CloseStreamResponse, ColdWriteAdmission, CreateStreamExternalRequest,
+    CreateStreamRequest, CreateStreamResponse, DeleteSnapshotRequest, DeleteStreamRequest,
+    DeleteStreamResponse, FlushColdRequest, FlushColdResponse, ForkRefResponse, HeadStreamRequest,
+    HeadStreamResponse, PlanColdFlushRequest, PlanGroupColdFlushRequest, PublishSnapshotRequest,
     PublishSnapshotResponse, ReadSnapshotRequest, ReadSnapshotResponse, ReadStreamRequest,
     ReadStreamResponse,
 };
@@ -154,6 +154,14 @@ pub(crate) enum GroupCommand {
         max_candidates: usize,
         response_tx: oneshot::Sender<Result<Vec<ColdFlushCandidate>, RuntimeError>>,
     },
+    PlanColdGc {
+        max: usize,
+        response_tx: oneshot::Sender<Result<Vec<ColdGcEntry>, RuntimeError>>,
+    },
+    AckColdGc {
+        up_to_seq: u64,
+        response_tx: oneshot::Sender<Result<AckColdGcResponse, RuntimeError>>,
+    },
     Append {
         request: AppendRequest,
         response_tx: oneshot::Sender<Result<AppendResponse, RuntimeError>>,
@@ -231,6 +239,12 @@ impl GroupCommand {
                 let _ = response_tx.send(Err(err));
             }
             Self::PlanNextColdFlushBatch { response_tx, .. } => {
+                let _ = response_tx.send(Err(err));
+            }
+            Self::PlanColdGc { response_tx, .. } => {
+                let _ = response_tx.send(Err(err));
+            }
+            Self::AckColdGc { response_tx, .. } => {
                 let _ = response_tx.send(Err(err));
             }
             Self::Append { response_tx, .. } => {
@@ -540,6 +554,19 @@ impl GroupActor {
                         max_candidates,
                     )
                     .await;
+                    let _ = response_tx.send(response);
+                }
+                GroupCommand::PlanColdGc { max, response_tx } => {
+                    let response =
+                        CoreWorker::plan_cold_gc(&mut self.engine, max, self.placement).await;
+                    let _ = response_tx.send(response);
+                }
+                GroupCommand::AckColdGc {
+                    up_to_seq,
+                    response_tx,
+                } => {
+                    let response =
+                        CoreWorker::ack_cold_gc(&mut self.engine, up_to_seq, self.placement).await;
                     let _ = response_tx.send(response);
                 }
                 GroupCommand::Append {

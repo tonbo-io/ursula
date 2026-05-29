@@ -27,6 +27,7 @@ pub fn spawn_default_runtime(
         cold_store,
     )?;
     spawn_cold_flush_worker_if_configured(&runtime);
+    spawn_cold_gc_worker_if_configured(&runtime);
     Ok(runtime)
 }
 
@@ -43,6 +44,7 @@ pub fn spawn_wal_runtime(
         cold_store,
     )?;
     spawn_cold_flush_worker_if_configured(&runtime);
+    spawn_cold_gc_worker_if_configured(&runtime);
     Ok(runtime)
 }
 
@@ -61,6 +63,7 @@ pub fn spawn_raft_memory_runtime(
         None => ShardRuntime::spawn_with_engine_factory(config, RaftGroupEngineFactory),
     }?;
     spawn_cold_flush_worker_if_configured(&runtime);
+    spawn_cold_gc_worker_if_configured(&runtime);
     Ok(runtime)
 }
 
@@ -86,6 +89,7 @@ pub fn spawn_static_grpc_raft_memory_runtime(
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
     spawn_cold_flush_worker_if_configured(&runtime);
+    spawn_cold_gc_worker_if_configured(&runtime);
     spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
     Ok((runtime, registry))
 }
@@ -113,6 +117,7 @@ pub fn spawn_static_grpc_raft_memory_runtime_with_per_group_initializers(
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
     spawn_cold_flush_worker_if_configured(&runtime);
+    spawn_cold_gc_worker_if_configured(&runtime);
     spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
     Ok((runtime, registry))
 }
@@ -141,6 +146,7 @@ pub fn spawn_static_grpc_raft_runtime(
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
     spawn_cold_flush_worker_if_configured(&runtime);
+    spawn_cold_gc_worker_if_configured(&runtime);
     spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
     Ok((runtime, registry))
 }
@@ -170,6 +176,7 @@ pub fn spawn_static_grpc_raft_runtime_with_per_group_initializers(
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
     spawn_cold_flush_worker_if_configured(&runtime);
+    spawn_cold_gc_worker_if_configured(&runtime);
     spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
     Ok((runtime, registry))
 }
@@ -187,6 +194,7 @@ pub fn spawn_raft_runtime(
         cold_store,
     )?;
     spawn_cold_flush_worker_if_configured(&runtime);
+    spawn_cold_gc_worker_if_configured(&runtime);
     Ok(runtime)
 }
 
@@ -272,6 +280,31 @@ pub fn spawn_cold_flush_worker_if_configured(runtime: &ShardRuntime) {
     });
 }
 
+/// Drains the cold-GC queue on each tick: the leader of every group physically
+/// reclaims the cold objects of deleted/expired streams and replicates an ack
+/// that pops them. A no-op when no cold store is configured or the interval is
+/// zero.
+pub fn spawn_cold_gc_worker_if_configured(runtime: &ShardRuntime) {
+    if !runtime.has_cold_store() {
+        return;
+    }
+    let interval_ms = env_usize("URSULA_COLD_GC_INTERVAL_MS", 5_000);
+    if interval_ms == 0 {
+        return;
+    }
+    let max_entries = env_usize("URSULA_COLD_GC_MAX_ENTRIES_PER_GROUP", 256).max(1);
+    let runtime = runtime.clone();
+    tokio::spawn(async move {
+        let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX));
+        loop {
+            if let Err(err) = runtime.run_cold_gc_all_groups_once(max_entries).await {
+                eprintln!("cold gc worker error: {err}");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
 /// Drives raft snapshots manually after first draining each group's hot tail to
 /// cold. The drain makes the resulting snapshot's `payload` field empty (no
 /// uncommitted hot bytes), shrinking the manifest install_snapshot has to ship.
@@ -301,6 +334,12 @@ pub fn spawn_snapshot_driver_if_configured(
     // Consecutive ticks where the S3-health probe fails before this node
     // declares its own S3 unhealthy and yields leadership.
     let unhealthy_ticks = env_usize("URSULA_S3_UNHEALTHY_TICKS", 1).max(1);
+    // Consecutive healthy ticks required before a yielded node re-enables
+    // elections. Hysteresis matters because the cold-flush failure signal
+    // disappears once a node yields (a follower does not flush), so recovery is
+    // judged by the probe alone — a short hold-down avoids re-grabbing
+    // leadership only to fail the next flush and yield again (flapping).
+    let heal_ticks = env_usize("URSULA_S3_HEAL_TICKS", 2).max(1);
     let runtime = runtime.clone();
     let registry = registry.clone();
     tokio::spawn(async move {
@@ -312,7 +351,11 @@ pub fn spawn_snapshot_driver_if_configured(
         // disables its own elections; once its S3 recovers it re-enables
         // elections and rejoins/catches up normally (self-heal).
         let mut consecutive_bad = 0usize;
+        let mut consecutive_good = 0usize;
         let mut yielded = false;
+        // Baseline the cold-flush error counter so the first tick measures a
+        // delta, not the run's cumulative total.
+        let mut last_flush_errors = runtime.metrics().snapshot().cold_flush_write_errors;
         loop {
             // Cheap S3-health probe: a single `stat` round-trip. Crucially this
             // does NOT build a snapshot — a failed `build_snapshot` returns a
@@ -321,15 +364,24 @@ pub fn spawn_snapshot_driver_if_configured(
             // the snapshot triggers and the (possibly slow) cold flush keeps
             // leadership-yield detection fast.
             let snaps = registry.metrics_snapshot();
-            let healthy = matches!(
+            let probe_healthy = matches!(
                 tokio::time::timeout(probe_timeout, snapshot_store.health_check()).await,
                 Ok(Ok(()))
             );
-            let bad_tick = !healthy;
+            // Primary signal: did a real cold-flush S3 write fail since the last
+            // tick? This detects "this node can't write to S3" directly, which a
+            // keep-alive `stat` probe can mask (an idle pooled connection answers
+            // the probe while concurrent flushes that open new connections fail).
+            let flush_errors_now = runtime.metrics().snapshot().cold_flush_write_errors;
+            let flush_failing = flush_errors_now > last_flush_errors;
+            last_flush_errors = flush_errors_now;
+            let bad_tick = !probe_healthy || flush_failing;
             if bad_tick {
                 consecutive_bad += 1;
+                consecutive_good = 0;
             } else {
                 consecutive_bad = 0;
+                consecutive_good += 1;
             }
 
             if !yielded && consecutive_bad >= unhealthy_ticks {
@@ -361,9 +413,10 @@ pub fn spawn_snapshot_driver_if_configured(
                         }
                     }
                 }
-            } else if yielded && !bad_tick {
-                // Local S3 recovered: re-enable elections so this node rejoins
-                // normal raft participation and catches up (self-heal).
+            } else if yielded && consecutive_good >= heal_ticks {
+                // Local S3 recovered (sustained healthy ticks): re-enable
+                // elections so this node rejoins normal raft participation and
+                // catches up (self-heal). The hold-down avoids flapping.
                 yielded = false;
                 for snapshot in &snaps {
                     if let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) {
@@ -373,12 +426,15 @@ pub fn spawn_snapshot_driver_if_configured(
                 eprintln!("s3-healthy: node re-enabled elections after S3 recovery");
             }
 
-            // Drive snapshots (log compaction) only while S3 is healthy. With
-            // SnapshotPolicy::Never these driver triggers are the only snapshots,
-            // so skipping them during an outage keeps the raft core alive: the
-            // in-memory log grows until S3 returns (bounded by the outage), then
-            // the next healthy tick compacts it.
-            if healthy {
+            // Drive snapshots (log compaction) only while fully healthy (probe
+            // ok AND cold flush succeeding). With SnapshotPolicy::Never these
+            // driver triggers are the only snapshots, so skipping them during an
+            // outage keeps the raft core alive: the in-memory log grows until S3
+            // returns (bounded by the outage), then the next healthy tick
+            // compacts it. Gating on `!bad_tick` (not just the probe) avoids
+            // triggering a snapshot build against an S3 the probe only thinks is
+            // reachable.
+            if !bad_tick {
                 let mut triggers = tokio::task::JoinSet::new();
                 for snapshot in &snaps {
                     let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) else {

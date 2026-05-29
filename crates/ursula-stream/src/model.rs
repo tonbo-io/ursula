@@ -124,6 +124,26 @@ impl From<&ColdChunkRef> for ObjectPayloadRef {
 
 pub type ExternalPayloadRef = ExternalPayloadRefV1;
 
+/// One unit of deferred cold-storage reclamation. Enqueued deterministically in
+/// the state machine when a stream's cold objects become unreferenced, drained
+/// asynchronously by the leader's background GC worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColdGcEntry {
+    pub seq: u64,
+    pub target: ColdGcTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColdGcTarget {
+    /// Every cold object owned by a fully removed stream. Cold objects are
+    /// stream-exclusive (forks copy, never share), so the whole `{stream}/chunks/`
+    /// prefix can be reclaimed at once.
+    Stream(BucketStreamId),
+    /// Specific cold object paths dropped while the stream lives on (snapshot
+    /// retention compaction).
+    Paths(Vec<String>),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HotPayloadSegment {
     pub start_offset: u64,

@@ -94,4 +94,10 @@ pub enum StreamCommand {
     DeleteStream {
         stream_id: BucketStreamId,
     },
+    /// Confirms the leader's background worker has physically reclaimed every
+    /// queued cold-GC entry with `seq <= up_to_seq`; removes them from the
+    /// replicated queue. Idempotent under replay.
+    AckColdGc {
+        up_to_seq: u64,
+    },
 }

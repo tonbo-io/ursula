@@ -3,14 +3,18 @@ use ursula_shard::BucketStreamId;
 
 use crate::integrity::StreamIntegritySnapshot;
 use crate::model::{
-    ColdChunkRef, HotPayloadSegment, ObjectPayloadRef, ProducerSnapshot, StreamMessageRecord,
-    StreamMetadata, StreamVisibleSnapshot,
+    ColdChunkRef, ColdGcEntry, HotPayloadSegment, ObjectPayloadRef, ProducerSnapshot,
+    StreamMessageRecord, StreamMetadata, StreamVisibleSnapshot,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamSnapshot {
     pub buckets: Vec<String>,
     pub streams: Vec<StreamSnapshotEntry>,
+    #[serde(default)]
+    pub pending_cold_gc: Vec<ColdGcEntry>,
+    #[serde(default)]
+    pub next_cold_gc_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

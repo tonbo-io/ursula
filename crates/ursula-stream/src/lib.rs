@@ -20,11 +20,12 @@ mod validate;
 pub use command::StreamCommand;
 pub use integrity::{StreamIntegrityRecord, StreamIntegritySnapshot};
 pub use model::{
-    AppendStreamInput, ColdChunkRef, ColdFlushCandidate, ExternalPayloadRef, HotPayloadSegment,
-    ObjectPayloadRef, ProducerAppendRecord, ProducerRequest, ProducerSnapshot, StreamBatchAppend,
-    StreamBatchAppendItem, StreamBootstrapPlan, StreamMessageRecord, StreamMetadata, StreamRead,
-    StreamReadColdSegment, StreamReadObjectSegment, StreamReadPlan, StreamReadSegment,
-    StreamStatus, StreamVisibleSnapshot,
+    AppendStreamInput, ColdChunkRef, ColdFlushCandidate, ColdGcEntry, ColdGcTarget,
+    ExternalPayloadRef, HotPayloadSegment, ObjectPayloadRef, ProducerAppendRecord, ProducerRequest,
+    ProducerSnapshot, StreamBatchAppend, StreamBatchAppendItem, StreamBootstrapPlan,
+    StreamMessageRecord, StreamMetadata, StreamRead, StreamReadColdSegment,
+    StreamReadObjectSegment, StreamReadPlan, StreamReadSegment, StreamStatus,
+    StreamVisibleSnapshot,
 };
 pub use response::{StreamErrorCode, StreamResponse};
 pub use snapshot::{StreamSnapshot, StreamSnapshotEntry, StreamSnapshotError};

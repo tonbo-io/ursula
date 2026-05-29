@@ -7,12 +7,12 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use ursula_shard::{BucketStreamId, ShardPlacement};
-use ursula_stream::{ColdFlushCandidate, StreamErrorCode};
+use ursula_stream::{ColdFlushCandidate, ColdGcEntry, StreamErrorCode};
 
 use crate::command::{GroupSnapshot, GroupWriteCommand};
 use crate::metrics::{RaftWriteManySample, RuntimeMetricsInner};
 use crate::request::{
-    AppendBatchRequest, AppendExternalRequest, AppendRequest, AppendResponse,
+    AckColdGcResponse, AppendBatchRequest, AppendExternalRequest, AppendRequest, AppendResponse,
     BootstrapStreamRequest, BootstrapStreamResponse, CloseStreamRequest, CloseStreamResponse,
     ColdHotBacklog, ColdWriteAdmission, CreateStreamExternalRequest, CreateStreamRequest,
     CreateStreamResponse, DeleteSnapshotRequest, DeleteStreamRequest, DeleteStreamResponse,
@@ -60,6 +60,10 @@ pub type GroupCloseStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CloseStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupDeleteStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<DeleteStreamResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupAckColdGcFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<AckColdGcResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupPlanColdGcFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<ColdGcEntry>, GroupEngineError>> + Send + 'a>>;
 pub type GroupForkRefFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ForkRefResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupSnapshotFuture<'a> =
@@ -100,6 +104,7 @@ pub enum GroupWriteResponse {
     FlushCold(FlushColdResponse),
     CloseStream(CloseStreamResponse),
     DeleteStream(DeleteStreamResponse),
+    AckColdGc(AckColdGcResponse),
     Batch(Vec<Result<GroupWriteResponse, GroupEngineError>>),
 }
 
@@ -241,6 +246,26 @@ pub trait GroupEngine: Send + 'static {
         request: DeleteStreamRequest,
         placement: ShardPlacement,
     ) -> GroupDeleteStreamFuture<'a>;
+
+    /// Replicated confirmation that cold-GC entries up to `up_to_seq` have been
+    /// physically reclaimed; pops them from the queue. Default unsupported.
+    fn ack_cold_gc<'a>(
+        &'a mut self,
+        _up_to_seq: u64,
+        _placement: ShardPlacement,
+    ) -> GroupAckColdGcFuture<'a> {
+        Box::pin(async { Err(GroupEngineError::new("cold GC ack is not supported")) })
+    }
+
+    /// Leader-local read of the front of the cold-GC queue for the background
+    /// worker to reclaim. Default returns an empty batch.
+    fn plan_cold_gc<'a>(
+        &'a mut self,
+        _max: usize,
+        _placement: ShardPlacement,
+    ) -> GroupPlanColdGcFuture<'a> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 
     fn append<'a>(
         &'a mut self,
@@ -585,6 +610,10 @@ pub trait GroupEngine: Send + 'static {
                         .delete_stream(DeleteStreamRequest { stream_id }, placement)
                         .await
                         .map(GroupWriteResponse::DeleteStream),
+                    GroupWriteCommand::AckColdGc { up_to_seq } => self
+                        .ack_cold_gc(up_to_seq, placement)
+                        .await
+                        .map(GroupWriteResponse::AckColdGc),
                     GroupWriteCommand::Batch { commands } => self
                         .write_batch(commands, placement)
                         .await

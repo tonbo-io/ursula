@@ -335,6 +335,13 @@ pub struct DeleteStreamResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AckColdGcResponse {
+    pub placement: ShardPlacement,
+    pub removed: u64,
+    pub group_commit_index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForkRefResponse {
     pub placement: ShardPlacement,
     pub fork_ref_count: u64,
