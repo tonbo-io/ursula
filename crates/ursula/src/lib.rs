@@ -551,6 +551,7 @@ pub fn client_router_from_state(state: HttpState) -> Router {
     let memory_admission = state.node_memory_admission.clone();
     Router::new()
         .route("/__ursula/metrics", get(metrics))
+        .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route(
             "/__ursula/flush-cold/{bucket}/{stream}",
             post(flush_cold_stream),
@@ -662,6 +663,17 @@ async fn concurrency_limit_middleware(
     }
 }
 
+/// Path of the cluster egress-health probe (M2). Peers POST a payload here over
+/// the cluster plane; the round-trip time exposes loss/delay on the sender's
+/// egress, which a small heartbeat-sized request would mask.
+pub(crate) const CLUSTER_PROBE_PATH: &str = "/__ursula/cluster-probe";
+
+/// Probe target: drain the body (so the sender's full egress traverses the
+/// cluster plane) and answer 200. Bypasses memory admission.
+async fn cluster_probe(_body: Bytes) -> StatusCode {
+    StatusCode::OK
+}
+
 /// axum middleware that short-circuits write-method requests (PUT/POST/PATCH/
 /// DELETE) with a 503 + Retry-After when the per-process RSS is over the
 /// configured soft cap. Reads (GET/HEAD/OPTIONS) bypass the check so a
@@ -672,6 +684,12 @@ async fn node_memory_admission_middleware(
     next: Next,
 ) -> Response {
     if !admission.is_enabled() {
+        return next.run(request).await;
+    }
+    // The cluster egress-health probe is a POST but carries no durable work; it
+    // must bypass admission so RSS pressure is never mistaken for an egress
+    // fault (which would wrongly trigger a leadership yield).
+    if request.uri().path() == CLUSTER_PROBE_PATH {
         return next.run(request).await;
     }
     let method = request.method();

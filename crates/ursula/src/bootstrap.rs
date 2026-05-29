@@ -1,6 +1,7 @@
 //! Process-level orchestration: env-driven `ShardRuntime` constructors and
 //! the cold-flush background worker.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -77,10 +78,11 @@ pub fn spawn_static_grpc_raft_memory_runtime(
     let cold_store = cold_store_from_env()?;
     let snapshot_store = snapshot_store_from_env_or_error()?;
     let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
+    let peers: Vec<(u64, String)> = peers.into_iter().collect();
     let registry = RaftGroupHandleRegistry::default();
     let factory = StaticGrpcRaftGroupEngineFactory::new(
         node_id,
-        peers,
+        peers.clone(),
         initialize_membership,
         registry.clone(),
     )
@@ -91,6 +93,8 @@ pub fn spawn_static_grpc_raft_memory_runtime(
     spawn_cold_flush_worker_if_configured(&runtime);
     spawn_cold_gc_worker_if_configured(&runtime);
     spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
+    spawn_leadership_balancer_if_configured(&registry);
+    spawn_cluster_egress_gate_if_configured(&registry, node_id, &peers);
     Ok((runtime, registry))
 }
 
@@ -104,10 +108,11 @@ pub fn spawn_static_grpc_raft_memory_runtime_with_per_group_initializers(
     let cold_store = cold_store_from_env()?;
     let snapshot_store = snapshot_store_from_env_or_error()?;
     let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
+    let peers: Vec<(u64, String)> = peers.into_iter().collect();
     let registry = RaftGroupHandleRegistry::default();
     let factory = StaticGrpcRaftGroupEngineFactory::new(
         node_id,
-        peers,
+        peers.clone(),
         initialize_membership,
         registry.clone(),
     )
@@ -119,6 +124,8 @@ pub fn spawn_static_grpc_raft_memory_runtime_with_per_group_initializers(
     spawn_cold_flush_worker_if_configured(&runtime);
     spawn_cold_gc_worker_if_configured(&runtime);
     spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
+    spawn_leadership_balancer_if_configured(&registry);
+    spawn_cluster_egress_gate_if_configured(&registry, node_id, &peers);
     Ok((runtime, registry))
 }
 
@@ -133,10 +140,11 @@ pub fn spawn_static_grpc_raft_runtime(
     let cold_store = cold_store_from_env()?;
     let snapshot_store = snapshot_store_from_env_or_error()?;
     let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
+    let peers: Vec<(u64, String)> = peers.into_iter().collect();
     let registry = RaftGroupHandleRegistry::default();
     let factory = StaticGrpcRaftGroupEngineFactory::new(
         node_id,
-        peers,
+        peers.clone(),
         initialize_membership,
         registry.clone(),
     )
@@ -148,6 +156,8 @@ pub fn spawn_static_grpc_raft_runtime(
     spawn_cold_flush_worker_if_configured(&runtime);
     spawn_cold_gc_worker_if_configured(&runtime);
     spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
+    spawn_leadership_balancer_if_configured(&registry);
+    spawn_cluster_egress_gate_if_configured(&registry, node_id, &peers);
     Ok((runtime, registry))
 }
 
@@ -162,10 +172,11 @@ pub fn spawn_static_grpc_raft_runtime_with_per_group_initializers(
     let cold_store = cold_store_from_env()?;
     let snapshot_store = snapshot_store_from_env_or_error()?;
     let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
+    let peers: Vec<(u64, String)> = peers.into_iter().collect();
     let registry = RaftGroupHandleRegistry::default();
     let factory = StaticGrpcRaftGroupEngineFactory::new(
         node_id,
-        peers,
+        peers.clone(),
         initialize_membership,
         registry.clone(),
     )
@@ -178,6 +189,8 @@ pub fn spawn_static_grpc_raft_runtime_with_per_group_initializers(
     spawn_cold_flush_worker_if_configured(&runtime);
     spawn_cold_gc_worker_if_configured(&runtime);
     spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
+    spawn_leadership_balancer_if_configured(&registry);
+    spawn_cluster_egress_gate_if_configured(&registry, node_id, &peers);
     Ok((runtime, registry))
 }
 
@@ -469,6 +482,184 @@ pub fn spawn_snapshot_driver_if_configured(
             }
 
             tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+/// M1 — leadership balancing. Spreads raft-group leadership evenly across
+/// nodes so a single node's failure or network impairment can stall at most
+/// its `ceil(groups / nodes)` share rather than the whole cluster (leadership
+/// concentration is what turns one impaired node into a cluster-wide ops drop).
+///
+/// Each node runs this independently and only moves groups it currently leads;
+/// `current_leader` is globally agreed, so every node computes the same
+/// distribution and converges. One transfer per tick keeps convergence gentle
+/// and avoids thundering-herd handoffs. `transfer_leader` brings the target up
+/// to date before handing off, so a lagging or unhealthy (elections-disabled)
+/// target simply makes the transfer a no-op that retries next tick.
+pub fn spawn_leadership_balancer_if_configured(registry: &RaftGroupHandleRegistry) {
+    let interval_ms = env_usize("URSULA_LEADERSHIP_BALANCE_MS", 15_000);
+    if interval_ms == 0 {
+        return;
+    }
+    let registry = registry.clone();
+    tokio::spawn(async move {
+        let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(15_000));
+        loop {
+            tokio::time::sleep(interval).await;
+            let snaps = registry.metrics_snapshot();
+            if snaps.is_empty() {
+                continue;
+            }
+            let my_id = snaps[0].node_id;
+            let node_ids: HashSet<u64> = snaps
+                .iter()
+                .flat_map(|snap| snap.voter_ids.iter().copied())
+                .collect();
+            let node_count = node_ids.len().max(1);
+            let group_count = snaps.len();
+            let fair = group_count.div_ceil(node_count);
+
+            let mut leader_count: HashMap<u64, usize> = HashMap::new();
+            for snap in &snaps {
+                if let Some(leader) = snap.current_leader {
+                    *leader_count.entry(leader).or_insert(0) += 1;
+                }
+            }
+            if leader_count.get(&my_id).copied().unwrap_or(0) <= fair {
+                continue; // this node is at or below its fair share
+            }
+
+            // Shed one group I lead to the most under-loaded eligible voter.
+            let mut best: Option<(u32, u64, usize)> = None; // (group, target, target_load)
+            for snap in &snaps {
+                if snap.current_leader != Some(my_id) {
+                    continue;
+                }
+                for target in snap.voter_ids.iter().copied().filter(|v| *v != my_id) {
+                    let load = leader_count.get(&target).copied().unwrap_or(0);
+                    if load < fair && best.is_none_or(|(_, _, b)| load < b) {
+                        best = Some((snap.raft_group_id, target, load));
+                    }
+                }
+            }
+            if let Some((gid, target, _)) = best
+                && let Some(raft) = registry.get(RaftGroupId(gid))
+            {
+                match raft.trigger().transfer_leader(target).await {
+                    Ok(()) => eprintln!(
+                        "leadership-balance: node {my_id} handing group {gid} -> node {target} (fair={fair})"
+                    ),
+                    Err(err) => eprintln!(
+                        "leadership-balance: transfer_leader group {gid} -> {target} failed: {err}"
+                    ),
+                }
+            }
+        }
+    });
+}
+
+/// M2 — egress-health leadership gate. Each node actively measures its own
+/// egress to peers over the cluster plane (a payload POST with a tight
+/// deadline, sized so 15% loss / added delay fails it while a healthy link
+/// passes trivially — a heartbeat-sized probe would be masked by loss). A node
+/// that cannot push to a quorum of peers cannot replicate, so it sheds
+/// leadership and disables elections; it re-enables once its egress is clean.
+///
+/// Unlike inferring health from commit progress (load-dependent, and gone once
+/// the client gives up), this probe is role-independent: a yielded follower
+/// keeps measuring its own egress, so recovery is self-evident even though
+/// egress-only loss leaves its inbound replication looking healthy. That is
+/// what prevents the flap that a commit-stall step-down suffers.
+pub fn spawn_cluster_egress_gate_if_configured(
+    registry: &RaftGroupHandleRegistry,
+    node_id: u64,
+    peers: &[(u64, String)],
+) {
+    let interval_ms = env_usize("URSULA_CLUSTER_PROBE_MS", 2_000);
+    if interval_ms == 0 {
+        return;
+    }
+    let peer_urls: Vec<String> = peers
+        .iter()
+        .filter(|(id, _)| *id != node_id)
+        .map(|(_, url)| url.clone())
+        .collect();
+    if peer_urls.is_empty() {
+        return; // single node: no quorum to lose
+    }
+    // Peers we must still reach to keep a commit quorum (self already counts).
+    let total_nodes = peer_urls.len() + 1;
+    let needed_peers = (total_nodes / 2 + 1).saturating_sub(1).max(1);
+    let probe_bytes = env_usize("URSULA_CLUSTER_PROBE_BYTES", 64 * 1024);
+    let probe_timeout_ms = env_usize("URSULA_CLUSTER_PROBE_TIMEOUT_MS", 500);
+    let unhealthy_ticks = env_usize("URSULA_CLUSTER_PROBE_UNHEALTHY_TICKS", 2).max(1);
+    let heal_ticks = env_usize("URSULA_CLUSTER_PROBE_HEAL_TICKS", 3).max(1);
+    let registry = registry.clone();
+    tokio::spawn(async move {
+        let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(2_000));
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_millis(
+                u64::try_from(probe_timeout_ms).unwrap_or(500),
+            ))
+            .build()
+        {
+            Ok(client) => client,
+            Err(err) => {
+                eprintln!("cluster-egress: failed to build probe client: {err}");
+                return;
+            }
+        };
+        let payload = vec![0u8; probe_bytes];
+        let mut consecutive_bad = 0usize;
+        let mut consecutive_good = 0usize;
+        let mut yielded = false;
+        loop {
+            tokio::time::sleep(interval).await;
+            let mut healthy_peers = 0usize;
+            for url in &peer_urls {
+                let probe_url = format!("{url}{}", crate::CLUSTER_PROBE_PATH);
+                if let Ok(resp) = client.post(&probe_url).body(payload.clone()).send().await
+                    && resp.status().is_success()
+                {
+                    healthy_peers += 1;
+                }
+            }
+            let can_reach_quorum = healthy_peers >= needed_peers;
+            if can_reach_quorum {
+                consecutive_good += 1;
+                consecutive_bad = 0;
+            } else {
+                consecutive_bad += 1;
+                consecutive_good = 0;
+            }
+
+            if !yielded && consecutive_bad >= unhealthy_ticks {
+                yielded = true;
+                for snap in registry.metrics_snapshot() {
+                    let Some(raft) = registry.get(RaftGroupId(snap.raft_group_id)) else {
+                        continue;
+                    };
+                    raft.runtime_config().elect(false);
+                    if snap.current_leader == Some(node_id)
+                        && let Some(target) = snap.voter_ids.iter().copied().find(|v| *v != node_id)
+                    {
+                        let _ = raft.trigger().transfer_leader(target).await;
+                    }
+                }
+                eprintln!(
+                    "cluster-egress: node {node_id} egress degraded (reached {healthy_peers}/{} peers, need {needed_peers}); yielding leadership",
+                    peer_urls.len()
+                );
+            } else if yielded && consecutive_good >= heal_ticks {
+                yielded = false;
+                for snap in registry.metrics_snapshot() {
+                    if let Some(raft) = registry.get(RaftGroupId(snap.raft_group_id)) {
+                        raft.runtime_config().elect(true);
+                    }
+                }
+                eprintln!("cluster-egress: node {node_id} egress recovered; re-enabling elections");
+            }
         }
     });
 }
