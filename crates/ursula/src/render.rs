@@ -484,6 +484,12 @@ pub(crate) fn render_metrics(
     body.push_str(&snapshot.cold_orphan_cleanup_errors.to_string());
     body.push_str(",\"cold_orphan_bytes\":");
     body.push_str(&snapshot.cold_orphan_bytes.to_string());
+    body.push_str(",\"cold_gc_reclaimed\":");
+    body.push_str(&snapshot.cold_gc_reclaimed.to_string());
+    body.push_str(",\"cold_gc_errors\":");
+    body.push_str(&snapshot.cold_gc_errors.to_string());
+    body.push_str(",\"cold_flush_write_errors\":");
+    body.push_str(&snapshot.cold_flush_write_errors.to_string());
     body.push_str(",\"cold_hot_bytes\":");
     body.push_str(&snapshot.cold_hot_bytes.to_string());
     body.push_str(",\"per_group_cold_hot_bytes\":");

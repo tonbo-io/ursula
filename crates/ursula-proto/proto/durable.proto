@@ -85,6 +85,7 @@ message RaftGroupCommandV1 {
     CloseStreamCommandV1 close_stream = 11;
     DeleteStreamCommandV1 delete_stream = 12;
     BatchCommandV1 batch = 13;
+    AckColdGcCommandV1 ack_cold_gc = 14;
   }
 }
 
@@ -187,6 +188,10 @@ message BatchCommandV1 {
   repeated RaftGroupCommandV1 commands = 1;
 }
 
+message AckColdGcCommandV1 {
+  uint64 up_to_seq = 1;
+}
+
 message RaftGroupResponseV1 {
   oneof response {
     BlankResponseV1 blank = 1;
@@ -213,6 +218,7 @@ message WriteAppliedResponseV1 {
     CloseStreamResponseV1 close_stream = 9;
     DeleteStreamResponseV1 delete_stream = 10;
     BatchResponseV1 batch = 11;
+    AckColdGcResponseV1 ack_cold_gc = 12;
   }
 }
 
@@ -286,6 +292,12 @@ message DeleteStreamResponseV1 {
   uint64 group_commit_index = 2;
   bool hard_deleted = 3;
   BucketStreamIdV1 parent_to_release = 4;
+}
+
+message AckColdGcResponseV1 {
+  ShardPlacementV1 placement = 1;
+  uint64 removed = 2;
+  uint64 group_commit_index = 3;
 }
 
 message BatchResponseV1 {

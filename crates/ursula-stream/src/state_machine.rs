@@ -5,11 +5,11 @@ use ursula_shard::BucketStreamId;
 use crate::command::StreamCommand;
 use crate::integrity::StreamIntegrity;
 use crate::model::{
-    AppendExternalInput, AppendStreamInput, ColdChunkRef, ColdFlushCandidate, ExternalPayloadRef,
-    HotPayloadSegment, ObjectPayloadRef, ProducerAppendRecord, ProducerRequest, ProducerSnapshot,
-    ProducerState, StreamBatchAppend, StreamBatchAppendItem, StreamBootstrapPlan,
-    StreamMessageRecord, StreamMetadata, StreamRead, StreamReadObjectSegment, StreamReadPlan,
-    StreamReadSegment, StreamStatus, StreamVisibleSnapshot,
+    AppendExternalInput, AppendStreamInput, ColdChunkRef, ColdFlushCandidate, ColdGcEntry,
+    ColdGcTarget, ExternalPayloadRef, HotPayloadSegment, ObjectPayloadRef, ProducerAppendRecord,
+    ProducerRequest, ProducerSnapshot, ProducerState, StreamBatchAppend, StreamBatchAppendItem,
+    StreamBootstrapPlan, StreamMessageRecord, StreamMetadata, StreamRead, StreamReadObjectSegment,
+    StreamReadPlan, StreamReadSegment, StreamStatus, StreamVisibleSnapshot,
 };
 use crate::response::{StreamErrorCode, StreamResponse};
 use crate::snapshot::{StreamSnapshot, StreamSnapshotEntry, StreamSnapshotError};
@@ -26,6 +26,8 @@ pub struct StreamStateMachine {
     integrities: HashMap<BucketStreamId, StreamIntegrity>,
     visible_snapshots: HashMap<BucketStreamId, StreamVisibleSnapshot>,
     producers: HashMap<BucketStreamId, HashMap<String, ProducerState>>,
+    pending_cold_gc: VecDeque<ColdGcEntry>,
+    next_cold_gc_seq: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -352,6 +354,7 @@ impl StreamStateMachine {
                 now_ms,
             } => self.close(stream_id, stream_seq, producer, now_ms),
             StreamCommand::DeleteStream { stream_id } => self.delete_stream(&stream_id),
+            StreamCommand::AckColdGc { up_to_seq } => self.ack_cold_gc(up_to_seq),
         }
     }
 
@@ -624,7 +627,12 @@ impl StreamStateMachine {
             compare_stream_ids(&left.metadata.stream_id, &right.metadata.stream_id)
         });
 
-        StreamSnapshot { buckets, streams }
+        StreamSnapshot {
+            buckets,
+            streams,
+            pending_cold_gc: self.pending_cold_gc.iter().cloned().collect(),
+            next_cold_gc_seq: self.next_cold_gc_seq,
+        }
     }
 
     pub fn restore(snapshot: StreamSnapshot) -> Result<Self, StreamSnapshotError> {
@@ -726,6 +734,9 @@ impl StreamStateMachine {
             }
             machine.producers.insert(stream_id.clone(), producer_states);
         }
+
+        machine.pending_cold_gc = snapshot.pending_cold_gc.into_iter().collect();
+        machine.next_cold_gc_seq = snapshot.next_cold_gc_seq;
 
         Ok(machine)
     }
@@ -2084,16 +2095,55 @@ impl StreamStateMachine {
     fn remove_stream_state(&mut self, stream_id: &BucketStreamId) -> bool {
         if self.streams.remove(stream_id).is_some() {
             self.hot_buffers.remove(stream_id);
-            self.cold_chunks.remove(stream_id);
+            let had_cold = self
+                .cold_chunks
+                .remove(stream_id)
+                .is_some_and(|chunks| !chunks.is_empty());
             self.external_segments.remove(stream_id);
             self.message_records.remove(stream_id);
             self.integrities.remove(stream_id);
             self.visible_snapshots.remove(stream_id);
             self.producers.remove(stream_id);
+            // The cold objects we wrote for this stream are now unreferenced.
+            // Enqueue the whole prefix for the background GC worker to reclaim;
+            // cold objects are stream-exclusive (forks copy, never share), so a
+            // prefix sweep is safe and keeps the queue O(streams) not O(chunks).
+            if had_cold {
+                self.enqueue_cold_gc(ColdGcTarget::Stream(stream_id.clone()));
+            }
             true
         } else {
             false
         }
+    }
+
+    fn enqueue_cold_gc(&mut self, target: ColdGcTarget) {
+        let seq = self.next_cold_gc_seq;
+        self.next_cold_gc_seq = self.next_cold_gc_seq.saturating_add(1);
+        self.pending_cold_gc.push_back(ColdGcEntry { seq, target });
+    }
+
+    fn ack_cold_gc(&mut self, up_to_seq: u64) -> StreamResponse {
+        let before = self.pending_cold_gc.len();
+        while self
+            .pending_cold_gc
+            .front()
+            .is_some_and(|entry| entry.seq <= up_to_seq)
+        {
+            self.pending_cold_gc.pop_front();
+        }
+        let removed = u64::try_from(before - self.pending_cold_gc.len()).expect("removed fits u64");
+        StreamResponse::ColdGcAcked { removed }
+    }
+
+    /// A bounded snapshot of the front of the GC queue for the leader's worker
+    /// to reclaim. Read-only; draining is confirmed by a replicated `AckColdGc`.
+    pub fn pending_cold_gc_batch(&self, max: usize) -> Vec<ColdGcEntry> {
+        self.pending_cold_gc.iter().take(max).cloned().collect()
+    }
+
+    pub fn pending_cold_gc_len(&self) -> usize {
+        self.pending_cold_gc.len()
     }
 
     fn validate_stream_scope(&self, stream_id: &BucketStreamId) -> Result<(), StreamResponse> {
@@ -2149,11 +2199,21 @@ impl StreamStateMachine {
         if let Some(integrity) = self.integrities.get_mut(stream_id) {
             integrity.evict_before(retained_offset);
         }
+        let mut dropped_cold_paths = Vec::new();
         if let Some(chunks) = self.cold_chunks.get_mut(stream_id) {
-            chunks.retain(|chunk| chunk.end_offset > retained_offset);
+            chunks.retain(|chunk| {
+                let retain = chunk.end_offset > retained_offset;
+                if !retain {
+                    dropped_cold_paths.push(chunk.s3_path.clone());
+                }
+                retain
+            });
             if chunks.is_empty() {
                 self.cold_chunks.remove(stream_id);
             }
+        }
+        if !dropped_cold_paths.is_empty() {
+            self.enqueue_cold_gc(ColdGcTarget::Paths(dropped_cold_paths));
         }
         if let Some(objects) = self.external_segments.get_mut(stream_id) {
             objects.retain(|object| object.end_offset > retained_offset);

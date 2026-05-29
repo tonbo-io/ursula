@@ -1,9 +1,9 @@
 use prost::Message;
 use ursula_proto as raft_app_proto;
 use ursula_runtime::{
-    AppendResponse, CloseStreamResponse, CreateStreamResponse, DeleteStreamResponse,
-    FlushColdResponse, ForkRefResponse, GroupAppendBatchResponse, GroupEngineError,
-    GroupLeaderHint, GroupWriteCommand, GroupWriteResponse, HeadStreamResponse,
+    AckColdGcResponse, AppendResponse, CloseStreamResponse, CreateStreamResponse,
+    DeleteStreamResponse, FlushColdResponse, ForkRefResponse, GroupAppendBatchResponse,
+    GroupEngineError, GroupLeaderHint, GroupWriteCommand, GroupWriteResponse, HeadStreamResponse,
     PublishSnapshotResponse, ReadStreamResponse, StreamErrorCode, StreamIntegritySnapshot,
     TouchStreamAccessResponse,
 };
@@ -116,6 +116,9 @@ pub(crate) fn group_write_command_from_proto(
         }),
         Command::DeleteStream(command) => Ok(GroupWriteCommand::DeleteStream {
             stream_id: stream_id_from_proto(command.stream_id, "delete_stream.stream_id")?,
+        }),
+        Command::AckColdGc(command) => Ok(GroupWriteCommand::AckColdGc {
+            up_to_seq: command.up_to_seq,
         }),
         Command::Batch(command) => Ok(GroupWriteCommand::Batch {
             commands: command
@@ -246,6 +249,9 @@ pub(crate) fn write_applied_response_to_proto(
         GroupWriteResponse::DeleteStream(response) => {
             Response::DeleteStream(delete_stream_response_to_proto(response))
         }
+        GroupWriteResponse::AckColdGc(response) => {
+            Response::AckColdGc(ack_cold_gc_response_to_proto(response))
+        }
         GroupWriteResponse::Batch(items) => Response::Batch(raft_app_proto::BatchResponseV1 {
             items: items
                 .into_iter()
@@ -363,6 +369,16 @@ pub(crate) fn delete_stream_response_to_proto(
     }
 }
 
+pub(crate) fn ack_cold_gc_response_to_proto(
+    response: AckColdGcResponse,
+) -> raft_app_proto::AckColdGcResponseV1 {
+    raft_app_proto::AckColdGcResponseV1 {
+        placement: Some(placement_to_proto(response.placement)),
+        removed: response.removed,
+        group_commit_index: response.group_commit_index,
+    }
+}
+
 pub(crate) fn append_result_to_proto(
     result: Result<AppendResponse, GroupEngineError>,
 ) -> raft_app_proto::AppendResultV1 {
@@ -443,6 +459,9 @@ pub(crate) fn group_write_response_from_proto(
         )),
         Response::DeleteStream(response) => Ok(GroupWriteResponse::DeleteStream(
             delete_stream_response_from_proto(response)?,
+        )),
+        Response::AckColdGc(response) => Ok(GroupWriteResponse::AckColdGc(
+            ack_cold_gc_response_from_proto(response)?,
         )),
         Response::Batch(response) => Ok(GroupWriteResponse::Batch(
             response
@@ -649,6 +668,16 @@ pub(crate) fn delete_stream_response_from_proto(
         group_commit_index: response.group_commit_index,
         hard_deleted: response.hard_deleted,
         parent_to_release: optional_stream_id_from_proto(response.parent_to_release)?,
+    })
+}
+
+pub(crate) fn ack_cold_gc_response_from_proto(
+    response: raft_app_proto::AckColdGcResponseV1,
+) -> Result<AckColdGcResponse, GroupEngineError> {
+    Ok(AckColdGcResponse {
+        placement: placement_from_proto(response.placement, "ack_cold_gc_response.placement")?,
+        removed: response.removed,
+        group_commit_index: response.group_commit_index,
     })
 }
 

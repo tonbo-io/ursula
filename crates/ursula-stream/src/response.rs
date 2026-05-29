@@ -60,6 +60,9 @@ pub enum StreamResponse {
         changed: bool,
         expired: bool,
     },
+    ColdGcAcked {
+        removed: u64,
+    },
     Error {
         code: StreamErrorCode,
         message: String,

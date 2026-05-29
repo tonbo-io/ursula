@@ -310,6 +310,9 @@ impl RuntimeMetrics {
         let cold_orphan_cleanup_attempts = self.inner.cold_orphan_cleanup_attempts.load_relaxed();
         let cold_orphan_cleanup_errors = self.inner.cold_orphan_cleanup_errors.load_relaxed();
         let cold_orphan_bytes = self.inner.cold_orphan_bytes.load_relaxed();
+        let cold_gc_reclaimed = self.inner.cold_gc_reclaimed.load_relaxed();
+        let cold_gc_errors = self.inner.cold_gc_errors.load_relaxed();
+        let cold_flush_write_errors = self.inner.cold_flush_write_errors.load_relaxed();
         let per_group_cold_hot_bytes = self
             .inner
             .per_group_cold_hot_bytes
@@ -420,6 +423,9 @@ impl RuntimeMetrics {
             cold_flush_publish_ns,
             cold_orphan_cleanup_attempts,
             cold_orphan_cleanup_errors,
+            cold_gc_reclaimed,
+            cold_gc_errors,
+            cold_flush_write_errors,
             cold_orphan_bytes,
             cold_hot_bytes,
             per_group_cold_hot_bytes,
@@ -512,6 +518,9 @@ pub struct RuntimeMetricsSnapshot {
     pub cold_orphan_cleanup_attempts: u64,
     pub cold_orphan_cleanup_errors: u64,
     pub cold_orphan_bytes: u64,
+    pub cold_gc_reclaimed: u64,
+    pub cold_gc_errors: u64,
+    pub cold_flush_write_errors: u64,
     pub cold_hot_bytes: u64,
     pub per_group_cold_hot_bytes: Vec<u64>,
     pub cold_hot_group_bytes_max: u64,
@@ -581,6 +590,9 @@ pub(crate) struct RuntimeMetricsInner {
     pub(crate) cold_flush_publish_ns: PaddedAtomicU64,
     pub(crate) cold_orphan_cleanup_attempts: PaddedAtomicU64,
     pub(crate) cold_orphan_cleanup_errors: PaddedAtomicU64,
+    pub(crate) cold_gc_reclaimed: PaddedAtomicU64,
+    pub(crate) cold_gc_errors: PaddedAtomicU64,
+    pub(crate) cold_flush_write_errors: PaddedAtomicU64,
     pub(crate) cold_orphan_bytes: PaddedAtomicU64,
     pub(crate) per_group_cold_hot_bytes: Vec<PaddedAtomicU64>,
     pub(crate) per_group_cold_hot_bytes_max: Vec<PaddedAtomicU64>,
@@ -712,6 +724,9 @@ impl RuntimeMetricsInner {
             cold_flush_publish_ns: PaddedAtomicU64::new(0),
             cold_orphan_cleanup_attempts: PaddedAtomicU64::new(0),
             cold_orphan_cleanup_errors: PaddedAtomicU64::new(0),
+            cold_gc_reclaimed: PaddedAtomicU64::new(0),
+            cold_gc_errors: PaddedAtomicU64::new(0),
+            cold_flush_write_errors: PaddedAtomicU64::new(0),
             cold_orphan_bytes: PaddedAtomicU64::new(0),
             per_group_cold_hot_bytes: (0..raft_group_count)
                 .map(|_| PaddedAtomicU64::new(0))
@@ -883,6 +898,18 @@ impl RuntimeMetricsInner {
             self.cold_orphan_cleanup_errors.fetch_add_relaxed(1);
             self.cold_orphan_bytes.fetch_add_relaxed(bytes);
         }
+    }
+
+    pub(crate) fn record_cold_gc_reclaimed(&self, entries: u64) {
+        self.cold_gc_reclaimed.fetch_add_relaxed(entries);
+    }
+
+    pub(crate) fn record_cold_flush_write_error(&self) {
+        self.cold_flush_write_errors.fetch_add_relaxed(1);
+    }
+
+    pub(crate) fn record_cold_gc_error(&self) {
+        self.cold_gc_errors.fetch_add_relaxed(1);
     }
 
     pub(crate) fn record_cold_hot_backlog(

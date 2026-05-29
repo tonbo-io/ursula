@@ -5,10 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::rt::time::Instant;
 use bytes::Bytes;
 use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardId, ShardPlacement, StaticShardMap};
-use ursula_stream::{ColdChunkRef, ColdFlushCandidate, StreamErrorCode};
+use ursula_stream::{ColdChunkRef, ColdFlushCandidate, ColdGcEntry, ColdGcTarget, StreamErrorCode};
 
 use crate::admission::{RaftUncommittedAdmission, RaftUncommittedBytesTracker};
-use crate::cold_store::{ColdStoreHandle, ColdStoreInfo, new_cold_chunk_path};
+use crate::cold_store::{ColdStoreHandle, ColdStoreInfo, cold_chunk_prefix, new_cold_chunk_path};
 use crate::command::GroupSnapshot;
 use crate::core_worker::{CoreCommand, CoreMailbox, CoreWorker, WaitReadCancel};
 use crate::engine::in_memory::InMemoryGroupEngineFactory;
@@ -19,12 +19,12 @@ use crate::metrics::{
     elapsed_ns, is_stale_cold_flush_candidate_error,
 };
 use crate::request::{
-    AppendBatchRequest, AppendBatchResponse, AppendExternalRequest, AppendRequest, AppendResponse,
-    BootstrapStreamRequest, BootstrapStreamResponse, CloseStreamRequest, CloseStreamResponse,
-    ColdWriteAdmission, CreateStreamExternalRequest, CreateStreamRequest, CreateStreamResponse,
-    DeleteSnapshotRequest, DeleteStreamRequest, DeleteStreamResponse, FlushColdRequest,
-    FlushColdResponse, ForkRefResponse, HeadStreamRequest, HeadStreamResponse,
-    PlanColdFlushRequest, PlanGroupColdFlushRequest, PublishSnapshotRequest,
+    AckColdGcResponse, AppendBatchRequest, AppendBatchResponse, AppendExternalRequest,
+    AppendRequest, AppendResponse, BootstrapStreamRequest, BootstrapStreamResponse,
+    CloseStreamRequest, CloseStreamResponse, ColdWriteAdmission, CreateStreamExternalRequest,
+    CreateStreamRequest, CreateStreamResponse, DeleteSnapshotRequest, DeleteStreamRequest,
+    DeleteStreamResponse, FlushColdRequest, FlushColdResponse, ForkRefResponse, HeadStreamRequest,
+    HeadStreamResponse, PlanColdFlushRequest, PlanGroupColdFlushRequest, PublishSnapshotRequest,
     PublishSnapshotResponse, ReadSnapshotRequest, ReadSnapshotResponse, ReadStreamRequest,
     ReadStreamResponse,
 };
@@ -736,12 +736,19 @@ impl ShardRuntime {
             candidate.end_offset,
         );
         let upload_started_at = Instant::now();
-        let object_size = cold_store
-            .write_chunk(&path, &candidate.payload)
-            .await
-            .map_err(|err| RuntimeError::ColdStoreIo {
-                message: err.to_string(),
-            })?;
+        let object_size = match cold_store.write_chunk(&path, &candidate.payload).await {
+            Ok(object_size) => object_size,
+            Err(err) => {
+                // Surfaces "this node can't write to S3" to the snapshot driver's
+                // health/yield logic, which drives leadership-yield off real cold
+                // flush failures rather than a stat probe a keep-alive connection
+                // can mask.
+                self.metrics.record_cold_flush_write_error();
+                return Err(RuntimeError::ColdStoreIo {
+                    message: err.to_string(),
+                });
+            }
+        };
         self.metrics
             .record_cold_upload(object_size, elapsed_ns(upload_started_at));
         let publish_started_at = Instant::now();
@@ -870,6 +877,122 @@ impl ShardRuntime {
                 .len();
         }
         Ok(flushed)
+    }
+
+    async fn plan_cold_gc(
+        &self,
+        raft_group_id: RaftGroupId,
+        max: usize,
+    ) -> Result<Vec<ColdGcEntry>, RuntimeError> {
+        let placement = self.placement_for_group(raft_group_id)?;
+        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send_core_command(
+            mailbox,
+            CoreCommand::PlanColdGc {
+                max,
+                placement,
+                response_tx,
+            },
+            response_rx,
+        )
+        .await
+    }
+
+    async fn ack_cold_gc(
+        &self,
+        raft_group_id: RaftGroupId,
+        up_to_seq: u64,
+    ) -> Result<AckColdGcResponse, RuntimeError> {
+        let placement = self.placement_for_group(raft_group_id)?;
+        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send_core_command(
+            mailbox,
+            CoreCommand::AckColdGc {
+                up_to_seq,
+                placement,
+                response_tx,
+            },
+            response_rx,
+        )
+        .await
+    }
+
+    /// Drains the leader-side cold-GC queue for one group: physically reclaims
+    /// each queued target from cold storage, then replicates an ack that pops
+    /// the reclaimed entries. Deletions are idempotent, so a crash or leader
+    /// change between reclaim and ack simply re-runs them next tick.
+    pub async fn run_cold_gc_group_once(
+        &self,
+        raft_group_id: RaftGroupId,
+        max_entries: usize,
+    ) -> Result<usize, RuntimeError> {
+        let Some(cold_store) = self.cold_store.as_ref() else {
+            return Ok(0);
+        };
+        let entries = self.plan_cold_gc(raft_group_id, max_entries).await?;
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let mut acked_seq = None;
+        let mut reclaimed = 0usize;
+        // Entries are FIFO by seq; stop at the first failure so the ack never
+        // skips past an object that is still present in cold storage.
+        for entry in entries {
+            let result = match &entry.target {
+                ColdGcTarget::Stream(stream_id) => {
+                    cold_store.remove_all(&cold_chunk_prefix(stream_id)).await
+                }
+                ColdGcTarget::Paths(paths) => {
+                    let mut outcome = Ok(());
+                    for path in paths {
+                        if let Err(err) = cold_store.delete_chunk(path).await {
+                            outcome = Err(err);
+                            break;
+                        }
+                    }
+                    outcome
+                }
+            };
+            match result {
+                Ok(()) => {
+                    acked_seq = Some(entry.seq);
+                    reclaimed += 1;
+                }
+                Err(err) => {
+                    self.metrics.record_cold_gc_error();
+                    if acked_seq.is_none() {
+                        return Err(RuntimeError::ColdStoreIo {
+                            message: err.to_string(),
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+        if let Some(up_to_seq) = acked_seq {
+            self.ack_cold_gc(raft_group_id, up_to_seq).await?;
+            self.metrics
+                .record_cold_gc_reclaimed(u64::try_from(reclaimed).expect("reclaimed fits u64"));
+        }
+        Ok(reclaimed)
+    }
+
+    pub async fn run_cold_gc_all_groups_once(
+        &self,
+        max_entries_per_group: usize,
+    ) -> Result<usize, RuntimeError> {
+        if self.cold_store.is_none() {
+            return Ok(0);
+        }
+        let mut reclaimed = 0;
+        for group_id in 0..self.shard_map.raft_group_count() {
+            reclaimed += self
+                .run_cold_gc_group_once(RaftGroupId(group_id), max_entries_per_group)
+                .await?;
+        }
+        Ok(reclaimed)
     }
 
     pub async fn append(&self, request: AppendRequest) -> Result<AppendResponse, RuntimeError> {

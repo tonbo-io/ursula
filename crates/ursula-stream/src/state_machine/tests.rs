@@ -368,6 +368,125 @@ fn flush_cold_moves_hot_prefix_to_manifest_and_read_plan_splits() {
     );
 }
 
+fn flush_one_cold_chunk(machine: &mut StreamStateMachine, id: &str) {
+    machine.apply(StreamCommand::Append {
+        stream_id: stream(id),
+        content_type: Some("application/octet-stream".to_owned()),
+        payload: b"abcd".to_vec(),
+        close_after: false,
+        stream_seq: None,
+        producer: None,
+        now_ms: 0,
+    });
+    let candidate = machine
+        .plan_cold_flush(&stream(id), 4, 4)
+        .expect("plan cold flush")
+        .expect("cold flush candidate");
+    machine.apply(StreamCommand::FlushCold {
+        stream_id: stream(id),
+        chunk: ColdChunkRef {
+            start_offset: candidate.start_offset,
+            end_offset: candidate.end_offset,
+            s3_path: format!("s3://bucket/{id}/000000"),
+            object_size: u64::try_from(candidate.payload.len()).unwrap(),
+        },
+    });
+}
+
+#[test]
+fn delete_stream_enqueues_cold_gc_then_ack_drains_it() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    create_stream(&mut machine, "cold-a");
+    create_stream(&mut machine, "cold-b");
+    flush_one_cold_chunk(&mut machine, "cold-a");
+    flush_one_cold_chunk(&mut machine, "cold-b");
+
+    for id in ["cold-a", "cold-b"] {
+        assert!(matches!(
+            machine.apply(StreamCommand::DeleteStream {
+                stream_id: stream(id)
+            }),
+            StreamResponse::Deleted {
+                hard_deleted: true,
+                ..
+            }
+        ));
+    }
+
+    let pending = machine.pending_cold_gc_batch(16);
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].target, ColdGcTarget::Stream(stream("cold-a")));
+    assert_eq!(pending[1].target, ColdGcTarget::Stream(stream("cold-b")));
+    // Seqs are monotonic and FIFO-ordered.
+    assert!(pending[0].seq < pending[1].seq);
+
+    // Snapshot round-trip must preserve the queue so a crash never loses the
+    // reclamation work.
+    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
+    assert_eq!(restored.pending_cold_gc_batch(16), pending);
+
+    // Acking the first seq pops only that entry; the later one survives.
+    assert_eq!(
+        machine.apply(StreamCommand::AckColdGc {
+            up_to_seq: pending[0].seq,
+        }),
+        StreamResponse::ColdGcAcked { removed: 1 }
+    );
+    assert_eq!(machine.pending_cold_gc_batch(16), vec![pending[1].clone()]);
+    // Re-acking the same seq is idempotent.
+    assert_eq!(
+        machine.apply(StreamCommand::AckColdGc {
+            up_to_seq: pending[0].seq,
+        }),
+        StreamResponse::ColdGcAcked { removed: 0 }
+    );
+    assert_eq!(
+        machine.apply(StreamCommand::AckColdGc {
+            up_to_seq: pending[1].seq,
+        }),
+        StreamResponse::ColdGcAcked { removed: 1 }
+    );
+    assert_eq!(machine.pending_cold_gc_len(), 0);
+}
+
+#[test]
+fn expired_stream_with_cold_chunks_enqueues_cold_gc() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    machine.apply(StreamCommand::CreateStream {
+        stream_id: stream("ttl"),
+        content_type: "application/octet-stream".to_owned(),
+        initial_payload: Vec::new(),
+        close_after: false,
+        stream_seq: None,
+        producer: None,
+        stream_ttl_seconds: None,
+        stream_expires_at_ms: Some(1_000),
+        forked_from: None,
+        fork_offset: None,
+        now_ms: 0,
+    });
+    flush_one_cold_chunk(&mut machine, "ttl");
+
+    // A lazy access past the expiry removes the stream and queues its cold prefix.
+    assert!(machine.head_at(&stream("ttl"), 2_000).is_none());
+    let pending = machine.pending_cold_gc_batch(16);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].target, ColdGcTarget::Stream(stream("ttl")));
+}
+
+#[test]
+fn stream_without_cold_chunks_enqueues_nothing_on_delete() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    create_stream(&mut machine, "hot-only");
+    machine.apply(StreamCommand::DeleteStream {
+        stream_id: stream("hot-only"),
+    });
+    assert_eq!(machine.pending_cold_gc_len(), 0);
+}
+
 #[test]
 fn flush_cold_can_coalesce_contiguous_hot_segments() {
     let mut machine = StreamStateMachine::new();
@@ -959,6 +1078,8 @@ fn snapshot_order_is_deterministic() {
 fn snapshot_restore_rejects_invalid_entries() {
     assert_eq!(
         StreamStateMachine::restore(StreamSnapshot {
+            pending_cold_gc: Vec::new(),
+            next_cold_gc_seq: 0,
             buckets: vec!["benchcmp".to_owned(), "benchcmp".to_owned()],
             streams: Vec::new(),
         })
@@ -968,6 +1089,8 @@ fn snapshot_restore_rejects_invalid_entries() {
 
     assert!(matches!(
         StreamStateMachine::restore(StreamSnapshot {
+            pending_cold_gc: Vec::new(),
+            next_cold_gc_seq: 0,
             buckets: vec!["benchcmp".to_owned()],
             streams: vec![StreamSnapshotEntry {
                 metadata: StreamMetadata {
@@ -1000,6 +1123,8 @@ fn snapshot_restore_rejects_invalid_entries() {
 
     assert!(matches!(
         StreamStateMachine::restore(StreamSnapshot {
+            pending_cold_gc: Vec::new(),
+            next_cold_gc_seq: 0,
             buckets: vec!["benchcmp".to_owned()],
             streams: vec![StreamSnapshotEntry {
                 metadata: StreamMetadata {
@@ -1032,6 +1157,8 @@ fn snapshot_restore_rejects_invalid_entries() {
 
     assert!(matches!(
         StreamStateMachine::restore(StreamSnapshot {
+            pending_cold_gc: Vec::new(),
+            next_cold_gc_seq: 0,
             buckets: vec!["benchcmp".to_owned()],
             streams: vec![StreamSnapshotEntry {
                 metadata: StreamMetadata {

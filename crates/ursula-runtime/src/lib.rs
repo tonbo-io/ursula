@@ -39,27 +39,27 @@ pub use command::{GroupSnapshot, GroupWriteCommand};
 pub use engine::in_memory::{InMemoryGroupEngine, InMemoryGroupEngineFactory};
 pub use engine::wal::{WalGroupEngine, WalGroupEngineFactory};
 pub use engine::{
-    GroupAppendBatchFuture, GroupAppendBatchResponse, GroupAppendFuture,
+    GroupAckColdGcFuture, GroupAppendBatchFuture, GroupAppendBatchResponse, GroupAppendFuture,
     GroupBootstrapStreamFuture, GroupCloseStreamFuture, GroupColdHotBacklogFuture,
     GroupCreateStreamFuture, GroupDeleteSnapshotFuture, GroupDeleteStreamFuture, GroupEngine,
     GroupEngineCreateFuture, GroupEngineError, GroupEngineFactory, GroupEngineMetrics,
     GroupFlushColdFuture, GroupForkRefFuture, GroupHeadStreamFuture, GroupInstallSnapshotFuture,
-    GroupLeaderHint, GroupPlanColdFlushFuture, GroupPlanNextColdFlushBatchFuture,
-    GroupPlanNextColdFlushFuture, GroupPublishSnapshotFuture, GroupReadSnapshotFuture,
-    GroupReadStreamFuture, GroupReadStreamPartsFuture, GroupRequireLiveReadOwnerFuture,
-    GroupShutdownFuture, GroupSnapshotFuture, GroupTouchStreamAccessFuture, GroupWriteBatchFuture,
-    GroupWriteResponse,
+    GroupLeaderHint, GroupPlanColdFlushFuture, GroupPlanColdGcFuture,
+    GroupPlanNextColdFlushBatchFuture, GroupPlanNextColdFlushFuture, GroupPublishSnapshotFuture,
+    GroupReadSnapshotFuture, GroupReadStreamFuture, GroupReadStreamPartsFuture,
+    GroupRequireLiveReadOwnerFuture, GroupShutdownFuture, GroupSnapshotFuture,
+    GroupTouchStreamAccessFuture, GroupWriteBatchFuture, GroupWriteResponse,
 };
 pub use error::RuntimeError;
 pub use metrics::{RuntimeMailboxSnapshot, RuntimeMetrics, RuntimeMetricsSnapshot};
 pub use request::{
-    AppendBatchRequest, AppendBatchResponse, AppendExternalRequest, AppendRequest, AppendResponse,
-    BootstrapStreamRequest, BootstrapStreamResponse, BootstrapUpdate, CloseStreamRequest,
-    CloseStreamResponse, ColdHotBacklog, ColdWriteAdmission, CreateStreamExternalRequest,
-    CreateStreamRequest, CreateStreamResponse, DeleteSnapshotRequest, DeleteStreamRequest,
-    DeleteStreamResponse, FlushColdRequest, FlushColdResponse, ForkRefResponse,
-    GroupReadStreamBody, GroupReadStreamParts, HeadStreamRequest, HeadStreamResponse,
-    PlanColdFlushRequest, PlanGroupColdFlushRequest, PublishSnapshotRequest,
+    AckColdGcResponse, AppendBatchRequest, AppendBatchResponse, AppendExternalRequest,
+    AppendRequest, AppendResponse, BootstrapStreamRequest, BootstrapStreamResponse,
+    BootstrapUpdate, CloseStreamRequest, CloseStreamResponse, ColdHotBacklog, ColdWriteAdmission,
+    CreateStreamExternalRequest, CreateStreamRequest, CreateStreamResponse, DeleteSnapshotRequest,
+    DeleteStreamRequest, DeleteStreamResponse, FlushColdRequest, FlushColdResponse,
+    ForkRefResponse, GroupReadStreamBody, GroupReadStreamParts, HeadStreamRequest,
+    HeadStreamResponse, PlanColdFlushRequest, PlanGroupColdFlushRequest, PublishSnapshotRequest,
     PublishSnapshotResponse, ReadSnapshotRequest, ReadSnapshotResponse, ReadStreamRequest,
     ReadStreamResponse, StreamAppendCount, TouchStreamAccessResponse,
 };
@@ -73,8 +73,8 @@ pub use snapshot_store::{
 pub use snapshot_store::{LocalSnapshotStore, S3SnapshotStore};
 
 pub use ursula_stream::{
-    ColdChunkRef, ColdFlushCandidate, ExternalPayloadRef, ProducerRequest, StreamErrorCode,
-    StreamIntegritySnapshot,
+    ColdChunkRef, ColdFlushCandidate, ColdGcEntry, ColdGcTarget, ExternalPayloadRef,
+    ProducerRequest, StreamErrorCode, StreamIntegritySnapshot,
 };
 
 #[cfg(test)]

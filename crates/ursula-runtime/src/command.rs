@@ -105,6 +105,9 @@ pub enum GroupWriteCommand {
     DeleteStream {
         stream_id: BucketStreamId,
     },
+    AckColdGc {
+        up_to_seq: u64,
+    },
     Batch {
         commands: Vec<GroupWriteCommand>,
     },
@@ -417,6 +420,9 @@ impl fmt::Display for GroupWriteCommand {
             }
             Self::DeleteStream { stream_id } => {
                 write!(f, "delete_stream:{stream_id}")
+            }
+            Self::AckColdGc { up_to_seq } => {
+                write!(f, "ack_cold_gc:up_to_seq={up_to_seq}")
             }
             Self::Batch { commands } => {
                 write!(f, "batch:{} commands", commands.len())

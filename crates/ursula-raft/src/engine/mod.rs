@@ -22,17 +22,18 @@ use ursula_runtime::{
     AppendBatchRequest, AppendExternalRequest, AppendRequest, BootstrapStreamRequest,
     CloseStreamRequest, ColdStoreHandle, ColdWriteAdmission, CreateStreamExternalRequest,
     CreateStreamRequest, DeleteSnapshotRequest, DeleteStreamRequest, FlushColdRequest,
-    GroupAppendBatchFuture, GroupAppendFuture, GroupBootstrapStreamFuture, GroupCloseStreamFuture,
-    GroupColdHotBacklogFuture, GroupCreateStreamFuture, GroupDeleteSnapshotFuture,
-    GroupDeleteStreamFuture, GroupEngine, GroupEngineError, GroupEngineMetrics,
-    GroupFlushColdFuture, GroupForkRefFuture, GroupHeadStreamFuture, GroupInstallSnapshotFuture,
-    GroupPlanColdFlushFuture, GroupPlanNextColdFlushBatchFuture, GroupPlanNextColdFlushFuture,
-    GroupPublishSnapshotFuture, GroupReadSnapshotFuture, GroupReadStreamFuture,
-    GroupReadStreamParts, GroupReadStreamPartsFuture, GroupSnapshot, GroupSnapshotFuture,
-    GroupTouchStreamAccessFuture, GroupWriteBatchFuture, GroupWriteCommand, GroupWriteResponse,
-    HeadStreamRequest, PlanColdFlushRequest, PlanGroupColdFlushRequest, PublishSnapshotRequest,
-    ReadSnapshotRequest, ReadStreamRequest, SharedSnapshotStore, StreamErrorCode,
-    TouchStreamAccessResponse, default_snapshot_store,
+    GroupAckColdGcFuture, GroupAppendBatchFuture, GroupAppendFuture, GroupBootstrapStreamFuture,
+    GroupCloseStreamFuture, GroupColdHotBacklogFuture, GroupCreateStreamFuture,
+    GroupDeleteSnapshotFuture, GroupDeleteStreamFuture, GroupEngine, GroupEngineError,
+    GroupEngineMetrics, GroupFlushColdFuture, GroupForkRefFuture, GroupHeadStreamFuture,
+    GroupInstallSnapshotFuture, GroupPlanColdFlushFuture, GroupPlanColdGcFuture,
+    GroupPlanNextColdFlushBatchFuture, GroupPlanNextColdFlushFuture, GroupPublishSnapshotFuture,
+    GroupReadSnapshotFuture, GroupReadStreamFuture, GroupReadStreamParts,
+    GroupReadStreamPartsFuture, GroupSnapshot, GroupSnapshotFuture, GroupTouchStreamAccessFuture,
+    GroupWriteBatchFuture, GroupWriteCommand, GroupWriteResponse, HeadStreamRequest,
+    PlanColdFlushRequest, PlanGroupColdFlushRequest, PublishSnapshotRequest, ReadSnapshotRequest,
+    ReadStreamRequest, SharedSnapshotStore, StreamErrorCode, TouchStreamAccessResponse,
+    default_snapshot_store,
 };
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
@@ -884,6 +885,37 @@ impl GroupEngine for RaftGroupEngine {
                     "unexpected delete stream write response: {other:?}"
                 ))),
             }
+        })
+    }
+
+    fn ack_cold_gc<'a>(
+        &'a mut self,
+        up_to_seq: u64,
+        _placement: ShardPlacement,
+    ) -> GroupAckColdGcFuture<'a> {
+        Box::pin(async move {
+            match self
+                .write(GroupWriteCommand::AckColdGc { up_to_seq })
+                .await?
+            {
+                GroupWriteResponse::AckColdGc(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected ack cold gc write response: {other:?}"
+                ))),
+            }
+        })
+    }
+
+    fn plan_cold_gc<'a>(
+        &'a mut self,
+        max: usize,
+        placement: ShardPlacement,
+    ) -> GroupPlanColdGcFuture<'a> {
+        Box::pin(async move {
+            self.with_state_machine(move |state_machine| {
+                Box::pin(async move { state_machine.plan_cold_gc(max, placement).await })
+            })
+            .await?
         })
     }
 

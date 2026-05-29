@@ -1123,6 +1123,13 @@ pub fn new_cold_chunk_path(
     )
 }
 
+/// The prefix under which all of a stream's cold chunks live. Cold objects are
+/// stream-exclusive, so removing this prefix reclaims every chunk for a fully
+/// deleted stream in one sweep. Mirrors the layout of [`new_cold_chunk_path`].
+pub fn cold_chunk_prefix(stream_id: &BucketStreamId) -> String {
+    format!("{stream_id}/chunks/")
+}
+
 pub fn new_external_payload_path(stream_id: &BucketStreamId) -> String {
     let unix_nanos = cold_object_unix_nanos();
     let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);

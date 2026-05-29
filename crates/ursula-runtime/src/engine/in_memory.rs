@@ -8,20 +8,20 @@ use ursula_stream::{
 };
 
 use super::{
-    GroupAppendBatchFuture, GroupAppendBatchResponse, GroupAppendFuture,
+    GroupAckColdGcFuture, GroupAppendBatchFuture, GroupAppendBatchResponse, GroupAppendFuture,
     GroupBootstrapStreamFuture, GroupCloseStreamFuture, GroupColdHotBacklogFuture,
     GroupCreateStreamFuture, GroupDeleteSnapshotFuture, GroupDeleteStreamFuture, GroupEngine,
     GroupEngineCreateFuture, GroupEngineError, GroupEngineFactory, GroupEngineMetrics,
     GroupFlushColdFuture, GroupForkRefFuture, GroupHeadStreamFuture, GroupInstallSnapshotFuture,
-    GroupPlanColdFlushFuture, GroupPlanNextColdFlushBatchFuture, GroupPlanNextColdFlushFuture,
-    GroupPublishSnapshotFuture, GroupReadSnapshotFuture, GroupReadStreamFuture,
-    GroupReadStreamPartsFuture, GroupSnapshotFuture, GroupTouchStreamAccessFuture,
-    GroupWriteResponse,
+    GroupPlanColdFlushFuture, GroupPlanColdGcFuture, GroupPlanNextColdFlushBatchFuture,
+    GroupPlanNextColdFlushFuture, GroupPublishSnapshotFuture, GroupReadSnapshotFuture,
+    GroupReadStreamFuture, GroupReadStreamPartsFuture, GroupSnapshotFuture,
+    GroupTouchStreamAccessFuture, GroupWriteResponse,
 };
 use crate::cold_store::{ColdStoreHandle, DEFAULT_CONTENT_TYPE};
 use crate::command::{GroupSnapshot, GroupWriteCommand};
 use crate::request::{
-    AppendBatchRequest, AppendExternalRequest, AppendRequest, AppendResponse,
+    AckColdGcResponse, AppendBatchRequest, AppendExternalRequest, AppendRequest, AppendResponse,
     BootstrapStreamRequest, BootstrapStreamResponse, BootstrapUpdate, CloseStreamRequest,
     CloseStreamResponse, ColdHotBacklog, ColdWriteAdmission, CreateStreamExternalRequest,
     CreateStreamRequest, CreateStreamResponse, DeleteSnapshotRequest, DeleteStreamRequest,
@@ -603,6 +603,24 @@ impl InMemoryGroupEngine {
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected delete stream response: {other:?}"
+                    ))),
+                }
+            }
+            GroupWriteCommand::AckColdGc { up_to_seq } => {
+                let response = self
+                    .state_machine
+                    .apply(StreamCommand::AckColdGc { up_to_seq });
+                match response {
+                    StreamResponse::ColdGcAcked { removed } => {
+                        self.commit_index += 1;
+                        Ok(GroupWriteResponse::AckColdGc(AckColdGcResponse {
+                            placement,
+                            removed,
+                            group_commit_index: self.commit_index,
+                        }))
+                    }
+                    other => Err(GroupEngineError::new(format!(
+                        "unexpected ack cold gc response: {other:?}"
                     ))),
                 }
             }
@@ -1269,6 +1287,20 @@ impl InMemoryGroupEngine {
                     ))),
                 }
             }
+            StreamCommand::AckColdGc { up_to_seq } => {
+                match self
+                    .state_machine
+                    .apply(StreamCommand::AckColdGc { up_to_seq })
+                {
+                    StreamResponse::ColdGcAcked { .. } => {
+                        self.commit_index += 1;
+                        Ok(())
+                    }
+                    other => Err(GroupEngineError::new(format!(
+                        "unexpected replay ack cold gc response: {other:?}"
+                    ))),
+                }
+            }
         }
     }
 
@@ -1824,6 +1856,32 @@ impl GroupEngine for InMemoryGroupEngine {
                 ))),
             }
         })
+    }
+
+    fn ack_cold_gc<'a>(
+        &'a mut self,
+        up_to_seq: u64,
+        placement: ShardPlacement,
+    ) -> GroupAckColdGcFuture<'a> {
+        Box::pin(async move {
+            match self
+                .apply_committed_write(GroupWriteCommand::AckColdGc { up_to_seq }, placement)?
+            {
+                GroupWriteResponse::AckColdGc(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected ack cold gc write response: {other:?}"
+                ))),
+            }
+        })
+    }
+
+    fn plan_cold_gc<'a>(
+        &'a mut self,
+        max: usize,
+        _placement: ShardPlacement,
+    ) -> GroupPlanColdGcFuture<'a> {
+        let entries = self.state_machine.pending_cold_gc_batch(max);
+        Box::pin(async move { Ok(entries) })
     }
 
     fn append<'a>(

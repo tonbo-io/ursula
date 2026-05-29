@@ -113,6 +113,7 @@ impl fmt::Display for RaftGroupCommand {
             Some(raft_app_proto::raft_group_command_v1::Command::DeleteStream(_)) => {
                 "delete_stream"
             }
+            Some(raft_app_proto::raft_group_command_v1::Command::AckColdGc(_)) => "ack_cold_gc",
             Some(raft_app_proto::raft_group_command_v1::Command::Batch(_)) => "batch",
             None => "missing",
         };
@@ -278,6 +279,9 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
                 Command::DeleteStream(raft_app_proto::DeleteStreamCommandV1 {
                     stream_id: Some(stream_id.into()),
                 })
+            }
+            GroupWriteCommand::AckColdGc { up_to_seq } => {
+                Command::AckColdGc(raft_app_proto::AckColdGcCommandV1 { up_to_seq })
             }
             GroupWriteCommand::Batch { commands } => {
                 Command::Batch(raft_app_proto::BatchCommandV1 {

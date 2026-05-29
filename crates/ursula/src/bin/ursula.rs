@@ -7,8 +7,9 @@ use axum::Router;
 use serde::Deserialize;
 use ursula::{
     HttpState, client_router_from_state, cluster_router_from_state,
-    spawn_cold_flush_worker_if_configured, spawn_default_runtime, spawn_raft_memory_runtime,
-    spawn_raft_runtime, spawn_static_grpc_raft_memory_runtime,
+    spawn_cold_flush_worker_if_configured, spawn_cold_gc_worker_if_configured,
+    spawn_default_runtime, spawn_raft_memory_runtime, spawn_raft_runtime,
+    spawn_static_grpc_raft_memory_runtime,
     spawn_static_grpc_raft_memory_runtime_with_per_group_initializers,
     spawn_static_grpc_raft_runtime, spawn_static_grpc_raft_runtime_with_per_group_initializers,
     spawn_wal_runtime,
@@ -101,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         runtime.warm_all_groups().await?;
         spawn_cold_flush_worker_if_configured(&runtime);
+        spawn_cold_gc_worker_if_configured(&runtime);
         HttpState::with_static_raft_cluster(runtime, registry, args.raft_peers.clone())
     } else {
         let runtime = match (args.wal_dir, args.raft_log_dir, args.raft_memory) {

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::rt::time::Instant;
 use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardPlacement};
-use ursula_stream::ColdFlushCandidate;
+use ursula_stream::{ColdFlushCandidate, ColdGcEntry};
 
 use crate::admission::{
     RaftUncommittedAdmission, SharedRaftUncommittedBytes, UncommittedBytesGuard,
@@ -21,14 +21,14 @@ use crate::metrics::{
     record_cold_hot_backlog,
 };
 use crate::request::{
-    AppendBatchRequest, AppendBatchResponse, AppendExternalRequest, AppendRequest, AppendResponse,
-    BootstrapStreamRequest, BootstrapStreamResponse, CloseStreamRequest, CloseStreamResponse,
-    ColdWriteAdmission, CreateStreamExternalRequest, CreateStreamRequest, CreateStreamResponse,
-    DeleteSnapshotRequest, DeleteStreamRequest, DeleteStreamResponse, FlushColdRequest,
-    FlushColdResponse, ForkRefResponse, GroupReadStreamParts, HeadStreamRequest,
-    HeadStreamResponse, PlanColdFlushRequest, PlanGroupColdFlushRequest, PublishSnapshotRequest,
-    PublishSnapshotResponse, ReadSnapshotRequest, ReadSnapshotResponse, ReadStreamRequest,
-    ReadStreamResponse,
+    AckColdGcResponse, AppendBatchRequest, AppendBatchResponse, AppendExternalRequest,
+    AppendRequest, AppendResponse, BootstrapStreamRequest, BootstrapStreamResponse,
+    CloseStreamRequest, CloseStreamResponse, ColdWriteAdmission, CreateStreamExternalRequest,
+    CreateStreamRequest, CreateStreamResponse, DeleteSnapshotRequest, DeleteStreamRequest,
+    DeleteStreamResponse, FlushColdRequest, FlushColdResponse, ForkRefResponse,
+    GroupReadStreamParts, HeadStreamRequest, HeadStreamResponse, PlanColdFlushRequest,
+    PlanGroupColdFlushRequest, PublishSnapshotRequest, PublishSnapshotResponse,
+    ReadSnapshotRequest, ReadSnapshotResponse, ReadStreamRequest, ReadStreamResponse,
 };
 use crate::rt::sync::{Semaphore, mpsc, oneshot};
 
@@ -145,6 +145,16 @@ pub(crate) enum CoreCommand {
         placement: ShardPlacement,
         max_candidates: usize,
         response_tx: oneshot::Sender<Result<Vec<ColdFlushCandidate>, RuntimeError>>,
+    },
+    PlanColdGc {
+        max: usize,
+        placement: ShardPlacement,
+        response_tx: oneshot::Sender<Result<Vec<ColdGcEntry>, RuntimeError>>,
+    },
+    AckColdGc {
+        up_to_seq: u64,
+        placement: ShardPlacement,
+        response_tx: oneshot::Sender<Result<AckColdGcResponse, RuntimeError>>,
     },
     Append {
         request: AppendRequest,
@@ -565,6 +575,33 @@ impl CoreWorker {
                         GroupCommand::PlanNextColdFlushBatch {
                             request,
                             max_candidates,
+                            response_tx,
+                        },
+                    )
+                    .await;
+                }
+                CoreCommand::PlanColdGc {
+                    max,
+                    placement,
+                    response_tx,
+                } => {
+                    debug_assert_eq!(placement.core_id, self.core_id);
+                    self.send_group_command(
+                        placement,
+                        GroupCommand::PlanColdGc { max, response_tx },
+                    )
+                    .await;
+                }
+                CoreCommand::AckColdGc {
+                    up_to_seq,
+                    placement,
+                    response_tx,
+                } => {
+                    debug_assert_eq!(placement.core_id, self.core_id);
+                    self.send_group_command(
+                        placement,
+                        GroupCommand::AckColdGc {
+                            up_to_seq,
                             response_tx,
                         },
                     )
@@ -1314,6 +1351,33 @@ impl CoreWorker {
             .await;
         }
         response
+    }
+
+    pub(crate) async fn plan_cold_gc(
+        group: &mut Box<dyn GroupEngine>,
+        max: usize,
+        placement: ShardPlacement,
+    ) -> Result<Vec<ColdGcEntry>, RuntimeError> {
+        // GC is leader-side side-effecting work: only the local leader reclaims
+        // and acks, mirroring the cold-flush planner's leadership gate.
+        if !group.accepts_local_writes() {
+            return Ok(Vec::new());
+        }
+        group
+            .plan_cold_gc(max, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err))
+    }
+
+    pub(crate) async fn ack_cold_gc(
+        group: &mut Box<dyn GroupEngine>,
+        up_to_seq: u64,
+        placement: ShardPlacement,
+    ) -> Result<AckColdGcResponse, RuntimeError> {
+        group
+            .ack_cold_gc(up_to_seq, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err))
     }
 
     pub(crate) async fn plan_cold_flush(
