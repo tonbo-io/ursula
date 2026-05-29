@@ -2377,6 +2377,25 @@ class ChaosAgent:
             if elapsed < interval:
                 time.sleep(interval - elapsed)
 
+    def control_loop(self) -> None:
+        # Fault management + status publishing on a dedicated thread, decoupled
+        # from the probe loop below. The probes do many sequential reads that
+        # hang against an impaired node (each hitting the request timeout); if
+        # publishing shared a thread with them, the dashboard would freeze
+        # mid-fault and read as "ops 0" even while workers keep committing. Here
+        # status always refreshes on cadence and recovery is detected promptly.
+        last_status = 0.0
+        while True:
+            loop_started = time.monotonic()
+            try:
+                self.maybe_inject_fault()
+                if loop_started - last_status >= self.status_every:
+                    self.publish_status()
+                    last_status = loop_started
+            except Exception as exc:  # noqa: BLE001
+                self.event("warn", f"control loop error: {exc}")
+            time.sleep(1.0)
+
     def run_forever_with_append_workers(self) -> None:
         for lane_id in range(self.append_workers):
             worker = threading.Thread(
@@ -2386,21 +2405,17 @@ class ChaosAgent:
                 daemon=True,
             )
             worker.start()
+        threading.Thread(target=self.control_loop, name="control", daemon=True).start()
         self.event("info", f"{self.append_workers} append lanes started")
 
-        last_status = 0.0
         last_verified_success = 0
         last_read_probe_success = 0
         last_producer_probe_success = 0
         while True:
-            loop_started = time.monotonic()
-            # The whole tick is guarded: an exception in any probe/fault step
-            # must not kill the control loop, or status publishing and fault
-            # recovery would freeze (which previously masked the cluster's real
-            # behavior as a permanent "ops 0"). A skipped op simply retries next
-            # tick (~0.2s later).
+            # Probe loop: integrity/read/producer verification + GC churn. These
+            # may block against an impaired node, but they no longer gate fault
+            # management or status publishing (those run on control_loop).
             try:
-                self.maybe_inject_fault()
                 with self.state_lock:
                     append_success = self.append_success
 
@@ -2428,11 +2443,8 @@ class ChaosAgent:
                 ):
                     self.run_gc_churn()
                     self.last_gc_churn_success = append_success
-                if loop_started - last_status >= self.status_every:
-                    self.publish_status()
-                    last_status = loop_started
             except Exception as exc:  # noqa: BLE001
-                self.event("warn", f"control loop tick error: {exc}")
+                self.event("warn", f"probe loop tick error: {exc}")
             time.sleep(0.2)
 
 
