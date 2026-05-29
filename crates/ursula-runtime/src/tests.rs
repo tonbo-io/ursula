@@ -1043,6 +1043,49 @@ async fn install_group_snapshot_restores_group_state_and_append_counts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_after_stream_delete_installs_without_dangling_append_count() {
+    // Regression: a deleted stream must not leave a stale entry in the runtime
+    // append-count map. Such an entry would make the snapshot fail every
+    // follower's install with "append count references missing snapshot stream",
+    // so a lagging node could never catch up and leadership transfer (which
+    // catches the target up via a snapshot) could never complete.
+    let source = runtime(2, 8);
+    let stream = BucketStreamId::new("benchcmp", "churn-delete");
+    let placement = source.locate(&stream);
+    create_stream(&source, &stream).await;
+    source
+        .append(AppendRequest::from_bytes(stream.clone(), b"ab".to_vec()))
+        .await
+        .expect("append");
+    source
+        .delete_stream(DeleteStreamRequest {
+            stream_id: stream.clone(),
+        })
+        .await
+        .expect("delete");
+
+    let snapshot = source
+        .snapshot_group(placement.raft_group_id)
+        .await
+        .expect("snapshot group");
+    assert!(
+        snapshot
+            .stream_append_counts
+            .iter()
+            .all(|count| count.stream_id != stream),
+        "snapshot must not carry an append count for the deleted stream: {:?}",
+        snapshot.stream_append_counts
+    );
+
+    // Previously this failed the restore consistency check.
+    let target = runtime(2, 8);
+    target
+        .install_group_snapshot(snapshot)
+        .await
+        .expect("install snapshot after delete");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn install_group_snapshot_rejects_mismatched_placement_before_routing() {
     let runtime = runtime(2, 8);
     let snapshot = GroupSnapshot {

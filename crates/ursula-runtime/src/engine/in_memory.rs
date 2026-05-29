@@ -576,15 +576,21 @@ impl InMemoryGroupEngine {
                 }
             }
             GroupWriteCommand::DeleteStream { stream_id } => {
-                let response = self
-                    .state_machine
-                    .apply(StreamCommand::DeleteStream { stream_id });
+                let response = self.state_machine.apply(StreamCommand::DeleteStream {
+                    stream_id: stream_id.clone(),
+                });
                 match response {
                     StreamResponse::Deleted {
                         hard_deleted,
                         parent_to_release,
                     } => {
                         self.commit_index += 1;
+                        if hard_deleted {
+                            // Stream is gone: drop its runtime append count so the
+                            // map stays bounded under delete churn (snapshot build
+                            // also filters, but this avoids unbounded growth).
+                            self.stream_append_counts.remove(&stream_id);
+                        }
                         Ok(GroupWriteResponse::DeleteStream(DeleteStreamResponse {
                             placement,
                             group_commit_index: self.commit_index,
@@ -1509,18 +1515,35 @@ impl InMemoryGroupEngine {
     }
 
     pub(crate) fn build_snapshot(&self, placement: ShardPlacement) -> GroupSnapshot {
+        let stream_snapshot = self.state_machine.snapshot();
+        let stream_append_counts = self.stream_append_counts_snapshot(&stream_snapshot);
         GroupSnapshot {
             placement,
             group_commit_index: self.commit_index,
-            stream_snapshot: self.state_machine.snapshot(),
-            stream_append_counts: self.stream_append_counts_snapshot(),
+            stream_snapshot,
+            stream_append_counts,
         }
     }
 
-    pub(crate) fn stream_append_counts_snapshot(&self) -> Vec<StreamAppendCount> {
+    pub(crate) fn stream_append_counts_snapshot(
+        &self,
+        stream_snapshot: &ursula_stream::StreamSnapshot,
+    ) -> Vec<StreamAppendCount> {
+        // Only emit append counts for streams actually present in the snapshot.
+        // A deleted/expired stream can leave a stale entry in the runtime map;
+        // emitting it would make every follower's `install_snapshot` fail the
+        // `restore_stream_append_counts` consistency check, so a lagging node
+        // could never catch up (and leadership transfer, which catches the
+        // target up via a snapshot, could never complete).
+        let live: HashSet<&BucketStreamId> = stream_snapshot
+            .streams
+            .iter()
+            .map(|entry| &entry.metadata.stream_id)
+            .collect();
         let mut counts = self
             .stream_append_counts
             .iter()
+            .filter(|(stream_id, _)| live.contains(stream_id))
             .map(|(stream_id, append_count)| StreamAppendCount {
                 stream_id: stream_id.clone(),
                 append_count: *append_count,
