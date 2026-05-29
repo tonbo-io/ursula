@@ -1,6 +1,7 @@
 //! Process-level orchestration: env-driven `ShardRuntime` constructors and
 //! the cold-flush background worker.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -91,6 +92,7 @@ pub fn spawn_static_grpc_raft_memory_runtime(
     spawn_cold_flush_worker_if_configured(&runtime);
     spawn_cold_gc_worker_if_configured(&runtime);
     spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
+    spawn_commit_health_monitor_if_configured(&registry);
     Ok((runtime, registry))
 }
 
@@ -119,6 +121,7 @@ pub fn spawn_static_grpc_raft_memory_runtime_with_per_group_initializers(
     spawn_cold_flush_worker_if_configured(&runtime);
     spawn_cold_gc_worker_if_configured(&runtime);
     spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
+    spawn_commit_health_monitor_if_configured(&registry);
     Ok((runtime, registry))
 }
 
@@ -148,6 +151,7 @@ pub fn spawn_static_grpc_raft_runtime(
     spawn_cold_flush_worker_if_configured(&runtime);
     spawn_cold_gc_worker_if_configured(&runtime);
     spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
+    spawn_commit_health_monitor_if_configured(&registry);
     Ok((runtime, registry))
 }
 
@@ -178,6 +182,7 @@ pub fn spawn_static_grpc_raft_runtime_with_per_group_initializers(
     spawn_cold_flush_worker_if_configured(&runtime);
     spawn_cold_gc_worker_if_configured(&runtime);
     spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
+    spawn_commit_health_monitor_if_configured(&registry);
     Ok((runtime, registry))
 }
 
@@ -468,6 +473,75 @@ pub fn spawn_snapshot_driver_if_configured(
                 eprintln!("snapshot driver flush error: {err}");
             }
 
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+/// Steps a leader down when it can't make commit progress.
+///
+/// Raft drives elections off heartbeat *liveness*, not commit *progress*. Under
+/// partial packet loss on a leader's egress (e.g. 15% loss on the cluster
+/// plane), small frequent heartbeats still get through — suppressing follower
+/// elections and satisfying the leader's own quorum lease — while bulk entry
+/// replication collapses under TCP congestion control, so commits stall and
+/// writes hang with no re-vote. This monitor watches each group this node
+/// leads: if it has uncommitted entries (`last_log_index > committed`) whose
+/// committed index does not advance for `URSULA_COMMIT_STALL_STEPDOWN_SECS`,
+/// it transfers leadership to a peer voter. No election-disable/hysteresis is
+/// needed: netem loss is egress-only, so once a healthy peer leads, the impaired
+/// node receives that leader's heartbeats cleanly and stays a stable follower
+/// (openraft also brings the transfer target up to date before handing off).
+pub fn spawn_commit_health_monitor_if_configured(registry: &RaftGroupHandleRegistry) {
+    let interval_ms = env_usize("URSULA_COMMIT_STALL_CHECK_MS", 1_000);
+    if interval_ms == 0 {
+        return;
+    }
+    let stall_secs = env_usize("URSULA_COMMIT_STALL_STEPDOWN_SECS", 3).max(1);
+    let stall_ticks = ((stall_secs * 1_000) / interval_ms).max(1);
+    let registry = registry.clone();
+    tokio::spawn(async move {
+        let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(1_000));
+        let mut last_committed: HashMap<u32, u64> = HashMap::new();
+        let mut stuck_ticks: HashMap<u32, usize> = HashMap::new();
+        loop {
+            for snap in registry.metrics_snapshot() {
+                let gid = snap.raft_group_id;
+                let is_leader = snap.current_leader == Some(snap.node_id);
+                let committed = snap.committed.as_ref().map(|c| c.index).unwrap_or(0);
+                let last_log = snap.last_log_index.unwrap_or(0);
+                let pending = last_log > committed;
+                let progressed = match last_committed.insert(gid, committed) {
+                    Some(prev) => committed > prev,
+                    None => true,
+                };
+                if is_leader && pending && !progressed {
+                    let ticks = stuck_ticks.entry(gid).or_insert(0);
+                    *ticks += 1;
+                    if *ticks >= stall_ticks {
+                        *ticks = 0;
+                        if let Some(target) = snap
+                            .voter_ids
+                            .iter()
+                            .copied()
+                            .find(|voter| *voter != snap.node_id)
+                            && let Some(raft) = registry.get(RaftGroupId(gid))
+                        {
+                            match raft.trigger().transfer_leader(target).await {
+                                Ok(()) => eprintln!(
+                                    "commit-stall: node {} stepped down group {} (committed stuck at {}, last_log {}) -> node {}",
+                                    snap.node_id, gid, committed, last_log, target,
+                                ),
+                                Err(err) => eprintln!(
+                                    "commit-stall: transfer_leader group {gid} -> {target} failed: {err}"
+                                ),
+                            }
+                        }
+                    }
+                } else {
+                    stuck_ticks.insert(gid, 0);
+                }
+            }
             tokio::time::sleep(interval).await;
         }
     });
