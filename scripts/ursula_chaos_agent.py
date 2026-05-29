@@ -724,6 +724,15 @@ class ChaosAgent:
                     self.global_unresolved_append = True
                 else:
                     self.lane_unresolved_appends[lane_id % self.append_workers] = True
+            if lane_id is not None:
+                # Advance the lane to the next stream even on failure. Otherwise
+                # lane_attempts only moves on success, so a lane whose current
+                # stream sits in a network-impaired group retries that SAME
+                # stuck stream forever and makes zero progress — collapsing the
+                # agent's measured throughput to 0 while the cluster keeps
+                # serving the other (healthy) groups. The producer seq is
+                # per-stream, so rotating away and dedup-retrying later is safe.
+                self.lane_attempts[lane_id % self.append_workers] += 1
         if is_pure_shed:
             self.event("warn", f"append shed (ColdBackpressure) on all nodes: {last_error}")
         else:
