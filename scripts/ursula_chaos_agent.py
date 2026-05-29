@@ -427,6 +427,22 @@ class ChaosAgent:
         self.last_status_cold_backpressure_events: int | None = None
         self.last_status_published_at: datetime | None = None
         self.cold_refresh_cursor = 0
+        # GC churn: a lane of ephemeral streams that are appended to, left long
+        # enough for the cold-flush worker to spill them to S3, then deleted so
+        # the server's background cold-GC worker physically reclaims the chunks.
+        # Kept separate from `self.streams` so integrity/read probes never touch
+        # them.
+        self.gc_churn_every = max(0, args.gc_churn_every)
+        self.gc_churn_batch = max(1, args.gc_churn_batch)
+        self.gc_churn_bytes = max(1, args.gc_churn_bytes)
+        self.gc_churn_delay_secs = max(0.5, args.gc_churn_delay_secs)
+        self.gc_churn_ttl_secs = max(1, args.gc_churn_ttl_secs)
+        self.gc_churn_counter = 0
+        self.gc_churn_created = 0
+        self.gc_churn_deleted = 0
+        self.gc_churn_errors = 0
+        self.gc_churn_pending: deque[tuple[str, float]] = deque()
+        self.last_gc_churn_success = 0
         self.restored_workload_coverage: dict[str, Any] = {}
         self.next_burst_at = time.monotonic() + self.burst_every if self.burst_every > 0 else None
         self.restore_published_state()
@@ -706,6 +722,69 @@ class ChaosAgent:
         else:
             self.event("warn", f"append failed on all nodes: {last_error}")
         return False
+
+    def run_gc_churn(self) -> None:
+        """Exercise the server's cold-GC path: append to ephemeral streams, let
+        the cold-flush worker spill them to S3, then delete them so the cold-GC
+        worker physically reclaims the chunks. Writes follow 307 to the leader.
+        """
+        if self.gc_churn_every <= 0 or not self.nodes:
+            return
+        now = time.monotonic()
+        # Phase 1: delete streams aged past the flush delay, so the delete drops
+        # real cold chunks (not just hot bytes) for the GC worker to reclaim.
+        while (
+            self.gc_churn_pending
+            and now - self.gc_churn_pending[0][1] >= self.gc_churn_delay_secs
+        ):
+            name, _ = self.gc_churn_pending.popleft()
+            node = self.nodes[self.gc_churn_counter % len(self.nodes)]
+            try:
+                status, _, _ = self.request(
+                    "DELETE", f"{node.base_url}/{BUCKET}/{name}", timeout_secs=10
+                )
+                if status in {200, 204, 404, 410}:
+                    self.gc_churn_deleted += 1
+                else:
+                    self.gc_churn_errors += 1
+            except Exception:  # noqa: BLE001
+                self.gc_churn_errors += 1
+        # Phase 2: create + append a fresh ephemeral batch. A short server-side
+        # TTL is set as a backstop so an interrupted agent can't leak streams.
+        payload = b"g" * self.gc_churn_bytes
+        for _ in range(self.gc_churn_batch):
+            self.gc_churn_counter += 1
+            name = f"{self.run_id}-gc-{self.gc_churn_counter:06d}"
+            node = self.nodes[self.gc_churn_counter % len(self.nodes)]
+            try:
+                status, _, _ = self.request(
+                    "PUT",
+                    f"{node.base_url}/{BUCKET}/{name}",
+                    headers={"stream-ttl": str(self.gc_churn_ttl_secs)},
+                    timeout_secs=10,
+                )
+                if status not in {200, 201, 409}:
+                    self.gc_churn_errors += 1
+                    continue
+                status, _, _ = self.request(
+                    "POST",
+                    f"{node.base_url}/{BUCKET}/{name}",
+                    body=payload,
+                    headers={"content-type": CONTENT_TYPE},
+                    timeout_secs=10,
+                )
+                if status in {200, 204}:
+                    self.gc_churn_created += 1
+                    self.gc_churn_pending.append((name, time.monotonic()))
+                else:
+                    self.gc_churn_errors += 1
+            except Exception:  # noqa: BLE001
+                self.gc_churn_errors += 1
+        # Backstop: bound the pending queue if deletes are failing (the streams
+        # still carry a short server-side TTL, so dropping them here is safe).
+        cap = self.gc_churn_batch * 64
+        while len(self.gc_churn_pending) > cap:
+            self.gc_churn_pending.popleft()
 
     def build_payload(
         self,
@@ -2116,6 +2195,10 @@ class ChaosAgent:
                 "producer_count": len(self.producers),
                 "payload_sizes": self.payload_sizes,
                 "stream_count": len(self.streams),
+                "gc_churn_created_total": self.gc_churn_created,
+                "gc_churn_deleted_total": self.gc_churn_deleted,
+                "gc_churn_error_total": self.gc_churn_errors,
+                "gc_churn_pending": len(self.gc_churn_pending),
                 "coverage": self.workload_coverage(storage),
             },
             "integrity": {
@@ -2298,6 +2381,12 @@ class ChaosAgent:
             ):
                 self.run_producer_semantics_probe()
                 last_producer_probe_success = append_success
+            if (
+                self.gc_churn_every > 0
+                and append_success - self.last_gc_churn_success >= self.gc_churn_every
+            ):
+                self.run_gc_churn()
+                self.last_gc_churn_success = append_success
             if loop_started - last_status >= self.status_every:
                 self.publish_status()
                 last_status = loop_started
@@ -2332,6 +2421,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--old-sample-every", type=int, default=128)
     parser.add_argument("--burst-every", type=int, default=300)
     parser.add_argument("--burst-appends", type=int, default=200)
+    parser.add_argument("--gc-churn-every", type=int, default=50,
+                        help="appends between GC-churn rounds (0 disables)")
+    parser.add_argument("--gc-churn-batch", type=int, default=4,
+                        help="ephemeral streams created+deleted per churn round")
+    parser.add_argument("--gc-churn-bytes", type=int, default=16384,
+                        help="payload bytes appended to each churn stream")
+    parser.add_argument("--gc-churn-delay-secs", type=float, default=2.0,
+                        help="age before a churn stream is deleted (lets cold flush spill it)")
+    parser.add_argument("--gc-churn-ttl-secs", type=int, default=120,
+                        help="server-side TTL backstop on churn streams")
     parser.add_argument("--status-every", type=int, default=15)
     parser.add_argument("--history-points", type=int, default=5760)
     parser.add_argument("--injection-history", type=int, default=32)
