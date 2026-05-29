@@ -27,20 +27,17 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(not(madsim))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::body::{Body, Bytes, to_bytes};
+use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, OriginalUri, Path, RawQuery, State};
-use axum::http::header::{
-    CACHE_CONTROL, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HOST, IF_NONE_MATCH, LOCATION,
-    TRANSFER_ENCODING,
-};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION};
+use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -50,13 +47,10 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::stream;
 use openraft::BasicNode;
 use openraft::rt::WatchReceiver;
-use tonic::transport::{Channel, Endpoint};
-use tower::ServiceExt;
 use ursula_raft::{
-    RAFT_GRPC_APPEND_PATH, RAFT_GRPC_FORWARD_HTTP_WRITE_PATH, RAFT_GRPC_FULL_SNAPSHOT_PATH,
-    RAFT_GRPC_GROUP_READ_PATH, RAFT_GRPC_GROUP_WRITE_PATH, RAFT_GRPC_MAX_MESSAGE_BYTES,
-    RAFT_GRPC_VOTE_PATH, RaftGroupHandleRegistry, RaftGrpcService, RaftLogProgressSnapshot,
-    raft_internal_proto,
+    RAFT_GRPC_APPEND_PATH, RAFT_GRPC_FULL_SNAPSHOT_PATH, RAFT_GRPC_GROUP_READ_PATH,
+    RAFT_GRPC_GROUP_WRITE_PATH, RAFT_GRPC_MAX_MESSAGE_BYTES, RAFT_GRPC_VOTE_PATH,
+    RaftGroupHandleRegistry, RaftGrpcService, RaftLogProgressSnapshot, raft_internal_proto,
 };
 use ursula_runtime::{
     AppendBatchRequest, AppendExternalRequest, AppendRequest, AppendResponse,
@@ -99,7 +93,6 @@ const HEADER_PREFER: &str = "prefer";
 const HEADER_X_CONTENT_TYPE_OPTIONS: &str = "x-content-type-options";
 const HEADER_CROSS_ORIGIN_RESOURCE_POLICY: &str = "cross-origin-resource-policy";
 const HEADER_URSULA_RAFT_LEADER_ID: &str = "x-ursula-raft-leader-id";
-const HEADER_URSULA_FORWARD_HOP: &str = "x-ursula-forward-hop";
 const APPEND_BATCH_MAX_ITEMS: usize = 512;
 const APPEND_BATCH_MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -175,7 +168,7 @@ impl HttpState {
         Self {
             runtime,
             raft_registry: Some(raft_registry),
-            client_write_router: Some(ClientWriteLeaderRouter::with_env_inflight_cap(peers)),
+            client_write_router: Some(ClientWriteLeaderRouter::new(peers)),
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
             node_memory_admission: NodeMemoryAdmission::from_env(),
@@ -239,55 +232,18 @@ struct HttpMetricsSnapshot {
     sse_error_events: u64,
 }
 
-/// Per-peer forward-queue admission. When set, this node refuses to forward
-/// a new HTTP write to a remote leader once `inflight_forward_bytes_for(peer)`
-/// already exceeds the limit. Independent from cold and raft admissions; this
-/// one catches the "leader is wedged so the forward channel piles up" failure
-/// mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ForwardQueueAdmission {
-    pub max_inflight_bytes_per_peer: Option<u64>,
-}
-
-impl ForwardQueueAdmission {
-    fn from_env() -> Self {
-        Self {
-            max_inflight_bytes_per_peer: env_u64_optional(
-                "URSULA_FORWARD_MAX_INFLIGHT_BYTES_PER_PEER",
-            ),
-        }
-    }
-
-    pub fn is_enabled(self) -> bool {
-        self.max_inflight_bytes_per_peer.is_some()
-    }
-}
-
+/// Resolves the current leader of a raft group to a client-reachable base URL
+/// so a write/read that lands on a non-leader can be answered with a 307
+/// redirect. `peers` maps raft node id to that node's listen address; gRPC and
+/// the client API share one listener, so a single address per peer is both the
+/// replication endpoint and the redirect target.
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
     peers: Arc<BTreeMap<u64, String>>,
-    channels: Arc<Mutex<BTreeMap<u64, Channel>>>,
-    forward_admission: ForwardQueueAdmission,
-    inflight_forward_bytes: Arc<Mutex<HashMap<u64, Arc<AtomicU64>>>>,
 }
 
 impl ClientWriteLeaderRouter {
     pub fn new(peers: impl IntoIterator<Item = (u64, String)>) -> Self {
-        Self::with_admission(peers, ForwardQueueAdmission::default())
-    }
-
-    /// Same as [`Self::new`] but reads
-    /// `URSULA_FORWARD_MAX_INFLIGHT_BYTES_PER_PEER` to configure the
-    /// per-peer inflight cap. Used by the production binary path; tests
-    /// stay on [`Self::new`] for a disabled admission.
-    pub fn with_env_inflight_cap(peers: impl IntoIterator<Item = (u64, String)>) -> Self {
-        Self::with_admission(peers, ForwardQueueAdmission::from_env())
-    }
-
-    pub fn with_admission(
-        peers: impl IntoIterator<Item = (u64, String)>,
-        forward_admission: ForwardQueueAdmission,
-    ) -> Self {
         Self {
             peers: Arc::new(
                 peers
@@ -295,49 +251,7 @@ impl ClientWriteLeaderRouter {
                     .map(|(node_id, url)| (node_id, url.trim_end_matches('/').to_owned()))
                     .collect(),
             ),
-            channels: Arc::new(Mutex::new(BTreeMap::new())),
-            forward_admission,
-            inflight_forward_bytes: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-
-    fn inflight_slot(&self, peer_id: u64) -> Arc<AtomicU64> {
-        let mut guard = self
-            .inflight_forward_bytes
-            .lock()
-            .expect("forward inflight bytes mutex poisoned");
-        guard
-            .entry(peer_id)
-            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
-            .clone()
-    }
-
-    /// Returns Some(503-response) if accepting `body_len` bytes would push
-    /// inflight bytes for `peer_id` past the configured cap. Otherwise None
-    /// and the caller may proceed (acquiring a guard separately via
-    /// `acquire_forward_guard`).
-    fn check_forward_admission(&self, peer_id: u64, body_len: u64) -> Option<Response> {
-        let limit = self.forward_admission.max_inflight_bytes_per_peer?;
-        let slot = self.inflight_slot(peer_id);
-        let current = slot.load(Ordering::Relaxed);
-        if current.saturating_add(body_len) <= limit {
-            return None;
-        }
-        Some(forward_backpressure_response(
-            peer_id, current, body_len, limit,
-        ))
-    }
-
-    fn acquire_forward_guard(&self, peer_id: u64, body_len: u64) -> Option<ForwardInflightGuard> {
-        if !self.forward_admission.is_enabled() {
-            return None;
-        }
-        let slot = self.inflight_slot(peer_id);
-        slot.fetch_add(body_len, Ordering::Relaxed);
-        Some(ForwardInflightGuard {
-            slot,
-            bytes: body_len,
-        })
     }
 
     fn leader_base(&self, err: &RuntimeError) -> Option<(u64, String)> {
@@ -356,82 +270,6 @@ impl ClientWriteLeaderRouter {
         Some((leader_id, leader_base.trim_end_matches('/').to_owned()))
     }
 
-    async fn forward_http_write(
-        &self,
-        err: &RuntimeError,
-        method: Method,
-        request_target: &str,
-        request_headers: &HeaderMap,
-        body: Bytes,
-    ) -> Option<Response> {
-        let (leader_id, leader_base) = self.leader_base(err)?;
-        let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
-        if let Some(rejected) = self.check_forward_admission(leader_id, body_len) {
-            return Some(rejected);
-        }
-        // Hold the guard for the duration of the gRPC call; on success or
-        // error it decrements the inflight counter when dropped.
-        let _forward_guard = self.acquire_forward_guard(leader_id, body_len);
-        let channel = match self.leader_channel(leader_id, &leader_base).await {
-            Ok(channel) => channel,
-            Err(err) => {
-                return Some(internal_forward_error_response(
-                    leader_id,
-                    format!("connect to raft leader {leader_base}: {err}"),
-                ));
-            }
-        };
-        let mut client =
-            raft_internal_proto::raft_internal_client::RaftInternalClient::new(channel)
-                .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
-                .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES);
-        let next_hop = forward_hop(request_headers).saturating_add(1);
-        let mut headers = headers_to_proto(request_headers);
-        headers.retain(|header| !header.name.eq_ignore_ascii_case(HEADER_URSULA_FORWARD_HOP));
-        headers.push(raft_internal_proto::HttpHeaderV1 {
-            name: HEADER_URSULA_FORWARD_HOP.to_owned(),
-            value: next_hop.to_string().into_bytes(),
-        });
-        let response = client
-            .forward_http_write(raft_internal_proto::HttpWriteRequestV1 {
-                method: method.as_str().to_owned(),
-                target: request_target.to_owned(),
-                headers,
-                body: body.to_vec(),
-            })
-            .await;
-        match response {
-            Ok(response) => Some(http_response_from_proto(response.into_inner())),
-            Err(err) => Some(internal_forward_error_response(
-                leader_id,
-                format!("forward HTTP write to raft leader {leader_base}: {err}"),
-            )),
-        }
-    }
-
-    async fn leader_channel(&self, leader_id: u64, leader_base: &str) -> Result<Channel, String> {
-        if let Some(channel) = self
-            .channels
-            .lock()
-            .map_err(|_| "raft leader channel cache mutex poisoned".to_owned())?
-            .get(&leader_id)
-            .cloned()
-        {
-            return Ok(channel);
-        }
-        let endpoint = Endpoint::from_shared(leader_base.to_owned())
-            .map_err(|err| format!("invalid leader endpoint: {err}"))?;
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(|err| format!("connect: {err}"))?;
-        self.channels
-            .lock()
-            .map_err(|_| "raft leader channel cache mutex poisoned".to_owned())?
-            .insert(leader_id, channel.clone());
-        Ok(channel)
-    }
-
     fn redirect_response(&self, err: &RuntimeError, request_target: &str) -> Option<Response> {
         let (leader_id, leader_base) = self.leader_base(err)?;
         let mut headers = HeaderMap::new();
@@ -445,45 +283,6 @@ impl ClientWriteLeaderRouter {
         insert_u64_header(&mut headers, HEADER_URSULA_RAFT_LEADER_ID, leader_id);
         Some((StatusCode::TEMPORARY_REDIRECT, headers, err.to_string()).into_response())
     }
-}
-
-/// RAII handle that decrements a peer's inflight-forward byte counter on drop.
-struct ForwardInflightGuard {
-    slot: Arc<AtomicU64>,
-    bytes: u64,
-}
-
-impl Drop for ForwardInflightGuard {
-    fn drop(&mut self) {
-        let mut current = self.slot.load(Ordering::Relaxed);
-        loop {
-            let next = current.saturating_sub(self.bytes);
-            match self.slot.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return,
-                Err(observed) => current = observed,
-            }
-        }
-    }
-}
-
-fn forward_backpressure_response(
-    peer_id: u64,
-    inflight_bytes: u64,
-    incoming_bytes: u64,
-    limit: u64,
-) -> Response {
-    let mut headers = HeaderMap::new();
-    insert_default_response_headers(&mut headers);
-    insert_u64_header(&mut headers, HEADER_URSULA_RAFT_LEADER_ID, peer_id);
-    let body = format!(
-        "ForwardBackpressure: peer {peer_id} inflight {inflight_bytes} bytes plus incoming {incoming_bytes} would exceed limit {limit}"
-    );
-    (StatusCode::SERVICE_UNAVAILABLE, headers, body).into_response()
 }
 
 /// Process-wide RSS soft-cap admission. Independent from cold/raft/forward
@@ -622,7 +421,6 @@ fn env_u64_optional(name: &str) -> Option<u64> {
 
 struct HttpRaftGrpcService {
     raft: RaftGrpcService,
-    state: HttpState,
 }
 
 impl HttpRaftGrpcService {
@@ -630,7 +428,6 @@ impl HttpRaftGrpcService {
         let cold_store = state.runtime().cold_store();
         Self {
             raft: RaftGrpcService::new(registry).with_cold_store(cold_store),
-            state,
         }
     }
 }
@@ -659,52 +456,6 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for HttpRaftGrpcSer
             .await
     }
 
-    async fn forward_http_write(
-        &self,
-        request: tonic::Request<raft_internal_proto::HttpWriteRequestV1>,
-    ) -> Result<tonic::Response<raft_internal_proto::HttpWriteResponseV1>, tonic::Status> {
-        let request = request.into_inner();
-        let method: Method = request
-            .method
-            .parse()
-            .map_err(|err| tonic::Status::invalid_argument(format!("invalid method: {err}")))?;
-        let uri: Uri = request
-            .target
-            .parse()
-            .map_err(|err| tonic::Status::invalid_argument(format!("invalid target: {err}")))?;
-        let mut builder = Request::builder().method(method).uri(uri);
-        for header in request.headers {
-            let name = HeaderName::from_bytes(header.name.as_bytes()).map_err(|err| {
-                tonic::Status::invalid_argument(format!("invalid header name: {err}"))
-            })?;
-            if !should_forward_request_header(&name) {
-                continue;
-            }
-            let value = HeaderValue::from_bytes(&header.value).map_err(|err| {
-                tonic::Status::invalid_argument(format!("invalid header value: {err}"))
-            })?;
-            builder = builder.header(name, value);
-        }
-        let request = builder
-            .body(Body::from(request.body))
-            .map_err(|err| tonic::Status::invalid_argument(format!("build request: {err}")))?;
-        let response = router_from_state(self.state.clone())
-            .oneshot(request)
-            .await
-            .map_err(|err| tonic::Status::internal(format!("dispatch forwarded write: {err}")))?;
-        let (parts, body) = response.into_parts();
-        let body = to_bytes(body, MAX_HTTP_BODY_BYTES)
-            .await
-            .map_err(|err| tonic::Status::internal(format!("read forwarded response: {err}")))?;
-        Ok(tonic::Response::new(
-            raft_internal_proto::HttpWriteResponseV1 {
-                status: parts.status.as_u16().into(),
-                headers: response_headers_to_proto(&parts.headers),
-                body: body.to_vec(),
-            },
-        ))
-    }
-
     async fn group_write(
         &self,
         request: tonic::Request<raft_internal_proto::GroupWriteRequestV1>,
@@ -731,61 +482,6 @@ fn raft_grpc_service(
     ))
     .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
     .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
-}
-
-fn should_forward_request_header(name: &HeaderName) -> bool {
-    name != CONNECTION && name != CONTENT_LENGTH && name != TRANSFER_ENCODING
-}
-
-fn should_forward_response_header(name: &HeaderName) -> bool {
-    name != HOST && name != CONNECTION && name != CONTENT_LENGTH && name != TRANSFER_ENCODING
-}
-
-fn headers_to_proto(headers: &HeaderMap) -> Vec<raft_internal_proto::HttpHeaderV1> {
-    headers
-        .iter()
-        .filter(|(name, _)| should_forward_request_header(name))
-        .map(|(name, value)| raft_internal_proto::HttpHeaderV1 {
-            name: name.as_str().to_owned(),
-            value: value.as_bytes().to_vec(),
-        })
-        .collect()
-}
-
-fn response_headers_to_proto(headers: &HeaderMap) -> Vec<raft_internal_proto::HttpHeaderV1> {
-    headers
-        .iter()
-        .filter(|(name, _)| should_forward_response_header(name))
-        .map(|(name, value)| raft_internal_proto::HttpHeaderV1 {
-            name: name.as_str().to_owned(),
-            value: value.as_bytes().to_vec(),
-        })
-        .collect()
-}
-
-fn http_response_from_proto(response: raft_internal_proto::HttpWriteResponseV1) -> Response {
-    let status = u16::try_from(response.status)
-        .ok()
-        .and_then(|status| StatusCode::from_u16(status).ok())
-        .unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut headers = HeaderMap::new();
-    for header in response.headers {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(header.name.as_bytes()),
-            HeaderValue::from_bytes(&header.value),
-        ) && should_forward_response_header(&name)
-        {
-            headers.insert(name, value);
-        }
-    }
-    (status, headers, Bytes::from(response.body)).into_response()
-}
-
-fn internal_forward_error_response(leader_id: u64, message: String) -> Response {
-    let mut headers = HeaderMap::new();
-    insert_default_response_headers(&mut headers);
-    insert_u64_header(&mut headers, HEADER_URSULA_RAFT_LEADER_ID, leader_id);
-    (StatusCode::BAD_GATEWAY, headers, message).into_response()
 }
 
 pub fn router(runtime: ShardRuntime) -> Router {
@@ -832,10 +528,6 @@ pub fn cluster_router_from_state(state: HttpState) -> Router {
         )
         .route_service(
             RAFT_GRPC_FULL_SNAPSHOT_PATH,
-            raft_grpc_service(state.clone(), raft_registry.clone()),
-        )
-        .route_service(
-            RAFT_GRPC_FORWARD_HTTP_WRITE_PATH,
             raft_grpc_service(state.clone(), raft_registry.clone()),
         )
         .route_service(
@@ -1138,7 +830,6 @@ pub(crate) async fn flush_cold_stream(
     OriginalUri(uri): OriginalUri,
     Path((bucket, stream)): Path<(String, String)>,
     RawQuery(raw_query): RawQuery,
-    headers: HeaderMap,
 ) -> Response {
     let query = match parse_query(raw_query.as_deref()) {
         Ok(query) => query,
@@ -1177,15 +868,7 @@ pub(crate) async fn flush_cold_stream(
         }
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => {
-            runtime_error_or_leader_redirect_async(
-                &state,
-                err,
-                Method::POST,
-                &request_target(&uri),
-                &headers,
-                Bytes::new(),
-            )
-            .await
+            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
         }
     }
 }
@@ -1570,7 +1253,6 @@ pub(crate) async fn create_stream_by_id(
             request,
             public_path,
             request_headers,
-            body.clone(),
             producer,
         )
         .await;
@@ -1587,17 +1269,7 @@ pub(crate) async fn create_stream_by_id(
             public_path: public_path.as_deref(),
             request_headers: &request_headers,
         }),
-        Err(err) => {
-            runtime_error_or_leader_redirect_async(
-                &state,
-                err,
-                Method::PUT,
-                &request_target,
-                &request_headers,
-                body.clone(),
-            )
-            .await
-        }
+        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
 
@@ -1607,7 +1279,6 @@ pub(crate) async fn create_stream_external_by_id(
     mut request: CreateStreamRequest,
     public_path: Option<String>,
     request_headers: HeaderMap,
-    body: Bytes,
     producer: Option<ProducerRequest>,
 ) -> Response {
     let stream_id = request.stream_id.clone();
@@ -1636,15 +1307,7 @@ pub(crate) async fn create_stream_external_by_id(
         }),
         Err(err) => {
             cleanup_external_payload(&state, &external_path).await;
-            runtime_error_or_leader_redirect_async(
-                &state,
-                err,
-                Method::PUT,
-                &request_target,
-                &request_headers,
-                body,
-            )
-            .await
+            runtime_error_or_leader_redirect_async(&state, err, &request_target).await
         }
     }
 }
@@ -1706,17 +1369,7 @@ pub(crate) async fn append_stream_by_id(
                 insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
                 (StatusCode::NO_CONTENT, headers).into_response()
             }
-            Err(err) => {
-                runtime_error_or_leader_redirect_async(
-                    &state,
-                    err,
-                    Method::POST,
-                    &request_target,
-                    &headers,
-                    Bytes::new(),
-                )
-                .await
-            }
+            Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
         };
     }
     if !body.is_empty() && !has_content_type(&headers) {
@@ -1744,22 +1397,12 @@ pub(crate) async fn append_stream_by_id(
     request.producer = producer.clone();
 
     if should_externalize_payload(&state, request.payload.len(), true) {
-        return append_stream_external_by_id(state, request_target, request, headers, body).await;
+        return append_stream_external_by_id(state, request_target, request).await;
     }
 
     match state.runtime.append(request).await {
         Ok(response) => append_http_response(response),
-        Err(err) => {
-            runtime_error_or_leader_redirect_async(
-                &state,
-                err,
-                Method::POST,
-                &request_target,
-                &headers,
-                body.clone(),
-            )
-            .await
-        }
+        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
 
@@ -1767,8 +1410,6 @@ pub(crate) async fn append_stream_external_by_id(
     state: HttpState,
     request_target: String,
     mut request: AppendRequest,
-    headers: HeaderMap,
-    body: Bytes,
 ) -> Response {
     let stream_id = request.stream_id.clone();
     let payload = std::mem::take(&mut request.payload);
@@ -1782,15 +1423,7 @@ pub(crate) async fn append_stream_external_by_id(
         Ok(response) => append_http_response(response),
         Err(err) => {
             cleanup_external_payload(&state, &external_path).await;
-            runtime_error_or_leader_redirect_async(
-                &state,
-                err,
-                Method::POST,
-                &request_target,
-                &headers,
-                body,
-            )
-            .await
+            runtime_error_or_leader_redirect_async(&state, err, &request_target).await
         }
     }
 }
@@ -1831,15 +1464,8 @@ pub(crate) async fn append_batch(
     let response = match state.runtime.append_batch(request).await {
         Ok(response) => response,
         Err(err) => {
-            return runtime_error_or_leader_redirect_async(
-                &state,
-                err,
-                Method::POST,
-                &request_target(&uri),
-                &headers,
-                body.clone(),
-            )
-            .await;
+            return runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri))
+                .await;
         }
     };
 
@@ -1859,30 +1485,27 @@ pub(crate) async fn delete_stream(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
     Path((bucket, stream)): Path<(String, String)>,
-    headers: HeaderMap,
 ) -> Response {
     let stream_id = BucketStreamId::new(bucket, stream);
-    delete_stream_by_id(state, request_target(&uri), stream_id, headers).await
+    delete_stream_by_id(state, request_target(&uri), stream_id).await
 }
 
 pub(crate) async fn delete_stream_v1(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
     Path(path): Path<String>,
-    headers: HeaderMap,
 ) -> Response {
     let stream_id = match v1_stream_id(&path) {
         Ok(stream_id) => stream_id,
         Err(response) => return *response,
     };
-    delete_stream_by_id(state, request_target(&uri), stream_id, headers).await
+    delete_stream_by_id(state, request_target(&uri), stream_id).await
 }
 
 pub(crate) async fn delete_stream_by_id(
     state: HttpState,
     request_target: String,
     stream_id: BucketStreamId,
-    headers: HeaderMap,
 ) -> Response {
     match state
         .runtime
@@ -1894,17 +1517,7 @@ pub(crate) async fn delete_stream_by_id(
             insert_default_response_headers(&mut headers);
             (StatusCode::NO_CONTENT, headers).into_response()
         }
-        Err(err) => {
-            runtime_error_or_leader_redirect_async(
-                &state,
-                err,
-                Method::DELETE,
-                &request_target,
-                &headers,
-                Bytes::new(),
-            )
-            .await
-        }
+        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
 
@@ -1912,30 +1525,27 @@ pub(crate) async fn head_stream(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
     Path((bucket, stream)): Path<(String, String)>,
-    headers: HeaderMap,
 ) -> Response {
     let stream_id = BucketStreamId::new(bucket, stream);
-    head_stream_by_id(state, request_target(&uri), stream_id, headers).await
+    head_stream_by_id(state, request_target(&uri), stream_id).await
 }
 
 pub(crate) async fn head_stream_v1(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
     Path(path): Path<String>,
-    headers: HeaderMap,
 ) -> Response {
     let stream_id = match v1_stream_id(&path) {
         Ok(stream_id) => stream_id,
         Err(response) => return *response,
     };
-    head_stream_by_id(state, request_target(&uri), stream_id, headers).await
+    head_stream_by_id(state, request_target(&uri), stream_id).await
 }
 
 pub(crate) async fn head_stream_by_id(
     state: HttpState,
     request_target: String,
     stream_id: BucketStreamId,
-    request_headers: HeaderMap,
 ) -> Response {
     match state
         .runtime
@@ -2005,17 +1615,7 @@ pub(crate) async fn head_stream_by_id(
             }
             (StatusCode::OK, headers).into_response()
         }
-        Err(err) => {
-            runtime_error_or_leader_redirect_async(
-                &state,
-                err,
-                Method::HEAD,
-                &request_target,
-                &request_headers,
-                Bytes::new(),
-            )
-            .await
-        }
+        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
 
@@ -2066,22 +1666,13 @@ pub(crate) async fn read_stream_by_id(
             .require_local_live_read_owner(&stream_id)
             .await
     {
-        return runtime_error_or_leader_redirect_async(
-            &state,
-            err,
-            Method::GET,
-            &request_target,
-            &headers,
-            Bytes::new(),
-        )
-        .await;
+        return runtime_error_or_leader_redirect_async(&state, err, &request_target).await;
     }
     let offset = match read_offset(
         &state,
         &stream_id,
         query.get("offset").map(String::as_str),
         &request_target,
-        &headers,
     )
     .await
     {
@@ -2095,16 +1686,7 @@ pub(crate) async fn read_stream_by_id(
 
     match live_mode {
         Some("sse") => {
-            return sse_stream(
-                state,
-                request_target,
-                stream_id,
-                offset,
-                max_len,
-                &query,
-                headers,
-            )
-            .await;
+            return sse_stream(state, request_target, stream_id, offset, max_len, &query).await;
         }
         Some("long-poll") => {
             return long_poll_stream(
@@ -2134,17 +1716,7 @@ pub(crate) async fn read_stream_by_id(
     {
         Ok(response) if offset_is_now => offset_now_response(response),
         Ok(response) => read_response(response, &headers, None),
-        Err(err) => {
-            runtime_error_or_leader_redirect_async(
-                &state,
-                err,
-                Method::GET,
-                &request_target,
-                &headers,
-                Bytes::new(),
-            )
-            .await
-        }
+        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
 
@@ -2175,15 +1747,7 @@ pub(crate) async fn publish_snapshot(
             (StatusCode::NO_CONTENT, headers).into_response()
         }
         Err(err) => {
-            runtime_error_or_leader_redirect_async(
-                &state,
-                err,
-                Method::PUT,
-                &request_target(&uri),
-                &headers,
-                body.clone(),
-            )
-            .await
+            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
         }
     }
 }
@@ -2205,15 +1769,8 @@ pub(crate) async fn read_latest_snapshot(
     {
         Ok(head) => head,
         Err(err) => {
-            return runtime_error_or_leader_redirect_async(
-                &state,
-                err,
-                Method::GET,
-                &request_target(&uri),
-                &headers,
-                Bytes::new(),
-            )
-            .await;
+            return runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri))
+                .await;
         }
     };
     let Some(snapshot_offset) = head.snapshot_offset else {
@@ -2231,7 +1788,6 @@ pub(crate) async fn read_snapshot(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
     Path((bucket, stream, snapshot_offset)): Path<(String, String, String)>,
-    headers: HeaderMap,
 ) -> Response {
     let snapshot_offset = match parse_snapshot_offset(&snapshot_offset) {
         Ok(offset) => offset,
@@ -2249,15 +1805,7 @@ pub(crate) async fn read_snapshot(
     {
         Ok(response) => snapshot_response(response),
         Err(err) => {
-            runtime_error_or_leader_redirect_async(
-                &state,
-                err,
-                Method::GET,
-                &request_target(&uri),
-                &headers,
-                Bytes::new(),
-            )
-            .await
+            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
         }
     }
 }
@@ -2266,7 +1814,6 @@ pub(crate) async fn delete_snapshot(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
     Path((bucket, stream, snapshot_offset)): Path<(String, String, String)>,
-    headers: HeaderMap,
 ) -> Response {
     let snapshot_offset = match parse_snapshot_offset(&snapshot_offset) {
         Ok(offset) => offset,
@@ -2288,15 +1835,7 @@ pub(crate) async fn delete_snapshot(
             (StatusCode::NO_CONTENT, headers).into_response()
         }
         Err(err) => {
-            runtime_error_or_leader_redirect_async(
-                &state,
-                err,
-                Method::DELETE,
-                &request_target(&uri),
-                &headers,
-                Bytes::new(),
-            )
-            .await
+            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
         }
     }
 }
@@ -2306,7 +1845,6 @@ pub(crate) async fn bootstrap_stream(
     OriginalUri(uri): OriginalUri,
     Path((bucket, stream)): Path<(String, String)>,
     RawQuery(raw_query): RawQuery,
-    headers: HeaderMap,
 ) -> Response {
     let query = match parse_query(raw_query.as_deref()) {
         Ok(query) => query,
@@ -2330,15 +1868,7 @@ pub(crate) async fn bootstrap_stream(
     {
         Ok(response) => bootstrap_response(response),
         Err(err) => {
-            runtime_error_or_leader_redirect_async(
-                &state,
-                err,
-                Method::GET,
-                &request_target(&uri),
-                &headers,
-                Bytes::new(),
-            )
-            .await
+            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
         }
     }
 }
@@ -2358,7 +1888,6 @@ pub(crate) async fn read_offset(
     stream_id: &BucketStreamId,
     raw: Option<&str>,
     request_target: &str,
-    request_headers: &HeaderMap,
 ) -> Result<u64, BoxResponse> {
     match raw {
         Some("-1") => Ok(0),
@@ -2372,15 +1901,8 @@ pub(crate) async fn read_offset(
         {
             Ok(head) => Ok(head.tail_offset),
             Err(err) => {
-                let response = runtime_error_or_leader_redirect_async(
-                    state,
-                    err,
-                    Method::GET,
-                    request_target,
-                    request_headers,
-                    Bytes::new(),
-                )
-                .await;
+                let response =
+                    runtime_error_or_leader_redirect_async(state, err, request_target).await;
                 Err(Box::new(response))
             }
         },
@@ -2416,17 +1938,7 @@ pub(crate) async fn long_poll_stream(
             &headers,
             Some(query.get("cursor").map(String::as_str).unwrap_or("")),
         ),
-        Ok(Err(err)) => {
-            runtime_error_or_leader_redirect_async(
-                &state,
-                err,
-                Method::GET,
-                &request_target,
-                &headers,
-                Bytes::new(),
-            )
-            .await
-        }
+        Ok(Err(err)) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
         Err(_) => match state
             .runtime
             .head_stream(HeadStreamRequest {
@@ -2450,17 +1962,7 @@ pub(crate) async fn long_poll_stream(
                 }
                 (StatusCode::NO_CONTENT, headers).into_response()
             }
-            Err(err) => {
-                runtime_error_or_leader_redirect_async(
-                    &state,
-                    err,
-                    Method::GET,
-                    &request_target,
-                    &headers,
-                    Bytes::new(),
-                )
-                .await
-            }
+            Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
         },
     }
 }
@@ -2485,7 +1987,6 @@ pub(crate) async fn sse_stream(
     offset: u64,
     max_len: usize,
     query: &HashMap<String, String>,
-    headers: HeaderMap,
 ) -> Response {
     let head = match state
         .runtime
@@ -2497,15 +1998,7 @@ pub(crate) async fn sse_stream(
     {
         Ok(head) => head,
         Err(err) => {
-            return runtime_error_or_leader_redirect_async(
-                &state,
-                err,
-                Method::GET,
-                &request_target,
-                &headers,
-                Bytes::new(),
-            )
-            .await;
+            return runtime_error_or_leader_redirect_async(&state, err, &request_target).await;
         }
     };
 
@@ -2840,40 +2333,56 @@ fn runtime_error_response(err: RuntimeError) -> Response {
 pub(crate) async fn runtime_error_or_leader_redirect_async(
     state: &HttpState,
     err: RuntimeError,
-    method: Method,
     request_target: &str,
-    request_headers: &HeaderMap,
-    body: Bytes,
 ) -> Response {
     let Some(router) = state.client_write_router() else {
         return runtime_error_response(err);
     };
-    if method == Method::GET || method == Method::HEAD {
-        return router
-            .redirect_response(&err, request_target)
-            .unwrap_or_else(|| runtime_error_response(err));
+    // gRPC and the client API share one listener, so the leader's address is
+    // a valid redirect target for reads and writes alike. 307 preserves the
+    // method and body, so a forwarded POST/PUT re-runs as a write on the
+    // leader. Writes go through the leader's raft client_write exactly as a
+    // local write would; redirecting only moves the leader hop to the client.
+    if let Some(redirect) = router.redirect_response(&err, request_target) {
+        return redirect;
     }
-    if forward_hop(request_headers) >= 4 {
-        return runtime_error_response(err);
+    // Forward-to-leader error whose leader is currently unknown (election in
+    // progress): tell the client to retry rather than failing hard.
+    if is_forward_to_leader(&err) {
+        return leader_unknown_retry_response(err);
     }
-    router
-        .forward_http_write(&err, method, request_target, request_headers, body)
-        .await
-        .unwrap_or_else(|| runtime_error_response(err))
+    runtime_error_response(err)
+}
+
+/// True when `err` is a group-engine error asking the caller to forward to the
+/// leader (carries a leader hint), regardless of whether the leader is yet
+/// known.
+fn is_forward_to_leader(err: &RuntimeError) -> bool {
+    matches!(
+        err,
+        RuntimeError::GroupEngine {
+            leader_hint: Some(_),
+            ..
+        }
+    )
+}
+
+/// 503 + `Retry-After: 1` for a write that hit a non-leader while the group has
+/// no known leader. Retryable: a new leader should be elected shortly.
+fn leader_unknown_retry_response(err: RuntimeError) -> Response {
+    let mut headers = HeaderMap::new();
+    insert_default_response_headers(&mut headers);
+    headers.insert(
+        axum::http::header::RETRY_AFTER,
+        HeaderValue::from_static("1"),
+    );
+    (StatusCode::SERVICE_UNAVAILABLE, headers, err.to_string()).into_response()
 }
 
 fn request_target(uri: &Uri) -> String {
     uri.path_and_query()
         .map(|path_and_query| path_and_query.as_str().to_owned())
         .unwrap_or_else(|| uri.path().to_owned())
-}
-
-fn forward_hop(headers: &HeaderMap) -> u8 {
-    headers
-        .get(HEADER_URSULA_FORWARD_HOP)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u8>().ok())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

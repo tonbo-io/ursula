@@ -2784,13 +2784,16 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
         .build()
         .expect("build reqwest client");
     let forwarded_stream = BucketStreamId::new("benchcmp", "follower-forward");
+    // A write that lands on a follower is answered with a 307 to the leader;
+    // the redirect-following client re-issues the PUT on the leader, which
+    // creates the stream through raft.
     let follower_response = http_client
         .put(format!("{}/benchcmp/follower-forward", peers[1].1))
         .header(CONTENT_TYPE, "text/plain")
         .body("created-through-forward")
         .send()
         .await
-        .expect("send follower write through internal gRPC forwarding");
+        .expect("send follower write redirected to leader");
     assert_eq!(follower_response.status(), StatusCode::CREATED);
     assert_eq!(
         follower_response
@@ -2799,21 +2802,6 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
             .and_then(|value| value.to_str().ok()),
         Some("00000000000000000023")
     );
-    let follower_read = http_client
-        .get(format!("{}/benchcmp/follower-forward", peers[1].1))
-        .send()
-        .await
-        .expect("send immediate follower read");
-    assert_eq!(follower_read.status(), StatusCode::OK);
-    assert_eq!(
-        follower_read
-            .headers()
-            .get(HEADER_STREAM_NEXT_OFFSET)
-            .and_then(|value| value.to_str().ok()),
-        Some("00000000000000000023")
-    );
-    let follower_body = follower_read.bytes().await.expect("follower read body");
-    assert_eq!(&follower_body[..], b"created-through-forward");
 
     let no_redirect_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -2856,6 +2844,24 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
         )
         .await;
     }
+
+    // Once replication has caught up, a normal (non-live) read is served
+    // locally by the follower without any redirect to the leader.
+    let follower_read = http_client
+        .get(format!("{}/benchcmp/follower-forward", peers[1].1))
+        .send()
+        .await
+        .expect("send follower local read after replication");
+    assert_eq!(follower_read.status(), StatusCode::OK);
+    assert_eq!(
+        follower_read
+            .headers()
+            .get(HEADER_STREAM_NEXT_OFFSET)
+            .and_then(|value| value.to_str().ok()),
+        Some("00000000000000000023")
+    );
+    let follower_body = follower_read.bytes().await.expect("follower read body");
+    assert_eq!(&follower_body[..], b"created-through-forward");
 
     let leader_sse = http_client
         .get(format!(
@@ -4386,42 +4392,6 @@ fn batch_body(payloads: &[&[u8]]) -> Vec<u8> {
         body.extend_from_slice(payload);
     }
     body
-}
-
-#[test]
-fn forward_queue_admission_disabled_passes_check() {
-    let router = ClientWriteLeaderRouter::new(vec![(1u64, "http://10.0.0.1:4437".to_owned())]);
-    // Without an explicit cap, even an arbitrarily large incoming size must
-    // be accepted: the admission only consults its configured limit.
-    assert!(router.check_forward_admission(1, 1024 * 1024).is_none());
-}
-
-#[test]
-fn forward_queue_admission_rejects_when_inflight_plus_incoming_exceeds_limit() {
-    let admission = ForwardQueueAdmission {
-        max_inflight_bytes_per_peer: Some(8),
-    };
-    let router = ClientWriteLeaderRouter::with_admission(
-        vec![(1u64, "http://10.0.0.1:4437".to_owned())],
-        admission,
-    );
-
-    // Initially the peer has zero inflight; a small request must fit.
-    assert!(router.check_forward_admission(1, 4).is_none());
-
-    // Hold a guard that accounts for 8 bytes of inflight; any further byte
-    // must be rejected with a 503 + ForwardBackpressure message.
-    let guard = router
-        .acquire_forward_guard(1, 8)
-        .expect("guard issued when admission is enabled");
-    let response = router
-        .check_forward_admission(1, 1)
-        .expect("admission rejects when inflight + incoming exceeds limit");
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-    // Releasing the guard restores capacity.
-    drop(guard);
-    assert!(router.check_forward_admission(1, 8).is_none());
 }
 
 #[test]

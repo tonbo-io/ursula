@@ -3476,6 +3476,8 @@ dependencies = [
  "tokio",
  "tonic 0.12.3",
  "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
  "ursula-raft",
  "ursula-runtime",
  "ursula-shard",

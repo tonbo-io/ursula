@@ -344,7 +344,10 @@ impl RaftGroupEngine {
     ) -> Result<GroupWriteResponse, GroupEngineError> {
         let response = match self.raft.client_write(command.into()).await {
             Ok(response) => response,
-            Err(err) => return Err(group_engine_client_write_error(err)),
+            Err(err) => {
+                let self_id = self.raft.metrics().borrow_watched().id;
+                return Err(group_engine_client_write_error(err, self_id));
+            }
         };
         group_write_result_from_raft_response(response.data)?
     }
@@ -371,10 +374,12 @@ impl RaftGroupEngine {
         }
         let leader_id = self.raft.current_leader().await;
         let leader_node = self.current_leader_node().await;
+        let self_id = self.raft.metrics().borrow_watched().id;
         Err(group_engine_forward_to_leader_error(
             "OpenRaft group write has to run on the local leader runtime",
             leader_id,
             leader_node.as_ref(),
+            self_id,
         ))
     }
 
@@ -452,10 +457,12 @@ impl RaftGroupEngine {
         if self.raft.is_leader() {
             return Ok(());
         }
+        let self_id = self.raft.metrics().borrow_watched().id;
         Err(group_engine_forward_to_leader_error(
             format!("OpenRaft {operation} has to forward request to leader"),
             self.raft.current_leader().await,
             None,
+            self_id,
         ))
     }
 

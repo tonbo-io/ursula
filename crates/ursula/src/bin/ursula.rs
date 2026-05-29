@@ -24,6 +24,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tokio_console_if_enabled();
+    init_tracing();
 
     let args = Args::parse()?;
     apply_admission_env_overrides(&args);
@@ -157,14 +158,6 @@ fn apply_admission_env_overrides(args: &Args) {
             );
         }
     }
-    if let Some(value) = args.forward_max_inflight_bytes_per_peer {
-        unsafe {
-            std::env::set_var(
-                "URSULA_FORWARD_MAX_INFLIGHT_BYTES_PER_PEER",
-                value.to_string(),
-            );
-        }
-    }
     if let Some(value) = args.node_memory_soft_cap_bytes {
         unsafe {
             std::env::set_var("URSULA_NODE_MEMORY_SOFT_CAP_BYTES", value.to_string());
@@ -184,6 +177,19 @@ fn init_tokio_console_if_enabled() {
 
     #[cfg(not(feature = "tokio-console"))]
     eprintln!("URSULA_TOKIO_CONSOLE is set, but ursula was built without tokio-console feature");
+}
+
+/// Install a stderr tracing subscriber filtered by `RUST_LOG` (default `info`).
+/// `try_init` is a no-op if a global subscriber was already installed (e.g. the
+/// tokio-console layer), so this never conflicts with that path.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(true)
+        .try_init();
 }
 
 #[derive(Debug)]
@@ -208,10 +214,6 @@ struct Args {
     /// disables. Catches raft replication lag before in-memory queues grow
     /// unbounded.
     raft_max_uncommitted_bytes_per_group: Option<u64>,
-    /// Per-leader-peer cap on bytes currently being forwarded over the
-    /// cluster gRPC plane. `None` disables. Sheds load when a remote peer
-    /// stalls before this node fills its forward queue.
-    forward_max_inflight_bytes_per_peer: Option<u64>,
     /// Process-wide RSS soft cap. When exceeded, write endpoints return 503
     /// with `Retry-After: 1`. `None` disables. Linux-only.
     node_memory_soft_cap_bytes: Option<u64>,
@@ -240,7 +242,6 @@ impl Args {
         let mut raft_init_membership = false;
         let mut raft_init_membership_per_group = false;
         let mut raft_max_uncommitted_bytes_per_group: Option<u64> = None;
-        let mut forward_max_inflight_bytes_per_peer: Option<u64> = None;
         let mut node_memory_soft_cap_bytes: Option<u64> = None;
 
         let mut args = args.into_iter().map(Into::into);
@@ -349,14 +350,6 @@ impl Args {
                         format!("invalid --raft-max-uncommitted-bytes-per-group '{raw}': {err}")
                     })?);
                 }
-                "--forward-max-inflight-bytes-per-peer" => {
-                    let raw = args.next().ok_or_else(|| {
-                        "--forward-max-inflight-bytes-per-peer requires a value".to_owned()
-                    })?;
-                    forward_max_inflight_bytes_per_peer = Some(raw.parse().map_err(|err| {
-                        format!("invalid --forward-max-inflight-bytes-per-peer '{raw}': {err}")
-                    })?);
-                }
                 "--node-memory-soft-cap-bytes" => {
                     let raw = args.next().ok_or_else(|| {
                         "--node-memory-soft-cap-bytes requires a value".to_owned()
@@ -390,7 +383,6 @@ impl Args {
             raft_init_membership,
             raft_init_membership_per_group,
             raft_max_uncommitted_bytes_per_group,
-            forward_max_inflight_bytes_per_peer,
             node_memory_soft_cap_bytes,
         })
     }
@@ -405,7 +397,7 @@ impl Args {
 }
 
 fn help() -> String {
-    "usage: ursula [--listen ADDR] [--cluster-listen ADDR] [--core-count N] [--raft-group-count N] [--raft-memory | --wal-dir DIR | --raft-log-dir DIR] [--raft-cluster-config FILE | --raft-node-id ID --raft-peer ID=URL ... --raft-init-membership | --raft-init-membership-per-group] [--raft-max-uncommitted-bytes-per-group N] [--forward-max-inflight-bytes-per-peer N] [--node-memory-soft-cap-bytes N]"
+    "usage: ursula [--listen ADDR] [--cluster-listen ADDR] [--core-count N] [--raft-group-count N] [--raft-memory | --wal-dir DIR | --raft-log-dir DIR] [--raft-cluster-config FILE | --raft-node-id ID --raft-peer ID=URL ... --raft-init-membership | --raft-init-membership-per-group] [--raft-max-uncommitted-bytes-per-group N] [--node-memory-soft-cap-bytes N]"
         .to_owned()
 }
 

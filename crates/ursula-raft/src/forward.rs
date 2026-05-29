@@ -6,6 +6,7 @@ use crate::rt::time::Instant;
 
 use openraft::BasicNode;
 use openraft::Raft;
+use openraft::rt::WatchReceiver;
 use prost::Message;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
@@ -200,6 +201,7 @@ pub(crate) async fn write_commands_on_raft(
                 format!("OpenRaft client_write_many forwarded to leader: {err}"),
                 err.leader_id,
                 err.leader_node.as_ref(),
+                raft.metrics().borrow_watched().id,
             )),
         };
         responses.push(response);
@@ -238,12 +240,14 @@ pub(crate) fn group_engine_client_write_error(
         UrsulaRaftTypeConfig,
         openraft::error::ClientWriteError<UrsulaRaftTypeConfig>,
     >,
+    self_id: u64,
 ) -> GroupEngineError {
     if let Some(forward) = err.forward_to_leader() {
         return group_engine_forward_to_leader_error(
             format!("OpenRaft client_write forwarded to leader: {err}"),
             forward.leader_id,
             forward.leader_node.as_ref(),
+            self_id,
         );
     }
     GroupEngineError::new(format!("OpenRaft client_write: {err}"))
@@ -253,7 +257,15 @@ pub(crate) fn group_engine_forward_to_leader_error(
     message: impl Into<String>,
     leader_id: Option<u64>,
     leader_node: Option<&BasicNode>,
+    self_id: u64,
 ) -> GroupEngineError {
+    // The write bounced because this node is not the leader. If the reported
+    // leader is *this* node, leadership is in a transient step-down/election
+    // window: redirecting the client back to ourselves would just loop, so
+    // report leader-unknown and let the HTTP layer answer with a retryable 503.
+    if leader_id == Some(self_id) {
+        return GroupEngineError::forward_to_leader(message, None, None);
+    }
     GroupEngineError::forward_to_leader(
         message,
         leader_id,

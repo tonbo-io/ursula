@@ -60,20 +60,21 @@ FAULT_PROFILES = {
     # blast radius of the legacy network profile.
     "orthogonal": "cluster_netem_delay,cluster_netem_loss,cluster_partition,s3_unavailable",
 }
-# Cluster-plane subnet CIDRs (ens6). Used to scope netem to raft traffic
-# without touching S3 / AWS-endpoint traffic that also egresses ens6.
+# Per-node raft endpoints used to scope netem to inter-node raft traffic.
+# Single-port deployment: raft replication shares the primary interface
+# (ens5) with the client API on :4491, so we target each peer's ens5 IP as a
+# /32. Client traffic originates from the agent host (not in this set) and S3
+# egresses to different destinations, so neither is impaired.
 CLUSTER_SUBNETS = [
-    "172.31.96.0/20",
-    "172.31.112.0/20",
-    "172.31.128.0/20",
+    "172.31.80.22/32",
+    "172.31.31.150/32",
+    "172.31.47.237/32",
 ]
-# ens6 cluster-plane IPs per node, used by cluster_partition to drop
-# raft connections specifically (the legacy asymmetric_partition used the
-# ens5 client IPs which never appear on raft replication packets).
+# Per-node ens5 IPs, used by cluster_partition to drop raft connections.
 CLUSTER_IPS_BY_NAME = {
-    "ursula-chaos-node-1": "172.31.104.110",
-    "ursula-chaos-node-2": "172.31.122.61",
-    "ursula-chaos-node-3": "172.31.129.198",
+    "ursula-chaos-node-1": "172.31.80.22",
+    "ursula-chaos-node-2": "172.31.31.150",
+    "ursula-chaos-node-3": "172.31.47.237",
 }
 SETSUM_PRIMES = [
     4294967291,
@@ -502,13 +503,33 @@ class ChaosAgent:
         headers: dict[str, str] | None = None,
         timeout_secs: float | None = None,
     ) -> tuple[int, bytes, dict[str, str]]:
-        request = urllib.request.Request(url, data=body, method=method, headers=headers or {})
-        try:
-            timeout = self.timeout_secs if timeout_secs is None else timeout_secs
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return response.status, response.read(), _lower_headers(response.headers)
-        except urllib.error.HTTPError as exc:
-            return exc.code, exc.read(), _lower_headers(exc.headers)
+        timeout = self.timeout_secs if timeout_secs is None else timeout_secs
+        # A write/read that lands on a non-leader is answered with a 307 to the
+        # leader. urllib does NOT auto-follow 307/308 for non-GET/HEAD methods,
+        # so follow it explicitly here, preserving method + body, up to a few
+        # hops (leadership can move mid-flight).
+        for _hop in range(4):
+            request = urllib.request.Request(
+                url, data=body, method=method, headers=headers or {}
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    status, data, resp_headers = (
+                        response.status,
+                        response.read(),
+                        _lower_headers(response.headers),
+                    )
+            except urllib.error.HTTPError as exc:
+                status, data, resp_headers = (
+                    exc.code,
+                    exc.read(),
+                    _lower_headers(exc.headers),
+                )
+            if status in {307, 308} and resp_headers.get("location"):
+                url = urllib.parse.urljoin(url, resp_headers["location"])
+                continue
+            return status, data, resp_headers
+        return status, data, resp_headers
 
     def create_streams(self) -> None:
         for stream in self.streams:

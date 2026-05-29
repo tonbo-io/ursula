@@ -42,7 +42,6 @@ use crate::registry::RaftGroupHandleRegistry;
 pub const RAFT_GRPC_APPEND_PATH: &str = "/ursula.raft.v1.RaftInternal/Append";
 pub const RAFT_GRPC_VOTE_PATH: &str = "/ursula.raft.v1.RaftInternal/Vote";
 pub const RAFT_GRPC_FULL_SNAPSHOT_PATH: &str = "/ursula.raft.v1.RaftInternal/FullSnapshot";
-pub const RAFT_GRPC_FORWARD_HTTP_WRITE_PATH: &str = "/ursula.raft.v1.RaftInternal/ForwardHttpWrite";
 pub const RAFT_GRPC_GROUP_WRITE_PATH: &str = "/ursula.raft.v1.RaftInternal/GroupWrite";
 pub const RAFT_GRPC_GROUP_READ_PATH: &str = "/ursula.raft.v1.RaftInternal/GroupRead";
 pub const RAFT_GRPC_MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
@@ -180,15 +179,6 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             raft_internal_proto::RaftFullSnapshotAckV1 {
                 response: Some(snapshot_response_to_proto(response)),
             },
-        ))
-    }
-
-    async fn forward_http_write(
-        &self,
-        _request: tonic::Request<raft_internal_proto::HttpWriteRequestV1>,
-    ) -> Result<tonic::Response<raft_internal_proto::HttpWriteResponseV1>, tonic::Status> {
-        Err(tonic::Status::unimplemented(
-            "HTTP write forwarding is provided by the HTTP adapter",
         ))
     }
 

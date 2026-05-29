@@ -1,6 +1,6 @@
 use axum::body::Bytes;
 use axum::http::StatusCode;
-use axum::http::header::{HeaderMap, HeaderValue};
+use axum::http::header::{HOST, HeaderMap, HeaderValue};
 use axum::response::Response;
 use base64::Engine;
 use ursula_raft::RaftGroupMetricsSnapshot;

@@ -34,24 +34,6 @@ message RaftFullSnapshotAckV1 {
   RaftSnapshotResponseV1 response = 1;
 }
 
-message HttpHeaderV1 {
-  string name = 1;
-  bytes value = 2;
-}
-
-message HttpWriteRequestV1 {
-  string method = 1;
-  string target = 2;
-  repeated HttpHeaderV1 headers = 3;
-  bytes body = 4;
-}
-
-message HttpWriteResponseV1 {
-  uint32 status = 1;
-  repeated HttpHeaderV1 headers = 2;
-  bytes body = 3;
-}
-
 message GroupWriteRequestV1 {
   uint32 raft_group_id = 1;
   uint32 core_id = 2;
@@ -259,7 +241,6 @@ service RaftInternal {
   rpc Append(RaftRpcEnvelopeV1) returns (RaftRpcAckV1);
   rpc Vote(RaftRpcEnvelopeV1) returns (RaftRpcAckV1);
   rpc FullSnapshot(RaftFullSnapshotRequestV1) returns (RaftFullSnapshotAckV1);
-  rpc ForwardHttpWrite(HttpWriteRequestV1) returns (HttpWriteResponseV1);
   rpc GroupWrite(GroupWriteRequestV1) returns (GroupWriteResponseV1);
   rpc GroupRead(GroupReadRequestV1) returns (GroupReadResponseV1);
 }
