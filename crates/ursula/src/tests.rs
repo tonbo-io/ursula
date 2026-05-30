@@ -4457,6 +4457,146 @@ fn node_memory_admission_partial_shed_between_soft_and_hard_cap() {
     assert!(passed > 0, "no writes survived partial shedding");
 }
 
+mod cold_health {
+    use crate::bootstrap::{ColdHealthDecision, ColdHealthSample, ColdHealthTracker};
+
+    fn sample(errors: u64, hot_max: u64) -> ColdHealthSample {
+        ColdHealthSample {
+            cold_flush_write_errors: errors,
+            cold_hot_group_bytes_max: hot_max,
+        }
+    }
+
+    fn fresh_tracker() -> ColdHealthTracker {
+        // unhealthy_ticks=2, heal_ticks=3, hot_high=7MB, hot_low=4MB,
+        // errors_per_tick_high=1 → match the chaos defaults but smaller
+        // tick counts so tests stay short.
+        ColdHealthTracker::new(2, 3, 7 * 1024 * 1024, 4 * 1024 * 1024, 1)
+    }
+
+    #[test]
+    fn healthy_steady_state_does_nothing() {
+        let mut t = fresh_tracker();
+        for _ in 0..5 {
+            assert_eq!(t.evaluate(sample(0, 0)), ColdHealthDecision::NoChange);
+        }
+        assert!(!t.yielded());
+    }
+
+    #[test]
+    fn first_tick_with_accumulated_errors_does_not_immediately_shed() {
+        // Process started with 1000 errors already on the counter from a
+        // prior run — that's not "+1000/tick", just the baseline.
+        let mut t = fresh_tracker();
+        assert_eq!(t.evaluate(sample(1000, 0)), ColdHealthDecision::NoChange);
+        // Subsequent flat reads must stay quiet too.
+        assert_eq!(t.evaluate(sample(1000, 0)), ColdHealthDecision::NoChange);
+        assert!(!t.yielded());
+    }
+
+    #[test]
+    fn hot_above_high_for_unhealthy_ticks_sheds() {
+        let mut t = fresh_tracker();
+        // tick 1: unhealthy (hot 8MB ≥ 7MB high)
+        assert_eq!(
+            t.evaluate(sample(0, 8 * 1024 * 1024)),
+            ColdHealthDecision::NoChange
+        );
+        // tick 2: still unhealthy → shed (unhealthy_ticks=2)
+        match t.evaluate(sample(0, 8 * 1024 * 1024)) {
+            ColdHealthDecision::Shed { reason } => assert!(reason.contains("cold_hot_max")),
+            other => panic!("expected Shed, got {other:?}"),
+        }
+        assert!(t.yielded());
+    }
+
+    #[test]
+    fn growing_errors_for_unhealthy_ticks_sheds() {
+        let mut t = fresh_tracker();
+        // baseline
+        t.evaluate(sample(100, 0));
+        // tick: +5 errors > 1/tick high → unhealthy
+        assert_eq!(t.evaluate(sample(105, 0)), ColdHealthDecision::NoChange);
+        // tick: +3 errors > 1/tick → still unhealthy → shed
+        match t.evaluate(sample(108, 0)) {
+            ColdHealthDecision::Shed { reason } => {
+                assert!(reason.contains("cold_flush_write_errors"))
+            }
+            other => panic!("expected Shed, got {other:?}"),
+        }
+        assert!(t.yielded());
+    }
+
+    #[test]
+    fn shed_does_not_fire_twice_until_a_heal() {
+        let mut t = fresh_tracker();
+        t.evaluate(sample(0, 8 * 1024 * 1024));
+        let _ = t.evaluate(sample(0, 8 * 1024 * 1024));
+        assert!(t.yielded());
+        // Stay unhealthy more ticks — must NOT keep emitting Shed, just NoChange.
+        for _ in 0..5 {
+            assert_eq!(
+                t.evaluate(sample(0, 8 * 1024 * 1024)),
+                ColdHealthDecision::NoChange,
+            );
+        }
+        assert!(t.yielded());
+    }
+
+    #[test]
+    fn full_recovery_after_heal_ticks_re_enables() {
+        let mut t = fresh_tracker();
+        // Get yielded first.
+        t.evaluate(sample(0, 8 * 1024 * 1024));
+        let _ = t.evaluate(sample(0, 8 * 1024 * 1024));
+        assert!(t.yielded());
+
+        // Now healthy: errors flat, hot ≤ LOW. heal_ticks=3.
+        assert_eq!(
+            t.evaluate(sample(0, 1024 * 1024)),
+            ColdHealthDecision::NoChange
+        );
+        assert_eq!(
+            t.evaluate(sample(0, 1024 * 1024)),
+            ColdHealthDecision::NoChange
+        );
+        assert_eq!(t.evaluate(sample(0, 1024 * 1024)), ColdHealthDecision::Heal);
+        assert!(!t.yielded());
+    }
+
+    #[test]
+    fn middle_band_neither_sheds_nor_heals() {
+        let mut t = fresh_tracker();
+        // Yield first.
+        t.evaluate(sample(0, 8 * 1024 * 1024));
+        let _ = t.evaluate(sample(0, 8 * 1024 * 1024));
+        assert!(t.yielded());
+
+        // Hot 5 MB is between LOW (4) and HIGH (7) — neutral. Must NOT heal
+        // even after many ticks; the system needs a real catch-up window
+        // (hot ≤ LOW) before we re-elect.
+        for _ in 0..10 {
+            assert_eq!(
+                t.evaluate(sample(0, 5 * 1024 * 1024)),
+                ColdHealthDecision::NoChange,
+            );
+        }
+        assert!(t.yielded());
+    }
+
+    #[test]
+    fn flapping_health_resets_streaks_and_does_not_shed() {
+        let mut t = fresh_tracker();
+        // alternating: bad, good, bad, good — should never accumulate
+        // unhealthy_ticks=2 in a row.
+        for _ in 0..5 {
+            t.evaluate(sample(0, 8 * 1024 * 1024)); // bad
+            t.evaluate(sample(0, 1024 * 1024)); // healthy
+        }
+        assert!(!t.yielded());
+    }
+}
+
 mod leadership_balance {
     use crate::bootstrap::plan_leadership_balance;
     use ursula_raft::{RaftGroupMetricsSnapshot, RaftLogProgressSnapshot};
