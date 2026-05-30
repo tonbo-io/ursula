@@ -202,18 +202,36 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
     .await;
     assert_eq!(payload, b"cli-durable-cluster-payload");
 
+    // raft replication is acked once a quorum (leader + one follower) has the
+    // entry. The remaining follower may still be flushing to its journal when
+    // the client-side read on peers[2] returns — particularly on slower CI
+    // disks. Poll for the journal up to ~5s per node before asserting, so the
+    // test only fails when a node truly never persists, not when it persists
+    // a beat later than the read.
     for node_id in 1..=3 {
         let journal_path = root
             .join(format!("node-{node_id}-log"))
             .join("core-0")
             .join("journal.bin");
-        assert!(journal_path.exists(), "node {node_id} journal should exist");
+        let mut last_len = 0u64;
+        for _ in 0..100 {
+            if journal_path.exists() {
+                last_len = std::fs::metadata(&journal_path)
+                    .expect("node journal metadata")
+                    .len();
+                if last_len > 0 {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(
-            std::fs::metadata(&journal_path)
-                .expect("node journal metadata")
-                .len()
-                > 0,
-            "node {node_id} journal should contain records"
+            journal_path.exists(),
+            "node {node_id} journal should exist after polling for ~5s",
+        );
+        assert!(
+            last_len > 0,
+            "node {node_id} journal should contain records after polling for ~5s (saw len={last_len})",
         );
     }
 
