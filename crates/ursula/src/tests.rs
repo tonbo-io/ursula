@@ -4453,3 +4453,177 @@ fn node_memory_admission_partial_shed_between_soft_and_hard_cap() {
     );
     assert!(passed > 0, "no writes survived partial shedding");
 }
+
+mod commit_stall {
+    use crate::bootstrap::{CommitStallAction, CommitStallTracker};
+    use std::time::{Duration, Instant};
+    use ursula_raft::{RaftGroupMetricsSnapshot, RaftLogProgressSnapshot};
+
+    fn snap(
+        group_id: u32,
+        node_id: u64,
+        leader: Option<u64>,
+        last_log: Option<u64>,
+        committed: Option<u64>,
+    ) -> RaftGroupMetricsSnapshot {
+        RaftGroupMetricsSnapshot {
+            raft_group_id: group_id,
+            node_id,
+            current_term: 1,
+            current_leader: leader,
+            last_log_index: last_log,
+            committed: committed.map(|index| RaftLogProgressSnapshot { term: 1, index }),
+            last_applied: committed.map(|index| RaftLogProgressSnapshot { term: 1, index }),
+            snapshot: None,
+            purged: None,
+            voter_ids: vec![1, 2, 3],
+            learner_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn no_gap_emits_no_action_and_tracks_nothing() {
+        let mut tracker = CommitStallTracker::default();
+        let t0 = Instant::now();
+        let snaps = vec![snap(0, 2, Some(2), Some(100), Some(100))];
+        let actions = tracker.evaluate(&snaps, 2, t0, Duration::from_secs(15));
+        assert!(actions.is_empty());
+        // Later tick, still no gap: still nothing.
+        let actions = tracker.evaluate(
+            &snaps,
+            2,
+            t0 + Duration::from_secs(60),
+            Duration::from_secs(15),
+        );
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn gap_below_threshold_silently_baselines() {
+        let mut tracker = CommitStallTracker::default();
+        let t0 = Instant::now();
+        let snaps = vec![snap(0, 2, Some(2), Some(101), Some(100))];
+        // First sighting → baselined, no action.
+        let actions = tracker.evaluate(&snaps, 2, t0, Duration::from_secs(15));
+        assert!(actions.is_empty());
+        // 10s later, same indices, still under threshold → still no action.
+        let actions = tracker.evaluate(
+            &snaps,
+            2,
+            t0 + Duration::from_secs(10),
+            Duration::from_secs(15),
+        );
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn gap_persisting_past_threshold_emits_transfer() {
+        let mut tracker = CommitStallTracker::default();
+        let t0 = Instant::now();
+        // Group 3 stalled on N2 (the bug observed in chaos), N1/N3 are voters.
+        let snaps = vec![snap(3, 2, Some(2), Some(19172), Some(19171))];
+        tracker.evaluate(&snaps, 2, t0, Duration::from_secs(15));
+        let actions = tracker.evaluate(
+            &snaps,
+            2,
+            t0 + Duration::from_secs(16),
+            Duration::from_secs(15),
+        );
+        assert_eq!(
+            actions,
+            vec![CommitStallAction {
+                group_id: 3,
+                target: 1, // first non-self voter
+                stalled_for: Duration::from_secs(16),
+                last_log: Some(19172),
+                committed: Some(19171),
+            }]
+        );
+        // After emitting, baseline is cleared → another full threshold wait
+        // before re-firing, even though the gap still exists.
+        let actions = tracker.evaluate(
+            &snaps,
+            2,
+            t0 + Duration::from_secs(20),
+            Duration::from_secs(15),
+        );
+        assert!(
+            actions.is_empty(),
+            "must not hammer transfers; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn forward_progress_resets_the_baseline_and_prevents_trigger() {
+        let mut tracker = CommitStallTracker::default();
+        let t0 = Instant::now();
+        let s1 = vec![snap(0, 2, Some(2), Some(100), Some(99))];
+        tracker.evaluate(&s1, 2, t0, Duration::from_secs(15));
+        // 10s later: committed catches up by one, gap remains but indices moved.
+        let s2 = vec![snap(0, 2, Some(2), Some(101), Some(100))];
+        let actions = tracker.evaluate(
+            &s2,
+            2,
+            t0 + Duration::from_secs(10),
+            Duration::from_secs(15),
+        );
+        assert!(actions.is_empty());
+        // Another 10s on the same indices (now baselined at t+10) — still
+        // under threshold from the most recent re-baseline.
+        let actions = tracker.evaluate(
+            &s2,
+            2,
+            t0 + Duration::from_secs(20),
+            Duration::from_secs(15),
+        );
+        assert!(
+            actions.is_empty(),
+            "10s since reset < 15s threshold; got {actions:?}"
+        );
+        // 20s past the reset → finally fires.
+        let actions = tracker.evaluate(
+            &s2,
+            2,
+            t0 + Duration::from_secs(30),
+            Duration::from_secs(15),
+        );
+        assert_eq!(actions.len(), 1);
+    }
+
+    #[test]
+    fn losing_leadership_clears_tracking() {
+        let mut tracker = CommitStallTracker::default();
+        let t0 = Instant::now();
+        let stalled = vec![snap(0, 2, Some(2), Some(101), Some(100))];
+        tracker.evaluate(&stalled, 2, t0, Duration::from_secs(15));
+        // Leadership moves to node 1 (e.g. via M1 transfer); we should drop
+        // this group from our tracker — not our problem anymore.
+        let new_leader = vec![snap(0, 2, Some(1), Some(101), Some(100))];
+        let actions = tracker.evaluate(
+            &new_leader,
+            2,
+            t0 + Duration::from_secs(60),
+            Duration::from_secs(15),
+        );
+        assert!(actions.is_empty());
+        // If we win leadership back later, we restart the timer from scratch.
+        let re_leader = vec![snap(0, 2, Some(2), Some(101), Some(100))];
+        let actions = tracker.evaluate(
+            &re_leader,
+            2,
+            t0 + Duration::from_secs(62),
+            Duration::from_secs(15),
+        );
+        assert!(
+            actions.is_empty(),
+            "fresh leadership re-baselines; got {actions:?}"
+        );
+        let actions = tracker.evaluate(
+            &re_leader,
+            2,
+            t0 + Duration::from_secs(80),
+            Duration::from_secs(15),
+        );
+        assert_eq!(actions.len(), 1);
+    }
+}
