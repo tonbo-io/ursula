@@ -2062,18 +2062,20 @@ class ChaosAgent:
             and cold_backpressure_clean
             and integrity_status == "operational"
         )
-        # An injection is "recovered" once the fault no longer harms
-        # availability: the cluster commits on a quorum with an acceptable error
-        # rate and intact integrity. This is intentionally looser than
+        # An injection is "recovered" once the cluster is back to serving on a
+        # quorum with intact integrity. This is intentionally looser than
         # `fully_healthy` (used for the operational display): the egress-health
-        # gate (M2) deliberately runs the cluster on the two healthy nodes while
-        # one is impaired, and M1/M2 failover causes brief read misses — so
-        # requiring all-3-perfect-with-zero-read-errors would leave recovery
-        # undetected and trip a false `repair_failed` on every cluster fault.
+        # gate (M2) deliberately runs the cluster on two healthy nodes while one
+        # is impaired, M1/M2 failover causes brief read misses, and the workload
+        # (churn + producer probes) leaves a steady error trickle — so
+        # requiring "all-3-perfect" or a tight error-rate window would leave
+        # recovery undetected and trip a false `repair_failed` on every cluster
+        # fault. Error rate is a workload-degradation signal, not a recovery
+        # signal; `workload_progressing` is enough to confirm the cluster is
+        # doing useful work.
         recovered_healthy = (
             quorum_healthy
             and workload_progressing
-            and workload_clean
             and integrity_status == "operational"
         )
         if integrity_status != "operational" or running_nodes < 2 or metrics_ok < 2:
