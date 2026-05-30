@@ -2369,8 +2369,11 @@ async fn static_grpc_memory_node_rejoins_empty_after_allowed_log_revert() {
         .snapshot()
         .await
         .expect("trigger leader snapshot");
+    // 15s headroom: x86 CI runners finish openraft's snapshot worker noticeably
+    // slower than ARM and laptops; the previous 5s ceiling was tight enough
+    // to flake despite the wait being correct.
     leader_raft
-        .wait(Some(Duration::from_secs(5)))
+        .wait(Some(Duration::from_secs(15)))
         .snapshot(
             snapshot_log_id,
             "leader snapshot includes quorum-only write",
