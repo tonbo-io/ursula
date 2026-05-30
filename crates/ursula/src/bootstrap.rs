@@ -3,7 +3,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// `tokio::time::Instant` (not `std::time::Instant`) so the M3 commit-stall
+// timer behaves deterministically under madsim, which shims tokio's clock but
+// can't shim std's. The non-test code path is unchanged: outside madsim it's
+// just std's monotonic clock under tokio's facade.
+use tokio::time::Instant;
 
 use ursula_raft::{
     ColdRaftGroupEngineFactory, DurableRaftGroupEngineFactory, RaftGroupEngineFactory,

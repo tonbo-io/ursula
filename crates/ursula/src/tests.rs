@@ -4627,7 +4627,8 @@ mod leadership_balance {
 
 mod commit_stall {
     use crate::bootstrap::{CommitStallAction, CommitStallTracker};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use tokio::time::Instant;
     use ursula_raft::{RaftGroupMetricsSnapshot, RaftLogProgressSnapshot};
 
     fn snap(
