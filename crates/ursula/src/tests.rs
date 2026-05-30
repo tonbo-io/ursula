@@ -4454,6 +4454,177 @@ fn node_memory_admission_partial_shed_between_soft_and_hard_cap() {
     assert!(passed > 0, "no writes survived partial shedding");
 }
 
+mod leadership_balance {
+    use crate::bootstrap::plan_leadership_balance;
+    use ursula_raft::{RaftGroupMetricsSnapshot, RaftLogProgressSnapshot};
+
+    fn snap(group_id: u32, leader: Option<u64>) -> RaftGroupMetricsSnapshot {
+        RaftGroupMetricsSnapshot {
+            raft_group_id: group_id,
+            node_id: 1,
+            current_term: 1,
+            current_leader: leader,
+            last_log_index: Some(100),
+            committed: Some(RaftLogProgressSnapshot {
+                term: 1,
+                index: 100,
+            }),
+            last_applied: Some(RaftLogProgressSnapshot {
+                term: 1,
+                index: 100,
+            }),
+            snapshot: None,
+            purged: None,
+            voter_ids: vec![1, 2, 3],
+            learner_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn balanced_cluster_plans_nothing() {
+        // 6 groups, 3 voters: each holds 2 — already at fair share.
+        let snaps = vec![
+            snap(0, Some(1)),
+            snap(1, Some(1)),
+            snap(2, Some(2)),
+            snap(3, Some(2)),
+            snap(4, Some(3)),
+            snap(5, Some(3)),
+        ];
+        for me in [1u64, 2, 3] {
+            assert!(
+                plan_leadership_balance(&snaps, me, 4).is_empty(),
+                "node {me} unexpectedly planned a transfer in a balanced cluster",
+            );
+        }
+    }
+
+    #[test]
+    fn sole_node_with_everything_sheds_to_fair_share_in_one_tick() {
+        // Worst case after a sudden election: one node won every leadership.
+        // With max_per_tick=4 (default) we should fully balance in one tick.
+        let snaps = vec![
+            snap(0, Some(1)),
+            snap(1, Some(1)),
+            snap(2, Some(1)),
+            snap(3, Some(1)),
+            snap(4, Some(1)),
+            snap(5, Some(1)),
+        ];
+        let actions = plan_leadership_balance(&snaps, 1, 4);
+        // fair = ceil(6/3) = 2. Node 1 has 6, must shed 4. Both other voters
+        // should land at 2 each: that's a complete rebalance in a single tick.
+        assert_eq!(actions.len(), 4, "actions={actions:?}");
+        let mut target_counts = std::collections::HashMap::new();
+        for a in &actions {
+            *target_counts.entry(a.target).or_insert(0usize) += 1;
+        }
+        assert_eq!(target_counts.get(&2).copied().unwrap_or(0), 2);
+        assert_eq!(target_counts.get(&3).copied().unwrap_or(0), 2);
+        // Group ids should be the smallest 4 (deterministic order).
+        let mut group_ids: Vec<u32> = actions.iter().map(|a| a.group_id).collect();
+        group_ids.sort();
+        assert_eq!(group_ids, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn max_per_tick_caps_thundering_herd() {
+        // Same skew, but tick budget of 1: we shed exactly one and stop.
+        let snaps = vec![
+            snap(0, Some(1)),
+            snap(1, Some(1)),
+            snap(2, Some(1)),
+            snap(3, Some(1)),
+            snap(4, Some(1)),
+            snap(5, Some(1)),
+        ];
+        let actions = plan_leadership_balance(&snaps, 1, 1);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].group_id, 0); // smallest group_id first
+    }
+
+    #[test]
+    fn only_my_excess_planned_not_peer_excess() {
+        // Node 1 at fair share, node 2 over. From node 1's perspective, no
+        // action — only node 2's own balancer should shed.
+        let snaps = vec![
+            snap(0, Some(1)),
+            snap(1, Some(1)),
+            snap(2, Some(2)),
+            snap(3, Some(2)),
+            snap(4, Some(2)),
+            snap(5, Some(2)),
+        ];
+        assert!(plan_leadership_balance(&snaps, 1, 4).is_empty());
+        let actions_from_2 = plan_leadership_balance(&snaps, 2, 4);
+        assert_eq!(actions_from_2.len(), 2);
+        // Both transfers must target node 3 (the only under-loaded peer).
+        for a in &actions_from_2 {
+            assert_eq!(a.target, 3);
+        }
+    }
+
+    #[test]
+    fn picks_least_loaded_target_among_multiple_peers() {
+        // Node 1 has 4, node 2 has 1, node 3 has 1, fair = 2. Each of the
+        // two transfers should rotate (one to 2, one to 3), not pile up.
+        let snaps = vec![
+            snap(0, Some(1)),
+            snap(1, Some(1)),
+            snap(2, Some(1)),
+            snap(3, Some(1)),
+            snap(4, Some(2)),
+            snap(5, Some(3)),
+        ];
+        let actions = plan_leadership_balance(&snaps, 1, 4);
+        let mut target_counts = std::collections::HashMap::new();
+        for a in &actions {
+            *target_counts.entry(a.target).or_insert(0usize) += 1;
+        }
+        assert_eq!(actions.len(), 2);
+        assert_eq!(target_counts.get(&2).copied().unwrap_or(0), 1);
+        assert_eq!(target_counts.get(&3).copied().unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn group_with_no_eligible_voter_target_is_skipped() {
+        // Group 0 has voter set {1} only — nowhere to send. Group 1 normal.
+        let mut g0 = snap(0, Some(1));
+        g0.voter_ids = vec![1];
+        let mut g1 = snap(1, Some(1));
+        g1.voter_ids = vec![1, 2, 3];
+        let mut g2 = snap(2, Some(1));
+        g2.voter_ids = vec![1, 2, 3];
+        let snaps = vec![g0, g1, g2];
+        // 3 groups / 3 voters → fair = 1. Node 1 has 3, must shed 2.
+        let actions = plan_leadership_balance(&snaps, 1, 4);
+        // Two transfers, both from groups 1 and 2; group 0 stays put.
+        let group_ids: std::collections::BTreeSet<u32> =
+            actions.iter().map(|a| a.group_id).collect();
+        assert_eq!(group_ids, std::collections::BTreeSet::from([1, 2]));
+    }
+
+    #[test]
+    fn unbalance_consumer_does_not_evaluate_an_action_for_a_target_we_already_overflowed() {
+        // Synthetic: only one peer slot left under fair; second action would
+        // pile target above fair, so it should be cut.
+        let snaps = vec![
+            snap(0, Some(1)),
+            snap(1, Some(1)),
+            snap(2, Some(1)),
+            snap(3, Some(2)),
+            snap(4, Some(2)),
+            snap(5, Some(3)),
+        ];
+        // fair = 2. Node 1 has 3, must shed 1. Node 2 is at 2 (fair, no room),
+        // node 3 is at 1 (room for 1). Plan should be exactly one transfer to
+        // node 3 — not also to node 2.
+        let actions = plan_leadership_balance(&snaps, 1, 4);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].target, 3);
+    }
+}
+
 mod commit_stall {
     use crate::bootstrap::{CommitStallAction, CommitStallTracker};
     use std::time::{Duration, Instant};
@@ -4533,7 +4704,9 @@ mod commit_stall {
             actions,
             vec![CommitStallAction {
                 group_id: 3,
-                target: 1, // first non-self voter
+                // Both peer voters (1 and 3) are equally idle (0 leaderships)
+                // and tie-broken by id ascending → [1, 3].
+                targets: vec![1, 3],
                 stalled_for: Duration::from_secs(16),
                 last_log: Some(19172),
                 committed: Some(19171),
@@ -4588,6 +4761,36 @@ mod commit_stall {
             Duration::from_secs(15),
         );
         assert_eq!(actions.len(), 1);
+    }
+
+    #[test]
+    fn target_priority_prefers_least_loaded_peer() {
+        // 5 groups total; node 2 leads group 0 (stalled) plus group 4
+        // (running fine). Node 1 leads 3 groups, node 3 leads 0. The stall
+        // handoff should prefer node 3 (the lightest) first, then node 1.
+        let mut tracker = CommitStallTracker::default();
+        let t0 = Instant::now();
+        let snaps = vec![
+            snap(0, 2, Some(2), Some(100), Some(99)), // STALLED, led by us
+            snap(1, 2, Some(1), Some(200), Some(200)),
+            snap(2, 2, Some(1), Some(300), Some(300)),
+            snap(3, 2, Some(1), Some(400), Some(400)),
+            snap(4, 2, Some(2), Some(500), Some(500)),
+        ];
+        tracker.evaluate(&snaps, 2, t0, Duration::from_secs(15));
+        let actions = tracker.evaluate(
+            &snaps,
+            2,
+            t0 + Duration::from_secs(16),
+            Duration::from_secs(15),
+        );
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0].targets,
+            vec![3, 1],
+            "lightest voter (load 0) first, then the heavy one (load 3); got {:?}",
+            actions[0].targets,
+        );
     }
 
     #[test]
