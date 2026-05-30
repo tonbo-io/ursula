@@ -32,6 +32,11 @@ CONTENT_TYPE = "application/octet-stream"
 # State-aware refusals from the server: the node is up and reasoning about its
 # own stream state, it just can't serve this exact offset *right now*. None of
 # these imply data divergence:
+#     0 — request() sentinel for connection refused / timeout / URLError. The
+#         node is unreachable, not "answering with bad data" — pure availability.
+#         Critically includes the brief window after a node crash/restart, where
+#         skipping this would misclassify every chaos-induced reboot as integrity
+#         divergence and pin integrity_status=major_outage indefinitely.
 #   204 — no payload to return (empty range)
 #   404 — stream not yet known here (follower hasn't applied create / cluster routed elsewhere)
 #   410 — stream gone (deleted, but observed mid-replication)
@@ -41,7 +46,7 @@ CONTENT_TYPE = "application/octet-stream"
 # Real integrity divergence would be 200-OK responses with disagreeing bytes,
 # which `verify_server_integrity` already checks against published setsum
 # headers — that's the authoritative signal, not this read probe.
-READ_AVAILABILITY_STATUSES = {204, 404, 410, 416, 502, 503}
+READ_AVAILABILITY_STATUSES = {0, 204, 404, 410, 416, 502, 503}
 REVERT_DETECTION_SCENARIOS = {"no_allow_stop"}
 # Scenarios applied as faultd impairments (tc qdisc / iptables) rather than by
 # stopping the instance. Their recovery MUST clear the impairment via faultd
@@ -930,6 +935,14 @@ class ChaosAgent:
             error = self.probe_read_availability(stream)
             if error is None:
                 self.reader_success += 1
+                # Self-heal: a fully successful cross-node read clears any
+                # integrity-error left over from earlier transient noise (e.g. a
+                # node-restart window). Without this, last_integrity_error is
+                # sticky until verify_server_integrity happens to fire and pass,
+                # which can leave integrity_status=major_outage long after the
+                # cluster is healthy and block recovery lifecycle on the next
+                # injection.
+                self.last_integrity_error = None
             else:
                 self.reader_errors += 1
                 availability_error = self.is_read_availability_error(error)
