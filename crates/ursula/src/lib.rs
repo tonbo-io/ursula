@@ -374,6 +374,13 @@ impl NodeMemoryAdmission {
     fn spawn_rss_sampler(&self) {
         let last_rss_bytes = self.last_rss_bytes.clone();
         let abort_cap = env_u64_optional("URSULA_NODE_MEMORY_ABORT_CAP_BYTES");
+        let soft_cap = self.soft_cap_bytes;
+        let hard_cap = self.effective_hard_cap_bytes();
+        // Optional sticky path: if set we also write the same breadcrumb to a
+        // file so it survives systemd journald rotation and is trivially
+        // pulled later via SSH. Path is set, not derived, so deployments can
+        // route it into a long-lived disk (e.g. /var/log/ursula-abort.json).
+        let abort_log_path = std::env::var("URSULA_NODE_MEMORY_ABORT_LOG_PATH").ok();
         tokio::spawn(async move {
             loop {
                 if let Some(rss) = read_proc_self_status_vm_rss_bytes() {
@@ -385,12 +392,42 @@ impl NodeMemoryAdmission {
                         // raft uncommitted, forward, concurrency) should bound
                         // memory under normal load. If we still overshoot, the
                         // unaccounted growth (allocator slack, framework
-                        // overhead) is unbounded — process::abort lets
-                        // systemd restart from a clean state instead of
-                        // riding OOM-killer into kernel-level shutdown that
-                        // also takes SSM agent / cloud-init credentials with
-                        // it.
-                        eprintln!("ursula: RSS {rss} bytes exceeded abort cap {cap}, aborting");
+                        // overhead) is unbounded — process::abort lets systemd
+                        // restart from a clean state instead of riding the
+                        // OOM-killer into a kernel-level shutdown that also
+                        // takes the SSM agent / cloud-init credentials with it.
+                        //
+                        // Before aborting, emit a structured breadcrumb to
+                        // stderr (so journald captures it) AND optionally to a
+                        // sticky file. The previous bare eprintln was hard to
+                        // grep across many nodes and left no machine-readable
+                        // trail — under chaos load when this fires across the
+                        // fleet we want to correlate aborts to the same minute.
+                        let host = std::env::var("HOSTNAME")
+                            .ok()
+                            .or_else(|| std::fs::read_to_string("/proc/sys/kernel/hostname").ok())
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_default();
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0);
+                        let breadcrumb = format!(
+                            "{{\"event\":\"memory_admission_abort\",\"ts_ms\":{now_ms},\"host\":\"{host}\",\"rss_bytes\":{rss},\"soft_cap_bytes\":{soft},\"hard_cap_bytes\":{hard},\"abort_cap_bytes\":{cap}}}",
+                            soft = soft_cap
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "null".into()),
+                            hard = hard_cap
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "null".into()),
+                        );
+                        eprintln!("{breadcrumb}");
+                        if let Some(path) = &abort_log_path {
+                            // Best-effort: filesystem write may fail under
+                            // memory pressure but the stderr line above is
+                            // already in flight. Don't bother retrying.
+                            let _ = std::fs::write(path, format!("{breadcrumb}\n"));
+                        }
                         std::process::abort();
                     }
                 }

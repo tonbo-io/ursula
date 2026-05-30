@@ -502,13 +502,21 @@ pub fn spawn_snapshot_driver_if_configured(
 /// to date before handing off, so a lagging or unhealthy (elections-disabled)
 /// target simply makes the transfer a no-op that retries next tick.
 pub fn spawn_leadership_balancer_if_configured(registry: &RaftGroupHandleRegistry) {
-    let interval_ms = env_usize("URSULA_LEADERSHIP_BALANCE_MS", 15_000);
+    // 5s default is fast enough to converge a 6-group cluster after a sudden
+    // leader-concentration event (e.g. one node dies, all its leaderships
+    // land on whoever wins the elections first) within a couple of ticks.
+    // 15s left a 30s+ window of single-node overload that masked itself as
+    // ColdBackpressure storms in the chaos test.
+    let interval_ms = env_usize("URSULA_LEADERSHIP_BALANCE_MS", 5_000);
     if interval_ms == 0 {
         return;
     }
+    // Cap transfers per tick to bound thundering-herd risk while still
+    // letting a deeply skewed cluster heal in one or two ticks. None=unbounded.
+    let max_per_tick = env_usize("URSULA_LEADERSHIP_BALANCE_MAX_PER_TICK", 4);
     let registry = registry.clone();
     tokio::spawn(async move {
-        let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(15_000));
+        let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(5_000));
         loop {
             tokio::time::sleep(interval).await;
             let snaps = registry.metrics_snapshot();
@@ -516,51 +524,121 @@ pub fn spawn_leadership_balancer_if_configured(registry: &RaftGroupHandleRegistr
                 continue;
             }
             let my_id = snaps[0].node_id;
-            let node_ids: HashSet<u64> = snaps
-                .iter()
-                .flat_map(|snap| snap.voter_ids.iter().copied())
-                .collect();
-            let node_count = node_ids.len().max(1);
-            let group_count = snaps.len();
-            let fair = group_count.div_ceil(node_count);
-
-            let mut leader_count: HashMap<u64, usize> = HashMap::new();
-            for snap in &snaps {
-                if let Some(leader) = snap.current_leader {
-                    *leader_count.entry(leader).or_insert(0) += 1;
-                }
-            }
-            if leader_count.get(&my_id).copied().unwrap_or(0) <= fair {
-                continue; // this node is at or below its fair share
-            }
-
-            // Shed one group I lead to the most under-loaded eligible voter.
-            let mut best: Option<(u32, u64, usize)> = None; // (group, target, target_load)
-            for snap in &snaps {
-                if snap.current_leader != Some(my_id) {
+            let actions = plan_leadership_balance(&snaps, my_id, max_per_tick);
+            for action in actions {
+                let Some(raft) = registry.get(RaftGroupId(action.group_id)) else {
                     continue;
-                }
-                for target in snap.voter_ids.iter().copied().filter(|v| *v != my_id) {
-                    let load = leader_count.get(&target).copied().unwrap_or(0);
-                    if load < fair && best.is_none_or(|(_, _, b)| load < b) {
-                        best = Some((snap.raft_group_id, target, load));
-                    }
-                }
-            }
-            if let Some((gid, target, _)) = best
-                && let Some(raft) = registry.get(RaftGroupId(gid))
-            {
-                match raft.trigger().transfer_leader(target).await {
+                };
+                match raft.trigger().transfer_leader(action.target).await {
                     Ok(()) => eprintln!(
-                        "leadership-balance: node {my_id} handing group {gid} -> node {target} (fair={fair})"
+                        "leadership-balance: node {my_id} handing group {} -> node {} (fair={})",
+                        action.group_id, action.target, action.fair
                     ),
                     Err(err) => eprintln!(
-                        "leadership-balance: transfer_leader group {gid} -> {target} failed: {err}"
+                        "leadership-balance: transfer_leader group {} -> {} failed: {err}",
+                        action.group_id, action.target
                     ),
                 }
             }
         }
     });
+}
+
+/// One planned leader handoff for the M1 balancer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LeadershipBalanceAction {
+    pub group_id: u32,
+    pub target: u64,
+    pub fair: usize,
+}
+
+/// Plan the leader handoffs this tick should attempt. Pure function — split
+/// out so it tests against synthetic snapshots without spawning a task.
+///
+/// Each node runs this independently using the cluster-wide leader map
+/// (`current_leader` is globally agreed), so every node computes the same
+/// distribution and only schedules transfers it itself can perform (i.e. for
+/// groups where it is currently leader). The result respects `max_per_tick`
+/// and produces a deterministic order (smallest group id first, smallest
+/// target id on ties) so retries on the same snapshot are stable.
+pub(crate) fn plan_leadership_balance(
+    snaps: &[ursula_raft::RaftGroupMetricsSnapshot],
+    my_id: u64,
+    max_per_tick: usize,
+) -> Vec<LeadershipBalanceAction> {
+    if snaps.is_empty() {
+        return Vec::new();
+    }
+    let node_ids: HashSet<u64> = snaps
+        .iter()
+        .flat_map(|snap| snap.voter_ids.iter().copied())
+        .collect();
+    let node_count = node_ids.len().max(1);
+    let group_count = snaps.len();
+    let fair = group_count.div_ceil(node_count);
+
+    let mut leader_count: HashMap<u64, usize> = HashMap::new();
+    for snap in snaps {
+        if let Some(leader) = snap.current_leader {
+            *leader_count.entry(leader).or_insert(0) += 1;
+        }
+    }
+    let my_load = leader_count.get(&my_id).copied().unwrap_or(0);
+    if my_load <= fair {
+        return Vec::new();
+    }
+    let mut excess = my_load - fair;
+    // Groups we currently lead, smallest id first — deterministic shedding
+    // order so consecutive ticks against the same snapshot stay stable.
+    let mut groups_we_lead: Vec<&ursula_raft::RaftGroupMetricsSnapshot> = snaps
+        .iter()
+        .filter(|s| s.current_leader == Some(my_id))
+        .collect();
+    groups_we_lead.sort_by_key(|s| s.raft_group_id);
+
+    let mut planned_load: HashMap<u64, usize> = leader_count.clone();
+    let mut actions = Vec::new();
+    for snap in groups_we_lead {
+        if excess == 0 {
+            break;
+        }
+        if max_per_tick > 0 && actions.len() >= max_per_tick {
+            break;
+        }
+        // Pick the least-loaded peer voter that still has headroom under
+        // `fair`; ties broken by id ascending for determinism.
+        let mut peers: Vec<u64> = snap
+            .voter_ids
+            .iter()
+            .copied()
+            .filter(|v| *v != my_id)
+            .collect();
+        peers.sort_by_key(|v| (planned_load.get(v).copied().unwrap_or(0), *v));
+        let Some(&target) = peers
+            .iter()
+            .find(|v| planned_load.get(*v).copied().unwrap_or(0) < fair)
+        else {
+            // No peer of *this* group can take it (e.g. the group has a
+            // shrunken voter set or all eligible peers are already at fair).
+            // Move on to the next group — a different group may still have a
+            // viable peer. Without `continue` a structurally-restricted group
+            // would block all subsequent rebalancing.
+            continue;
+        };
+        actions.push(LeadershipBalanceAction {
+            group_id: snap.raft_group_id,
+            target,
+            fair,
+        });
+        *planned_load.entry(target).or_insert(0) += 1;
+        // We model the handoff as already done for planning purposes so the
+        // next iteration sees the updated load distribution.
+        if let Some(slot) = planned_load.get_mut(&my_id) {
+            *slot = slot.saturating_sub(1);
+        }
+        excess -= 1;
+    }
+    actions
 }
 
 /// M2 — egress-health leadership gate. Each node actively measures its own
@@ -718,17 +796,41 @@ pub fn spawn_commit_stall_watchdog_if_configured(registry: &RaftGroupHandleRegis
                     continue;
                 };
                 eprintln!(
-                    "commit-stall: node {my_id} group {} stalled {:.1}s (last_log={:?} committed={:?}); transferring leader -> {}",
+                    "commit-stall: node {my_id} group {} stalled {:.1}s (last_log={:?} committed={:?}); trying targets {:?}",
                     action.group_id,
                     action.stalled_for.as_secs_f64(),
                     action.last_log,
                     action.committed,
-                    action.target,
+                    action.targets,
                 );
-                if let Err(err) = raft.trigger().transfer_leader(action.target).await {
+                // Walk the prioritized target list (least-loaded first). The
+                // first target whose transfer_leader call succeeds wins; if
+                // ALL fail, the next tick re-baselines and waits the full
+                // threshold again before retrying — naturally backs off.
+                let mut handed_off = false;
+                for target in &action.targets {
+                    match raft.trigger().transfer_leader(*target).await {
+                        Ok(()) => {
+                            eprintln!(
+                                "commit-stall: group {} handed off -> {}",
+                                action.group_id, target
+                            );
+                            handed_off = true;
+                            break;
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "commit-stall: transfer_leader group {} -> {} failed: {err}; trying next target",
+                                action.group_id, target
+                            );
+                        }
+                    }
+                }
+                if !handed_off {
                     eprintln!(
-                        "commit-stall: transfer_leader group {} -> {} failed: {err}",
-                        action.group_id, action.target
+                        "commit-stall: group {} no target accepted transfer (all {} candidates failed); will retry after threshold",
+                        action.group_id,
+                        action.targets.len(),
                     );
                 }
             }
@@ -736,12 +838,15 @@ pub fn spawn_commit_stall_watchdog_if_configured(registry: &RaftGroupHandleRegis
     });
 }
 
-/// Per-tick decision (transfer leader of this group to this target because it
-/// has been commit-stalled this long).
+/// Per-tick decision (transfer leader of this group because it has been
+/// commit-stalled this long). `targets` is a priority-ordered list of peer
+/// voters to try; least-loaded first so a wedge doesn't pile load onto the
+/// already-busy node. The driver walks the list and stops at the first
+/// `transfer_leader` that succeeds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitStallAction {
     pub group_id: u32,
-    pub target: u64,
+    pub targets: Vec<u64>,
     pub stalled_for: Duration,
     pub last_log: Option<u64>,
     pub committed: Option<u64>,
@@ -768,6 +873,15 @@ impl CommitStallTracker {
                 .iter()
                 .any(|s| s.raft_group_id == *gid && s.current_leader == Some(my_id))
         });
+        // Count leaderships per node so we can prefer least-loaded targets.
+        // Without this, a single stalled leader handing off would always pick
+        // the same first-non-self voter, potentially the already-loaded one.
+        let mut leader_count: HashMap<u64, usize> = HashMap::new();
+        for snap in snaps {
+            if let Some(leader) = snap.current_leader {
+                *leader_count.entry(leader).or_insert(0) += 1;
+            }
+        }
         let mut actions = Vec::new();
         for snap in snaps {
             if snap.current_leader != Some(my_id) {
@@ -799,12 +913,22 @@ impl CommitStallTracker {
             if stalled_for < threshold {
                 continue;
             }
-            let Some(target) = snap.voter_ids.iter().copied().find(|v| *v != my_id) else {
+            // Build prioritized target list: every peer voter, sorted by
+            // current leader load (ascending) so we shed to the lightest
+            // node first. Ties broken by voter id for determinism.
+            let mut targets: Vec<u64> = snap
+                .voter_ids
+                .iter()
+                .copied()
+                .filter(|v| *v != my_id)
+                .collect();
+            targets.sort_by_key(|v| (leader_count.get(v).copied().unwrap_or(0), *v));
+            if targets.is_empty() {
                 continue;
-            };
+            }
             actions.push(CommitStallAction {
                 group_id: snap.raft_group_id,
-                target,
+                targets,
                 stalled_for,
                 last_log,
                 committed,
