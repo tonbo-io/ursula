@@ -355,6 +355,13 @@ pub struct GrpcRaftNetwork {
     target: u64,
     endpoint: String,
     client: Result<raft_internal_proto::raft_internal_client::RaftInternalClient<Channel>, String>,
+    /// Streak of consecutive RPC failures on this channel. Reset to 0 on the
+    /// next successful RPC. When it crosses `reconnect_threshold` we drop the
+    /// underlying HTTP/2 channel and rebuild a fresh one — tonic's
+    /// `connect_lazy` keeps a stuck channel forever otherwise (the TCP socket
+    /// stays open, the HTTP/2 streams stay borked, no auto-heal).
+    consecutive_failures: u32,
+    reconnect_threshold: u32,
 }
 
 impl Debug for GrpcRaftNetwork {
@@ -363,6 +370,8 @@ impl Debug for GrpcRaftNetwork {
             .field("raft_group_id", &self.raft_group_id)
             .field("target", &self.target)
             .field("endpoint", &self.endpoint)
+            .field("consecutive_failures", &self.consecutive_failures)
+            .field("reconnect_threshold", &self.reconnect_threshold)
             .finish()
     }
 }
@@ -370,20 +379,22 @@ impl Debug for GrpcRaftNetwork {
 impl GrpcRaftNetwork {
     pub fn new(raft_group_id: RaftGroupId, target: u64, address: impl Into<String>) -> Self {
         let endpoint = normalize_grpc_endpoint(address.into());
-        let client = Endpoint::from_shared(endpoint.clone())
-            .map(|endpoint| {
-                raft_internal_proto::raft_internal_client::RaftInternalClient::new(
-                    endpoint.connect_lazy(),
-                )
-                .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
-                .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
-            })
-            .map_err(|err| format!("invalid raft gRPC endpoint {endpoint}: {err}"));
+        let client = build_client(&endpoint);
+        // 8 consecutive failures × ~150ms heartbeat ≈ 1.2s of stuck stream
+        // before we forcibly rebuild — long enough that a single transient
+        // timeout doesn't churn channels, short enough that a real wedge
+        // self-heals before openraft's leadership lease expires.
+        let reconnect_threshold = std::env::var("URSULA_RAFT_GRPC_RECONNECT_AFTER_FAILURES")
+            .ok()
+            .and_then(|raw| raw.parse::<u32>().ok())
+            .unwrap_or(8);
         Self {
             raft_group_id,
             target,
             endpoint,
             client,
+            consecutive_failures: 0,
+            reconnect_threshold,
         }
     }
 
@@ -396,6 +407,26 @@ impl GrpcRaftNetwork {
         self.client
             .clone()
             .map_err(|err| RPCError::Unreachable(Unreachable::from_string(err)))
+    }
+
+    /// Increment the failure streak. If we cross the threshold, drop the
+    /// stuck channel and build a fresh one — the next RPC call gets a new
+    /// HTTP/2 connection. We also reset the counter so the freshly-built
+    /// channel gets a full grace period before any further rebuild.
+    fn note_failure(&mut self, route: &str) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        if self.consecutive_failures >= self.reconnect_threshold {
+            eprintln!(
+                "raft-grpc: rebuilding channel to node {} ({}) after {} consecutive {} failures",
+                self.target, self.endpoint, self.consecutive_failures, route,
+            );
+            self.client = build_client(&self.endpoint);
+            self.consecutive_failures = 0;
+        }
+    }
+
+    fn note_success(&mut self) {
+        self.consecutive_failures = 0;
     }
 
     pub(crate) fn append_envelope(
@@ -450,6 +481,20 @@ impl GrpcRaftNetwork {
     }
 }
 
+/// Construct a fresh tonic client over a lazy channel. Called both during
+/// initial `new` and during reconnect when the channel is detected stuck.
+fn build_client(
+    endpoint: &str,
+) -> Result<raft_internal_proto::raft_internal_client::RaftInternalClient<Channel>, String> {
+    Endpoint::from_shared(endpoint.to_owned())
+        .map(|ep| {
+            raft_internal_proto::raft_internal_client::RaftInternalClient::new(ep.connect_lazy())
+                .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
+        })
+        .map_err(|err| format!("invalid raft gRPC endpoint {endpoint}: {err}"))
+}
+
 pub(crate) fn normalize_grpc_endpoint(address: String) -> String {
     let address = address.trim_end_matches('/').to_owned();
     if address.starts_with("http://") || address.starts_with("https://") {
@@ -471,12 +516,17 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
     ) -> Result<UrsulaAppendEntriesResponse, RPCError<UrsulaRaftTypeConfig>> {
         let mut request = tonic::Request::new(self.append_envelope(rpc));
         self.apply_rpc_timeout(&mut request, option);
-        let response = self
-            .client()?
-            .append(request)
-            .await
-            .map_err(|err| self.map_tonic_status("Append", err))?
-            .into_inner();
+        let response = match self.client()?.append(request).await {
+            Ok(response) => {
+                self.note_success();
+                response.into_inner()
+            }
+            Err(err) => {
+                let mapped = self.map_tonic_status("Append", err);
+                self.note_failure("Append");
+                return Err(mapped);
+            }
+        };
         match required(response.payload, "raft append ack payload")
             .map_err(|err| raft_rpc_network_error(err.to_string()))?
         {
@@ -502,12 +552,17 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
     ) -> Result<UrsulaVoteResponse, RPCError<UrsulaRaftTypeConfig>> {
         let mut request = tonic::Request::new(self.vote_envelope(rpc));
         self.apply_rpc_timeout(&mut request, option);
-        let response = self
-            .client()?
-            .vote(request)
-            .await
-            .map_err(|err| self.map_tonic_status("Vote", err))?
-            .into_inner();
+        let response = match self.client()?.vote(request).await {
+            Ok(response) => {
+                self.note_success();
+                response.into_inner()
+            }
+            Err(err) => {
+                let mapped = self.map_tonic_status("Vote", err);
+                self.note_failure("Vote");
+                return Err(mapped);
+            }
+        };
         match required(response.payload, "raft vote ack payload")
             .map_err(|err| raft_rpc_network_error(err.to_string()))?
         {
@@ -543,18 +598,88 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
         };
         let mut request = tonic::Request::new(request);
         self.apply_rpc_timeout(&mut request, option);
-        let response = self
-            .client()
-            .map_err(StreamingError::from)?
-            .full_snapshot(request)
-            .await
-            .map_err(|err| StreamingError::from(self.map_tonic_status("FullSnapshot", err)))?
-            .into_inner();
+        let mut client = self.client().map_err(StreamingError::from)?;
+        let response = match client.full_snapshot(request).await {
+            Ok(response) => {
+                self.note_success();
+                response.into_inner()
+            }
+            Err(err) => {
+                let mapped = self.map_tonic_status("FullSnapshot", err);
+                self.note_failure("FullSnapshot");
+                return Err(StreamingError::from(mapped));
+            }
+        };
         snapshot_response_from_required_proto(response.response).map_err(|err| {
             StreamingError::from(raft_rpc_network_error(format!(
                 "decode FullSnapshot response from node {} at {}: {err}",
                 self.target, self.endpoint
             )))
         })
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+
+    fn fresh_network(threshold: u32) -> GrpcRaftNetwork {
+        let mut net = GrpcRaftNetwork::new(RaftGroupId(0), 2, "http://127.0.0.1:9999");
+        // Override threshold so tests don't depend on the env var
+        net.reconnect_threshold = threshold;
+        net
+    }
+
+    #[tokio::test]
+    async fn note_failure_below_threshold_just_increments() {
+        let mut net = fresh_network(5);
+        for n in 1..=4 {
+            net.note_failure("Append");
+            assert_eq!(net.consecutive_failures, n);
+        }
+    }
+
+    #[tokio::test]
+    async fn crossing_threshold_rebuilds_and_resets_counter() {
+        let mut net = fresh_network(3);
+        net.note_failure("Append");
+        net.note_failure("Append");
+        assert_eq!(net.consecutive_failures, 2);
+        net.note_failure("Append");
+        // After crossing the threshold we should be back at 0 (the post-
+        // rebuild grace period), and the client should still be valid.
+        assert_eq!(net.consecutive_failures, 0);
+        assert!(net.client.is_ok(), "channel should be rebuilt cleanly");
+    }
+
+    #[tokio::test]
+    async fn success_clears_the_streak() {
+        let mut net = fresh_network(5);
+        net.note_failure("Append");
+        net.note_failure("Append");
+        assert_eq!(net.consecutive_failures, 2);
+        net.note_success();
+        assert_eq!(net.consecutive_failures, 0);
+        // A subsequent failure starts the streak from 1, not 3 — the grace
+        // period truly resets, so a flaky connection that periodically
+        // succeeds doesn't accumulate toward a forced rebuild.
+        net.note_failure("Append");
+        assert_eq!(net.consecutive_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn rebuild_path_does_not_panic_even_on_unparseable_endpoint() {
+        // tonic accepts a lot of textually-weird endpoints (e.g. "not-a-url"
+        // gets normalized to "http://not-a-url" and parses fine; it just
+        // fails on connect). Force a real `from_shared` rejection with a
+        // genuinely-invalid URI — the rebuild path must surface that as a
+        // permanent Err on `client`, not panic, so openraft keeps retrying.
+        let mut net = GrpcRaftNetwork::new(RaftGroupId(0), 2, "http://");
+        net.reconnect_threshold = 2;
+        net.note_failure("Append");
+        net.note_failure("Append");
+        assert_eq!(net.consecutive_failures, 0);
+        // Whether the post-rebuild client is Ok or Err is tonic's choice for
+        // this endpoint string; the contract is just "no panic, counter reset".
     }
 }
