@@ -29,7 +29,19 @@ from typing import Any
 
 BUCKET = "chaos"
 CONTENT_TYPE = "application/octet-stream"
-READ_AVAILABILITY_STATUSES = {204, 404, 410, 502, 503}
+# State-aware refusals from the server: the node is up and reasoning about its
+# own stream state, it just can't serve this exact offset *right now*. None of
+# these imply data divergence:
+#   204 — no payload to return (empty range)
+#   404 — stream not yet known here (follower hasn't applied create / cluster routed elsewhere)
+#   410 — stream gone (deleted, but observed mid-replication)
+#   416 — OffsetOutOfRange (follower apply lag, or offset below live window after snapshot)
+#   502 — forwarding/proxy hop failed
+#   503 — backpressure / cold store unavailable
+# Real integrity divergence would be 200-OK responses with disagreeing bytes,
+# which `verify_server_integrity` already checks against published setsum
+# headers — that's the authoritative signal, not this read probe.
+READ_AVAILABILITY_STATUSES = {204, 404, 410, 416, 502, 503}
 REVERT_DETECTION_SCENARIOS = {"no_allow_stop"}
 # Scenarios applied as faultd impairments (tc qdisc / iptables) rather than by
 # stopping the instance. Their recovery MUST clear the impairment via faultd
