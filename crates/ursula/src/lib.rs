@@ -290,9 +290,18 @@ impl ClientWriteLeaderRouter {
 /// admissions; this one sheds writes when the entire process is approaching
 /// OOM regardless of which downstream is misbehaving. Read-only routes are
 /// not gated by this admission.
+///
+/// Shedding is *probabilistic* between `soft_cap` and `hard_cap`: at soft_cap
+/// 0% of writes are rejected, at hard_cap 100% are rejected, linear in
+/// between. Going off a cliff at soft_cap turned an s3_unavailable transient
+/// into a complete write outage — even partial throughput keeps producers
+/// alive while cold flush drains the live region back under soft_cap, and
+/// shedding ramps in / out smoothly tracks the RSS trajectory rather than
+/// snapping at a single threshold.
 #[derive(Clone)]
 pub struct NodeMemoryAdmission {
     soft_cap_bytes: Option<u64>,
+    hard_cap_bytes: Option<u64>,
     last_rss_bytes: Arc<AtomicU64>,
 }
 
@@ -300,6 +309,7 @@ impl std::fmt::Debug for NodeMemoryAdmission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeMemoryAdmission")
             .field("soft_cap_bytes", &self.soft_cap_bytes)
+            .field("hard_cap_bytes", &self.hard_cap_bytes)
             .field(
                 "last_rss_bytes",
                 &self.last_rss_bytes.load(Ordering::Relaxed),
@@ -312,6 +322,7 @@ impl NodeMemoryAdmission {
     pub fn disabled() -> Self {
         Self {
             soft_cap_bytes: None,
+            hard_cap_bytes: None,
             last_rss_bytes: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -319,6 +330,7 @@ impl NodeMemoryAdmission {
     pub fn from_env() -> Self {
         let admission = Self {
             soft_cap_bytes: env_u64_optional("URSULA_NODE_MEMORY_SOFT_CAP_BYTES"),
+            hard_cap_bytes: env_u64_optional("URSULA_NODE_MEMORY_HARD_CAP_BYTES"),
             last_rss_bytes: Arc::new(AtomicU64::new(0)),
         };
         // Always sample RSS so the /__ursula/metrics endpoint can report
@@ -340,6 +352,16 @@ impl NodeMemoryAdmission {
 
     pub fn soft_cap_bytes(&self) -> Option<u64> {
         self.soft_cap_bytes
+    }
+
+    /// Effective hard cap: explicit env override, or `soft + soft/4` when only
+    /// the soft cap is configured. Returns None iff the admission is disabled.
+    pub fn effective_hard_cap_bytes(&self) -> Option<u64> {
+        let soft = self.soft_cap_bytes?;
+        let hard = self
+            .hard_cap_bytes
+            .unwrap_or_else(|| soft.saturating_add(soft / 4));
+        Some(hard.max(soft))
     }
 
     #[cfg(madsim)]
@@ -378,12 +400,23 @@ impl NodeMemoryAdmission {
     }
 }
 
-/// Returns Some(503-response) if the admission is enabled and the current
-/// RSS sample is over the soft cap; None otherwise. Read paths skip this.
+/// Returns Some(503-response) when admission decides to shed this write.
+/// Below soft_cap: never shed. Above hard_cap: always shed. In between, the
+/// shed probability ramps linearly so producers keep partial throughput while
+/// the live region drains back. Read paths bypass this entirely.
 fn node_memory_admission_response(admission: &NodeMemoryAdmission) -> Option<Response> {
-    let limit = admission.soft_cap_bytes?;
+    let soft = admission.soft_cap_bytes?;
+    let hard = admission.effective_hard_cap_bytes()?;
     let rss = admission.last_rss_bytes.load(Ordering::Relaxed);
-    if rss <= limit {
+    if rss <= soft {
+        return None;
+    }
+    let reject_prob: f64 = if rss >= hard || hard == soft {
+        1.0
+    } else {
+        (rss - soft) as f64 / (hard - soft) as f64
+    };
+    if reject_prob < 1.0 && admission_sample() >= reject_prob {
         return None;
     }
     let mut headers = HeaderMap::new();
@@ -394,9 +427,26 @@ fn node_memory_admission_response(admission: &NodeMemoryAdmission) -> Option<Res
     );
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let body = format!(
-        "{{\"error\":\"NodeMemoryBackpressure\",\"rss_bytes\":{rss},\"soft_cap_bytes\":{limit}}}"
+        "{{\"error\":\"NodeMemoryBackpressure\",\"rss_bytes\":{rss},\"soft_cap_bytes\":{soft},\"hard_cap_bytes\":{hard}}}"
     );
     Some((StatusCode::SERVICE_UNAVAILABLE, headers, body).into_response())
+}
+
+/// Cheap process-local pseudo-random sample in [0, 1). Xorshift64 over a
+/// shared atomic seed; race-induced bias is irrelevant for load shedding and
+/// avoids pulling in a `rand` dependency just for this path.
+fn admission_sample() -> f64 {
+    static SEED: AtomicU64 = AtomicU64::new(0xfeed_face_cafe_beef);
+    let mut s = SEED.load(Ordering::Relaxed);
+    if s == 0 {
+        s = 0xdead_beef;
+    }
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    SEED.store(s, Ordering::Relaxed);
+    // Map the high 53 bits into [0, 1) so the result fits in an f64 mantissa.
+    ((s >> 11) as f64) / ((1u64 << 53) as f64)
 }
 
 #[cfg(not(madsim))]

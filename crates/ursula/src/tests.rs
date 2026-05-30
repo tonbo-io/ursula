@@ -4402,13 +4402,16 @@ fn node_memory_admission_disabled_returns_no_response() {
 }
 
 #[test]
-fn node_memory_admission_trips_when_sampled_rss_over_soft_cap() {
+fn node_memory_admission_trips_when_sampled_rss_over_hard_cap() {
+    // rss (2048) far exceeds the effective hard cap (soft + soft/4 = 1280),
+    // so every sample must reject regardless of the probabilistic dice.
     let admission = NodeMemoryAdmission {
         soft_cap_bytes: Some(1024),
+        hard_cap_bytes: None,
         last_rss_bytes: Arc::new(AtomicU64::new(2048)),
     };
     let response =
-        node_memory_admission_response(&admission).expect("over-cap RSS should be rejected");
+        node_memory_admission_response(&admission).expect("over-hard-cap RSS should be rejected");
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let retry_after = response
         .headers()
@@ -4419,7 +4422,34 @@ fn node_memory_admission_trips_when_sampled_rss_over_soft_cap() {
     // Under-cap RSS leaves the request alone.
     let under = NodeMemoryAdmission {
         soft_cap_bytes: Some(4096),
+        hard_cap_bytes: None,
         last_rss_bytes: Arc::new(AtomicU64::new(2048)),
     };
     assert!(node_memory_admission_response(&under).is_none());
+}
+
+#[test]
+fn node_memory_admission_partial_shed_between_soft_and_hard_cap() {
+    // Halfway between soft (1000) and explicit hard (2000) sits rss=1500.
+    // Reject probability should be ~50%; over many trials we expect both a
+    // meaningful pass and a meaningful reject count — neither extreme.
+    let admission = NodeMemoryAdmission {
+        soft_cap_bytes: Some(1000),
+        hard_cap_bytes: Some(2000),
+        last_rss_bytes: Arc::new(AtomicU64::new(1500)),
+    };
+    let mut rejected = 0;
+    let mut passed = 0;
+    for _ in 0..2000 {
+        if node_memory_admission_response(&admission).is_some() {
+            rejected += 1;
+        } else {
+            passed += 1;
+        }
+    }
+    assert!(
+        rejected > 600 && rejected < 1400,
+        "expected ~50% reject between soft/hard cap, got rejected={rejected} passed={passed}",
+    );
+    assert!(passed > 0, "no writes survived partial shedding");
 }
