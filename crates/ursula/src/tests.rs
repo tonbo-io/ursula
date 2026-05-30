@@ -4764,6 +4764,55 @@ mod commit_stall {
     }
 
     #[test]
+    fn m3_followed_by_m1_does_not_double_handoff() {
+        // Composite: a stalled leader (node 2) hands off via M3. After M3's
+        // transfer lands, the snapshot reflects the new leader. M1 evaluating
+        // the SAME post-handoff snapshot must not also plan a redundant
+        // transfer of that group, otherwise the two watchdogs would fight on
+        // every tick and produce leadership flap.
+        let mut tracker = CommitStallTracker::default();
+        let t0 = Instant::now();
+        let stalled = vec![
+            snap(0, 2, Some(2), Some(100), Some(99)), // node 2 stalled
+            snap(1, 2, Some(1), Some(50), Some(50)),
+            snap(2, 2, Some(3), Some(50), Some(50)),
+        ];
+        tracker.evaluate(&stalled, 2, t0, Duration::from_secs(15));
+        let actions = tracker.evaluate(
+            &stalled,
+            2,
+            t0 + Duration::from_secs(16),
+            Duration::from_secs(15),
+        );
+        assert_eq!(actions.len(), 1);
+        let action_target = actions[0].targets[0];
+
+        // Simulate transfer landing: snap now shows new leader and the wedge
+        // released (committed caught up).
+        let post_transfer = vec![
+            snap(0, 2, Some(action_target), Some(100), Some(100)),
+            snap(1, 2, Some(1), Some(50), Some(50)),
+            snap(2, 2, Some(3), Some(50), Some(50)),
+        ];
+        let m1_plan = crate::bootstrap::plan_leadership_balance(&post_transfer, 2, 4);
+        assert!(
+            m1_plan.is_empty(),
+            "M1 must not re-balance after M3 handoff; got {m1_plan:?}",
+        );
+
+        let m3_followup = tracker.evaluate(
+            &post_transfer,
+            2,
+            t0 + Duration::from_secs(20),
+            Duration::from_secs(15),
+        );
+        assert!(
+            m3_followup.is_empty(),
+            "M3 followup not empty after handoff: {m3_followup:?}",
+        );
+    }
+
+    #[test]
     fn target_priority_prefers_least_loaded_peer() {
         // 5 groups total; node 2 leads group 0 (stalled) plus group 4
         // (running fine). Node 1 leads 3 groups, node 3 leads 0. The stall
