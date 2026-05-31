@@ -205,6 +205,17 @@ message RaftSnapshotResponseV1 {
   VoteV1 vote = 1;
 }
 
+message RaftTransferLeaderRequestV1 {
+  uint32 raft_group_id = 1;
+  uint64 node_id = 2;
+  uint32 protocol_version = 3;
+  VoteV1 from_leader = 4;
+  uint64 to_node_id = 5;
+  LogIdV1 last_log_id = 6;
+}
+
+message RaftTransferLeaderAckV1 {}
+
 message HeadStreamResponsePayloadV1 {
   uint32 core_id = 1;
   uint32 shard_id = 2;
@@ -243,4 +254,5 @@ service RaftInternal {
   rpc FullSnapshot(RaftFullSnapshotRequestV1) returns (RaftFullSnapshotAckV1);
   rpc GroupWrite(GroupWriteRequestV1) returns (GroupWriteResponseV1);
   rpc GroupRead(GroupReadRequestV1) returns (GroupReadResponseV1);
+  rpc TransferLeader(RaftTransferLeaderRequestV1) returns (RaftTransferLeaderAckV1);
 }

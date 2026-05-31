@@ -40,7 +40,7 @@ pub use engine::{
 pub use grpc::{
     GrpcRaftNetwork, GrpcRaftNetworkFactory, RAFT_GRPC_APPEND_PATH, RAFT_GRPC_FULL_SNAPSHOT_PATH,
     RAFT_GRPC_GROUP_READ_PATH, RAFT_GRPC_GROUP_WRITE_PATH, RAFT_GRPC_MAX_MESSAGE_BYTES,
-    RAFT_GRPC_VOTE_PATH, RaftGrpcService, raft_grpc_service,
+    RAFT_GRPC_TRANSFER_LEADER_PATH, RAFT_GRPC_VOTE_PATH, RaftGrpcService, raft_grpc_service,
 };
 pub use log_store::{RaftGroupFileLogStore, RaftGroupLogStore};
 pub use registry::{
