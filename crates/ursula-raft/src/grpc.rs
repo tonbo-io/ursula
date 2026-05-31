@@ -1,4 +1,5 @@
 use openraft::RaftNetworkV2;
+use openraft::raft::TransferLeaderRequest;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;
@@ -44,6 +45,7 @@ pub const RAFT_GRPC_VOTE_PATH: &str = "/ursula.raft.v1.RaftInternal/Vote";
 pub const RAFT_GRPC_FULL_SNAPSHOT_PATH: &str = "/ursula.raft.v1.RaftInternal/FullSnapshot";
 pub const RAFT_GRPC_GROUP_WRITE_PATH: &str = "/ursula.raft.v1.RaftInternal/GroupWrite";
 pub const RAFT_GRPC_GROUP_READ_PATH: &str = "/ursula.raft.v1.RaftInternal/GroupRead";
+pub const RAFT_GRPC_TRANSFER_LEADER_PATH: &str = "/ursula.raft.v1.RaftInternal/TransferLeader";
 pub const RAFT_GRPC_MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const RAFT_GRPC_PROTOCOL_VERSION: u32 = 1;
 
@@ -216,6 +218,43 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .collect();
         Ok(tonic::Response::new(
             raft_internal_proto::GroupWriteResponseV1 { results },
+        ))
+    }
+
+    async fn transfer_leader(
+        &self,
+        request: tonic::Request<raft_internal_proto::RaftTransferLeaderRequestV1>,
+    ) -> Result<tonic::Response<raft_internal_proto::RaftTransferLeaderAckV1>, tonic::Status> {
+        let request = request.into_inner();
+        validate_grpc_metadata(request.protocol_version)?;
+        let raft_group_id = RaftGroupId(request.raft_group_id);
+        if !self.registry.contains_group(raft_group_id) {
+            return Err(GrpcRpcError::not_found(format!(
+                "raft group {} is not registered on this node",
+                raft_group_id.0
+            ))
+            .into());
+        }
+        let from_leader = vote_from_required_proto(request.from_leader)
+            .map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))?;
+        let last_log_id = match request.last_log_id {
+            Some(log_id) => Some(
+                log_id_from_required_proto(Some(log_id), "transfer_leader.last_log_id")
+                    .map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))?,
+            ),
+            None => None,
+        };
+        let openraft_request = openraft::raft::TransferLeaderRequest::<UrsulaRaftTypeConfig>::new(
+            from_leader,
+            request.to_node_id,
+            last_log_id,
+        );
+        self.registry
+            .handle_transfer_leader(raft_group_id, openraft_request)
+            .await
+            .map_err(|err| tonic::Status::internal(err.to_string()))?;
+        Ok(tonic::Response::new(
+            raft_internal_proto::RaftTransferLeaderAckV1 {},
         ))
     }
 
@@ -445,6 +484,20 @@ impl GrpcRaftNetwork {
         }
     }
 
+    pub(crate) fn transfer_leader_envelope(
+        &self,
+        request: &TransferLeaderRequest<UrsulaRaftTypeConfig>,
+    ) -> raft_internal_proto::RaftTransferLeaderRequestV1 {
+        raft_internal_proto::RaftTransferLeaderRequestV1 {
+            raft_group_id: self.raft_group_id.0,
+            node_id: self.target,
+            protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+            from_leader: Some(vote_to_proto(*request.from_leader())),
+            to_node_id: *request.to_node_id(),
+            last_log_id: request.last_log_id().cloned().map(log_id_to_proto),
+        }
+    }
+
     pub(crate) fn vote_envelope(
         &self,
         request: UrsulaVoteRequest,
@@ -616,6 +669,26 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
                 self.target, self.endpoint
             )))
         })
+    }
+
+    async fn transfer_leader(
+        &mut self,
+        req: TransferLeaderRequest<UrsulaRaftTypeConfig>,
+        option: RPCOption,
+    ) -> Result<(), RPCError<UrsulaRaftTypeConfig>> {
+        let mut request = tonic::Request::new(self.transfer_leader_envelope(&req));
+        self.apply_rpc_timeout(&mut request, option);
+        match self.client()?.transfer_leader(request).await {
+            Ok(_response) => {
+                self.note_success();
+                Ok(())
+            }
+            Err(err) => {
+                let mapped = self.map_tonic_status("TransferLeader", err);
+                self.note_failure("TransferLeader");
+                Err(mapped)
+            }
+        }
     }
 }
 

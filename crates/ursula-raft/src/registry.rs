@@ -23,6 +23,7 @@ use openraft::network::RPCOption;
 use openraft::raft::AppendEntriesRequest;
 use openraft::raft::AppendEntriesResponse;
 use openraft::raft::SnapshotResponse;
+use openraft::raft::TransferLeaderRequest;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use openraft::storage::RaftSnapshotBuilder;
@@ -74,6 +75,14 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for SingleNodeRaftNetwork {
         _option: RPCOption,
     ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, StreamingError<UrsulaRaftTypeConfig>> {
         unreachable!("single-node raft group must not send snapshots")
+    }
+
+    async fn transfer_leader(
+        &mut self,
+        _req: TransferLeaderRequest<UrsulaRaftTypeConfig>,
+        _option: RPCOption,
+    ) -> Result<(), RPCError<UrsulaRaftTypeConfig>> {
+        unreachable!("single-node raft group must not transfer leadership")
     }
 }
 
@@ -173,6 +182,7 @@ pub enum InProcessRaftRpcKind {
     AppendEntries,
     Vote,
     FullSnapshot,
+    TransferLeader,
 }
 
 #[derive(Debug, Clone)]
@@ -558,6 +568,36 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
                 )))
             })
     }
+
+    async fn transfer_leader(
+        &mut self,
+        req: TransferLeaderRequest<UrsulaRaftTypeConfig>,
+        _option: RPCOption,
+    ) -> Result<(), RPCError<UrsulaRaftTypeConfig>> {
+        self.before_rpc(InProcessRaftRpcKind::TransferLeader)
+            .await
+            .map_err(RPCError::Unreachable)?;
+        let target = self.registry.get(self.target).ok_or_else(|| {
+            self.policy
+                .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
+                    source: self.source,
+                    target: self.target,
+                    kind: InProcessRaftRpcKind::TransferLeader,
+                });
+            RPCError::Unreachable(self.missing_target_error())
+        })?;
+        self.policy.notify(InProcessRaftNetworkEvent::RpcDelivered {
+            source: self.source,
+            target: self.target,
+            kind: InProcessRaftRpcKind::TransferLeader,
+        });
+        target.handle_transfer_leader(req).await.map_err(|err| {
+            RPCError::Network(NetworkError::from_string(format!(
+                "remote TransferLeader on node {}: {err}",
+                self.target
+            )))
+        })
+    }
 }
 
 #[cfg(madsim)]
@@ -678,6 +718,17 @@ impl RaftGroupHandleRegistry {
         raft.install_full_snapshot(vote, snapshot)
             .await
             .map_err(|err| GroupEngineError::new(format!("OpenRaft install snapshot: {err}")))
+    }
+
+    pub async fn handle_transfer_leader(
+        &self,
+        raft_group_id: RaftGroupId,
+        request: TransferLeaderRequest<UrsulaRaftTypeConfig>,
+    ) -> Result<(), GroupEngineError> {
+        let raft = self.require_group(raft_group_id)?;
+        raft.handle_transfer_leader(request)
+            .await
+            .map_err(|err| GroupEngineError::new(format!("OpenRaft handle_transfer_leader: {err}")))
     }
 
     pub async fn build_snapshot_for_transfer(

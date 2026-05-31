@@ -51,8 +51,9 @@ use openraft::BasicNode;
 use openraft::rt::WatchReceiver;
 use ursula_raft::{
     RAFT_GRPC_APPEND_PATH, RAFT_GRPC_FULL_SNAPSHOT_PATH, RAFT_GRPC_GROUP_READ_PATH,
-    RAFT_GRPC_GROUP_WRITE_PATH, RAFT_GRPC_MAX_MESSAGE_BYTES, RAFT_GRPC_VOTE_PATH,
-    RaftGroupHandleRegistry, RaftGrpcService, RaftLogProgressSnapshot, raft_internal_proto,
+    RAFT_GRPC_GROUP_WRITE_PATH, RAFT_GRPC_MAX_MESSAGE_BYTES, RAFT_GRPC_TRANSFER_LEADER_PATH,
+    RAFT_GRPC_VOTE_PATH, RaftGroupHandleRegistry, RaftGrpcService, RaftLogProgressSnapshot,
+    raft_internal_proto,
 };
 use ursula_runtime::{
     AppendBatchRequest, AppendExternalRequest, AppendRequest, AppendResponse,
@@ -560,6 +561,16 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for HttpRaftGrpcSer
         raft_internal_proto::raft_internal_server::RaftInternal::group_read(&self.raft, request)
             .await
     }
+
+    async fn transfer_leader(
+        &self,
+        request: tonic::Request<raft_internal_proto::RaftTransferLeaderRequestV1>,
+    ) -> Result<tonic::Response<raft_internal_proto::RaftTransferLeaderAckV1>, tonic::Status> {
+        raft_internal_proto::raft_internal_server::RaftInternal::transfer_leader(
+            &self.raft, request,
+        )
+        .await
+    }
 }
 
 fn raft_grpc_service(
@@ -625,6 +636,10 @@ pub fn cluster_router_from_state(state: HttpState) -> Router {
         )
         .route_service(
             RAFT_GRPC_GROUP_READ_PATH,
+            raft_grpc_service(state.clone(), raft_registry.clone()),
+        )
+        .route_service(
+            RAFT_GRPC_TRANSFER_LEADER_PATH,
             raft_grpc_service(state.clone(), raft_registry),
         )
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
