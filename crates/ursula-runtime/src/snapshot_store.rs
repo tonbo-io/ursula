@@ -162,6 +162,22 @@ pub trait SnapshotStore: Send + Sync + Debug {
     fn health_check(&self) -> SnapshotStoreFuture<'_, ()> {
         Box::pin(async move { Ok(()) })
     }
+
+    /// Verify that a freshly-uploaded snapshot is actually retrievable from
+    /// the backend. Called immediately after `upload` returns Ok, before the
+    /// new pointer is published. Catches silent partial-success modes
+    /// (multipart upload Init/Part Ok but Complete failed, opendal retry
+    /// returning Ok on cached state, etc.) that would otherwise leave
+    /// `current_snapshot` pointing at a 404. Default no-op for backends that
+    /// can't lie about persistence (Inline keeps bytes in the pointer; Local
+    /// uses a single fs syscall whose Ok means present). The S3 backend
+    /// overrides this with a `stat` round-trip.
+    fn verify_uploaded<'a>(
+        &'a self,
+        _location: &'a SnapshotLocation,
+    ) -> SnapshotStoreFuture<'a, ()> {
+        Box::pin(async move { Ok(()) })
+    }
 }
 
 pub type SharedSnapshotStore = Arc<dyn SnapshotStore>;
@@ -304,12 +320,26 @@ mod s3 {
             Ok(Self::new(operator, prefix))
         }
 
+        /// Build a per-attempt-unique S3 key. The openraft `snapshot_id` is
+        /// derived from `last_applied_log_id`, so two builds during an
+        /// apply-idle window compute the SAME snapshot_id. If the S3 key also
+        /// matched, the second build's `schedule_previous_snapshot_gc` would
+        /// schedule a delete of the very object we just rewrote — 300s later
+        /// the current snapshot vanishes (this exact path wedged group-4 on
+        /// 2026-05-31). A nanosecond + per-process counter suffix keeps the
+        /// physical S3 key unique per upload attempt without changing the
+        /// openraft-visible snapshot_id.
         fn object_key(&self, key: &SnapshotKey) -> String {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let nonce_nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let nonce_seq = COUNTER.fetch_add(1, Ordering::Relaxed);
             format!(
-                "{}/group-{}/{}",
-                self.prefix,
-                key.raft_group_id,
-                key.filename(),
+                "{}/group-{}/{}-{nonce_nanos:032}-{nonce_seq:020}.snap",
+                self.prefix, key.raft_group_id, key.snapshot_id,
             )
         }
     }
@@ -382,6 +412,33 @@ mod s3 {
                     Err(err) if matches!(err.kind(), opendal::ErrorKind::NotFound) => Ok(()),
                     Err(err) => Err(SnapshotStoreError::Backend(err.to_string())),
                 }
+            })
+        }
+
+        fn verify_uploaded<'a>(
+            &'a self,
+            location: &'a SnapshotLocation,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            Box::pin(async move {
+                let SnapshotLocation::S3 { key, size_bytes } = location else {
+                    return Ok(());
+                };
+                let meta = self.operator.stat(key).await.map_err(|err| {
+                    if matches!(err.kind(), opendal::ErrorKind::NotFound) {
+                        SnapshotStoreError::NotFound(format!(
+                            "s3 snapshot upload verification failed: {key} not present after upload"
+                        ))
+                    } else {
+                        SnapshotStoreError::Backend(err.to_string())
+                    }
+                })?;
+                let actual = meta.content_length();
+                if actual != *size_bytes {
+                    return Err(SnapshotStoreError::Integrity(format!(
+                        "s3 snapshot {key} size mismatch post-upload: stat={actual} expected={size_bytes}"
+                    )));
+                }
+                Ok(())
             })
         }
 
@@ -643,6 +700,57 @@ mod tests {
         ));
         // Second delete is a no-op.
         store.delete(&loc).await.unwrap();
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_two_uploads_with_same_snapshot_id_get_different_keys() {
+        // Regression for the 2026-05-31 wedge: snapshot_id is derived from
+        // last_applied_log_id, so two builds during apply-idle compute the
+        // same id. The S3 object key must still be unique per attempt, else
+        // schedule_previous_snapshot_gc deletes the live object on the next
+        // build's GC tick.
+        let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
+        let key1 = test_key(4, "group-4-T18-N3-264150");
+        let key2 = test_key(4, "group-4-T18-N3-264150");
+        let loc1 = store.upload(key1, b"body1".to_vec()).await.unwrap();
+        let loc2 = store.upload(key2, b"body2".to_vec()).await.unwrap();
+        let (k1, k2) = match (&loc1, &loc2) {
+            (SnapshotLocation::S3 { key: k1, .. }, SnapshotLocation::S3 { key: k2, .. }) => {
+                (k1.clone(), k2.clone())
+            }
+            _ => panic!("expected S3 locations"),
+        };
+        assert_ne!(k1, k2, "same snapshot_id must yield distinct S3 keys");
+        // Both stay independently readable — deleting one must not nuke the
+        // other (the self-GC failure mode).
+        assert_eq!(store.download(&loc1).await.unwrap(), b"body1");
+        assert_eq!(store.download(&loc2).await.unwrap(), b"body2");
+        store.delete(&loc1).await.unwrap();
+        assert!(matches!(
+            store.download(&loc1).await,
+            Err(SnapshotStoreError::NotFound(_))
+        ));
+        assert_eq!(store.download(&loc2).await.unwrap(), b"body2");
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_verify_uploaded_catches_missing_object() {
+        let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
+        let key = test_key(2, "group-2-T1-N1-7");
+        let loc = store.upload(key, b"payload".to_vec()).await.unwrap();
+        // Round-trip after a real upload: must succeed.
+        store.verify_uploaded(&loc).await.unwrap();
+        // Same location, after an out-of-band delete: must report missing so
+        // the snapshot build path can fail fast instead of publishing a
+        // pointer to a 404.
+        store.delete(&loc).await.unwrap();
+        let err = store.verify_uploaded(&loc).await.unwrap_err();
+        assert!(
+            matches!(err, SnapshotStoreError::NotFound(_)),
+            "expected NotFound after delete, got {err:?}"
+        );
     }
 
     #[cfg(not(madsim))]

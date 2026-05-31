@@ -418,6 +418,14 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             .upload(key, body)
             .await
             .map_err(|err| err.into_io())?;
+        // Re-stat immediately so a silent partial-success (multipart Complete
+        // failing after the parts uploaded, opendal retry caching, etc.) is
+        // caught HERE rather than 10 minutes later as an install_snapshot
+        // NotFound on a follower. Cheap relative to the upload itself.
+        self.snapshot_store
+            .verify_uploaded(&location)
+            .await
+            .map_err(|err| err.into_io())?;
         let pointer = SnapshotPointer {
             snapshot_id: self.meta.snapshot_id.clone(),
             location,
@@ -430,7 +438,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                 pointer_bytes: pointer_bytes.clone(),
             })
         };
-        schedule_previous_snapshot_gc(self.snapshot_store.clone(), previous);
+        schedule_previous_snapshot_gc(self.snapshot_store.clone(), previous, &pointer_bytes);
         Ok(SnapshotOf::<UrsulaRaftTypeConfig> {
             meta: self.meta.clone(),
             snapshot: Cursor::new(pointer_bytes),
@@ -453,6 +461,7 @@ fn snapshot_gc_grace_secs() -> u64 {
 fn schedule_previous_snapshot_gc(
     store: ursula_runtime::SharedSnapshotStore,
     previous: Option<CurrentSnapshot>,
+    new_pointer_bytes: &[u8],
 ) {
     let Some(previous) = previous else { return };
     let Ok(prev_pointer) = SnapshotPointer::decode(&previous.pointer_bytes) else {
@@ -463,6 +472,19 @@ fn schedule_previous_snapshot_gc(
         prev_pointer.location,
         ursula_runtime::SnapshotLocation::Inline { .. }
     ) {
+        return;
+    }
+    // Same-key self-GC guard: snapshot_id is derived from last_applied_log_id
+    // (state_machine.rs::snapshot_meta), so two consecutive builds that race
+    // an apply-idle interval produce the SAME key. Without this check we'd
+    // schedule a GC against the very object we just wrote — `delete` runs 300s
+    // later and silently nukes the current snapshot, leaving `current_snapshot`
+    // pointing at a 404. This is exactly how N3 wedged group-4 transfers on
+    // 2026-05-31 (snapshot_id collided across repeated 15s driver ticks while
+    // apply was hot-tier-blocked, the GC nuked the live object).
+    if let Ok(new_pointer) = SnapshotPointer::decode(new_pointer_bytes)
+        && new_pointer.location == prev_pointer.location
+    {
         return;
     }
     let grace = std::time::Duration::from_secs(snapshot_gc_grace_secs());
@@ -481,6 +503,7 @@ fn schedule_previous_snapshot_gc(
 fn schedule_previous_snapshot_gc(
     _store: ursula_runtime::SharedSnapshotStore,
     _previous: Option<CurrentSnapshot>,
+    _new_pointer_bytes: &[u8],
 ) {
     // madsim has no fs/network store path that needs deferred GC; the inline
     // backend keeps everything in-pointer so this is always a no-op there.
