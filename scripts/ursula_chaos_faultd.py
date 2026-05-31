@@ -68,6 +68,13 @@ class FaultState:
         self.s3_patterns: list[str] = []
         self.has_root_qdisc = False
         self.has_classful_qdisc = False
+        # Stale iptables/tc rules from a prior chaos run survive faultd restart
+        # because they live in the kernel, not in this process. If the new run
+        # never targets this node with /apply (so clear() never fires), the
+        # rules silently impair the node forever — exactly the s3_unavailable
+        # iptables DROP that wedged N3's cold flush in the 2026-05-31 incident.
+        # Clear at startup so a fresh process always starts from a clean kernel.
+        self.clear()
 
     def clear(self) -> None:
         # Stateless: always attempt to remove the root qdisc. A daemon restart
