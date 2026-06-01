@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -106,6 +107,7 @@ struct StaticGrpcTestNodeStorage {
     raft_log_dir: Option<PathBuf>,
     cold_store: Option<ColdStoreHandle>,
     per_group_initializers: bool,
+    per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
 }
 
 async fn spawn_static_grpc_test_node(
@@ -148,6 +150,7 @@ async fn spawn_static_grpc_test_node_with_log_dir(
             raft_log_dir,
             cold_store: None,
             per_group_initializers: false,
+            per_group_voters: BTreeMap::new(),
         },
     )
     .await
@@ -172,6 +175,7 @@ async fn spawn_static_grpc_test_node_with_per_group_initializers(
             raft_log_dir: None,
             cold_store: None,
             per_group_initializers: true,
+            per_group_voters: BTreeMap::new(),
         },
     )
     .await
@@ -196,6 +200,7 @@ async fn spawn_static_grpc_test_node_with_storage(
         registry.clone(),
     );
     factory = factory.with_per_group_membership_initializers(storage.per_group_initializers);
+    factory = factory.with_per_group_voters(storage.per_group_voters.clone());
     factory = factory.with_cold_store(storage.cold_store.clone());
     if let Some(raft_log_dir) = storage.raft_log_dir {
         factory = factory.with_raft_log_dir(raft_log_dir);
@@ -2169,6 +2174,97 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn static_grpc_per_group_voters_create_distinct_initial_memberships() {
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    for node_id in 1..=4u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        peers.push((node_id, format!("http://{addr}")));
+        listeners.push(listener);
+    }
+
+    let group_voters = BTreeMap::from([
+        (RaftGroupId(0), BTreeSet::from([1, 2, 3])),
+        (RaftGroupId(1), BTreeSet::from([2, 3, 4])),
+    ]);
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        nodes.push(
+            spawn_static_grpc_test_node_with_storage(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                true,
+                2,
+                StaticGrpcTestNodeStorage {
+                    raft_log_dir: None,
+                    cold_store: None,
+                    per_group_initializers: true,
+                    per_group_voters: group_voters.clone(),
+                },
+            )
+            .await,
+        );
+    }
+
+    for (raft_group_id, voters) in &group_voters {
+        for (index, node) in nodes.iter().enumerate() {
+            let node_id = u64::try_from(index + 1).expect("node id fits u64");
+            if voters.contains(&node_id) {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    node.runtime.warm_group(*raft_group_id),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("warm node {node_id} group {} timed out", raft_group_id.0)
+                })
+                .expect("warm voter group");
+            }
+        }
+    }
+
+    for (raw_group_id, expected_voters, expected_leader) in
+        [(0, vec![1, 2, 3], 1), (1, vec![2, 3, 4], 3)]
+    {
+        let raft_group_id = RaftGroupId(raw_group_id);
+        for node_id in &expected_voters {
+            let node = &nodes[usize::try_from(*node_id - 1).expect("node id index fits usize")];
+            let raft = node.registry.get(raft_group_id).expect("registered group");
+            raft.wait(Some(Duration::from_secs(5)))
+                .current_leader(
+                    expected_leader,
+                    "configured group should elect its initializer",
+                )
+                .await
+                .expect("wait for configured group leader");
+            let expected_voters_for_wait = expected_voters.clone();
+            raft.wait(Some(Duration::from_secs(5)))
+                .metrics(
+                    move |metrics| {
+                        metrics
+                            .membership_config
+                            .voter_ids()
+                            .eq(expected_voters_for_wait.iter().copied())
+                    },
+                    "configured group should expose its static voter set",
+                )
+                .await
+                .expect("wait for configured group membership");
+        }
+    }
+
+    for node in nodes {
+        node.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn static_grpc_follower_serves_replicated_catch_up_read_without_leader_proxy() {
     let mut listeners = Vec::new();
     let mut peers = Vec::new();
@@ -2374,9 +2470,14 @@ async fn static_grpc_memory_node_rejoins_empty_after_allowed_log_revert() {
     // to flake despite the wait being correct.
     leader_raft
         .wait(Some(Duration::from_secs(15)))
-        .snapshot(
-            snapshot_log_id,
-            "leader snapshot includes quorum-only write",
+        .metrics(
+            |metrics| {
+                metrics
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot >= &snapshot_log_id)
+            },
+            format!("leader snapshot includes quorum-only write .snapshot >= {snapshot_log_id}"),
         )
         .await
         .expect("wait for leader snapshot");
@@ -2426,9 +2527,16 @@ async fn static_grpc_memory_node_rejoins_empty_after_allowed_log_revert() {
         .expect("restarted group");
     restarted_raft
         .wait(Some(Duration::from_secs(10)))
-        .snapshot(
-            snapshot_log_id,
-            "restarted empty node installed leader snapshot",
+        .metrics(
+            |metrics| {
+                metrics
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot >= &snapshot_log_id)
+            },
+            format!(
+                "restarted empty node installed leader snapshot .snapshot >= {snapshot_log_id}"
+            ),
         )
         .await
         .expect("wait for restarted node snapshot");
@@ -3201,6 +3309,7 @@ async fn static_grpc_raft_durable_cold_flush_replicates_manifest() {
                     raft_log_dir: Some(node_root),
                     cold_store: Some(cold_store.clone()),
                     per_group_initializers: false,
+                    per_group_voters: BTreeMap::new(),
                 },
             )
             .await,

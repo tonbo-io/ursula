@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -263,6 +263,7 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
 pub struct StaticGrpcRaftGroupEngineFactory {
     node_id: u64,
     peers: BTreeMap<u64, String>,
+    per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
     initialize_membership: bool,
     initialize_membership_per_group: bool,
     registry: RaftGroupHandleRegistry,
@@ -281,6 +282,7 @@ impl StaticGrpcRaftGroupEngineFactory {
         Self {
             node_id,
             peers: peers.into_iter().collect(),
+            per_group_voters: BTreeMap::new(),
             initialize_membership,
             initialize_membership_per_group: false,
             registry,
@@ -314,6 +316,11 @@ impl StaticGrpcRaftGroupEngineFactory {
         self
     }
 
+    pub fn with_per_group_voters(mut self, voters: BTreeMap<RaftGroupId, BTreeSet<u64>>) -> Self {
+        self.per_group_voters = voters;
+        self
+    }
+
     fn peer_nodes(&self) -> BTreeMap<u64, BasicNode> {
         self.peers
             .iter()
@@ -321,22 +328,61 @@ impl StaticGrpcRaftGroupEngineFactory {
             .collect()
     }
 
+    fn peer_nodes_for_group(
+        &self,
+        raft_group_id: RaftGroupId,
+    ) -> Result<BTreeMap<u64, BasicNode>, GroupEngineError> {
+        let Some(voters) = self.per_group_voters.get(&raft_group_id) else {
+            return Ok(self.peer_nodes());
+        };
+        if voters.is_empty() {
+            return Err(GroupEngineError::new(format!(
+                "raft group {} has an empty static voter set",
+                raft_group_id.0
+            )));
+        }
+
+        let mut nodes = BTreeMap::new();
+        for node_id in voters {
+            let address = self.peers.get(node_id).ok_or_else(|| {
+                GroupEngineError::new(format!(
+                    "raft group {} voter {} is not present in static peer config",
+                    raft_group_id.0, node_id
+                ))
+            })?;
+            nodes.insert(*node_id, BasicNode::new(address.clone()));
+        }
+        Ok(nodes)
+    }
+
+    fn membership_initializer_ids(&self, raft_group_id: RaftGroupId) -> Vec<u64> {
+        self.per_group_voters
+            .get(&raft_group_id)
+            .map(|voters| voters.iter().copied().collect())
+            .unwrap_or_else(|| self.peers.keys().copied().collect())
+    }
+
     fn should_initialize_membership(&self, raft_group_id: RaftGroupId) -> bool {
         if !self.initialize_membership {
+            return false;
+        }
+        if let Some(voters) = self.per_group_voters.get(&raft_group_id)
+            && !voters.contains(&self.node_id)
+        {
             return false;
         }
         if !self.initialize_membership_per_group {
             return true;
         }
-        let peer_count = self.peers.len();
+        let initializer_ids = self.membership_initializer_ids(raft_group_id);
+        let peer_count = initializer_ids.len();
         if peer_count == 0 {
             return false;
         }
         let initializer_index =
             usize::try_from(raft_group_id.0).expect("raft group id fits usize") % peer_count;
-        self.peers
-            .keys()
-            .nth(initializer_index)
+        initializer_ids
+            .get(initializer_index)
             .is_some_and(|node_id| *node_id == self.node_id)
     }
 }
@@ -421,11 +467,77 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                         .observe_any_leader(rejoin_leader_probe_timeout())
                         .await;
                 if !rejoin_existing_cluster {
-                    engine.initialize_membership(self.peer_nodes()).await?;
+                    engine
+                        .initialize_membership(self.peer_nodes_for_group(placement.raft_group_id)?)
+                        .await?;
                 }
             }
             let engine: Box<dyn GroupEngine> = Box::new(engine);
             Ok(engine)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    fn peer_ids(nodes: BTreeMap<u64, BasicNode>) -> Vec<u64> {
+        nodes.keys().copied().collect()
+    }
+
+    fn per_group_voters(groups: &[(u32, &[u64])]) -> BTreeMap<RaftGroupId, BTreeSet<u64>> {
+        groups
+            .iter()
+            .map(|(group_id, voters)| (RaftGroupId(*group_id), voters.iter().copied().collect()))
+            .collect()
+    }
+
+    fn factory_for_node(node_id: u64) -> StaticGrpcRaftGroupEngineFactory {
+        StaticGrpcRaftGroupEngineFactory::new(
+            node_id,
+            [
+                (1, "http://node-1".to_owned()),
+                (2, "http://node-2".to_owned()),
+                (3, "http://node-3".to_owned()),
+                (4, "http://node-4".to_owned()),
+            ],
+            true,
+            RaftGroupHandleRegistry::default(),
+        )
+        .with_per_group_voters(per_group_voters(&[(0, &[1, 2, 3]), (1, &[2, 3, 4])]))
+    }
+
+    #[test]
+    fn per_group_static_voters_override_default_peer_set() {
+        let factory = factory_for_node(1);
+
+        assert_eq!(
+            peer_ids(factory.peer_nodes_for_group(RaftGroupId(0)).unwrap()),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            peer_ids(factory.peer_nodes_for_group(RaftGroupId(1)).unwrap()),
+            vec![2, 3, 4]
+        );
+        assert_eq!(
+            peer_ids(factory.peer_nodes_for_group(RaftGroupId(2)).unwrap()),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn per_group_initializers_are_chosen_from_group_voters() {
+        let node_1 = factory_for_node(1).with_per_group_membership_initializers(true);
+        let node_3 = factory_for_node(3).with_per_group_membership_initializers(true);
+        let node_4 = factory_for_node(4).with_per_group_membership_initializers(true);
+
+        assert!(node_1.should_initialize_membership(RaftGroupId(0)));
+        assert!(!node_4.should_initialize_membership(RaftGroupId(0)));
+
+        assert!(node_3.should_initialize_membership(RaftGroupId(1)));
+        assert!(!node_1.should_initialize_membership(RaftGroupId(1)));
     }
 }

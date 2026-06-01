@@ -1,7 +1,7 @@
 //! Process-level orchestration: env-driven `ShardRuntime` constructors and
 //! the cold-flush background worker.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 // `tokio::time::Instant` (not `std::time::Instant`) so the M3 commit-stall
@@ -20,6 +20,12 @@ use ursula_runtime::{
     snapshot_store_from_env,
 };
 use ursula_shard::RaftGroupId;
+
+#[derive(Debug, Clone, Default)]
+pub struct StaticGrpcRaftMembershipConfig {
+    pub initialize_membership_per_group: bool,
+    pub per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
+}
 
 pub fn spawn_default_runtime(
     core_count: usize,
@@ -80,6 +86,24 @@ pub fn spawn_static_grpc_raft_memory_runtime(
     peers: impl IntoIterator<Item = (u64, String)>,
     initialize_membership: bool,
 ) -> Result<(ShardRuntime, RaftGroupHandleRegistry), RuntimeError> {
+    spawn_static_grpc_raft_memory_runtime_with_membership_config(
+        core_count,
+        raft_group_count,
+        node_id,
+        peers,
+        initialize_membership,
+        StaticGrpcRaftMembershipConfig::default(),
+    )
+}
+
+pub fn spawn_static_grpc_raft_memory_runtime_with_membership_config(
+    core_count: usize,
+    raft_group_count: usize,
+    node_id: u64,
+    peers: impl IntoIterator<Item = (u64, String)>,
+    initialize_membership: bool,
+    membership_config: StaticGrpcRaftMembershipConfig,
+) -> Result<(ShardRuntime, RaftGroupHandleRegistry), RuntimeError> {
     let cold_store = cold_store_from_env()?;
     let snapshot_store = snapshot_store_from_env_or_error()?;
     let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
@@ -91,6 +115,8 @@ pub fn spawn_static_grpc_raft_memory_runtime(
         initialize_membership,
         registry.clone(),
     )
+    .with_per_group_membership_initializers(membership_config.initialize_membership_per_group)
+    .with_per_group_voters(membership_config.per_group_voters)
     .with_cold_store(cold_store.clone())
     .with_snapshot_store(snapshot_store.clone());
     let runtime =
@@ -112,30 +138,17 @@ pub fn spawn_static_grpc_raft_memory_runtime_with_per_group_initializers(
     peers: impl IntoIterator<Item = (u64, String)>,
     initialize_membership: bool,
 ) -> Result<(ShardRuntime, RaftGroupHandleRegistry), RuntimeError> {
-    let cold_store = cold_store_from_env()?;
-    let snapshot_store = snapshot_store_from_env_or_error()?;
-    let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
-    let peers: Vec<(u64, String)> = peers.into_iter().collect();
-    let registry = RaftGroupHandleRegistry::default();
-    let factory = StaticGrpcRaftGroupEngineFactory::new(
+    spawn_static_grpc_raft_memory_runtime_with_membership_config(
+        core_count,
+        raft_group_count,
         node_id,
-        peers.clone(),
+        peers,
         initialize_membership,
-        registry.clone(),
+        StaticGrpcRaftMembershipConfig {
+            initialize_membership_per_group: true,
+            per_group_voters: BTreeMap::new(),
+        },
     )
-    .with_per_group_membership_initializers(true)
-    .with_cold_store(cold_store.clone())
-    .with_snapshot_store(snapshot_store.clone());
-    let runtime =
-        ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
-    spawn_cold_flush_worker_if_configured(&runtime);
-    spawn_cold_gc_worker_if_configured(&runtime);
-    spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
-    spawn_leadership_balancer_if_configured(&registry);
-    spawn_cluster_egress_gate_if_configured(&registry, node_id, &peers);
-    spawn_commit_stall_watchdog_if_configured(&registry);
-    spawn_cold_health_gate_if_configured(&runtime, &registry, node_id);
-    Ok((runtime, registry))
 }
 
 pub fn spawn_static_grpc_raft_runtime(
@@ -144,6 +157,26 @@ pub fn spawn_static_grpc_raft_runtime(
     node_id: u64,
     peers: impl IntoIterator<Item = (u64, String)>,
     initialize_membership: bool,
+    raft_log_dir: impl Into<PathBuf>,
+) -> Result<(ShardRuntime, RaftGroupHandleRegistry), RuntimeError> {
+    spawn_static_grpc_raft_runtime_with_membership_config(
+        core_count,
+        raft_group_count,
+        node_id,
+        peers,
+        initialize_membership,
+        StaticGrpcRaftMembershipConfig::default(),
+        raft_log_dir,
+    )
+}
+
+pub fn spawn_static_grpc_raft_runtime_with_membership_config(
+    core_count: usize,
+    raft_group_count: usize,
+    node_id: u64,
+    peers: impl IntoIterator<Item = (u64, String)>,
+    initialize_membership: bool,
+    membership_config: StaticGrpcRaftMembershipConfig,
     raft_log_dir: impl Into<PathBuf>,
 ) -> Result<(ShardRuntime, RaftGroupHandleRegistry), RuntimeError> {
     let cold_store = cold_store_from_env()?;
@@ -157,6 +190,8 @@ pub fn spawn_static_grpc_raft_runtime(
         initialize_membership,
         registry.clone(),
     )
+    .with_per_group_membership_initializers(membership_config.initialize_membership_per_group)
+    .with_per_group_voters(membership_config.per_group_voters)
     .with_cold_store(cold_store.clone())
     .with_raft_log_dir(raft_log_dir)
     .with_snapshot_store(snapshot_store.clone());
@@ -180,31 +215,18 @@ pub fn spawn_static_grpc_raft_runtime_with_per_group_initializers(
     initialize_membership: bool,
     raft_log_dir: impl Into<PathBuf>,
 ) -> Result<(ShardRuntime, RaftGroupHandleRegistry), RuntimeError> {
-    let cold_store = cold_store_from_env()?;
-    let snapshot_store = snapshot_store_from_env_or_error()?;
-    let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
-    let peers: Vec<(u64, String)> = peers.into_iter().collect();
-    let registry = RaftGroupHandleRegistry::default();
-    let factory = StaticGrpcRaftGroupEngineFactory::new(
+    spawn_static_grpc_raft_runtime_with_membership_config(
+        core_count,
+        raft_group_count,
         node_id,
-        peers.clone(),
+        peers,
         initialize_membership,
-        registry.clone(),
+        StaticGrpcRaftMembershipConfig {
+            initialize_membership_per_group: true,
+            per_group_voters: BTreeMap::new(),
+        },
+        raft_log_dir,
     )
-    .with_per_group_membership_initializers(true)
-    .with_cold_store(cold_store.clone())
-    .with_raft_log_dir(raft_log_dir)
-    .with_snapshot_store(snapshot_store.clone());
-    let runtime =
-        ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
-    spawn_cold_flush_worker_if_configured(&runtime);
-    spawn_cold_gc_worker_if_configured(&runtime);
-    spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
-    spawn_leadership_balancer_if_configured(&registry);
-    spawn_cluster_egress_gate_if_configured(&registry, node_id, &peers);
-    spawn_commit_stall_watchdog_if_configured(&registry);
-    spawn_cold_health_gate_if_configured(&runtime, &registry, node_id);
-    Ok((runtime, registry))
 }
 
 pub fn spawn_raft_runtime(
