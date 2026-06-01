@@ -683,18 +683,22 @@ impl LeadershipShedState {
     /// Whether this node should accept an inbound TransferLeader request.
     ///
     /// Only cluster-egress impairment blocks this. Snapshot/cold-health
-    /// impairments should still shed local leaders and stop campaigning, but
-    /// refusing inbound transfer for those states can deadlock the balancer
-    /// when every peer has a transient cold-path bit set.
+    /// impairments are cold-path pressure signals; refusing inbound transfer
+    /// for those states can deadlock the balancer when every peer has a
+    /// transient cold-path bit set.
     pub fn should_accept_transfer(self) -> bool {
         !self.contains(LeadershipShedReason::ClusterEgress)
     }
 
     /// Whether local raft groups should be allowed to campaign.
     ///
-    /// Any shed reason disables campaigning until that specific reason heals.
+    /// Cluster-egress and local S3 snapshot-driver impairment disable
+    /// campaigning. Cold-health is softer: the node should shed excess current
+    /// leadership, but it must remain electable so a cluster-wide hot backlog
+    /// cannot exclude every node from leadership.
     pub fn should_campaign(self) -> bool {
-        !self.is_shed()
+        !self.contains(LeadershipShedReason::ClusterEgress)
+            && !self.contains(LeadershipShedReason::SnapshotDriverS3)
     }
 
     /// Whether local raft groups should actively move current leadership away.
@@ -954,7 +958,7 @@ mod tests {
 
         let cold_shed = LeadershipShedState::from_bits(LeadershipShedReason::ColdHealth.bit());
         assert!(cold_shed.should_accept_transfer());
-        assert!(!cold_shed.should_campaign());
+        assert!(cold_shed.should_campaign());
         assert!(cold_shed.should_shed_current_leaders());
         assert_eq!(cold_shed.transfer_rejection_reason(), None);
 

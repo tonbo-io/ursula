@@ -4428,7 +4428,7 @@ async fn cluster_router_reports_leadership_shed_policy() {
     let body = std::str::from_utf8(&body).expect("status utf8");
     assert!(body.contains("\"state\":\"cold-health\""), "{body}");
     assert!(body.contains("\"should_accept_transfer\":true"), "{body}");
-    assert!(body.contains("\"should_campaign\":false"), "{body}");
+    assert!(body.contains("\"should_campaign\":true"), "{body}");
     assert!(
         body.contains("\"should_shed_current_leaders\":true"),
         "{body}"
@@ -4738,7 +4738,10 @@ mod cold_health {
 }
 
 mod leadership_balance {
-    use crate::bootstrap::{plan_leadership_balance, plan_leadership_balance_with_eligible_nodes};
+    use crate::bootstrap::{
+        leader_counts, plan_leadership_balance, plan_leadership_balance_with_eligible_nodes,
+        prioritized_transfer_targets,
+    };
     use std::collections::HashSet;
     use ursula_raft::{RaftGroupMetricsSnapshot, RaftLogProgressSnapshot};
 
@@ -4909,11 +4912,11 @@ mod leadership_balance {
     }
 
     #[test]
-    fn cold_shed_peer_is_not_rebalanced_into() {
-        // Node 1 has shed all leadership because it is cold-impaired. With all
-        // voters considered eligible, node 2 would see node 1 as under-loaded
-        // and push group 0 there, causing a ping-pong with M4. Recomputing fair
-        // over only campaign-eligible nodes {2,3} makes node 2 already fair.
+    fn campaign_ineligible_peer_is_not_rebalanced_into() {
+        // Node 1 has hard-yielded leadership and is not campaign-eligible.
+        // With all voters considered eligible, node 2 would see node 1 as
+        // under-loaded and push group 0 there. Recomputing fair over only
+        // campaign-eligible nodes {2,3} makes node 2 already fair.
         let snaps = vec![
             snap(0, Some(2)),
             snap(1, Some(2)),
@@ -4928,9 +4931,9 @@ mod leadership_balance {
 
     #[test]
     fn rebalances_only_to_campaign_eligible_peers() {
-        // If one peer is cold-impaired, a deeply overloaded leader should still
-        // rebalance across the remaining healthy peer instead of targeting the
-        // impaired low-load node.
+        // If one peer is campaign-ineligible, a deeply overloaded leader
+        // should still rebalance across the remaining healthy peer instead of
+        // targeting the impaired low-load node.
         let snaps = vec![
             snap(0, Some(2)),
             snap(1, Some(2)),
@@ -4943,6 +4946,21 @@ mod leadership_balance {
         let actions = plan_leadership_balance_with_eligible_nodes(&snaps, 2, 4, &eligible);
         assert_eq!(actions.len(), 3, "actions={actions:?}");
         assert!(actions.iter().all(|action| action.target == 3));
+    }
+
+    #[test]
+    fn prioritized_transfer_targets_try_least_loaded_peer_first() {
+        let snaps = vec![
+            snap(0, Some(1)),
+            snap(1, Some(2)),
+            snap(2, Some(2)),
+            snap(3, Some(3)),
+        ];
+        let counts = leader_counts(&snaps);
+        assert_eq!(
+            prioritized_transfer_targets(&snaps[0], 1, &counts),
+            vec![3, 2]
+        );
     }
 }
 
