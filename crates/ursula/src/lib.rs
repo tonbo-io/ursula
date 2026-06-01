@@ -16,12 +16,13 @@ mod http_time {
 mod render;
 
 pub use bootstrap::{
-    spawn_cold_flush_worker_if_configured, spawn_cold_gc_worker_if_configured,
-    spawn_default_runtime, spawn_raft_memory_runtime, spawn_raft_runtime,
-    spawn_static_grpc_raft_memory_runtime,
+    StaticGrpcRaftMembershipConfig, spawn_cold_flush_worker_if_configured,
+    spawn_cold_gc_worker_if_configured, spawn_default_runtime, spawn_raft_memory_runtime,
+    spawn_raft_runtime, spawn_static_grpc_raft_memory_runtime,
+    spawn_static_grpc_raft_memory_runtime_with_membership_config,
     spawn_static_grpc_raft_memory_runtime_with_per_group_initializers,
-    spawn_static_grpc_raft_runtime, spawn_static_grpc_raft_runtime_with_per_group_initializers,
-    spawn_wal_runtime,
+    spawn_static_grpc_raft_runtime, spawn_static_grpc_raft_runtime_with_membership_config,
+    spawn_static_grpc_raft_runtime_with_per_group_initializers, spawn_wal_runtime,
 };
 
 use std::collections::hash_map::DefaultHasher;

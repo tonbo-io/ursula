@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -6,14 +6,13 @@ use std::path::{Path, PathBuf};
 use axum::Router;
 use serde::Deserialize;
 use ursula::{
-    HttpState, client_router_from_state, cluster_router_from_state,
+    HttpState, StaticGrpcRaftMembershipConfig, client_router_from_state, cluster_router_from_state,
     spawn_cold_flush_worker_if_configured, spawn_cold_gc_worker_if_configured,
     spawn_default_runtime, spawn_raft_memory_runtime, spawn_raft_runtime,
-    spawn_static_grpc_raft_memory_runtime,
-    spawn_static_grpc_raft_memory_runtime_with_per_group_initializers,
-    spawn_static_grpc_raft_runtime, spawn_static_grpc_raft_runtime_with_per_group_initializers,
-    spawn_wal_runtime,
+    spawn_static_grpc_raft_memory_runtime_with_membership_config,
+    spawn_static_grpc_raft_runtime_with_membership_config, spawn_wal_runtime,
 };
+use ursula_shard::RaftGroupId;
 
 // glibc malloc held ~1 GB of cached arena chunks under the chaos workload
 // (16+ per-thread arenas of 64 MB each, freed memory never returned to the OS).
@@ -63,44 +62,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let node_id = args
             .raft_node_id
             .expect("static gRPC Raft validation required node id");
-        let (runtime, registry) = if let Some(raft_log_dir) = args.raft_log_dir {
-            if args.raft_init_membership_per_group {
-                spawn_static_grpc_raft_runtime_with_per_group_initializers(
-                    args.core_count,
-                    args.raft_group_count,
-                    node_id,
-                    args.raft_peers.clone(),
-                    args.raft_init_membership,
-                    raft_log_dir,
-                )?
-            } else {
-                spawn_static_grpc_raft_runtime(
-                    args.core_count,
-                    args.raft_group_count,
-                    node_id,
-                    args.raft_peers.clone(),
-                    args.raft_init_membership,
-                    raft_log_dir,
-                )?
-            }
-        } else if args.raft_init_membership_per_group {
-            spawn_static_grpc_raft_memory_runtime_with_per_group_initializers(
+        let (runtime, registry) = if let Some(raft_log_dir) = args.raft_log_dir.clone() {
+            spawn_static_grpc_raft_runtime_with_membership_config(
                 args.core_count,
                 args.raft_group_count,
                 node_id,
                 args.raft_peers.clone(),
                 args.raft_init_membership,
+                StaticGrpcRaftMembershipConfig {
+                    initialize_membership_per_group: args.raft_init_membership_per_group,
+                    per_group_voters: args.raft_group_voters.clone(),
+                },
+                raft_log_dir,
             )?
         } else {
-            spawn_static_grpc_raft_memory_runtime(
+            spawn_static_grpc_raft_memory_runtime_with_membership_config(
                 args.core_count,
                 args.raft_group_count,
                 node_id,
                 args.raft_peers.clone(),
                 args.raft_init_membership,
+                StaticGrpcRaftMembershipConfig {
+                    initialize_membership_per_group: args.raft_init_membership_per_group,
+                    per_group_voters: args.raft_group_voters.clone(),
+                },
             )?
         };
-        runtime.warm_all_groups().await?;
+        warm_static_grpc_groups(
+            &runtime,
+            args.raft_group_count,
+            node_id,
+            &args.raft_group_voters,
+        )
+        .await?;
         spawn_cold_flush_worker_if_configured(&runtime);
         spawn_cold_gc_worker_if_configured(&runtime);
         HttpState::with_static_raft_cluster(runtime, registry, args.raft_peers.clone())
@@ -210,6 +204,7 @@ struct Args {
     raft_cluster_config: Option<PathBuf>,
     raft_node_id: Option<u64>,
     raft_peers: BTreeMap<u64, String>,
+    raft_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
     raft_init_membership: bool,
     raft_init_membership_per_group: bool,
     /// Per-group cap on raft-submitted-but-not-yet-applied payload bytes; `None`
@@ -241,6 +236,7 @@ impl Args {
         let mut raft_cluster_config = None;
         let mut raft_node_id = None;
         let mut raft_peers = BTreeMap::new();
+        let mut raft_group_voters = BTreeMap::new();
         let mut raft_init_membership = false;
         let mut raft_init_membership_per_group = false;
         let mut raft_max_uncommitted_bytes_per_group: Option<u64> = None;
@@ -307,6 +303,7 @@ impl Args {
                         config,
                         &mut raft_node_id,
                         &mut raft_peers,
+                        &mut raft_group_voters,
                         &mut raft_init_membership,
                         &mut raft_init_membership_per_group,
                     )?;
@@ -382,6 +379,7 @@ impl Args {
             raft_cluster_config,
             raft_node_id,
             raft_peers,
+            raft_group_voters,
             raft_init_membership,
             raft_init_membership_per_group,
             raft_max_uncommitted_bytes_per_group,
@@ -393,9 +391,40 @@ impl Args {
         self.raft_cluster_config.is_some()
             || self.raft_node_id.is_some()
             || !self.raft_peers.is_empty()
+            || !self.raft_group_voters.is_empty()
             || self.raft_init_membership
             || self.raft_init_membership_per_group
     }
+}
+
+async fn warm_static_grpc_groups(
+    runtime: &ursula_runtime::ShardRuntime,
+    raft_group_count: usize,
+    node_id: u64,
+    raft_group_voters: &BTreeMap<RaftGroupId, BTreeSet<u64>>,
+) -> Result<(), ursula_runtime::RuntimeError> {
+    if raft_group_voters.is_empty() {
+        return runtime.warm_all_groups().await;
+    }
+
+    for raw_group_id in 0..raft_group_count {
+        let raft_group_id =
+            u32::try_from(raw_group_id).expect("runtime config validates raft group ids fit u32");
+        if static_grpc_node_hosts_group(node_id, raft_group_id, raft_group_voters) {
+            runtime.warm_group(RaftGroupId(raft_group_id)).await?;
+        }
+    }
+    Ok(())
+}
+
+fn static_grpc_node_hosts_group(
+    node_id: u64,
+    raft_group_id: u32,
+    raft_group_voters: &BTreeMap<RaftGroupId, BTreeSet<u64>>,
+) -> bool {
+    raft_group_voters
+        .get(&RaftGroupId(raft_group_id))
+        .is_none_or(|voters| voters.contains(&node_id))
 }
 
 fn help() -> String {
@@ -409,6 +438,8 @@ struct RaftClusterConfigFile {
     #[serde(default)]
     peers: Vec<RaftPeerConfigFile>,
     #[serde(default)]
+    groups: Vec<RaftGroupConfigFile>,
+    #[serde(default)]
     init_membership: bool,
     #[serde(default)]
     init_membership_per_group: bool,
@@ -418,6 +449,12 @@ struct RaftClusterConfigFile {
 struct RaftPeerConfigFile {
     node_id: u64,
     url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RaftGroupConfigFile {
+    raft_group_id: u32,
+    voters: Vec<u64>,
 }
 
 fn load_raft_cluster_config(path: &Path) -> Result<RaftClusterConfigFile, String> {
@@ -432,6 +469,7 @@ fn merge_raft_cluster_config(
     config: RaftClusterConfigFile,
     raft_node_id: &mut Option<u64>,
     raft_peers: &mut BTreeMap<u64, String>,
+    raft_group_voters: &mut BTreeMap<RaftGroupId, BTreeSet<u64>>,
     raft_init_membership: &mut bool,
     raft_init_membership_per_group: &mut bool,
 ) -> Result<(), String> {
@@ -457,6 +495,37 @@ fn merge_raft_cluster_config(
                 "--raft-cluster-config '{}' duplicates raft peer node id {}",
                 path.display(),
                 node_id
+            ));
+        }
+    }
+
+    for group in config.groups {
+        if group.voters.is_empty() {
+            return Err(format!(
+                "--raft-cluster-config '{}' raft group {} has no voters",
+                path.display(),
+                group.raft_group_id
+            ));
+        }
+        let mut voters = BTreeSet::new();
+        for voter in group.voters {
+            if !voters.insert(voter) {
+                return Err(format!(
+                    "--raft-cluster-config '{}' raft group {} duplicates voter node id {}",
+                    path.display(),
+                    group.raft_group_id,
+                    voter
+                ));
+            }
+        }
+        if raft_group_voters
+            .insert(RaftGroupId(group.raft_group_id), voters)
+            .is_some()
+        {
+            return Err(format!(
+                "--raft-cluster-config '{}' duplicates raft group {}",
+                path.display(),
+                group.raft_group_id
             ));
         }
     }
@@ -632,6 +701,68 @@ mod tests {
         assert!(args.raft_init_membership_per_group);
 
         std::fs::remove_file(path).expect("remove cluster config");
+    }
+
+    #[test]
+    fn parses_static_grpc_per_group_voters_from_config_file() {
+        let path = std::env::temp_dir().join(format!(
+            "ursula-raft-cluster-config-group-voters-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after unix epoch")
+                .as_nanos()
+        ));
+        std::fs::write(
+            &path,
+            r#"{
+                "node_id": 2,
+                "init_membership_per_group": true,
+                "peers": [
+                    {"node_id": 1, "url": "http://10.0.0.1:4437"},
+                    {"node_id": 2, "url": "http://10.0.0.2:4437"},
+                    {"node_id": 3, "url": "http://10.0.0.3:4437"},
+                    {"node_id": 4, "url": "http://10.0.0.4:4437"}
+                ],
+                "groups": [
+                    {"raft_group_id": 0, "voters": [1, 2, 3]},
+                    {"raft_group_id": 1, "voters": [2, 3, 4]}
+                ]
+            }"#,
+        )
+        .expect("write cluster config");
+
+        let args = Args::parse_from([
+            "--raft-memory",
+            "--raft-cluster-config",
+            path.to_str().expect("utf8 path"),
+        ])
+        .expect("static gRPC Raft config should parse");
+
+        assert_eq!(
+            args.raft_group_voters.get(&RaftGroupId(0)),
+            Some(&BTreeSet::from([1, 2, 3]))
+        );
+        assert_eq!(
+            args.raft_group_voters.get(&RaftGroupId(1)),
+            Some(&BTreeSet::from([2, 3, 4]))
+        );
+
+        fs::remove_file(path).expect("remove cluster config");
+    }
+
+    #[test]
+    fn configured_group_voters_limit_startup_warmup_to_member_nodes() {
+        let group_voters = BTreeMap::from([
+            (RaftGroupId(0), BTreeSet::from([1, 2, 3])),
+            (RaftGroupId(1), BTreeSet::from([2, 3, 4])),
+        ]);
+
+        assert!(static_grpc_node_hosts_group(1, 0, &group_voters));
+        assert!(!static_grpc_node_hosts_group(1, 1, &group_voters));
+        assert!(!static_grpc_node_hosts_group(4, 0, &group_voters));
+        assert!(static_grpc_node_hosts_group(4, 1, &group_voters));
+        assert!(static_grpc_node_hosts_group(4, 2, &group_voters));
     }
 
     #[test]
