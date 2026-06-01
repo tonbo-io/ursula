@@ -11,8 +11,8 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use ursula_raft::{
-    ColdRaftGroupEngineFactory, DurableRaftGroupEngineFactory, RaftGroupEngineFactory,
-    RaftGroupHandleRegistry, StaticGrpcRaftGroupEngineFactory,
+    ColdRaftGroupEngineFactory, DurableRaftGroupEngineFactory, LeadershipShedReason,
+    RaftGroupEngineFactory, RaftGroupHandleRegistry, StaticGrpcRaftGroupEngineFactory,
 };
 use ursula_runtime::{
     ColdStore, InMemoryGroupEngineFactory, PlanGroupColdFlushRequest, RuntimeConfig, RuntimeError,
@@ -437,6 +437,7 @@ pub fn spawn_snapshot_driver_if_configured(
                 // off any group we currently lead to a healthy peer so the
                 // cluster keeps serving appends on those groups.
                 yielded = true;
+                registry.mark_leadership_shed(LeadershipShedReason::SnapshotDriverS3);
                 for snapshot in &snaps {
                     let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) else {
                         continue;
@@ -466,6 +467,7 @@ pub fn spawn_snapshot_driver_if_configured(
                 // elections so this node rejoins normal raft participation and
                 // catches up (self-heal). The hold-down avoids flapping.
                 yielded = false;
+                registry.clear_leadership_shed(LeadershipShedReason::SnapshotDriverS3);
                 for snapshot in &snaps {
                     if let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) {
                         raft.runtime_config().elect(true);
@@ -749,6 +751,12 @@ pub fn spawn_cluster_egress_gate_if_configured(
 
             if !yielded && consecutive_bad >= unhealthy_ticks {
                 yielded = true;
+                // Publish "do not accept leadership" BEFORE asking openraft to
+                // hand off, so any peer's M1 transfer that races our shed sees
+                // the flag and gets rejected at our gRPC handler — closing the
+                // M1-fights-M2 flap that wedged ops during cluster_netem_delay
+                // on 2026-06-01.
+                registry.mark_leadership_shed(LeadershipShedReason::ClusterEgress);
                 for snap in registry.metrics_snapshot() {
                     let Some(raft) = registry.get(RaftGroupId(snap.raft_group_id)) else {
                         continue;
@@ -771,6 +779,7 @@ pub fn spawn_cluster_egress_gate_if_configured(
                         raft.runtime_config().elect(true);
                     }
                 }
+                registry.clear_leadership_shed(LeadershipShedReason::ClusterEgress);
                 eprintln!("cluster-egress: node {node_id} egress recovered; re-enabling elections");
             }
         }
@@ -1045,6 +1054,7 @@ pub fn spawn_cold_health_gate_if_configured(
                     eprintln!(
                         "cold-health: node {node_id} cold-impaired ({reason}); yielding leadership"
                     );
+                    registry.mark_leadership_shed(LeadershipShedReason::ColdHealth);
                     for snap in registry.metrics_snapshot() {
                         let Some(raft) = registry.get(RaftGroupId(snap.raft_group_id)) else {
                             continue;
@@ -1060,6 +1070,7 @@ pub fn spawn_cold_health_gate_if_configured(
                 }
                 ColdHealthDecision::Heal => {
                     eprintln!("cold-health: node {node_id} cold recovered; re-enabling elections");
+                    registry.clear_leadership_shed(LeadershipShedReason::ColdHealth);
                     for snap in registry.metrics_snapshot() {
                         if let Some(raft) = registry.get(RaftGroupId(snap.raft_group_id)) {
                             raft.runtime_config().elect(true);

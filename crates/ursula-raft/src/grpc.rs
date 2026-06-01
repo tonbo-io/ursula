@@ -38,7 +38,7 @@ use crate::types::*;
 
 pub(crate) static GRPC_LEADER_CHANNELS: OnceLock<Mutex<BTreeMap<String, Channel>>> =
     OnceLock::new();
-use crate::registry::RaftGroupHandleRegistry;
+use crate::registry::{LeadershipShedFlag, RaftGroupHandleRegistry};
 
 pub const RAFT_GRPC_APPEND_PATH: &str = "/ursula.raft.v1.RaftInternal/Append";
 pub const RAFT_GRPC_VOTE_PATH: &str = "/ursula.raft.v1.RaftInternal/Vote";
@@ -88,18 +88,26 @@ impl From<GrpcRpcError> for tonic::Status {
 pub struct RaftGrpcService {
     registry: RaftGroupHandleRegistry,
     cold_store: Option<ColdStoreHandle>,
+    leadership_shed: LeadershipShedFlag,
 }
 
 impl RaftGrpcService {
     pub fn new(registry: RaftGroupHandleRegistry) -> Self {
+        let leadership_shed = registry.leadership_shed_flag();
         Self {
             registry,
             cold_store: None,
+            leadership_shed,
         }
     }
 
     pub fn with_cold_store(mut self, cold_store: Option<ColdStoreHandle>) -> Self {
         self.cold_store = cold_store;
+        self
+    }
+
+    pub fn with_leadership_shed_flag(mut self, leadership_shed: LeadershipShedFlag) -> Self {
+        self.leadership_shed = leadership_shed;
         self
     }
 }
@@ -231,6 +239,22 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         if !self.registry.contains_group(raft_group_id) {
             return Err(GrpcRpcError::not_found(format!(
                 "raft group {} is not registered on this node",
+                raft_group_id.0
+            ))
+            .into());
+        }
+        // M2/M4 shed gate: when this node has been declared locally unhealthy
+        // (egress probe failing or cold S3 stalled), accepting leadership would
+        // trigger an immediate re-shed by the same watchdog — peer M1 would
+        // see us under fair share again next tick and hand it back. Rejecting
+        // here lets M1 observe the failure and converge to a healthy peer.
+        if self
+            .leadership_shed
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+        {
+            return Err(GrpcRpcError::failed_precondition(format!(
+                "node shed leadership; refusing TransferLeader for group {}",
                 raft_group_id.0
             ))
             .into());
