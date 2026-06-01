@@ -547,10 +547,11 @@ pub fn spawn_snapshot_driver_if_configured(
 /// distribution and converges. One transfer per tick keeps convergence gentle
 /// and avoids thundering-herd handoffs. Before planning a handoff, M1 asks
 /// peers for their leadership-shed policy state and only targets nodes whose
-/// policy says they may campaign. That prevents balancing into a
-/// cold-health/snapshot-shed peer that will immediately shed the same
-/// leadership back out. `transfer_leader` still brings lagging eligible
-/// targets up to date before handing off.
+/// policy says they may campaign. That prevents balancing into a hard-yielded
+/// peer that cannot safely lead. Cold-health remains campaign-eligible because
+/// it is a cluster-wide pressure signal under backlog: excluding every hot
+/// peer can deadlock leadership movement. `transfer_leader` still brings
+/// lagging eligible targets up to date before handing off.
 pub fn spawn_leadership_balancer_if_configured(
     registry: &RaftGroupHandleRegistry,
     node_id: u64,
@@ -715,12 +716,7 @@ pub(crate) fn plan_leadership_balance_with_eligible_nodes(
     let group_count = snaps.len();
     let fair = group_count.div_ceil(node_count);
 
-    let mut leader_count: HashMap<u64, usize> = HashMap::new();
-    for snap in snaps {
-        if let Some(leader) = snap.current_leader {
-            *leader_count.entry(leader).or_insert(0) += 1;
-        }
-    }
+    let leader_count = leader_counts(snaps);
     let my_load = leader_count.get(&my_id).copied().unwrap_or(0);
     if my_load <= fair {
         return Vec::new();
@@ -778,6 +774,33 @@ pub(crate) fn plan_leadership_balance_with_eligible_nodes(
         excess -= 1;
     }
     actions
+}
+
+pub(crate) fn leader_counts(
+    snaps: &[ursula_raft::RaftGroupMetricsSnapshot],
+) -> HashMap<u64, usize> {
+    let mut leader_count = HashMap::new();
+    for snap in snaps {
+        if let Some(leader) = snap.current_leader {
+            *leader_count.entry(leader).or_insert(0) += 1;
+        }
+    }
+    leader_count
+}
+
+pub(crate) fn prioritized_transfer_targets(
+    snap: &ursula_raft::RaftGroupMetricsSnapshot,
+    my_id: u64,
+    leader_count: &HashMap<u64, usize>,
+) -> Vec<u64> {
+    let mut targets: Vec<u64> = snap
+        .voter_ids
+        .iter()
+        .copied()
+        .filter(|voter| *voter != my_id)
+        .collect();
+    targets.sort_by_key(|target| (leader_count.get(target).copied().unwrap_or(0), *target));
+    targets
 }
 
 /// M2 — egress-health leadership gate. Each node actively measures its own
@@ -1097,11 +1120,12 @@ impl CommitStallTracker {
 ///    hot tier isn't draining back, so we're queued up against the cap
 ///    and writes will reactively backpressure at the cliff.
 ///
-/// Either condition sustained for `unhealthy_ticks` ticks triggers a shed:
-/// `elect(false)` on every group so this node won't win new elections, and
-/// `transfer_leader` away for every group it currently leads. The node heals
-/// when error growth stops AND hot_max drops below HOT_LOW for `heal_ticks`
-/// ticks, then `elect(true)` is restored only if no other shed reason remains.
+/// Either condition sustained for `unhealthy_ticks` ticks triggers a soft
+/// shed: the node attempts to `transfer_leader` away for every group it
+/// currently leads, but it stays campaign-eligible. Cold-health is often
+/// cluster-wide during backlog; disabling elections on every hot peer can
+/// freeze leadership movement. The node heals when error growth stops AND
+/// hot_max drops below HOT_LOW for `heal_ticks` ticks.
 ///
 /// Why this matters: ColdBackpressure 503 is a per-write reactive gate —
 /// once hot pegs at cap, the leader keeps accepting writes that immediately
@@ -1123,7 +1147,8 @@ pub fn spawn_cold_health_gate_if_configured(
     let heal_ticks = env_usize("URSULA_COLD_HEALTH_HEAL_TICKS", 5).max(1);
     // 7 MiB high water vs the default 8 MiB cap: shed BEFORE 503 cliff, not
     // after. 4 MiB low water gives a meaningful catch-up window before
-    // re-electing — otherwise we'd flap on every fault recovery.
+    // clearing the cold-health signal; otherwise we'd flap on every fault
+    // recovery.
     let hot_high_bytes = u64::try_from(env_usize(
         "URSULA_COLD_HEALTH_HOT_BYTES_HIGH",
         7 * 1024 * 1024,
@@ -1160,16 +1185,37 @@ pub fn spawn_cold_health_gate_if_configured(
                         "cold-health: node {node_id} cold-impaired ({reason}); yielding leadership"
                     );
                     registry.mark_leadership_shed(LeadershipShedReason::ColdHealth);
-                    for snap in registry.metrics_snapshot() {
+                    let snaps = registry.metrics_snapshot();
+                    let leader_count = leader_counts(&snaps);
+                    for snap in snaps {
+                        if snap.current_leader != Some(node_id) {
+                            continue;
+                        }
                         let Some(raft) = registry.get(RaftGroupId(snap.raft_group_id)) else {
                             continue;
                         };
-                        raft.runtime_config().elect(false);
-                        if snap.current_leader == Some(node_id)
-                            && let Some(target) =
-                                snap.voter_ids.iter().copied().find(|v| *v != node_id)
-                        {
-                            let _ = raft.trigger().transfer_leader(target).await;
+                        let targets = prioritized_transfer_targets(&snap, node_id, &leader_count);
+                        if targets.is_empty() {
+                            eprintln!(
+                                "cold-health: group {} has no peer voter target",
+                                snap.raft_group_id
+                            );
+                            continue;
+                        }
+                        for target in targets {
+                            match raft.trigger().transfer_leader(target).await {
+                                Ok(()) => {
+                                    eprintln!(
+                                        "cold-health: node {node_id} yielded leadership of group {} to node {target}",
+                                        snap.raft_group_id
+                                    );
+                                    break;
+                                }
+                                Err(err) => eprintln!(
+                                    "cold-health: transfer_leader group {} -> {target} failed: {err}",
+                                    snap.raft_group_id
+                                ),
+                            }
                         }
                     }
                 }
