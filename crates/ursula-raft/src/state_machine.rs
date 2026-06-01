@@ -23,8 +23,8 @@ use ursula_runtime::{
     CreateStreamRequest, DeleteSnapshotRequest, GroupEngine, GroupEngineError, GroupEngineMetrics,
     GroupSnapshot, HeadStreamRequest, HeadStreamResponse, InMemoryGroupEngine,
     PlanColdFlushRequest, PlanGroupColdFlushRequest, ReadSnapshotRequest, ReadSnapshotResponse,
-    ReadStreamRequest, ReadStreamResponse, SharedSnapshotStore, SnapshotKey, SnapshotPointer,
-    default_snapshot_store,
+    ReadStreamRequest, ReadStreamResponse, SharedSnapshotStore, SnapshotKey, SnapshotLocation,
+    SnapshotPointer, default_snapshot_store,
 };
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
@@ -363,11 +363,14 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         let pointer_bytes = snapshot.into_inner();
         let pointer = SnapshotPointer::decode(&pointer_bytes)
             .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
-        let snapshot_bytes = self
-            .snapshot_store
-            .download(&pointer.location)
-            .await
-            .map_err(|err| err.into_io())?;
+        let snapshot_bytes = match &pointer.location {
+            SnapshotLocation::Inline { bytes } => bytes.clone(),
+            location => self
+                .snapshot_store
+                .download(location)
+                .await
+                .map_err(|err| err.into_io())?,
+        };
         let group_snapshot: GroupSnapshot =
             serde_json::from_slice(&snapshot_bytes).map_err(invalid_data)?;
         self.engine

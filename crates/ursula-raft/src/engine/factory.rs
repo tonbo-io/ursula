@@ -332,6 +332,7 @@ impl StaticGrpcRaftGroupEngineFactory {
     }
 
     pub fn with_snapshot_store(mut self, snapshot_store: Option<SharedSnapshotStore>) -> Self {
+        self.registry.set_snapshot_store(snapshot_store.clone());
         self.snapshot_store = snapshot_store;
         self
     }
