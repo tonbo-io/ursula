@@ -664,6 +664,7 @@ pub fn cluster_router_from_state(state: HttpState) -> Router {
             RAFT_GRPC_TRANSFER_LEADER_PATH,
             raft_grpc_service(state.clone(), raft_registry),
         )
+        .route(LEADERSHIP_SHED_PATH, get(leadership_shed_status))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state)
 }
@@ -792,11 +793,37 @@ async fn concurrency_limit_middleware(
 /// the cluster plane; the round-trip time exposes loss/delay on the sender's
 /// egress, which a small heartbeat-sized request would mask.
 pub(crate) const CLUSTER_PROBE_PATH: &str = "/__ursula/cluster-probe";
+pub(crate) const LEADERSHIP_SHED_PATH: &str = "/__ursula/leadership-shed";
 
 /// Probe target: drain the body (so the sender's full egress traverses the
 /// cluster plane) and answer 200. Bypasses memory admission.
 async fn cluster_probe(_body: Bytes) -> StatusCode {
     StatusCode::OK
+}
+
+async fn leadership_shed_status(State(state): State<HttpState>) -> Response {
+    let shed_state = state
+        .raft_registry()
+        .map(RaftGroupHandleRegistry::leadership_shed_state)
+        .unwrap_or_default();
+    let mut body = String::from("{\"bits\":");
+    body.push_str(&shed_state.bits().to_string());
+    body.push_str(",\"state\":");
+    push_json_string(&mut body, &shed_state.to_string());
+    body.push_str(",\"should_accept_transfer\":");
+    body.push_str(bool_json(shed_state.should_accept_transfer()));
+    body.push_str(",\"should_campaign\":");
+    body.push_str(bool_json(shed_state.should_campaign()));
+    body.push_str(",\"should_shed_current_leaders\":");
+    body.push_str(bool_json(shed_state.should_shed_current_leaders()));
+    body.push('}');
+    let mut headers = HeaderMap::new();
+    insert_content_type(&mut headers, "application/json");
+    (StatusCode::OK, headers, body).into_response()
+}
+
+fn bool_json(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
 }
 
 /// axum middleware that short-circuits write-method requests (PUT/POST/PATCH/
