@@ -2,6 +2,7 @@ use openraft::RaftNetworkV2;
 use openraft::rt::WatchReceiver;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::fmt;
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::Arc;
@@ -622,8 +623,110 @@ pub enum LeadershipShedReason {
 }
 
 impl LeadershipShedReason {
-    fn bit(self) -> u8 {
+    const ALL: [Self; 3] = [
+        Self::SnapshotDriverS3,
+        Self::ClusterEgress,
+        Self::ColdHealth,
+    ];
+
+    const fn bit(self) -> u8 {
         self as u8
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SnapshotDriverS3 => "snapshot-driver-s3",
+            Self::ClusterEgress => "cluster-egress",
+            Self::ColdHealth => "cold-health",
+        }
+    }
+}
+
+impl fmt::Display for LeadershipShedReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+const LEADERSHIP_SHED_KNOWN_BITS: u8 = LeadershipShedReason::SnapshotDriverS3.bit()
+    | LeadershipShedReason::ClusterEgress.bit()
+    | LeadershipShedReason::ColdHealth.bit();
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LeadershipShedState {
+    bits: u8,
+}
+
+impl LeadershipShedState {
+    pub fn from_bits(bits: u8) -> Self {
+        Self {
+            bits: bits & LEADERSHIP_SHED_KNOWN_BITS,
+        }
+    }
+
+    pub fn load(flag: &LeadershipShedFlag) -> Self {
+        Self::from_bits(flag.load(Ordering::Acquire))
+    }
+
+    pub fn bits(self) -> u8 {
+        self.bits
+    }
+
+    pub fn is_shed(self) -> bool {
+        self.bits != 0
+    }
+
+    pub fn contains(self, reason: LeadershipShedReason) -> bool {
+        self.bits & reason.bit() != 0
+    }
+
+    /// Whether this node should accept an inbound TransferLeader request.
+    ///
+    /// Only cluster-egress impairment blocks this. Snapshot/cold-health
+    /// impairments should still shed local leaders and stop campaigning, but
+    /// refusing inbound transfer for those states can deadlock the balancer
+    /// when every peer has a transient cold-path bit set.
+    pub fn should_accept_transfer(self) -> bool {
+        !self.contains(LeadershipShedReason::ClusterEgress)
+    }
+
+    /// Whether local raft groups should be allowed to campaign.
+    ///
+    /// Any shed reason disables campaigning until that specific reason heals.
+    pub fn should_campaign(self) -> bool {
+        !self.is_shed()
+    }
+
+    /// Whether local raft groups should actively move current leadership away.
+    pub fn should_shed_current_leaders(self) -> bool {
+        self.is_shed()
+    }
+
+    pub fn transfer_rejection_reason(self) -> Option<LeadershipShedReason> {
+        if self.contains(LeadershipShedReason::ClusterEgress) {
+            Some(LeadershipShedReason::ClusterEgress)
+        } else {
+            None
+        }
+    }
+}
+
+impl fmt::Display for LeadershipShedState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut wrote = false;
+        for reason in LeadershipShedReason::ALL {
+            if self.contains(reason) {
+                if wrote {
+                    f.write_str("|")?;
+                }
+                fmt::Display::fmt(&reason, f)?;
+                wrote = true;
+            }
+        }
+        if !wrote {
+            f.write_str("none")?;
+        }
+        Ok(())
     }
 }
 
@@ -687,18 +790,32 @@ impl RaftGroupHandleRegistry {
         self.leadership_shed.clone()
     }
 
+    pub fn leadership_shed_state(&self) -> LeadershipShedState {
+        LeadershipShedState::load(&self.leadership_shed)
+    }
+
     pub fn mark_leadership_shed(&self, reason: LeadershipShedReason) {
-        self.leadership_shed
+        let previous = self
+            .leadership_shed
             .fetch_or(reason.bit(), Ordering::Release);
+        if previous & reason.bit() == 0 {
+            let current = LeadershipShedState::from_bits(previous | reason.bit());
+            eprintln!("leadership-shed: mark {reason}; state={current}");
+        }
     }
 
     pub fn clear_leadership_shed(&self, reason: LeadershipShedReason) {
-        self.leadership_shed
+        let previous = self
+            .leadership_shed
             .fetch_and(!reason.bit(), Ordering::Release);
+        if previous & reason.bit() != 0 {
+            let current = LeadershipShedState::from_bits(previous & !reason.bit());
+            eprintln!("leadership-shed: clear {reason}; state={current}");
+        }
     }
 
     pub fn is_leadership_shed(&self) -> bool {
-        self.leadership_shed.load(Ordering::Acquire) != 0
+        self.leadership_shed_state().is_shed()
     }
 
     pub fn metrics_snapshot(&self) -> Vec<RaftGroupMetricsSnapshot> {
@@ -821,18 +938,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn leadership_shed_reasons_are_independent() {
+    fn leadership_shed_policy_splits_transfer_from_campaigning() {
+        let empty = LeadershipShedState::default();
+        assert!(empty.should_accept_transfer());
+        assert!(empty.should_campaign());
+        assert!(!empty.should_shed_current_leaders());
+        assert_eq!(empty.transfer_rejection_reason(), None);
+
+        let snapshot_shed =
+            LeadershipShedState::from_bits(LeadershipShedReason::SnapshotDriverS3.bit());
+        assert!(snapshot_shed.should_accept_transfer());
+        assert!(!snapshot_shed.should_campaign());
+        assert!(snapshot_shed.should_shed_current_leaders());
+        assert_eq!(snapshot_shed.transfer_rejection_reason(), None);
+
+        let cold_shed = LeadershipShedState::from_bits(LeadershipShedReason::ColdHealth.bit());
+        assert!(cold_shed.should_accept_transfer());
+        assert!(!cold_shed.should_campaign());
+        assert!(cold_shed.should_shed_current_leaders());
+        assert_eq!(cold_shed.transfer_rejection_reason(), None);
+
+        let egress_shed = LeadershipShedState::from_bits(
+            LeadershipShedReason::ClusterEgress.bit() | LeadershipShedReason::ColdHealth.bit(),
+        );
+        assert!(!egress_shed.should_accept_transfer());
+        assert!(!egress_shed.should_campaign());
+        assert!(egress_shed.should_shed_current_leaders());
+        assert_eq!(
+            egress_shed.transfer_rejection_reason(),
+            Some(LeadershipShedReason::ClusterEgress)
+        );
+    }
+
+    #[test]
+    fn leadership_shed_reasons_are_tracked_independently() {
         let registry = RaftGroupHandleRegistry::default();
         assert!(!registry.is_leadership_shed());
 
         registry.mark_leadership_shed(LeadershipShedReason::ClusterEgress);
         registry.mark_leadership_shed(LeadershipShedReason::ColdHealth);
         assert!(registry.is_leadership_shed());
+        assert!(!registry.leadership_shed_state().should_accept_transfer());
 
         registry.clear_leadership_shed(LeadershipShedReason::ClusterEgress);
         assert!(registry.is_leadership_shed());
+        assert!(registry.leadership_shed_state().should_accept_transfer());
+
+        registry.mark_leadership_shed(LeadershipShedReason::SnapshotDriverS3);
+        assert!(registry.is_leadership_shed());
+        assert!(registry.leadership_shed_state().should_accept_transfer());
 
         registry.clear_leadership_shed(LeadershipShedReason::ColdHealth);
+        registry.clear_leadership_shed(LeadershipShedReason::SnapshotDriverS3);
         assert!(!registry.is_leadership_shed());
     }
 }
