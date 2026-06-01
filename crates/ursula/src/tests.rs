@@ -4405,6 +4405,37 @@ async fn cluster_router_does_not_expose_client_plane_routes() {
 }
 
 #[tokio::test]
+async fn cluster_router_reports_leadership_shed_policy() {
+    let registry = RaftGroupHandleRegistry::default();
+    registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::ColdHealth);
+    let state =
+        HttpState::with_raft_registry(spawn_default_runtime(1, 1).expect("runtime"), registry);
+    let cluster = cluster_router_from_state(state);
+    let response = cluster
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(LEADERSHIP_SHED_PATH)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body = std::str::from_utf8(&body).expect("status utf8");
+    assert!(body.contains("\"state\":\"cold-health\""), "{body}");
+    assert!(body.contains("\"should_accept_transfer\":true"), "{body}");
+    assert!(body.contains("\"should_campaign\":false"), "{body}");
+    assert!(
+        body.contains("\"should_shed_current_leaders\":true"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn merged_router_serves_both_planes() {
     // The single-listener router (backwards compat / in-process tests) must
     // still answer both client and cluster routes from one bind.
@@ -4707,7 +4738,8 @@ mod cold_health {
 }
 
 mod leadership_balance {
-    use crate::bootstrap::plan_leadership_balance;
+    use crate::bootstrap::{plan_leadership_balance, plan_leadership_balance_with_eligible_nodes};
+    use std::collections::HashSet;
     use ursula_raft::{RaftGroupMetricsSnapshot, RaftLogProgressSnapshot};
 
     fn snap(group_id: u32, leader: Option<u64>) -> RaftGroupMetricsSnapshot {
@@ -4874,6 +4906,43 @@ mod leadership_balance {
         let actions = plan_leadership_balance(&snaps, 1, 4);
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].target, 3);
+    }
+
+    #[test]
+    fn cold_shed_peer_is_not_rebalanced_into() {
+        // Node 1 has shed all leadership because it is cold-impaired. With all
+        // voters considered eligible, node 2 would see node 1 as under-loaded
+        // and push group 0 there, causing a ping-pong with M4. Recomputing fair
+        // over only campaign-eligible nodes {2,3} makes node 2 already fair.
+        let snaps = vec![
+            snap(0, Some(2)),
+            snap(1, Some(2)),
+            snap(2, Some(2)),
+            snap(3, Some(3)),
+            snap(4, Some(3)),
+            snap(5, Some(3)),
+        ];
+        let eligible = HashSet::from([2, 3]);
+        assert!(plan_leadership_balance_with_eligible_nodes(&snaps, 2, 4, &eligible).is_empty());
+    }
+
+    #[test]
+    fn rebalances_only_to_campaign_eligible_peers() {
+        // If one peer is cold-impaired, a deeply overloaded leader should still
+        // rebalance across the remaining healthy peer instead of targeting the
+        // impaired low-load node.
+        let snaps = vec![
+            snap(0, Some(2)),
+            snap(1, Some(2)),
+            snap(2, Some(2)),
+            snap(3, Some(2)),
+            snap(4, Some(2)),
+            snap(5, Some(2)),
+        ];
+        let eligible = HashSet::from([2, 3]);
+        let actions = plan_leadership_balance_with_eligible_nodes(&snaps, 2, 4, &eligible);
+        assert_eq!(actions.len(), 3, "actions={actions:?}");
+        assert!(actions.iter().all(|action| action.target == 3));
     }
 }
 
