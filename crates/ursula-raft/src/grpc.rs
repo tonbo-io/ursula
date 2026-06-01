@@ -38,7 +38,7 @@ use crate::types::*;
 
 pub(crate) static GRPC_LEADER_CHANNELS: OnceLock<Mutex<BTreeMap<String, Channel>>> =
     OnceLock::new();
-use crate::registry::{LeadershipShedFlag, RaftGroupHandleRegistry};
+use crate::registry::{LeadershipShedFlag, LeadershipShedState, RaftGroupHandleRegistry};
 
 pub const RAFT_GRPC_APPEND_PATH: &str = "/ursula.raft.v1.RaftInternal/Append";
 pub const RAFT_GRPC_VOTE_PATH: &str = "/ursula.raft.v1.RaftInternal/Vote";
@@ -243,18 +243,10 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             ))
             .into());
         }
-        // M2/M4 shed gate: when this node has been declared locally unhealthy
-        // (egress probe failing or cold S3 stalled), accepting leadership would
-        // trigger an immediate re-shed by the same watchdog — peer M1 would
-        // see us under fair share again next tick and hand it back. Rejecting
-        // here lets M1 observe the failure and converge to a healthy peer.
-        if self
-            .leadership_shed
-            .load(std::sync::atomic::Ordering::Acquire)
-            != 0
-        {
+        let shed_state = LeadershipShedState::load(&self.leadership_shed);
+        if let Some(reason) = shed_state.transfer_rejection_reason() {
             return Err(GrpcRpcError::failed_precondition(format!(
-                "node shed leadership; refusing TransferLeader for group {}",
+                "node {reason} shed leadership; refusing TransferLeader for group {}",
                 raft_group_id.0
             ))
             .into());

@@ -190,8 +190,8 @@ impl HttpState {
 
     /// Replace the leadership-shed flag with one shared with the bootstrap
     /// health gates. They set per-gate bits on shed and clear their own bit on
-    /// heal; the gRPC TransferLeader handler refuses leadership while any bit
-    /// remains set.
+    /// heal; the raft registry policy decides separately whether the node may
+    /// campaign, shed current leaders, or accept inbound leadership transfer.
     pub fn with_leadership_shed_flag(mut self, flag: LeadershipShedFlag) -> Self {
         self.leadership_shed = flag;
         self

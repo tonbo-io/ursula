@@ -353,6 +353,24 @@ pub fn spawn_cold_gc_worker_if_configured(runtime: &ShardRuntime) {
     });
 }
 
+fn set_registered_group_elections(registry: &RaftGroupHandleRegistry, enabled: bool) {
+    for snapshot in registry.metrics_snapshot() {
+        if let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) {
+            raft.runtime_config().elect(enabled);
+        }
+    }
+}
+
+fn reenable_elections_if_campaign_allowed(registry: &RaftGroupHandleRegistry, context: &str) {
+    let shed_state = registry.leadership_shed_state();
+    if shed_state.should_campaign() {
+        set_registered_group_elections(registry, true);
+        eprintln!("{context}; re-enabling elections");
+    } else {
+        eprintln!("{context}; elections remain disabled while leadership-shed state={shed_state}");
+    }
+}
+
 /// Drives raft snapshots manually after first draining each group's hot tail to
 /// cold. The drain makes the resulting snapshot's `payload` field empty (no
 /// uncommitted hot bytes), shrinking the manifest install_snapshot has to ship.
@@ -382,11 +400,12 @@ pub fn spawn_snapshot_driver_if_configured(
     // Consecutive ticks where the S3-health probe fails before this node
     // declares its own S3 unhealthy and yields leadership.
     let unhealthy_ticks = env_usize("URSULA_S3_UNHEALTHY_TICKS", 1).max(1);
-    // Consecutive healthy ticks required before a yielded node re-enables
-    // elections. Hysteresis matters because the cold-flush failure signal
-    // disappears once a node yields (a follower does not flush), so recovery is
-    // judged by the probe alone — a short hold-down avoids re-grabbing
-    // leadership only to fail the next flush and yield again (flapping).
+    // Consecutive healthy ticks required before this reason clears. Elections
+    // are only re-enabled if no other shed reason remains set. Hysteresis
+    // matters because the cold-flush failure signal disappears once a node
+    // yields (a follower does not flush), so recovery is judged by the probe
+    // alone — a short hold-down avoids re-grabbing leadership only to fail the
+    // next flush and yield again (flapping).
     let heal_ticks = env_usize("URSULA_S3_HEAL_TICKS", 2).max(1);
     let runtime = runtime.clone();
     let registry = registry.clone();
@@ -396,8 +415,8 @@ pub fn spawn_snapshot_driver_if_configured(
         // cannot flush cold or persist snapshots, so it must not keep leading
         // groups (it would reject every append on them while healthy peers sit
         // idle). On sustained local S3 failure it transfers leadership away and
-        // disables its own elections; once its S3 recovers it re-enables
-        // elections and rejoins/catches up normally (self-heal).
+        // disables its own elections; once its S3 recovers it clears this shed
+        // reason and rejoins only when no other reason still blocks campaigns.
         let mut consecutive_bad = 0usize;
         let mut consecutive_good = 0usize;
         let mut yielded = false;
@@ -463,17 +482,12 @@ pub fn spawn_snapshot_driver_if_configured(
                     }
                 }
             } else if yielded && consecutive_good >= heal_ticks {
-                // Local S3 recovered (sustained healthy ticks): re-enable
-                // elections so this node rejoins normal raft participation and
-                // catches up (self-heal). The hold-down avoids flapping.
+                // Local S3 recovered (sustained healthy ticks): clear this
+                // reason and re-enable elections only if no other shed reason
+                // still requires this node to stay out of campaigns.
                 yielded = false;
                 registry.clear_leadership_shed(LeadershipShedReason::SnapshotDriverS3);
-                for snapshot in &snaps {
-                    if let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) {
-                        raft.runtime_config().elect(true);
-                    }
-                }
-                eprintln!("s3-healthy: node re-enabled elections after S3 recovery");
+                reenable_elections_if_campaign_allowed(&registry, "s3-healthy: node S3 recovered");
             }
 
             // Drive snapshots (log compaction) only while fully healthy (probe
@@ -679,7 +693,8 @@ pub(crate) fn plan_leadership_balance(
 /// deadline, sized so 15% loss / added delay fails it while a healthy link
 /// passes trivially — a heartbeat-sized probe would be masked by loss). A node
 /// that cannot push to a quorum of peers cannot replicate, so it sheds
-/// leadership and disables elections; it re-enables once its egress is clean.
+/// leadership and disables elections; it clears this reason once its egress is
+/// clean and re-enables elections only if no other shed reason remains.
 ///
 /// Unlike inferring health from commit progress (load-dependent, and gone once
 /// the client gives up), this probe is role-independent: a yielded follower
@@ -774,13 +789,11 @@ pub fn spawn_cluster_egress_gate_if_configured(
                 );
             } else if yielded && consecutive_good >= heal_ticks {
                 yielded = false;
-                for snap in registry.metrics_snapshot() {
-                    if let Some(raft) = registry.get(RaftGroupId(snap.raft_group_id)) {
-                        raft.runtime_config().elect(true);
-                    }
-                }
                 registry.clear_leadership_shed(LeadershipShedReason::ClusterEgress);
-                eprintln!("cluster-egress: node {node_id} egress recovered; re-enabling elections");
+                reenable_elections_if_campaign_allowed(
+                    &registry,
+                    &format!("cluster-egress: node {node_id} egress recovered"),
+                );
             }
         }
     });
@@ -996,7 +1009,7 @@ impl CommitStallTracker {
 /// `elect(false)` on every group so this node won't win new elections, and
 /// `transfer_leader` away for every group it currently leads. The node heals
 /// when error growth stops AND hot_max drops below HOT_LOW for `heal_ticks`
-/// ticks, then `elect(true)` is restored.
+/// ticks, then `elect(true)` is restored only if no other shed reason remains.
 ///
 /// Why this matters: ColdBackpressure 503 is a per-write reactive gate —
 /// once hot pegs at cap, the leader keeps accepting writes that immediately
@@ -1069,13 +1082,11 @@ pub fn spawn_cold_health_gate_if_configured(
                     }
                 }
                 ColdHealthDecision::Heal => {
-                    eprintln!("cold-health: node {node_id} cold recovered; re-enabling elections");
                     registry.clear_leadership_shed(LeadershipShedReason::ColdHealth);
-                    for snap in registry.metrics_snapshot() {
-                        if let Some(raft) = registry.get(RaftGroupId(snap.raft_group_id)) {
-                            raft.runtime_config().elect(true);
-                        }
-                    }
+                    reenable_elections_if_campaign_allowed(
+                        &registry,
+                        &format!("cold-health: node {node_id} cold recovered"),
+                    );
                 }
                 ColdHealthDecision::NoChange => {}
             }

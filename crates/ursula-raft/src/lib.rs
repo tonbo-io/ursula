@@ -47,8 +47,8 @@ pub use registry::{
     InProcessRaftFaultAction, InProcessRaftFaultScript, InProcessRaftFaultStep,
     InProcessRaftNetwork, InProcessRaftNetworkEvent, InProcessRaftNetworkFactory,
     InProcessRaftNetworkPolicy, InProcessRaftNetworkPolicyEvent, InProcessRaftRegistry,
-    InProcessRaftRpcKind, LeadershipShedFlag, LeadershipShedReason, RaftGroupHandleRegistry,
-    SingleNodeRaftNetwork, SingleNodeRaftNetworkFactory,
+    InProcessRaftRpcKind, LeadershipShedFlag, LeadershipShedReason, LeadershipShedState,
+    RaftGroupHandleRegistry, SingleNodeRaftNetwork, SingleNodeRaftNetworkFactory,
 };
 #[cfg(madsim)]
 pub use sim_runtime::MadsimOpenRaftRuntime;
