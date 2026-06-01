@@ -354,6 +354,7 @@ class ChaosAgent:
             raise SystemExit("--fault-scenarios is required when --fault-profile=custom")
         self.fault_profile = args.fault_profile
         self.fault_scenarios = [scenario.strip() for scenario in fault_scenarios.split(",") if scenario.strip()]
+        self.raft_ready_max_lag = max(0, args.raft_ready_max_lag)
         configured_unsupported = sorted(set(self.fault_scenarios) & UNSUPPORTED_QUORUM_LOSS_SCENARIOS)
         if configured_unsupported:
             raise SystemExit(
@@ -403,6 +404,7 @@ class ChaosAgent:
         self.append_shed = 0
         self.last_append_shed_error: str | None = None
         self.state_lock = threading.Lock()
+        self.publish_lock = threading.Lock()
         self.reader_success = 0
         self.reader_errors = 0
         self.read_availability_errors = 0
@@ -443,6 +445,8 @@ class ChaosAgent:
         self.last_status_read_availability_errors: int | None = None
         self.last_status_cold_backpressure_events: int | None = None
         self.last_status_published_at: datetime | None = None
+        self.last_fault_postpone_log_at: datetime | None = None
+        self.control_thread_started = False
         self.cold_refresh_cursor = 0
         # GC churn: a lane of ephemeral streams that are appended to, left long
         # enough for the cold-flush worker to spill them to S3, then deleted so
@@ -1319,6 +1323,96 @@ class ChaosAgent:
             "raft_groups": [groups[group_id] for group_id in sorted(groups)],
         }
 
+    def raft_replica_lag_status(self, topology: dict[str, Any]) -> dict[str, Any]:
+        max_lag = 0
+        lagging: list[dict[str, Any]] = []
+        for group in topology.get("raft_groups", []):
+            if not isinstance(group, dict):
+                continue
+            group_id = group.get("raft_group_id")
+            replicas = group.get("replicas", [])
+            if not isinstance(replicas, list) or not replicas:
+                lagging.append(
+                    {
+                        "raft_group_id": group_id,
+                        "node_id": None,
+                        "lag": None,
+                        "reason": "missing replicas",
+                    }
+                )
+                continue
+            committed_values = [
+                replica.get("committed_index")
+                for replica in replicas
+                if isinstance(replica, dict) and isinstance(replica.get("committed_index"), int)
+            ]
+            if not committed_values:
+                lagging.append(
+                    {
+                        "raft_group_id": group_id,
+                        "node_id": None,
+                        "lag": None,
+                        "reason": "missing committed indexes",
+                    }
+                )
+                continue
+            group_max = max(committed_values)
+            for replica in replicas:
+                if not isinstance(replica, dict):
+                    continue
+                committed = replica.get("committed_index")
+                applied = replica.get("last_applied_index")
+                if not isinstance(committed, int) or not isinstance(applied, int):
+                    lagging.append(
+                        {
+                            "raft_group_id": group_id,
+                            "node_id": replica.get("node_id"),
+                            "node_name": replica.get("node_name"),
+                            "lag": None,
+                            "reason": "missing committed/applied index",
+                        }
+                    )
+                    continue
+                lag = max(group_max - committed, group_max - applied)
+                max_lag = max(max_lag, lag)
+                if lag > self.raft_ready_max_lag:
+                    lagging.append(
+                        {
+                            "raft_group_id": group_id,
+                            "node_id": replica.get("node_id"),
+                            "node_name": replica.get("node_name"),
+                            "lag": lag,
+                            "committed_index": committed,
+                            "last_applied_index": applied,
+                            "group_max_committed_index": group_max,
+                        }
+                    )
+        return {
+            "ok": not lagging,
+            "max_lag": max_lag,
+            "max_allowed_lag": self.raft_ready_max_lag,
+            "lagging_count": len(lagging),
+            "lagging": lagging[:12],
+        }
+
+    def raft_lag_reason(self, lag_status: dict[str, Any]) -> str:
+        examples = []
+        for item in lag_status.get("lagging", [])[:3]:
+            if not isinstance(item, dict):
+                continue
+            group_id = item.get("raft_group_id")
+            node = item.get("node_name") or item.get("node_id")
+            lag = item.get("lag")
+            if lag is None:
+                examples.append(f"g{group_id}/n{node}: {item.get('reason', 'unknown')}")
+            else:
+                examples.append(f"g{group_id}/n{node}: lag {lag}")
+        suffix = f" ({', '.join(examples)})" if examples else ""
+        return (
+            f"raft replica lag max {lag_status.get('max_lag')} > "
+            f"{lag_status.get('max_allowed_lag')} entries{suffix}"
+        )
+
     def allow_next_revert_for_node(self, target: Node) -> None:
         samples = [self.sample_node(node) for node in self.nodes]
         nodes_by_id = {
@@ -1496,6 +1590,20 @@ class ChaosAgent:
             return
         if self.next_fault_at is None or now < self.next_fault_at:
             return
+        ready, not_ready_reasons = self.fault_injection_readiness()
+        if not ready:
+            self.next_fault_at = now + timedelta(seconds=max(15, self.status_every))
+            if (
+                self.last_fault_postpone_log_at is None
+                or (now - self.last_fault_postpone_log_at).total_seconds() >= 60
+            ):
+                self.event(
+                    "warn",
+                    "postponing fault injection until cluster is fully ready: "
+                    + "; ".join(not_ready_reasons),
+                )
+                self.last_fault_postpone_log_at = now
+            return
         scenario = self.choose_fault_scenario()
         targets = self.choose_fault_targets(scenario)
         allow_revert = scenario in {"clean_stop", "mixed_allow_stop", "rolling_restart"} or (
@@ -1570,6 +1678,10 @@ class ChaosAgent:
 
         repair_count = int(injection.get("repair_attempts") or 0)
         if repair_count >= self.max_repair_attempts:
+            changed = False
+            if self.next_fault_at is not None:
+                self.next_fault_at = None
+                changed = True
             if injection.get("status") != "repair_failed":
                 injection["status"] = "repair_failed"
                 injection["repair_failed_at"] = iso(now)
@@ -1581,7 +1693,8 @@ class ChaosAgent:
                     }
                 )
                 self.active_injection_id = None
-                self.next_fault_at = None
+                changed = True
+            if changed:
                 self.publish_status()
             return True
 
@@ -1992,6 +2105,45 @@ class ChaosAgent:
                 return False
         return True
 
+    def fault_injection_readiness(self) -> tuple[bool, list[str]]:
+        nodes = [self.sample_node(node) for node in self.nodes]
+        topology = self.build_topology(nodes)
+        expected_nodes = len(self.nodes)
+        expected_voters = {
+            node_id
+            for node_id in (node.get("node_id") for node in nodes)
+            if isinstance(node_id, int)
+        }
+        expected_groups = max(
+            (node.get("raft_groups") for node in nodes if isinstance(node.get("raft_groups"), int)),
+            default=0,
+        )
+        running_nodes = sum(1 for node in nodes if node.get("instance_state") == "running")
+        metrics_ok = sum(1 for node in nodes if node.get("metrics_state") == "ok")
+        full_raft_nodes = sum(
+            1
+            for node in nodes
+            if len(expected_voters) == expected_nodes
+            and self.raft_node_has_full_view(
+                node,
+                expected_groups=expected_groups,
+                expected_voters=expected_voters,
+            )
+        )
+        lag_status = self.raft_replica_lag_status(topology)
+        reasons = []
+        if running_nodes < expected_nodes:
+            reasons.append(f"{running_nodes}/{expected_nodes} nodes running")
+        if metrics_ok < expected_nodes:
+            reasons.append(f"{metrics_ok}/{expected_nodes} metrics endpoints healthy")
+        if full_raft_nodes < expected_nodes:
+            reasons.append(
+                f"{full_raft_nodes}/{expected_nodes} nodes have complete Raft membership and applied state"
+            )
+        if not lag_status["ok"]:
+            reasons.append(self.raft_lag_reason(lag_status))
+        return not reasons, reasons
+
     def build_status(self) -> dict[str, Any]:
         nodes = [self.sample_node(node) for node in self.nodes]
         topology = self.build_topology(nodes)
@@ -2004,6 +2156,8 @@ class ChaosAgent:
         running_nodes = sum(1 for node in nodes if node.get("instance_state") == "running")
         metrics_ok = sum(1 for node in nodes if node.get("metrics_state") == "ok")
         storage = self.storage_status(nodes)
+        raft_lag_status = self.raft_replica_lag_status(topology)
+        raft_replicas_caught_up = raft_lag_status["ok"]
         full_raft_nodes = sum(
             1
             for node in nodes
@@ -2065,6 +2219,8 @@ class ChaosAgent:
             reasons.append(f"{metrics_ok}/{expected_nodes} metrics endpoints healthy")
         if full_raft_nodes < expected_nodes:
             reasons.append(f"{full_raft_nodes}/{expected_nodes} nodes have complete Raft membership and applied state")
+        if not raft_replicas_caught_up:
+            reasons.append(self.raft_lag_reason(raft_lag_status))
         if not workload_progressing:
             reasons.append("append workload is not progressing")
         if not workload_clean:
@@ -2081,6 +2237,7 @@ class ChaosAgent:
             running_nodes == expected_nodes
             and metrics_ok == expected_nodes
             and full_raft_nodes == expected_nodes
+            and raft_replicas_caught_up
             and workload_progressing
             and workload_clean
             and read_availability_clean
@@ -2100,6 +2257,7 @@ class ChaosAgent:
         # doing useful work.
         recovered_healthy = (
             quorum_healthy
+            and raft_replicas_caught_up
             and workload_progressing
             and integrity_status == "operational"
         )
@@ -2140,6 +2298,11 @@ class ChaosAgent:
             "read_availability_clean": read_availability_clean,
             "cold_backpressure_clean": cold_backpressure_clean,
             "quorum_healthy": quorum_healthy,
+            "raft_replicas_caught_up": raft_replicas_caught_up,
+            "raft_replica_max_lag": raft_lag_status["max_lag"],
+            "raft_replica_max_allowed_lag": raft_lag_status["max_allowed_lag"],
+            "raft_replica_lagging_count": raft_lag_status["lagging_count"],
+            "raft_replica_lagging": raft_lag_status["lagging"],
             "reasons": reasons,
         }
         injection = self.current_injection()
@@ -2220,6 +2383,8 @@ class ChaosAgent:
                 "append_error_delta": append_error_delta,
                 "read_availability_error_delta": read_availability_error_delta,
                 "cold_backpressure_event_delta": cold_backpressure_event_delta,
+                "raft_replica_max_lag": raft_lag_status["max_lag"],
+                "raft_replica_lagging_count": raft_lag_status["lagging_count"],
                 "integrity_status": integrity_status,
                 "active_fault": active_fault,
                 "reasons": reasons,
@@ -2232,6 +2397,9 @@ class ChaosAgent:
             _slim_injection(inj) for inj in list(self.injections)[-_PUBLISHED_INJECTIONS:]
         ]
         published_events = list(self.events)[-_PUBLISHED_EVENTS:]
+        published_next_fault_at = self.next_fault_at
+        if self.current_injection() is not None:
+            published_next_fault_at = None
         status = {
             "schema_version": 1,
             "overall": overall,
@@ -2273,7 +2441,7 @@ class ChaosAgent:
             "chaos": {
                 "enabled": not self.disable_faults,
                 "active_fault": active_fault,
-                "next_fault_after": iso(self.next_fault_at),
+                "next_fault_after": iso(published_next_fault_at),
                 "fault_profile": self.fault_profile,
                 "coverage": self.chaos_coverage(),
                 "recovery_slo_secs": self.recovery_slo_secs,
@@ -2329,33 +2497,36 @@ class ChaosAgent:
         }
 
     def publish_status(self) -> None:
-        status = self.build_status()
-        self.status_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.status_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n")
-        tmp.replace(self.status_file)
-        if self.status_s3_uri:
-            run(
-                [
-                    "aws",
-                    "s3",
-                    "cp",
-                    str(self.status_file),
-                    self.status_s3_uri,
-                    "--content-type",
-                    "application/json",
-                    "--cache-control",
-                    "no-store",
-                ],
-                check=False,
-                timeout_secs=self.aws_timeout_secs,
-            )
+        with self.publish_lock:
+            status = self.build_status()
+            self.status_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.status_file.with_suffix(".tmp")
+            tmp.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n")
+            tmp.replace(self.status_file)
+            if self.status_s3_uri:
+                run(
+                    [
+                        "aws",
+                        "s3",
+                        "cp",
+                        str(self.status_file),
+                        self.status_s3_uri,
+                        "--content-type",
+                        "application/json",
+                        "--cache-control",
+                        "no-store",
+                    ],
+                    check=False,
+                    timeout_secs=self.aws_timeout_secs,
+                )
 
     def run_forever(self) -> None:
-        self.create_streams_until_ready()
-        if self.first_fault_secs is not None and self.active_fault is None:
-            self.next_fault_at = utc_now() + timedelta(seconds=self.first_fault_secs)
         self.event("info", "chaos agent started")
+        if self.append_workers > 1:
+            self.start_control_loop()
+        self.create_streams_until_ready()
+        if self.first_fault_secs is not None and self.active_fault is None and self.current_injection() is None:
+            self.next_fault_at = utc_now() + timedelta(seconds=self.first_fault_secs)
         if self.append_workers > 1:
             self.run_forever_with_append_workers()
             return
@@ -2423,6 +2594,12 @@ class ChaosAgent:
                 self.event("warn", f"control loop error: {exc}")
             time.sleep(1.0)
 
+    def start_control_loop(self) -> None:
+        if self.control_thread_started:
+            return
+        threading.Thread(target=self.control_loop, name="control", daemon=True).start()
+        self.control_thread_started = True
+
     def run_forever_with_append_workers(self) -> None:
         for lane_id in range(self.append_workers):
             worker = threading.Thread(
@@ -2432,7 +2609,7 @@ class ChaosAgent:
                 daemon=True,
             )
             worker.start()
-        threading.Thread(target=self.control_loop, name="control", daemon=True).start()
+        self.start_control_loop()
         self.event("info", f"{self.append_workers} append lanes started")
 
         last_verified_success = 0
@@ -2518,6 +2695,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--injection-history", type=int, default=32)
     parser.add_argument("--fault-min-secs", type=int, default=900)
     parser.add_argument("--fault-max-secs", type=int, default=1800)
+    parser.add_argument(
+        "--raft-ready-max-lag",
+        type=int,
+        default=4096,
+        help="maximum per-replica committed/applied lag before starting the next fault",
+    )
     parser.add_argument(
         "--fault-profile",
         choices=["network", "revert-detection", "custom"],
