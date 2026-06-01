@@ -6,6 +6,8 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use openraft::BasicNode;
@@ -610,9 +612,34 @@ async fn sleep_in_process_raft_network(delay: Duration) {
     std::thread::sleep(delay);
 }
 
-#[derive(Debug, Clone, Default)]
+pub type LeadershipShedFlag = Arc<AtomicU8>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeadershipShedReason {
+    SnapshotDriverS3 = 0b001,
+    ClusterEgress = 0b010,
+    ColdHealth = 0b100,
+}
+
+impl LeadershipShedReason {
+    fn bit(self) -> u8 {
+        self as u8
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct RaftGroupHandleRegistry {
     groups: Arc<Mutex<BTreeMap<u32, Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>>>>,
+    leadership_shed: LeadershipShedFlag,
+}
+
+impl Default for RaftGroupHandleRegistry {
+    fn default() -> Self {
+        Self {
+            groups: Arc::new(Mutex::new(BTreeMap::new())),
+            leadership_shed: Arc::new(AtomicU8::new(0)),
+        }
+    }
 }
 
 impl RaftGroupHandleRegistry {
@@ -654,6 +681,24 @@ impl RaftGroupHandleRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn leadership_shed_flag(&self) -> LeadershipShedFlag {
+        self.leadership_shed.clone()
+    }
+
+    pub fn mark_leadership_shed(&self, reason: LeadershipShedReason) {
+        self.leadership_shed
+            .fetch_or(reason.bit(), Ordering::Release);
+    }
+
+    pub fn clear_leadership_shed(&self, reason: LeadershipShedReason) {
+        self.leadership_shed
+            .fetch_and(!reason.bit(), Ordering::Release);
+    }
+
+    pub fn is_leadership_shed(&self) -> bool {
+        self.leadership_shed.load(Ordering::Acquire) != 0
     }
 
     pub fn metrics_snapshot(&self) -> Vec<RaftGroupMetricsSnapshot> {
@@ -768,5 +813,26 @@ pub(crate) fn log_progress_snapshot(
     RaftLogProgressSnapshot {
         term: log_id.leader_id.term,
         index: log_id.index,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leadership_shed_reasons_are_independent() {
+        let registry = RaftGroupHandleRegistry::default();
+        assert!(!registry.is_leadership_shed());
+
+        registry.mark_leadership_shed(LeadershipShedReason::ClusterEgress);
+        registry.mark_leadership_shed(LeadershipShedReason::ColdHealth);
+        assert!(registry.is_leadership_shed());
+
+        registry.clear_leadership_shed(LeadershipShedReason::ClusterEgress);
+        assert!(registry.is_leadership_shed());
+
+        registry.clear_leadership_shed(LeadershipShedReason::ColdHealth);
+        assert!(!registry.is_leadership_shed());
     }
 }

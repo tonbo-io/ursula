@@ -50,10 +50,10 @@ use futures_util::stream;
 use openraft::BasicNode;
 use openraft::rt::WatchReceiver;
 use ursula_raft::{
-    RAFT_GRPC_APPEND_PATH, RAFT_GRPC_FULL_SNAPSHOT_PATH, RAFT_GRPC_GROUP_READ_PATH,
-    RAFT_GRPC_GROUP_WRITE_PATH, RAFT_GRPC_MAX_MESSAGE_BYTES, RAFT_GRPC_TRANSFER_LEADER_PATH,
-    RAFT_GRPC_VOTE_PATH, RaftGroupHandleRegistry, RaftGrpcService, RaftLogProgressSnapshot,
-    raft_internal_proto,
+    LeadershipShedFlag, RAFT_GRPC_APPEND_PATH, RAFT_GRPC_FULL_SNAPSHOT_PATH,
+    RAFT_GRPC_GROUP_READ_PATH, RAFT_GRPC_GROUP_WRITE_PATH, RAFT_GRPC_MAX_MESSAGE_BYTES,
+    RAFT_GRPC_TRANSFER_LEADER_PATH, RAFT_GRPC_VOTE_PATH, RaftGroupHandleRegistry, RaftGrpcService,
+    RaftLogProgressSnapshot, raft_internal_proto,
 };
 use ursula_runtime::{
     AppendBatchRequest, AppendExternalRequest, AppendRequest, AppendResponse,
@@ -135,6 +135,7 @@ pub struct HttpState {
     http_metrics: Arc<HttpMetrics>,
     wall_clock: Arc<dyn WallClock>,
     node_memory_admission: NodeMemoryAdmission,
+    leadership_shed: LeadershipShedFlag,
 }
 
 impl HttpState {
@@ -146,6 +147,7 @@ impl HttpState {
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
             node_memory_admission: NodeMemoryAdmission::from_env(),
+            leadership_shed: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }
     }
 
@@ -153,6 +155,7 @@ impl HttpState {
         runtime: ShardRuntime,
         raft_registry: RaftGroupHandleRegistry,
     ) -> Self {
+        let leadership_shed = raft_registry.leadership_shed_flag();
         Self {
             runtime,
             raft_registry: Some(raft_registry),
@@ -160,6 +163,7 @@ impl HttpState {
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
             node_memory_admission: NodeMemoryAdmission::from_env(),
+            leadership_shed,
         }
     }
 
@@ -168,6 +172,7 @@ impl HttpState {
         raft_registry: RaftGroupHandleRegistry,
         peers: impl IntoIterator<Item = (u64, String)>,
     ) -> Self {
+        let leadership_shed = raft_registry.leadership_shed_flag();
         Self {
             runtime,
             raft_registry: Some(raft_registry),
@@ -175,7 +180,21 @@ impl HttpState {
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
             node_memory_admission: NodeMemoryAdmission::from_env(),
+            leadership_shed,
         }
+    }
+
+    pub fn leadership_shed_flag(&self) -> LeadershipShedFlag {
+        self.leadership_shed.clone()
+    }
+
+    /// Replace the leadership-shed flag with one shared with the bootstrap
+    /// health gates. They set per-gate bits on shed and clear their own bit on
+    /// heal; the gRPC TransferLeader handler refuses leadership while any bit
+    /// remains set.
+    pub fn with_leadership_shed_flag(mut self, flag: LeadershipShedFlag) -> Self {
+        self.leadership_shed = flag;
+        self
     }
 
     pub fn with_wall_clock(mut self, wall_clock: impl WallClock) -> Self {
@@ -516,8 +535,11 @@ struct HttpRaftGrpcService {
 impl HttpRaftGrpcService {
     fn new(registry: RaftGroupHandleRegistry, state: HttpState) -> Self {
         let cold_store = state.runtime().cold_store();
+        let leadership_shed = state.leadership_shed_flag();
         Self {
-            raft: RaftGrpcService::new(registry).with_cold_store(cold_store),
+            raft: RaftGrpcService::new(registry)
+                .with_cold_store(cold_store)
+                .with_leadership_shed_flag(leadership_shed),
         }
     }
 }
