@@ -1559,6 +1559,23 @@ class ChaosAgent:
         now = utc_now()
         if self.disable_faults:
             return
+        # Self-heal scheduler: if we are completely idle (no in-flight fault,
+        # no injection waiting to be resolved, no future tick scheduled), pick
+        # the next firing time. This rescues the agent from a single race
+        # window: `repair_unrecovered_injection` nulls `next_fault_at` when an
+        # injection hits `max_repair_attempts`, and the SAME loop tick's
+        # `build_status` can then mark that injection `recovered` once the
+        # cluster heals — clearing `active_injection_id` but leaving
+        # `next_fault_at = None` with no other code path to reschedule, so the
+        # agent silently stops injecting forever (observed in `#126`,
+        # 2026-06-01: status flipped repair_failed -> recovered while the
+        # scheduler stayed paused).
+        if (
+            self.next_fault_at is None
+            and self.active_fault is None
+            and self.current_injection() is None
+        ):
+            self.next_fault_at = self.choose_next_fault()
         if self.active_fault is not None:
             recover_at = self.active_fault["recover_at"]
             if now < recover_at:
