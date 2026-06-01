@@ -19,6 +19,8 @@ use crate::registry::RaftGroupHandleRegistry;
 
 use super::RaftGroupEngine;
 
+const RAFT_INSTALL_SNAPSHOT_TIMEOUT_DEFAULT_MS: u64 = 120_000;
+
 /// How long a restarting bootstrap node waits to observe an already-established
 /// (or freshly re-elected) leader before deciding the group is truly new and
 /// bootstrapping it. Must exceed the election window so peers that lost this
@@ -31,6 +33,29 @@ fn rejoin_leader_probe_timeout() -> Duration {
         .filter(|ms| *ms > 0)
         .unwrap_or(6000);
     Duration::from_millis(ms)
+}
+
+/// OpenRaft's `install_snapshot_timeout` covers the whole FullSnapshot RPC.
+/// Ursula sends only a snapshot pointer in that RPC, but the receiver downloads
+/// and installs the referenced object before replying, so this timeout must be
+/// comfortably above the S3 per-attempt timeout plus retries. Tunable via
+/// `URSULA_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS`.
+fn raft_install_snapshot_timeout_ms() -> u64 {
+    parse_positive_millis_env(
+        "URSULA_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS",
+        RAFT_INSTALL_SNAPSHOT_TIMEOUT_DEFAULT_MS,
+    )
+}
+
+fn parse_positive_millis_env(name: &str, default_ms: u64) -> u64 {
+    let raw = std::env::var(name).ok();
+    parse_positive_millis(raw.as_deref(), default_ms)
+}
+
+fn parse_positive_millis(raw: Option<&str>, default_ms: u64) -> u64 {
+    raw.and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(default_ms)
 }
 
 /// Whether the manual snapshot driver is configured. When it is, snapshots are
@@ -411,6 +436,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 heartbeat_interval: 250,
                 election_timeout_min: 1500,
                 election_timeout_max: 3000,
+                install_snapshot_timeout: raft_install_snapshot_timeout_ms(),
                 ..Default::default()
             };
             // With the manual snapshot driver, snapshots are driver-driven and
@@ -539,5 +565,17 @@ mod tests {
 
         assert!(node_3.should_initialize_membership(RaftGroupId(1)));
         assert!(!node_1.should_initialize_membership(RaftGroupId(1)));
+    }
+
+    #[test]
+    fn raft_snapshot_timeout_parser_uses_positive_millis_only() {
+        assert_eq!(parse_positive_millis(Some("45000"), 120_000), 45_000);
+        assert_eq!(parse_positive_millis(Some("0"), 120_000), 120_000);
+        assert_eq!(parse_positive_millis(Some("-1"), 120_000), 120_000);
+        assert_eq!(
+            parse_positive_millis(Some("not-a-number"), 120_000),
+            120_000
+        );
+        assert_eq!(parse_positive_millis(None, 120_000), 120_000);
     }
 }
