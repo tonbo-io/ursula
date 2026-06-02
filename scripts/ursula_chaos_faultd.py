@@ -29,6 +29,10 @@ S3_SNI_PATTERNS = [
 ]
 
 
+def unique(values: list[str]) -> list[str]:
+    return list(dict.fromkeys(value for value in values if value))
+
+
 def run(argv: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
     return subprocess.run(argv, check=check, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -76,7 +80,12 @@ class FaultState:
         # Clear at startup so a fresh process always starts from a clean kernel.
         self.clear()
 
-    def clear(self) -> None:
+    def clear(
+        self,
+        *,
+        peer_hosts: list[str] | None = None,
+        s3_patterns: list[str] | None = None,
+    ) -> None:
         # Stateless: always attempt to remove the root qdisc. A daemon restart
         # or a concurrent ThreadingHTTPServer request can lose has_*_qdisc,
         # which would otherwise leave a netem delay/loss qdisc permanently
@@ -84,9 +93,11 @@ class FaultState:
         run([self.tc, "qdisc", "del", "dev", self.dev, "root"])
         self.has_root_qdisc = False
         self.has_classful_qdisc = False
-        for host in self.peer_hosts:
-            run([self.iptables, "-D", "INPUT", "-s", host, "-j", "DROP"])
-            run([self.iptables, "-D", "OUTPUT", "-d", host, "-j", "DROP"])
+        for host in unique([*self.peer_hosts, *(peer_hosts or [])]):
+            while run([self.iptables, "-D", "INPUT", "-s", host, "-j", "DROP"]).returncode == 0:
+                pass
+            while run([self.iptables, "-D", "OUTPUT", "-d", host, "-j", "DROP"]).returncode == 0:
+                pass
         self.peer_hosts = []
         # Stateless cleanup: remove rules for every known SNI pattern, not just
         # what this process tracked. A daemon restart (or a concurrent
@@ -94,18 +105,60 @@ class FaultState:
         # otherwise leave an OUTPUT DROP rule in place and permanently block the
         # node's S3 — wedging cold flush long after the fault was "cleared".
         # Loop each -D until it fails so duplicate rules are fully removed.
-        for pattern in dict.fromkeys([*self.s3_patterns, *S3_SNI_PATTERNS]):
+        for pattern in unique([*self.s3_patterns, *S3_SNI_PATTERNS, *(s3_patterns or [])]):
             while run([self.iptables, "-D", "OUTPUT", "-p", "tcp", "--dport", "443",
                        "-m", "string", "--algo", "bm", "--string", pattern,
                        "-j", "DROP"]).returncode == 0:
                 pass
         self.s3_patterns = []
 
+    def status(
+        self,
+        *,
+        peer_hosts: list[str] | None = None,
+        s3_patterns: list[str] | None = None,
+    ) -> dict[str, Any]:
+        qdisc = run([self.tc, "qdisc", "show", "dev", self.dev])
+        qdisc_lines = qdisc.stdout.splitlines() if qdisc.returncode == 0 else []
+        active_qdisc = [
+            line
+            for line in qdisc_lines
+            if line.startswith("qdisc netem ") or line.startswith("qdisc prio ")
+        ]
+
+        partition_rules: list[dict[str, str]] = []
+        for host in unique([*self.peer_hosts, *(peer_hosts or [])]):
+            if run([self.iptables, "-C", "INPUT", "-s", host, "-j", "DROP"]).returncode == 0:
+                partition_rules.append({"direction": "input", "host": host})
+            if run([self.iptables, "-C", "OUTPUT", "-d", host, "-j", "DROP"]).returncode == 0:
+                partition_rules.append({"direction": "output", "host": host})
+
+        s3_rules: list[str] = []
+        for pattern in unique([*self.s3_patterns, *S3_SNI_PATTERNS, *(s3_patterns or [])]):
+            if run([self.iptables, "-C", "OUTPUT", "-p", "tcp", "--dport", "443",
+                    "-m", "string", "--algo", "bm", "--string", pattern,
+                    "-j", "DROP"]).returncode == 0:
+                s3_rules.append(pattern)
+
+        qdisc_error = ""
+        if qdisc.returncode != 0:
+            qdisc_error = qdisc.stderr.strip() or qdisc.stdout.strip()
+        clean = not active_qdisc and not partition_rules and not s3_rules and not qdisc_error
+        return {
+            "clean": clean,
+            "dev": self.dev,
+            "active_qdisc": active_qdisc,
+            "partition_rules": partition_rules,
+            "s3_rules": s3_rules,
+            "qdisc_error": qdisc_error,
+        }
+
     def apply(self, payload: dict[str, Any]) -> dict[str, Any]:
         self.clear()
         kind = payload.get("kind")
         if kind == "clear":
-            return {"ok": True, "kind": "clear"}
+            status = self.status()
+            return {"ok": status["clean"], "kind": "clear", **status}
         if kind == "netem":
             return self._apply_netem(payload)
         if kind == "partition":
@@ -188,13 +241,26 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         try:
             if self.path == "/clear":
-                self.state.clear()
-                self.write_json(200, {"ok": True})
+                payload = self.read_json_body()
+                peer_hosts = [str(host) for host in payload.get("peer_hosts", []) if host]
+                s3_patterns = [str(pattern) for pattern in payload.get("s3_patterns", []) if pattern]
+                self.state.clear(peer_hosts=peer_hosts, s3_patterns=s3_patterns)
+                status = self.state.status(peer_hosts=peer_hosts, s3_patterns=s3_patterns)
+                self.write_json(200 if status["clean"] else 500, {"ok": status["clean"], **status})
                 return
             if self.path == "/apply":
-                length = int(self.headers.get("content-length", "0"))
-                payload = json.loads(self.rfile.read(length) or b"{}")
+                payload = self.read_json_body()
                 self.write_json(200, self.state.apply(payload))
+                return
+            self.write_json(404, {"ok": False, "error": "not found"})
+        except Exception as exc:  # noqa: BLE001
+            self.write_json(500, {"ok": False, "error": str(exc)})
+
+    def do_GET(self) -> None:  # noqa: N802
+        try:
+            if self.path == "/status":
+                status = self.state.status()
+                self.write_json(200 if status["clean"] else 500, {"ok": status["clean"], **status})
                 return
             self.write_json(404, {"ok": False, "error": "not found"})
         except Exception as exc:  # noqa: BLE001
@@ -210,6 +276,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def read_json_body(self) -> dict[str, Any]:
+        length = int(self.headers.get("content-length", "0"))
+        if length <= 0:
+            return {}
+        return json.loads(self.rfile.read(length) or b"{}")
 
 
 def main() -> int:
