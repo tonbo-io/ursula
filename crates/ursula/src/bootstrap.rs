@@ -110,6 +110,7 @@ pub fn spawn_static_grpc_raft_memory_runtime_with_membership_config(
     let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
     let peers: Vec<(u64, String)> = peers.into_iter().collect();
     let registry = RaftGroupHandleRegistry::default();
+    let per_group_voters = membership_config.per_group_voters.clone();
     let factory = StaticGrpcRaftGroupEngineFactory::new(
         node_id,
         peers.clone(),
@@ -126,7 +127,7 @@ pub fn spawn_static_grpc_raft_memory_runtime_with_membership_config(
     spawn_cold_gc_worker_if_configured(&runtime);
     spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
     spawn_leadership_balancer_if_configured(&registry, node_id, &peers);
-    spawn_cluster_egress_gate_if_configured(&registry, node_id, &peers);
+    spawn_cluster_egress_gate_if_configured(&registry, node_id, &peers, per_group_voters);
     spawn_commit_stall_watchdog_if_configured(&registry);
     spawn_cold_health_gate_if_configured(&runtime, &registry, node_id);
     Ok((runtime, registry))
@@ -185,6 +186,7 @@ pub fn spawn_static_grpc_raft_runtime_with_membership_config(
     let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
     let peers: Vec<(u64, String)> = peers.into_iter().collect();
     let registry = RaftGroupHandleRegistry::default();
+    let per_group_voters = membership_config.per_group_voters.clone();
     let factory = StaticGrpcRaftGroupEngineFactory::new(
         node_id,
         peers.clone(),
@@ -202,7 +204,7 @@ pub fn spawn_static_grpc_raft_runtime_with_membership_config(
     spawn_cold_gc_worker_if_configured(&runtime);
     spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
     spawn_leadership_balancer_if_configured(&registry, node_id, &peers);
-    spawn_cluster_egress_gate_if_configured(&registry, node_id, &peers);
+    spawn_cluster_egress_gate_if_configured(&registry, node_id, &peers, per_group_voters);
     spawn_commit_stall_watchdog_if_configured(&registry);
     spawn_cold_health_gate_if_configured(&runtime, &registry, node_id);
     Ok((runtime, registry))
@@ -840,26 +842,93 @@ const DEFAULT_CLUSTER_PROBE_HEAL_TICKS: usize = 6;
 /// keeps measuring its own egress, so recovery is self-evident even though
 /// egress-only loss leaves its inbound replication looking healthy. That is
 /// what prevents the flap that a commit-stall step-down suffers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClusterEgressProbeScope {
+    Global,
+    Group(RaftGroupId),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClusterEgressProbeGroup {
+    pub scope: ClusterEgressProbeScope,
+    pub peer_urls: Vec<String>,
+    pub needed_peers: usize,
+}
+
+fn remote_peers_needed_for_quorum(total_voters: usize) -> usize {
+    (total_voters / 2 + 1).saturating_sub(1)
+}
+
+pub(crate) fn cluster_egress_probe_groups(
+    node_id: u64,
+    peers: &[(u64, String)],
+    per_group_voters: &BTreeMap<RaftGroupId, BTreeSet<u64>>,
+    snapshots: &[RaftGroupMetricsSnapshot],
+) -> Vec<ClusterEgressProbeGroup> {
+    let peer_urls: BTreeMap<u64, String> = peers
+        .iter()
+        .map(|(node_id, url)| (*node_id, url.clone()))
+        .collect();
+
+    if per_group_voters.is_empty() {
+        let peer_urls: Vec<String> = peers
+            .iter()
+            .filter(|(id, _)| *id != node_id)
+            .map(|(_, url)| url.clone())
+            .collect();
+        if peer_urls.is_empty() {
+            return Vec::new();
+        }
+        return vec![ClusterEgressProbeGroup {
+            scope: ClusterEgressProbeScope::Global,
+            peer_urls,
+            needed_peers: remote_peers_needed_for_quorum(peers.len()),
+        }];
+    }
+
+    let registered_groups: BTreeSet<RaftGroupId> = snapshots
+        .iter()
+        .map(|snapshot| RaftGroupId(snapshot.raft_group_id))
+        .collect();
+
+    per_group_voters
+        .iter()
+        .filter(|(raft_group_id, voters)| {
+            voters.contains(&node_id)
+                && (registered_groups.is_empty() || registered_groups.contains(raft_group_id))
+        })
+        .filter_map(|(raft_group_id, voters)| {
+            let peer_urls: Vec<String> = voters
+                .iter()
+                .filter(|id| **id != node_id)
+                .filter_map(|id| peer_urls.get(id).cloned())
+                .collect();
+            if peer_urls.is_empty() {
+                return None;
+            }
+            Some(ClusterEgressProbeGroup {
+                scope: ClusterEgressProbeScope::Group(*raft_group_id),
+                peer_urls,
+                needed_peers: remote_peers_needed_for_quorum(voters.len()),
+            })
+        })
+        .collect()
+}
+
 pub fn spawn_cluster_egress_gate_if_configured(
     registry: &RaftGroupHandleRegistry,
     node_id: u64,
     peers: &[(u64, String)],
+    per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
 ) {
     let interval_ms = env_usize("URSULA_CLUSTER_PROBE_MS", DEFAULT_CLUSTER_PROBE_INTERVAL_MS);
     if interval_ms == 0 {
         return;
     }
-    let peer_urls: Vec<String> = peers
-        .iter()
-        .filter(|(id, _)| *id != node_id)
-        .map(|(_, url)| url.clone())
-        .collect();
-    if peer_urls.is_empty() {
+    let initial_probe_groups = cluster_egress_probe_groups(node_id, peers, &per_group_voters, &[]);
+    if initial_probe_groups.is_empty() {
         return; // single node: no quorum to lose
     }
-    // Peers we must still reach to keep a commit quorum (self already counts).
-    let total_nodes = peer_urls.len() + 1;
-    let needed_peers = (total_nodes / 2 + 1).saturating_sub(1).max(1);
     let probe_bytes = env_usize("URSULA_CLUSTER_PROBE_BYTES", 64 * 1024);
     // Detect impaired leadership before the default 3s client append deadline:
     // if a node cannot push a 64KiB probe to a peer within 200ms for two
@@ -879,6 +948,7 @@ pub fn spawn_cluster_egress_gate_if_configured(
     )
     .max(1);
     let registry = registry.clone();
+    let peers = peers.to_vec();
     tokio::spawn(async move {
         let interval = Duration::from_millis(
             u64::try_from(interval_ms)
@@ -903,16 +973,34 @@ pub fn spawn_cluster_egress_gate_if_configured(
         let mut yielded = false;
         loop {
             tokio::time::sleep(interval).await;
-            let mut healthy_peers = 0usize;
-            for url in &peer_urls {
-                let probe_url = format!("{url}{}", crate::CLUSTER_PROBE_PATH);
-                if let Ok(resp) = client.post(&probe_url).body(payload.clone()).send().await
-                    && resp.status().is_success()
-                {
-                    healthy_peers += 1;
+            let snaps = registry.metrics_snapshot();
+            let probe_groups =
+                cluster_egress_probe_groups(node_id, &peers, &per_group_voters, &snaps);
+            if probe_groups.is_empty() {
+                continue;
+            }
+            let mut degraded_probe = None;
+            for group in &probe_groups {
+                let mut healthy_peers = 0usize;
+                for url in &group.peer_urls {
+                    let probe_url = format!("{url}{}", crate::CLUSTER_PROBE_PATH);
+                    if let Ok(resp) = client.post(&probe_url).body(payload.clone()).send().await
+                        && resp.status().is_success()
+                    {
+                        healthy_peers += 1;
+                    }
+                }
+                if healthy_peers < group.needed_peers {
+                    degraded_probe = Some((
+                        group.scope.clone(),
+                        healthy_peers,
+                        group.peer_urls.len(),
+                        group.needed_peers,
+                    ));
+                    break;
                 }
             }
-            let can_reach_quorum = healthy_peers >= needed_peers;
+            let can_reach_quorum = degraded_probe.is_none();
             if can_reach_quorum {
                 consecutive_good += 1;
                 consecutive_bad = 0;
@@ -925,11 +1013,9 @@ pub fn spawn_cluster_egress_gate_if_configured(
                 yielded = true;
                 // Publish "do not accept leadership" BEFORE asking openraft to
                 // hand off, so any peer's M1 transfer that races our shed sees
-                // the flag and gets rejected at our gRPC handler — closing the
-                // M1-fights-M2 flap that wedged ops during cluster_netem_delay
-                // on 2026-06-01.
+                // the flag and gets rejected at our gRPC handler.
                 registry.mark_leadership_shed(LeadershipShedReason::ClusterEgress);
-                for snap in registry.metrics_snapshot() {
+                for snap in &snaps {
                     let Some(raft) = registry.get(RaftGroupId(snap.raft_group_id)) else {
                         continue;
                     };
@@ -940,10 +1026,11 @@ pub fn spawn_cluster_egress_gate_if_configured(
                         let _ = raft.trigger().transfer_leader(target).await;
                     }
                 }
-                tracing::warn!(
-                    "cluster-egress: node {node_id} egress degraded (reached {healthy_peers}/{} peers, need {needed_peers}); yielding leadership",
-                    peer_urls.len()
-                );
+                if let Some((scope, healthy_peers, peer_count, needed_peers)) = degraded_probe {
+                    tracing::warn!(
+                        "cluster-egress: node {node_id} {scope:?} egress degraded (reached {healthy_peers}/{peer_count} peers, need {needed_peers}); yielding leadership",
+                    );
+                }
             } else if yielded && consecutive_good >= heal_ticks {
                 yielded = false;
                 registry.clear_leadership_shed(LeadershipShedReason::ClusterEgress);

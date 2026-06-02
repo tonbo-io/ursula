@@ -462,9 +462,15 @@ impl StaticGrpcRaftGroupEngineFactory {
 }
 
 impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
+    fn hosts_group(&self, placement: ShardPlacement) -> bool {
+        self.per_group_voters
+            .get(&placement.raft_group_id)
+            .is_none_or(|voters| voters.contains(&self.node_id))
+    }
+
     fn create<'a>(
         &'a self,
-        placement: ursula_shard::ShardPlacement,
+        placement: ShardPlacement,
         metrics: GroupEngineMetrics,
     ) -> GroupEngineCreateFuture<'a> {
         Box::pin(async move {

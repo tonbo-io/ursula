@@ -175,11 +175,31 @@ impl HttpState {
         raft_registry: RaftGroupHandleRegistry,
         peers: impl IntoIterator<Item = (u64, String)>,
     ) -> Self {
+        Self::with_static_raft_cluster_topology(
+            runtime,
+            raft_registry,
+            None,
+            peers,
+            BTreeMap::new(),
+        )
+    }
+
+    pub fn with_static_raft_cluster_topology(
+        runtime: ShardRuntime,
+        raft_registry: RaftGroupHandleRegistry,
+        node_id: impl Into<Option<u64>>,
+        peers: impl IntoIterator<Item = (u64, String)>,
+        per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
+    ) -> Self {
         let leadership_shed = raft_registry.leadership_shed_flag();
         Self {
             runtime,
             raft_registry: Some(raft_registry),
-            client_write_router: Some(ClientWriteLeaderRouter::new(peers)),
+            client_write_router: Some(ClientWriteLeaderRouter::with_static_topology(
+                node_id,
+                peers,
+                per_group_voters,
+            )),
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::from_env(),
@@ -265,10 +285,20 @@ struct HttpMetricsSnapshot {
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
     peers: Arc<BTreeMap<u64, String>>,
+    node_id: Option<u64>,
+    per_group_voters: Arc<BTreeMap<RaftGroupId, BTreeSet<u64>>>,
 }
 
 impl ClientWriteLeaderRouter {
     pub fn new(peers: impl IntoIterator<Item = (u64, String)>) -> Self {
+        Self::with_static_topology(None, peers, BTreeMap::new())
+    }
+
+    pub fn with_static_topology(
+        node_id: impl Into<Option<u64>>,
+        peers: impl IntoIterator<Item = (u64, String)>,
+        per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
+    ) -> Self {
         Self {
             peers: Arc::new(
                 peers
@@ -276,6 +306,8 @@ impl ClientWriteLeaderRouter {
                     .map(|(node_id, url)| (node_id, url.trim_end_matches('/').to_owned()))
                     .collect(),
             ),
+            node_id: node_id.into(),
+            per_group_voters: Arc::new(per_group_voters),
         }
     }
 
@@ -295,8 +327,26 @@ impl ClientWriteLeaderRouter {
         Some((leader_id, leader_base.trim_end_matches('/').to_owned()))
     }
 
+    fn hosted_group_base(&self, err: &RuntimeError) -> Option<(u64, String)> {
+        let RuntimeError::GroupNotHosted { raft_group_id, .. } = err else {
+            return None;
+        };
+        let voters = self.per_group_voters.get(raft_group_id)?;
+        voters
+            .iter()
+            .copied()
+            .filter(|node_id| Some(*node_id) != self.node_id)
+            .find_map(|node_id| {
+                self.peers
+                    .get(&node_id)
+                    .map(|base| (node_id, base.trim_end_matches('/').to_owned()))
+            })
+    }
+
     fn redirect_response(&self, err: &RuntimeError, request_target: &str) -> Option<Response> {
-        let (leader_id, leader_base) = self.leader_base(err)?;
+        let (leader_id, leader_base) = self
+            .leader_base(err)
+            .or_else(|| self.hosted_group_base(err))?;
         let mut headers = HeaderMap::new();
         insert_default_response_headers(&mut headers);
         let leader_url = format!("{}{}", leader_base.trim_end_matches('/'), request_target);
@@ -508,6 +558,22 @@ pub fn router_with_static_raft_cluster(
         runtime,
         raft_registry,
         peers,
+    ))
+}
+
+pub fn router_with_static_raft_cluster_topology(
+    runtime: ShardRuntime,
+    raft_registry: RaftGroupHandleRegistry,
+    node_id: u64,
+    peers: impl IntoIterator<Item = (u64, String)>,
+    per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
+) -> Router {
+    router_from_state(HttpState::with_static_raft_cluster_topology(
+        runtime,
+        raft_registry,
+        Some(node_id),
+        peers,
+        per_group_voters,
     ))
 }
 
