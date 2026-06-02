@@ -1589,8 +1589,29 @@ class ChaosAgent:
                         self.allow_next_revert_for_node(node)
                 run(["aws", "ec2", "start-instances", "--instance-ids", *[node.instance_id for node in targets]], check=False)
             else:
+                cleared = True
                 for node in targets:
-                    self.clear_node_impairment(node)
+                    cleared = self.clear_node_impairment(node) and cleared
+                if not cleared:
+                    self.active_fault["recover_at"] = now + timedelta(seconds=self.repair_retry_secs)
+                    injection = self.current_injection()
+                    if injection is not None:
+                        clear_attempts = int(injection.get("clear_attempts") or 0) + 1
+                        injection["clear_attempts"] = clear_attempts
+                        injection["status"] = "clear_failed"
+                        injection["last_clear_failed_at"] = iso(now)
+                        injection["timeline"].append(
+                            {
+                                "time": iso(now),
+                                "status": "clear_failed",
+                                "message": (
+                                    f"recovery attempt {clear_attempts} could not confirm faultd clear "
+                                    f"for {', '.join(node.name for node in targets)}; retaining active fault"
+                                ),
+                            }
+                        )
+                    self.publish_status()
+                    return
             self.last_fault = f"{scenario} on {', '.join(node.name for node in targets)}"
             injection = self.current_injection()
             if injection is not None and injection.get("start_requested_at") is None:
@@ -1744,14 +1765,23 @@ class ChaosAgent:
         injection["repair_attempts"] = repair_count
         target_label = ", ".join(node.name for node in targets)
         if injection.get("cleanup") == "clear_impairment":
+            cleared = True
             for node in targets:
-                self.clear_node_impairment(node)
+                cleared = self.clear_node_impairment(node) and cleared
+            repair_status = "repairing" if cleared else "repair_clear_failed"
+            injection["status"] = repair_status
+            injection["last_clear_failed_at"] = None if cleared else iso(now)
             injection["timeline"].append(
                 {
                     "time": iso(now),
-                    "status": "repairing",
+                    "status": repair_status,
                     "message": (
-                        f"recovery missed SLO; repair attempt {repair_count} is clearing impairment on {target_label}"
+                        f"recovery missed SLO; repair attempt {repair_count} "
+                        + (
+                            f"confirmed impairment clear on {target_label}"
+                            if cleared
+                            else f"could not confirm faultd clear on {target_label}"
+                        )
                     ),
                 }
             )
@@ -1896,14 +1926,41 @@ class ChaosAgent:
             return False
         return True
 
-    def clear_node_impairment(self, node: Node) -> None:
+    def faultd_clear_payload(self) -> dict[str, Any]:
+        peer_hosts = [
+            host
+            for host in (
+                urllib.parse.urlparse(candidate.base_url).hostname
+                for candidate in self.nodes
+            )
+            if host
+        ]
+        return {"kind": "clear", "peer_hosts": list(dict.fromkeys(peer_hosts))}
+
+    def clear_node_impairment(self, node: Node) -> bool:
+        payload = self.faultd_clear_payload()
         try:
-            status, body, _ = self.request("POST", f"{node.fault_url}/clear")
+            status, body, _ = self.request(
+                "POST",
+                f"{node.fault_url}/clear",
+                body=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
         except Exception as exc:  # noqa: BLE001
             self.event("warn", f"faultd clear failed on {node.name}: {exc}")
-            return
+            return False
         if status != 200:
-            self.event("warn", f"faultd clear failed on {node.name}: status={status} body={body[:80]!r}")
+            self.event("warn", f"faultd clear failed on {node.name}: status={status} body={body[:160]!r}")
+            return False
+        try:
+            response = json.loads(body or b"{}")
+        except Exception as exc:  # noqa: BLE001
+            self.event("warn", f"faultd clear failed on {node.name}: invalid response: {exc}")
+            return False
+        if response.get("ok") is not True or response.get("clean") is not True:
+            self.event("warn", f"faultd clear failed on {node.name}: not clean body={body[:160]!r}")
+            return False
+        return True
 
     def current_injection(self) -> dict[str, Any] | None:
         if self.active_injection_id is None:
