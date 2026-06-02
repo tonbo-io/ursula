@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 #[cfg(madsim)]
 fn main() -> Result<(), Box<dyn Error>> {
+    init_stderr_tracing();
     let args = Args::parse()?;
     let request = MinimizeRequest::from_artifact(args.artifact, args.target_overrides)?;
     let encoded = if args.list_candidates {
@@ -26,6 +27,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 #[cfg(not(madsim))]
 fn main() -> Result<(), Box<dyn Error>> {
+    init_stderr_tracing();
     let args = Args::parse()?;
     let _ = (
         args.artifact,
@@ -1013,8 +1015,18 @@ fn shrink_cold_path_schedule(
 #[cfg(madsim)]
 fn trace_minimize_candidate(mutation: &str) {
     if env::var_os("URSULA_SIM_MINIMIZE_TRACE").is_some() {
-        eprintln!("ursula-sim-minimize: running candidate `{mutation}`");
+        tracing::info!("ursula-sim-minimize: running candidate `{mutation}`");
     }
+}
+
+fn init_stderr_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 #[cfg(madsim)]

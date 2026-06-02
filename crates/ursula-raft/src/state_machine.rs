@@ -614,7 +614,7 @@ fn schedule_previous_snapshot_gc(
     tokio::spawn(async move {
         tokio::time::sleep(grace).await;
         if let Err(err) = store.delete(&prev_pointer.location).await {
-            eprintln!(
+            tracing::warn!(
                 "ursula raft snapshot gc: delete of previous {} failed: {err}",
                 prev_pointer.snapshot_id,
             );

@@ -2,6 +2,9 @@
 **/.DS_Store
 **/__pycache__/
 
+# IDEs and Editors
+.idea
+
 # Docs site build artifacts
 docs/web/node_modules/
 docs/web/dist/

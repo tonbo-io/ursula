@@ -92,12 +92,7 @@ struct RestartArgs {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
+    init_tracing();
 
     let cli = Cli::parse();
     match cli.command {
@@ -105,6 +100,15 @@ async fn main() -> Result<()> {
         Command::Status(args) => run_status_subcommand(args).await,
         Command::WaitReady(args) => run_wait_ready_subcommand(args).await,
     }
+}
+
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .init();
 }
 
 async fn run_status_subcommand(args: ObserveArgs) -> Result<()> {

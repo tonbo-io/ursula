@@ -23,15 +23,157 @@ readme = "README.md"
 keywords = ["durable-streams", "raft", "thread-per-core", "multi-raft"]
 categories = ["database-implementations", "network-programming"]
 
+[workspace.dependencies]
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+bytes = "1.7"
+chrono = "0.4"
+clap = "4"
+console-subscriber = "0.5.0"
+criterion = "0.5"
+futures = "0.3"
+futures-util = "0.3"
+hdrhistogram = "7"
+madsim = "0.2.34"
+mimalloc = { version = "0.1", default-features = false }
+opendal = "0.51"
+openraft = { version = "0.10.0-alpha.20", default-features = false, features = ["tokio-rt", "type-alias", "serde"] }
+openraft-rt = "0.10.0-alpha.20"
+pin-project-lite = "0.2"
+prost = "0.13"
+prost-build = "0.13"
+proptest = "1.11.0"
+protoc-bin-vendored = "3"
+rand = { version = "0.10", default-features = false }
+reqwest = { version = "0.12", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+setsum = "0.8.0"
+sim-tokio = { package = "madsim-tokio", version = "0.2.30" }
+tempfile = "3"
+thiserror = "1"
+tokio = "1.39"
+tokio-stream = "0.1"
+tonic = "0.12"
+tonic-build = "0.12"
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+ursula = { path = "crates/ursula", version = "0.1.0" }
+ursula-ctl = { path = "crates/ursula-ctl", version = "0.1.0" }
+ursula-proto = { path = "crates/ursula-proto", version = "0.1.0" }
+ursula-raft = { path = "crates/ursula-raft", version = "0.1.0" }
+ursula-runtime = { path = "crates/ursula-runtime", version = "0.1.0" }
+ursula-shard = { path = "crates/ursula-shard", version = "0.1.0" }
+ursula-stream = { path = "crates/ursula-stream", version = "0.1.0" }
+
 [patch.crates-io]
 openraft = { git = "https://github.com/databendlabs/openraft.git", rev = "13df5b32288b7937a293759264712b5a144987ac" }
 openraft-macros = { git = "https://github.com/databendlabs/openraft.git", rev = "13df5b32288b7937a293759264712b5a144987ac" }
 openraft-rt = { git = "https://github.com/databendlabs/openraft.git", rev = "13df5b32288b7937a293759264712b5a144987ac" }
 openraft-rt-tokio = { git = "https://github.com/databendlabs/openraft.git", rev = "13df5b32288b7937a293759264712b5a144987ac" }
 
-# NOTE: experimented with `lto = "fat"` and `lto = "thin"` + codegen-units = 1.
-# On the c7g benchmark cluster (3 × c7g.4xlarge, 256 B append workload),
-# write throughput regressed 10–13% at peak with either LTO setting - likely
-# loss of icache locality on tokio's deep async call paths. Replay (large
-# body, contiguous code) did benefit, but the write-path regression
-# dominated. Kept default profile until we have a profile-guided build.
+[workspace.lints.rust]
+unknown_lints = "deny"
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)', 'cfg(tokio_unstable)'] }
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+# Don't Panic - prevent panics from unwraps and unsafe slicing or indexing
+string_slice = "warn"
+indexing_slicing = "warn"
+unwrap_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+get_unwrap = "warn"
+unwrap_in_result = "warn"
+unchecked_time_subtraction = "warn"
+panic_in_result_fn = "warn"
+expect_used = "allow"
+arithmetic_side_effects = "warn"
+
+# Don't Fail Silently - prevent dropped futures and swallowed errors
+let_underscore_future = "warn"
+let_underscore_must_use = "warn"
+unused_result_ok = "warn"
+map_err_ignore = "warn"
+assertions_on_result_states = "warn"
+
+# Don't Do Bad Async Stuff - prevent deadlocks and concurrency bugs
+await_holding_lock = "warn"
+await_holding_refcell_ref = "warn"
+large_futures = "warn"
+
+# Don't Do Unsafe Things with Memory
+mem_forget = "warn"
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"
+unnecessary_safety_doc = "warn"
+unnecessary_safety_comment = "warn"
+
+# Don't Do Potentially Incorrect Things with Numbers
+float_cmp = "warn"
+float_cmp_const = "warn"
+lossy_float_literal = "warn"
+cast_sign_loss = "warn"
+invalid_upcast_comparisons = "warn"
+# Optional - these effectively force you to document numeric invariants
+# cast_possible_wrap = "warn"
+# cast_precision_loss = "warn"
+# cast_possible_truncation = "warn"
+
+# Don't Do Bad Things That are Easy to Avoid
+rc_mutex = "warn"
+debug_assert_with_mut_call = "warn"
+iter_not_returning_iterator = "warn"
+expl_impl_clone_on_copy = "warn"
+infallible_try_from = "warn"
+dbg_macro = "warn"
+
+# Don't `allow` Your Way Around These Lints - every suppression must be
+# a deliberate #[expect(..., reason = "...")] rather than a silent #[allow]
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+
+[profile.release]
+debug = 1
+lto = "thin"
+overflow-checks = false
+opt-level = "s"
+incremental = false
+codegen-units = 1
+
+[profile.ci]
+inherits = "release"
+overflow-checks = true
+incremental = false
+debug-assertions = true
+
+[profile.dev]
+split-debuginfo = "unpacked"
+overflow-checks = true
+incremental = true
+
+[profile.bench]
+debug = true
+overflow-checks = false
+debug-assertions = true
+
+[profile.test]
+opt-level = 0
+debug = true
+codegen-units = 16
+lto = false
+debug-assertions = true
+overflow-checks = true
+rpath = true
+
+[profile.dist]
+codegen-units = 1
+debug = true
+inherits = "release"
+lto = "fat"

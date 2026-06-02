@@ -73,8 +73,8 @@ Cold backend is selected entirely via `URSULA_COLD_*` env vars. See [Configure S
 
 | Variable | Purpose |
 | -------- | ------- |
-| `URSULA_TOKIO_CONSOLE` | When set and the binary was built with the `tokio-console` feature, initializes the console subscriber on startup |
-| `RUST_LOG` | Standard tracing filter `ursula=info,ursula_runtime=info,ursula_raft=info` is a reasonable baseline |
+| `URSULA_TOKIO_CONSOLE` | When set, initializes the Tokio console subscriber if the binary was built with `--features tokio-console` and `RUSTFLAGS="--cfg tokio_unstable"`; otherwise logs a warning |
+| `RUST_LOG` | Standard tracing subscriber filter `ursula=info,ursula_runtime=info,ursula_raft=info` is a reasonable baseline |
 
 ## Minimal examples
 

@@ -61,7 +61,7 @@ impl MetricsClient {
             match self.fetch_node(node).await {
                 Ok(view) => per_node.push(view),
                 Err(err) => {
-                    tracing::debug!(node_id = node.id, error = %err, "metrics fetch failed");
+                    tracing::debug!("metrics fetch failed: node_id={} error={err}", node.id);
                 }
             }
         }

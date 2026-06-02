@@ -13,29 +13,29 @@ description = "Ursula durable-stream server: thread-per-core, multi-Raft, HTTP f
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]
 
 [dependencies]
-axum = { version = "0.8" }
-base64 = "0.22"
-chrono = "0.4"
-console-subscriber = { version = "0.5.0", optional = true }
-futures-util = "0.3"
-mimalloc = { version = "0.1", default-features = false }
-openraft = { version = "0.10.0-alpha.20", default-features = false, features = ["tokio-rt", "type-alias", "serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.39", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
-tonic = { version = "0.12", features = ["transport"] }
-tower = { version = "0.5", features = ["util", "limit", "load-shed"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-ursula-raft = { path = "../ursula-raft", version = "0.1.0" }
-ursula-runtime = { path = "../ursula-runtime", version = "0.1.0" }
-ursula-shard = { path = "../ursula-shard", version = "0.1.0" }
+axum = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true }
+console-subscriber = { workspace = true, optional = true }
+futures-util = { workspace = true }
+mimalloc = { workspace = true }
+openraft = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+tonic = { workspace = true, features = ["transport"] }
+tower = { workspace = true, features = ["util", "limit", "load-shed"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+ursula-raft = { workspace = true }
+ursula-runtime = { workspace = true }
+ursula-shard = { workspace = true }
 
 [target.'cfg(madsim)'.dependencies]
-madsim = "0.2.34"
+madsim = { workspace = true }
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)', 'cfg(tokio_unstable)'] }
 
 [dev-dependencies]

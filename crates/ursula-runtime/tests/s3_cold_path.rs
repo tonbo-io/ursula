@@ -10,7 +10,7 @@ use ursula_shard::BucketStreamId;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s3_cold_path_flushes_reads_and_cleans_up_object() {
     if std::env::var("URSULA_COLD_S3_INTEGRATION").ok().as_deref() != Some("1") {
-        eprintln!(
+        tracing::warn!(
             "skipping S3 cold-path integration; set URSULA_COLD_S3_INTEGRATION=1 and URSULA_COLD_S3_BUCKET"
         );
         return;

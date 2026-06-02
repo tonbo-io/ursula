@@ -862,7 +862,7 @@ impl RaftGroupHandleRegistry {
             .fetch_or(reason.bit(), Ordering::Release);
         if previous & reason.bit() == 0 {
             let current = LeadershipShedState::from_bits(previous | reason.bit());
-            eprintln!("leadership-shed: mark {reason}; state={current}");
+            tracing::warn!("leadership-shed: mark {reason}; state={current}");
         }
     }
 
@@ -872,7 +872,7 @@ impl RaftGroupHandleRegistry {
             .fetch_and(!reason.bit(), Ordering::Release);
         if previous & reason.bit() != 0 {
             let current = LeadershipShedState::from_bits(previous & !reason.bit());
-            eprintln!("leadership-shed: clear {reason}; state={current}");
+            tracing::warn!("leadership-shed: clear {reason}; state={current}");
         }
     }
 

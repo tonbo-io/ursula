@@ -10,20 +10,21 @@ readme.workspace = true
 description = "Per-core actor runtime for Ursula: hot ring, cold-tier flush, and the replaceable group-engine boundary."
 
 [dependencies]
-bytes = { version = "1.7", features = ["serde"] }
-opendal = { version = "0.51", features = ["services-memory", "services-s3"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.39", features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
-ursula-shard = { path = "../ursula-shard", version = "0.1.0" }
-ursula-stream = { path = "../ursula-stream", version = "0.1.0" }
+bytes = { workspace = true, features = ["serde"] }
+opendal = { workspace = true, features = ["services-memory", "services-s3"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
+ursula-shard = { workspace = true }
+ursula-stream = { workspace = true }
 
 [target.'cfg(madsim)'.dependencies]
-sim-tokio = { package = "madsim-tokio", version = "0.2.30", features = ["macros", "rt", "sync", "time"] }
+sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["async_tokio"] }
-tempfile = "3"
+criterion = { workspace = true, features = ["async_tokio"] }
+tempfile = { workspace = true }
+tracing = { workspace = true }
 
 [[bench]]
 name = "cold_cache"
