@@ -14,6 +14,13 @@
     "plan": "no action: cold_object_unix_nanos() is split — cfg(not(madsim)) calls SystemTime::now(); cfg(madsim) returns 0. Cold object uniqueness under cfg(madsim) is provided by COLD_CHUNK_SEQUENCE, and reset_cold_chunk_sequence_for_sim() lets the simulator clear the counter between scenarios for Runtime::check_determinism replay."
   },
   {
+    "category": "system_time_now",
+    "path": "crates/ursula-runtime/src/snapshot_store.rs",
+    "snippet_contains": "SystemTime::now()",
+    "reason": "already-cfg-gated",
+    "plan": "no action: the call is inside #[cfg(not(madsim))] mod s3; under cfg(madsim), snapshot_store_from_env rejects the s3 backend and only inline snapshots are available, so the wall-clock nonce is not sim-reachable."
+  },
+  {
     "category": "tokio_runtime_builder",
     "path": "crates/ursula-runtime/src/runtime.rs",
     "snippet_contains": "tokio::runtime::Builder::new_current_thread()",
