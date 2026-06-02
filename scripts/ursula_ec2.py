@@ -296,6 +296,7 @@ ExecStart={exec_start}
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
+LimitCORE=0
 
 [Install]
 WantedBy=multi-user.target
