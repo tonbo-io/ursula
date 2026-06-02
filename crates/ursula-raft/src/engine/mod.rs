@@ -42,7 +42,7 @@ use crate::codec::*;
 use crate::forward::*;
 use crate::log_store::{RaftGroupFileLogStore, RaftGroupLogStore};
 use crate::registry::*;
-use crate::state_machine::RaftGroupStateMachine;
+use crate::state_machine::{RaftGroupStateMachine, SnapshotInstallCoordinator};
 use crate::types::*;
 
 pub struct RaftGroupEngine {
@@ -174,6 +174,7 @@ impl RaftGroupEngine {
             metrics,
             cold_store,
             None,
+            None,
         )
         .await?;
 
@@ -219,6 +220,7 @@ impl RaftGroupEngine {
             metrics,
             cold_store,
             None,
+            None,
         )
         .await
     }
@@ -233,22 +235,25 @@ impl RaftGroupEngine {
         metrics: Option<GroupEngineMetrics>,
         cold_store: Option<ColdStoreHandle>,
         snapshot_store: Option<SharedSnapshotStore>,
+        snapshot_install: Option<SnapshotInstallCoordinator>,
     ) -> Result<Self, GroupEngineError>
     where
         NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
         let snapshot_store = snapshot_store.unwrap_or_else(default_snapshot_store);
+        let snapshot_install = snapshot_install.unwrap_or_default();
         let raft = Raft::<UrsulaRaftTypeConfig, RaftGroupStateMachine>::new(
             node_id,
             config,
             network_factory,
             log_store,
-            RaftGroupStateMachine::new_with_stores(
+            RaftGroupStateMachine::new_with_stores_and_snapshot_install(
                 placement,
                 metrics.clone(),
                 cold_store.clone(),
                 snapshot_store,
+                snapshot_install,
             ),
         )
         .await
