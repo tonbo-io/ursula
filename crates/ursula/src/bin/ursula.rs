@@ -83,10 +83,12 @@ async fn init_static_grpc_state(args: &Args) -> Result<HttpState, Box<dyn std::e
     .await?;
     spawn_cold_flush_worker_if_configured(&runtime);
     spawn_cold_gc_worker_if_configured(&runtime);
-    Ok(HttpState::with_static_raft_cluster(
+    Ok(HttpState::with_static_raft_cluster_topology(
         runtime,
         registry,
+        node_id,
         args.raft_peers.clone(),
+        args.raft_group_voters.clone(),
     ))
 }
 

@@ -784,6 +784,12 @@ impl CoreWorker {
     ) -> Result<GroupMailbox, RuntimeError> {
         if !self.groups.contains_key(&placement.raft_group_id) {
             let engine_factory = self.engine_factory.clone();
+            if !engine_factory.hosts_group(placement) {
+                return Err(RuntimeError::GroupNotHosted {
+                    core_id: placement.core_id,
+                    raft_group_id: placement.raft_group_id,
+                });
+            }
             let metrics = GroupEngineMetrics {
                 inner: self.metrics.clone(),
             };

@@ -627,6 +627,10 @@ pub trait GroupEngine: Send + 'static {
 }
 
 pub trait GroupEngineFactory: Send + Sync + 'static {
+    fn hosts_group(&self, _placement: ShardPlacement) -> bool {
+        true
+    }
+
     fn create<'a>(
         &'a self,
         placement: ShardPlacement,

@@ -26,6 +26,10 @@ pub enum RuntimeError {
         current_waiters: u64,
         limit: u64,
     },
+    GroupNotHosted {
+        core_id: CoreId,
+        raft_group_id: RaftGroupId,
+    },
     GroupEngine {
         core_id: CoreId,
         raft_group_id: RaftGroupId,
@@ -87,6 +91,14 @@ impl std::fmt::Display for RuntimeError {
                 f,
                 "core {} live read waiters at {} would exceed limit {}",
                 core_id.0, current_waiters, limit
+            ),
+            Self::GroupNotHosted {
+                core_id,
+                raft_group_id,
+            } => write!(
+                f,
+                "core {} does not host raft group {}",
+                core_id.0, raft_group_id.0
             ),
             Self::GroupEngine {
                 core_id,

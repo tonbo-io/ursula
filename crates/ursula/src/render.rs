@@ -25,6 +25,9 @@ pub(crate) fn runtime_error_status(err: &RuntimeError) -> StatusCode {
             StatusCode::INTERNAL_SERVER_ERROR
         }
         RuntimeError::LiveReadBackpressure { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        // Normal static-cluster path redirects GroupNotHosted to a voter. This is the
+        // fallback when no routing target is available.
+        RuntimeError::GroupNotHosted { .. } => StatusCode::SERVICE_UNAVAILABLE,
         RuntimeError::GroupEngine { message, .. } => stream_error_status(message),
     }
 }

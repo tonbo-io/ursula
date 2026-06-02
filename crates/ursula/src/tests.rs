@@ -219,7 +219,13 @@ async fn spawn_static_grpc_test_node_with_storage(
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, storage.cold_store)
             .expect("runtime");
-    let app = router_with_static_raft_cluster(runtime.clone(), registry.clone(), router_peers);
+    let app = router_with_static_raft_cluster_topology(
+        runtime.clone(),
+        registry.clone(),
+        node_id,
+        router_peers,
+        storage.per_group_voters,
+    );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -2269,6 +2275,102 @@ async fn static_grpc_per_group_voters_create_distinct_initial_memberships() {
                 .expect("wait for configured group membership");
         }
     }
+
+    for node in nodes {
+        node.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn static_grpc_non_voter_redirects_request_without_creating_group() {
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    for node_id in 1..=4u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        peers.push((node_id, format!("http://{addr}")));
+        listeners.push(listener);
+    }
+
+    let group_voters = BTreeMap::from([
+        (RaftGroupId(0), BTreeSet::from([1, 2, 3])),
+        (RaftGroupId(1), BTreeSet::from([2, 3, 4])),
+    ]);
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        nodes.push(
+            spawn_static_grpc_test_node_with_storage(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                true,
+                2,
+                StaticGrpcTestNodeStorage {
+                    raft_log_dir: None,
+                    cold_store: None,
+                    per_group_initializers: true,
+                    per_group_voters: group_voters.clone(),
+                },
+            )
+            .await,
+        );
+    }
+
+    for (raft_group_id, voters) in &group_voters {
+        for (index, node) in nodes.iter().enumerate() {
+            let node_id = u64::try_from(index + 1).expect("node id fits u64");
+            if voters.contains(&node_id) {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    node.runtime.warm_group(*raft_group_id),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("warm node {node_id} group {} timed out", raft_group_id.0)
+                })
+                .expect("warm voter group");
+            }
+        }
+    }
+
+    let stream_id = (0..10_000)
+        .map(|index| BucketStreamId::new("benchcmp", format!("non-voter-route-{index}")))
+        .find(|stream_id| nodes[0].runtime.locate(stream_id).raft_group_id == RaftGroupId(1))
+        .expect("find stream in group hosted by nodes 2, 3, 4");
+    assert!(nodes[0].registry.get(RaftGroupId(1)).is_none());
+
+    let no_redirect_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build no-redirect reqwest client");
+    let response = no_redirect_client
+        .put(format!("{}/{}", peers[0].1, stream_id))
+        .header(CONTENT_TYPE, "text/plain")
+        .body("must-not-create-on-non-voter")
+        .send()
+        .await
+        .expect("send request to non-voter");
+
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location = response
+        .headers()
+        .get(LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("redirect location");
+    assert!(
+        peers
+            .iter()
+            .filter(|(node_id, _)| [2, 3, 4].contains(node_id))
+            .any(|(_, peer_url)| location.starts_with(peer_url)),
+        "location {location} should target a voter for group 1"
+    );
+    assert!(location.ends_with(&format!("/{}", stream_id)));
+    assert!(nodes[0].registry.get(RaftGroupId(1)).is_none());
 
     for node in nodes {
         node.shutdown().await;
@@ -5075,6 +5177,147 @@ mod leadership_balance {
             prioritized_transfer_targets(&snaps[0], 1, &counts),
             vec![3, 2]
         );
+    }
+}
+
+mod cluster_egress {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use crate::bootstrap::{ClusterEgressProbeScope, cluster_egress_probe_groups};
+    use axum::Router;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use ursula_raft::{RaftGroupHandleRegistry, RaftGroupMetricsSnapshot, RaftLogProgressSnapshot};
+    use ursula_shard::RaftGroupId;
+
+    fn snap(group_id: u32, voters: Vec<u64>) -> RaftGroupMetricsSnapshot {
+        RaftGroupMetricsSnapshot {
+            raft_group_id: group_id,
+            node_id: 1,
+            current_term: 1,
+            current_leader: Some(1),
+            last_log_index: Some(100),
+            committed: Some(RaftLogProgressSnapshot {
+                term: 1,
+                index: 100,
+            }),
+            last_applied: Some(RaftLogProgressSnapshot {
+                term: 1,
+                index: 100,
+            }),
+            snapshot: None,
+            purged: None,
+            voter_ids: voters,
+            learner_ids: vec![],
+        }
+    }
+
+    fn peers() -> Vec<(u64, String)> {
+        vec![
+            (1, "http://node1".to_owned()),
+            (2, "http://node2".to_owned()),
+            (3, "http://node3".to_owned()),
+            (4, "http://node4".to_owned()),
+        ]
+    }
+
+    #[test]
+    fn per_group_probe_plan_uses_only_that_groups_voters() {
+        let per_group_voters = BTreeMap::from([
+            (RaftGroupId(0), BTreeSet::from([1, 2, 3])),
+            (RaftGroupId(1), BTreeSet::from([2, 3, 4])),
+        ]);
+        let snaps = vec![snap(0, vec![1, 2, 3]), snap(1, vec![2, 3, 4])];
+
+        let groups = cluster_egress_probe_groups(1, &peers(), &per_group_voters, &snaps);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].scope,
+            ClusterEgressProbeScope::Group(RaftGroupId(0))
+        );
+        assert_eq!(groups[0].peer_urls, vec!["http://node2", "http://node3"]);
+        assert_eq!(groups[0].needed_peers, 1);
+    }
+
+    #[test]
+    fn global_probe_plan_is_preserved_without_per_group_voters() {
+        let groups = cluster_egress_probe_groups(1, &peers(), &BTreeMap::new(), &[]);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].scope, ClusterEgressProbeScope::Global);
+        assert_eq!(
+            groups[0].peer_urls,
+            vec!["http://node2", "http://node3", "http://node4"]
+        );
+        assert_eq!(groups[0].needed_peers, 2);
+    }
+
+    async fn serve_counting_probe_peer(
+        counter: Arc<AtomicU64>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe peer");
+        let addr = listener.local_addr().expect("probe peer addr");
+        let app = Router::new().route(
+            crate::CLUSTER_PROBE_PATH,
+            post(move |_body: axum::body::Bytes| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve probe peer");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn spawned_gate_uses_per_group_voters_for_probe_targets() {
+        let node2_probes = Arc::new(AtomicU64::new(0));
+        let node3_probes = Arc::new(AtomicU64::new(0));
+        let node4_probes = Arc::new(AtomicU64::new(0));
+        let (node2_url, node2_task) = serve_counting_probe_peer(node2_probes.clone()).await;
+        let (node3_url, node3_task) = serve_counting_probe_peer(node3_probes.clone()).await;
+        let (node4_url, node4_task) = serve_counting_probe_peer(node4_probes.clone()).await;
+        let peers = vec![
+            (1, "http://node1".to_owned()),
+            (2, node2_url),
+            (3, node3_url),
+            (4, node4_url),
+        ];
+        let per_group_voters = BTreeMap::from([
+            (RaftGroupId(0), BTreeSet::from([1, 2, 3])),
+            (RaftGroupId(1), BTreeSet::from([2, 3, 4])),
+        ]);
+        let registry = RaftGroupHandleRegistry::default();
+
+        crate::bootstrap::spawn_cluster_egress_gate_if_configured(
+            &registry,
+            1,
+            &peers,
+            per_group_voters,
+        );
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+        assert!(node2_probes.load(Ordering::SeqCst) > 0);
+        assert!(node3_probes.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            node4_probes.load(Ordering::SeqCst),
+            0,
+            "node 4 is not a voter for any group hosted by node 1"
+        );
+
+        node2_task.abort();
+        node3_task.abort();
+        node4_task.abort();
     }
 }
 
