@@ -150,9 +150,9 @@ fn apply_admission_env_overrides(args: &Args) {
             );
         }
     }
-    if let Some(value) = args.node_memory_soft_cap_bytes {
+    if let Some(value) = args.http_inflight_body_bytes {
         unsafe {
-            std::env::set_var("URSULA_NODE_MEMORY_SOFT_CAP_BYTES", value.to_string());
+            std::env::set_var("URSULA_HTTP_INFLIGHT_BODY_BYTES", value.to_string());
         }
     }
 }
@@ -305,10 +305,9 @@ struct RawArgs {
     #[arg(long)]
     raft_max_uncommitted_bytes_per_group: Option<u64>,
 
-    /// Process-wide RSS soft cap. When exceeded, write endpoints return 503
-    /// with `Retry-After: 1`. `None` disables. Linux-only.
+    /// Process-wide cap on accepted write body bytes held by the HTTP layer.
     #[arg(long)]
-    node_memory_soft_cap_bytes: Option<u64>,
+    http_inflight_body_bytes: Option<u64>,
 }
 
 impl TryFrom<RawArgs> for Args {
@@ -349,7 +348,7 @@ impl TryFrom<RawArgs> for Args {
             raft_init_membership,
             raft_init_membership_per_group: raw.raft_init_membership_per_group,
             raft_max_uncommitted_bytes_per_group: raw.raft_max_uncommitted_bytes_per_group,
-            node_memory_soft_cap_bytes: raw.node_memory_soft_cap_bytes,
+            http_inflight_body_bytes: raw.http_inflight_body_bytes,
         };
 
         if let Some(path) = raw.raft_cluster_config {
@@ -384,7 +383,7 @@ struct Args {
     raft_init_membership: bool,
     raft_init_membership_per_group: bool,
     raft_max_uncommitted_bytes_per_group: Option<u64>,
-    node_memory_soft_cap_bytes: Option<u64>,
+    http_inflight_body_bytes: Option<u64>,
 }
 
 impl Args {
@@ -640,6 +639,8 @@ mod tests {
             "--raft-peer",
             "2=http://10.0.0.2:4437/",
             "--raft-init-membership",
+            "--http-inflight-body-bytes",
+            "67108864",
         ])
         .expect("static gRPC Raft args should parse");
 
@@ -659,6 +660,7 @@ mod tests {
         );
         assert!(args.raft_init_membership);
         assert!(!args.raft_init_membership_per_group);
+        assert_eq!(args.http_inflight_body_bytes, Some(67_108_864));
     }
 
     #[test]

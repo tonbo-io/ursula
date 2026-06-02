@@ -4537,64 +4537,115 @@ fn batch_body(payloads: &[&[u8]]) -> Vec<u8> {
     body
 }
 
-#[test]
-fn node_memory_admission_disabled_returns_no_response() {
-    let admission = NodeMemoryAdmission::disabled();
-    assert!(node_memory_admission_response(&admission).is_none());
-    assert!(!admission.is_enabled());
-}
+#[tokio::test]
+async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
+    let app = Router::new()
+        .route(
+            "/write",
+            post(|_body: Bytes| async { StatusCode::NO_CONTENT }),
+        )
+        .layer(middleware::from_fn_with_state(
+            IngressAdmission {
+                body_bytes: Arc::new(tokio::sync::Semaphore::new(4)),
+            },
+            ingress_admission_middleware,
+        ));
 
-#[test]
-fn node_memory_admission_trips_when_sampled_rss_over_hard_cap() {
-    // rss (2048) far exceeds the effective hard cap (soft + soft/4 = 1280),
-    // so every sample must reject regardless of the probabilistic dice.
-    let admission = NodeMemoryAdmission {
-        soft_cap_bytes: Some(1024),
-        hard_cap_bytes: None,
-        last_rss_bytes: Arc::new(AtomicU64::new(2048)),
-    };
-    let response =
-        node_memory_admission_response(&admission).expect("over-hard-cap RSS should be rejected");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/write")
+                .header(CONTENT_LENGTH, "5")
+                .body(Body::from("abcde"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let retry_after = response
-        .headers()
-        .get(axum::http::header::RETRY_AFTER)
-        .expect("Retry-After header set");
-    assert_eq!(retry_after.to_str().expect("ascii retry-after"), "1");
-
-    // Under-cap RSS leaves the request alone.
-    let under = NodeMemoryAdmission {
-        soft_cap_bytes: Some(4096),
-        hard_cap_bytes: None,
-        last_rss_bytes: Arc::new(AtomicU64::new(2048)),
-    };
-    assert!(node_memory_admission_response(&under).is_none());
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("retry-after")
+            .to_str()
+            .expect("ascii retry-after"),
+        "1"
+    );
+    let body = to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES)
+        .await
+        .expect("body");
+    assert!(
+        std::str::from_utf8(&body)
+            .expect("utf8 body")
+            .contains("IngressBodyBytesLimitReached")
+    );
 }
 
-#[test]
-fn node_memory_admission_partial_shed_between_soft_and_hard_cap() {
-    // Halfway between soft (1000) and explicit hard (2000) sits rss=1500.
-    // Reject probability should be ~50%; over many trials we expect both a
-    // meaningful pass and a meaningful reject count — neither extreme.
-    let admission = NodeMemoryAdmission {
-        soft_cap_bytes: Some(1000),
-        hard_cap_bytes: Some(2000),
-        last_rss_bytes: Arc::new(AtomicU64::new(1500)),
-    };
-    let mut rejected = 0;
-    let mut passed = 0;
-    for _ in 0..2000 {
-        if node_memory_admission_response(&admission).is_some() {
-            rejected += 1;
-        } else {
-            passed += 1;
+#[tokio::test]
+async fn ingress_body_budget_holds_credit_until_response_finishes() {
+    let entered = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let app = Router::new()
+        .route(
+            "/write",
+            post({
+                let entered = entered.clone();
+                let release = release.clone();
+                move |_body: Bytes| {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    async move {
+                        entered.wait().await;
+                        release.notified().await;
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        )
+        .layer(middleware::from_fn_with_state(
+            IngressAdmission {
+                body_bytes: Arc::new(tokio::sync::Semaphore::new(4)),
+            },
+            ingress_admission_middleware,
+        ));
+
+    let first = tokio::spawn({
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/write")
+                    .header(CONTENT_LENGTH, "4")
+                    .body(Body::from("abcd"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
         }
-    }
-    assert!(
-        rejected > 600 && rejected < 1400,
-        "expected ~50% reject between soft/hard cap, got rejected={rejected} passed={passed}",
+    });
+    entered.wait().await;
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/write")
+                .header(CONTENT_LENGTH, "1")
+                .body(Body::from("e"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    release.notify_one();
+    assert_eq!(
+        first.await.expect("first join").status(),
+        StatusCode::NO_CONTENT
     );
-    assert!(passed > 0, "no writes survived partial shedding");
 }
 
 mod cold_health {
