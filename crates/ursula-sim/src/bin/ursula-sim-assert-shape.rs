@@ -21,8 +21,9 @@ use std::error::Error;
 
 #[cfg(not(madsim))]
 fn main() -> ExitCode {
-    eprintln!("ursula-sim-assert-shape requires `--cfg madsim`. Re-run with");
-    eprintln!(
+    init_stderr_tracing();
+    tracing::error!("ursula-sim-assert-shape requires `--cfg madsim`. Re-run with");
+    tracing::error!(
         "  RUSTFLAGS=\"--cfg madsim\" cargo run -p ursula-sim --bin ursula-sim-assert-shape -- ..."
     );
     ExitCode::from(2)
@@ -30,6 +31,7 @@ fn main() -> ExitCode {
 
 #[cfg(madsim)]
 fn main() -> ExitCode {
+    init_stderr_tracing();
     let result = (|| -> Result<(), Box<dyn Error>> {
         let mut args = env::args().skip(1);
         let mut artifact: Option<String> = None;
@@ -89,10 +91,20 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("ursula-sim-assert-shape: {err}");
+            tracing::error!("ursula-sim-assert-shape: {err}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn init_stderr_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 #[cfg(madsim)]

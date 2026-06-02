@@ -471,9 +471,12 @@ impl GrpcRaftNetwork {
     fn note_failure(&mut self, route: &str) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         if self.consecutive_failures >= self.reconnect_threshold {
-            eprintln!(
+            tracing::warn!(
                 "raft-grpc: rebuilding channel to node {} ({}) after {} consecutive {} failures",
-                self.target, self.endpoint, self.consecutive_failures, route,
+                self.target,
+                self.endpoint,
+                self.consecutive_failures,
+                route,
             );
             self.client = build_client(&self.endpoint);
             self.consecutive_failures = 0;

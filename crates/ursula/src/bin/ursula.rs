@@ -23,8 +23,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_tokio_console_if_enabled();
-    init_tracing();
+    let tokio_console = init_tokio_console_if_enabled();
+    if !tokio_console.installed() {
+        init_tracing();
+    }
+    tokio_console.warn_if_needed();
 
     let args = Args::parse()?;
     apply_admission_env_overrides(&args);
@@ -161,25 +164,76 @@ fn apply_admission_env_overrides(args: &Args) {
     }
 }
 
-fn init_tokio_console_if_enabled() {
-    if std::env::var_os("URSULA_TOKIO_CONSOLE").is_none() {
-        return;
+#[derive(Debug, Clone, Copy)]
+enum TokioConsoleInit {
+    Disabled,
+    #[cfg(all(feature = "tokio-console", tokio_unstable))]
+    Installed,
+    #[cfg(not(feature = "tokio-console"))]
+    MissingFeature,
+    #[cfg(all(feature = "tokio-console", not(tokio_unstable)))]
+    MissingTokioUnstable,
+}
+
+impl TokioConsoleInit {
+    fn installed(self) -> bool {
+        #[cfg(all(feature = "tokio-console", tokio_unstable))]
+        {
+            matches!(self, Self::Installed)
+        }
+        #[cfg(not(all(feature = "tokio-console", tokio_unstable)))]
+        {
+            let _ = self;
+            false
+        }
     }
 
-    #[cfg(feature = "tokio-console")]
-    console_subscriber::ConsoleLayer::builder()
-        .with_default_env()
-        .init();
+    fn warn_if_needed(self) {
+        match self {
+            Self::Disabled => {}
+            #[cfg(all(feature = "tokio-console", tokio_unstable))]
+            Self::Installed => {}
+            #[cfg(all(feature = "tokio-console", not(tokio_unstable)))]
+            Self::MissingTokioUnstable => tracing::warn!(
+                "URSULA_TOKIO_CONSOLE is set, but tokio-console requires building with RUSTFLAGS=\"--cfg tokio_unstable\""
+            ),
+            #[cfg(not(feature = "tokio-console"))]
+            Self::MissingFeature => tracing::warn!(
+                "URSULA_TOKIO_CONSOLE is set, but ursula was built without tokio-console feature"
+            ),
+        }
+    }
+}
+
+fn init_tokio_console_if_enabled() -> TokioConsoleInit {
+    if std::env::var_os("URSULA_TOKIO_CONSOLE").is_none() {
+        return TokioConsoleInit::Disabled;
+    }
+
+    #[cfg(all(feature = "tokio-console", tokio_unstable))]
+    {
+        console_subscriber::ConsoleLayer::builder()
+            .with_default_env()
+            .init();
+        TokioConsoleInit::Installed
+    }
+
+    #[cfg(all(feature = "tokio-console", not(tokio_unstable)))]
+    {
+        TokioConsoleInit::MissingTokioUnstable
+    }
 
     #[cfg(not(feature = "tokio-console"))]
-    eprintln!("URSULA_TOKIO_CONSOLE is set, but ursula was built without tokio-console feature");
+    {
+        TokioConsoleInit::MissingFeature
+    }
 }
 
 /// Install a stderr tracing subscriber filtered by `RUST_LOG` (default `info`).
-/// `try_init` is a no-op if a global subscriber was already installed (e.g. the
-/// tokio-console layer), so this never conflicts with that path.
+/// `try_init` is a no-op if a global subscriber was already installed.
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
+
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

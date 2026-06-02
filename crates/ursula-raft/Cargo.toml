@@ -10,30 +10,31 @@ readme.workspace = true
 description = "OpenRaft integration for Ursula's per-group multi-Raft replication: network, log store, and snapshot transport."
 
 [dependencies]
-futures-util = "0.3"
-openraft-rt = "0.10.0-alpha.20"
-openraft = { version = "0.10.0-alpha.20", default-features = false, features = ["tokio-rt", "type-alias", "serde"] }
-prost = "0.13"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.39", features = ["macros", "rt", "rt-multi-thread", "sync"] }
-tonic = { version = "0.12", features = ["transport"] }
-ursula-runtime = { path = "../ursula-runtime", version = "0.1.0" }
-ursula-proto = { path = "../ursula-proto", version = "0.1.0" }
-ursula-shard = { path = "../ursula-shard", version = "0.1.0" }
+futures-util = { workspace = true }
+openraft-rt = { workspace = true }
+openraft = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync"] }
+tonic = { workspace = true, features = ["transport"] }
+tracing = { workspace = true }
+ursula-runtime = { workspace = true }
+ursula-proto = { workspace = true }
+ursula-shard = { workspace = true }
 
 [build-dependencies]
-protoc-bin-vendored = "3"
-tonic-build = { version = "0.12", features = ["prost"] }
+protoc-bin-vendored = { workspace = true }
+tonic-build = { workspace = true, features = ["prost"] }
 
 [target.'cfg(madsim)'.dependencies]
-madsim = "0.2.34"
-pin-project-lite = "0.2"
-rand = { version = "0.10", features = ["std", "std_rng", "thread_rng"], default-features = false }
-sim-tokio = { package = "madsim-tokio", version = "0.2.30", features = ["macros", "rt", "sync", "time"] }
+madsim = { workspace = true }
+pin-project-lite = { workspace = true }
+rand = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
+sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
-tokio = { version = "1.39", features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }

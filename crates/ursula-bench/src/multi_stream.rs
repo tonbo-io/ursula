@@ -95,10 +95,10 @@ pub async fn run(args: MultiStreamArgs) -> Result<MultiStreamResult> {
     );
 
     tracing::info!(
-        api = args.api_style.as_str(),
-        streams = args.streams,
-        targets = backend.bases.len(),
-        "creating namespace and streams"
+        "creating namespace and streams: api={} streams={} targets={}",
+        args.api_style.as_str(),
+        args.streams,
+        backend.bases.len()
     );
     backend.ensure_namespace().await?;
     create_streams(&backend, args.streams, args.setup_concurrency).await?;

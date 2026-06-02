@@ -95,15 +95,18 @@ pub async fn run_restart(
     };
     for (idx, target) in ordered.iter().enumerate() {
         tracing::info!(
-            target_node_id = target.id,
-            step = idx + 1,
-            total = ordered.len(),
-            "begin per-node restart"
+            "begin per-node restart: target_node_id={} step={} total={}",
+            target.id,
+            idx + 1,
+            ordered.len()
         );
         let outcome = restart_one(nodes, target, client, options).await;
         match &outcome {
             Ok(RestartOutcome::Aborted { reason }) => {
-                tracing::error!(target_node_id = target.id, reason, "aborting rollout");
+                tracing::error!(
+                    "aborting rollout: target_node_id={} reason={reason}",
+                    target.id
+                );
                 report.per_node.push((
                     target.id,
                     RestartOutcome::Aborted {
@@ -113,12 +116,15 @@ pub async fn run_restart(
                 return Ok(report);
             }
             Ok(o) => {
-                tracing::info!(target_node_id = target.id, ?o, "node done");
+                tracing::info!("node done: target_node_id={} outcome={o:?}", target.id);
                 report.per_node.push((target.id, o.clone()));
             }
             Err(err) => {
                 let reason = format!("{err:#}");
-                tracing::error!(target_node_id = target.id, reason = %reason, "aborting rollout");
+                tracing::error!(
+                    "aborting rollout: target_node_id={} reason={reason}",
+                    target.id
+                );
                 report
                     .per_node
                     .push((target.id, RestartOutcome::Aborted { reason }));
@@ -142,18 +148,18 @@ async fn restart_one(
         .context("pre-flight metrics")?;
     let plan = plan_drain(&snapshot, target.id);
     tracing::info!(
-        target_node_id = target.id,
-        led_groups = plan.transfers.len(),
-        "drain plan computed"
+        "drain plan computed: target_node_id={} led_groups={}",
+        target.id,
+        plan.transfers.len()
     );
 
     // Drain leaderships.
     for transfer in &plan.transfers {
         tracing::info!(
-            target_node_id = target.id,
-            raft_group_id = transfer.raft_group_id,
-            to = transfer.preferred_successor,
-            "transferring leadership"
+            "transferring leadership: target_node_id={} raft_group_id={} to={}",
+            target.id,
+            transfer.raft_group_id,
+            transfer.preferred_successor
         );
         if options.dry_run {
             continue;
@@ -245,7 +251,10 @@ fn format_unready(_snap: &ClusterSnapshot, report: &crate::plan::ReadinessReport
 
 async fn execute_restart_cmd(target: &NodeInfo, template: &str) -> Result<()> {
     let rendered = render_template(template, target);
-    tracing::info!(target_node_id = target.id, cmd = %rendered, "exec restart command");
+    tracing::info!(
+        "exec restart command: target_node_id={} cmd={rendered}",
+        target.id
+    );
     let status = Command::new("sh")
         .arg("-c")
         .arg(&rendered)

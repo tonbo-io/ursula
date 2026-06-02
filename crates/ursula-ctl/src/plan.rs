@@ -31,9 +31,8 @@ pub fn plan_drain(snapshot: &ClusterSnapshot, target_node_id: u64) -> DrainPlan 
     for group in led {
         let Some(successor) = pick_successor(snapshot, &group, target_node_id) else {
             tracing::warn!(
-                raft_group_id = group.raft_group_id,
-                target = target_node_id,
-                "no eligible successor voter; restart cannot proceed safely"
+                "no eligible successor voter; restart cannot proceed safely: raft_group_id={} target={target_node_id}",
+                group.raft_group_id
             );
             continue;
         };

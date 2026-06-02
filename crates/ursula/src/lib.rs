@@ -420,7 +420,7 @@ impl NodeMemoryAdmission {
                         //
                         // Before aborting, emit a structured breadcrumb to
                         // stderr (so journald captures it) AND optionally to a
-                        // sticky file. The previous bare eprintln was hard to
+                        // sticky file. The previous bare log was hard to
                         // grep across many nodes and left no machine-readable
                         // trail — under chaos load when this fires across the
                         // fleet we want to correlate aborts to the same minute.
@@ -442,7 +442,7 @@ impl NodeMemoryAdmission {
                                 .map(|v| v.to_string())
                                 .unwrap_or_else(|| "null".into()),
                         );
-                        eprintln!("{breadcrumb}");
+                        tracing::error!("{breadcrumb}");
                         if let Some(path) = &abort_log_path {
                             // Best-effort: filesystem write may fail under
                             // memory pressure but the stderr line above is

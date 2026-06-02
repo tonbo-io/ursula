@@ -21,7 +21,7 @@ impl Drop for ChildGuard {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_cluster_forwards_follower_writes() {
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
-        eprintln!("CARGO_BIN_EXE_ursula is not set; skipping CLI cluster smoke test");
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping CLI cluster smoke test");
         return;
     };
     let ports = [free_port(), free_port(), free_port()];
@@ -77,7 +77,7 @@ async fn cli_static_grpc_raft_cluster_forwards_follower_writes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_log_dir_recovers_after_restart() {
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
-        eprintln!("CARGO_BIN_EXE_ursula is not set; skipping CLI durable restart smoke test");
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping CLI durable restart smoke test");
         return;
     };
     let port = free_port();
@@ -138,7 +138,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_after_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
-        eprintln!("CARGO_BIN_EXE_ursula is not set; skipping CLI durable cluster smoke test");
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping CLI durable cluster smoke test");
         return;
     };
     let ports = [free_port(), free_port(), free_port()];
@@ -242,7 +242,9 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
-        eprintln!("CARGO_BIN_EXE_ursula is not set; skipping CLI durable late learner smoke test");
+        tracing::warn!(
+            "CARGO_BIN_EXE_ursula is not set; skipping CLI durable late learner smoke test"
+        );
         return;
     };
     let ports = [free_port(), free_port(), free_port()];
@@ -392,13 +394,13 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after_restart() {
     if std::env::var("URSULA_COLD_S3_INTEGRATION").ok().as_deref() != Some("1") {
-        eprintln!(
+        tracing::warn!(
             "skipping CLI S3 cold-manifest restart integration; set URSULA_COLD_S3_INTEGRATION=1 and URSULA_COLD_S3_BUCKET"
         );
         return;
     }
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
-        eprintln!(
+        tracing::warn!(
             "CARGO_BIN_EXE_ursula is not set; skipping CLI S3 cold cluster restart smoke test"
         );
         return;

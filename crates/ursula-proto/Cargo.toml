@@ -10,9 +10,9 @@ readme.workspace = true
 description = "Shared protobuf wire types for Ursula (stream commands, cold chunk refs, Raft RPC payloads)."
 
 [dependencies]
-prost = "0.13"
-serde = { version = "1.0", features = ["derive"] }
+prost = { workspace = true }
+serde = { workspace = true }
 
 [build-dependencies]
-prost-build = "0.13"
-protoc-bin-vendored = "3"
+prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }

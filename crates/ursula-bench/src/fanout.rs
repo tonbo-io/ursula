@@ -103,7 +103,7 @@ pub async fn run(args: FanOutArgs) -> Result<FanOutResult> {
             if let Err(e) =
                 run_subscriber(&backend, &stream, idx, barrier, recv, hist, deadline, idle).await
             {
-                tracing::warn!(idx, "subscriber failed: {e:#}");
+                tracing::warn!("subscriber failed: idx={idx} error={e:#}");
                 serr.fetch_add(1, Ordering::Relaxed);
             }
         }));

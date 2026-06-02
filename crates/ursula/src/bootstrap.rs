@@ -322,7 +322,7 @@ pub fn spawn_cold_flush_worker_if_configured(runtime: &ShardRuntime) {
                 )
                 .await
             {
-                eprintln!("cold flush worker error: {err}");
+                tracing::error!("cold flush worker error: {err}");
             }
             tokio::time::sleep(interval).await;
         }
@@ -347,7 +347,7 @@ pub fn spawn_cold_gc_worker_if_configured(runtime: &ShardRuntime) {
         let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX));
         loop {
             if let Err(err) = runtime.run_cold_gc_all_groups_once(max_entries).await {
-                eprintln!("cold gc worker error: {err}");
+                tracing::error!("cold gc worker error: {err}");
             }
             tokio::time::sleep(interval).await;
         }
@@ -366,9 +366,11 @@ fn reenable_elections_if_campaign_allowed(registry: &RaftGroupHandleRegistry, co
     let shed_state = registry.leadership_shed_state();
     if shed_state.should_campaign() {
         set_registered_group_elections(registry, true);
-        eprintln!("{context}; re-enabling elections");
+        tracing::warn!("{context}; re-enabling elections");
     } else {
-        eprintln!("{context}; elections remain disabled while leadership-shed state={shed_state}");
+        tracing::warn!(
+            "{context}; elections remain disabled while leadership-shed state={shed_state}"
+        );
     }
 }
 
@@ -471,13 +473,16 @@ pub fn spawn_snapshot_driver_if_configured(
                             .find(|voter| *voter != snapshot.node_id)
                     {
                         match raft.trigger().transfer_leader(target).await {
-                            Ok(()) => eprintln!(
+                            Ok(()) => tracing::warn!(
                                 "s3-unhealthy: node {} yielded leadership of group {} to node {}",
-                                snapshot.node_id, snapshot.raft_group_id, target,
+                                snapshot.node_id,
+                                snapshot.raft_group_id,
+                                target,
                             ),
-                            Err(err) => eprintln!(
+                            Err(err) => tracing::error!(
                                 "s3-unhealthy: transfer_leader group {} -> {} failed: {err}",
-                                snapshot.raft_group_id, target,
+                                snapshot.raft_group_id,
+                                target,
                             ),
                         }
                     }
@@ -511,7 +516,7 @@ pub fn spawn_snapshot_driver_if_configured(
                     let gid = snapshot.raft_group_id;
                     triggers.spawn(async move {
                         if let Err(err) = raft.trigger().snapshot().await {
-                            eprintln!("snapshot driver trigger group {gid} error: {err}");
+                            tracing::error!("snapshot driver trigger group {gid} error: {err}");
                         }
                     });
                 }
@@ -533,7 +538,7 @@ pub fn spawn_snapshot_driver_if_configured(
                     )
                     .await
             {
-                eprintln!("snapshot driver flush error: {err}");
+                tracing::error!("snapshot driver flush error: {err}");
             }
 
             tokio::time::sleep(interval).await;
@@ -593,7 +598,7 @@ pub fn spawn_leadership_balancer_if_configured(
         {
             Ok(client) => client,
             Err(err) => {
-                eprintln!("leadership-balance: failed to build peer-status client: {err}");
+                tracing::error!("leadership-balance: failed to build peer-status client: {err}");
                 return;
             }
         };
@@ -617,13 +622,16 @@ pub fn spawn_leadership_balancer_if_configured(
                     continue;
                 };
                 match raft.trigger().transfer_leader(action.target).await {
-                    Ok(()) => eprintln!(
+                    Ok(()) => tracing::warn!(
                         "leadership-balance: node {my_id} handing group {} -> node {} (fair={})",
-                        action.group_id, action.target, action.fair
+                        action.group_id,
+                        action.target,
+                        action.fair
                     ),
-                    Err(err) => eprintln!(
+                    Err(err) => tracing::error!(
                         "leadership-balance: transfer_leader group {} -> {} failed: {err}",
-                        action.group_id, action.target
+                        action.group_id,
+                        action.target
                     ),
                 }
             }
@@ -862,7 +870,7 @@ pub fn spawn_cluster_egress_gate_if_configured(
         {
             Ok(client) => client,
             Err(err) => {
-                eprintln!("cluster-egress: failed to build probe client: {err}");
+                tracing::error!("cluster-egress: failed to build probe client: {err}");
                 return;
             }
         };
@@ -909,7 +917,7 @@ pub fn spawn_cluster_egress_gate_if_configured(
                         let _ = raft.trigger().transfer_leader(target).await;
                     }
                 }
-                eprintln!(
+                tracing::warn!(
                     "cluster-egress: node {node_id} egress degraded (reached {healthy_peers}/{} peers, need {needed_peers}); yielding leadership",
                     peer_urls.len()
                 );
@@ -974,7 +982,7 @@ pub fn spawn_commit_stall_watchdog_if_configured(registry: &RaftGroupHandleRegis
                 let Some(raft) = registry.get(RaftGroupId(action.group_id)) else {
                     continue;
                 };
-                eprintln!(
+                tracing::warn!(
                     "commit-stall: node {my_id} group {} stalled {:.1}s (last_log={:?} committed={:?}); trying targets {:?}",
                     action.group_id,
                     action.stalled_for.as_secs_f64(),
@@ -990,23 +998,25 @@ pub fn spawn_commit_stall_watchdog_if_configured(registry: &RaftGroupHandleRegis
                 for target in &action.targets {
                     match raft.trigger().transfer_leader(*target).await {
                         Ok(()) => {
-                            eprintln!(
+                            tracing::warn!(
                                 "commit-stall: group {} handed off -> {}",
-                                action.group_id, target
+                                action.group_id,
+                                target
                             );
                             handed_off = true;
                             break;
                         }
                         Err(err) => {
-                            eprintln!(
+                            tracing::error!(
                                 "commit-stall: transfer_leader group {} -> {} failed: {err}; trying next target",
-                                action.group_id, target
+                                action.group_id,
+                                target
                             );
                         }
                     }
                 }
                 if !handed_off {
-                    eprintln!(
+                    tracing::error!(
                         "commit-stall: group {} no target accepted transfer (all {} candidates failed); will retry after threshold",
                         action.group_id,
                         action.targets.len(),
@@ -1192,7 +1202,7 @@ pub fn spawn_cold_health_gate_if_configured(
             };
             match tracker.evaluate(sample) {
                 ColdHealthDecision::Shed { reason } => {
-                    eprintln!(
+                    tracing::warn!(
                         "cold-health: node {node_id} cold-impaired ({reason}); yielding leadership"
                     );
                     registry.mark_leadership_shed(LeadershipShedReason::ColdHealth);
@@ -1207,7 +1217,7 @@ pub fn spawn_cold_health_gate_if_configured(
                         };
                         let targets = prioritized_transfer_targets(&snap, node_id, &leader_count);
                         if targets.is_empty() {
-                            eprintln!(
+                            tracing::warn!(
                                 "cold-health: group {} has no peer voter target",
                                 snap.raft_group_id
                             );
@@ -1216,13 +1226,13 @@ pub fn spawn_cold_health_gate_if_configured(
                         for target in targets {
                             match raft.trigger().transfer_leader(target).await {
                                 Ok(()) => {
-                                    eprintln!(
+                                    tracing::warn!(
                                         "cold-health: node {node_id} yielded leadership of group {} to node {target}",
                                         snap.raft_group_id
                                     );
                                     break;
                                 }
-                                Err(err) => eprintln!(
+                                Err(err) => tracing::error!(
                                     "cold-health: transfer_leader group {} -> {target} failed: {err}",
                                     snap.raft_group_id
                                 ),
