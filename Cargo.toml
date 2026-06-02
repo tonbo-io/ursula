@@ -23,6 +23,12 @@ readme = "README.md"
 keywords = ["durable-streams", "raft", "thread-per-core", "multi-raft"]
 categories = ["database-implementations", "network-programming"]
 
+[patch.crates-io]
+openraft = { git = "https://github.com/databendlabs/openraft.git", rev = "13df5b32288b7937a293759264712b5a144987ac" }
+openraft-macros = { git = "https://github.com/databendlabs/openraft.git", rev = "13df5b32288b7937a293759264712b5a144987ac" }
+openraft-rt = { git = "https://github.com/databendlabs/openraft.git", rev = "13df5b32288b7937a293759264712b5a144987ac" }
+openraft-rt-tokio = { git = "https://github.com/databendlabs/openraft.git", rev = "13df5b32288b7937a293759264712b5a144987ac" }
+
 # NOTE: experimented with `lto = "fat"` and `lto = "thin"` + codegen-units = 1.
 # On the c7g benchmark cluster (3 × c7g.4xlarge, 256 B append workload),
 # write throughput regressed 10–13% at peak with either LTO setting - likely

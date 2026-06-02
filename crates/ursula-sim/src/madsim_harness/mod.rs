@@ -623,6 +623,7 @@ struct MadsimRuntimeRaftNetworkFactory {
     seed: u64,
     policy: InProcessRaftNetworkPolicy,
     cold_store: Option<ColdStoreHandle>,
+    aggressive_snapshot_purge: bool,
     followers: Arc<Mutex<Vec<(u64, RaftGroupEngine)>>>,
     leaders: Arc<Mutex<BTreeMap<u32, u64>>>,
     groups: Arc<Mutex<BTreeMap<u32, RuntimeRaftNetworkGroupControl>>>,
@@ -651,10 +652,17 @@ impl MadsimRuntimeRaftNetworkFactory {
             seed,
             policy,
             cold_store,
+            aggressive_snapshot_purge: false,
             followers: Arc::new(Mutex::new(Vec::new())),
             leaders: Arc::new(Mutex::new(BTreeMap::new())),
             groups: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    #[cfg(test)]
+    fn with_aggressive_snapshot_purge(mut self) -> Self {
+        self.aggressive_snapshot_purge = true;
+        self
     }
 
     fn leader_id(&self, raft_group_id: RaftGroupId) -> Option<u64> {
@@ -878,22 +886,29 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
         let seed = self.seed ^ 0x7274_6e65_7477_6f72 ^ u64::from(placement.raft_group_id.0);
         let policy = self.policy.clone();
         let cold_store = self.cold_store.clone();
+        let aggressive_snapshot_purge = self.aggressive_snapshot_purge;
         let followers = self.followers.clone();
         let leaders = self.leaders.clone();
         let groups = self.groups.clone();
         Box::pin(MadsimOpenRaftRuntime::scope(seed, async move {
             let registry = InProcessRaftRegistry::default();
-            let config = Arc::new(
-                Config {
-                    cluster_name: format!("ursula-sim-runtime-group-{}", placement.raft_group_id.0),
-                    heartbeat_interval: 10,
-                    election_timeout_min: 50,
-                    election_timeout_max: 100,
-                    ..Default::default()
-                }
-                .validate()
-                .map_err(|err| GroupEngineError::new(format!("invalid OpenRaft config: {err}")))?,
-            );
+            let mut config = Config {
+                cluster_name: format!("ursula-sim-runtime-group-{}", placement.raft_group_id.0),
+                heartbeat_interval: 10,
+                election_timeout_min: 50,
+                election_timeout_max: 100,
+                ..Default::default()
+            };
+            if aggressive_snapshot_purge {
+                config.max_in_snapshot_log_to_keep = 0;
+                config.purge_batch_size = 1;
+                config.replication_lag_threshold = 0;
+                config.snapshot_policy = SnapshotPolicy::LogsSinceLast(4);
+            }
+            let config =
+                Arc::new(config.validate().map_err(|err| {
+                    GroupEngineError::new(format!("invalid OpenRaft config: {err}"))
+                })?);
             let mut nodes = BTreeMap::new();
             for node_id in 1..=3 {
                 nodes.insert(
@@ -1305,6 +1320,7 @@ fn network_rpc_kind_name(kind: InProcessRaftRpcKind) -> &'static str {
         InProcessRaftRpcKind::AppendEntries => "append_entries",
         InProcessRaftRpcKind::Vote => "vote",
         InProcessRaftRpcKind::FullSnapshot => "full_snapshot",
+        InProcessRaftRpcKind::TransferLeader => "transfer_leader",
     }
 }
 
@@ -2167,6 +2183,72 @@ pub(super) async fn build_lagging_learner_snapshot_cluster(
             .expect("wait for shared leader");
     }
     (registry, engines, leader_id)
+}
+
+#[cfg(test)]
+pub(super) async fn build_three_node_snapshot_purge_cluster(
+    policy: InProcessRaftNetworkPolicy,
+) -> (
+    InProcessRaftRegistry,
+    Vec<RaftGroupEngine>,
+    Vec<Arc<RaftGroupLogStore>>,
+    u64,
+) {
+    let registry = InProcessRaftRegistry::default();
+    let config = Arc::new(
+        Config {
+            cluster_name: "ursula-sim-three-node-snapshot-purge".to_owned(),
+            heartbeat_interval: 10,
+            election_timeout_min: 50,
+            election_timeout_max: 100,
+            max_in_snapshot_log_to_keep: 0,
+            purge_batch_size: 1,
+            replication_lag_threshold: 0,
+            snapshot_policy: SnapshotPolicy::Never,
+            ..Default::default()
+        }
+        .validate()
+        .expect("valid raft config"),
+    );
+    let mut nodes = BTreeMap::new();
+    for node_id in 1..=3 {
+        nodes.insert(node_id, BasicNode::new(format!("node-{node_id}")));
+    }
+
+    let mut engines = Vec::new();
+    let mut log_stores = Vec::new();
+    for node_id in 1..=3 {
+        let log_store = RaftGroupLogStore::shared();
+        let engine = RaftGroupEngine::new_node_with_log_store_and_network(
+            placement(),
+            node_id,
+            config.clone(),
+            InProcessRaftNetworkFactory::new(registry.clone())
+                .with_source(node_id)
+                .with_policy(policy.clone()),
+            log_store.clone(),
+            None,
+            None,
+        )
+        .await
+        .expect("create snapshot-purge simulated raft group node");
+        registry.register(node_id, engine.raft_handle());
+        engines.push(engine);
+        log_stores.push(log_store);
+    }
+
+    engines[0]
+        .initialize_membership(nodes)
+        .await
+        .expect("initialize snapshot-purge simulated raft group");
+    let leader_metrics = engines[0]
+        .raft_handle()
+        .wait(Some(Duration::from_secs(5)))
+        .metrics(|metrics| metrics.current_leader.is_some(), "leader elected")
+        .await
+        .expect("wait for snapshot-purge simulated leader");
+    let leader_id = leader_metrics.current_leader.expect("leader id");
+    (registry, engines, log_stores, leader_id)
 }
 
 pub(super) fn placement() -> ShardPlacement {

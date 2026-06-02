@@ -122,6 +122,50 @@ fn snapshot_catch_up_workload_replays_with_same_seed_and_trace() {
 }
 
 #[test]
+#[ignore = "diagnostic: targets pending OpenRaft responders during snapshot/purge catch-up"]
+fn isolated_leader_pending_write_snapshot_purge_probe() {
+    let _guard = sim_test_guard();
+    for seed in 901..=916 {
+        let outcome = run_with_madsim(seed, async move {
+            run_isolated_leader_pending_write_snapshot_purge_inner(ThreeNodeRaftSimConfig::new(
+                seed,
+                format!("ursula-sim-isolated-leader-pending-write-snapshot-purge-{seed}"),
+            ))
+            .await
+        });
+
+        assert_eq!(outcome.seed, seed);
+        assert!(outcome.target_node_id.is_some());
+        assert!(outcome.appended_log_index > 0);
+        assert!(
+            outcome
+                .trace
+                .events
+                .iter()
+                .any(|event| matches!(event, SimEvent::LogPurged { .. }))
+        );
+        assert!(outcome.trace.events.iter().any(|event| matches!(
+            event,
+            SimEvent::FullSnapshotTransferred { count, .. } if *count > 0
+        )));
+        assert!(
+            outcome
+                .trace
+                .events
+                .iter()
+                .any(|event| matches!(event, SimEvent::FollowerCaughtUp { .. }))
+        );
+        assert!(
+            outcome
+                .trace
+                .events
+                .iter()
+                .any(|event| matches!(event, SimEvent::FollowerReadVerified { .. }))
+        );
+    }
+}
+
+#[test]
 #[ignore = "diagnostic: madsim process-global state makes scenario tests safer to run individually"]
 fn restart_follower_workload_replays_with_same_seed_and_trace() {
     let _guard = sim_test_guard();
@@ -681,6 +725,171 @@ fn runtime_raft_network_workload_replays_with_same_seed_and_trace() {
             ..
         } if *delivered_rpc_count > 0
     )));
+}
+
+#[test]
+#[ignore = "diagnostic: netem-delay style runtime Raft snapshot/purge stress"]
+fn runtime_raft_network_delay_snapshot_purge_probe() {
+    let _guard = sim_test_guard();
+    for seed in 917..=924 {
+        for (delay_index, delay_ms) in [25_u64, 75, 125].into_iter().enumerate() {
+            let sim_seed = seed * 10 + u64::try_from(delay_index).expect("delay index fits u64");
+            run_with_madsim(sim_seed, async move {
+                let policy = sim_network_policy();
+                let factory = MadsimRuntimeRaftNetworkFactory::new(sim_seed, policy.clone())
+                    .with_aggressive_snapshot_purge();
+                let mut runtime_config = RuntimeConfig::new(1, 1);
+                runtime_config.threading = RuntimeThreading::HostedTokio;
+                let runtime =
+                    ShardRuntime::spawn_with_engine_factory(runtime_config, factory.clone())
+                        .expect("spawn diagnostic runtime raft network");
+                let stream = BucketStreamId::new(
+                    "benchcmp",
+                    format!("runtime-raft-delay-snapshot-purge-{sim_seed}-{delay_ms}"),
+                );
+                runtime
+                    .create_stream(CreateStreamRequest::new(
+                        stream.clone(),
+                        "application/octet-stream",
+                    ))
+                    .await
+                    .expect("create diagnostic runtime raft stream");
+                let placement = runtime.locate(&stream);
+                let initial_leader_id = factory
+                    .leader_id(placement.raft_group_id)
+                    .expect("diagnostic runtime raft initial leader");
+                let isolated_id = seeded_follower_id(sim_seed, initial_leader_id);
+                policy.partition_bidirectional(initial_leader_id, isolated_id);
+
+                policy.set_delay(Some(Duration::from_millis(delay_ms)));
+                let mut tasks = Vec::new();
+                for append_id in 0..96_u64 {
+                    let runtime = runtime.clone();
+                    let stream = stream.clone();
+                    tasks.push(madsim::task::spawn(async move {
+                        if append_id % 8 != 0 {
+                            madsim::time::sleep(Duration::from_millis((append_id % 8) * 3)).await;
+                        }
+                        runtime
+                            .append_batch(AppendBatchRequest::new(
+                                stream,
+                                vec![format!("delay-{append_id};").into_bytes()],
+                            ))
+                            .await
+                    }));
+                }
+
+                for _ in 0..24 {
+                    madsim::time::sleep(Duration::from_millis(25)).await;
+                    for node_id in 1..=3 {
+                        let Some(raft) = factory.raft_handle(node_id) else {
+                            continue;
+                        };
+                        let _ = raft.trigger().snapshot().await;
+                        if let Some(last_log_index) =
+                            factory.log_store_last_log_index(node_id).await
+                        {
+                            let _ = raft.trigger().purge_log(last_log_index).await;
+                        }
+                    }
+                }
+
+                policy.heal_bidirectional(initial_leader_id, isolated_id);
+                for _ in 0..16 {
+                    madsim::time::sleep(Duration::from_millis(50)).await;
+                    for node_id in 1..=3 {
+                        if let Some(raft) = factory.raft_handle(node_id) {
+                            let _ = raft.trigger().heartbeat().await;
+                            let _ = raft.trigger().snapshot().await;
+                        }
+                    }
+                }
+                policy.clear();
+                madsim::time::sleep(Duration::from_millis(500)).await;
+
+                let mut successful_items = 0usize;
+                let mut nonfatal_errors = 0usize;
+                for task in tasks {
+                    let joined = madsim::time::timeout(Duration::from_secs(10), task)
+                        .await
+                        .expect("diagnostic delayed append task timed out")
+                        .expect("diagnostic delayed append task panicked");
+                    match joined {
+                        Ok(batch) => match batch.items.into_iter().collect::<Result<Vec<_>, _>>() {
+                            Ok(items) => successful_items += items.len(),
+                            Err(err) => {
+                                let err = format!("{err:?}");
+                                assert!(
+                                    !err.contains("panicked"),
+                                    "OpenRaft panicked during delayed append item: {err}"
+                                );
+                                nonfatal_errors += 1;
+                            }
+                        },
+                        Err(err) => {
+                            let err = format!("{err:?}");
+                            assert!(
+                                !err.contains("panicked"),
+                                "OpenRaft panicked during delayed append: {err}"
+                            );
+                            nonfatal_errors += 1;
+                        }
+                    }
+                }
+                assert!(
+                    successful_items > 0,
+                    "seed {sim_seed} delay {delay_ms}ms should complete at least one delayed append; nonfatal_errors={nonfatal_errors}"
+                );
+
+                let observer = factory.raft_handle(1).expect("diagnostic raft node 1");
+                let current_leader = observer
+                    .wait(Some(Duration::from_secs(5)))
+                    .metrics(
+                        |metrics| metrics.current_leader.is_some(),
+                        "observe leader after clearing raft delay",
+                    )
+                    .await
+                    .expect("observe leader after clearing raft delay")
+                    .current_leader
+                    .expect("current leader after clearing raft delay");
+                let leader_raft = factory
+                    .raft_handle(current_leader)
+                    .expect("diagnostic current leader raft handle");
+                let probe_payload = format!("after-delay-{sim_seed}-{delay_ms};").into_bytes();
+                let probe = leader_raft
+                    .client_write(
+                        GroupWriteCommand::from(AppendBatchRequest::new(
+                            stream,
+                            vec![probe_payload],
+                        ))
+                        .into(),
+                    )
+                    .await;
+                if let Err(err) = probe {
+                    let err = format!("{err:?}");
+                    assert!(
+                        !err.contains("panicked"),
+                        "OpenRaft panicked during post-delay leader probe: {err}"
+                    );
+                }
+                let trace = SimTrace::last_recorded();
+                let full_snapshot_decisions = trace
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            SimEvent::NetworkRpcDecision { kind, .. } if kind == "full_snapshot"
+                        )
+                    })
+                    .count();
+                assert!(
+                    full_snapshot_decisions > 0,
+                    "seed {sim_seed} delay {delay_ms}ms should attempt at least one full_snapshot"
+                );
+            });
+        }
+    }
 }
 
 #[test]
