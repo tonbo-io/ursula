@@ -462,6 +462,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     Some(metrics),
                     self.cold_store.clone(),
                     self.snapshot_store.clone(),
+                    Some(self.registry.snapshot_install_coordinator()),
                 )
                 .await?
             } else {
@@ -474,6 +475,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     Some(metrics),
                     self.cold_store.clone(),
                     self.snapshot_store.clone(),
+                    Some(self.registry.snapshot_install_coordinator()),
                 )
                 .await?
             };

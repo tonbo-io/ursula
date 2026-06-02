@@ -12,7 +12,8 @@ use tokio::time::Instant;
 
 use ursula_raft::{
     ColdRaftGroupEngineFactory, DurableRaftGroupEngineFactory, LeadershipShedReason,
-    RaftGroupEngineFactory, RaftGroupHandleRegistry, StaticGrpcRaftGroupEngineFactory,
+    RaftGroupEngineFactory, RaftGroupHandleRegistry, RaftGroupMetricsSnapshot,
+    StaticGrpcRaftGroupEngineFactory,
 };
 use ursula_runtime::{
     ColdStore, InMemoryGroupEngineFactory, PlanGroupColdFlushRequest, RuntimeConfig, RuntimeError,
@@ -501,6 +502,9 @@ pub fn spawn_snapshot_driver_if_configured(
             if !bad_tick {
                 let mut triggers = tokio::task::JoinSet::new();
                 for snapshot in &snaps {
+                    if !should_drive_snapshot_for_group(snapshot) {
+                        continue;
+                    }
                     let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) else {
                         continue;
                     };
@@ -535,6 +539,13 @@ pub fn spawn_snapshot_driver_if_configured(
             tokio::time::sleep(interval).await;
         }
     });
+}
+
+pub(crate) fn should_drive_snapshot_for_group(snapshot: &RaftGroupMetricsSnapshot) -> bool {
+    // An empty in-memory raft node has no applied state yet; triggering a
+    // manual snapshot there publishes a `group-X-empty` object that cannot be a
+    // valid recovery source for an existing group.
+    snapshot.last_applied.is_some()
 }
 
 /// M1 — leadership balancing. Spreads raft-group leadership evenly across

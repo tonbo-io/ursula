@@ -1,10 +1,13 @@
 use futures_util::TryStreamExt;
+use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use crate::rt::sync::OwnedSemaphorePermit;
+use crate::rt::sync::Semaphore;
 use crate::rt::time::Instant;
 
 use futures_util::Stream;
@@ -35,6 +38,98 @@ use crate::log_store::*;
 use crate::types::*;
 
 #[derive(Debug, Clone)]
+pub struct SnapshotInstallCoordinator {
+    inner: Arc<SnapshotInstallCoordinatorInner>,
+}
+
+#[derive(Debug)]
+struct SnapshotInstallCoordinatorInner {
+    semaphore: Arc<Semaphore>,
+    prefetched: Mutex<BTreeMap<String, Arc<Vec<u8>>>>,
+}
+
+impl Default for SnapshotInstallCoordinator {
+    fn default() -> Self {
+        Self::new(snapshot_install_max_concurrency_from_env())
+    }
+}
+
+impl SnapshotInstallCoordinator {
+    pub fn new(max_concurrency: usize) -> Self {
+        Self {
+            inner: Arc::new(SnapshotInstallCoordinatorInner {
+                semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
+                prefetched: Mutex::new(BTreeMap::new()),
+            }),
+        }
+    }
+
+    pub async fn acquire(&self) -> Result<OwnedSemaphorePermit, GroupEngineError> {
+        self.inner
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|err| GroupEngineError::new(format!("snapshot install gate closed: {err}")))
+    }
+
+    pub fn cache_key(snapshot_id: &str, location: &SnapshotLocation) -> String {
+        match location {
+            SnapshotLocation::Inline { bytes } => {
+                format!("{snapshot_id}:inline:{}", bytes.len())
+            }
+            SnapshotLocation::Local { path, size_bytes } => {
+                format!("{snapshot_id}:local:{}:{size_bytes}", path.display())
+            }
+            SnapshotLocation::S3 { key, size_bytes } => {
+                format!("{snapshot_id}:s3:{key}:{size_bytes}")
+            }
+        }
+    }
+
+    pub fn cache_prefetched(
+        &self,
+        snapshot_id: &str,
+        location: &SnapshotLocation,
+        bytes: Vec<u8>,
+    ) -> String {
+        let key = Self::cache_key(snapshot_id, location);
+        self.inner
+            .prefetched
+            .lock()
+            .expect("snapshot install prefetch cache mutex")
+            .insert(key.clone(), Arc::new(bytes));
+        key
+    }
+
+    pub fn take_prefetched(&self, pointer: &SnapshotPointer) -> Option<Arc<Vec<u8>>> {
+        let key = Self::cache_key(&pointer.snapshot_id, &pointer.location);
+        self.clear_prefetched_key(&key)
+    }
+
+    pub fn clear_prefetched_key(&self, key: &str) -> Option<Arc<Vec<u8>>> {
+        self.inner
+            .prefetched
+            .lock()
+            .expect("snapshot install prefetch cache mutex")
+            .remove(key)
+    }
+
+    #[cfg(test)]
+    fn available_permits(&self) -> usize {
+        self.inner.semaphore.available_permits()
+    }
+}
+
+fn snapshot_install_max_concurrency_from_env() -> usize {
+    std::env::var("URSULA_RAFT_SNAPSHOT_INSTALL_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct CurrentSnapshot {
     pub(crate) meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
     /// Bytes that ride through openraft's `SnapshotData`. With the default
@@ -51,6 +146,7 @@ pub struct RaftGroupStateMachine {
     pub(crate) last_membership: StoredMembershipOf<UrsulaRaftTypeConfig>,
     pub(crate) current_snapshot: Arc<Mutex<Option<CurrentSnapshot>>>,
     pub(crate) snapshot_store: SharedSnapshotStore,
+    pub(crate) snapshot_install: SnapshotInstallCoordinator,
 }
 
 impl RaftGroupStateMachine {
@@ -79,6 +175,22 @@ impl RaftGroupStateMachine {
         cold_store: Option<ColdStoreHandle>,
         snapshot_store: SharedSnapshotStore,
     ) -> Self {
+        Self::new_with_stores_and_snapshot_install(
+            placement,
+            metrics,
+            cold_store,
+            snapshot_store,
+            SnapshotInstallCoordinator::default(),
+        )
+    }
+
+    pub(crate) fn new_with_stores_and_snapshot_install(
+        placement: ShardPlacement,
+        metrics: Option<GroupEngineMetrics>,
+        cold_store: Option<ColdStoreHandle>,
+        snapshot_store: SharedSnapshotStore,
+        snapshot_install: SnapshotInstallCoordinator,
+    ) -> Self {
         Self {
             placement,
             engine: match cold_store {
@@ -90,6 +202,7 @@ impl RaftGroupStateMachine {
             last_membership: StoredMembershipOf::<UrsulaRaftTypeConfig>::default(),
             current_snapshot: Arc::new(Mutex::new(None)),
             snapshot_store,
+            snapshot_install,
         }
     }
 
@@ -364,15 +477,22 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         let pointer = SnapshotPointer::decode(&pointer_bytes)
             .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
         let snapshot_bytes = match &pointer.location {
-            SnapshotLocation::Inline { bytes } => bytes.clone(),
-            location => self
-                .snapshot_store
-                .download(location)
-                .await
-                .map_err(|err| err.into_io())?,
+            SnapshotLocation::Inline { bytes } => Arc::new(bytes.clone()),
+            location => {
+                if let Some(bytes) = self.snapshot_install.take_prefetched(&pointer) {
+                    bytes
+                } else {
+                    Arc::new(
+                        self.snapshot_store
+                            .download(location)
+                            .await
+                            .map_err(|err| err.into_io())?,
+                    )
+                }
+            }
         };
         let group_snapshot: GroupSnapshot =
-            serde_json::from_slice(&snapshot_bytes).map_err(invalid_data)?;
+            serde_json::from_slice(snapshot_bytes.as_slice()).map_err(invalid_data)?;
         self.engine
             .install_snapshot(group_snapshot)
             .await
@@ -510,4 +630,31 @@ fn schedule_previous_snapshot_gc(
 ) {
     // madsim has no fs/network store path that needs deferred GC; the inline
     // backend keeps everything in-pointer so this is always a no-op there.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn snapshot_install_coordinator_defaults_to_single_permit() {
+        let coordinator = SnapshotInstallCoordinator::default();
+
+        let permit = coordinator.acquire().await.expect("acquire install permit");
+        assert_eq!(coordinator.available_permits(), 0);
+
+        drop(permit);
+        assert_eq!(coordinator.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_coordinator_clamps_zero_to_one_permit() {
+        let coordinator = SnapshotInstallCoordinator::new(0);
+
+        let permit = coordinator.acquire().await.expect("acquire install permit");
+        assert_eq!(coordinator.available_permits(), 0);
+
+        drop(permit);
+        assert_eq!(coordinator.available_permits(), 1);
+    }
 }
