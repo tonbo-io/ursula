@@ -4737,6 +4737,33 @@ mod cold_health {
     }
 }
 
+mod snapshot_driver {
+    use crate::bootstrap::should_drive_snapshot_for_group;
+    use ursula_raft::{RaftGroupMetricsSnapshot, RaftLogProgressSnapshot};
+
+    fn snap(last_applied: Option<u64>) -> RaftGroupMetricsSnapshot {
+        RaftGroupMetricsSnapshot {
+            raft_group_id: 0,
+            node_id: 1,
+            current_term: 1,
+            current_leader: Some(1),
+            last_log_index: last_applied,
+            committed: last_applied.map(|index| RaftLogProgressSnapshot { term: 1, index }),
+            last_applied: last_applied.map(|index| RaftLogProgressSnapshot { term: 1, index }),
+            snapshot: None,
+            purged: None,
+            voter_ids: vec![1, 2, 3],
+            learner_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn snapshot_driver_skips_empty_raft_state() {
+        assert!(!should_drive_snapshot_for_group(&snap(None)));
+        assert!(should_drive_snapshot_for_group(&snap(Some(42))));
+    }
+}
+
 mod leadership_balance {
     use crate::bootstrap::{
         leader_counts, plan_leadership_balance, plan_leadership_balance_with_eligible_nodes,

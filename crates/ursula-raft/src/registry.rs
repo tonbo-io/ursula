@@ -743,6 +743,7 @@ pub struct RaftGroupHandleRegistry {
     groups: Arc<Mutex<BTreeMap<u32, Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>>>>,
     leadership_shed: LeadershipShedFlag,
     snapshot_store: Arc<Mutex<SharedSnapshotStore>>,
+    snapshot_install: SnapshotInstallCoordinator,
 }
 
 impl Default for RaftGroupHandleRegistry {
@@ -751,6 +752,7 @@ impl Default for RaftGroupHandleRegistry {
             groups: Arc::new(Mutex::new(BTreeMap::new())),
             leadership_shed: Arc::new(AtomicU8::new(0)),
             snapshot_store: Arc::new(Mutex::new(default_snapshot_store())),
+            snapshot_install: SnapshotInstallCoordinator::default(),
         }
     }
 }
@@ -809,6 +811,10 @@ impl RaftGroupHandleRegistry {
             .lock()
             .expect("raft group snapshot store mutex")
             .clone()
+    }
+
+    pub fn snapshot_install_coordinator(&self) -> SnapshotInstallCoordinator {
+        self.snapshot_install.clone()
     }
 
     pub fn leadership_shed_flag(&self) -> LeadershipShedFlag {
@@ -902,16 +908,23 @@ impl RaftGroupHandleRegistry {
         snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
     ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, GroupEngineError> {
         let raft = self.require_group(raft_group_id)?;
-        let snapshot = self.materialize_snapshot_for_install(snapshot).await?;
-        raft.install_full_snapshot(vote, snapshot)
+        let _install_permit = self.snapshot_install.acquire().await?;
+        let (snapshot, prefetched_key) = self.prefetch_snapshot_for_install(snapshot).await?;
+        let result = raft
+            .install_full_snapshot(vote, snapshot)
             .await
-            .map_err(|err| GroupEngineError::new(format!("OpenRaft install snapshot: {err}")))
+            .map_err(|err| GroupEngineError::new(format!("OpenRaft install snapshot: {err}")));
+        if let Some(key) = prefetched_key {
+            self.snapshot_install.clear_prefetched_key(&key);
+        }
+        result
     }
 
-    async fn materialize_snapshot_for_install(
+    async fn prefetch_snapshot_for_install(
         &self,
         snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
-    ) -> Result<TypeConfigSnapshotOf<UrsulaRaftTypeConfig>, GroupEngineError> {
+    ) -> Result<(TypeConfigSnapshotOf<UrsulaRaftTypeConfig>, Option<String>), GroupEngineError>
+    {
         let pointer_bytes = snapshot.snapshot.into_inner();
         let pointer = SnapshotPointer::decode(&pointer_bytes).map_err(|err| {
             GroupEngineError::new(format!("decode OpenRaft snapshot pointer: {err}"))
@@ -921,10 +934,13 @@ impl RaftGroupHandleRegistry {
             location,
         } = pointer;
         if matches!(location, SnapshotLocation::Inline { .. }) {
-            return Ok(TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
-                meta: snapshot.meta,
-                snapshot: Cursor::new(pointer_bytes),
-            });
+            return Ok((
+                TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
+                    meta: snapshot.meta,
+                    snapshot: Cursor::new(pointer_bytes),
+                },
+                None,
+            ));
         }
 
         let snapshot_store = self.snapshot_store();
@@ -938,19 +954,16 @@ impl RaftGroupHandleRegistry {
                 "decode prefetched OpenRaft snapshot {snapshot_id}: {err}"
             ))
         })?;
-        let pointer = SnapshotPointer {
-            snapshot_id,
-            location: SnapshotLocation::Inline {
-                bytes: snapshot_bytes,
+        let prefetched_key =
+            self.snapshot_install
+                .cache_prefetched(&snapshot_id, &location, snapshot_bytes);
+        Ok((
+            TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
+                meta: snapshot.meta,
+                snapshot: Cursor::new(pointer_bytes),
             },
-        };
-        let pointer_bytes = pointer.encode().map_err(|err| {
-            GroupEngineError::new(format!("encode inline snapshot pointer: {err}"))
-        })?;
-        Ok(TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
-            meta: snapshot.meta,
-            snapshot: Cursor::new(pointer_bytes),
-        })
+            Some(prefetched_key),
+        ))
     }
 
     pub async fn handle_transfer_leader(
@@ -1078,34 +1091,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialize_snapshot_for_install_inlines_external_snapshot_bytes() {
+    async fn prefetch_snapshot_for_install_keeps_external_pointer_and_caches_bytes() {
         let registry = RaftGroupHandleRegistry::default();
         registry.set_snapshot_store(Some(Arc::new(StaticSnapshotStore {
             bytes: Some(group_snapshot_bytes()),
         })));
 
-        let snapshot = registry
-            .materialize_snapshot_for_install(external_snapshot("snapshot-a"))
+        let (snapshot, prefetched_key) = registry
+            .prefetch_snapshot_for_install(external_snapshot("snapshot-a"))
             .await
-            .expect("materialize external snapshot");
+            .expect("prefetch external snapshot");
 
         let pointer = SnapshotPointer::decode(&snapshot.snapshot.into_inner()).unwrap();
         assert_eq!(pointer.snapshot_id, "snapshot-a");
         match pointer.location {
-            SnapshotLocation::Inline { bytes } => {
-                serde_json::from_slice::<GroupSnapshot>(&bytes).unwrap();
-            }
-            other => panic!("expected inline snapshot, got {other:?}"),
+            SnapshotLocation::S3 { key, .. } => assert_eq!(key, "snapshot-a.snap"),
+            other => panic!("expected s3 snapshot, got {other:?}"),
         }
+        let prefetched_key = prefetched_key.expect("external snapshot is cached");
+        let cached = registry
+            .snapshot_install_coordinator()
+            .clear_prefetched_key(&prefetched_key)
+            .expect("prefetched snapshot bytes cached");
+        serde_json::from_slice::<GroupSnapshot>(cached.as_slice()).unwrap();
     }
 
     #[tokio::test]
-    async fn materialize_snapshot_for_install_keeps_prefetch_failure_outside_openraft() {
+    async fn prefetch_snapshot_for_install_keeps_prefetch_failure_outside_openraft() {
         let registry = RaftGroupHandleRegistry::default();
         registry.set_snapshot_store(Some(Arc::new(StaticSnapshotStore { bytes: None })));
 
         let err = registry
-            .materialize_snapshot_for_install(external_snapshot("missing"))
+            .prefetch_snapshot_for_install(external_snapshot("missing"))
             .await
             .expect_err("missing snapshot should fail before OpenRaft install");
 
@@ -1114,7 +1131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialize_snapshot_for_install_does_not_download_inline_snapshot() {
+    async fn prefetch_snapshot_for_install_does_not_download_inline_snapshot() {
         let registry = RaftGroupHandleRegistry::default();
         registry.set_snapshot_store(Some(Arc::new(StaticSnapshotStore { bytes: None })));
         let pointer = SnapshotPointer {
@@ -1129,7 +1146,7 @@ mod tests {
         };
 
         registry
-            .materialize_snapshot_for_install(snapshot)
+            .prefetch_snapshot_for_install(snapshot)
             .await
             .expect("inline snapshot does not touch snapshot store");
     }
