@@ -372,6 +372,284 @@ pub(super) async fn run_snapshot_catch_up_inner(
     }
 }
 
+#[cfg(test)]
+pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
+    config: ThreeNodeRaftSimConfig,
+) -> ThreeNodeRaftSimOutcome {
+    let mut trace = SimTrace::default();
+    let policy = sim_network_policy();
+    let (registry, mut engines, log_stores, old_leader_id) =
+        build_three_node_snapshot_purge_cluster(policy.clone()).await;
+    trace.push(SimEvent::ClusterBuilt { seed: config.seed });
+    trace.push(SimEvent::LeaderElected {
+        leader_id: old_leader_id,
+    });
+
+    let old_leader_index = usize::try_from(old_leader_id - 1).expect("leader id fits usize");
+    engines[old_leader_index]
+        .create_stream(
+            CreateStreamRequest::new(config.stream.clone(), "application/octet-stream"),
+            placement(),
+        )
+        .await
+        .expect("create stream through old leader");
+    trace.push(SimEvent::StreamCreated {
+        stream: config.stream.clone(),
+    });
+
+    let baseline = engines[old_leader_index]
+        .append(
+            AppendRequest::from_bytes(config.stream.clone(), b"baseline;".to_vec()),
+            placement(),
+        )
+        .await
+        .expect("append baseline through old leader");
+    let baseline_log_index = baseline.group_commit_index;
+    trace.push(SimEvent::AppendCommitted {
+        stream: config.stream.clone(),
+        log_index: baseline_log_index,
+    });
+    wait_all_nodes_applied(
+        &engines,
+        baseline_log_index,
+        "baseline applied on all nodes",
+    )
+    .await;
+    trace.push(SimEvent::AllNodesApplied {
+        log_index: baseline_log_index,
+    });
+
+    let connected_ids = (1..=3)
+        .filter(|node_id| *node_id != old_leader_id)
+        .collect::<Vec<_>>();
+    for peer in &connected_ids {
+        policy.partition_bidirectional(old_leader_id, *peer);
+    }
+    trace.push(SimEvent::FaultApplied {
+        phase: "isolate_old_leader".to_owned(),
+    });
+
+    let old_leader_raft = engines[old_leader_index].raft_handle();
+    let pending_write_count = 32_u64;
+    let mut pending_writes = Vec::new();
+    for pending_id in 0..pending_write_count {
+        let pending_stream = config.stream.clone();
+        pending_writes.push(madsim::task::spawn({
+            let old_leader_raft = old_leader_raft.clone();
+            async move {
+                old_leader_raft
+                    .client_write(
+                        GroupWriteCommand::from(AppendRequest::from_bytes(
+                            pending_stream,
+                            format!("pending-old-leader-{pending_id};").into_bytes(),
+                        ))
+                        .into(),
+                    )
+                    .await
+            }
+        }));
+    }
+
+    let mut old_leader_log_store = log_stores[old_leader_index].clone();
+    let mut pending_log_index = None;
+    for _ in 0..100 {
+        let log_state = old_leader_log_store
+            .get_log_state()
+            .await
+            .expect("read old leader log state");
+        if let Some(index) = log_state.last_log_id.map(|log_id| log_id.index) {
+            if index >= baseline_log_index + pending_write_count {
+                pending_log_index = Some(index);
+                break;
+            }
+        }
+        madsim::time::sleep(Duration::from_millis(10)).await;
+    }
+    let pending_log_index =
+        pending_log_index.expect("old leader should append pending uncommitted client write");
+    trace.push(SimEvent::IsolatedFollowerLagged {
+        node_id: old_leader_id,
+        log_index: pending_log_index,
+    });
+
+    let observer_id = connected_ids[0];
+    let observer_index = usize::try_from(observer_id - 1).expect("observer id fits usize");
+    let observer_raft = engines[observer_index].raft_handle();
+    let new_leader_metrics = observer_raft
+        .wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| {
+                metrics
+                    .current_leader
+                    .is_some_and(|leader_id| leader_id != old_leader_id)
+            },
+            "connected voters elect replacement leader",
+        )
+        .await
+        .expect("wait for replacement leader");
+    let new_leader_id = new_leader_metrics
+        .current_leader
+        .expect("replacement leader id");
+    let new_leader_index = usize::try_from(new_leader_id - 1).expect("new leader id fits usize");
+    trace.push(SimEvent::LeaderElected {
+        leader_id: new_leader_id,
+    });
+
+    let mut expected_payload = b"baseline;".to_vec();
+    let mut latest_log_index = baseline_log_index;
+    for append_id in 0..8 {
+        let payload = format!("new-{append_id};").into_bytes();
+        let appended = engines[new_leader_index]
+            .append(
+                AppendRequest::from_bytes(config.stream.clone(), payload.clone()),
+                placement(),
+            )
+            .await
+            .expect("append through replacement leader");
+        expected_payload.extend(payload);
+        latest_log_index = appended.group_commit_index;
+        trace.push(SimEvent::AppendCommitted {
+            stream: config.stream.clone(),
+            log_index: latest_log_index,
+        });
+    }
+    for node_id in &connected_ids {
+        let index = usize::try_from(*node_id - 1).expect("node id fits usize");
+        engines[index]
+            .raft_handle()
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index_at_least(
+                Some(latest_log_index),
+                "replacement majority applied new leader appends",
+            )
+            .await
+            .expect("wait for replacement majority apply");
+    }
+    trace.push(SimEvent::MajorityApplied {
+        log_index: latest_log_index,
+    });
+
+    let new_leader_raft = engines[new_leader_index].raft_handle();
+    new_leader_raft
+        .trigger()
+        .snapshot()
+        .await
+        .expect("trigger replacement leader snapshot");
+    new_leader_raft
+        .wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| {
+                metrics
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|log_id| log_id.index() >= latest_log_index)
+            },
+            "replacement leader snapshot includes new appends",
+        )
+        .await
+        .expect("wait for replacement leader snapshot");
+    trace.push(SimEvent::SnapshotCreated {
+        log_index: latest_log_index,
+    });
+
+    new_leader_raft
+        .trigger()
+        .purge_log(latest_log_index)
+        .await
+        .expect("trigger replacement leader log purge");
+    new_leader_raft
+        .wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| {
+                metrics
+                    .purged
+                    .as_ref()
+                    .is_some_and(|log_id| log_id.index() >= latest_log_index)
+            },
+            "replacement leader purged snapshotted logs",
+        )
+        .await
+        .expect("wait for replacement leader purge");
+    trace.push(SimEvent::LogPurged {
+        log_index: latest_log_index,
+    });
+
+    policy.set_delay(Some(Duration::from_millis(125)));
+    trace.push(SimEvent::FaultApplied {
+        phase: "delay_before_heal_old_leader".to_owned(),
+    });
+    for peer in &connected_ids {
+        policy.heal_bidirectional(old_leader_id, *peer);
+    }
+    trace.push(SimEvent::FaultApplied {
+        phase: "heal_old_leader".to_owned(),
+    });
+
+    for attempt in 0..50 {
+        if old_leader_raft
+            .wait(Some(Duration::from_millis(100)))
+            .applied_index_at_least(Some(latest_log_index), "old leader catches up after purge")
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        new_leader_raft
+            .trigger()
+            .heartbeat()
+            .await
+            .expect("trigger heartbeat while waiting for old leader catch-up");
+        SimTrace::record(SimEvent::HeartbeatTriggered {
+            node_id: new_leader_id,
+            reason: "waiting for old leader catch-up after purge".to_owned(),
+            attempt,
+        });
+        madsim::time::sleep(Duration::from_millis(100)).await;
+    }
+    old_leader_raft
+        .wait(Some(Duration::from_secs(5)))
+        .applied_index_at_least(Some(latest_log_index), "old leader catches up after purge")
+        .await
+        .expect("wait for old leader catch-up after purge");
+    trace.push(SimEvent::FullSnapshotTransferred {
+        node_id: old_leader_id,
+        count: registry.full_snapshot_count(old_leader_id),
+    });
+    trace.push(SimEvent::FollowerCaughtUp {
+        node_id: old_leader_id,
+        log_index: latest_log_index,
+    });
+
+    read_local_payload_eventually(
+        &engines[old_leader_index],
+        old_leader_id,
+        &config.stream,
+        0,
+        expected_payload.len(),
+        &expected_payload,
+        "read old leader after snapshot/purge catch-up",
+    )
+    .await;
+    trace.push(SimEvent::FollowerReadVerified {
+        node_id: old_leader_id,
+        stream: config.stream.clone(),
+    });
+
+    for pending_write in pending_writes {
+        if let Ok(joined) = madsim::time::timeout(Duration::from_millis(100), pending_write).await {
+            let _ = joined.expect("pending old-leader client write task panicked");
+        }
+    }
+
+    ThreeNodeRaftSimOutcome {
+        seed: config.seed,
+        leader_id: old_leader_id,
+        target_node_id: Some(old_leader_id),
+        appended_log_index: latest_log_index,
+        trace,
+    }
+}
+
 pub(super) async fn run_restart_follower_inner(
     config: ThreeNodeRaftSimConfig,
 ) -> ThreeNodeRaftSimOutcome {

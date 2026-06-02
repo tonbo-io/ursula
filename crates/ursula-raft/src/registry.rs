@@ -477,6 +477,38 @@ impl InProcessRaftNetwork {
         }
         Ok(())
     }
+
+    async fn before_streaming_rpc(
+        &self,
+        kind: InProcessRaftRpcKind,
+        cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+    ) -> Result<(), StreamingError<UrsulaRaftTypeConfig>> {
+        let decision = self.policy.decision(self.source, self.target, kind);
+        self.policy.notify(InProcessRaftNetworkEvent::RpcDecision {
+            source: decision.source,
+            target: decision.target,
+            kind: decision.kind,
+            delay: decision.delay,
+            partitioned: decision.partitioned,
+        });
+        if decision.partitioned {
+            return Err(StreamingError::Unreachable(Unreachable::from_string(
+                decision.partition_error(),
+            )));
+        }
+        if let Some(delay) = decision.delay {
+            let sleep = sleep_in_process_raft_network(delay);
+            futures_util::pin_mut!(sleep);
+            futures_util::pin_mut!(cancel);
+            match futures_util::future::select(sleep, cancel).await {
+                futures_util::future::Either::Left((_done, _cancel)) => {}
+                futures_util::future::Either::Right((closed, _sleep)) => {
+                    return Err(StreamingError::Closed(closed));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
@@ -544,12 +576,11 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         &mut self,
         vote: VoteOf<UrsulaRaftTypeConfig>,
         snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
-        _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+        cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, StreamingError<UrsulaRaftTypeConfig>> {
-        self.before_rpc(InProcessRaftRpcKind::FullSnapshot)
-            .await
-            .map_err(StreamingError::Unreachable)?;
+        self.before_streaming_rpc(InProcessRaftRpcKind::FullSnapshot, cancel)
+            .await?;
         self.registry.record_full_snapshot(self.target);
         let target = self.registry.get(self.target).ok_or_else(|| {
             self.policy
