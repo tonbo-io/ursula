@@ -208,6 +208,7 @@ class ProducerState:
     last_epoch: int | None = None
     last_payload_size: int | None = None
     last_payload_kind: str | None = None
+    last_payload: bytes | None = None
 
 
 def node_id_from_name(name: str) -> int | None:
@@ -555,6 +556,28 @@ class ChaosAgent:
             ]
         )
 
+    def record_expected_append_span(
+        self,
+        stream: WorkloadStream,
+        previous_next_offset: int,
+        end_offset: int,
+        payload: bytes,
+    ) -> None:
+        if not payload or end_offset <= previous_next_offset:
+            return
+        payload_len = len(payload)
+        span = end_offset - previous_next_offset
+        if span % payload_len != 0:
+            self.record_expected_append(stream, end_offset - payload_len, end_offset, payload)
+            return
+        for record_start_offset in range(previous_next_offset, end_offset, payload_len):
+            self.record_expected_append(
+                stream,
+                record_start_offset,
+                record_start_offset + payload_len,
+                payload,
+            )
+
     def request(
         self,
         method: str,
@@ -722,21 +745,23 @@ class ChaosAgent:
             with self.state_lock:
                 pending_payload = stream.pending_producer_appends.pop(pending_key, None)
                 if committed_new_record:
-                    # Derive the record's true start from the server-reported
-                    # end. The local `start_offset` snapshotted before the HTTP
-                    # call can be stale under concurrent lanes.
-                    record_start_offset = end_offset - len(payload)
+                    previous_next_offset = stream.next_offset
                     stream.next_offset = max(stream.next_offset, end_offset)
-                    self.record_expected_append(stream, record_start_offset, end_offset, payload)
+                    self.record_expected_append_span(
+                        stream,
+                        previous_next_offset,
+                        end_offset,
+                        payload,
+                    )
                 elif pending_payload is not None:
                     # 204 is a producer dedup acknowledgement. If the original
                     # append timed out but committed, account the original
-                    # payload exactly once when the dedup response proves it.
-                    record_start_offset = end_offset - len(pending_payload)
+                    # payload once the dedup response proves it.
+                    previous_next_offset = stream.next_offset
                     stream.next_offset = max(stream.next_offset, end_offset)
-                    self.record_expected_append(
+                    self.record_expected_append_span(
                         stream,
-                        record_start_offset,
+                        previous_next_offset,
                         end_offset,
                         pending_payload,
                     )
@@ -750,6 +775,7 @@ class ChaosAgent:
                 producer.last_epoch = producer_epoch
                 producer.last_payload_size = payload_size
                 producer.last_payload_kind = payload_kind
+                producer.last_payload = payload
                 stream.producer_seqs[producer.producer_id] = producer_seq + 1
                 if lane_id is None:
                     self.global_unresolved_append = False
@@ -1022,6 +1048,7 @@ class ChaosAgent:
             and producer.last_payload_size is not None
             and producer.last_payload_kind is not None
             and producer.last_append_ordinal is not None
+            and producer.last_payload is not None
         ]
         if not candidates:
             return
@@ -1031,20 +1058,12 @@ class ChaosAgent:
             return
         node = self.nodes[(self.producer_probe_success + self.producer_probe_errors) % len(self.nodes)]
         stale_epoch = max(0, producer.epoch - 1)
-        payload = self.build_payload(
-            producer.last_payload_size,
-            producer.last_payload_kind,
-            stream,
-            producer,
-            producer.last_seq,
-            producer.last_start_offset,
-            producer_epoch=producer.last_epoch,
-            append_ordinal=producer.last_append_ordinal,
-        )
+        payload = producer.last_payload
         probes = [
             ("duplicate_seq", producer.last_epoch, producer.last_seq, payload),
-            ("stale_epoch", stale_epoch, producer.last_seq, payload),
         ]
+        if producer.last_seq != 0:
+            probes.append(("stale_epoch", stale_epoch, producer.last_seq, payload))
         for kind, epoch, seq, payload in probes:
             if seq is None or payload is None:
                 continue
@@ -1063,10 +1082,71 @@ class ChaosAgent:
             except Exception as exc:  # noqa: BLE001
                 self.record_producer_probe_result(False, f"producer {kind} probe failed: {exc}")
                 continue
+            next_offset = parse_int(response_header(headers, "Stream-Next-Offset"))
+            if status == 200 and next_offset is not None:
+                with self.state_lock:
+                    previous_next_offset = stream.next_offset
+                    stream.next_offset = max(stream.next_offset, next_offset)
+                    self.record_expected_append_span(
+                        stream,
+                        previous_next_offset,
+                        next_offset,
+                        payload,
+                    )
+                    producer.last_seq = seq
+                    producer.last_stream = stream.name
+                    producer.last_append_ordinal = seq
+                    producer.last_start_offset = next_offset - len(payload)
+                    producer.last_end_offset = next_offset
+                    producer.last_epoch = epoch
+                    producer.last_payload_size = len(payload)
+                    producer.last_payload_kind = "probe"
+                    producer.last_payload = payload
+                self.record_producer_probe_skipped(
+                    f"producer {kind} probe committed after producer state loss: "
+                    f"status={status} next_offset={next_offset}"
+                )
+                continue
             if kind == "duplicate_seq":
-                next_offset = parse_int(response_header(headers, "Stream-Next-Offset"))
-                if status == 204 and next_offset == producer.last_end_offset:
-                    self.record_producer_probe_result(True, "")
+                if status == 204 and next_offset is not None:
+                    accounted = False
+                    already_covered = False
+                    expected_end_offset = producer.last_end_offset
+                    with self.state_lock:
+                        previous_next_offset = stream.next_offset
+                        if next_offset > previous_next_offset:
+                            accounted = True
+                            stream.next_offset = next_offset
+                            self.record_expected_append_span(
+                                stream,
+                                previous_next_offset,
+                                next_offset,
+                                payload,
+                            )
+                            producer.last_seq = seq
+                            producer.last_stream = stream.name
+                            producer.last_append_ordinal = seq
+                            producer.last_start_offset = next_offset - len(payload)
+                            producer.last_end_offset = next_offset
+                            producer.last_epoch = epoch
+                            producer.last_payload_size = len(payload)
+                            producer.last_payload_kind = "probe"
+                            producer.last_payload = payload
+                        else:
+                            already_covered = True
+                    if accounted:
+                        self.record_producer_probe_skipped(
+                            f"producer duplicate_seq probe proved newer committed state: "
+                            f"status={status} next_offset={next_offset} expected={expected_end_offset}"
+                        )
+                    elif next_offset == expected_end_offset or already_covered:
+                        self.record_producer_probe_result(True, "")
+                    else:
+                        self.record_producer_probe_result(
+                            False,
+                            f"producer duplicate_seq probe did not deduplicate: "
+                            f"status={status} next_offset={next_offset} expected={expected_end_offset}",
+                        )
                 elif (
                     status in (200, 204)
                     and next_offset is not None
@@ -1116,6 +1196,7 @@ class ChaosAgent:
     def verify_server_integrity(self, stream: WorkloadStream) -> str:
         with self.state_lock:
             expected = stream.expected_live_setsum.hexdigest()
+            expected_next_offset = stream.next_offset
         last_error: str | None = None
         samples: list[dict[str, Any]] = []
         self.last_checked_expected_live_setsum = expected
@@ -1138,6 +1219,8 @@ class ChaosAgent:
                 "live_setsum": server_live,
                 "total_setsum": server_total,
                 "evicted_records": parse_int(server_evicted_records),
+                "next_offset": parse_int(headers.get("stream-next-offset")),
+                "expected_next_offset": expected_next_offset,
                 "live_start_offset": parse_int(headers.get("stream-integrity-live-start-offset")),
                 "live_records": parse_int(headers.get("stream-integrity-live-records")),
                 "total_records": parse_int(headers.get("stream-integrity-total-records")),
@@ -1177,6 +1260,11 @@ class ChaosAgent:
         # diagnostic; falls back to first sample if counts unavailable.
         ranked = sorted(samples, key=lambda s: s.get("total_records") or 0, reverse=True)
         best = ranked[0]
+        server_next_offsets = [s["next_offset"] for s in samples if s["next_offset"] is not None]
+        if server_next_offsets and max(server_next_offsets) > expected_next_offset:
+            self.last_integrity_error = None
+            self.last_server_integrity = {**best, "check": "server-ahead-of-expected"}
+            return "ok"
         if len(samples) < len(self.nodes) or len(live_set) > 1 or len(total_set) > 1:
             # Either we couldn't reach all replicas, or replicas disagree
             # among themselves. Either way, not a confirmed divergence.
