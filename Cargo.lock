@@ -3461,6 +3461,7 @@ dependencies = [
  "axum 0.8.9",
  "base64 0.22.1",
  "chrono",
+ "clap",
  "console-subscriber",
  "futures-util",
  "madsim",

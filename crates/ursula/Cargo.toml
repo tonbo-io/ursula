@@ -16,6 +16,7 @@ tokio-console = ["dep:console-subscriber", "tokio/tracing"]
 axum = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
+clap = { workspace = true }
 console-subscriber = { workspace = true, optional = true }
 futures-util = { workspace = true }
 mimalloc = { workspace = true }
