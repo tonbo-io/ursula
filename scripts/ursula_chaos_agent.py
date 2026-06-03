@@ -655,18 +655,24 @@ class ChaosAgent:
             stream_name = stream.name
             producer_id = producer.producer_id
             pending_key = f"{producer_id}\0{producer_epoch}\0{producer_seq}"
-            payload_size = self.payload_sizes[producer_seq % len(self.payload_sizes)]
-            payload_kind = self.payload_kinds[producer_seq % len(self.payload_kinds)] if self.payload_kinds else "ascii"
-            payload = self.build_payload(
-                payload_size,
-                payload_kind,
-                stream,
-                producer,
-                producer_seq,
-                start_offset,
-                producer_epoch=producer_epoch,
-                append_ordinal=producer_seq,
-            )
+            pending_payload = stream.pending_producer_appends.get(pending_key)
+            if pending_payload is None:
+                payload_size = self.payload_sizes[producer_seq % len(self.payload_sizes)]
+                payload_kind = self.payload_kinds[producer_seq % len(self.payload_kinds)] if self.payload_kinds else "ascii"
+                payload = self.build_payload(
+                    payload_size,
+                    payload_kind,
+                    stream,
+                    producer,
+                    producer_seq,
+                    start_offset,
+                    producer_epoch=producer_epoch,
+                    append_ordinal=producer_seq,
+                )
+            else:
+                payload = pending_payload
+                payload_size = len(payload)
+                payload_kind = "pending"
         first_node = attempt_id % len(self.nodes)
         last_error = "no target nodes"
         saw_cold_backpressure = False
