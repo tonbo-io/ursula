@@ -822,6 +822,11 @@ pub(crate) fn prioritized_transfer_targets(
     targets
 }
 
+const DEFAULT_CLUSTER_PROBE_INTERVAL_MS: usize = 500;
+const DEFAULT_CLUSTER_PROBE_TIMEOUT_MS: usize = 200;
+const DEFAULT_CLUSTER_PROBE_UNHEALTHY_TICKS: usize = 2;
+const DEFAULT_CLUSTER_PROBE_HEAL_TICKS: usize = 6;
+
 /// M2 — egress-health leadership gate. Each node actively measures its own
 /// egress to peers over the cluster plane (a payload POST with a tight
 /// deadline, sized so 15% loss / added delay fails it while a healthy link
@@ -840,7 +845,7 @@ pub fn spawn_cluster_egress_gate_if_configured(
     node_id: u64,
     peers: &[(u64, String)],
 ) {
-    let interval_ms = env_usize("URSULA_CLUSTER_PROBE_MS", 2_000);
+    let interval_ms = env_usize("URSULA_CLUSTER_PROBE_MS", DEFAULT_CLUSTER_PROBE_INTERVAL_MS);
     if interval_ms == 0 {
         return;
     }
@@ -856,15 +861,33 @@ pub fn spawn_cluster_egress_gate_if_configured(
     let total_nodes = peer_urls.len() + 1;
     let needed_peers = (total_nodes / 2 + 1).saturating_sub(1).max(1);
     let probe_bytes = env_usize("URSULA_CLUSTER_PROBE_BYTES", 64 * 1024);
-    let probe_timeout_ms = env_usize("URSULA_CLUSTER_PROBE_TIMEOUT_MS", 500);
-    let unhealthy_ticks = env_usize("URSULA_CLUSTER_PROBE_UNHEALTHY_TICKS", 2).max(1);
-    let heal_ticks = env_usize("URSULA_CLUSTER_PROBE_HEAL_TICKS", 3).max(1);
+    // Detect impaired leadership before the default 3s client append deadline:
+    // if a node cannot push a 64KiB probe to a peer within 200ms for two
+    // 500ms ticks, it should stop leading and let healthy peers take over.
+    let probe_timeout_ms = env_usize(
+        "URSULA_CLUSTER_PROBE_TIMEOUT_MS",
+        DEFAULT_CLUSTER_PROBE_TIMEOUT_MS,
+    );
+    let unhealthy_ticks = env_usize(
+        "URSULA_CLUSTER_PROBE_UNHEALTHY_TICKS",
+        DEFAULT_CLUSTER_PROBE_UNHEALTHY_TICKS,
+    )
+    .max(1);
+    let heal_ticks = env_usize(
+        "URSULA_CLUSTER_PROBE_HEAL_TICKS",
+        DEFAULT_CLUSTER_PROBE_HEAL_TICKS,
+    )
+    .max(1);
     let registry = registry.clone();
     tokio::spawn(async move {
-        let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(2_000));
+        let interval = Duration::from_millis(
+            u64::try_from(interval_ms)
+                .unwrap_or(u64::try_from(DEFAULT_CLUSTER_PROBE_INTERVAL_MS).unwrap_or(500)),
+        );
         let client = match reqwest::Client::builder()
             .timeout(Duration::from_millis(
-                u64::try_from(probe_timeout_ms).unwrap_or(500),
+                u64::try_from(probe_timeout_ms)
+                    .unwrap_or(u64::try_from(DEFAULT_CLUSTER_PROBE_TIMEOUT_MS).unwrap_or(200)),
             ))
             .build()
         {
