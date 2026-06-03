@@ -26,6 +26,8 @@ Optimize for local readability and whole-system readability at the same time: ke
 
 For performance-oriented changes, add or update a focused micro benchmark that validates the expected benefit.
 
+Use `tracing` logging macros for Rust diagnostics and operational logging. Do not add `eprintln!` logging in Rust code; use the appropriate `tracing::{error,warn,info,debug,trace}!` level instead.
+
 ## Before Commit
 
 Run formatting and lint checks before committing:

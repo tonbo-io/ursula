@@ -534,19 +534,19 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 // a lost-node/rejoin case, not proof that the group is new.
                 // Leave the raft uninitialized so quorum can remove/re-add it
                 // as a learner instead of minting a second empty history.
-                let bootstrap_already_used =
-                    self.raft_memory_bootstrap_seen(placement.raft_group_id);
-                let recovery_possible = self.snapshot_store.is_some() && !bootstrap_already_used;
+                let bootstrapped = self.raft_memory_bootstrap_seen(placement.raft_group_id);
+                let recovery_possible = self.snapshot_store.is_some() && !bootstrapped;
                 let rejoin_existing_cluster = recovery_possible
                     && engine
                         .observe_any_leader(rejoin_leader_probe_timeout())
                         .await;
                 if rejoin_existing_cluster {
                     self.mark_raft_memory_bootstrap_seen(placement.raft_group_id)?;
-                } else if bootstrap_already_used {
-                    eprintln!(
+                } else if bootstrapped {
+                    tracing::warn!(
                         "raft-memory: skip bootstrap for node {} group {} because this node already initialized it once; waiting for membership repair",
-                        self.node_id, placement.raft_group_id.0
+                        self.node_id,
+                        placement.raft_group_id.0
                     );
                 } else {
                     engine
