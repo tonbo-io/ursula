@@ -876,7 +876,7 @@ function TopologyCanvas({ topology }: { topology?: ChaosTopology }) {
       });
 
       const nodeRadius = 24;
-      const groupRadius = 14;
+      const groupRadius = 26;
 
       ctx.lineCap = "butt";
       groupPositions.forEach(({ group, x, y }) => {
@@ -926,7 +926,7 @@ function TopologyCanvas({ topology }: { topology?: ChaosTopology }) {
       groupPositions.forEach(({ group, x, y }) => {
         ctx.fillStyle = group.leader_id == null ? danger : text;
         ctx.font = "600 13px IBM Plex Sans, sans-serif";
-        ctx.fillText(`g${group.raft_group_id}`, x, y - 2);
+        ctx.fillText(`group ${group.raft_group_id}`, x, y - 2);
         ctx.fillStyle = muted;
         ctx.font = "11px IBM Plex Mono, monospace";
         ctx.fillText(

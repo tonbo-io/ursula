@@ -554,14 +554,13 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             location,
         };
         let pointer_bytes = pointer.encode().map_err(|err| err.into_io())?;
-        let previous = {
+        {
             let mut guard = self.current_snapshot.lock().expect("snapshot mutex");
             guard.replace(CurrentSnapshot {
                 meta: self.meta.clone(),
                 pointer_bytes: pointer_bytes.clone(),
-            })
-        };
-        schedule_previous_snapshot_gc(self.snapshot_store.clone(), previous, &pointer_bytes);
+            });
+        }
         Ok(SnapshotOf::<UrsulaRaftTypeConfig> {
             meta: self.meta.clone(),
             snapshot: Cursor::new(pointer_bytes),
@@ -569,72 +568,106 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
     }
 }
 
-/// Number of seconds to wait before deleting the previous snapshot's bytes
-/// after a new one has been published. Lets in-flight `install_snapshot`
-/// downloads complete before the underlying object disappears.
-#[cfg(not(madsim))]
-fn snapshot_gc_grace_secs() -> u64 {
-    std::env::var("URSULA_SNAPSHOT_GC_GRACE_SECS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .unwrap_or(300)
-}
-
-#[cfg(not(madsim))]
-fn schedule_previous_snapshot_gc(
-    store: ursula_runtime::SharedSnapshotStore,
-    previous: Option<CurrentSnapshot>,
-    new_pointer_bytes: &[u8],
-) {
-    let Some(previous) = previous else { return };
-    let Ok(prev_pointer) = SnapshotPointer::decode(&previous.pointer_bytes) else {
-        return;
-    };
-    // Inline locations are kept in-pointer; nothing to GC out-of-line.
-    if matches!(
-        prev_pointer.location,
-        ursula_runtime::SnapshotLocation::Inline { .. }
-    ) {
-        return;
-    }
-    // Same-key self-GC guard: snapshot_id is derived from last_applied_log_id
-    // (state_machine.rs::snapshot_meta), so two consecutive builds that race
-    // an apply-idle interval produce the SAME key. Without this check we'd
-    // schedule a GC against the very object we just wrote — `delete` runs 300s
-    // later and silently nukes the current snapshot, leaving `current_snapshot`
-    // pointing at a 404. This is exactly how N3 wedged group-4 transfers on
-    // 2026-05-31 (snapshot_id collided across repeated 15s driver ticks while
-    // apply was hot-tier-blocked, the GC nuked the live object).
-    if let Ok(new_pointer) = SnapshotPointer::decode(new_pointer_bytes)
-        && new_pointer.location == prev_pointer.location
-    {
-        return;
-    }
-    let grace = std::time::Duration::from_secs(snapshot_gc_grace_secs());
-    tokio::spawn(async move {
-        tokio::time::sleep(grace).await;
-        if let Err(err) = store.delete(&prev_pointer.location).await {
-            tracing::warn!(
-                "ursula raft snapshot gc: delete of previous {} failed: {err}",
-                prev_pointer.snapshot_id,
-            );
-        }
-    });
-}
-
-#[cfg(madsim)]
-fn schedule_previous_snapshot_gc(
-    _store: ursula_runtime::SharedSnapshotStore,
-    _previous: Option<CurrentSnapshot>,
-    _new_pointer_bytes: &[u8],
-) {
-    // madsim has no fs/network store path that needs deferred GC; the inline
-    // backend keeps everything in-pointer so this is always a no-op there.
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(madsim))]
+    fn test_log_id(index: u64) -> LogIdOf<UrsulaRaftTypeConfig> {
+        use openraft::LogId;
+        use openraft::vote::RaftLeaderId;
+
+        type LeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
+        LogId {
+            leader_id: LeaderId::new(1, 1),
+            index,
+        }
+    }
+
+    #[cfg(not(madsim))]
+    fn test_snapshot_meta(index: u64) -> SnapshotMetaOf<UrsulaRaftTypeConfig> {
+        let log_id = test_log_id(index);
+        SnapshotMetaOf::<UrsulaRaftTypeConfig> {
+            last_log_id: Some(log_id),
+            last_membership: StoredMembershipOf::<UrsulaRaftTypeConfig>::default(),
+            snapshot_id: format!(
+                "group-7-{}-{}",
+                log_id.committed_leader_id(),
+                log_id.index()
+            ),
+        }
+    }
+
+    #[cfg(not(madsim))]
+    fn test_group_snapshot(placement: ShardPlacement, commit_index: u64) -> GroupSnapshot {
+        GroupSnapshot {
+            placement,
+            group_commit_index: commit_index,
+            stream_snapshot: Default::default(),
+            stream_append_counts: Vec::new(),
+        }
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn snapshot_builder_keeps_previous_external_snapshot_objects() {
+        use std::sync::Arc;
+        use ursula_runtime::S3SnapshotStore;
+        use ursula_runtime::SnapshotStore;
+        use ursula_shard::{CoreId, RaftGroupId, ShardId};
+
+        let placement = ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: RaftGroupId(7),
+        };
+        let raw_store = Arc::new(
+            S3SnapshotStore::memory_for_tests(format!(
+                "state-machine-snapshot-retention-{}",
+                std::process::id()
+            ))
+            .expect("memory S3 snapshot store"),
+        );
+        let snapshot_store: SharedSnapshotStore = raw_store.clone();
+        let current_snapshot = Arc::new(Mutex::new(None));
+
+        let mut first = RaftGroupSnapshotBuilder {
+            placement,
+            snapshot: test_group_snapshot(placement, 1),
+            meta: test_snapshot_meta(1),
+            current_snapshot: current_snapshot.clone(),
+            snapshot_store: snapshot_store.clone(),
+        };
+        let first_snapshot = first.build_snapshot().await.expect("first snapshot");
+        let first_pointer =
+            SnapshotPointer::decode(&first_snapshot.snapshot.into_inner()).expect("first pointer");
+
+        let mut second = RaftGroupSnapshotBuilder {
+            placement,
+            snapshot: test_group_snapshot(placement, 2),
+            meta: test_snapshot_meta(2),
+            current_snapshot,
+            snapshot_store,
+        };
+        let second_snapshot = second.build_snapshot().await.expect("second snapshot");
+        let second_pointer = SnapshotPointer::decode(&second_snapshot.snapshot.into_inner())
+            .expect("second pointer");
+
+        let first_bytes = raw_store
+            .download(&first_pointer.location)
+            .await
+            .expect("previous snapshot remains readable");
+        let second_bytes = raw_store
+            .download(&second_pointer.location)
+            .await
+            .expect("current snapshot remains readable");
+        let first_group: GroupSnapshot =
+            serde_json::from_slice(&first_bytes).expect("decode first group snapshot");
+        let second_group: GroupSnapshot =
+            serde_json::from_slice(&second_bytes).expect("decode second group snapshot");
+        assert_eq!(first_group.group_commit_index, 1);
+        assert_eq!(second_group.group_commit_index, 2);
+    }
 
     #[tokio::test]
     async fn snapshot_install_coordinator_defaults_to_single_permit() {

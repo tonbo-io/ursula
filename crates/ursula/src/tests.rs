@@ -85,6 +85,17 @@ async fn wait_raft_state_machine_payload(
     panic!("{context}: timed out waiting for stream payload; latest={last_observed:?}");
 }
 
+#[test]
+fn parses_membership_voter_ids() {
+    assert_eq!(
+        parse_voter_ids("3,1,2").expect("parse voters"),
+        BTreeSet::from([1, 2, 3])
+    );
+    assert!(parse_voter_ids("").is_err());
+    assert!(parse_voter_ids("1,,2").is_err());
+    assert!(parse_voter_ids("1,node-2").is_err());
+}
+
 struct StaticGrpcTestNode {
     runtime: ShardRuntime,
     registry: RaftGroupHandleRegistry,
@@ -3643,6 +3654,31 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
         .await
         .expect("wait for late learner catch-up");
 
+    let promote = client
+        .post(format!(
+            "{leader_base}/__ursula/raft/0/membership?voters=1,2,3"
+        ))
+        .send()
+        .await
+        .expect("promote late learner");
+    assert_eq!(promote.status(), StatusCode::OK);
+    let promote_body = promote.text().await.expect("promote body");
+    assert!(
+        promote_body.contains("\"voter_ids\":[1,2,3]"),
+        "promote response should include final voter set: {promote_body}"
+    );
+    let promote_json: serde_json::Value =
+        serde_json::from_str(&promote_body).expect("decode promote response");
+    let promote_index = promote_json
+        .get("log_index")
+        .and_then(serde_json::Value::as_u64)
+        .expect("promote log index");
+    late_learner
+        .wait(Some(Duration::from_secs(10)))
+        .applied_index_at_least(Some(promote_index), "late learner applied voter promotion")
+        .await
+        .expect("wait for late learner promotion");
+
     wait_raft_state_machine_payload(
         &nodes[2].registry,
         placement,
@@ -3694,8 +3730,8 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
     assert!(late_metrics_body.contains("\"raft_group_count\":1"));
     assert!(late_metrics_body.contains("\"raft_group_id\":0"));
     assert!(late_metrics_body.contains(&format!("\"snapshot_index\":{}", snapshot_log_id.index())));
-    assert!(late_metrics_body.contains("\"voter_ids\":[1,2]"));
-    assert!(late_metrics_body.contains("\"learner_ids\":[3]"));
+    assert!(late_metrics_body.contains("\"voter_ids\":[1,2,3]"));
+    assert!(late_metrics_body.contains("\"learner_ids\":[]"));
 
     if let Some(raft_root) = &raft_root {
         for node_id in 1..=3 {

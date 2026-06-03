@@ -20,7 +20,6 @@ use crate::registry::RaftGroupHandleRegistry;
 use super::RaftGroupEngine;
 
 const RAFT_INSTALL_SNAPSHOT_TIMEOUT_DEFAULT_MS: u64 = 120_000;
-
 /// How long a restarting bootstrap node waits to observe an already-established
 /// (or freshly re-elected) leader before deciding the group is truly new and
 /// bootstrapping it. Must exceed the election window so peers that lost this
@@ -68,6 +67,13 @@ fn snapshot_driver_configured() -> bool {
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
         .is_some_and(|ms| ms > 0)
+}
+
+fn raft_memory_bootstrap_marker_dir() -> Option<PathBuf> {
+    std::env::var("URSULA_RAFT_MEMORY_BOOTSTRAP_MARKER_DIR")
+        .ok()
+        .filter(|raw| !raw.trim().is_empty())
+        .map(PathBuf::from)
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -347,6 +353,48 @@ impl StaticGrpcRaftGroupEngineFactory {
         self
     }
 
+    fn uses_memory_log_store(&self) -> bool {
+        self.log_stores.is_none()
+    }
+
+    fn raft_memory_bootstrap_marker_path(&self, raft_group_id: RaftGroupId) -> Option<PathBuf> {
+        Some(raft_memory_bootstrap_marker_dir()?.join(format!(
+            "node-{}-group-{}.bootstrapped",
+            self.node_id, raft_group_id.0
+        )))
+    }
+
+    fn raft_memory_bootstrap_seen(&self, raft_group_id: RaftGroupId) -> bool {
+        if !self.uses_memory_log_store() {
+            return false;
+        }
+        self.raft_memory_bootstrap_marker_path(raft_group_id)
+            .is_some_and(|path| path.exists())
+    }
+
+    fn mark_raft_memory_bootstrap_seen(
+        &self,
+        raft_group_id: RaftGroupId,
+    ) -> Result<(), GroupEngineError> {
+        if !self.uses_memory_log_store() {
+            return Ok(());
+        }
+        let Some(path) = self.raft_memory_bootstrap_marker_path(raft_group_id) else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                GroupEngineError::new(format!("create raft-memory bootstrap marker dir: {err}"))
+            })?;
+        }
+        std::fs::write(&path, b"initialized\n").map_err(|err| {
+            GroupEngineError::new(format!(
+                "write raft-memory bootstrap marker {}: {err}",
+                path.display()
+            ))
+        })
+    }
+
     fn peer_nodes(&self) -> BTreeMap<u64, BasicNode> {
         self.peers
             .iter()
@@ -481,24 +529,30 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             };
             self.registry.register(placement, engine.raft_handle());
             if self.should_initialize_membership(placement.raft_group_id) {
-                // A designated bootstrap node must not re-bootstrap a group it
-                // restarts into. With an in-memory raft log a restarted
-                // initializer has empty state, so a naive `initialize()` would
-                // create a conflicting fresh membership (term 1) and wedge the
-                // group with no leader. Only a configured persistent snapshot
-                // store makes restart-recovery meaningful; when present, wait
-                // briefly for peers to surface an existing or re-elected leader
-                // and, if one appears, rejoin as a follower (the leader streams
-                // us the latest snapshot from S3) instead of bootstrapping.
-                let recovery_possible = self.snapshot_store.is_some();
+                // An in-memory Raft node is not crash-recoverable. After this
+                // node has once bootstrapped a group, a later empty startup is
+                // a lost-node/rejoin case, not proof that the group is new.
+                // Leave the raft uninitialized so quorum can remove/re-add it
+                // as a learner instead of minting a second empty history.
+                let bootstrap_already_used =
+                    self.raft_memory_bootstrap_seen(placement.raft_group_id);
+                let recovery_possible = self.snapshot_store.is_some() && !bootstrap_already_used;
                 let rejoin_existing_cluster = recovery_possible
                     && engine
                         .observe_any_leader(rejoin_leader_probe_timeout())
                         .await;
-                if !rejoin_existing_cluster {
+                if rejoin_existing_cluster {
+                    self.mark_raft_memory_bootstrap_seen(placement.raft_group_id)?;
+                } else if bootstrap_already_used {
+                    eprintln!(
+                        "raft-memory: skip bootstrap for node {} group {} because this node already initialized it once; waiting for membership repair",
+                        self.node_id, placement.raft_group_id.0
+                    );
+                } else {
                     engine
                         .initialize_membership(self.peer_nodes_for_group(placement.raft_group_id)?)
                         .await?;
+                    self.mark_raft_memory_bootstrap_seen(placement.raft_group_id)?;
                 }
             }
             let engine: Box<dyn GroupEngine> = Box::new(engine);
@@ -539,6 +593,17 @@ mod tests {
         .with_per_group_voters(per_group_voters(&[(0, &[1, 2, 3]), (1, &[2, 3, 4])]))
     }
 
+    fn unique_test_dir(name: &str) -> PathBuf {
+        static TEST_DIR_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let ordinal = TEST_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "ursula-raft-{name}-{}-{}",
+            std::process::id(),
+            ordinal,
+        ))
+    }
+
     #[test]
     fn per_group_static_voters_override_default_peer_set() {
         let factory = factory_for_node(1);
@@ -568,6 +633,38 @@ mod tests {
 
         assert!(node_3.should_initialize_membership(RaftGroupId(1)));
         assert!(!node_1.should_initialize_membership(RaftGroupId(1)));
+    }
+
+    #[test]
+    fn raft_memory_bootstrap_marker_blocks_reinitialize() {
+        let dir = unique_test_dir("memory-bootstrap-marker");
+        let previous = std::env::var_os("URSULA_RAFT_MEMORY_BOOTSTRAP_MARKER_DIR");
+        unsafe {
+            std::env::set_var("URSULA_RAFT_MEMORY_BOOTSTRAP_MARKER_DIR", &dir);
+        }
+
+        let memory_factory = factory_for_node(1).with_per_group_membership_initializers(true);
+        assert!(memory_factory.uses_memory_log_store());
+        assert!(!memory_factory.raft_memory_bootstrap_seen(RaftGroupId(0)));
+        memory_factory
+            .mark_raft_memory_bootstrap_seen(RaftGroupId(0))
+            .expect("write marker");
+        assert!(memory_factory.raft_memory_bootstrap_seen(RaftGroupId(0)));
+
+        let durable_factory = factory_for_node(1).with_raft_log_dir(dir.join("raft-log"));
+        assert!(!durable_factory.uses_memory_log_store());
+        assert!(!durable_factory.raft_memory_bootstrap_seen(RaftGroupId(0)));
+
+        if let Some(previous) = previous {
+            unsafe {
+                std::env::set_var("URSULA_RAFT_MEMORY_BOOTSTRAP_MARKER_DIR", previous);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("URSULA_RAFT_MEMORY_BOOTSTRAP_MARKER_DIR");
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
