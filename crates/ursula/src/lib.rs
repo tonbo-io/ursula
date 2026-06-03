@@ -377,7 +377,7 @@ impl NodeMemoryMonitor {
                         let breadcrumb = format!(
                             "{{\"event\":\"memory_abort_cap_exit\",\"ts_ms\":{now_ms},\"host\":\"{host}\",\"rss_bytes\":{rss},\"abort_cap_bytes\":{cap}}}",
                         );
-                        eprintln!("{breadcrumb}");
+                        tracing::error!("{breadcrumb}");
                         use std::io::Write as _;
                         let _ = std::io::stderr().flush();
                         std::process::exit(134);
