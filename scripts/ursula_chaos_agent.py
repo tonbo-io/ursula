@@ -687,28 +687,32 @@ class ChaosAgent:
                     f"{next_offset_header!r}: {exc}"
                 ) from exc
             end_offset = next_offset_value
+            committed_new_record = status == 200
             with self.state_lock:
                 # Derive the record's true start from the server-reported
                 # end. The local `start_offset` snapshotted before the HTTP
-                # call can be stale under concurrent lanes, and on dedup'd
-                # 204 retries the server returns the offsets of the
-                # original commit; in both cases `end_offset - len(payload)`
-                # matches what the server used for its setsum.
+                # call can be stale under concurrent lanes; for fresh commits,
+                # `end_offset - len(payload)` matches what the server used for
+                # its setsum. A producer dedup retry returns 204 with the
+                # original commit's end offset and does not mutate the stream.
                 record_start_offset = end_offset - len(payload)
-                stream.next_offset = max(stream.next_offset + len(payload), end_offset)
-                stream.expected_live_setsum.insert_vectored(
-                    [
-                        b"ursula-stream-record-v1",
-                        BUCKET.encode(),
-                        b"\0",
-                        stream.name.encode(),
-                        b"\0",
-                        record_start_offset.to_bytes(8, "little"),
-                        end_offset.to_bytes(8, "little"),
-                        b"inline",
-                        payload,
-                    ]
-                )
+                if committed_new_record:
+                    stream.next_offset = max(stream.next_offset + len(payload), end_offset)
+                    stream.expected_live_setsum.insert_vectored(
+                        [
+                            b"ursula-stream-record-v1",
+                            BUCKET.encode(),
+                            b"\0",
+                            stream.name.encode(),
+                            b"\0",
+                            record_start_offset.to_bytes(8, "little"),
+                            end_offset.to_bytes(8, "little"),
+                            b"inline",
+                            payload,
+                        ]
+                    )
+                else:
+                    stream.next_offset = max(stream.next_offset, end_offset)
                 producer.last_seq = producer_seq
                 producer.last_stream = stream.name
                 producer.last_append_ordinal = producer_seq
