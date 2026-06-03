@@ -286,10 +286,6 @@ impl CoreWorker {
                     debug_assert_eq!(placement.core_id, self.core_id);
                     let incoming_bytes =
                         u64::try_from(request.initial_payload.len()).expect("payload len fits u64");
-                    if let Some(err) = self.early_cold_backpressure(placement, incoming_bytes) {
-                        let _ = response_tx.send(Err(err));
-                        continue;
-                    }
                     if let Some(err) =
                         self.early_raft_uncommitted_backpressure(placement, incoming_bytes)
                     {
@@ -614,10 +610,6 @@ impl CoreWorker {
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
                     let incoming_bytes = request.payload_len();
-                    if let Some(err) = self.early_cold_backpressure(placement, incoming_bytes) {
-                        let _ = response_tx.send(Err(err));
-                        continue;
-                    }
                     if let Some(err) =
                         self.early_raft_uncommitted_backpressure(placement, incoming_bytes)
                     {
@@ -658,10 +650,6 @@ impl CoreWorker {
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
                     let incoming_bytes = append_batch_payload_bytes(&request);
-                    if let Some(err) = self.early_cold_backpressure(placement, incoming_bytes) {
-                        let _ = response_tx.send(Err(err));
-                        continue;
-                    }
                     if let Some(err) =
                         self.early_raft_uncommitted_backpressure(placement, incoming_bytes)
                     {
@@ -730,35 +718,6 @@ impl CoreWorker {
                 }
             }
         }
-    }
-
-    fn early_cold_backpressure(
-        &self,
-        placement: ShardPlacement,
-        incoming_bytes: u64,
-    ) -> Option<RuntimeError> {
-        let limit = self.cold_write_admission.max_hot_bytes_per_group?;
-        let current_hot_bytes = self
-            .metrics
-            .cold_hot_bytes_for_group(placement.raft_group_id);
-        if current_hot_bytes.saturating_add(incoming_bytes) <= limit {
-            return None;
-        }
-        self.metrics.record_cold_backpressure(
-            placement.core_id,
-            placement.raft_group_id,
-            incoming_bytes,
-            limit,
-        );
-        Some(RuntimeError::GroupEngine {
-            core_id: placement.core_id,
-            raft_group_id: placement.raft_group_id,
-            message: format!(
-                "ColdBackpressure: group hot bytes {current_hot_bytes} plus incoming {incoming_bytes} would exceed limit {limit}"
-            ),
-            next_offset: None,
-            leader_hint: None,
-        })
     }
 
     fn early_raft_uncommitted_backpressure(
