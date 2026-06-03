@@ -322,6 +322,7 @@ class WorkloadStream:
     expected_live_setsum: Setsum | None = None
     producer_epochs: dict[str, int] | None = None
     producer_seqs: dict[str, int] | None = None
+    pending_producer_appends: dict[str, bytes] | None = None
     def __post_init__(self) -> None:
         if self.expected_live_setsum is None:
             self.expected_live_setsum = Setsum()
@@ -329,6 +330,8 @@ class WorkloadStream:
             self.producer_epochs = {}
         if self.producer_seqs is None:
             self.producer_seqs = {}
+        if self.pending_producer_appends is None:
+            self.pending_producer_appends = {}
 
 
 class ChaosAgent:
@@ -531,6 +534,27 @@ class ChaosAgent:
             print(f"{iso(utc_now())} WARN unable to restore previous status: {exc}", flush=True)
             return None
 
+    def record_expected_append(
+        self,
+        stream: WorkloadStream,
+        record_start_offset: int,
+        end_offset: int,
+        payload: bytes,
+    ) -> None:
+        stream.expected_live_setsum.insert_vectored(
+            [
+                b"ursula-stream-record-v1",
+                BUCKET.encode(),
+                b"\0",
+                stream.name.encode(),
+                b"\0",
+                record_start_offset.to_bytes(8, "little"),
+                end_offset.to_bytes(8, "little"),
+                b"inline",
+                payload,
+            ]
+        )
+
     def request(
         self,
         method: str,
@@ -630,6 +654,7 @@ class ChaosAgent:
             producer_epoch = producer.epoch
             stream_name = stream.name
             producer_id = producer.producer_id
+            pending_key = f"{producer_id}\0{producer_epoch}\0{producer_seq}"
             payload_size = self.payload_sizes[producer_seq % len(self.payload_sizes)]
             payload_kind = self.payload_kinds[producer_seq % len(self.payload_kinds)] if self.payload_kinds else "ascii"
             payload = self.build_payload(
@@ -689,27 +714,25 @@ class ChaosAgent:
             end_offset = next_offset_value
             committed_new_record = status == 200
             with self.state_lock:
-                # Derive the record's true start from the server-reported
-                # end. The local `start_offset` snapshotted before the HTTP
-                # call can be stale under concurrent lanes; for fresh commits,
-                # `end_offset - len(payload)` matches what the server used for
-                # its setsum. A producer dedup retry returns 204 with the
-                # original commit's end offset and does not mutate the stream.
-                record_start_offset = end_offset - len(payload)
+                pending_payload = stream.pending_producer_appends.pop(pending_key, None)
                 if committed_new_record:
-                    stream.next_offset = max(stream.next_offset + len(payload), end_offset)
-                    stream.expected_live_setsum.insert_vectored(
-                        [
-                            b"ursula-stream-record-v1",
-                            BUCKET.encode(),
-                            b"\0",
-                            stream.name.encode(),
-                            b"\0",
-                            record_start_offset.to_bytes(8, "little"),
-                            end_offset.to_bytes(8, "little"),
-                            b"inline",
-                            payload,
-                        ]
+                    # Derive the record's true start from the server-reported
+                    # end. The local `start_offset` snapshotted before the HTTP
+                    # call can be stale under concurrent lanes.
+                    record_start_offset = end_offset - len(payload)
+                    stream.next_offset = max(stream.next_offset, end_offset)
+                    self.record_expected_append(stream, record_start_offset, end_offset, payload)
+                elif pending_payload is not None:
+                    # 204 is a producer dedup acknowledgement. If the original
+                    # append timed out but committed, account the original
+                    # payload exactly once when the dedup response proves it.
+                    record_start_offset = end_offset - len(pending_payload)
+                    stream.next_offset = max(stream.next_offset, end_offset)
+                    self.record_expected_append(
+                        stream,
+                        record_start_offset,
+                        end_offset,
+                        pending_payload,
                     )
                 else:
                     stream.next_offset = max(stream.next_offset, end_offset)
@@ -744,6 +767,7 @@ class ChaosAgent:
                 else:
                     self.lane_unresolved_appends[lane_id % self.append_workers] = False
             else:
+                stream.pending_producer_appends.setdefault(pending_key, payload)
                 self.append_errors += 1
                 if lane_id is None:
                     self.global_unresolved_append = True
@@ -856,9 +880,12 @@ class ChaosAgent:
         return (prefix + filler)[:size]
 
     def verify_integrity(self) -> None:
+        if self.workload_probes_paused():
+            return
         with self.state_lock:
             has_unresolved_appends = self.global_unresolved_append or any(self.lane_unresolved_appends)
-        if has_unresolved_appends:
+            has_pending_appends = any(stream.pending_producer_appends for stream in self.streams)
+        if has_unresolved_appends or has_pending_appends:
             return
         mode = "setsum"
         self.verify_attempts += 1
