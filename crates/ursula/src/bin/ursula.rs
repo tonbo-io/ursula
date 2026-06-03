@@ -235,11 +235,11 @@ fn init_tracing() {
         .try_init();
 }
 
-/// CLI argument schema for clap derive.
-///
-/// Several invariants (duplicate-peer detection, cross-field defaults, config
-/// file merge) cannot be expressed declaratively with `#[derive(Parser)]`.
-/// Post-processing happens in [`TryFrom<RawArgs> for Args`].
+// CLI argument schema for clap derive.
+//
+// Several invariants (duplicate-peer detection, cross-field defaults, config
+// file merge) cannot be expressed declaratively with `#[derive(Parser)]`.
+// Post-processing happens in [`TryFrom<RawArgs> for Args`].
 #[derive(Parser, Debug)]
 #[command(
     version,
