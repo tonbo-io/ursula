@@ -1937,6 +1937,35 @@ async fn cold_write_admission_rejects_append_batch_without_partial_mutation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_write_admission_does_not_preempt_non_local_write_engine() {
+    let factory = RecordingFactory::without_local_writes().with_cold_hot_bytes(8);
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
+        factory,
+    )
+    .expect("spawn runtime");
+    let stream = BucketStreamId::new("benchcmp", "cold-admission-non-local");
+
+    runtime
+        .create_stream(CreateStreamRequest::new(
+            stream.clone(),
+            DEFAULT_CONTENT_TYPE,
+        ))
+        .await
+        .expect("create reaches non-local engine");
+    assert_eq!(runtime.metrics().snapshot().cold_hot_bytes, 8);
+
+    runtime
+        .append(AppendRequest::from_bytes(stream, b"x".to_vec()))
+        .await
+        .expect("append reaches non-local engine despite local cold backlog");
+
+    let metrics = runtime.metrics().snapshot();
+    assert_eq!(metrics.accepted_appends, 1);
+    assert_eq!(metrics.cold_backpressure_events, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flush_cold_group_once_selects_stream_inside_owner_group() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
@@ -3500,6 +3529,7 @@ async fn wal_group_engine_recovers_producer_append_batch_dedup_state() {
 struct RecordingFactory {
     created: Arc<Mutex<Vec<ShardPlacement>>>,
     accepts_local_writes: bool,
+    cold_hot_bytes: u64,
 }
 
 impl Default for RecordingFactory {
@@ -3507,6 +3537,7 @@ impl Default for RecordingFactory {
         Self {
             created: Arc::default(),
             accepts_local_writes: true,
+            cold_hot_bytes: 0,
         }
     }
 }
@@ -3517,6 +3548,11 @@ impl RecordingFactory {
             accepts_local_writes: false,
             ..Self::default()
         }
+    }
+
+    fn with_cold_hot_bytes(mut self, bytes: u64) -> Self {
+        self.cold_hot_bytes = bytes;
+        self
     }
 
     fn created(&self) -> Vec<ShardPlacement> {
@@ -3539,6 +3575,7 @@ impl GroupEngineFactory for RecordingFactory {
                 placement,
                 commit_index: 0,
                 accepts_local_writes: self.accepts_local_writes,
+                cold_hot_bytes: self.cold_hot_bytes,
             });
             Ok(engine)
         })
@@ -3549,6 +3586,7 @@ struct RecordingEngine {
     placement: ShardPlacement,
     commit_index: u64,
     accepts_local_writes: bool,
+    cold_hot_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -3982,6 +4020,21 @@ impl GroupEngine for RecordingEngine {
                 }));
             }
             Ok(GroupAppendBatchResponse { placement, items })
+        })
+    }
+
+    fn cold_hot_backlog<'a>(
+        &'a mut self,
+        stream_id: BucketStreamId,
+        placement: ShardPlacement,
+    ) -> GroupColdHotBacklogFuture<'a> {
+        Box::pin(async move {
+            assert_eq!(placement, self.placement);
+            Ok(ColdHotBacklog {
+                stream_id,
+                stream_hot_bytes: self.cold_hot_bytes,
+                group_hot_bytes: self.cold_hot_bytes,
+            })
         })
     }
 

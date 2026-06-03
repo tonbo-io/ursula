@@ -925,11 +925,6 @@ impl RuntimeMetricsInner {
             .fetch_max_relaxed(stream_hot_bytes);
     }
 
-    pub(crate) fn cold_hot_bytes_for_group(&self, group_id: RaftGroupId) -> u64 {
-        let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        self.per_group_cold_hot_bytes[group_index].load_relaxed()
-    }
-
     pub(crate) fn record_cold_backpressure(
         &self,
         core_id: CoreId,
