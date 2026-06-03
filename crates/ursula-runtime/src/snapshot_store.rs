@@ -323,12 +323,10 @@ mod s3 {
         /// Build a per-attempt-unique S3 key. The openraft `snapshot_id` is
         /// derived from `last_applied_log_id`, so two builds during an
         /// apply-idle window compute the SAME snapshot_id. If the S3 key also
-        /// matched, the second build's `schedule_previous_snapshot_gc` would
-        /// schedule a delete of the very object we just rewrote — 300s later
-        /// the current snapshot vanishes (this exact path wedged group-4 on
-        /// 2026-05-31). A nanosecond + per-process counter suffix keeps the
-        /// physical S3 key unique per upload attempt without changing the
-        /// openraft-visible snapshot_id.
+        /// matched, two distinct published pointers could alias one physical
+        /// object. A nanosecond + per-process counter suffix keeps the physical
+        /// S3 key unique per upload attempt without changing the openraft-visible
+        /// snapshot_id.
         fn object_key(&self, key: &SnapshotKey) -> String {
             use std::sync::atomic::{AtomicU64, Ordering};
             static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -707,9 +705,8 @@ mod tests {
     async fn s3_two_uploads_with_same_snapshot_id_get_different_keys() {
         // Regression for the 2026-05-31 wedge: snapshot_id is derived from
         // last_applied_log_id, so two builds during apply-idle compute the
-        // same id. The S3 object key must still be unique per attempt, else
-        // schedule_previous_snapshot_gc deletes the live object on the next
-        // build's GC tick.
+        // same id. The S3 object key must still be unique per attempt so
+        // distinct published pointers never alias one physical object.
         let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
         let key1 = test_key(4, "group-4-T18-N3-264150");
         let key2 = test_key(4, "group-4-T18-N3-264150");

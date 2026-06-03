@@ -277,11 +277,19 @@ class Ec2Ops:
         return args
 
     def install_service(self, node: Node, restart: bool = True) -> None:
+        service_env = dict(self.config.cold_env)
+        if self.config.raft_memory:
+            service_env.setdefault(
+                "URSULA_RAFT_MEMORY_BOOTSTRAP_MARKER_DIR",
+                "/tmp/ursula-raft-memory-bootstrap",
+            )
         env_lines = "\n".join(
             f"Environment={key}={value}"
-            for key, value in sorted(self.config.cold_env.items())
+            for key, value in sorted(service_env.items())
         )
         exec_start = " ".join(shlex.quote(arg) for arg in self.node_command(node))
+        restart_policy = "no" if self.config.raft_memory else "always"
+        restart_sec = "" if self.config.raft_memory else "RestartSec=3"
         unit = f"""[Unit]
 Description=Ursula chaos node {node.id}
 After=network-online.target
@@ -293,8 +301,8 @@ User={self.config.ssh_user}
 WorkingDirectory=/tmp
 {env_lines}
 ExecStart={exec_start}
-Restart=always
-RestartSec=3
+Restart={restart_policy}
+{restart_sec}
 LimitNOFILE=1048576
 LimitCORE=0
 
@@ -305,6 +313,7 @@ WantedBy=multi-user.target
             [
                 "set -euo pipefail",
                 f"test -x {shlex.quote(self.config.binary)}",
+                *self.raft_log_dir_setup_commands(node),
                 "sudo tee /etc/systemd/system/ursula-chaos.service >/dev/null <<'EOF'",
                 unit,
                 "EOF",
@@ -315,6 +324,15 @@ WantedBy=multi-user.target
         if restart:
             command = "\n".join([command, "sudo systemctl restart ursula-chaos.service"])
         self.ssh(node, command)
+
+    def raft_log_dir_setup_commands(self, node: Node) -> list[str]:
+        if self.config.raft_memory or not self.config.raft_log_prefix:
+            return []
+        raft_log_dir = f"{self.config.raft_log_prefix}-{node.id}"
+        return [
+            f"sudo mkdir -p {shlex.quote(raft_log_dir)}",
+            f"sudo chown -R {shlex.quote(self.config.ssh_user)}:{shlex.quote(self.config.ssh_user)} {shlex.quote(raft_log_dir)}",
+        ]
 
     def metrics(self, node: Node) -> dict[str, Any]:
         command = f"curl -fsS http://127.0.0.1:{self.config.port}/__ursula/metrics"
@@ -588,12 +606,6 @@ WantedBy=multi-user.target
             str(args.burst_every),
             "--burst-appends",
             str(args.burst_appends),
-            "--backpressure-probe-every",
-            str(args.backpressure_probe_every),
-            "--backpressure-probe-bytes",
-            str(args.backpressure_probe_bytes),
-            "--backpressure-probe-max-appends",
-            str(args.backpressure_probe_max_appends),
             "--status-every",
             str(args.status_every),
             "--fault-min-secs",
@@ -779,9 +791,6 @@ def build_parser() -> argparse.ArgumentParser:
     chaos_agent.add_argument("--old-sample-every", type=int, default=128)
     chaos_agent.add_argument("--burst-every", type=int, default=300)
     chaos_agent.add_argument("--burst-appends", type=int, default=200)
-    chaos_agent.add_argument("--backpressure-probe-every", type=int, default=0)
-    chaos_agent.add_argument("--backpressure-probe-bytes", type=int, default=65535)
-    chaos_agent.add_argument("--backpressure-probe-max-appends", type=int, default=1024)
     chaos_agent.add_argument("--status-every", type=int, default=15)
     chaos_agent.add_argument("--fault-min-secs", type=int, default=900)
     chaos_agent.add_argument("--fault-max-secs", type=int, default=1800)
@@ -835,9 +844,6 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_chaos.add_argument("--old-sample-every", type=int, default=128)
     deploy_chaos.add_argument("--burst-every", type=int, default=300)
     deploy_chaos.add_argument("--burst-appends", type=int, default=200)
-    deploy_chaos.add_argument("--backpressure-probe-every", type=int, default=0)
-    deploy_chaos.add_argument("--backpressure-probe-bytes", type=int, default=65535)
-    deploy_chaos.add_argument("--backpressure-probe-max-appends", type=int, default=1024)
     deploy_chaos.add_argument("--status-every", type=int, default=15)
     deploy_chaos.add_argument("--fault-min-secs", type=int, default=900)
     deploy_chaos.add_argument("--fault-max-secs", type=int, default=1800)

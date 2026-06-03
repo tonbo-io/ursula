@@ -26,7 +26,7 @@ pub use bootstrap::{
 };
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -572,6 +572,10 @@ pub fn client_router_from_state(state: HttpState) -> Router {
             post(trigger_raft_purge),
         )
         .route(
+            "/__ursula/raft/{raft_group_id}/membership",
+            post(change_raft_membership),
+        )
+        .route(
             "/__ursula/raft/{raft_group_id}/learners/{node_id}",
             post(add_raft_learner),
         )
@@ -1091,6 +1095,95 @@ pub(crate) async fn add_raft_learner(
         )
             .into_response(),
     }
+}
+
+pub(crate) async fn change_raft_membership(
+    State(state): State<HttpState>,
+    Path(raft_group_id): Path<u64>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let query = match parse_query(raw_query.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
+    };
+    let Some(raw_voters) = query.get("voters").filter(|value| !value.trim().is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "voters query parameter is required",
+        )
+            .into_response();
+    };
+    let voters = match parse_voter_ids(raw_voters) {
+        Ok(voters) => voters,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let Some(registry) = state.raft_registry() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "raft registry is not configured for this server",
+        )
+            .into_response();
+    };
+    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
+    };
+    let Some(raft) = registry.get(raft_group_id) else {
+        return (StatusCode::NOT_FOUND, "raft group is not registered").into_response();
+    };
+    let metrics = raft.metrics().borrow_watched().clone();
+    if metrics.current_leader != Some(metrics.id) {
+        return (
+            StatusCode::CONFLICT,
+            [("content-type", "application/json")],
+            format!(
+                "{{\"raft_group_id\":{},\"current_leader\":{},\"changed\":false,\"reason\":\"not leader\"}}",
+                raft_group_id.0,
+                optional_u64_json(metrics.current_leader)
+            ),
+        )
+            .into_response();
+    }
+
+    match raft.change_membership(voters.clone(), false).await {
+        Ok(response) => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            format!(
+                "{{\"raft_group_id\":{},\"voter_ids\":[{}],\"log_index\":{},\"changed\":true}}",
+                raft_group_id.0,
+                voters
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                response.log_id.index()
+            ),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("change raft membership: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+pub(crate) fn parse_voter_ids(raw: &str) -> Result<BTreeSet<u64>, String> {
+    let mut voters = BTreeSet::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err("voters contains an empty node id".to_owned());
+        }
+        let node_id = part
+            .parse::<u64>()
+            .map_err(|err| format!("invalid voter id '{part}': {err}"))?;
+        voters.insert(node_id);
+    }
+    if voters.is_empty() {
+        return Err("voters must not be empty".to_owned());
+    }
+    Ok(voters)
 }
 
 pub(crate) async fn allow_raft_node_next_revert(
