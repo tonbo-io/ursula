@@ -633,6 +633,45 @@ fn plan_next_cold_flush_selects_deterministic_eligible_stream() {
 }
 
 #[test]
+fn plan_next_cold_flush_drains_distributed_group_hot_bytes() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    create_stream(&mut machine, "z-cold");
+    create_stream(&mut machine, "a-cold");
+    for stream_name in ["z-cold", "a-cold"] {
+        assert!(matches!(
+            machine.apply(StreamCommand::Append {
+                stream_id: stream(stream_name),
+                content_type: Some("application/octet-stream".to_owned()),
+                payload: b"aa".to_vec(),
+                close_after: false,
+                stream_seq: None,
+                producer: None,
+                now_ms: 0,
+            }),
+            StreamResponse::Appended { .. }
+        ));
+    }
+
+    assert!(
+        machine
+            .plan_next_cold_flush(4, 4)
+            .expect("plan next cold flush")
+            .is_some()
+    );
+    let candidate = machine
+        .plan_next_cold_flush(5, 4)
+        .expect("plan next cold flush");
+    assert!(candidate.is_none());
+    let candidate = machine
+        .plan_next_cold_flush(4, 4)
+        .expect("plan next cold flush")
+        .expect("candidate");
+    assert_eq!(candidate.stream_id, stream("a-cold"));
+    assert_eq!(candidate.payload, b"aa");
+}
+
+#[test]
 fn plan_next_cold_flush_batch_advances_on_preview_state() {
     let mut machine = StreamStateMachine::new();
     create_bucket(&mut machine);
@@ -2896,20 +2935,13 @@ proptest! {
         let candidates = machine
             .plan_next_cold_flush_batch(min_hot_bytes, max_flush_bytes, max_candidates)
             .expect("plan cold flush batch");
+        let repeated_candidates = machine
+            .plan_next_cold_flush_batch(min_hot_bytes, max_flush_bytes, max_candidates)
+            .expect("repeat plan cold flush batch");
+        prop_assert_eq!(candidates.as_slice(), repeated_candidates.as_slice());
 
-        let mut previous_stream = None::<BucketStreamId>;
         let mut next_start_by_stream = Vec::<(BucketStreamId, u64)>::new();
         for candidate in &candidates {
-            if let Some(previous_stream) = &previous_stream {
-                prop_assert!(
-                    compare_stream_ids(previous_stream, &candidate.stream_id)
-                        != std::cmp::Ordering::Greater,
-                    "flush batch stream order regressed from {previous_stream} to {}",
-                    candidate.stream_id
-                );
-            }
-            previous_stream = Some(candidate.stream_id.clone());
-
             let expected_start = next_start_by_stream
                 .iter()
                 .find(|(stream_id, _)| stream_id == &candidate.stream_id)

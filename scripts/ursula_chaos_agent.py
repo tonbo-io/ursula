@@ -1715,7 +1715,11 @@ class ChaosAgent:
                 run(["aws", "ec2", "start-instances", "--instance-ids", *[node.instance_id for node in targets]], check=False)
             else:
                 cleared = True
-                for node in targets:
+                # Single-active-fault invariant: when an impairment fault
+                # recovers, no node should retain faultd-owned kernel state.
+                # Clear every node so stale state from an older run or a lost
+                # target record cannot survive behind active_fault=None.
+                for node in self.nodes:
                     cleared = self.clear_node_impairment(node) and cleared
                 if not cleared:
                     self.active_fault["recover_at"] = now + timedelta(seconds=self.repair_retry_secs)
@@ -1731,7 +1735,7 @@ class ChaosAgent:
                                 "status": "clear_failed",
                                 "message": (
                                     f"recovery attempt {clear_attempts} could not confirm faultd clear "
-                                    f"for {', '.join(node.name for node in targets)}; retaining active fault"
+                                    "for all nodes; retaining active fault"
                                 ),
                             }
                         )
@@ -1891,7 +1895,7 @@ class ChaosAgent:
         target_label = ", ".join(node.name for node in targets)
         if injection.get("cleanup") == "clear_impairment":
             cleared = True
-            for node in targets:
+            for node in self.nodes:
                 cleared = self.clear_node_impairment(node) and cleared
             repair_status = "repairing" if cleared else "repair_clear_failed"
             injection["status"] = repair_status
@@ -1903,9 +1907,9 @@ class ChaosAgent:
                     "message": (
                         f"recovery missed SLO; repair attempt {repair_count} "
                         + (
-                            f"confirmed impairment clear on {target_label}"
+                            "confirmed impairment clear on all nodes"
                             if cleared
-                            else f"could not confirm faultd clear on {target_label}"
+                            else "could not confirm faultd clear on all nodes"
                         )
                     ),
                 }
