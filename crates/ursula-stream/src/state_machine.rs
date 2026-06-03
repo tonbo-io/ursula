@@ -499,8 +499,24 @@ impl StreamStateMachine {
         }
         let mut stream_ids = self.streams.keys().cloned().collect::<Vec<_>>();
         stream_ids.sort_by(compare_stream_ids);
+        for stream_id in &stream_ids {
+            match self.plan_cold_flush(stream_id, min_hot_bytes, max_flush_bytes) {
+                Ok(Some(candidate)) => return Ok(Some(candidate)),
+                Ok(None) => {}
+                Err(StreamResponse::Error {
+                    code: StreamErrorCode::StreamGone | StreamErrorCode::StreamNotFound,
+                    ..
+                }) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        let group_min_hot_bytes = u64::try_from(min_hot_bytes).unwrap_or(u64::MAX);
+        let group_hot_bytes = self.total_hot_payload_bytes();
+        if group_hot_bytes < group_min_hot_bytes {
+            return Ok(None);
+        }
         for stream_id in stream_ids {
-            match self.plan_cold_flush(&stream_id, min_hot_bytes, max_flush_bytes) {
+            match self.plan_cold_flush(&stream_id, 1, max_flush_bytes) {
                 Ok(Some(candidate)) => return Ok(Some(candidate)),
                 Ok(None) => {}
                 Err(StreamResponse::Error {
