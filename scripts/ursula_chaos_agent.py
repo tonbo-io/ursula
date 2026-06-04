@@ -378,7 +378,6 @@ class ChaosAgent:
         self.read_probe_every = max(1, args.read_probe_every)
         self.aws_timeout_secs = max(1, args.aws_timeout_secs)
         self.producer_count = max(1, args.producer_count, self.append_workers)
-        self.epoch_bump_every = args.epoch_bump_every
         self.producer_probe_every = args.producer_probe_every
         self.burst_every = args.burst_every
         self.burst_appends = args.burst_appends
@@ -402,7 +401,6 @@ class ChaosAgent:
         self.lane_attempts = [0 for _ in range(self.append_workers)]
         self.lane_unresolved_appends = [False for _ in range(self.append_workers)]
         self.global_unresolved_append = False
-        self.last_epoch_bump_success: int | None = None
         self.append_errors = 0
         # Appends rejected on every node solely with `503 ColdBackpressure`
         # are a clean pre-commit load-shed (the server is protecting the hot
@@ -663,17 +661,6 @@ class ChaosAgent:
                 lane_attempt = self.lane_attempts[lane]
                 stream = self.streams[(lane + lane_attempt * self.append_workers) % len(self.streams)]
                 producer = self.producers[lane % len(self.producers)]
-            if (
-                self.epoch_bump_every > 0
-                and self.append_success > 0
-                and self.append_success % self.epoch_bump_every == 0
-                and self.last_epoch_bump_success != self.append_success
-            ):
-                producer.epoch += 1
-                for candidate in self.streams:
-                    candidate.producer_seqs[producer.producer_id] = 0
-                self.event("info", f"{producer.producer_id} bumped epoch to {producer.epoch}")
-                self.last_epoch_bump_success = self.append_success
             stream.producer_epochs[producer.producer_id] = producer.epoch
             producer_seq = stream.producer_seqs.get(producer.producer_id, 0)
             start_offset = stream.next_offset
@@ -1234,7 +1221,8 @@ class ChaosAgent:
         self.setsum_mismatch_count += 1
         def sample_detail(sample: dict[str, Any]) -> str:
             return (
-                f"{sample['node']}=live:{sample['live_setsum']}"
+                f"{sample['node']}={sample['stream']}"
+                f"/live:{sample['live_setsum']}"
                 f"/total:{sample['total_setsum']}"
                 f"/evicted:{sample['evicted_records']}"
                 f"/next:{sample['next_offset']}"
@@ -2794,7 +2782,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--payload-sizes", default="128,1024,16384,65536")
     parser.add_argument("--payload-kinds", default="ascii,binary,zero,utf8")
     parser.add_argument("--producer-count", type=int, default=8)
-    parser.add_argument("--epoch-bump-every", type=int, default=5000)
+    parser.add_argument("--epoch-bump-every", type=int, default=0)
     parser.add_argument("--producer-probe-every", type=int, default=200)
     parser.add_argument("--reader-count", type=int, default=2)
     parser.add_argument("--verify-modes", default="latest,recent,old,cold")

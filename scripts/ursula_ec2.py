@@ -590,8 +590,6 @@ WantedBy=multi-user.target
             args.payload_kinds,
             "--producer-count",
             str(args.producer_count),
-            "--epoch-bump-every",
-            str(args.epoch_bump_every),
             "--producer-probe-every",
             str(args.producer_probe_every),
             "--reader-count",
@@ -832,7 +830,7 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_chaos.add_argument("--payload-sizes", default="128,1024,16384,65536")
     deploy_chaos.add_argument("--payload-kinds", default="ascii,binary,zero,utf8")
     deploy_chaos.add_argument("--producer-count", type=int, default=8)
-    deploy_chaos.add_argument("--epoch-bump-every", type=int, default=5000)
+    deploy_chaos.add_argument("--epoch-bump-every", type=int, default=0)
     deploy_chaos.add_argument("--producer-probe-every", type=int, default=200)
     deploy_chaos.add_argument("--reader-count", type=int, default=2)
     deploy_chaos.add_argument("--verify-modes", default="latest,recent,old,cold")
