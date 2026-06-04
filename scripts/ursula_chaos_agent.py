@@ -1007,14 +1007,6 @@ class ChaosAgent:
             error = self.probe_read_availability(stream)
             if error is None:
                 self.reader_success += 1
-                # Self-heal: a fully successful cross-node read clears any
-                # integrity-error left over from earlier transient noise (e.g. a
-                # node-restart window). Without this, last_integrity_error is
-                # sticky until verify_server_integrity happens to fire and pass,
-                # which can leave integrity_status=major_outage long after the
-                # cluster is healthy and block recovery lifecycle on the next
-                # injection.
-                self.last_integrity_error = None
             else:
                 self.reader_errors += 1
                 availability_error = self.is_read_availability_error(error)
