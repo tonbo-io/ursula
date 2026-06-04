@@ -1030,7 +1030,15 @@ pub(crate) async fn trigger_raft_snapshot(
     if let Some(snapshot_log_id) = snapshot_log_id
         && let Err(err) = raft
             .wait(Some(Duration::from_secs(10)))
-            .snapshot(snapshot_log_id, "admin snapshot trigger")
+            .metrics(
+                |metrics| {
+                    metrics
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot >= &snapshot_log_id)
+                },
+                format!("admin snapshot trigger .snapshot >= {snapshot_log_id}"),
+            )
             .await
     {
         return (

@@ -491,9 +491,8 @@ pub(crate) fn load_log_store_inner(path: &Path) -> Result<RaftGroupLogStoreInner
         return Ok(RaftGroupLogStoreInner::default());
     }
 
-    let bytes = fs::read(path)?;
     let mut inner = RaftGroupLogStoreInner::default();
-    for (record_index, record) in read_protobuf_frames::<RaftGroupLogRecord>(&bytes)?
+    for (record_index, record) in read_protobuf_frames_from_file::<RaftGroupLogRecord>(path)?
         .into_iter()
         .enumerate()
     {
@@ -519,13 +518,8 @@ pub(crate) fn load_log_store_inner_from_core_journal(
         return Ok(RaftGroupLogStoreInner::default());
     }
 
-    let bytes = fs::read(journal_path)?;
-    if bytes.is_empty() {
-        return Ok(RaftGroupLogStoreInner::default());
-    }
-
     let mut inner = RaftGroupLogStoreInner::default();
-    for (record_index, record) in read_protobuf_frames::<CoreJournalRecord>(&bytes)?
+    for (record_index, record) in read_protobuf_frames_from_file::<CoreJournalRecord>(journal_path)?
         .into_iter()
         .enumerate()
     {
@@ -554,6 +548,17 @@ pub(crate) fn load_log_store_inner_from_core_journal(
         })?;
     }
     Ok(inner)
+}
+
+pub(crate) fn read_protobuf_frames_from_file<M: Message + Default>(
+    path: &Path,
+) -> Result<Vec<M>, io::Error> {
+    let bytes = fs::read(path)?;
+    let (records, valid_len) = read_protobuf_frames_with_valid_len::<M>(&bytes)?;
+    if valid_len < bytes.len() {
+        truncate_file_to_len(path, valid_len)?;
+    }
+    Ok(records)
 }
 
 pub(crate) fn append_log_store_record(
@@ -596,16 +601,28 @@ pub(crate) fn write_protobuf_frame_to_file<M: Message>(
     file.write_all(&bytes)
 }
 
+#[cfg(test)]
 pub(crate) fn read_protobuf_frames<M: Message + Default>(
     bytes: &[u8],
 ) -> Result<Vec<M>, io::Error> {
+    read_protobuf_frames_with_valid_len(bytes).map(|(records, _)| records)
+}
+
+pub(crate) fn read_protobuf_frames_with_valid_len<M: Message + Default>(
+    bytes: &[u8],
+) -> Result<(Vec<M>, usize), io::Error> {
     if bytes.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
 
     let mut cursor = Cursor::new(bytes);
     let mut records = Vec::new();
     while usize::try_from(cursor.position()).expect("cursor position fits usize") < bytes.len() {
+        let frame_start = usize::try_from(cursor.position()).expect("cursor position fits usize");
+        if bytes.len() - frame_start < 4 {
+            return Ok((records, frame_start));
+        }
+
         let mut len_bytes = [0_u8; 4];
         cursor.read_exact(&mut len_bytes)?;
         let len = usize::try_from(u32::from_le_bytes(len_bytes)).expect("u32 fits usize");
@@ -617,15 +634,18 @@ pub(crate) fn read_protobuf_frames<M: Message + Default>(
             )
         })?;
         if end > bytes.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "OpenRaft journal frame extends past end of file",
-            ));
+            return Ok((records, frame_start));
         }
         records.push(M::decode(&bytes[start..end]).map_err(invalid_data)?);
         cursor.set_position(u64::try_from(end).expect("frame end fits u64"));
     }
-    Ok(records)
+    Ok((records, bytes.len()))
+}
+
+pub(crate) fn truncate_file_to_len(path: &Path, valid_len: usize) -> Result<(), io::Error> {
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(u64::try_from(valid_len).expect("valid protobuf frame offset fits u64"))?;
+    file.sync_data()
 }
 
 pub(crate) fn sync_file_handle(
@@ -720,5 +740,120 @@ pub(crate) fn apply_log_store_record(
             inner.entries.retain(|index, _| *index > log_id.index);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use ursula_shard::{CoreId, RaftGroupId, ShardId};
+
+    static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_journal_path(name: &str) -> PathBuf {
+        let nonce = TEMP_JOURNAL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join("ursula-raft-file-log-tests")
+            .join(format!("{name}-{}-{nonce}.bin", std::process::id()));
+        let _ = fs::remove_file(&path);
+        path
+    }
+
+    fn append_torn_frame(path: &Path) {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("open journal for torn append");
+        file.write_all(&128_u32.to_le_bytes())
+            .expect("write torn frame length");
+        file.write_all(b"torn").expect("write partial torn payload");
+        file.sync_data().expect("sync torn tail");
+    }
+
+    fn committed_vote() -> VoteOf<UrsulaRaftTypeConfig> {
+        openraft::Vote::new_committed(7, 1)
+    }
+
+    #[test]
+    fn load_log_store_inner_truncates_torn_tail() {
+        let path = temp_journal_path("group-log-torn-tail");
+        let vote = committed_vote();
+        let mut handle = RaftGroupFileLogHandle {
+            file: None,
+            parent_needs_sync: true,
+        };
+        append_log_store_record(&path, &mut handle, &save_vote_record(vote))
+            .expect("write complete vote record");
+        drop(handle);
+        let valid_len = fs::metadata(&path).expect("journal metadata").len();
+
+        append_torn_frame(&path);
+        assert!(
+            fs::metadata(&path)
+                .expect("journal metadata after torn append")
+                .len()
+                > valid_len
+        );
+
+        let inner = load_log_store_inner(&path).expect("load journal with torn tail");
+        assert_eq!(inner.vote, Some(vote));
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("journal metadata after recovery")
+                .len(),
+            valid_len
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_core_journal_truncates_torn_tail() {
+        let path = temp_journal_path("core-journal-torn-tail");
+        let placement = ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: RaftGroupId(3),
+        };
+        let vote = committed_vote();
+        let mut handle = RaftGroupFileLogHandle {
+            file: None,
+            parent_needs_sync: true,
+        };
+        write_protobuf_frame_to_file(
+            &path,
+            &mut handle,
+            &CoreJournalRecord {
+                group_id: placement.raft_group_id.0,
+                record: Some(save_vote_record(vote)),
+            },
+        )
+        .expect("write complete core journal record");
+        sync_file_handle(&path, &mut handle).expect("sync complete core journal record");
+        drop(handle);
+        let valid_len = fs::metadata(&path).expect("core journal metadata").len();
+
+        append_torn_frame(&path);
+        assert!(
+            fs::metadata(&path)
+                .expect("core journal metadata after torn append")
+                .len()
+                > valid_len
+        );
+
+        let inner = load_log_store_inner_from_core_journal(&path, placement)
+            .expect("load core journal with torn tail");
+        assert_eq!(inner.vote, Some(vote));
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("core journal metadata after recovery")
+                .len(),
+            valid_len
+        );
+
+        let _ = fs::remove_file(&path);
     }
 }

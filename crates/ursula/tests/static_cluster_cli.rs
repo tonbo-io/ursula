@@ -1,25 +1,32 @@
 use std::collections::HashSet;
+use std::fs::File;
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ursula_runtime::ColdStore;
 
 struct ChildGuard {
     child: Child,
+    label: String,
+    stderr_path: PathBuf,
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if !std::thread::panicking() {
+            let _ = std::fs::remove_file(&self.stderr_path);
+        }
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_cluster_forwards_follower_writes() {
+    let _guard = static_cluster_cli_test_guard().await;
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
         tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping CLI cluster smoke test");
         return;
@@ -43,8 +50,9 @@ async fn cli_static_grpc_raft_cluster_forwards_follower_writes() {
     ];
 
     let client = reqwest::Client::new();
+    let mut children = children;
     for (_, base_url) in &peers {
-        wait_until_ready(&client, base_url).await;
+        wait_until_ready(&client, base_url, &mut children).await;
     }
 
     let response = put_with_body_until_created(
@@ -76,6 +84,7 @@ async fn cli_static_grpc_raft_cluster_forwards_follower_writes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_log_dir_recovers_after_restart() {
+    let _guard = static_cluster_cli_test_guard().await;
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
         tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping CLI durable restart smoke test");
         return;
@@ -97,9 +106,9 @@ async fn cli_static_grpc_raft_log_dir_recovers_after_restart() {
 
     write_single_node_cluster_config(&config_path, &base_url, true);
     {
-        let _child = spawn_node_with_cluster_config(binary, port, 1, &config_path, &log_dir);
+        let mut child = spawn_node_with_cluster_config(binary, port, 1, &config_path, &log_dir);
         let client = reqwest::Client::new();
-        wait_until_ready(&client, &base_url).await;
+        wait_until_ready(&client, &base_url, std::slice::from_mut(&mut child)).await;
         put_until_created(&client, &format!("{base_url}/benchcmp/cli-durable-restart")).await;
         post_until_no_content(
             &client,
@@ -121,9 +130,9 @@ async fn cli_static_grpc_raft_log_dir_recovers_after_restart() {
 
     write_single_node_cluster_config(&config_path, &base_url, false);
     {
-        let _child = spawn_node_with_cluster_config(binary, port, 1, &config_path, &log_dir);
+        let mut child = spawn_node_with_cluster_config(binary, port, 1, &config_path, &log_dir);
         let client = reqwest::Client::new();
-        wait_until_ready(&client, &base_url).await;
+        wait_until_ready(&client, &base_url, std::slice::from_mut(&mut child)).await;
         let payload = read_until_replicated(
             &client,
             &format!("{base_url}/benchcmp/cli-durable-restart?offset=0&max_bytes=64"),
@@ -137,6 +146,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_after_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
+    let _guard = static_cluster_cli_test_guard().await;
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
         tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping CLI durable cluster smoke test");
         return;
@@ -170,7 +180,7 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
         configs.push(config_path);
     }
 
-    let children = vec![
+    let mut children = vec![
         spawn_node_with_cluster_config(binary, ports[1], 4, &configs[1], &root.join("node-2-log")),
         spawn_node_with_cluster_config(binary, ports[2], 4, &configs[2], &root.join("node-3-log")),
         spawn_node_with_cluster_config(binary, ports[0], 4, &configs[0], &root.join("node-1-log")),
@@ -178,7 +188,7 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
 
     let client = reqwest::Client::new();
     for (_, base_url) in &peers {
-        wait_until_ready(&client, base_url).await;
+        wait_until_ready(&client, base_url, &mut children).await;
     }
     put_until_created(
         &client,
@@ -241,6 +251,7 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
+    let _guard = static_cluster_cli_test_guard().await;
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
         tracing::warn!(
             "CARGO_BIN_EXE_ursula is not set; skipping CLI durable late learner smoke test"
@@ -295,8 +306,8 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
     ];
 
     let client = reqwest::Client::new();
-    wait_until_ready(&client, &peers[0].1).await;
-    wait_until_ready(&client, &peers[1].1).await;
+    wait_until_ready(&client, &peers[0].1, &mut children).await;
+    wait_until_ready(&client, &peers[1].1, &mut children).await;
     put_until_created(
         &client,
         &format!("{}/benchcmp/cli-late-learner", peers[0].1),
@@ -349,7 +360,7 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
         &node3_config,
         &root.join("node-3-log"),
     ));
-    wait_until_ready(&client, &peers[2].1).await;
+    wait_until_ready(&client, &peers[2].1, &mut children).await;
 
     let add_learner = client
         .post(format!(
@@ -393,6 +404,7 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after_restart() {
+    let _guard = static_cluster_cli_test_guard().await;
     if std::env::var("URSULA_COLD_S3_INTEGRATION").ok().as_deref() != Some("1") {
         tracing::warn!(
             "skipping CLI S3 cold-manifest restart integration; set URSULA_COLD_S3_INTEGRATION=1 and URSULA_COLD_S3_BUCKET"
@@ -443,7 +455,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
     }
 
     {
-        let children = vec![
+        let mut children = vec![
             spawn_node_with_cluster_config_and_cold_s3(
                 binary,
                 ports[1],
@@ -472,7 +484,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
 
         let client = reqwest::Client::new();
         for (_, base_url) in &peers {
-            wait_until_ready(&client, base_url).await;
+            wait_until_ready(&client, base_url, &mut children).await;
         }
         put_until_created(
             &client,
@@ -514,7 +526,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
     }
 
     {
-        let children = vec![
+        let mut children = vec![
             spawn_node_with_cluster_config_and_cold_s3(
                 binary,
                 ports[1],
@@ -542,7 +554,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
         ];
         let client = reqwest::Client::new();
         for (_, base_url) in &peers {
-            wait_until_ready(&client, base_url).await;
+            wait_until_ready(&client, base_url, &mut children).await;
         }
         let payload = read_until_replicated(
             &client,
@@ -561,6 +573,17 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
         .await
         .expect("cleanup S3 cold test root");
     std::fs::remove_dir_all(&root).expect("remove temp root");
+}
+
+async fn static_cluster_cli_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    // These tests spawn real Ursula clusters on localhost. Keep them serial so
+    // small CI runners do not race several multi-process clusters at once, and
+    // so a child-process startup failure is attributable to one test.
+    static TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
 }
 
 fn free_port() -> u16 {
@@ -598,9 +621,7 @@ fn spawn_node(
         .arg("--raft-node-id")
         .arg(node_id.to_string())
         .env("URSULA_COLD_BACKEND", "memory")
-        .env("URSULA_COLD_FLUSH_INTERVAL_MS", "0")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .env("URSULA_COLD_FLUSH_INTERVAL_MS", "0");
     for (peer_id, peer_url) in peers {
         command
             .arg("--raft-peer")
@@ -609,9 +630,7 @@ fn spawn_node(
     if init_membership {
         command.arg("--raft-init-membership");
     }
-    ChildGuard {
-        child: command.spawn().expect("spawn ursula node"),
-    }
+    spawn_child(command, format!("memory-node-{node_id}-{port}"))
 }
 
 fn spawn_node_with_cluster_config(
@@ -634,12 +653,8 @@ fn spawn_node_with_cluster_config(
         .arg("--raft-cluster-config")
         .arg(config_path)
         .env("URSULA_COLD_BACKEND", "memory")
-        .env("URSULA_COLD_FLUSH_INTERVAL_MS", "0")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    ChildGuard {
-        child: command.spawn().expect("spawn durable ursula node"),
-    }
+        .env("URSULA_COLD_FLUSH_INTERVAL_MS", "0");
+    spawn_child(command, child_label("durable-node", port, config_path))
 }
 
 fn spawn_node_with_cluster_config_and_cold_s3(
@@ -664,9 +679,7 @@ fn spawn_node_with_cluster_config_and_cold_s3(
         .arg(config_path)
         .env("URSULA_COLD_BACKEND", "s3")
         .env("URSULA_COLD_ROOT", cold_root)
-        .env("URSULA_COLD_FLUSH_INTERVAL_MS", "0")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .env("URSULA_COLD_FLUSH_INTERVAL_MS", "0");
     for name in [
         "URSULA_COLD_S3_BUCKET",
         "URSULA_COLD_S3_REGION",
@@ -684,9 +697,108 @@ fn spawn_node_with_cluster_config_and_cold_s3(
             command.env(name, value);
         }
     }
+    spawn_child(command, child_label("s3-node", port, config_path))
+}
+
+fn child_label(prefix: &str, port: u16, config_path: &Path) -> String {
+    let config_name = config_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("node");
+    format!("{prefix}-{config_name}-{port}")
+}
+
+fn spawn_child(mut command: Command, label: String) -> ChildGuard {
+    let stderr_path = child_stderr_path(&label);
+    let stderr = File::create(&stderr_path).unwrap_or_else(|err| {
+        panic!(
+            "create stderr log for {label} at {} failed: {err}",
+            stderr_path.display()
+        )
+    });
+    command.stdout(Stdio::null()).stderr(Stdio::from(stderr));
+    let child = command.spawn().unwrap_or_else(|err| {
+        panic!(
+            "spawn {label} failed; stderr log {}: {err}",
+            stderr_path.display()
+        )
+    });
     ChildGuard {
-        child: command.spawn().expect("spawn durable S3 cold ursula node"),
+        child,
+        label,
+        stderr_path,
     }
+}
+
+fn child_stderr_path(label: &str) -> PathBuf {
+    let safe_label = label
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "ursula-static-cluster-cli-{}-{nanos}-{safe_label}.stderr.log",
+        std::process::id()
+    ))
+}
+
+fn child_stderr_tail(child: &ChildGuard) -> String {
+    match std::fs::read_to_string(&child.stderr_path) {
+        Ok(content) if content.is_empty() => "<stderr empty>".to_owned(),
+        Ok(content) if content.len() <= 4096 => content,
+        Ok(content) => {
+            let min_index = content.len().saturating_sub(4096);
+            let start = content
+                .char_indices()
+                .map(|(index, _)| index)
+                .find(|index| *index >= min_index)
+                .unwrap_or(0);
+            content[start..].to_owned()
+        }
+        Err(err) => format!("<failed to read {}: {err}>", child.stderr_path.display()),
+    }
+}
+
+fn child_report(child: &ChildGuard) -> String {
+    format!(
+        "{} pid={} stderr={}:\n{}",
+        child.label,
+        child.child.id(),
+        child.stderr_path.display(),
+        child_stderr_tail(child)
+    )
+}
+
+fn exited_child_report(children: &mut [ChildGuard]) -> Option<String> {
+    for child in children {
+        match child.child.try_wait() {
+            Ok(Some(status)) => {
+                return Some(format!(
+                    "{} exited with {status}; {}",
+                    child.label,
+                    child_report(child)
+                ));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return Some(format!(
+                    "{} try_wait failed: {err}; {}",
+                    child.label,
+                    child_report(child)
+                ));
+            }
+        }
+    }
+    None
 }
 
 fn write_single_node_cluster_config(path: &Path, base_url: &str, init_membership: bool) {
@@ -710,9 +822,15 @@ fn write_cluster_config(path: &Path, node_id: u64, peers: &[(u64, String)], init
     .expect("write cluster config");
 }
 
-async fn wait_until_ready(client: &reqwest::Client, base_url: &str) {
+async fn wait_until_ready(client: &reqwest::Client, base_url: &str, children: &mut [ChildGuard]) {
     let mut last_error = String::from("no attempts made");
     for _ in 0..300 {
+        if let Some(report) = exited_child_report(children) {
+            panic!(
+                "node {base_url} did not become ready because a child exited; \
+                 last readiness error: {last_error}\n{report}"
+            );
+        }
         match client
             .get(format!("{base_url}/__ursula/metrics"))
             .send()
@@ -728,7 +846,12 @@ async fn wait_until_ready(client: &reqwest::Client, base_url: &str) {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("node {base_url} did not become ready: {last_error}");
+    let reports = children
+        .iter()
+        .map(child_report)
+        .collect::<Vec<_>>()
+        .join("\n---\n");
+    panic!("node {base_url} did not become ready: {last_error}\nchild diagnostics:\n{reports}");
 }
 
 async fn put_until_created(client: &reqwest::Client, url: &str) {
