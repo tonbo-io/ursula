@@ -70,6 +70,9 @@ class ClusterConfig:
     perf_compare: str | None
 
 
+DEFAULT_RAFT_MEMORY_ABORT_CAP_BYTES = str(1536 * 1024 * 1024)
+
+
 def run(argv: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         argv,
@@ -234,8 +237,23 @@ class Ec2Ops:
         )
         self.ssh(node, command, check=False)
 
+    def node_env(self) -> dict[str, str]:
+        env = dict(self.config.cold_env)
+        if self.config.raft_memory:
+            env.setdefault(
+                "URSULA_RAFT_MEMORY_BOOTSTRAP_MARKER_DIR",
+                "/tmp/ursula-raft-memory-bootstrap",
+            )
+            env.setdefault(
+                "URSULA_NODE_MEMORY_ABORT_CAP_BYTES",
+                DEFAULT_RAFT_MEMORY_ABORT_CAP_BYTES,
+            )
+        return env
+
     def start_node(self, node: Node) -> None:
-        env_lines = "\n".join(f"export {key}={shlex.quote(value)}" for key, value in sorted(self.config.cold_env.items()))
+        env_lines = "\n".join(
+            f"export {key}={shlex.quote(value)}" for key, value in sorted(self.node_env().items())
+        )
         command = "\n".join(
             [
                 "set -euo pipefail",
@@ -277,15 +295,9 @@ class Ec2Ops:
         return args
 
     def install_service(self, node: Node, restart: bool = True) -> None:
-        service_env = dict(self.config.cold_env)
-        if self.config.raft_memory:
-            service_env.setdefault(
-                "URSULA_RAFT_MEMORY_BOOTSTRAP_MARKER_DIR",
-                "/tmp/ursula-raft-memory-bootstrap",
-            )
         env_lines = "\n".join(
             f"Environment={key}={value}"
-            for key, value in sorted(service_env.items())
+            for key, value in sorted(self.node_env().items())
         )
         exec_start = " ".join(shlex.quote(arg) for arg in self.node_command(node))
         restart_policy = "no" if self.config.raft_memory else "always"
