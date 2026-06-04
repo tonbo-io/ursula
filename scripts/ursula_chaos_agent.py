@@ -756,7 +756,19 @@ class ChaosAgent:
                         pending_payload,
                     )
                 else:
+                    previous_next_offset = stream.next_offset
                     stream.next_offset = max(stream.next_offset, end_offset)
+                    if end_offset > previous_next_offset:
+                        # A dedup response can be the first durable proof the
+                        # agent sees for this producer seq. The payload is
+                        # deterministic for the seq, so account it when the
+                        # response advances our stream view.
+                        self.record_expected_append_span(
+                            stream,
+                            previous_next_offset,
+                            end_offset,
+                            payload,
+                        )
                 producer.last_seq = producer_seq
                 producer.last_stream = stream.name
                 producer.last_append_ordinal = producer_seq
