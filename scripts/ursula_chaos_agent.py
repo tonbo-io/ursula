@@ -389,6 +389,9 @@ class ChaosAgent:
             WorkloadStream(f"{self.run_id}-{index:04d}")
             for index in range(max(1, args.stream_count))
         ]
+        self.producer_probe_stream = WorkloadStream(f"{self.run_id}-producer-probe")
+        self.producer_probe_id = "chaos-agent-producer-probe"
+        self.producer_probe_epoch = 0
         self.created_streams: set[str] = set()
         self.producers = [
             ProducerState(f"chaos-agent-{index:03d}")
@@ -624,29 +627,32 @@ class ChaosAgent:
 
     def create_streams(self) -> None:
         for stream in self.streams:
-            if stream.name in self.created_streams:
-                continue
-            last_error: str | None = None
-            for node in self.nodes:
-                try:
-                    status, _, _ = self.request(
-                        "PUT",
-                        f"{node.base_url}/{BUCKET}/{stream.name}",
-                        timeout_secs=15,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    last_error = f"{node.name}: {exc}"
-                    continue
-                if status in {200, 201, 409}:
-                    self.created_streams.add(stream.name)
-                    break
-                last_error = f"{node.name}: status={status}"
-            else:
-                raise RuntimeError(
-                    f"unable to create chaos stream {stream.name} on any node"
-                    + (f" ({last_error})" if last_error else "")
-                )
+            self.create_stream_until_ready(stream)
+        self.create_stream_until_ready(self.producer_probe_stream)
         self.event("info", f"{len(self.streams)} streams ready for run {self.run_id}")
+
+    def create_stream_until_ready(self, stream: WorkloadStream) -> None:
+        if stream.name in self.created_streams:
+            return
+        last_error: str | None = None
+        for node in self.nodes:
+            try:
+                status, _, _ = self.request(
+                    "PUT",
+                    f"{node.base_url}/{BUCKET}/{stream.name}",
+                    timeout_secs=15,
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"{node.name}: {exc}"
+                continue
+            if status in {200, 201, 409}:
+                self.created_streams.add(stream.name)
+                return
+            last_error = f"{node.name}: status={status}"
+        raise RuntimeError(
+            f"unable to create chaos stream {stream.name} on any node"
+            + (f" ({last_error})" if last_error else "")
+        )
 
     def append_once(self, lane_id: int | None = None) -> bool:
         with self.state_lock:
@@ -1042,147 +1048,103 @@ class ChaosAgent:
             has_unknown_appends = self.has_unknown_appends_locked()
         if has_unknown_appends:
             return
-        candidates = [
-            producer
-            for producer in self.producers
-            if producer.last_stream is not None
-            and producer.last_seq is not None
-            and producer.last_start_offset is not None
-            and producer.last_end_offset is not None
-            and producer.last_epoch is not None
-            and producer.last_payload_size is not None
-            and producer.last_payload_kind is not None
-            and producer.last_append_ordinal is not None
-            and producer.last_payload is not None
-        ]
-        if not candidates:
-            return
-        producer = candidates[self.producer_probe_success % len(candidates)]
-        stream = next((stream for stream in self.streams if stream.name == producer.last_stream), None)
-        if stream is None:
-            return
+        self.create_stream_until_ready(self.producer_probe_stream)
         node = self.nodes[(self.producer_probe_success + self.producer_probe_errors) % len(self.nodes)]
-        stale_epoch = max(0, producer.epoch - 1)
-        payload = producer.last_payload
-        probes = [
-            ("duplicate_seq", producer.last_epoch, producer.last_seq, payload),
-        ]
-        if producer.last_seq != 0:
-            probes.append(("stale_epoch", stale_epoch, producer.last_seq, payload))
-        for kind, epoch, seq, payload in probes:
-            if seq is None or payload is None:
-                continue
-            try:
-                status, _, headers = self.request(
-                    "POST",
-                    f"{node.base_url}/{BUCKET}/{producer.last_stream}",
-                    body=payload,
-                    headers={
-                        "Content-Type": CONTENT_TYPE,
-                        "Producer-Id": producer.producer_id,
-                        "Producer-Epoch": str(epoch),
-                        "Producer-Seq": str(seq),
-                    },
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.record_producer_probe_result(False, f"producer {kind} probe failed: {exc}")
-                continue
-            next_offset = parse_int(response_header(headers, "Stream-Next-Offset"))
-            if status == 200 and next_offset is not None:
-                with self.state_lock:
-                    previous_next_offset = stream.next_offset
-                    stream.next_offset = max(stream.next_offset, next_offset)
-                    self.record_expected_append_span(
-                        stream,
-                        previous_next_offset,
-                        next_offset,
-                        payload,
-                    )
-                    producer.last_seq = seq
-                    producer.last_stream = stream.name
-                    producer.last_append_ordinal = seq
-                    producer.last_start_offset = next_offset - len(payload)
-                    producer.last_end_offset = next_offset
-                    producer.last_epoch = epoch
-                    producer.last_payload_size = len(payload)
-                    producer.last_payload_kind = "probe"
-                    producer.last_payload = payload
-                self.record_producer_probe_skipped(
-                    f"producer {kind} probe committed after producer state loss: "
-                    f"status={status} next_offset={next_offset}"
-                )
-                continue
-            if kind == "duplicate_seq":
-                if status == 204 and next_offset is not None:
-                    accounted = False
-                    already_covered = False
-                    expected_end_offset = producer.last_end_offset
-                    with self.state_lock:
-                        previous_next_offset = stream.next_offset
-                        if next_offset > previous_next_offset:
-                            accounted = True
-                            stream.next_offset = next_offset
-                            self.record_expected_append_span(
-                                stream,
-                                previous_next_offset,
-                                next_offset,
-                                payload,
-                            )
-                            producer.last_seq = seq
-                            producer.last_stream = stream.name
-                            producer.last_append_ordinal = seq
-                            producer.last_start_offset = next_offset - len(payload)
-                            producer.last_end_offset = next_offset
-                            producer.last_epoch = epoch
-                            producer.last_payload_size = len(payload)
-                            producer.last_payload_kind = "probe"
-                            producer.last_payload = payload
-                        else:
-                            already_covered = True
-                    if accounted:
-                        self.record_producer_probe_skipped(
-                            f"producer duplicate_seq probe proved newer committed state: "
-                            f"status={status} next_offset={next_offset} expected={expected_end_offset}"
-                        )
-                    elif next_offset == expected_end_offset or already_covered:
-                        self.record_producer_probe_result(True, "")
-                    else:
-                        self.record_producer_probe_result(
-                            False,
-                            f"producer duplicate_seq probe did not deduplicate: "
-                            f"status={status} next_offset={next_offset} expected={expected_end_offset}",
-                        )
-                elif (
-                    status in (200, 204)
-                    and next_offset is not None
-                    and producer.last_end_offset is not None
-                    and next_offset > producer.last_end_offset
-                ) or status == 500:
-                    self.record_producer_probe_skipped(
-                        f"producer duplicate_seq probe skipped (state lost): "
-                        f"status={status} next_offset={next_offset} expected={producer.last_end_offset}"
-                    )
-                else:
-                    self.record_producer_probe_result(
-                        False,
-                        f"producer duplicate_seq probe did not deduplicate: "
-                        f"status={status} next_offset={next_offset} expected={producer.last_end_offset}",
-                    )
-                continue
-            current_epoch = parse_int(response_header(headers, "Producer-Epoch"))
-            if status == 403 and current_epoch == producer.epoch:
-                self.record_producer_probe_result(True, "")
-            elif status == 500 or current_epoch is None:
-                self.record_producer_probe_skipped(
-                    f"producer stale_epoch probe skipped (state lost): "
-                    f"status={status} current_epoch={current_epoch} expected={producer.epoch}"
-                )
-            else:
-                self.record_producer_probe_result(
-                    False,
-                    f"producer stale_epoch probe was not fenced: "
-                    f"status={status} current_epoch={current_epoch} expected={producer.epoch}",
-                )
+        with self.state_lock:
+            self.producer_probe_epoch += 1
+            epoch = self.producer_probe_epoch
+            seq = 0
+            stream = self.producer_probe_stream
+            start_offset = stream.next_offset
+        payload = self.build_payload(
+            128,
+            "ascii",
+            stream,
+            ProducerState(self.producer_probe_id, epoch=epoch),
+            seq,
+            start_offset,
+            producer_epoch=epoch,
+            append_ordinal=seq,
+        )
+
+        try:
+            status, _, headers = self.request(
+                "POST",
+                f"{node.base_url}/{BUCKET}/{stream.name}",
+                body=payload,
+                headers={
+                    "Content-Type": CONTENT_TYPE,
+                    "Producer-Id": self.producer_probe_id,
+                    "Producer-Epoch": str(epoch),
+                    "Producer-Seq": str(seq),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.record_producer_probe_result(False, f"producer append probe failed: {exc}")
+            return
+        next_offset = parse_int(response_header(headers, "Stream-Next-Offset"))
+        if status != 200 or next_offset is None:
+            self.record_producer_probe_result(
+                False,
+                f"producer append probe failed: status={status} next_offset={next_offset}",
+            )
+            return
+        with self.state_lock:
+            stream.next_offset = max(stream.next_offset, next_offset)
+
+        status, _, headers = self.request(
+            "POST",
+            f"{node.base_url}/{BUCKET}/{stream.name}",
+            body=payload,
+            headers={
+                "Content-Type": CONTENT_TYPE,
+                "Producer-Id": self.producer_probe_id,
+                "Producer-Epoch": str(epoch),
+                "Producer-Seq": str(seq),
+            },
+        )
+        duplicate_next = parse_int(response_header(headers, "Stream-Next-Offset"))
+        if status == 200 and duplicate_next is not None and duplicate_next > next_offset:
+            with self.state_lock:
+                stream.next_offset = max(stream.next_offset, duplicate_next)
+            self.record_producer_probe_skipped(
+                f"producer duplicate_seq probe skipped (state lost): "
+                f"status={status} next_offset={duplicate_next} expected={next_offset}"
+            )
+            return
+        if status != 204 or duplicate_next != next_offset:
+            self.record_producer_probe_result(
+                False,
+                f"producer duplicate_seq probe did not deduplicate: "
+                f"status={status} next_offset={duplicate_next} expected={next_offset}",
+            )
+            return
+
+        stale_status, _, stale_headers = self.request(
+            "POST",
+            f"{node.base_url}/{BUCKET}/{stream.name}",
+            body=payload,
+            headers={
+                "Content-Type": CONTENT_TYPE,
+                "Producer-Id": self.producer_probe_id,
+                "Producer-Epoch": str(max(0, epoch - 1)),
+                "Producer-Seq": str(seq + 1),
+            },
+        )
+        current_epoch = parse_int(response_header(stale_headers, "Producer-Epoch"))
+        if stale_status == 403 and current_epoch == epoch:
+            self.record_producer_probe_result(True, "")
+        elif stale_status == 500 or current_epoch is None:
+            self.record_producer_probe_skipped(
+                f"producer stale_epoch probe skipped (state lost): "
+                f"status={stale_status} current_epoch={current_epoch} expected={epoch}"
+            )
+        else:
+            self.record_producer_probe_result(
+                False,
+                f"producer stale_epoch probe was not fenced: "
+                f"status={stale_status} current_epoch={current_epoch} expected={epoch}",
+            )
 
     def run_burst_probe(self) -> None:
         for _ in range(self.burst_appends):
@@ -1243,12 +1205,14 @@ class ChaosAgent:
             # remaining replicas may be one apply tick behind, which is not a
             # consistency problem.
             if server_total == expected:
-                self.last_integrity_error = None
+                if self.setsum_mismatch_count == 0:
+                    self.last_integrity_error = None
                 self.last_setsum_availability_error = None
                 self.last_server_integrity = {**sample, "check": "total-setsum-match"}
                 return "ok"
             if server_evicted_records == "0" and server_live == expected:
-                self.last_integrity_error = None
+                if self.setsum_mismatch_count == 0:
+                    self.last_integrity_error = None
                 self.last_setsum_availability_error = None
                 self.last_server_integrity = {**sample, "check": "live-setsum-match"}
                 return "ok"
@@ -1274,13 +1238,15 @@ class ChaosAgent:
         best = ranked[0]
         server_next_offsets = [s["next_offset"] for s in samples if s["next_offset"] is not None]
         if server_next_offsets and max(server_next_offsets) > expected_next_offset:
-            self.last_integrity_error = None
+            if self.setsum_mismatch_count == 0:
+                self.last_integrity_error = None
             self.last_server_integrity = {**best, "check": "server-ahead-of-expected"}
             return "ok"
         if len(samples) < len(self.nodes) or len(live_set) > 1 or len(total_set) > 1:
             # Either we couldn't reach all replicas, or replicas disagree
             # among themselves. Either way, not a confirmed divergence.
-            self.last_integrity_error = None
+            if self.setsum_mismatch_count == 0:
+                self.last_integrity_error = None
             self.last_server_integrity = {**best, "check": "replicas-not-converged"}
             return "ok"
 
