@@ -17,6 +17,7 @@
 //! - [`metrics`]: runtime metrics shared across cores; lock-free counters.
 
 mod admission;
+pub mod cold_index;
 mod cold_store;
 mod command;
 mod core_worker;
@@ -30,6 +31,11 @@ mod runtime;
 mod snapshot_store;
 
 pub use admission::RaftUncommittedAdmission;
+pub use cold_index::{
+    ColdIndexPage, ColdIndexPageCache, ColdIndexPageKey, ColdIndexPageStore,
+    ColdStoreColdIndexPageStore, InMemoryColdIndexPageStore, cold_index_prefix,
+    write_cold_chunk_index_pages, write_external_segment_index_pages,
+};
 pub use cold_store::{
     ColdReadCacheConfig, ColdStore, ColdStoreEvent, ColdStoreFault, ColdStoreFaultContext,
     ColdStoreFaultEffect, ColdStoreHandle, ColdStoreInfo, ColdStoreOperation, new_cold_chunk_path,

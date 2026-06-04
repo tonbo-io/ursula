@@ -1,4 +1,3 @@
-#[cfg(test)]
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -9,6 +8,7 @@ use ursula_stream::{
     StreamReadSegment,
 };
 
+use crate::cold_index::{ColdIndexPageCache, ColdStoreColdIndexPageStore};
 use crate::cold_store::{ColdStoreHandle, DEFAULT_CONTENT_TYPE};
 use crate::engine::GroupEngineError;
 use crate::engine::in_memory::InMemoryGroupEngine;
@@ -138,6 +138,7 @@ pub enum GroupReadStreamBody {
         stream_id: BucketStreamId,
         plan: StreamReadPlan,
         cold_store: Option<ColdStoreHandle>,
+        cold_index_cache: Option<Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>>,
     },
     #[cfg(test)]
     Blocking {
@@ -175,6 +176,7 @@ impl GroupReadStreamParts {
         stream_id: BucketStreamId,
         plan: StreamReadPlan,
         cold_store: Option<ColdStoreHandle>,
+        cold_index_cache: Option<Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>>,
     ) -> Self {
         Self {
             placement,
@@ -187,6 +189,7 @@ impl GroupReadStreamParts {
                 stream_id,
                 plan,
                 cold_store,
+                cold_index_cache,
             },
         }
     }
@@ -198,9 +201,15 @@ impl GroupReadStreamParts {
                 stream_id,
                 plan,
                 cold_store,
+                cold_index_cache,
             } => {
-                InMemoryGroupEngine::read_payload_from_plan(cold_store.as_ref(), stream_id, plan)
-                    .await?
+                InMemoryGroupEngine::read_payload_from_plan(
+                    cold_store.as_ref(),
+                    cold_index_cache.as_ref(),
+                    stream_id,
+                    plan,
+                )
+                .await?
             }
             #[cfg(test)]
             GroupReadStreamBody::Blocking {
@@ -230,6 +239,7 @@ impl GroupReadStreamParts {
             GroupReadStreamBody::Planned { plan, .. } => {
                 plan.segments.iter().all(|segment| match segment {
                     StreamReadSegment::Hot(payload) => payload.is_empty(),
+                    StreamReadSegment::ColdIndex(segment) => segment.len == 0,
                     StreamReadSegment::Object(segment) => segment.len == 0,
                 })
             }

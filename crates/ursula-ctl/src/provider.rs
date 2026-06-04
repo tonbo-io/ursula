@@ -58,18 +58,34 @@ impl NodeProvider for StaticNodeProvider {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RawConfig {
-    Wrapped { nodes: Vec<RawNode> },
+    Wrapped(RawWrappedConfig),
     Bare(Vec<RawNode>),
 }
 
 impl RawConfig {
     fn into_nodes(self) -> Result<Vec<NodeInfo>> {
         let raws = match self {
-            RawConfig::Wrapped { nodes } => nodes,
+            RawConfig::Wrapped(config) => {
+                let default_port = config.http_port.or(config.port);
+                return config
+                    .nodes
+                    .into_iter()
+                    .map(|node| node.into_node_with_default_port(default_port))
+                    .collect();
+            }
             RawConfig::Bare(nodes) => nodes,
         };
         raws.into_iter().map(RawNode::into_node).collect()
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct RawWrappedConfig {
+    nodes: Vec<RawNode>,
+    #[serde(default)]
+    http_port: Option<u16>,
+    #[serde(default)]
+    port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,16 +103,24 @@ struct RawNode {
     private_ip: Option<String>,
     #[serde(default)]
     http_port: Option<u16>,
+    #[serde(default)]
+    port: Option<u16>,
 }
 
 impl RawNode {
     fn into_node(self) -> Result<NodeInfo> {
+        self.into_node_with_default_port(None)
+    }
+
+    fn into_node_with_default_port(self, default_port: Option<u16>) -> Result<NodeInfo> {
         let (http_url, host) = if let Some(url) = self.http_url.as_deref() {
             let parsed = Url::parse(url)
                 .with_context(|| format!("invalid http_url for node {}", self.id))?;
             let host = self
                 .host
-                .clone()
+                .as_deref()
+                .and_then(non_empty)
+                .map(str::to_owned)
                 .or_else(|| parsed.host_str().map(str::to_owned))
                 .with_context(|| format!("node {} has no host", self.id))?;
             (parsed, host)
@@ -104,14 +128,24 @@ impl RawNode {
             let host_ip = self
                 .public_ip
                 .as_deref()
-                .or(self.private_ip.as_deref())
+                .and_then(non_empty)
+                .or_else(|| self.private_ip.as_deref().and_then(non_empty))
                 .with_context(|| {
                     format!("node {} requires http_url or public_ip/private_ip", self.id)
                 })?;
-            let port = self.http_port.unwrap_or(8080);
+            let port = self
+                .http_port
+                .or(self.port)
+                .or(default_port)
+                .unwrap_or(8080);
             let parsed = Url::parse(&format!("http://{host_ip}:{port}"))
                 .with_context(|| format!("synthesize http_url for node {}", self.id))?;
-            let host = self.host.clone().unwrap_or_else(|| host_ip.to_owned());
+            let host = self
+                .host
+                .as_deref()
+                .and_then(non_empty)
+                .unwrap_or(host_ip)
+                .to_owned();
             (parsed, host)
         };
         Ok(NodeInfo {
@@ -121,6 +155,11 @@ impl RawNode {
             name: self.name,
         })
     }
+}
+
+fn non_empty(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() { None } else { Some(value) }
 }
 
 #[cfg(test)]
@@ -146,5 +185,14 @@ mod tests {
         assert_eq!(nodes[0].http_url.as_str(), "http://203.0.113.10:9090/");
         assert_eq!(nodes[0].host, "203.0.113.10");
         assert_eq!(nodes[0].name.as_deref(), Some("n2"));
+    }
+
+    #[tokio::test]
+    async fn static_provider_accepts_bench_config_port_alias() {
+        let json = br#"{"port":4491,"nodes":[{"id":3,"public_ip":"","private_ip":"10.0.0.3"}]}"#;
+        let provider = StaticNodeProvider::from_bytes(json).unwrap();
+        let nodes = provider.list_nodes().await.unwrap();
+        assert_eq!(nodes[0].http_url.as_str(), "http://10.0.0.3:4491/");
+        assert_eq!(nodes[0].host, "10.0.0.3");
     }
 }

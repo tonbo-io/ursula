@@ -300,8 +300,7 @@ class Ec2Ops:
             for key, value in sorted(self.node_env().items())
         )
         exec_start = " ".join(shlex.quote(arg) for arg in self.node_command(node))
-        restart_policy = "no" if self.config.raft_memory else "always"
-        restart_sec = "" if self.config.raft_memory else "RestartSec=3"
+        restart_policy = "on-failure" if self.config.raft_memory else "always"
         unit = f"""[Unit]
 Description=Ursula chaos node {node.id}
 After=network-online.target
@@ -314,7 +313,7 @@ WorkingDirectory=/tmp
 {env_lines}
 ExecStart={exec_start}
 Restart={restart_policy}
-{restart_sec}
+RestartSec=3
 LimitNOFILE=1048576
 LimitCORE=0
 

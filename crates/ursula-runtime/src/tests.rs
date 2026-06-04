@@ -9,7 +9,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::sync::{Notify, Semaphore, oneshot};
 use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardId, ShardPlacement};
-use ursula_stream::{ObjectPayloadRef, StreamReadSegment, StreamSnapshot, StreamStateMachine};
+use ursula_stream::{
+    ExternalPayloadRef, ObjectPayloadRef, StreamReadSegment, StreamSnapshot, StreamStateMachine,
+};
 
 use crate::cold_store::{ColdReadCacheConfig, DEFAULT_CONTENT_TYPE};
 use crate::core_worker::{CoreWorker, ReadWatcher, ReadWatchers};
@@ -68,7 +70,6 @@ fn empty_integrity() -> StreamIntegritySnapshot {
         live_records: 0,
         evicted_records: 0,
         total_records: 0,
-        records: Vec::new(),
     }
 }
 
@@ -196,7 +197,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
         .read_plan(&stream, 0, 16)
         .expect("read plan");
     assert_eq!(plan.segments.len(), 2);
-    assert!(matches!(plan.segments[0], StreamReadSegment::Object(_)));
+    assert!(matches!(plan.segments[0], StreamReadSegment::ColdIndex(_)));
     assert_eq!(plan.segments[1], StreamReadSegment::Hot(b"c".to_vec()));
 }
 
@@ -244,8 +245,8 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
         )
         .expect("append");
     engine
-        .apply_committed_write(
-            GroupWriteCommand::FlushCold {
+        .flush_cold(
+            FlushColdRequest {
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -256,6 +257,7 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
             },
             placement,
         )
+        .await
         .expect("flush cold");
 
     let read = engine
@@ -273,6 +275,93 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
     assert_eq!(read.payload, b"cdef");
     assert_eq!(read.next_offset, 6);
     assert!(read.up_to_date);
+}
+
+#[tokio::test]
+async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        RuntimeConfig::new(1, 1),
+        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
+        Some(cold_store.clone()),
+    )
+    .expect("spawn runtime");
+    let stream = BucketStreamId::new("benchcmp", "external-index");
+
+    cold_store
+        .write_chunk("benchcmp/external-index/external/initial.bin", b"ab")
+        .await
+        .expect("write initial external payload");
+    runtime
+        .create_stream_external(CreateStreamExternalRequest {
+            stream_id: stream.clone(),
+            content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+            initial_payload: ExternalPayloadRef {
+                s3_path: "benchcmp/external-index/external/initial.bin".to_owned(),
+                payload_len: 2,
+                object_size: 2,
+            },
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            forked_from: None,
+            fork_offset: None,
+            now_ms: 0,
+        })
+        .await
+        .expect("create external stream");
+    runtime
+        .append(AppendRequest::from_bytes(stream.clone(), b"cd".to_vec()))
+        .await
+        .expect("append hot");
+    cold_store
+        .write_chunk("benchcmp/external-index/external/tail.bin", b"ef")
+        .await
+        .expect("write tail external payload");
+    runtime
+        .append_external(AppendExternalRequest {
+            stream_id: stream.clone(),
+            content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+            payload: ExternalPayloadRef {
+                s3_path: "benchcmp/external-index/external/tail.bin".to_owned(),
+                payload_len: 2,
+                object_size: 2,
+            },
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            now_ms: 0,
+        })
+        .await
+        .expect("append external payload");
+
+    let read = runtime
+        .read_stream(ReadStreamRequest {
+            stream_id: stream.clone(),
+            offset: 0,
+            max_len: 6,
+            now_ms: 0,
+        })
+        .await
+        .expect("read mixed external and hot payload");
+    assert_eq!(read.payload, b"abcdef");
+    assert_eq!(read.next_offset, 6);
+
+    let snapshot = runtime
+        .snapshot_group(runtime.locate(&stream).raft_group_id)
+        .await
+        .expect("snapshot group");
+    let entry = snapshot
+        .stream_snapshot
+        .streams
+        .iter()
+        .find(|entry| entry.metadata.stream_id == stream)
+        .expect("snapshot entry");
+    assert_eq!(entry.cold_frontier_offset, 6);
+    assert!(entry.cold_chunks.is_empty());
+    assert!(entry.external_segments.is_empty());
 }
 
 #[tokio::test]
@@ -1617,7 +1706,8 @@ async fn flush_cold_group_batch_once_publishes_multiple_chunks() {
         .iter()
         .find(|entry| entry.metadata.stream_id == stream)
         .expect("stream snapshot");
-    assert_eq!(entry.cold_chunks.len(), 4);
+    assert_eq!(entry.cold_frontier_offset, 4);
+    assert!(entry.cold_chunks.is_empty());
     assert!(entry.payload.is_empty());
 
     let read = runtime
@@ -1643,36 +1733,29 @@ async fn cold_gc_worker_physically_reclaims_deleted_stream_chunks() {
     )
     .expect("spawn runtime");
     let stream = BucketStreamId::new("benchcmp", "cold-gc");
-    let placement = runtime.locate(&stream);
     create_stream(&runtime, &stream).await;
     runtime
         .append(AppendRequest::from_bytes(stream.clone(), b"abcd".to_vec()))
         .await
         .expect("append");
+    let chunk = ColdChunkRef {
+        start_offset: 0,
+        end_offset: 4,
+        s3_path: "benchcmp/cold-gc/chunks/000000.bin".to_owned(),
+        object_size: 4,
+    };
+    cold_store
+        .write_chunk(&chunk.s3_path, b"abcd")
+        .await
+        .expect("write cold chunk");
     runtime
-        .flush_cold_group_batch_once(
-            placement.raft_group_id,
-            PlanGroupColdFlushRequest {
-                min_hot_bytes: 1,
-                max_flush_bytes: 4,
-            },
-            4,
-        )
+        .flush_cold(FlushColdRequest {
+            stream_id: stream.clone(),
+            chunk: chunk.clone(),
+        })
         .await
-        .expect("flush batch");
+        .expect("flush cold");
 
-    // Capture the on-disk chunk before deleting so we can prove it is gone after GC.
-    let snapshot = runtime
-        .snapshot_group(placement.raft_group_id)
-        .await
-        .expect("snapshot group");
-    let chunk = snapshot
-        .stream_snapshot
-        .streams
-        .iter()
-        .find(|entry| entry.metadata.stream_id == stream)
-        .and_then(|entry| entry.cold_chunks.first().cloned())
-        .expect("cold chunk present");
     assert!(
         cold_store
             .read_chunk_range(&chunk, chunk.start_offset, 4)

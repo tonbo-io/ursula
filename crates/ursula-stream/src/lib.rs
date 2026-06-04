@@ -18,14 +18,14 @@ mod state_machine;
 mod validate;
 
 pub use command::StreamCommand;
-pub use integrity::{StreamIntegrityRecord, StreamIntegritySnapshot};
+pub use integrity::StreamIntegritySnapshot;
 pub use model::{
-    AppendStreamInput, ColdChunkRef, ColdFlushCandidate, ColdGcEntry, ColdGcTarget,
-    ExternalPayloadRef, HotPayloadSegment, ObjectPayloadRef, ProducerAppendRecord, ProducerRequest,
-    ProducerSnapshot, StreamBatchAppend, StreamBatchAppendItem, StreamBootstrapPlan,
-    StreamMessageRecord, StreamMetadata, StreamRead, StreamReadColdSegment,
-    StreamReadObjectSegment, StreamReadPlan, StreamReadSegment, StreamStatus,
-    StreamVisibleSnapshot,
+    AppendStreamInput, COLD_INDEX_PAGE_SPAN_BYTES, ColdChunkRef, ColdFlushCandidate, ColdGcEntry,
+    ColdGcTarget, ExternalPayloadRef, HotPayloadSegment, ObjectPayloadRef, ProducerAppendRecord,
+    ProducerRequest, ProducerSnapshot, StreamBatchAppend, StreamBatchAppendItem,
+    StreamBootstrapPlan, StreamMessageRecord, StreamMetadata, StreamRead,
+    StreamReadColdIndexSegment, StreamReadColdSegment, StreamReadObjectSegment, StreamReadPlan,
+    StreamReadSegment, StreamStatus, StreamVisibleSnapshot,
 };
 pub use response::{StreamErrorCode, StreamResponse};
 pub use snapshot::{StreamSnapshot, StreamSnapshotEntry, StreamSnapshotError};

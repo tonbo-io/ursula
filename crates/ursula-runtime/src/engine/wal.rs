@@ -100,7 +100,7 @@ impl WalGroupEngine {
         let log_path = group_log_path(root, placement);
         match replay_group_log(&log_path) {
             Ok(mut inner) => {
-                inner.cold_store = cold_store;
+                inner.set_cold_store(cold_store);
                 Self {
                     inner,
                     log_path,
@@ -110,9 +110,10 @@ impl WalGroupEngine {
                 }
             }
             Err(err) => Self {
-                inner: InMemoryGroupEngine {
-                    cold_store,
-                    ..InMemoryGroupEngine::default()
+                inner: {
+                    let mut inner = InMemoryGroupEngine::default();
+                    inner.set_cold_store(cold_store);
+                    inner
                 },
                 log_path,
                 placement,

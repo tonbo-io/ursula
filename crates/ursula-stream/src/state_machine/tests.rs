@@ -61,7 +61,6 @@ fn empty_integrity() -> StreamIntegritySnapshot {
         live_records: 0,
         evicted_records: 0,
         total_records: 0,
-        records: Vec::new(),
     }
 }
 
@@ -316,17 +315,17 @@ fn flush_cold_moves_hot_prefix_to_manifest_and_read_plan_splits() {
         }
     );
     assert_eq!(machine.hot_start_offset(&stream("cold")), 4);
-    assert_eq!(machine.cold_chunks(&stream("cold")).len(), 1);
+    assert!(machine.cold_chunks(&stream("cold")).is_empty());
 
     let plan = machine.read_plan(&stream("cold"), 2, 4).expect("read plan");
     assert_eq!(plan.next_offset, 6);
     assert_eq!(plan.segments.len(), 2);
     match &plan.segments[0] {
-        StreamReadSegment::Object(segment) => {
+        StreamReadSegment::ColdIndex(segment) => {
             assert_eq!(segment.read_start_offset, 2);
             assert_eq!(segment.len, 2);
         }
-        other => panic!("expected cold object segment, got {other:?}"),
+        other => panic!("expected cold index segment, got {other:?}"),
     }
     match &plan.segments[1] {
         StreamReadSegment::Hot(payload) => assert_eq!(payload, b"ef"),
@@ -354,7 +353,7 @@ fn flush_cold_moves_hot_prefix_to_manifest_and_read_plan_splits() {
 
     let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
     assert_eq!(restored.hot_start_offset(&stream("cold")), 4);
-    assert_eq!(restored.cold_chunks(&stream("cold")).len(), 1);
+    assert!(restored.cold_chunks(&stream("cold")).is_empty());
     assert_eq!(
         restored.read(&stream("cold"), 4, 8).expect("hot read"),
         StreamRead {
@@ -365,6 +364,106 @@ fn flush_cold_moves_hot_prefix_to_manifest_and_read_plan_splits() {
             up_to_date: true,
             closed: false,
         }
+    );
+}
+
+#[test]
+fn flush_cold_compacts_message_records_to_cold_prefix() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    create_stream(&mut machine, "cold-records");
+    for payload in [b"ab".as_slice(), b"cd".as_slice(), b"ef".as_slice()] {
+        assert!(matches!(
+            machine.apply(StreamCommand::Append {
+                stream_id: stream("cold-records"),
+                content_type: Some("application/octet-stream".to_owned()),
+                payload: payload.to_vec(),
+                close_after: false,
+                stream_seq: None,
+                producer: None,
+                now_ms: 0,
+            }),
+            StreamResponse::Appended { .. }
+        ));
+    }
+
+    assert_eq!(
+        machine.apply(StreamCommand::FlushCold {
+            stream_id: stream("cold-records"),
+            chunk: ColdChunkRef {
+                start_offset: 0,
+                end_offset: 4,
+                s3_path: "s3://bucket/cold-records/000000".to_owned(),
+                object_size: 4,
+            },
+        }),
+        StreamResponse::ColdFlushed {
+            hot_start_offset: 4,
+        }
+    );
+    assert_eq!(
+        machine
+            .bootstrap_plan(&stream("cold-records"))
+            .expect("bootstrap")
+            .updates,
+        vec![
+            StreamMessageRecord {
+                start_offset: 0,
+                end_offset: 4,
+            },
+            StreamMessageRecord {
+                start_offset: 4,
+                end_offset: 6,
+            },
+        ]
+    );
+
+    assert_eq!(
+        machine.apply(StreamCommand::FlushCold {
+            stream_id: stream("cold-records"),
+            chunk: ColdChunkRef {
+                start_offset: 4,
+                end_offset: 6,
+                s3_path: "s3://bucket/cold-records/000001".to_owned(),
+                object_size: 2,
+            },
+        }),
+        StreamResponse::ColdFlushed {
+            hot_start_offset: 6,
+        }
+    );
+    assert_eq!(
+        machine
+            .bootstrap_plan(&stream("cold-records"))
+            .expect("bootstrap")
+            .updates,
+        vec![StreamMessageRecord {
+            start_offset: 0,
+            end_offset: 6,
+        }]
+    );
+    let snapshot = machine.snapshot();
+    let entry = snapshot
+        .streams
+        .iter()
+        .find(|entry| entry.metadata.stream_id == stream("cold-records"))
+        .expect("stream snapshot");
+    assert_eq!(
+        entry.message_records,
+        vec![StreamMessageRecord {
+            start_offset: 0,
+            end_offset: 6,
+        }]
+    );
+    assert_eq!(
+        machine.apply(StreamCommand::PublishSnapshot {
+            stream_id: stream("cold-records"),
+            snapshot_offset: 3,
+            content_type: "application/octet-stream".to_owned(),
+            payload: b"abc-state".to_vec(),
+            now_ms: 0,
+        }),
+        StreamResponse::SnapshotPublished { snapshot_offset: 3 }
     );
 }
 
@@ -541,7 +640,7 @@ fn flush_cold_can_coalesce_contiguous_hot_segments() {
     );
     assert!(machine.hot_segments(&stream("cold-coalesced")).is_empty());
     assert_eq!(machine.hot_payload_len(&stream("cold-coalesced")), Ok(0));
-    assert_eq!(machine.cold_chunks(&stream("cold-coalesced")).len(), 1);
+    assert!(machine.cold_chunks(&stream("cold-coalesced")).is_empty());
 
     let plan = machine
         .read_plan(&stream("cold-coalesced"), 0, 5)
@@ -549,11 +648,11 @@ fn flush_cold_can_coalesce_contiguous_hot_segments() {
     assert_eq!(plan.next_offset, 5);
     assert_eq!(plan.segments.len(), 1);
     match &plan.segments[0] {
-        StreamReadSegment::Object(segment) => {
+        StreamReadSegment::ColdIndex(segment) => {
             assert_eq!(segment.read_start_offset, 0);
             assert_eq!(segment.len, 5);
         }
-        other => panic!("expected cold object segment, got {other:?}"),
+        other => panic!("expected cold index segment, got {other:?}"),
     }
 }
 
@@ -1149,6 +1248,8 @@ fn snapshot_restore_rejects_invalid_entries() {
                 hot_start_offset: 0,
                 payload: Vec::new(),
                 hot_segments: Vec::new(),
+                cold_frontier_offset: 0,
+                cold_index_generation: 0,
                 cold_chunks: Vec::new(),
                 external_segments: Vec::new(),
                 message_records: Vec::new(),
@@ -1183,6 +1284,8 @@ fn snapshot_restore_rejects_invalid_entries() {
                 hot_start_offset: 0,
                 payload: b"x".to_vec(),
                 hot_segments: Vec::new(),
+                cold_frontier_offset: 0,
+                cold_index_generation: 0,
                 cold_chunks: Vec::new(),
                 external_segments: Vec::new(),
                 message_records: Vec::new(),
@@ -1217,6 +1320,8 @@ fn snapshot_restore_rejects_invalid_entries() {
                 hot_start_offset: 0,
                 payload: Vec::new(),
                 hot_segments: Vec::new(),
+                cold_frontier_offset: 0,
+                cold_index_generation: 0,
                 cold_chunks: Vec::new(),
                 external_segments: Vec::new(),
                 message_records: Vec::new(),
@@ -2036,10 +2141,10 @@ fn publish_snapshot_advances_retention_on_message_boundary() {
         .expect("integrity");
     assert_eq!(integrity.live_start_offset, 3);
     assert_eq!(integrity.tail_offset, 5);
-    assert_eq!(integrity.live_records, 1);
-    assert_eq!(integrity.evicted_records, 1);
+    assert_eq!(integrity.live_records, 2);
+    assert_eq!(integrity.evicted_records, 0);
     assert_eq!(integrity.total_records, 2);
-    assert_ne!(integrity.live_setsum, integrity.total_setsum);
+    assert_eq!(integrity.live_setsum, integrity.total_setsum);
     let snapshot = machine
         .read_snapshot(&stream("snap"), 3)
         .expect("visible snapshot");
@@ -2627,7 +2732,7 @@ proptest! {
 
         prop_assert_eq!(machine.head(&stream_id).expect("head").tail_offset, u64::try_from(expected.len()).unwrap());
         prop_assert_eq!(machine.hot_start_offset(&stream_id), u64::try_from(flush_len).unwrap());
-        prop_assert_eq!(machine.cold_chunks(&stream_id).len(), 1);
+        prop_assert!(machine.cold_chunks(&stream_id).is_empty());
         let suffix = &expected[flush_len..];
         let hot_read = machine
             .read(&stream_id, u64::try_from(flush_len).unwrap(), suffix.len())
@@ -2638,7 +2743,7 @@ proptest! {
             .read_plan(&stream_id, 0, expected.len())
             .expect("post-flush read plan");
         prop_assert_eq!(plan.next_offset, u64::try_from(expected.len()).unwrap());
-        prop_assert!(matches!(plan.segments.first(), Some(StreamReadSegment::Object(_))));
+        prop_assert!(matches!(plan.segments.first(), Some(StreamReadSegment::ColdIndex(_))));
 
         let restored =
             StreamStateMachine::restore(machine.snapshot()).expect("restore cold snapshot");
@@ -2742,10 +2847,7 @@ proptest! {
         let tail_offset = u64::try_from(expected.len()).expect("payload len fits u64");
         prop_assert_eq!(machine.head(&stream_id).expect("head").tail_offset, tail_offset);
         prop_assert_eq!(machine.hot_start_offset(&stream_id), candidate.end_offset);
-        prop_assert_eq!(machine.cold_chunks(&stream_id).len(), 1);
-        let cold_chunk = &machine.cold_chunks(&stream_id)[0];
-        prop_assert_eq!(cold_chunk.start_offset, candidate.start_offset);
-        prop_assert_eq!(cold_chunk.end_offset, candidate.end_offset);
+        prop_assert!(machine.cold_chunks(&stream_id).is_empty());
 
         let retained_plan = machine
             .read_plan(
@@ -2757,7 +2859,7 @@ proptest! {
         prop_assert_eq!(retained_plan.next_offset, tail_offset);
         prop_assert!(matches!(
             retained_plan.segments.first(),
-            Some(StreamReadSegment::Object(_))
+            Some(StreamReadSegment::ColdIndex(_))
         ));
 
         let bootstrap = machine.bootstrap_plan(&stream_id).expect("bootstrap plan");
@@ -2770,10 +2872,11 @@ proptest! {
             bootstrap.snapshot.as_ref(),
             expected_snapshot.as_ref()
         );
-        prop_assert_eq!(
-            bootstrap.updates.as_slice(),
-            &boundaries[snapshot_message_count..]
-        );
+        prop_assert!(message_records_cover_retained_suffix(
+            &bootstrap.updates,
+            snapshot_offset,
+            tail_offset
+        ));
         prop_assert_eq!(bootstrap.next_offset, tail_offset);
 
         let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");

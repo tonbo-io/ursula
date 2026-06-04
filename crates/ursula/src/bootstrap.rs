@@ -421,7 +421,10 @@ fn set_registered_group_elections(registry: &RaftGroupHandleRegistry, enabled: b
     }
 }
 
-fn reenable_elections_if_campaign_allowed(registry: &RaftGroupHandleRegistry, context: &str) {
+pub(crate) fn reenable_elections_if_campaign_allowed(
+    registry: &RaftGroupHandleRegistry,
+    context: &str,
+) {
     let shed_state = registry.leadership_shed_state();
     if shed_state.should_campaign() {
         set_registered_group_elections(registry, true);
@@ -485,6 +488,7 @@ pub fn spawn_snapshot_driver_if_configured(
         // Baseline the cold-flush error counter so the first tick measures a
         // delta, not the run's cumulative total.
         let mut last_flush_errors = runtime.metrics().snapshot().cold_flush_write_errors;
+        let mut next_snapshot_drive_pos = 0usize;
         loop {
             // Cheap S3-health probe: a single `stat` round-trip. Crucially this
             // does NOT build a snapshot — a failed `build_snapshot` returns a
@@ -578,16 +582,15 @@ pub fn spawn_snapshot_driver_if_configured(
             // driver triggers are the only snapshots, so skipping them during an
             // outage keeps the raft core alive: the in-memory log grows until S3
             // returns (bounded by the outage), then the next healthy tick
-            // compacts it. Trigger groups sequentially so full snapshot clones
-            // do not stack in process memory.
-            if !bad_tick {
-                for snapshot in &snaps {
-                    if !should_drive_snapshot_for_group(snapshot) {
-                        continue;
-                    }
-                    let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) else {
-                        continue;
-                    };
+            // compacts it. Trigger at most one group per tick: OpenRaft returns
+            // from trigger().snapshot() after enqueueing work, while the actual
+            // full-state clone/upload runs in a background task.
+            if !bad_tick
+                && let Some((pos, snapshot)) =
+                    next_snapshot_to_drive(&snaps, next_snapshot_drive_pos)
+            {
+                next_snapshot_drive_pos = pos.wrapping_add(1);
+                if let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) {
                     let gid = snapshot.raft_group_id;
                     if let Err(err) = raft.trigger().snapshot().await {
                         tracing::error!("snapshot driver trigger group {gid} error: {err}");
@@ -598,6 +601,23 @@ pub fn spawn_snapshot_driver_if_configured(
             tokio::time::sleep(interval).await;
         }
     });
+}
+
+pub(crate) fn next_snapshot_to_drive(
+    snapshots: &[RaftGroupMetricsSnapshot],
+    next_pos: usize,
+) -> Option<(usize, &RaftGroupMetricsSnapshot)> {
+    if snapshots.is_empty() {
+        return None;
+    }
+    let start = next_pos % snapshots.len();
+    snapshots
+        .iter()
+        .enumerate()
+        .cycle()
+        .skip(start)
+        .take(snapshots.len())
+        .find(|(_, snapshot)| should_drive_snapshot_for_group(snapshot))
 }
 
 pub(crate) fn should_drive_snapshot_for_group(snapshot: &RaftGroupMetricsSnapshot) -> bool {

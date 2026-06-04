@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use ursula_proto::{ColdChunkRefV1, ExternalPayloadRefV1, ProducerRequestV1};
 use ursula_shard::BucketStreamId;
 
+pub const COLD_INDEX_PAGE_SPAN_BYTES: u64 = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamStatus {
     Open,
@@ -175,7 +177,16 @@ pub struct StreamReadObjectSegment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamReadColdIndexSegment {
+    pub generation: u64,
+    pub page_id: u64,
+    pub read_start_offset: u64,
+    pub len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamReadSegment {
+    ColdIndex(StreamReadColdIndexSegment),
     Object(StreamReadObjectSegment),
     Hot(Vec<u8>),
 }

@@ -1,5 +1,3 @@
-use std::collections::VecDeque;
-
 use serde::{Deserialize, Serialize};
 use setsum::Setsum;
 use ursula_shard::BucketStreamId;
@@ -14,23 +12,13 @@ pub struct StreamIntegritySnapshot {
     pub live_records: u64,
     pub evicted_records: u64,
     pub total_records: u64,
-    pub records: Vec<StreamIntegrityRecord>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StreamIntegrityRecord {
-    pub start_offset: u64,
-    pub end_offset: u64,
-    pub setsum: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct StreamIntegrity {
     live: Setsum,
-    evicted: Setsum,
     total: Setsum,
-    records: VecDeque<StreamIntegrityRecord>,
-    evicted_records: u64,
+    total_records: u64,
 }
 
 impl StreamIntegrity {
@@ -65,18 +53,7 @@ impl StreamIntegrity {
     }
 
     pub(crate) fn evict_before(&mut self, retained_offset: u64) {
-        while self
-            .records
-            .front()
-            .is_some_and(|record| record.end_offset <= retained_offset)
-        {
-            let record = self.records.pop_front().expect("record exists");
-            let setsum = Setsum::from_hexdigest(&record.setsum)
-                .expect("integrity records are created from valid setsum hex");
-            self.live -= setsum;
-            self.evicted += setsum;
-            self.evicted_records += 1;
-        }
+        let _ = retained_offset;
     }
 
     pub(crate) fn snapshot(
@@ -86,16 +63,13 @@ impl StreamIntegrity {
     ) -> StreamIntegritySnapshot {
         StreamIntegritySnapshot {
             live_setsum: self.live.hexdigest(),
-            evicted_setsum: self.evicted.hexdigest(),
+            evicted_setsum: Setsum::default().hexdigest(),
             total_setsum: self.total.hexdigest(),
             live_start_offset,
             tail_offset,
-            live_records: u64::try_from(self.records.len()).expect("record count fits u64"),
-            evicted_records: self.evicted_records,
-            total_records: self
-                .evicted_records
-                .saturating_add(u64::try_from(self.records.len()).expect("record count fits u64")),
-            records: self.records.iter().cloned().collect(),
+            live_records: self.total_records,
+            evicted_records: 0,
+            total_records: self.total_records,
         }
     }
 
@@ -103,30 +77,13 @@ impl StreamIntegrity {
         let live = Setsum::from_hexdigest(&snapshot.live_setsum)?;
         let evicted = Setsum::from_hexdigest(&snapshot.evicted_setsum)?;
         let total = Setsum::from_hexdigest(&snapshot.total_setsum)?;
-        let records = snapshot.records.into_iter().collect::<VecDeque<_>>();
-        let mut computed_live = Setsum::default();
-        for record in &records {
-            if record.end_offset <= record.start_offset {
-                return None;
-            }
-            computed_live += Setsum::from_hexdigest(&record.setsum)?;
-        }
-        if computed_live != live || live + evicted != total {
-            return None;
-        }
-        let live_records = u64::try_from(records.len()).ok()?;
-        if snapshot.live_records != live_records {
-            return None;
-        }
-        if snapshot.total_records != snapshot.evicted_records.saturating_add(live_records) {
+        if live + evicted != total {
             return None;
         }
         Some(Self {
-            live,
-            evicted,
+            live: total,
             total,
-            records,
-            evicted_records: snapshot.evicted_records,
+            total_records: snapshot.total_records,
         })
     }
 
@@ -136,11 +93,7 @@ impl StreamIntegrity {
         }
         self.live += record;
         self.total += record;
-        self.records.push_back(StreamIntegrityRecord {
-            start_offset,
-            end_offset,
-            setsum: record.hexdigest(),
-        });
+        self.total_records = self.total_records.saturating_add(1);
     }
 }
 
@@ -167,4 +120,40 @@ fn record_setsum(
     item.extend_from_slice(pieces);
     setsum.insert_vectored(&item);
     setsum
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream_id() -> BucketStreamId {
+        BucketStreamId::new("benchcmp", "integrity")
+    }
+
+    #[test]
+    fn snapshot_omits_per_append_records() {
+        let stream_id = stream_id();
+        let mut integrity = StreamIntegrity::default();
+        integrity.append_payload(&stream_id, 0, 3, b"abc");
+        integrity.append_payload(&stream_id, 3, 5, b"de");
+
+        let snapshot = integrity.snapshot(0, 5);
+
+        assert_eq!(snapshot.live_records, 2);
+        assert_eq!(snapshot.evicted_records, 0);
+        assert_eq!(snapshot.total_records, 2);
+        assert_eq!(snapshot.live_setsum, snapshot.total_setsum);
+    }
+
+    #[test]
+    fn snapshot_wire_format_has_no_records_field() {
+        let stream_id = stream_id();
+        let mut integrity = StreamIntegrity::default();
+        integrity.append_payload(&stream_id, 0, 3, b"abc");
+
+        let encoded =
+            serde_json::to_value(integrity.snapshot(0, 3)).expect("encode compacted integrity");
+
+        assert!(encoded.get("records").is_none());
+    }
 }

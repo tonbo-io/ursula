@@ -20,20 +20,21 @@ use openraft::RaftNetworkFactory;
 use openraft::storage::RaftLogStorage;
 use ursula_runtime::{
     AppendBatchRequest, AppendExternalRequest, AppendRequest, BootstrapStreamRequest,
-    CloseStreamRequest, ColdStoreHandle, ColdWriteAdmission, CreateStreamExternalRequest,
-    CreateStreamRequest, DeleteSnapshotRequest, DeleteStreamRequest, FlushColdRequest,
-    GroupAckColdGcFuture, GroupAppendBatchFuture, GroupAppendFuture, GroupBootstrapStreamFuture,
-    GroupCloseStreamFuture, GroupColdHotBacklogFuture, GroupCreateStreamFuture,
-    GroupDeleteSnapshotFuture, GroupDeleteStreamFuture, GroupEngine, GroupEngineError,
-    GroupEngineMetrics, GroupFlushColdFuture, GroupForkRefFuture, GroupHeadStreamFuture,
-    GroupInstallSnapshotFuture, GroupPlanColdFlushFuture, GroupPlanColdGcFuture,
-    GroupPlanNextColdFlushBatchFuture, GroupPlanNextColdFlushFuture, GroupPublishSnapshotFuture,
-    GroupReadSnapshotFuture, GroupReadStreamFuture, GroupReadStreamParts,
-    GroupReadStreamPartsFuture, GroupSnapshot, GroupSnapshotFuture, GroupTouchStreamAccessFuture,
-    GroupWriteBatchFuture, GroupWriteCommand, GroupWriteResponse, HeadStreamRequest,
-    PlanColdFlushRequest, PlanGroupColdFlushRequest, PublishSnapshotRequest, ReadSnapshotRequest,
-    ReadStreamRequest, SharedSnapshotStore, StreamErrorCode, TouchStreamAccessResponse,
-    default_snapshot_store,
+    CloseStreamRequest, ColdIndexPageCache, ColdStoreColdIndexPageStore, ColdStoreHandle,
+    ColdWriteAdmission, CreateStreamExternalRequest, CreateStreamRequest, DeleteSnapshotRequest,
+    DeleteStreamRequest, FlushColdRequest, GroupAckColdGcFuture, GroupAppendBatchFuture,
+    GroupAppendFuture, GroupBootstrapStreamFuture, GroupCloseStreamFuture,
+    GroupColdHotBacklogFuture, GroupCreateStreamFuture, GroupDeleteSnapshotFuture,
+    GroupDeleteStreamFuture, GroupEngine, GroupEngineError, GroupEngineMetrics,
+    GroupFlushColdFuture, GroupForkRefFuture, GroupHeadStreamFuture, GroupInstallSnapshotFuture,
+    GroupPlanColdFlushFuture, GroupPlanColdGcFuture, GroupPlanNextColdFlushBatchFuture,
+    GroupPlanNextColdFlushFuture, GroupPublishSnapshotFuture, GroupReadSnapshotFuture,
+    GroupReadStreamFuture, GroupReadStreamParts, GroupReadStreamPartsFuture, GroupSnapshot,
+    GroupSnapshotFuture, GroupTouchStreamAccessFuture, GroupWriteBatchFuture, GroupWriteCommand,
+    GroupWriteResponse, HeadStreamRequest, PlanColdFlushRequest, PlanGroupColdFlushRequest,
+    PublishSnapshotRequest, ReadSnapshotRequest, ReadStreamRequest, SharedSnapshotStore,
+    StreamErrorCode, TouchStreamAccessResponse, default_snapshot_store,
+    write_cold_chunk_index_pages, write_external_segment_index_pages,
 };
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
@@ -53,6 +54,7 @@ pub struct RaftGroupEngine {
     pub(crate) placement: ShardPlacement,
     pub(crate) metrics: Option<GroupEngineMetrics>,
     pub(crate) cold_store: Option<ColdStoreHandle>,
+    pub(crate) cold_index_cache: Option<Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>>,
 }
 
 impl RaftGroupEngine {
@@ -262,11 +264,19 @@ impl RaftGroupEngine {
         .await
         .map_err(|err| GroupEngineError::new(format!("create OpenRaft group: {err}")))?;
 
+        let cold_index_cache = cold_store.as_ref().map(|cold_store| {
+            Arc::new(ColdIndexPageCache::new(
+                Arc::new(ColdStoreColdIndexPageStore::new(cold_store.clone())),
+                1024,
+            ))
+        });
+
         Ok(Self {
             raft,
             placement,
             metrics,
             cold_store,
+            cold_index_cache,
         })
     }
 
@@ -342,9 +352,15 @@ impl RaftGroupEngine {
                 })
             })
             .await??;
-        GroupReadStreamParts::from_plan(placement, stream_id, plan, self.cold_store.clone())
-            .into_response()
-            .await
+        GroupReadStreamParts::from_plan(
+            placement,
+            stream_id,
+            plan,
+            self.cold_store.clone(),
+            self.cold_index_cache.clone(),
+        )
+        .into_response()
+        .await
     }
 
     pub(crate) async fn write(
@@ -552,6 +568,17 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupCreateStreamFuture<'a> {
         Box::pin(async move {
+            if let Some(cold_store) = self.cold_store.as_ref() {
+                let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+                write_external_segment_index_pages(
+                    &store,
+                    &request.stream_id,
+                    0,
+                    &request.initial_payload,
+                )
+                .await
+                .map_err(|err| GroupEngineError::new(err.to_string()))?;
+            }
             match self.write(GroupWriteCommand::from(request)).await? {
                 GroupWriteResponse::CreateStream(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
@@ -638,6 +665,7 @@ impl GroupEngine for RaftGroupEngine {
                 stream_id,
                 plan,
                 self.cold_store.clone(),
+                self.cold_index_cache.clone(),
             );
             if !self.raft.is_leader() && parts.up_to_date && !parts.closed {
                 if parts.payload_is_empty()
@@ -970,6 +998,33 @@ impl GroupEngine for RaftGroupEngine {
             }
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
+            if let Some(cold_store) = self.cold_store.as_ref() {
+                let stream_id = request.stream_id.clone();
+                let start_offset = self
+                    .with_state_machine(move |state_machine| {
+                        Box::pin(async move {
+                            state_machine
+                                .engine
+                                .stream_tail_offset(&stream_id)
+                                .ok_or_else(|| {
+                                    GroupEngineError::stream(
+                                        StreamErrorCode::StreamNotFound,
+                                        format!("stream '{stream_id}' does not exist"),
+                                    )
+                                })
+                        })
+                    })
+                    .await??;
+                let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+                write_external_segment_index_pages(
+                    &store,
+                    &request.stream_id,
+                    start_offset,
+                    &request.payload,
+                )
+                .await
+                .map_err(|err| GroupEngineError::new(err.to_string()))?;
+            }
             match self.write(GroupWriteCommand::from(request)).await? {
                 GroupWriteResponse::Append(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
@@ -1164,6 +1219,12 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupFlushColdFuture<'a> {
         Box::pin(async move {
+            if let Some(cold_store) = self.cold_store.as_ref() {
+                let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+                write_cold_chunk_index_pages(&store, &request.stream_id, &request.chunk)
+                    .await
+                    .map_err(|err| GroupEngineError::new(err.to_string()))?;
+            }
             match self.write(GroupWriteCommand::from(request)).await? {
                 GroupWriteResponse::FlushCold(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(

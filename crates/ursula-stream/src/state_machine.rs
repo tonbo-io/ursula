@@ -5,10 +5,11 @@ use ursula_shard::BucketStreamId;
 use crate::command::StreamCommand;
 use crate::integrity::StreamIntegrity;
 use crate::model::{
-    AppendExternalInput, AppendStreamInput, ColdChunkRef, ColdFlushCandidate, ColdGcEntry,
-    ColdGcTarget, ExternalPayloadRef, HotPayloadSegment, ObjectPayloadRef, ProducerAppendRecord,
-    ProducerRequest, ProducerSnapshot, ProducerState, StreamBatchAppend, StreamBatchAppendItem,
-    StreamBootstrapPlan, StreamMessageRecord, StreamMetadata, StreamRead, StreamReadObjectSegment,
+    AppendExternalInput, AppendStreamInput, COLD_INDEX_PAGE_SPAN_BYTES, ColdChunkRef,
+    ColdFlushCandidate, ColdGcEntry, ColdGcTarget, ExternalPayloadRef, HotPayloadSegment,
+    ObjectPayloadRef, ProducerAppendRecord, ProducerRequest, ProducerSnapshot, ProducerState,
+    StreamBatchAppend, StreamBatchAppendItem, StreamBootstrapPlan, StreamMessageRecord,
+    StreamMetadata, StreamRead, StreamReadColdIndexSegment, StreamReadObjectSegment,
     StreamReadPlan, StreamReadSegment, StreamStatus, StreamVisibleSnapshot,
 };
 use crate::response::{StreamErrorCode, StreamResponse};
@@ -20,14 +21,161 @@ pub struct StreamStateMachine {
     buckets: HashSet<String>,
     streams: HashMap<BucketStreamId, StreamMetadata>,
     hot_buffers: HashMap<BucketStreamId, HotBuffer>,
-    cold_chunks: HashMap<BucketStreamId, Vec<ColdChunkRef>>,
-    external_segments: HashMap<BucketStreamId, Vec<ObjectPayloadRef>>,
+    cold_index: InMemoryColdIndex,
     message_records: HashMap<BucketStreamId, Vec<StreamMessageRecord>>,
     integrities: HashMap<BucketStreamId, StreamIntegrity>,
     visible_snapshots: HashMap<BucketStreamId, StreamVisibleSnapshot>,
     producers: HashMap<BucketStreamId, HashMap<String, ProducerState>>,
     pending_cold_gc: VecDeque<ColdGcEntry>,
     next_cold_gc_seq: u64,
+}
+
+trait ColdIndexState {
+    fn cold_chunks(&self, stream_id: &BucketStreamId) -> &[ColdChunkRef];
+    fn external_segments(&self, stream_id: &BucketStreamId) -> &[ObjectPayloadRef];
+    fn cold_generation(&self, stream_id: &BucketStreamId) -> u64;
+    fn push_cold_chunk(&mut self, stream_id: BucketStreamId, chunk: ColdChunkRef);
+    fn push_external_segment(&mut self, stream_id: BucketStreamId, object: ObjectPayloadRef);
+    fn restore_stream(
+        &mut self,
+        stream_id: BucketStreamId,
+        cold_frontier_offset: u64,
+        cold_index_generation: u64,
+        cold_chunks: Vec<ColdChunkRef>,
+        external_segments: Vec<ObjectPayloadRef>,
+    );
+    fn remove_stream(&mut self, stream_id: &BucketStreamId) -> bool;
+    fn compact_before(&mut self, stream_id: &BucketStreamId, retained_offset: u64) -> Vec<String>;
+    fn cold_frontier_offset(&self, stream_id: &BucketStreamId, retained_offset: u64) -> u64;
+}
+
+#[derive(Debug, Clone, Default)]
+struct InMemoryColdIndex {
+    cold_chunks: HashMap<BucketStreamId, Vec<ColdChunkRef>>,
+    external_segments: HashMap<BucketStreamId, Vec<ObjectPayloadRef>>,
+    cold_frontiers: HashMap<BucketStreamId, u64>,
+}
+
+impl ColdIndexState for InMemoryColdIndex {
+    fn cold_chunks(&self, stream_id: &BucketStreamId) -> &[ColdChunkRef] {
+        self.cold_chunks
+            .get(stream_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn external_segments(&self, stream_id: &BucketStreamId) -> &[ObjectPayloadRef] {
+        self.external_segments
+            .get(stream_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    fn cold_generation(&self, _stream_id: &BucketStreamId) -> u64 {
+        0
+    }
+
+    fn push_cold_chunk(&mut self, stream_id: BucketStreamId, chunk: ColdChunkRef) {
+        self.cold_frontiers.insert(stream_id, chunk.end_offset);
+    }
+
+    fn push_external_segment(&mut self, stream_id: BucketStreamId, object: ObjectPayloadRef) {
+        let frontier = self
+            .cold_frontiers
+            .get(&stream_id)
+            .copied()
+            .unwrap_or(object.start_offset)
+            .max(object.end_offset);
+        self.cold_frontiers.insert(stream_id, frontier);
+    }
+
+    fn restore_stream(
+        &mut self,
+        stream_id: BucketStreamId,
+        cold_frontier_offset: u64,
+        _cold_index_generation: u64,
+        cold_chunks: Vec<ColdChunkRef>,
+        external_segments: Vec<ObjectPayloadRef>,
+    ) {
+        if cold_frontier_offset > 0 {
+            self.cold_frontiers
+                .insert(stream_id.clone(), cold_frontier_offset);
+        }
+        if !cold_chunks.is_empty() {
+            self.cold_chunks.insert(stream_id.clone(), cold_chunks);
+        }
+        if !external_segments.is_empty() {
+            self.external_segments.insert(stream_id, external_segments);
+        }
+    }
+
+    fn remove_stream(&mut self, stream_id: &BucketStreamId) -> bool {
+        self.cold_frontiers
+            .remove(stream_id)
+            .is_some_and(|frontier| frontier > 0)
+            || self
+                .cold_chunks
+                .remove(stream_id)
+                .is_some_and(|chunks| !chunks.is_empty())
+            || self
+                .external_segments
+                .remove(stream_id)
+                .is_some_and(|objects| !objects.is_empty())
+    }
+
+    fn compact_before(&mut self, stream_id: &BucketStreamId, retained_offset: u64) -> Vec<String> {
+        let mut dropped_cold_paths = Vec::new();
+        if let Some(chunks) = self.cold_chunks.get_mut(stream_id) {
+            chunks.retain(|chunk| {
+                let retain = chunk.end_offset > retained_offset;
+                if !retain {
+                    dropped_cold_paths.push(chunk.s3_path.clone());
+                }
+                retain
+            });
+            if chunks.is_empty() {
+                self.cold_chunks.remove(stream_id);
+            }
+        }
+        if let Some(objects) = self.external_segments.get_mut(stream_id) {
+            objects.retain(|object| object.end_offset > retained_offset);
+            if objects.is_empty() {
+                self.external_segments.remove(stream_id);
+            }
+        }
+        dropped_cold_paths
+    }
+
+    fn cold_frontier_offset(&self, stream_id: &BucketStreamId, retained_offset: u64) -> u64 {
+        let external_segments = self.external_segments(stream_id);
+        let cold_frontier = self
+            .cold_frontiers
+            .get(stream_id)
+            .copied()
+            .unwrap_or(retained_offset);
+        let mut ranges = Vec::with_capacity(1 + external_segments.len());
+        if cold_frontier > retained_offset {
+            ranges.push((retained_offset, cold_frontier));
+        }
+        ranges.extend(
+            external_segments
+                .iter()
+                .map(|object| (object.start_offset, object.end_offset)),
+        );
+        ranges.sort_unstable();
+
+        let mut frontier = retained_offset;
+        for (start_offset, end_offset) in ranges {
+            if end_offset <= frontier {
+                continue;
+            }
+            if start_offset > frontier {
+                break;
+            }
+            frontier = end_offset;
+        }
+        frontier
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -405,17 +553,11 @@ impl StreamStateMachine {
     }
 
     pub fn cold_chunks(&self, stream_id: &BucketStreamId) -> &[ColdChunkRef] {
-        self.cold_chunks
-            .get(stream_id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.cold_index().cold_chunks(stream_id)
     }
 
     pub fn external_segments(&self, stream_id: &BucketStreamId) -> &[ObjectPayloadRef] {
-        self.external_segments
-            .get(stream_id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.cold_index().external_segments(stream_id)
     }
 
     pub fn hot_segments(&self, stream_id: &BucketStreamId) -> Vec<HotPayloadSegment> {
@@ -569,6 +711,14 @@ impl StreamStateMachine {
         self.buckets.contains(bucket_id)
     }
 
+    fn cold_index(&self) -> &impl ColdIndexState {
+        &self.cold_index
+    }
+
+    fn cold_index_mut(&mut self) -> &mut impl ColdIndexState {
+        &mut self.cold_index
+    }
+
     pub fn integrity_snapshot(
         &self,
         stream_id: &BucketStreamId,
@@ -611,19 +761,16 @@ impl StreamStateMachine {
                 let producer_states = self.producer_snapshot(&stream_id);
                 StreamSnapshotEntry {
                     metadata,
-                    hot_start_offset: hot_buffer.hot_start_offset(),
+                    hot_start_offset: self.hot_start_offset(&stream_id),
                     payload,
                     hot_segments: hot_buffer.hot_segments(),
-                    cold_chunks: self
-                        .cold_chunks
-                        .get(&stream_id)
-                        .cloned()
-                        .unwrap_or_default(),
-                    external_segments: self
-                        .external_segments
-                        .get(&stream_id)
-                        .cloned()
-                        .unwrap_or_default(),
+                    cold_frontier_offset: self.cold_frontier_offset(
+                        &stream_id,
+                        self.earliest_retained_offset(&stream_id),
+                    ),
+                    cold_index_generation: self.cold_index().cold_generation(&stream_id),
+                    cold_chunks: self.cold_index().cold_chunks(&stream_id).to_vec(),
+                    external_segments: self.cold_index().external_segments(&stream_id).to_vec(),
                     message_records: self
                         .message_records
                         .get(&stream_id)
@@ -690,6 +837,7 @@ impl StreamStateMachine {
             };
             if !hot_segments_match_payload(&hot_segments, entry.payload.len())
                 || !payload_sources_cover_retained_suffix(
+                    entry.cold_frontier_offset,
                     &entry.cold_chunks,
                     &entry.external_segments,
                     &hot_segments,
@@ -727,16 +875,13 @@ impl StreamStateMachine {
                 stream_id.clone(),
                 HotBuffer::from_snapshot(entry.payload, &hot_segments),
             );
-            if !entry.cold_chunks.is_empty() {
-                machine
-                    .cold_chunks
-                    .insert(stream_id.clone(), entry.cold_chunks);
-            }
-            if !entry.external_segments.is_empty() {
-                machine
-                    .external_segments
-                    .insert(stream_id.clone(), entry.external_segments);
-            }
+            machine.cold_index_mut().restore_stream(
+                stream_id.clone(),
+                entry.cold_frontier_offset,
+                entry.cold_index_generation,
+                entry.cold_chunks,
+                entry.external_segments,
+            );
             if !entry.message_records.is_empty() {
                 machine
                     .message_records
@@ -764,11 +909,12 @@ impl StreamStateMachine {
         max_len: usize,
     ) -> Result<StreamRead, StreamResponse> {
         let plan = self.read_plan(stream_id, offset, max_len)?;
-        if plan
-            .segments
-            .iter()
-            .any(|segment| matches!(segment, StreamReadSegment::Object(_)))
-        {
+        if plan.segments.iter().any(|segment| {
+            matches!(
+                segment,
+                StreamReadSegment::ColdIndex(_) | StreamReadSegment::Object(_)
+            )
+        }) {
             return Err(StreamResponse::error_with_next_offset(
                 StreamErrorCode::InvalidColdFlush,
                 format!("stream '{stream_id}' read requires object payload store"),
@@ -780,7 +926,9 @@ impl StreamStateMachine {
             .iter()
             .flat_map(|segment| match segment {
                 StreamReadSegment::Hot(payload) => payload.as_slice(),
-                StreamReadSegment::Object(_) => unreachable!("object segments checked above"),
+                StreamReadSegment::ColdIndex(_) | StreamReadSegment::Object(_) => {
+                    unreachable!("object segments checked above")
+                }
             })
             .copied()
             .collect();
@@ -853,6 +1001,41 @@ impl StreamStateMachine {
         let max_len_u64 = u64::try_from(max_len).unwrap_or(u64::MAX);
         let next_offset = stream.tail_offset.min(offset.saturating_add(max_len_u64));
         let mut segments = Vec::<(u64, StreamReadSegment)>::new();
+        let hot_segments = self
+            .hot_buffers
+            .get(stream_id)
+            .map(|hot_buffer| hot_buffer.read_segments(offset, next_offset))
+            .unwrap_or_default();
+        let cold_frontier = self.cold_frontier_offset(stream_id, retained_offset);
+        let cold_index_end = next_offset.min(cold_frontier);
+        let mut cursor = offset;
+        for (hot_start, hot_segment) in &hot_segments {
+            if cursor >= cold_index_end {
+                break;
+            }
+            let Some(hot_end) = read_segment_end(*hot_start, hot_segment) else {
+                continue;
+            };
+            if hot_end <= cursor {
+                continue;
+            }
+            let gap_end = (*hot_start).min(cold_index_end);
+            push_cold_index_segments(
+                &mut segments,
+                stream_id,
+                self.cold_index().cold_generation(stream_id),
+                cursor,
+                gap_end,
+            );
+            cursor = cursor.max(hot_end);
+        }
+        push_cold_index_segments(
+            &mut segments,
+            stream_id,
+            self.cold_index().cold_generation(stream_id),
+            cursor,
+            cold_index_end,
+        );
         for chunk in self.cold_chunks(stream_id) {
             let start = offset.max(chunk.start_offset);
             let end = next_offset.min(chunk.end_offset);
@@ -881,9 +1064,7 @@ impl StreamStateMachine {
                 ));
             }
         }
-        if let Some(hot_buffer) = self.hot_buffers.get(stream_id) {
-            segments.extend(hot_buffer.read_segments(offset, next_offset));
-        }
+        segments.extend(hot_segments);
         segments.sort_by_key(|(start, _)| *start);
         if !segments_cover_range(&segments, offset, next_offset) {
             return Err(StreamResponse::error_with_next_offset(
@@ -1150,10 +1331,13 @@ impl StreamStateMachine {
             .get_mut(&stream_id)
             .expect("hot buffer exists for stream metadata")
             .flush_prefix(chunk.end_offset);
-        self.cold_chunks
-            .entry(stream_id.clone())
-            .or_default()
-            .push(chunk.clone());
+        self.cold_index_mut()
+            .push_cold_chunk(stream_id.clone(), chunk.clone());
+        self.compact_message_records_before(
+            &stream_id,
+            self.earliest_retained_offset(&stream_id),
+            chunk.end_offset,
+        );
         StreamResponse::ColdFlushed {
             hot_start_offset: self.hot_start_offset(&stream_id),
         }
@@ -1413,22 +1597,16 @@ impl StreamStateMachine {
         self.streams.insert(input.stream_id.clone(), metadata);
         self.hot_buffers
             .insert(input.stream_id.clone(), HotBuffer::default());
-        self.external_segments.insert(
-            input.stream_id.clone(),
-            vec![ObjectPayloadRef {
-                start_offset: 0,
-                end_offset: initial_len,
-                s3_path: input.initial_payload.s3_path,
-                object_size: input.initial_payload.object_size,
-            }],
-        );
+        let object = ObjectPayloadRef {
+            start_offset: 0,
+            end_offset: initial_len,
+            s3_path: input.initial_payload.s3_path,
+            object_size: input.initial_payload.object_size,
+        };
+        self.cold_index_mut()
+            .push_external_segment(input.stream_id.clone(), object.clone());
         let mut integrity = StreamIntegrity::default();
         if initial_len > 0 {
-            let object = self
-                .external_segments
-                .get(&input.stream_id)
-                .and_then(|objects| objects.first())
-                .expect("external segment exists for stream metadata");
             integrity.append_external(
                 &input.stream_id,
                 object.start_offset,
@@ -1766,20 +1944,14 @@ impl StreamStateMachine {
                 }],
             );
         }
-        self.external_segments
-            .entry(stream_id.clone())
-            .or_default()
-            .push(ObjectPayloadRef {
-                start_offset: offset,
-                end_offset: next_offset,
-                s3_path: payload.s3_path,
-                object_size: payload.object_size,
-            });
-        let object = self
-            .external_segments
-            .get(&stream_id)
-            .and_then(|segments| segments.last())
-            .expect("external segment exists for stream metadata");
+        let object = ObjectPayloadRef {
+            start_offset: offset,
+            end_offset: next_offset,
+            s3_path: payload.s3_path,
+            object_size: payload.object_size,
+        };
+        self.cold_index_mut()
+            .push_external_segment(stream_id.clone(), object.clone());
         self.integrities
             .get_mut(&stream_id)
             .expect("integrity exists for stream metadata")
@@ -2111,11 +2283,7 @@ impl StreamStateMachine {
     fn remove_stream_state(&mut self, stream_id: &BucketStreamId) -> bool {
         if self.streams.remove(stream_id).is_some() {
             self.hot_buffers.remove(stream_id);
-            let had_cold = self
-                .cold_chunks
-                .remove(stream_id)
-                .is_some_and(|chunks| !chunks.is_empty());
-            self.external_segments.remove(stream_id);
+            let had_cold = self.cold_index_mut().remove_stream(stream_id);
             self.message_records.remove(stream_id);
             self.integrities.remove(stream_id);
             self.visible_snapshots.remove(stream_id);
@@ -2198,6 +2366,11 @@ impl StreamStateMachine {
         retained_offset: u64,
     ) -> bool {
         snapshot_offset == retained_offset
+            || snapshot_offset <= self.cold_frontier_offset(stream_id, retained_offset)
+            || self
+                .hot_buffers
+                .get(stream_id)
+                .is_some_and(|buffer| snapshot_offset <= buffer.hot_start_offset())
             || self.message_records.get(stream_id).is_some_and(|records| {
                 records
                     .iter()
@@ -2206,41 +2379,64 @@ impl StreamStateMachine {
     }
 
     fn compact_retained_prefix(&mut self, stream_id: &BucketStreamId, retained_offset: u64) {
-        if let Some(records) = self.message_records.get_mut(stream_id) {
-            records.retain(|record| record.end_offset > retained_offset);
-            if records.is_empty() {
-                self.message_records.remove(stream_id);
-            }
-        }
+        let frontier = self.cold_frontier_offset(stream_id, retained_offset).max(
+            self.hot_buffers
+                .get(stream_id)
+                .map(|buffer| buffer.hot_start_offset())
+                .unwrap_or(retained_offset),
+        );
+        self.compact_message_records_before(stream_id, retained_offset, frontier);
         if let Some(integrity) = self.integrities.get_mut(stream_id) {
             integrity.evict_before(retained_offset);
         }
-        let mut dropped_cold_paths = Vec::new();
-        if let Some(chunks) = self.cold_chunks.get_mut(stream_id) {
-            chunks.retain(|chunk| {
-                let retain = chunk.end_offset > retained_offset;
-                if !retain {
-                    dropped_cold_paths.push(chunk.s3_path.clone());
-                }
-                retain
-            });
-            if chunks.is_empty() {
-                self.cold_chunks.remove(stream_id);
-            }
-        }
+        let dropped_cold_paths = self
+            .cold_index_mut()
+            .compact_before(stream_id, retained_offset);
         if !dropped_cold_paths.is_empty() {
             self.enqueue_cold_gc(ColdGcTarget::Paths(dropped_cold_paths));
-        }
-        if let Some(objects) = self.external_segments.get_mut(stream_id) {
-            objects.retain(|object| object.end_offset > retained_offset);
-            if objects.is_empty() {
-                self.external_segments.remove(stream_id);
-            }
         }
 
         if let Some(hot_buffer) = self.hot_buffers.get_mut(stream_id) {
             hot_buffer.discard_before(retained_offset);
         }
+    }
+
+    fn compact_message_records_before(
+        &mut self,
+        stream_id: &BucketStreamId,
+        retained_offset: u64,
+        frontier: u64,
+    ) {
+        let Some(records) = self.message_records.remove(stream_id) else {
+            return;
+        };
+        let frontier = frontier.max(retained_offset);
+        let mut compacted = Vec::with_capacity(records.len());
+        if frontier > retained_offset {
+            compacted.push(StreamMessageRecord {
+                start_offset: retained_offset,
+                end_offset: frontier,
+            });
+        }
+        compacted.extend(records.iter().filter_map(|record| {
+            if record.end_offset <= frontier {
+                return None;
+            }
+            let start_offset = record.start_offset.max(frontier).max(retained_offset);
+            (record.end_offset > start_offset).then_some(StreamMessageRecord {
+                start_offset,
+                end_offset: record.end_offset,
+            })
+        }));
+        if compacted.is_empty() {
+            return;
+        }
+        self.message_records.insert(stream_id.clone(), compacted);
+    }
+
+    fn cold_frontier_offset(&self, stream_id: &BucketStreamId, retained_offset: u64) -> u64 {
+        self.cold_index()
+            .cold_frontier_offset(stream_id, retained_offset)
     }
 
     fn producer_snapshot(&self, stream_id: &BucketStreamId) -> Vec<ProducerSnapshot> {
@@ -2592,6 +2788,7 @@ fn hot_segments_match_payload(segments: &[HotPayloadSegment], payload_len: usize
 }
 
 fn payload_sources_cover_retained_suffix(
+    cold_frontier_offset: u64,
     cold_chunks: &[ColdChunkRef],
     external_segments: &[ObjectPayloadRef],
     hot_segments: &[HotPayloadSegment],
@@ -2602,7 +2799,10 @@ fn payload_sources_cover_retained_suffix(
         return false;
     }
     let mut ranges =
-        Vec::with_capacity(cold_chunks.len() + external_segments.len() + hot_segments.len());
+        Vec::with_capacity(1 + cold_chunks.len() + external_segments.len() + hot_segments.len());
+    if cold_frontier_offset > retained_offset {
+        ranges.push((retained_offset, cold_frontier_offset));
+    }
     for chunk in cold_chunks {
         if !valid_cold_chunk_ref(chunk) {
             return false;
@@ -2637,6 +2837,33 @@ fn payload_sources_cover_retained_suffix(
         }
     }
     expected_start == tail_offset
+}
+
+fn push_cold_index_segments(
+    segments: &mut Vec<(u64, StreamReadSegment)>,
+    _stream_id: &BucketStreamId,
+    generation: u64,
+    start_offset: u64,
+    end_offset: u64,
+) {
+    let mut cursor = start_offset;
+    while cursor < end_offset {
+        let page_id = cursor / COLD_INDEX_PAGE_SPAN_BYTES;
+        let page_end = page_id
+            .saturating_add(1)
+            .saturating_mul(COLD_INDEX_PAGE_SPAN_BYTES);
+        let segment_end = end_offset.min(page_end);
+        segments.push((
+            cursor,
+            StreamReadSegment::ColdIndex(StreamReadColdIndexSegment {
+                generation,
+                page_id,
+                read_start_offset: cursor,
+                len: usize::try_from(segment_end - cursor).expect("cold index read len fits usize"),
+            }),
+        ));
+        cursor = segment_end;
+    }
 }
 
 fn segments_cover_range(
@@ -2681,6 +2908,13 @@ fn read_segment_end(segment_start: u64, segment: &StreamReadSegment) -> Option<u
                 return None;
             }
             Some(segment_end)
+        }
+        StreamReadSegment::ColdIndex(index) => {
+            if index.len == 0 || index.read_start_offset != segment_start {
+                return None;
+            }
+            let len = u64::try_from(index.len).ok()?;
+            segment_start.checked_add(len)
         }
         StreamReadSegment::Hot(payload) => {
             if payload.is_empty() {

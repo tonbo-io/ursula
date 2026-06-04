@@ -32,22 +32,25 @@ pub(crate) struct GroupMailbox {
 
 impl GroupMailbox {
     pub(crate) async fn send(&self, command: GroupCommand) -> Result<(), Box<GroupCommand>> {
+        self.metrics.record_group_mailbox_enqueued(self.group_id);
         match self.tx.try_send(command) {
-            Ok(()) => {
-                self.metrics.record_group_mailbox_enqueued(self.group_id);
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(command)) => {
+                self.metrics.record_group_mailbox_dequeued(self.group_id);
                 self.metrics.record_group_mailbox_full(self.group_id);
+                self.metrics.record_group_mailbox_enqueued(self.group_id);
                 match self.tx.send(command).await {
-                    Ok(()) => {
-                        self.metrics.record_group_mailbox_enqueued(self.group_id);
-                        Ok(())
+                    Ok(()) => Ok(()),
+                    Err(err) => {
+                        self.metrics.record_group_mailbox_dequeued(self.group_id);
+                        Err(Box::new(err.0))
                     }
-                    Err(err) => Err(Box::new(err.0)),
                 }
             }
-            Err(mpsc::error::TrySendError::Closed(command)) => Err(Box::new(command)),
+            Err(mpsc::error::TrySendError::Closed(command)) => {
+                self.metrics.record_group_mailbox_dequeued(self.group_id);
+                Err(Box::new(command))
+            }
         }
     }
 }

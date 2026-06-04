@@ -448,6 +448,38 @@ impl ColdStore {
         Ok(object_size)
     }
 
+    pub(crate) async fn write_cold_index_page(
+        &self,
+        path: &str,
+        payload: &[u8],
+    ) -> io::Result<u64> {
+        if path.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cold index page path must not be empty",
+            ));
+        }
+        self.operator
+            .write(path, payload.to_vec())
+            .await
+            .map_err(|err| cold_store_io_error(path, err))?;
+        Ok(u64::try_from(payload.len()).expect("payload len fits u64"))
+    }
+
+    pub(crate) async fn read_cold_index_page(&self, path: &str) -> io::Result<Option<Vec<u8>>> {
+        if path.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cold index page path must not be empty",
+            ));
+        }
+        match self.operator.read(path).await {
+            Ok(bytes) => Ok(Some(bytes.to_bytes().to_vec())),
+            Err(err) if err.kind() == opendal::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(cold_store_io_error(path, err)),
+        }
+    }
+
     pub async fn delete_chunk(&self, path: &str) -> io::Result<()> {
         if path.trim().is_empty() {
             return Err(io::Error::new(
