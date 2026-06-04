@@ -71,14 +71,14 @@ jobs:
 
   build-image:
     name: Build Docker images
-    needs: change-detection
-    if: contains(fromJson(needs.change-detection.outputs.tests-to-run), 'rust')
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+
       - name: Build Docker image
         uses: docker/build-push-action@v6
         with:
