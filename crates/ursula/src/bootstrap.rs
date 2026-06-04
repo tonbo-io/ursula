@@ -496,33 +496,6 @@ pub fn spawn_snapshot_driver_if_configured(
                 reenable_elections_if_campaign_allowed(&registry, "s3-healthy: node S3 recovered");
             }
 
-            // Drive snapshots (log compaction) only while fully healthy (probe
-            // ok AND cold flush succeeding). With SnapshotPolicy::Never these
-            // driver triggers are the only snapshots, so skipping them during an
-            // outage keeps the raft core alive: the in-memory log grows until S3
-            // returns (bounded by the outage), then the next healthy tick
-            // compacts it. Gating on `!bad_tick` (not just the probe) avoids
-            // triggering a snapshot build against an S3 the probe only thinks is
-            // reachable.
-            if !bad_tick {
-                let mut triggers = tokio::task::JoinSet::new();
-                for snapshot in &snaps {
-                    if !should_drive_snapshot_for_group(snapshot) {
-                        continue;
-                    }
-                    let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) else {
-                        continue;
-                    };
-                    let gid = snapshot.raft_group_id;
-                    triggers.spawn(async move {
-                        if let Err(err) = raft.trigger().snapshot().await {
-                            tracing::error!("snapshot driver trigger group {gid} error: {err}");
-                        }
-                    });
-                }
-                while triggers.join_next().await.is_some() {}
-            }
-
             // Drain every group's hot tail to cold AFTER the health decision so
             // a slow/stalled flush never delays the leadership yield above.
             // `min_hot_bytes=1` makes any hot bytes eligible; `max_flush_bytes`
@@ -541,6 +514,28 @@ pub fn spawn_snapshot_driver_if_configured(
                 tracing::error!("snapshot driver flush error: {err}");
             }
 
+            // Drive snapshots (log compaction) only while fully healthy (probe
+            // ok AND cold flush succeeding). With SnapshotPolicy::Never these
+            // driver triggers are the only snapshots, so skipping them during an
+            // outage keeps the raft core alive: the in-memory log grows until S3
+            // returns (bounded by the outage), then the next healthy tick
+            // compacts it. Trigger groups sequentially so full snapshot clones
+            // do not stack in process memory.
+            if !bad_tick {
+                for snapshot in &snaps {
+                    if !should_drive_snapshot_for_group(snapshot) {
+                        continue;
+                    }
+                    let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) else {
+                        continue;
+                    };
+                    let gid = snapshot.raft_group_id;
+                    if let Err(err) = raft.trigger().snapshot().await {
+                        tracing::error!("snapshot driver trigger group {gid} error: {err}");
+                    }
+                }
+            }
+
             tokio::time::sleep(interval).await;
         }
     });
@@ -550,7 +545,12 @@ pub(crate) fn should_drive_snapshot_for_group(snapshot: &RaftGroupMetricsSnapsho
     // An empty in-memory raft node has no applied state yet; triggering a
     // manual snapshot there publishes a `group-X-empty` object that cannot be a
     // valid recovery source for an existing group.
-    snapshot.last_applied.is_some()
+    let Some(last_applied) = snapshot.last_applied else {
+        return false;
+    };
+    snapshot
+        .snapshot
+        .is_none_or(|current| current.index < last_applied.index)
 }
 
 /// M1 — leadership balancing. Spreads raft-group leadership evenly across

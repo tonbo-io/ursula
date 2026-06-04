@@ -4828,7 +4828,7 @@ mod snapshot_driver {
     use crate::bootstrap::should_drive_snapshot_for_group;
     use ursula_raft::{RaftGroupMetricsSnapshot, RaftLogProgressSnapshot};
 
-    fn snap(last_applied: Option<u64>) -> RaftGroupMetricsSnapshot {
+    fn snap(last_applied: Option<u64>, snapshot_index: Option<u64>) -> RaftGroupMetricsSnapshot {
         RaftGroupMetricsSnapshot {
             raft_group_id: 0,
             node_id: 1,
@@ -4837,7 +4837,7 @@ mod snapshot_driver {
             last_log_index: last_applied,
             committed: last_applied.map(|index| RaftLogProgressSnapshot { term: 1, index }),
             last_applied: last_applied.map(|index| RaftLogProgressSnapshot { term: 1, index }),
-            snapshot: None,
+            snapshot: snapshot_index.map(|index| RaftLogProgressSnapshot { term: 1, index }),
             purged: None,
             voter_ids: vec![1, 2, 3],
             learner_ids: vec![],
@@ -4845,9 +4845,12 @@ mod snapshot_driver {
     }
 
     #[test]
-    fn snapshot_driver_skips_empty_raft_state() {
-        assert!(!should_drive_snapshot_for_group(&snap(None)));
-        assert!(should_drive_snapshot_for_group(&snap(Some(42))));
+    fn snapshot_driver_only_snapshots_applied_work_past_current_snapshot() {
+        assert!(!should_drive_snapshot_for_group(&snap(None, None)));
+        assert!(should_drive_snapshot_for_group(&snap(Some(42), None)));
+        assert!(should_drive_snapshot_for_group(&snap(Some(42), Some(41))));
+        assert!(!should_drive_snapshot_for_group(&snap(Some(42), Some(42))));
+        assert!(!should_drive_snapshot_for_group(&snap(Some(42), Some(43))));
     }
 }
 
