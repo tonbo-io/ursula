@@ -47,7 +47,7 @@ use futures_util::stream;
 use openraft::BasicNode;
 use openraft::rt::WatchReceiver;
 use ursula_raft::{
-    LeadershipShedFlag, RAFT_GRPC_APPEND_PATH, RAFT_GRPC_FULL_SNAPSHOT_PATH,
+    LeadershipShedFlag, LeadershipShedReason, RAFT_GRPC_APPEND_PATH, RAFT_GRPC_FULL_SNAPSHOT_PATH,
     RAFT_GRPC_GROUP_READ_PATH, RAFT_GRPC_GROUP_WRITE_PATH, RAFT_GRPC_MAX_MESSAGE_BYTES,
     RAFT_GRPC_TRANSFER_LEADER_PATH, RAFT_GRPC_VOTE_PATH, RaftGroupHandleRegistry, RaftGrpcService,
     raft_internal_proto,
@@ -61,7 +61,7 @@ use ursula_runtime::{
 };
 use ursula_shard::{BucketStreamId, RaftGroupId};
 
-use crate::bootstrap::env_usize;
+use crate::bootstrap::{env_usize, reenable_elections_if_campaign_allowed};
 use crate::render::{
     bootstrap_response, insert_cache_control, insert_content_type, insert_cursor,
     insert_default_response_headers, insert_header_str, insert_lifetime_headers, insert_location,
@@ -658,6 +658,10 @@ pub fn client_router_from_state(state: HttpState) -> Router {
             post(transfer_raft_leader),
         )
         .route(
+            "/__ursula/leadership-shed/maintenance",
+            post(mark_maintenance_drain).delete(clear_maintenance_drain),
+        )
+        .route(
             "/v1/stream/{*path}",
             put(create_stream_v1)
                 .post(append_stream_v1)
@@ -814,6 +818,31 @@ async fn leadership_shed_status(State(state): State<HttpState>) -> Response {
     let mut headers = HeaderMap::new();
     insert_content_type(&mut headers, "application/json");
     (StatusCode::OK, headers, body).into_response()
+}
+
+async fn mark_maintenance_drain(State(state): State<HttpState>) -> Response {
+    let Some(registry) = state.raft_registry() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "raft registry is not configured for this server",
+        )
+            .into_response();
+    };
+    registry.mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
+    leadership_shed_status(State(state)).await
+}
+
+async fn clear_maintenance_drain(State(state): State<HttpState>) -> Response {
+    let Some(registry) = state.raft_registry() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "raft registry is not configured for this server",
+        )
+            .into_response();
+    };
+    registry.clear_leadership_shed(LeadershipShedReason::MaintenanceDrain);
+    reenable_elections_if_campaign_allowed(registry, "maintenance-drain cleared");
+    leadership_shed_status(State(state)).await
 }
 
 fn bool_json(value: bool) -> &'static str {

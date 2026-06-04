@@ -235,6 +235,7 @@ _PUBLISHED_HISTORY_RAW_MS = 60 * 60 * 1000  # keep raw samples for the last hour
 WORKLOAD_CLEAN_ERROR_RATE = 0.05
 FAULT_READY_MIN_SUCCESS_RATE = 0.90
 PROBE_PASS_ERROR_RATE = 0.05
+APPEND_TRANSIENT_RETRY_SECS = 5.0
 _PUBLISHED_INJECTIONS = 8  # page renders last 3, keep a small lookback
 _PUBLISHED_EVENTS = 16  # page renders last 10
 _PUBLISHED_INJECTION_TIMELINE = 8  # timeline shown only in expandable details
@@ -621,6 +622,23 @@ class ChaosAgent:
             return status, data, resp_headers
         return status, data, resp_headers
 
+    @staticmethod
+    def is_transient_append_failure(status: int, body: bytes, headers: dict[str, str]) -> bool:
+        if status == 0:
+            return True
+        if status in {307, 308}:
+            return True
+        if status == 503 and headers.get("retry-after"):
+            return True
+        if status == 503:
+            body_preview = body[:240].decode("utf-8", errors="replace")
+            return (
+                "forward request to leader" in body_preview
+                or "local leader runtime" in body_preview
+                or "leader" in body_preview.lower()
+            )
+        return False
+
     def create_streams(self) -> None:
         for stream in self.streams:
             self.create_stream_until_ready(stream)
@@ -691,108 +709,122 @@ class ChaosAgent:
         last_error = "no target nodes"
         saw_cold_backpressure = False
         saw_hard_error = False
-        for attempt in range(len(self.nodes)):
-            node = self.nodes[(first_node + attempt) % len(self.nodes)]
-            try:
-                status, body, headers = self.request(
-                    "POST",
-                    f"{node.base_url}/{BUCKET}/{stream_name}",
-                    body=payload,
-                    headers={
-                        "Content-Type": CONTENT_TYPE,
-                        "Producer-Id": producer_id,
-                        "Producer-Epoch": str(producer_epoch),
-                        "Producer-Seq": str(producer_seq),
-                    },
-                    timeout_secs=self.append_timeout_secs,
-                )
-            except Exception as exc:  # noqa: BLE001
-                last_error = f"{node.name}: {exc}"
-                saw_hard_error = True
-                continue
-            if status not in {200, 204}:
-                body_preview = body[:160].decode("utf-8", errors="replace").strip()
-                last_error = f"{node.name}: status={status} body={body_preview!r}"
-                if status == 503 and "ColdBackpressure" in body_preview:
-                    saw_cold_backpressure = True
-                else:
+        saw_transient_failure = False
+        retry_deadline = time.monotonic() + APPEND_TRANSIENT_RETRY_SECS
+        while True:
+            retryable_sweep = False
+            for attempt in range(len(self.nodes)):
+                node = self.nodes[(first_node + attempt) % len(self.nodes)]
+                try:
+                    status, body, headers = self.request(
+                        "POST",
+                        f"{node.base_url}/{BUCKET}/{stream_name}",
+                        body=payload,
+                        headers={
+                            "Content-Type": CONTENT_TYPE,
+                            "Producer-Id": producer_id,
+                            "Producer-Epoch": str(producer_epoch),
+                            "Producer-Seq": str(producer_seq),
+                        },
+                        timeout_secs=self.append_timeout_secs,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    last_error = f"{node.name}: {exc}"
                     saw_hard_error = True
-                continue
-            next_offset_header = headers.get("stream-next-offset")
-            if next_offset_header is None:
-                raise RuntimeError(
-                    f"{node.name}: 200/204 append response missing stream-next-offset "
-                    f"(stream={stream_name}, headers={sorted(headers.keys())})"
-                )
-            try:
-                next_offset_value = int(next_offset_header)
-            except ValueError as exc:
-                raise RuntimeError(
-                    f"{node.name}: invalid stream-next-offset header "
-                    f"{next_offset_header!r}: {exc}"
-                ) from exc
-            end_offset = next_offset_value
-            committed_new_record = status == 200
-            with self.state_lock:
-                pending_payload = stream.pending_producer_appends.pop(pending_key, None)
-                if committed_new_record:
-                    previous_next_offset = stream.next_offset
-                    stream.next_offset = max(stream.next_offset, end_offset)
-                    self.record_expected_append_span(
-                        stream,
-                        previous_next_offset,
-                        end_offset,
-                        payload,
+                    continue
+                if status not in {200, 204}:
+                    body_preview = body[:160].decode("utf-8", errors="replace").strip()
+                    last_error = f"{node.name}: status={status} body={body_preview!r}"
+                    if status == 503 and "ColdBackpressure" in body_preview:
+                        saw_cold_backpressure = True
+                    elif self.is_transient_append_failure(status, body, headers):
+                        saw_transient_failure = True
+                        retryable_sweep = True
+                    else:
+                        saw_hard_error = True
+                    continue
+                next_offset_header = headers.get("stream-next-offset")
+                if next_offset_header is None:
+                    raise RuntimeError(
+                        f"{node.name}: 200/204 append response missing stream-next-offset "
+                        f"(stream={stream_name}, headers={sorted(headers.keys())})"
                     )
-                elif pending_payload is not None:
-                    # 204 is a producer dedup acknowledgement. If the original
-                    # append timed out but committed, account the original
-                    # payload once the dedup response proves it.
-                    previous_next_offset = stream.next_offset
-                    stream.next_offset = max(stream.next_offset, end_offset)
-                    self.record_expected_append_span(
-                        stream,
-                        previous_next_offset,
-                        end_offset,
-                        pending_payload,
-                    )
-                else:
-                    previous_next_offset = stream.next_offset
-                    stream.next_offset = max(stream.next_offset, end_offset)
-                    if end_offset > previous_next_offset:
-                        # A dedup response can be the first durable proof the
-                        # agent sees for this producer seq. The payload is
-                        # deterministic for the seq, so account it when the
-                        # response advances our stream view.
+                try:
+                    next_offset_value = int(next_offset_header)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"{node.name}: invalid stream-next-offset header "
+                        f"{next_offset_header!r}: {exc}"
+                    ) from exc
+                end_offset = next_offset_value
+                committed_new_record = status == 200
+                with self.state_lock:
+                    pending_payload = stream.pending_producer_appends.pop(pending_key, None)
+                    if committed_new_record:
+                        previous_next_offset = stream.next_offset
+                        stream.next_offset = max(stream.next_offset, end_offset)
                         self.record_expected_append_span(
                             stream,
                             previous_next_offset,
                             end_offset,
                             payload,
                         )
-                producer.last_seq = producer_seq
-                producer.last_stream = stream.name
-                producer.last_append_ordinal = producer_seq
-                producer.last_start_offset = start_offset
-                producer.last_end_offset = end_offset
-                producer.last_epoch = producer_epoch
-                producer.last_payload_size = payload_size
-                producer.last_payload_kind = payload_kind
-                producer.last_payload = payload
-                stream.producer_seqs[producer.producer_id] = producer_seq + 1
-                if lane_id is None:
-                    self.global_unresolved_append = False
-                else:
-                    lane = lane_id % self.append_workers
-                    self.lane_attempts[lane] += 1
-                    self.lane_unresolved_appends[lane] = False
-                self.append_success += 1
-            return True
+                    elif pending_payload is not None:
+                        # 204 is a producer dedup acknowledgement. If the original
+                        # append timed out but committed, account the original
+                        # payload once the dedup response proves it.
+                        previous_next_offset = stream.next_offset
+                        stream.next_offset = max(stream.next_offset, end_offset)
+                        self.record_expected_append_span(
+                            stream,
+                            previous_next_offset,
+                            end_offset,
+                            pending_payload,
+                        )
+                    else:
+                        previous_next_offset = stream.next_offset
+                        stream.next_offset = max(stream.next_offset, end_offset)
+                        if end_offset > previous_next_offset:
+                            # A dedup response can be the first durable proof the
+                            # agent sees for this producer seq. The payload is
+                            # deterministic for the seq, so account it when the
+                            # response advances our stream view.
+                            self.record_expected_append_span(
+                                stream,
+                                previous_next_offset,
+                                end_offset,
+                                payload,
+                            )
+                    producer.last_seq = producer_seq
+                    producer.last_stream = stream.name
+                    producer.last_append_ordinal = producer_seq
+                    producer.last_start_offset = start_offset
+                    producer.last_end_offset = end_offset
+                    producer.last_epoch = producer_epoch
+                    producer.last_payload_size = payload_size
+                    producer.last_payload_kind = payload_kind
+                    producer.last_payload = payload
+                    stream.producer_seqs[producer.producer_id] = producer_seq + 1
+                    if lane_id is None:
+                        self.global_unresolved_append = False
+                    else:
+                        lane = lane_id % self.append_workers
+                        self.lane_attempts[lane] += 1
+                        self.lane_unresolved_appends[lane] = False
+                    self.append_success += 1
+                return True
+            if (
+                not retryable_sweep
+                or saw_hard_error
+                or time.monotonic() >= retry_deadline
+            ):
+                break
+            time.sleep(0.05)
         # Pure ColdBackpressure across all nodes (no timeout / non-503 error)
         # is a clean pre-commit rejection: the record definitively did not
         # commit, so the append is resolved (not unknown) and is recorded as a
         # shed rather than a workload error.
-        is_pure_shed = saw_cold_backpressure and not saw_hard_error
+        is_pure_shed = saw_cold_backpressure and not saw_hard_error and not saw_transient_failure
         with self.state_lock:
             if is_pure_shed:
                 self.append_shed += 1

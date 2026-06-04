@@ -23,6 +23,10 @@ pub struct StreamSnapshotEntry {
     pub hot_start_offset: u64,
     pub payload: Vec<u8>,
     pub hot_segments: Vec<HotPayloadSegment>,
+    #[serde(default)]
+    pub cold_frontier_offset: u64,
+    #[serde(default)]
+    pub cold_index_generation: u64,
     pub cold_chunks: Vec<ColdChunkRef>,
     pub external_segments: Vec<ObjectPayloadRef>,
     pub message_records: Vec<StreamMessageRecord>,

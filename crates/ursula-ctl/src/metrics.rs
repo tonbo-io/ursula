@@ -101,6 +101,70 @@ impl MetricsClient {
             ))
         }
     }
+
+    pub async fn set_maintenance_drain(&self, node: &NodeInfo, enabled: bool) -> Result<()> {
+        let url = node
+            .http_url
+            .join("/__ursula/leadership-shed/maintenance")
+            .with_context(|| format!("compose maintenance-drain url for node {}", node.id))?;
+        let request = if enabled {
+            self.client.post(url.clone())
+        } else {
+            self.client.delete(url.clone())
+        };
+        let resp = request
+            .send()
+            .await
+            .with_context(|| format!("{} {url}", if enabled { "POST" } else { "DELETE" }))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "maintenance-drain {} at node {} returned {}: {}",
+                if enabled { "mark" } else { "clear" },
+                node.id,
+                status,
+                body
+            ))
+        }
+    }
+
+    pub async fn allow_next_revert(
+        &self,
+        leader: &NodeInfo,
+        raft_group_id: u64,
+        node_id: u64,
+    ) -> Result<()> {
+        let path = format!("/__ursula/raft/{raft_group_id}/nodes/{node_id}/allow-next-revert");
+        let url = leader.http_url.join(&path).with_context(|| {
+            format!(
+                "compose allow-next-revert url at leader node {} for node {}",
+                leader.id, node_id
+            )
+        })?;
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "allow-next-revert at leader node {} (group {} node {}) returned {}: {}",
+                leader.id,
+                raft_group_id,
+                node_id,
+                status,
+                body
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -205,6 +269,20 @@ impl ClusterSnapshot {
         self.node(node_id)
             .map(|view| view.led_groups().cloned().collect())
             .unwrap_or_default()
+    }
+
+    pub fn groups_reported_led_by(&self, node_id: u64) -> Vec<RaftGroupView> {
+        let mut groups = HashMap::new();
+        for view in &self.per_node {
+            for group in &view.groups {
+                if group.current_leader == Some(node_id) {
+                    groups
+                        .entry(group.raft_group_id)
+                        .or_insert_with(|| group.clone());
+                }
+            }
+        }
+        groups.into_values().collect()
     }
 
     /// Peers' view of a raft group, keyed by reporting node_id, excluding the target.

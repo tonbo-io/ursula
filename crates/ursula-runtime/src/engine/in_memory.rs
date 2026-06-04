@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardId, ShardPlacement};
@@ -17,6 +18,10 @@ use super::{
     GroupPlanNextColdFlushFuture, GroupPublishSnapshotFuture, GroupReadSnapshotFuture,
     GroupReadStreamFuture, GroupReadStreamPartsFuture, GroupSnapshotFuture,
     GroupTouchStreamAccessFuture, GroupWriteResponse,
+};
+use crate::cold_index::{
+    ColdIndexPageCache, ColdStoreColdIndexPageStore, write_cold_chunk_index_pages,
+    write_external_segment_index_pages,
 };
 use crate::cold_store::{ColdStoreHandle, DEFAULT_CONTENT_TYPE};
 use crate::command::{GroupSnapshot, GroupWriteCommand};
@@ -48,18 +53,28 @@ pub struct InMemoryGroupEngine {
     pub(crate) state_machine: StreamStateMachine,
     pub(crate) stream_append_counts: HashMap<BucketStreamId, u64>,
     pub(crate) cold_store: Option<ColdStoreHandle>,
+    pub(crate) cold_index_cache: Option<Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>>,
 }
 
 impl InMemoryGroupEngine {
     pub fn with_cold_store(cold_store: ColdStoreHandle) -> Self {
-        Self {
-            cold_store: Some(cold_store),
-            ..Self::default()
-        }
+        let mut engine = Self::default();
+        engine.set_cold_store(Some(cold_store));
+        engine
     }
 
     pub fn cold_store(&self) -> Option<ColdStoreHandle> {
         self.cold_store.clone()
+    }
+
+    pub(crate) fn set_cold_store(&mut self, cold_store: Option<ColdStoreHandle>) {
+        self.cold_index_cache = cold_store.as_ref().map(|cold_store| {
+            Arc::new(ColdIndexPageCache::new(
+                Arc::new(ColdStoreColdIndexPageStore::new(cold_store.clone())),
+                1024,
+            ))
+        });
+        self.cold_store = cold_store;
     }
 
     pub fn apply_committed_write(
@@ -648,22 +663,25 @@ impl InMemoryGroupEngine {
         })
     }
 
-    pub(crate) fn enforce_cold_write_admission(
+    pub fn check_cold_write_admission_bytes(
         &self,
         stream_id: &BucketStreamId,
         admission: ColdWriteAdmission,
-        before_group_hot_bytes: u64,
-        after_group_hot_bytes: u64,
-        mutating: bool,
+        incoming_bytes: u64,
     ) -> Result<(), GroupEngineError> {
         let Some(limit) = admission.max_hot_bytes_per_group else {
             return Ok(());
         };
-        if !mutating || after_group_hot_bytes <= limit {
+        if incoming_bytes == 0 {
+            return Ok(());
+        }
+        let before = self.state_machine.total_hot_payload_bytes();
+        let after = before.saturating_add(incoming_bytes);
+        if after <= limit {
             return Ok(());
         }
         Err(GroupEngineError::new(format!(
-            "ColdBackpressure: stream '{stream_id}' would raise group hot bytes from {before_group_hot_bytes} to {after_group_hot_bytes}, above limit {limit}"
+            "ColdBackpressure: stream '{stream_id}' would raise group hot bytes from {before} to {after}, above limit {limit}"
         )))
     }
 
@@ -674,25 +692,20 @@ impl InMemoryGroupEngine {
         admission: ColdWriteAdmission,
     ) -> Result<CreateStreamResponse, GroupEngineError> {
         let stream_id = request.stream_id.clone();
-        let command = GroupWriteCommand::from(request);
-        let before = self.state_machine.total_hot_payload_bytes();
-        let mut preview = self.clone();
-        let response = match preview.apply_committed_write(command, placement)? {
-            GroupWriteResponse::CreateStream(response) => response,
-            other => {
-                return Err(GroupEngineError::new(format!(
-                    "unexpected create stream write response: {other:?}"
-                )));
-            }
-        };
-        preview.enforce_cold_write_admission(
+        self.check_cold_write_admission_bytes(
             &stream_id,
             admission,
-            before,
-            preview.state_machine.total_hot_payload_bytes(),
-            !response.already_exists,
+            u64::try_from(request.initial_payload.len()).expect("payload len fits u64"),
         )?;
-        *self = preview;
+        let response =
+            match self.apply_committed_write(GroupWriteCommand::from(request), placement)? {
+                GroupWriteResponse::CreateStream(response) => response,
+                other => {
+                    return Err(GroupEngineError::new(format!(
+                        "unexpected create stream write response: {other:?}"
+                    )));
+                }
+            };
         Ok(response)
     }
 
@@ -703,25 +716,20 @@ impl InMemoryGroupEngine {
         admission: ColdWriteAdmission,
     ) -> Result<AppendResponse, GroupEngineError> {
         let stream_id = request.stream_id.clone();
-        let command = GroupWriteCommand::from(request);
-        let before = self.state_machine.total_hot_payload_bytes();
-        let mut preview = self.clone();
-        let response = match preview.apply_committed_write(command, placement)? {
-            GroupWriteResponse::Append(response) => response,
-            other => {
-                return Err(GroupEngineError::new(format!(
-                    "unexpected append write response: {other:?}"
-                )));
-            }
-        };
-        preview.enforce_cold_write_admission(
+        self.check_cold_write_admission_bytes(
             &stream_id,
             admission,
-            before,
-            preview.state_machine.total_hot_payload_bytes(),
-            !response.deduplicated,
+            u64::try_from(request.payload.len()).expect("payload len fits u64"),
         )?;
-        *self = preview;
+        let response =
+            match self.apply_committed_write(GroupWriteCommand::from(request), placement)? {
+                GroupWriteResponse::Append(response) => response,
+                other => {
+                    return Err(GroupEngineError::new(format!(
+                        "unexpected append write response: {other:?}"
+                    )));
+                }
+            };
         Ok(response)
     }
 
@@ -732,29 +740,21 @@ impl InMemoryGroupEngine {
         admission: ColdWriteAdmission,
     ) -> Result<GroupAppendBatchResponse, GroupEngineError> {
         let stream_id = request.stream_id.clone();
-        let command = GroupWriteCommand::from(request);
-        let before = self.state_machine.total_hot_payload_bytes();
-        let mut preview = self.clone();
-        let response = match preview.apply_committed_write(command, placement)? {
-            GroupWriteResponse::AppendBatch(response) => response,
-            other => {
-                return Err(GroupEngineError::new(format!(
-                    "unexpected append batch write response: {other:?}"
-                )));
-            }
-        };
-        let mutating = response
-            .items
+        let incoming_bytes = request
+            .payloads
             .iter()
-            .any(|item| matches!(item, Ok(response) if !response.deduplicated));
-        preview.enforce_cold_write_admission(
-            &stream_id,
-            admission,
-            before,
-            preview.state_machine.total_hot_payload_bytes(),
-            mutating,
-        )?;
-        *self = preview;
+            .map(|payload| u64::try_from(payload.len()).expect("payload len fits u64"))
+            .sum();
+        self.check_cold_write_admission_bytes(&stream_id, admission, incoming_bytes)?;
+        let response =
+            match self.apply_committed_write(GroupWriteCommand::from(request), placement)? {
+                GroupWriteResponse::AppendBatch(response) => response,
+                other => {
+                    return Err(GroupEngineError::new(format!(
+                        "unexpected append batch write response: {other:?}"
+                    )));
+                }
+            };
         Ok(response)
     }
 
@@ -1442,6 +1442,7 @@ impl InMemoryGroupEngine {
 
     pub async fn read_payload_from_plan(
         cold_store: Option<&ColdStoreHandle>,
+        cold_index_cache: Option<&Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>>,
         stream_id: &BucketStreamId,
         plan: &StreamReadPlan,
     ) -> Result<Vec<u8>, GroupEngineError> {
@@ -1449,6 +1450,46 @@ impl InMemoryGroupEngine {
         for segment in &plan.segments {
             match segment {
                 StreamReadSegment::Hot(bytes) => payload.extend_from_slice(bytes),
+                StreamReadSegment::ColdIndex(segment) => {
+                    let Some(cold_store) = cold_store else {
+                        return Err(GroupEngineError::stream_with_next_offset(
+                            StreamErrorCode::InvalidColdFlush,
+                            format!("stream '{stream_id}' read requires object payload store"),
+                            Some(plan.next_offset),
+                        ));
+                    };
+                    let Some(cache) = cold_index_cache else {
+                        return Err(GroupEngineError::stream_with_next_offset(
+                            StreamErrorCode::InvalidColdFlush,
+                            format!("stream '{stream_id}' read requires cold index page cache"),
+                            Some(plan.next_offset),
+                        ));
+                    };
+                    let objects = cache
+                        .object_segments_for_read(stream_id, segment)
+                        .await
+                        .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                    let segment_end = segment
+                        .read_start_offset
+                        .saturating_add(u64::try_from(segment.len).expect("read len fits u64"));
+                    for object in objects {
+                        let start = object.start_offset.max(segment.read_start_offset);
+                        let end = object.end_offset.min(segment_end);
+                        if start >= end {
+                            continue;
+                        }
+                        let bytes = cold_store
+                            .read_object_range_for_stream(
+                                stream_id,
+                                &object,
+                                start,
+                                usize::try_from(end - start).expect("object read len fits usize"),
+                            )
+                            .await
+                            .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                        payload.extend_from_slice(&bytes);
+                    }
+                }
                 StreamReadSegment::Object(segment) => {
                     let Some(cold_store) = cold_store else {
                         return Err(GroupEngineError::stream_with_next_offset(
@@ -1478,7 +1519,13 @@ impl InMemoryGroupEngine {
         stream_id: &BucketStreamId,
         plan: &StreamReadPlan,
     ) -> Result<Vec<u8>, GroupEngineError> {
-        Self::read_payload_from_plan(self.cold_store.as_ref(), stream_id, plan).await
+        Self::read_payload_from_plan(
+            self.cold_store.as_ref(),
+            self.cold_index_cache.as_ref(),
+            stream_id,
+            plan,
+        )
+        .await
     }
 
     pub(crate) async fn bootstrap_updates(
@@ -1553,6 +1600,12 @@ impl InMemoryGroupEngine {
         counts
     }
 
+    pub fn stream_tail_offset(&self, stream_id: &BucketStreamId) -> Option<u64> {
+        self.state_machine
+            .head(stream_id)
+            .map(|metadata| metadata.tail_offset)
+    }
+
     pub(crate) fn install_snapshot_inner(
         &mut self,
         snapshot: GroupSnapshot,
@@ -1624,8 +1677,19 @@ impl GroupEngine for InMemoryGroupEngine {
         request: CreateStreamExternalRequest,
         placement: ShardPlacement,
     ) -> GroupCreateStreamFuture<'a> {
-        let command = GroupWriteCommand::from(request);
         Box::pin(async move {
+            if let Some(cold_store) = self.cold_store.as_ref() {
+                let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+                write_external_segment_index_pages(
+                    &store,
+                    &request.stream_id,
+                    0,
+                    &request.initial_payload,
+                )
+                .await
+                .map_err(|err| GroupEngineError::new(err.to_string()))?;
+            }
+            let command = GroupWriteCommand::from(request);
             match self.apply_committed_write(command, placement)? {
                 GroupWriteResponse::CreateStream(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
@@ -1661,6 +1725,7 @@ impl GroupEngine for InMemoryGroupEngine {
                 stream_id,
                 plan,
                 self.cold_store(),
+                self.cold_index_cache.clone(),
             ))
         })
     }
@@ -1943,6 +2008,27 @@ impl GroupEngine for InMemoryGroupEngine {
     ) -> GroupAppendFuture<'a> {
         Box::pin(async move {
             self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
+            if let Some(cold_store) = self.cold_store.as_ref() {
+                let start_offset = self
+                    .state_machine
+                    .head(&request.stream_id)
+                    .map(|metadata| metadata.tail_offset)
+                    .ok_or_else(|| {
+                        GroupEngineError::stream(
+                            ursula_stream::StreamErrorCode::StreamNotFound,
+                            format!("stream '{}' does not exist", request.stream_id),
+                        )
+                    })?;
+                let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+                write_external_segment_index_pages(
+                    &store,
+                    &request.stream_id,
+                    start_offset,
+                    &request.payload,
+                )
+                .await
+                .map_err(|err| GroupEngineError::new(err.to_string()))?;
+            }
             let command = GroupWriteCommand::from(request);
             match self.apply_committed_write(command, placement)? {
                 GroupWriteResponse::Append(response) => Ok(response),
@@ -1989,8 +2075,14 @@ impl GroupEngine for InMemoryGroupEngine {
         request: FlushColdRequest,
         placement: ShardPlacement,
     ) -> GroupFlushColdFuture<'a> {
-        let command = GroupWriteCommand::from(request);
         Box::pin(async move {
+            if let Some(cold_store) = self.cold_store.as_ref() {
+                let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+                write_cold_chunk_index_pages(&store, &request.stream_id, &request.chunk)
+                    .await
+                    .map_err(|err| GroupEngineError::new(err.to_string()))?;
+            }
+            let command = GroupWriteCommand::from(request);
             match self.apply_committed_write(command, placement)? {
                 GroupWriteResponse::FlushCold(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
@@ -2087,10 +2179,8 @@ impl GroupEngineFactory for InMemoryGroupEngineFactory {
         _metrics: GroupEngineMetrics,
     ) -> GroupEngineCreateFuture<'a> {
         Box::pin(async move {
-            let engine = InMemoryGroupEngine {
-                cold_store: self.cold_store.clone(),
-                ..InMemoryGroupEngine::default()
-            };
+            let mut engine = InMemoryGroupEngine::default();
+            engine.set_cold_store(self.cold_store.clone());
             let engine: Box<dyn GroupEngine> = Box::new(engine);
             Ok(engine)
         })
