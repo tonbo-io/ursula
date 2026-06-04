@@ -24,3 +24,6 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", 
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true, features = ["serde"] }
+
+[lints.clippy]
+wildcard_imports = "deny"

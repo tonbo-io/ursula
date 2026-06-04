@@ -27,9 +27,12 @@ use openraft::raft::SnapshotResponse;
 use openraft::vote::RaftLeaderId;
 
 use crate::engine::invalid_data;
-use crate::grpc::*;
+use crate::grpc::GrpcRpcError;
 use crate::raft_internal_proto;
-use crate::types::*;
+use crate::types::{
+    RaftGroupCommand, UrsulaAppendEntriesRequest, UrsulaAppendEntriesResponse,
+    UrsulaRaftTypeConfig, UrsulaVoteRequest, UrsulaVoteResponse,
+};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RaftGroupLogStoreInner {

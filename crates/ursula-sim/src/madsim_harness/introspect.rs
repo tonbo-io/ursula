@@ -3,7 +3,11 @@
 //! `has_*_in_fault_plan` / `*_from_fault_plan` predicates that the dispatch
 //! layer + minimize tool use to decide which scenario / invariant matches.
 
-use super::*;
+use super::{
+    ColdStoreEvent, ColdStoreOperation, HttpProtocolSurfacePlan, InProcessRaftNetworkEvent,
+    InProcessRaftNetworkPolicyEvent, RuntimeInterleavingPlan, RuntimeRaftNetworkWorkloadPlan,
+    SimEvent, SimFaultAction, SimFaultPlan, SimTrace, duration_ms, network_rpc_kind_name,
+};
 
 pub(super) fn runtime_interleaving_plan_from_fault_plan(
     fault_plan: &SimFaultPlan,

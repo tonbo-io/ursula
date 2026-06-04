@@ -40,8 +40,8 @@ use ursula_runtime::{
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 
-use crate::state_machine::*;
-use crate::types::*;
+use crate::state_machine::{RaftGroupStateMachine, SnapshotInstallCoordinator};
+use crate::types::{RaftGroupMetricsSnapshot, RaftLogProgressSnapshot, UrsulaRaftTypeConfig};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SingleNodeRaftNetworkFactory;

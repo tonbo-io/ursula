@@ -1,7 +1,15 @@
 //! HTTP protocol-surface scenarios extracted from `madsim_harness/mod.rs`
 //! (DoD #3 modularity refactor — workloads axis, HTTP/axum in-process scenarios).
 
-use super::*;
+use super::{
+    Arc, AtomicU64, Body, Duration, HttpProtocolSurfacePlan, HttpRequest, HttpState,
+    InMemoryGroupEngineFactory, Ordering, RuntimeConfig, RuntimeThreading, ServiceExt,
+    ShardRuntime, SimEvent, SimHttpWallClock, SimTrace, StatusCode, ThreeNodeRaftSimConfig,
+    ThreeNodeRaftSimOutcome, assert_http_protocol_surface_randomized_final_read,
+    assert_http_protocol_surface_randomized_live_backpressure,
+    assert_http_protocol_surface_randomized_sse_next_offset, http_offset, parse_http_offset,
+    router_with_http_state, to_bytes,
+};
 
 pub(super) async fn run_http_protocol_surface_inner(
     config: ThreeNodeRaftSimConfig,

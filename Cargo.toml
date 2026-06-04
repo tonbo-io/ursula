@@ -133,6 +133,7 @@ iter_not_returning_iterator = "warn"
 expl_impl_clone_on_copy = "warn"
 infallible_try_from = "warn"
 dbg_macro = "warn"
+wildcard_imports = "deny"
 
 # Don't `allow` Your Way Around These Lints - every suppression must be
 # a deliberate #[expect(..., reason = "...")] rather than a silent #[allow]
