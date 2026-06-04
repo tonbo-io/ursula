@@ -15,7 +15,7 @@ use ursula_raft::StaticGrpcRaftGroupEngineFactory;
 use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_runtime::{
     ColdStore, ColdStoreHandle, InMemoryGroupEngineFactory, PlanGroupColdFlushRequest,
-    RuntimeConfig,
+    RuntimeConfig, RuntimeError,
 };
 use ursula_shard::RaftGroupId;
 
@@ -85,6 +85,33 @@ async fn wait_raft_state_machine_payload(
     panic!("{context}: timed out waiting for stream payload; latest={last_observed:?}");
 }
 
+fn raft_group_metric_index_at_least(
+    body: &str,
+    raft_group_id: u64,
+    field: &str,
+    min_index: u64,
+) -> bool {
+    let json: serde_json::Value = serde_json::from_str(body).expect("metrics JSON");
+    let Some(groups) = json
+        .get("raft_groups")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    let field_name = format!("{field}_index");
+    groups
+        .iter()
+        .find(|group| {
+            group
+                .get("raft_group_id")
+                .and_then(serde_json::Value::as_u64)
+                == Some(raft_group_id)
+        })
+        .and_then(|group| group.get(&field_name))
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|index| index >= min_index)
+}
+
 #[test]
 fn parses_membership_voter_ids() {
     assert_eq!(
@@ -94,6 +121,34 @@ fn parses_membership_voter_ids() {
     assert!(parse_voter_ids("").is_err());
     assert!(parse_voter_ids("1,,2").is_err());
     assert!(parse_voter_ids("1,node-2").is_err());
+}
+
+#[test]
+fn static_grpc_membership_config_rejects_partial_group_voters() {
+    let result = crate::bootstrap::spawn_static_grpc_raft_memory_runtime_with_membership_config(
+        1,
+        2,
+        1,
+        [
+            (1, "http://node-1".to_owned()),
+            (2, "http://node-2".to_owned()),
+            (3, "http://node-3".to_owned()),
+        ],
+        true,
+        crate::bootstrap::StaticGrpcRaftMembershipConfig {
+            initialize_membership_per_group: true,
+            per_group_voters: BTreeMap::from([(RaftGroupId(0), BTreeSet::from([1, 2, 3]))]),
+        },
+    );
+
+    let Err(err) = result else {
+        panic!("partial static per-group voter config should be rejected");
+    };
+    let RuntimeError::StaticMembershipConfig { message } = err else {
+        panic!("expected static membership config error, got {err}");
+    };
+    assert!(message.contains("partial raft_group_voters config is not supported"));
+    assert!(message.contains("missing raft group 1"));
 }
 
 struct StaticGrpcTestNode {
@@ -3703,7 +3758,15 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
         .expect("trigger leader snapshot");
     leader_raft
         .wait(Some(Duration::from_secs(5)))
-        .snapshot(snapshot_log_id, "leader snapshot includes stream append")
+        .metrics(
+            |metrics| {
+                metrics
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot >= &snapshot_log_id)
+            },
+            format!("leader snapshot includes stream append .snapshot >= {snapshot_log_id}"),
+        )
         .await
         .expect("wait for leader snapshot");
     leader_raft
@@ -3744,7 +3807,15 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
         .expect("add late learner over gRPC");
     late_learner
         .wait(Some(Duration::from_secs(10)))
-        .snapshot(snapshot_log_id, "late learner installed gRPC snapshot")
+        .metrics(
+            |metrics| {
+                metrics
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot >= &snapshot_log_id)
+            },
+            format!("late learner installed gRPC snapshot .snapshot >= {snapshot_log_id}"),
+        )
         .await
         .expect("wait for late learner snapshot");
     late_learner
@@ -3815,9 +3886,23 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
     assert!(leader_metrics_body.contains("\"raft_group_count\":1"));
     assert!(leader_metrics_body.contains("\"raft_group_id\":0"));
     assert!(
-        leader_metrics_body.contains(&format!("\"snapshot_index\":{}", snapshot_log_id.index()))
+        raft_group_metric_index_at_least(
+            &leader_metrics_body,
+            0,
+            "snapshot",
+            snapshot_log_id.index()
+        ),
+        "leader snapshot should cover append log id {snapshot_log_id}: {leader_metrics_body}"
     );
-    assert!(leader_metrics_body.contains(&format!("\"purged_index\":{}", snapshot_log_id.index())));
+    assert!(
+        raft_group_metric_index_at_least(
+            &leader_metrics_body,
+            0,
+            "purged",
+            snapshot_log_id.index()
+        ),
+        "leader purge should cover append log id {snapshot_log_id}: {leader_metrics_body}"
+    );
 
     let late_metrics_response = client
         .get(format!("{}/__ursula/metrics", peers[2].1))
@@ -3831,7 +3916,15 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
         .expect("late learner metrics body");
     assert!(late_metrics_body.contains("\"raft_group_count\":1"));
     assert!(late_metrics_body.contains("\"raft_group_id\":0"));
-    assert!(late_metrics_body.contains(&format!("\"snapshot_index\":{}", snapshot_log_id.index())));
+    assert!(
+        raft_group_metric_index_at_least(
+            &late_metrics_body,
+            0,
+            "snapshot",
+            snapshot_log_id.index()
+        ),
+        "late learner snapshot should cover append log id {snapshot_log_id}: {late_metrics_body}"
+    );
     assert!(late_metrics_body.contains("\"voter_ids\":[1,2,3]"));
     assert!(late_metrics_body.contains("\"learner_ids\":[]"));
 

@@ -19,6 +19,7 @@ pub(crate) fn runtime_error_status(err: &RuntimeError) -> StatusCode {
         | RuntimeError::SnapshotPlacementMismatch { .. } => StatusCode::BAD_REQUEST,
         RuntimeError::InvalidConfig(_)
         | RuntimeError::ColdStoreConfig { .. }
+        | RuntimeError::StaticMembershipConfig { .. }
         | RuntimeError::ColdStoreIo { .. }
         | RuntimeError::MailboxClosed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         RuntimeError::ResponseDropped { .. } | RuntimeError::SpawnCoreThread { .. } => {

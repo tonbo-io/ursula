@@ -406,8 +406,15 @@ impl StaticGrpcRaftGroupEngineFactory {
         &self,
         raft_group_id: RaftGroupId,
     ) -> Result<BTreeMap<u64, BasicNode>, GroupEngineError> {
-        let Some(voters) = self.per_group_voters.get(&raft_group_id) else {
+        let voters = if self.per_group_voters.is_empty() {
             return Ok(self.peer_nodes());
+        } else {
+            self.per_group_voters.get(&raft_group_id).ok_or_else(|| {
+                GroupEngineError::new(format!(
+                    "raft group {} is missing from static per-group voter config",
+                    raft_group_id.0
+                ))
+            })?
         };
         if voters.is_empty() {
             return Err(GroupEngineError::new(format!(
@@ -429,19 +436,24 @@ impl StaticGrpcRaftGroupEngineFactory {
         Ok(nodes)
     }
 
-    fn membership_initializer_ids(&self, raft_group_id: RaftGroupId) -> Vec<u64> {
+    fn membership_initializer_ids(&self, raft_group_id: RaftGroupId) -> Option<Vec<u64>> {
+        if self.per_group_voters.is_empty() {
+            return Some(self.peers.keys().copied().collect());
+        }
         self.per_group_voters
             .get(&raft_group_id)
             .map(|voters| voters.iter().copied().collect())
-            .unwrap_or_else(|| self.peers.keys().copied().collect())
     }
 
     fn should_initialize_membership(&self, raft_group_id: RaftGroupId) -> bool {
         if !self.initialize_membership {
             return false;
         }
-        if let Some(voters) = self.per_group_voters.get(&raft_group_id)
-            && !voters.contains(&self.node_id)
+        if !self.per_group_voters.is_empty()
+            && !self
+                .per_group_voters
+                .get(&raft_group_id)
+                .is_some_and(|voters| voters.contains(&self.node_id))
         {
             return false;
         }
@@ -449,12 +461,12 @@ impl StaticGrpcRaftGroupEngineFactory {
             return true;
         }
         let initializer_ids = self.membership_initializer_ids(raft_group_id);
-        let peer_count = initializer_ids.len();
-        if peer_count == 0 {
+        if initializer_ids.as_ref().is_none_or(|i| i.is_empty()) {
             return false;
         }
-        let initializer_index =
-            usize::try_from(raft_group_id.0).expect("raft group id fits usize") % peer_count;
+        let initializer_ids = initializer_ids.unwrap();
+        let initializer_index = usize::try_from(raft_group_id.0).expect("raft group id fits usize")
+            % initializer_ids.len();
         initializer_ids
             .get(initializer_index)
             .is_some_and(|node_id| *node_id == self.node_id)
@@ -463,9 +475,12 @@ impl StaticGrpcRaftGroupEngineFactory {
 
 impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
     fn hosts_group(&self, placement: ShardPlacement) -> bool {
+        if self.per_group_voters.is_empty() {
+            return true;
+        }
         self.per_group_voters
             .get(&placement.raft_group_id)
-            .is_none_or(|voters| voters.contains(&self.node_id))
+            .is_some_and(|voters| voters.contains(&self.node_id))
     }
 
     fn create<'a>(
@@ -622,9 +637,12 @@ mod tests {
             peer_ids(factory.peer_nodes_for_group(RaftGroupId(1)).unwrap()),
             vec![2, 3, 4]
         );
-        assert_eq!(
-            peer_ids(factory.peer_nodes_for_group(RaftGroupId(2)).unwrap()),
-            vec![1, 2, 3, 4]
+        let err = factory
+            .peer_nodes_for_group(RaftGroupId(2))
+            .expect_err("partial per-group voter config must not fall back to all peers");
+        assert!(
+            err.message()
+                .contains("missing from static per-group voter config")
         );
     }
 

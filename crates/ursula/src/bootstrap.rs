@@ -28,6 +28,61 @@ pub struct StaticGrpcRaftMembershipConfig {
     pub per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
 }
 
+fn validate_static_grpc_membership_config(
+    raft_group_count: usize,
+    peers: &[(u64, String)],
+    membership_config: &StaticGrpcRaftMembershipConfig,
+) -> Result<(), RuntimeError> {
+    let per_group_voters = &membership_config.per_group_voters;
+    if per_group_voters.is_empty() {
+        return Ok(());
+    }
+
+    let peer_ids: BTreeSet<u64> = peers.iter().map(|(node_id, _)| *node_id).collect();
+    let raft_group_count_u32 =
+        u32::try_from(raft_group_count).map_err(|_| RuntimeError::StaticMembershipConfig {
+            message: format!("raft_group_count {raft_group_count} exceeds u32::MAX"),
+        })?;
+
+    for (raft_group_id, voters) in per_group_voters {
+        if raft_group_id.0 >= raft_group_count_u32 {
+            return Err(RuntimeError::InvalidRaftGroup {
+                raft_group_id: *raft_group_id,
+                raft_group_count: raft_group_count_u32,
+            });
+        }
+        if voters.is_empty() {
+            return Err(RuntimeError::StaticMembershipConfig {
+                message: format!("raft group {} has no voters", raft_group_id.0),
+            });
+        }
+        for voter in voters {
+            if !peer_ids.contains(voter) {
+                return Err(RuntimeError::StaticMembershipConfig {
+                    message: format!(
+                        "raft group {} voter {} is not present in static peer config",
+                        raft_group_id.0, voter
+                    ),
+                });
+            }
+        }
+    }
+
+    for raw_group_id in 0..raft_group_count_u32 {
+        let raft_group_id = RaftGroupId(raw_group_id);
+        if !per_group_voters.contains_key(&raft_group_id) {
+            return Err(RuntimeError::StaticMembershipConfig {
+                message: format!(
+                    "partial raft_group_voters config is not supported; missing raft group {} of {}",
+                    raw_group_id, raft_group_count
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 pub fn spawn_default_runtime(
     core_count: usize,
     raft_group_count: usize,
@@ -109,6 +164,7 @@ pub fn spawn_static_grpc_raft_memory_runtime_with_membership_config(
     let snapshot_store = snapshot_store_from_env_or_error()?;
     let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
     let peers: Vec<(u64, String)> = peers.into_iter().collect();
+    validate_static_grpc_membership_config(raft_group_count, &peers, &membership_config)?;
     let registry = RaftGroupHandleRegistry::default();
     let per_group_voters = membership_config.per_group_voters.clone();
     let factory = StaticGrpcRaftGroupEngineFactory::new(
@@ -185,6 +241,7 @@ pub fn spawn_static_grpc_raft_runtime_with_membership_config(
     let snapshot_store = snapshot_store_from_env_or_error()?;
     let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
     let peers: Vec<(u64, String)> = peers.into_iter().collect();
+    validate_static_grpc_membership_config(raft_group_count, &peers, &membership_config)?;
     let registry = RaftGroupHandleRegistry::default();
     let per_group_voters = membership_config.per_group_voters.clone();
     let factory = StaticGrpcRaftGroupEngineFactory::new(

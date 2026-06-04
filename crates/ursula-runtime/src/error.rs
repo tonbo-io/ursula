@@ -18,6 +18,9 @@ pub enum RuntimeError {
     ColdStoreConfig {
         message: String,
     },
+    StaticMembershipConfig {
+        message: String,
+    },
     ColdStoreIo {
         message: String,
     },
@@ -81,6 +84,9 @@ impl std::fmt::Display for RuntimeError {
             Self::EmptyAppend => f.write_str("append payload must be non-empty"),
             Self::ColdStoreConfig { message } => {
                 write!(f, "invalid cold store config: {message}")
+            }
+            Self::StaticMembershipConfig { message } => {
+                write!(f, "invalid static Raft membership config: {message}")
             }
             Self::ColdStoreIo { message } => write!(f, "cold store IO error: {message}"),
             Self::LiveReadBackpressure {

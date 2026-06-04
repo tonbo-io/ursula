@@ -665,27 +665,33 @@ async fn repeated_appends_to_one_stream_are_ordered() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn independent_streams_reach_all_cores_and_many_groups() {
     let runtime = runtime(4, 64);
-    let mut tasks = Vec::new();
-    for index in 0..4096 {
-        let runtime = runtime.clone();
-        tasks.push(tokio::spawn(async move {
-            let stream = BucketStreamId::new("benchcmp", format!("stream-{index}"));
-            create_stream(&runtime, &stream).await;
-            runtime
-                .append(AppendRequest::new(stream, 1))
-                .await
-                .expect("append")
-        }));
-    }
+    const STREAM_COUNT: usize = 4096;
+    const MAX_IN_FLIGHT: usize = 64;
 
-    for task in tasks {
-        let response = task.await.expect("task");
-        assert_eq!(response.start_offset, 0);
-        assert_eq!(response.next_offset, 1);
+    for chunk_start in (0..STREAM_COUNT).step_by(MAX_IN_FLIGHT) {
+        let chunk_end = (chunk_start + MAX_IN_FLIGHT).min(STREAM_COUNT);
+        let mut tasks = Vec::with_capacity(chunk_end - chunk_start);
+        for index in chunk_start..chunk_end {
+            let runtime = runtime.clone();
+            tasks.push(tokio::spawn(async move {
+                let stream = BucketStreamId::new("benchcmp", format!("stream-{index}"));
+                create_stream(&runtime, &stream).await;
+                runtime
+                    .append(AppendRequest::new(stream, 1))
+                    .await
+                    .expect("append")
+            }));
+        }
+
+        for task in tasks {
+            let response = task.await.expect("task");
+            assert_eq!(response.start_offset, 0);
+            assert_eq!(response.next_offset, 1);
+        }
     }
 
     let snapshot = runtime.metrics().snapshot();
-    assert_eq!(snapshot.accepted_appends, 4096);
+    assert_eq!(snapshot.accepted_appends, STREAM_COUNT as u64);
     assert!(snapshot.per_core_appends.iter().all(|value| *value > 0));
     let active_groups = snapshot
         .per_group_appends

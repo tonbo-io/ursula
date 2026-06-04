@@ -447,6 +447,54 @@ impl Args {
         if !self.raft_peers.contains_key(&node_id) {
             return Err(format!("--raft-peer must include this node id {node_id}"));
         }
+        self.validate_raft_group_voters()?;
+        Ok(())
+    }
+
+    fn validate_raft_group_voters(&self) -> Result<(), String> {
+        if self.raft_group_voters.is_empty() {
+            return Ok(());
+        }
+
+        let raft_group_count = u32::try_from(self.raft_group_count).map_err(|_| {
+            format!(
+                "--raft-group-count {} exceeds u32::MAX",
+                self.raft_group_count
+            )
+        })?;
+
+        for (raft_group_id, voters) in &self.raft_group_voters {
+            if raft_group_id.0 >= raft_group_count {
+                return Err(format!(
+                    "raft group {} is outside configured --raft-group-count {}",
+                    raft_group_id.0, self.raft_group_count
+                ));
+            }
+            if voters.is_empty() {
+                return Err(format!("raft group {} has no voters", raft_group_id.0));
+            }
+            for voter in voters {
+                if !self.raft_peers.contains_key(voter) {
+                    return Err(format!(
+                        "raft group {} voter {} is not present in static peer config",
+                        raft_group_id.0, voter
+                    ));
+                }
+            }
+        }
+
+        for raw_group_id in 0..raft_group_count {
+            if !self
+                .raft_group_voters
+                .contains_key(&RaftGroupId(raw_group_id))
+            {
+                return Err(format!(
+                    "partial raft_group_voters config is not supported; missing raft group {} of {}",
+                    raw_group_id, self.raft_group_count
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -476,9 +524,12 @@ fn static_grpc_node_hosts_group(
     raft_group_id: u32,
     raft_group_voters: &BTreeMap<RaftGroupId, BTreeSet<u64>>,
 ) -> bool {
+    if raft_group_voters.is_empty() {
+        return true;
+    }
     raft_group_voters
         .get(&RaftGroupId(raft_group_id))
-        .is_none_or(|voters| voters.contains(&node_id))
+        .is_some_and(|voters| voters.contains(&node_id))
 }
 
 #[derive(Debug, Deserialize)]
@@ -702,6 +753,8 @@ mod tests {
 
         let args = Args::parse_from([
             "--raft-memory",
+            "--raft-group-count",
+            "2",
             "--raft-cluster-config",
             path.to_str().expect("utf8 path"),
         ])
@@ -742,6 +795,8 @@ mod tests {
 
         let args = Args::parse_from([
             "--raft-memory",
+            "--raft-group-count",
+            "2",
             "--raft-cluster-config",
             path.to_str().expect("utf8 path"),
         ])
@@ -777,6 +832,8 @@ mod tests {
 
         let args = Args::parse_from([
             "--raft-memory",
+            "--raft-group-count",
+            "2",
             "--raft-cluster-config",
             path.to_str().expect("utf8 path"),
         ])
@@ -795,6 +852,40 @@ mod tests {
     }
 
     #[test]
+    fn rejects_partial_static_grpc_per_group_voters_from_config_file() {
+        let path = temp_config_path("raft-cluster-config-partial-group-voters");
+        std::fs::write(
+            &path,
+            r#"{
+                "node_id": 2,
+                "peers": [
+                    {"node_id": 1, "url": "http://10.0.0.1:4437"},
+                    {"node_id": 2, "url": "http://10.0.0.2:4437"},
+                    {"node_id": 3, "url": "http://10.0.0.3:4437"}
+                ],
+                "groups": [
+                    {"raft_group_id": 0, "voters": [1, 2, 3]}
+                ]
+            }"#,
+        )
+        .expect("write cluster config");
+
+        let err = Args::parse_from([
+            "--raft-memory",
+            "--raft-group-count",
+            "2",
+            "--raft-cluster-config",
+            path.to_str().expect("utf8 path"),
+        ])
+        .expect_err("partial static per-group voter config should be rejected");
+
+        assert!(err.contains("partial raft_group_voters config is not supported"));
+        assert!(err.contains("missing raft group 1"));
+
+        fs::remove_file(path).expect("remove cluster config");
+    }
+
+    #[test]
     fn configured_group_voters_limit_startup_warmup_to_member_nodes() {
         let group_voters = BTreeMap::from([
             (RaftGroupId(0), BTreeSet::from([1, 2, 3])),
@@ -805,7 +896,7 @@ mod tests {
         assert!(!static_grpc_node_hosts_group(1, 1, &group_voters));
         assert!(!static_grpc_node_hosts_group(4, 0, &group_voters));
         assert!(static_grpc_node_hosts_group(4, 1, &group_voters));
-        assert!(static_grpc_node_hosts_group(4, 2, &group_voters));
+        assert!(!static_grpc_node_hosts_group(4, 2, &group_voters));
     }
 
     #[test]
