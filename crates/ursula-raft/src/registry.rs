@@ -965,11 +965,9 @@ impl RaftGroupHandleRegistry {
         let (snapshot, prefetched_key) = self.prefetch_snapshot_for_install(snapshot).await?;
         let _prefetched_guard = prefetched_key
             .map(|key| PrefetchedSnapshotGuard::new(self.snapshot_install.clone(), key));
-        let result = raft
-            .install_full_snapshot(vote, snapshot)
+        raft.install_full_snapshot(vote, snapshot)
             .await
-            .map_err(|err| GroupEngineError::new(format!("OpenRaft install snapshot: {err}")));
-        result
+            .map_err(|err| GroupEngineError::new(format!("OpenRaft install snapshot: {err}")))
     }
 
     async fn prefetch_snapshot_for_install(
