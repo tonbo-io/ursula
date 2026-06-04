@@ -915,9 +915,8 @@ class ChaosAgent:
         if self.workload_probes_paused():
             return
         with self.state_lock:
-            has_unresolved_appends = self.global_unresolved_append or any(self.lane_unresolved_appends)
-            has_pending_appends = any(stream.pending_producer_appends for stream in self.streams)
-        if has_unresolved_appends or has_pending_appends:
+            has_unknown_appends = self.has_unknown_appends_locked()
+        if has_unknown_appends:
             return
         mode = "setsum"
         self.verify_attempts += 1
@@ -1037,6 +1036,12 @@ class ChaosAgent:
         self.event("info", message)
 
     def run_producer_semantics_probe(self) -> None:
+        if self.workload_probes_paused():
+            return
+        with self.state_lock:
+            has_unknown_appends = self.has_unknown_appends_locked()
+        if has_unknown_appends:
+            return
         candidates = [
             producer
             for producer in self.producers
@@ -1193,6 +1198,13 @@ class ChaosAgent:
         injection = self.current_injection()
         return injection is not None and injection.get("recovered_at") is None
 
+    def has_unknown_appends_locked(self) -> bool:
+        return (
+            self.global_unresolved_append
+            or any(self.lane_unresolved_appends)
+            or any(stream.pending_producer_appends for stream in self.streams)
+        )
+
     def verify_server_integrity(self, stream: WorkloadStream) -> str:
         with self.state_lock:
             expected = stream.expected_live_setsum.hexdigest()
@@ -1273,57 +1285,26 @@ class ChaosAgent:
             return "ok"
 
         self.setsum_mismatch_count += 1
-        detail = ", ".join(
-            f"{s['node']}=live:{s['live_setsum']}/total:{s['total_setsum']}/evicted:{s['evicted_records']}"
-            for s in samples
-        )
-        # Cluster is internally consistent (all replicas agree) but agent's
-        # expected has drifted — typically a phantom commit from an append
-        # that timed out client-side but actually committed server-side, or
-        # a dedup'd retry whose original payload bytes differ from the
-        # retry's recomputed payload (e.g., epoch bumped between attempts).
-        # Trust the cluster, adopt its setsum as the new expected baseline.
-        # Track the count so persistent drift remains visible without
-        # generating false hard failures.
-        server_live = best["live_setsum"]
-        server_total = best["total_setsum"]
-        server_evicted = best["evicted_records"]
-        resync_target = (
-            server_total
-            if server_total is not None
-            else (server_live if server_evicted == "0" else None)
-        )
-        if resync_target is None:
-            self.last_integrity_error = (
-                f"all {len(samples)} replicas agree but differ from expected={expected}; {detail}"
+        def sample_detail(sample: dict[str, Any]) -> str:
+            return (
+                f"{sample['node']}=live:{sample['live_setsum']}"
+                f"/total:{sample['total_setsum']}"
+                f"/evicted:{sample['evicted_records']}"
+                f"/next:{sample['next_offset']}"
+                f"/expected_next:{sample['expected_next_offset']}"
+                f"/live_records:{sample['live_records']}"
+                f"/total_records:{sample['total_records']}"
             )
-            self.last_server_integrity = {**best, "check": "all-replicas-disagree-with-expected"}
-            self.event("error", f"integrity setsum failed: {self.last_integrity_error}")
-            return "mismatch"
-        with self.state_lock:
-            try:
-                stream.expected_live_setsum.load_hex(resync_target)
-            except ValueError as exc:
-                self.last_integrity_error = (
-                    f"all {len(samples)} replicas agree but differ from expected={expected}; "
-                    f"resync rejected: {exc}; {detail}"
-                )
-                self.last_server_integrity = {
-                    **best,
-                    "check": "all-replicas-disagree-with-expected",
-                }
-                self.event("error", f"integrity setsum failed: {self.last_integrity_error}")
-                return "mismatch"
-        self.last_integrity_error = None
-        self.last_server_integrity = {
-            **best,
-            "check": "all-replicas-disagree-with-expected-resynced",
-        }
-        self.event(
-            "warn",
-            f"integrity setsum auto-resynced: expected={expected} -> server={resync_target}; {detail}",
+
+        detail = ", ".join(
+            sample_detail(s) for s in samples
         )
-        return "ok"
+        self.last_integrity_error = (
+            f"all {len(samples)} replicas agree but differ from expected={expected}; {detail}"
+        )
+        self.last_server_integrity = {**best, "check": "all-replicas-disagree-with-expected"}
+        self.event("error", f"integrity setsum failed: {self.last_integrity_error}")
+        return "mismatch"
 
     def sample_node(self, node: Node) -> dict[str, Any]:
         sample: dict[str, Any] = {
