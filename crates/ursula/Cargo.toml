@@ -36,7 +36,10 @@ ursula-shard = { workspace = true }
 [target.'cfg(madsim)'.dependencies]
 madsim = { workspace = true }
 
+[dev-dependencies]
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)', 'cfg(tokio_unstable)'] }
 
-[dev-dependencies]
+[lints.clippy]
+wildcard_imports = "deny"

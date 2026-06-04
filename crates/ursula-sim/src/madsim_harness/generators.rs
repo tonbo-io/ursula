@@ -2,7 +2,12 @@
 //! `madsim_harness/mod.rs` (DoD #3 modularity refactor — scenarios axis).
 //! Each method maps a u64 seed to a SimSchedule for a specific scenario.
 
-use super::*;
+use super::{
+    BucketStreamId, HttpProtocolSurfacePlan, RuntimeRaftNetworkWorkloadPlan, SimFaultAction,
+    SimFaultPlan, SimFaultStep, SimScenario, SimSchedule, SplitMix64,
+    has_stop_current_leader_in_fault_plan, has_verify_runtime_cold_live_reads_in_fault_plan,
+    runtime_cold_read_truncate_len, runtime_corrupt_read_client_id,
+};
 
 impl SimSchedule {
     pub fn generate_runtime_interleaving_failure(seed: u64) -> Self {
