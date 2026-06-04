@@ -28,3 +28,6 @@ ursula-ctl = { workspace = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }
+
+[lints.clippy]
+wildcard_imports = "deny"

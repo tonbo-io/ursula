@@ -14,7 +14,7 @@ use openraft::storage::LogState;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 
-use crate::types::*;
+use crate::types::UrsulaRaftTypeConfig;
 
 use super::{RaftGroupLogStoreInner, ensure_consecutive_entries, ensure_log_append_boundary};
 

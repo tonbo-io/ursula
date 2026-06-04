@@ -14,7 +14,7 @@ use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 
 use crate::raft_internal_proto;
-use crate::types::*;
+use crate::types::{RaftGroupCommand, RaftGroupResponse};
 
 pub(crate) fn placement_to_proto(placement: ShardPlacement) -> raft_app_proto::ShardPlacementV1 {
     raft_app_proto::ShardPlacementV1 {

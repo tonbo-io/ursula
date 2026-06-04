@@ -25,10 +25,8 @@ pub use bootstrap::{
     spawn_static_grpc_raft_runtime_with_per_group_initializers, spawn_wal_runtime,
 };
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -38,16 +36,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::Router;
 use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{DefaultBodyLimit, OriginalUri, Path, RawQuery, State};
-use axum::http::header::{
-    CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH, LOCATION,
-};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, LOCATION};
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::DateTime;
 use futures_util::stream;
 use openraft::BasicNode;
 use openraft::rt::WatchReceiver;
@@ -55,7 +50,7 @@ use ursula_raft::{
     LeadershipShedFlag, RAFT_GRPC_APPEND_PATH, RAFT_GRPC_FULL_SNAPSHOT_PATH,
     RAFT_GRPC_GROUP_READ_PATH, RAFT_GRPC_GROUP_WRITE_PATH, RAFT_GRPC_MAX_MESSAGE_BYTES,
     RAFT_GRPC_TRANSFER_LEADER_PATH, RAFT_GRPC_VOTE_PATH, RaftGroupHandleRegistry, RaftGrpcService,
-    RaftLogProgressSnapshot, raft_internal_proto,
+    raft_internal_proto,
 };
 use ursula_runtime::{
     AppendBatchRequest, AppendExternalRequest, AppendRequest, AppendResponse,
@@ -67,7 +62,16 @@ use ursula_runtime::{
 use ursula_shard::{BucketStreamId, RaftGroupId};
 
 use crate::bootstrap::env_usize;
-use crate::render::*;
+use crate::render::{
+    bootstrap_response, insert_cache_control, insert_content_type, insert_cursor,
+    insert_default_response_headers, insert_header_str, insert_lifetime_headers, insert_location,
+    insert_offset, insert_producer_ack, insert_producer_error_headers, insert_public_location,
+    insert_snapshot_offset, insert_static, insert_stream_error_headers, insert_stream_error_offset,
+    insert_u64_header, long_poll_no_content_response, normalize_http_write_payload,
+    offset_now_response, parse_append_batch, push_json_string, read_response, render_batch_results,
+    render_metrics, render_sse_read, response_cursor, runtime_error_status,
+    should_base64_encode_sse_data, snapshot_response, sse_safe_line,
+};
 
 type BoxResponse = Box<Response>;
 

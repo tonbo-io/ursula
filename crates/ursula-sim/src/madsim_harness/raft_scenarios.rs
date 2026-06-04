@@ -2,7 +2,18 @@
 //! restart-follower, leader-failover) extracted from `madsim_harness/mod.rs`
 //! (DoD #3 modularity refactor — workloads axis).
 
-use super::*;
+use super::{
+    AppendRequest, BasicNode, CreateStreamRequest, Duration, GroupEngine, InProcessRaftFaultAction,
+    InProcessRaftFaultScript, InProcessRaftNetworkFactory, RaftGroupEngine, SimEvent, SimTrace,
+    ThreeNodeRaftSimConfig, ThreeNodeRaftSimOutcome, build_lagging_learner_snapshot_cluster,
+    build_restartable_three_node_cluster, build_three_node_cluster, placement,
+    read_local_payload_eventually, seeded_follower_id, sim_network_policy,
+    verify_all_nodes_can_read, wait_all_nodes_applied,
+};
+#[cfg(test)]
+use super::{GroupWriteCommand, build_three_node_snapshot_purge_cluster};
+#[cfg(test)]
+use openraft::storage::RaftLogStorage;
 
 pub(super) async fn run_no_fault_inner(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
     let mut trace = SimTrace::default();
@@ -457,11 +468,11 @@ pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
             .get_log_state()
             .await
             .expect("read old leader log state");
-        if let Some(index) = log_state.last_log_id.map(|log_id| log_id.index) {
-            if index >= baseline_log_index + pending_write_count {
-                pending_log_index = Some(index);
-                break;
-            }
+        if let Some(index) = log_state.last_log_id.map(|log_id| log_id.index)
+            && index >= baseline_log_index + pending_write_count
+        {
+            pending_log_index = Some(index);
+            break;
         }
         madsim::time::sleep(Duration::from_millis(10)).await;
     }

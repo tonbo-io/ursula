@@ -30,7 +30,9 @@ use ursula_shard::ShardPlacement;
 
 use crate::engine::invalid_data;
 use crate::raft_internal_proto;
-use crate::types::*;
+use crate::types::{
+    CORE_LOG_GROUP_COMMIT_DELAY, CORE_LOG_GROUP_COMMIT_MAX_BATCH, UrsulaRaftTypeConfig,
+};
 
 use super::{
     CoreJournalRecord, RaftGroupLogRecord, RaftGroupLogStoreInner, StoredLogEntry, append_record,

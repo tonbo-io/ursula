@@ -218,8 +218,9 @@ impl SnapshotStore for InlineSnapshotStore {
 
 #[cfg(not(madsim))]
 mod s3 {
-    use super::*;
-
+    use super::{
+        SnapshotKey, SnapshotLocation, SnapshotStore, SnapshotStoreError, SnapshotStoreFuture,
+    };
     use opendal::{Operator, Scheme};
 
     /// Bytes live in an opendal-managed S3 bucket under `{prefix}/group-{gid}/`.
@@ -500,7 +501,12 @@ pub fn snapshot_store_from_env() -> Result<Option<SharedSnapshotStore>, Snapshot
 
 #[cfg(not(madsim))]
 mod local {
-    use super::*;
+    use std::io;
+    use std::path::PathBuf;
+
+    use super::{
+        SnapshotKey, SnapshotLocation, SnapshotStore, SnapshotStoreError, SnapshotStoreFuture,
+    };
 
     /// Bytes live on the local filesystem under a root directory.
     #[derive(Debug, Clone)]
