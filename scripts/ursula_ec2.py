@@ -602,10 +602,6 @@ WantedBy=multi-user.target
             str(args.verify_every),
             "--old-sample-every",
             str(args.old_sample_every),
-            "--burst-every",
-            str(args.burst_every),
-            "--burst-appends",
-            str(args.burst_appends),
             "--status-every",
             str(args.status_every),
             "--fault-min-secs",
@@ -842,8 +838,8 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_chaos.add_argument("--verify-modes", default="latest,recent,old,cold")
     deploy_chaos.add_argument("--verify-every", type=int, default=50)
     deploy_chaos.add_argument("--old-sample-every", type=int, default=128)
-    deploy_chaos.add_argument("--burst-every", type=int, default=300)
-    deploy_chaos.add_argument("--burst-appends", type=int, default=200)
+    deploy_chaos.add_argument("--burst-every", type=int, default=0)
+    deploy_chaos.add_argument("--burst-appends", type=int, default=0)
     deploy_chaos.add_argument("--status-every", type=int, default=15)
     deploy_chaos.add_argument("--fault-min-secs", type=int, default=900)
     deploy_chaos.add_argument("--fault-max-secs", type=int, default=1800)

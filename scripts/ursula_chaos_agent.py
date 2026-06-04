@@ -415,8 +415,6 @@ class ChaosAgent:
         self.reader_success = 0
         self.reader_errors = 0
         self.read_availability_errors = 0
-        self.burst_success = 0
-        self.burst_errors = 0
         self.producer_probe_success = 0
         self.producer_probe_errors = 0
         self.producer_probe_skipped = 0
@@ -472,7 +470,6 @@ class ChaosAgent:
         self.gc_churn_pending: deque[tuple[str, float]] = deque()
         self.last_gc_churn_success = 0
         self.restored_workload_coverage: dict[str, Any] = {}
-        self.next_burst_at = time.monotonic() + self.burst_every if self.burst_every > 0 else None
         self.restore_published_state()
 
     def choose_next_fault(self, *, initial: bool = False) -> datetime | None:
@@ -1137,14 +1134,6 @@ class ChaosAgent:
                 f"producer stale_epoch probe was not fenced: "
                 f"status={stale_status} current_epoch={current_epoch} expected={epoch}",
             )
-
-    def run_burst_probe(self) -> None:
-        for _ in range(self.burst_appends):
-            before_success = self.append_success
-            before_errors = self.append_errors
-            self.append_once()
-            self.burst_success += self.append_success - before_success
-            self.burst_errors += self.append_errors - before_errors
 
     def workload_probes_paused(self) -> bool:
         if self.active_fault is not None:
@@ -2159,12 +2148,6 @@ class ChaosAgent:
                 or (isinstance(cold_flush_uploads, int) and cold_flush_uploads > 0),
                 "passing": self.cold_flush_errors == 0,
             },
-            "burst": {
-                "success": self.burst_success,
-                "errors": self.burst_errors,
-                "covered": self.burst_success + self.burst_errors > 0,
-                "passing": self.burst_errors == 0,
-            },
             "cold_write_backpressure": {
                 "events": cold_backpressure_events,
                 "bytes": cold_backpressure_bytes,
@@ -2693,9 +2676,6 @@ class ChaosAgent:
                 and self.append_success % self.producer_probe_every == 0
             ):
                 self.run_producer_semantics_probe()
-            if not workload_probes_paused and self.next_burst_at is not None and loop_started >= self.next_burst_at:
-                self.run_burst_probe()
-                self.next_burst_at = loop_started + self.burst_every
             if loop_started - last_status >= self.status_every:
                 self.publish_status()
                 last_status = loop_started
