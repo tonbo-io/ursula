@@ -69,6 +69,23 @@ jobs:
       - name: Test workspace docs
         run: cargo test --workspace --doc
 
+  build-image:
+    name: Build Docker images
+    needs: change-detection
+    if: contains(fromJson(needs.change-detection.outputs.tests-to-run), 'rust')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+
   deterministic-simulation:
     name: Deterministic simulation smoke
     runs-on: ubuntu-24.04
