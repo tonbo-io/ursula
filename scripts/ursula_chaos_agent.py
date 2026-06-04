@@ -233,6 +233,7 @@ _PUBLISHED_HISTORY_RAW_MS = 60 * 60 * 1000  # keep raw samples for the last hour
 # during the drain right after a fault clears, queued retries cause sporadic
 # errors. Anything under this fraction of successful work is treated as healthy.
 WORKLOAD_CLEAN_ERROR_RATE = 0.05
+FAULT_READY_MIN_SUCCESS_RATE = 0.90
 PROBE_PASS_ERROR_RATE = 0.05
 _PUBLISHED_INJECTIONS = 8  # page renders last 3, keep a small lookback
 _PUBLISHED_EVENTS = 16  # page renders last 10
@@ -2267,6 +2268,37 @@ class ChaosAgent:
             )
         if not lag_status["ok"]:
             reasons.append(self.raft_lag_reason(lag_status))
+        if self.last_integrity_error is not None:
+            reasons.append(self.last_integrity_error)
+        if self.last_status_published_at is None or self.last_status_append_success is None:
+            reasons.append("no completed status window")
+        else:
+            elapsed = max(1.0, (utc_now() - self.last_status_published_at).total_seconds())
+            expected_success = int(self.append_per_second * elapsed * FAULT_READY_MIN_SUCCESS_RATE)
+            append_success_delta = self.append_success - self.last_status_append_success
+            append_error_delta = 0
+            if self.last_status_append_errors is not None:
+                append_error_delta = self.append_errors - self.last_status_append_errors
+            read_availability_error_delta = 0
+            if self.last_status_read_availability_errors is not None:
+                read_availability_error_delta = (
+                    self.read_availability_errors - self.last_status_read_availability_errors
+                )
+            cold_backpressure_event_delta = 0
+            storage = self.storage_status(nodes)
+            cold_backpressure_events = storage.get("cold_backpressure_events")
+            if self.last_status_cold_backpressure_events is not None and isinstance(cold_backpressure_events, int):
+                cold_backpressure_event_delta = cold_backpressure_events - self.last_status_cold_backpressure_events
+            if append_success_delta < expected_success:
+                reasons.append(
+                    f"append workload below fault-ready rate: {append_success_delta}/{expected_success}"
+                )
+            if append_error_delta > 0:
+                reasons.append(f"{append_error_delta} append errors since last publish")
+            if read_availability_error_delta > 0:
+                reasons.append(f"{read_availability_error_delta} read availability misses since last publish")
+            if cold_backpressure_event_delta > 0:
+                reasons.append(f"{cold_backpressure_event_delta} cold write backpressure events since last publish")
         return not reasons, reasons
 
     def build_status(self) -> dict[str, Any]:

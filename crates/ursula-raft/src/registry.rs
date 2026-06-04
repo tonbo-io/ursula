@@ -93,6 +93,28 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for SingleNodeRaftNetwork {
     }
 }
 
+struct PrefetchedSnapshotGuard {
+    snapshot_install: SnapshotInstallCoordinator,
+    key: Option<String>,
+}
+
+impl PrefetchedSnapshotGuard {
+    fn new(snapshot_install: SnapshotInstallCoordinator, key: String) -> Self {
+        Self {
+            snapshot_install,
+            key: Some(key),
+        }
+    }
+}
+
+impl Drop for PrefetchedSnapshotGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.snapshot_install.clear_prefetched_key(&key);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InProcessRaftRegistry {
     nodes: Arc<Mutex<BTreeMap<u64, Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>>>>,
@@ -941,13 +963,12 @@ impl RaftGroupHandleRegistry {
         let raft = self.require_group(raft_group_id)?;
         let _install_permit = self.snapshot_install.acquire().await?;
         let (snapshot, prefetched_key) = self.prefetch_snapshot_for_install(snapshot).await?;
+        let _prefetched_guard = prefetched_key
+            .map(|key| PrefetchedSnapshotGuard::new(self.snapshot_install.clone(), key));
         let result = raft
             .install_full_snapshot(vote, snapshot)
             .await
             .map_err(|err| GroupEngineError::new(format!("OpenRaft install snapshot: {err}")));
-        if let Some(key) = prefetched_key {
-            self.snapshot_install.clear_prefetched_key(&key);
-        }
         result
     }
 
@@ -1145,6 +1166,29 @@ mod tests {
             .clear_prefetched_key(&prefetched_key)
             .expect("prefetched snapshot bytes cached");
         serde_json::from_slice::<GroupSnapshot>(cached.as_slice()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prefetched_snapshot_guard_clears_cache_on_drop() {
+        let registry = RaftGroupHandleRegistry::default();
+        registry.set_snapshot_store(Some(Arc::new(StaticSnapshotStore {
+            bytes: Some(group_snapshot_bytes()),
+        })));
+
+        let (_, prefetched_key) = registry
+            .prefetch_snapshot_for_install(external_snapshot("snapshot-drop"))
+            .await
+            .expect("prefetch external snapshot");
+        let prefetched_key = prefetched_key.expect("external snapshot is cached");
+        let coordinator = registry.snapshot_install_coordinator();
+
+        let guard = PrefetchedSnapshotGuard::new(coordinator.clone(), prefetched_key.clone());
+        drop(guard);
+
+        assert!(
+            coordinator.clear_prefetched_key(&prefetched_key).is_none(),
+            "dropping an interrupted install must clear prefetched snapshot bytes"
+        );
     }
 
     #[tokio::test]
