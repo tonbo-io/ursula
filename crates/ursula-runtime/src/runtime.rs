@@ -8,6 +8,7 @@ use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardId, ShardPlacement,
 use ursula_stream::{ColdChunkRef, ColdFlushCandidate, ColdGcEntry, ColdGcTarget, StreamErrorCode};
 
 use crate::admission::{RaftUncommittedAdmission, RaftUncommittedBytesTracker};
+use crate::cold_index::cold_index_prefix;
 use crate::cold_store::{ColdStoreHandle, ColdStoreInfo, cold_chunk_prefix, new_cold_chunk_path};
 use crate::command::GroupSnapshot;
 use crate::core_worker::{CoreCommand, CoreMailbox, CoreWorker, WaitReadCancel};
@@ -751,16 +752,17 @@ impl ShardRuntime {
         };
         self.metrics
             .record_cold_upload(object_size, elapsed_ns(upload_started_at));
+        let chunk = ColdChunkRef {
+            start_offset: candidate.start_offset,
+            end_offset: candidate.end_offset,
+            s3_path: path.clone(),
+            object_size,
+        };
         let publish_started_at = Instant::now();
         let publish = self
             .flush_cold(FlushColdRequest {
                 stream_id: candidate.stream_id,
-                chunk: ColdChunkRef {
-                    start_offset: candidate.start_offset,
-                    end_offset: candidate.end_offset,
-                    s3_path: path.clone(),
-                    object_size,
-                },
+                chunk,
             })
             .await;
         match publish {
@@ -942,7 +944,10 @@ impl ShardRuntime {
         for entry in entries {
             let result = match &entry.target {
                 ColdGcTarget::Stream(stream_id) => {
-                    cold_store.remove_all(&cold_chunk_prefix(stream_id)).await
+                    match cold_store.remove_all(&cold_chunk_prefix(stream_id)).await {
+                        Ok(()) => cold_store.remove_all(&cold_index_prefix(stream_id)).await,
+                        Err(err) => Err(err),
+                    }
                 }
                 ColdGcTarget::Paths(paths) => {
                     let mut outcome = Ok(());

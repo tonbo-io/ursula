@@ -4667,6 +4667,53 @@ async fn cluster_router_reports_leadership_shed_policy() {
 }
 
 #[tokio::test]
+async fn maintenance_drain_endpoint_marks_and_clears_leadership_shed() {
+    let registry = RaftGroupHandleRegistry::default();
+    let state =
+        HttpState::with_raft_registry(spawn_default_runtime(1, 1).expect("runtime"), registry);
+    let router = router_with_http_state(state);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/__ursula/leadership-shed/maintenance")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body = std::str::from_utf8(&body).expect("status utf8");
+    assert!(body.contains("\"state\":\"maintenance-drain\""), "{body}");
+    assert!(body.contains("\"should_accept_transfer\":false"), "{body}");
+    assert!(body.contains("\"should_campaign\":false"), "{body}");
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/__ursula/leadership-shed/maintenance")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body = std::str::from_utf8(&body).expect("status utf8");
+    assert!(body.contains("\"state\":\"none\""), "{body}");
+    assert!(body.contains("\"should_accept_transfer\":true"), "{body}");
+    assert!(body.contains("\"should_campaign\":true"), "{body}");
+}
+
+#[tokio::test]
 async fn merged_router_serves_both_planes() {
     // The single-listener router (backwards compat / in-process tests) must
     // still answer both client and cluster routes from one bind.
@@ -5020,12 +5067,16 @@ mod cold_health {
 }
 
 mod snapshot_driver {
-    use crate::bootstrap::should_drive_snapshot_for_group;
+    use crate::bootstrap::{next_snapshot_to_drive, should_drive_snapshot_for_group};
     use ursula_raft::{RaftGroupMetricsSnapshot, RaftLogProgressSnapshot};
 
-    fn snap(last_applied: Option<u64>, snapshot_index: Option<u64>) -> RaftGroupMetricsSnapshot {
+    fn snap_with_group(
+        raft_group_id: u32,
+        last_applied: Option<u64>,
+        snapshot_index: Option<u64>,
+    ) -> RaftGroupMetricsSnapshot {
         RaftGroupMetricsSnapshot {
-            raft_group_id: 0,
+            raft_group_id,
             node_id: 1,
             current_term: 1,
             current_leader: Some(1),
@@ -5039,6 +5090,10 @@ mod snapshot_driver {
         }
     }
 
+    fn snap(last_applied: Option<u64>, snapshot_index: Option<u64>) -> RaftGroupMetricsSnapshot {
+        snap_with_group(0, last_applied, snapshot_index)
+    }
+
     #[test]
     fn snapshot_driver_only_snapshots_applied_work_past_current_snapshot() {
         assert!(!should_drive_snapshot_for_group(&snap(None, None)));
@@ -5046,6 +5101,27 @@ mod snapshot_driver {
         assert!(should_drive_snapshot_for_group(&snap(Some(42), Some(41))));
         assert!(!should_drive_snapshot_for_group(&snap(Some(42), Some(42))));
         assert!(!should_drive_snapshot_for_group(&snap(Some(42), Some(43))));
+    }
+
+    #[test]
+    fn snapshot_driver_picks_one_due_group_round_robin() {
+        let snapshots = vec![
+            snap_with_group(0, Some(42), Some(42)),
+            snap_with_group(1, Some(42), Some(41)),
+            snap_with_group(2, Some(42), Some(41)),
+        ];
+
+        let first = next_snapshot_to_drive(&snapshots, 0).expect("first due snapshot");
+        assert_eq!(first.0, 1);
+        assert_eq!(first.1.raft_group_id, 1);
+
+        let second = next_snapshot_to_drive(&snapshots, first.0 + 1).expect("second due snapshot");
+        assert_eq!(second.0, 2);
+        assert_eq!(second.1.raft_group_id, 2);
+
+        let wrapped = next_snapshot_to_drive(&snapshots, second.0 + 1).expect("wrapped snapshot");
+        assert_eq!(wrapped.0, 1);
+        assert_eq!(wrapped.1.raft_group_id, 1);
     }
 }
 

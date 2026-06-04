@@ -315,10 +315,12 @@ impl RaftGroupStateMachine {
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> Result<(), GroupEngineError> {
-        let mut preview = self.engine.clone();
-        preview
-            .create_stream_with_cold_admission(request, placement, admission)
-            .await?;
+        let _ = placement;
+        self.engine.check_cold_write_admission_bytes(
+            &request.stream_id,
+            admission,
+            u64::try_from(request.initial_payload.len()).expect("payload len fits u64"),
+        )?;
         Ok(())
     }
 
@@ -328,10 +330,12 @@ impl RaftGroupStateMachine {
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> Result<(), GroupEngineError> {
-        let mut preview = self.engine.clone();
-        preview
-            .append_with_cold_admission(request, placement, admission)
-            .await?;
+        let _ = placement;
+        self.engine.check_cold_write_admission_bytes(
+            &request.stream_id,
+            admission,
+            u64::try_from(request.payload.len()).expect("payload len fits u64"),
+        )?;
         Ok(())
     }
 
@@ -341,10 +345,17 @@ impl RaftGroupStateMachine {
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> Result<(), GroupEngineError> {
-        let mut preview = self.engine.clone();
-        preview
-            .append_batch_with_cold_admission(request, placement, admission)
-            .await?;
+        let _ = placement;
+        let incoming_bytes = request
+            .payloads
+            .iter()
+            .map(|payload| u64::try_from(payload.len()).expect("payload len fits u64"))
+            .sum();
+        self.engine.check_cold_write_admission_bytes(
+            &request.stream_id,
+            admission,
+            incoming_bytes,
+        )?;
         Ok(())
     }
 
@@ -354,12 +365,18 @@ impl RaftGroupStateMachine {
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> Result<(), GroupEngineError> {
-        let mut preview = self.engine.clone();
-        for request in requests {
-            preview
-                .append_batch_with_cold_admission(request, placement, admission)
-                .await?;
+        let _ = placement;
+        if requests.is_empty() {
+            return Ok(());
         }
+        let stream_id = requests[0].stream_id.clone();
+        let incoming_bytes = requests
+            .iter()
+            .flat_map(|request| request.payloads.iter())
+            .map(|payload| u64::try_from(payload.len()).expect("payload len fits u64"))
+            .sum();
+        self.engine
+            .check_cold_write_admission_bytes(&stream_id, admission, incoming_bytes)?;
         Ok(())
     }
 

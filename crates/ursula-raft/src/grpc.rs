@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::Cursor;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
@@ -24,7 +25,8 @@ use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 use ursula_proto as raft_app_proto;
 use ursula_runtime::{
-    ColdStoreHandle, GroupEngine, GroupEngineError, HeadStreamRequest, ReadStreamRequest,
+    ColdIndexPageCache, ColdStoreColdIndexPageStore, ColdStoreHandle, GroupEngine,
+    GroupEngineError, HeadStreamRequest, ReadStreamRequest,
 };
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
@@ -308,6 +310,12 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             placement,
             metrics: None,
             cold_store: self.cold_store.clone(),
+            cold_index_cache: self.cold_store.as_ref().map(|cold_store| {
+                Arc::new(ColdIndexPageCache::new(
+                    Arc::new(ColdStoreColdIndexPageStore::new(cold_store.clone())),
+                    1024,
+                ))
+            }),
         };
         let stream_id = BucketStreamId::new(request.bucket_id, request.stream_id);
         let result = match required(request.read, "group_read.read")

@@ -620,7 +620,6 @@ pub(crate) fn head_stream_response_from_proto(
             live_records: response.integrity_live_records,
             evicted_records: response.integrity_evicted_records,
             total_records: response.integrity_total_records,
-            records: Vec::new(),
         },
     })
 }

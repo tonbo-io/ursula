@@ -38,6 +38,9 @@ pub async fn collect_status(client: &MetricsClient, nodes: &[NodeInfo]) -> Statu
             Ok(view) => {
                 let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
                 for group in &view.groups {
+                    if !group_is_initialized(group) {
+                        continue;
+                    }
                     if let Some(leader) = group.current_leader {
                         *counts.entry(leader).or_default() += 1;
                     }
@@ -92,8 +95,9 @@ fn format_leaders(counts: &BTreeMap<u64, usize>) -> String {
     out
 }
 
-/// Block until every node reports `expected_groups` raft groups AND every group
-/// has a leader observed by that node. Mirrors `ursula_ec2.py::wait_ready`.
+/// Block until every node reports `expected_groups` raft groups and every
+/// initialized group has a leader observed by that node. Empty groups with no
+/// voters are allowed because raft groups are initialized lazily.
 pub async fn wait_ready(
     client: &MetricsClient,
     nodes: &[NodeInfo],
@@ -140,6 +144,7 @@ fn cluster_ready(
         let groups_without_leader = view
             .groups
             .iter()
+            .filter(|g| group_is_initialized(g))
             .filter(|g| g.current_leader.is_none())
             .count();
         if groups_without_leader > 0 {
@@ -150,8 +155,14 @@ fn cluster_ready(
             return false;
         }
     }
-    *summary = format!("all {expected_nodes} nodes report {expected_groups} groups with leaders");
+    *summary = format!(
+        "all {expected_nodes} nodes report {expected_groups} groups; initialized groups have leaders"
+    );
     true
+}
+
+fn group_is_initialized(group: &crate::metrics::RaftGroupView) -> bool {
+    !group.voter_ids.is_empty()
 }
 
 #[cfg(test)]
@@ -177,6 +188,18 @@ mod tests {
             committed_index: Some(1),
             last_applied_index: Some(1),
             voter_ids: vec![1, 2, 3],
+            learner_ids: vec![],
+        }
+    }
+
+    fn empty_group(raft_group_id: u64) -> RaftGroupView {
+        RaftGroupView {
+            raft_group_id,
+            node_id: 0,
+            current_leader: None,
+            committed_index: None,
+            last_applied_index: None,
+            voter_ids: vec![],
             learner_ids: vec![],
         }
     }
@@ -210,6 +233,18 @@ mod tests {
         let mut summary = String::new();
         assert!(!cluster_ready(&snapshot, 1, 1, &mut summary));
         assert!(summary.contains("without a leader"));
+    }
+
+    #[test]
+    fn cluster_ready_allows_uninitialized_empty_groups() {
+        let snapshot = ClusterSnapshot {
+            per_node: vec![NodeMetricsView {
+                node: node(1),
+                groups: vec![group(7, Some(1)), empty_group(8)],
+            }],
+        };
+        let mut summary = String::new();
+        assert!(cluster_ready(&snapshot, 1, 2, &mut summary));
     }
 
     #[test]

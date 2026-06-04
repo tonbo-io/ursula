@@ -27,7 +27,7 @@ enum Command {
     Restart(RestartArgs),
     /// Print per-node raft group count and leadership distribution from /__ursula/metrics.
     Status(ObserveArgs),
-    /// Block until every node reports the expected number of raft groups, each with a leader.
+    /// Block until every node reports the expected number of raft groups and initialized groups have leaders.
     WaitReady(WaitReadyArgs),
 }
 
@@ -85,6 +85,10 @@ struct RestartArgs {
     /// for the target to be considered ready.
     #[arg(long, default_value_t = 16)]
     lag_tolerance: u64,
+    /// Permit one empty-log rejoin per group before restarting a node.
+    /// Use only for volatile --raft-memory clusters.
+    #[arg(long, default_value_t = false)]
+    allow_empty_raft_rejoin: bool,
     /// Print the drain plan and stop before issuing transfers or restart commands.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
@@ -158,6 +162,7 @@ async fn run_restart_subcommand(args: RestartArgs) -> Result<()> {
         ready_timeout: Duration::from_secs(args.ready_timeout_secs),
         poll_interval: Duration::from_secs(args.poll_interval_secs),
         lag_tolerance: args.lag_tolerance,
+        allow_empty_raft_rejoin: args.allow_empty_raft_rejoin,
         only: args.only,
         dry_run: args.dry_run,
     };

@@ -803,13 +803,15 @@ impl RuntimeMetricsInner {
 
     pub(crate) fn record_group_mailbox_enqueued(&self, group_id: RaftGroupId) {
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        let depth = self.per_group_group_mailbox_depth[group_index].fetch_add_relaxed(1) + 1;
+        let depth = self.per_group_group_mailbox_depth[group_index]
+            .fetch_add_relaxed(1)
+            .saturating_add(1);
         self.per_group_group_mailbox_max_depth[group_index].fetch_max_relaxed(depth);
     }
 
     pub(crate) fn record_group_mailbox_dequeued(&self, group_id: RaftGroupId) {
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
-        self.per_group_group_mailbox_depth[group_index].fetch_sub_relaxed(1);
+        self.per_group_group_mailbox_depth[group_index].fetch_sub_saturating_relaxed(1);
     }
 
     pub(crate) fn record_group_mailbox_full(&self, group_id: RaftGroupId) {
@@ -1043,6 +1045,22 @@ impl PaddedAtomicU64 {
 
     pub(crate) fn fetch_sub_relaxed(&self, value: u64) {
         self.value.fetch_sub(value, Ordering::Relaxed);
+    }
+
+    pub(crate) fn fetch_sub_saturating_relaxed(&self, value: u64) {
+        let mut current = self.value.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(value);
+            match self.value.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     pub(crate) fn fetch_max_relaxed(&self, value: u64) {
