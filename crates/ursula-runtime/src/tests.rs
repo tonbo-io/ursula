@@ -278,6 +278,95 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
 }
 
 #[tokio::test]
+async fn stale_cold_flush_rolls_back_index_page_entry() {
+    let placement = placement();
+    let stream = BucketStreamId::new("benchcmp", "stale-cold-index");
+    let live_path = "benchcmp/stale-cold-index/chunks/live.bin";
+    let stale_path = "benchcmp/stale-cold-index/chunks/stale.bin";
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    cold_store
+        .write_chunk(live_path, b"abcd")
+        .await
+        .expect("write live cold object");
+    cold_store
+        .write_chunk(stale_path, b"abcd")
+        .await
+        .expect("write stale cold object");
+    let mut engine = InMemoryGroupEngine::with_cold_store(cold_store.clone());
+
+    engine
+        .create_stream(
+            CreateStreamRequest::new(stream.clone(), DEFAULT_CONTENT_TYPE),
+            placement,
+        )
+        .await
+        .expect("create stream");
+    engine
+        .append(
+            AppendRequest::from_bytes(stream.clone(), b"abcdef".to_vec()),
+            placement,
+        )
+        .await
+        .expect("append");
+    engine
+        .flush_cold(
+            FlushColdRequest {
+                stream_id: stream.clone(),
+                chunk: ColdChunkRef {
+                    start_offset: 0,
+                    end_offset: 4,
+                    s3_path: live_path.to_owned(),
+                    object_size: 4,
+                },
+            },
+            placement,
+        )
+        .await
+        .expect("flush live cold chunk");
+
+    let stale_flush = engine
+        .flush_cold(
+            FlushColdRequest {
+                stream_id: stream.clone(),
+                chunk: ColdChunkRef {
+                    start_offset: 0,
+                    end_offset: 4,
+                    s3_path: stale_path.to_owned(),
+                    object_size: 4,
+                },
+            },
+            placement,
+        )
+        .await
+        .expect_err("duplicate cold flush should be stale");
+    assert!(
+        stale_flush
+            .message()
+            .contains("must start at the hot prefix"),
+        "message={}",
+        stale_flush.message()
+    );
+    cold_store
+        .delete_chunk(stale_path)
+        .await
+        .expect("delete stale cold object");
+
+    let read = engine
+        .read_stream(
+            ReadStreamRequest {
+                stream_id: stream,
+                offset: 0,
+                max_len: 6,
+                now_ms: 0,
+            },
+            placement,
+        )
+        .await
+        .expect("read should still use live cold index entry");
+    assert_eq!(read.payload, b"abcdef");
+}
+
+#[tokio::test]
 async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
