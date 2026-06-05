@@ -692,11 +692,26 @@ impl InMemoryGroupEngine {
         admission: ColdWriteAdmission,
     ) -> Result<CreateStreamResponse, GroupEngineError> {
         let stream_id = request.stream_id.clone();
-        self.check_cold_write_admission_bytes(
-            &stream_id,
-            admission,
-            u64::try_from(request.initial_payload.len()).expect("payload len fits u64"),
-        )?;
+        if admission.is_enabled() {
+            let mut preview = self.clone();
+            let preview_response = match preview
+                .apply_committed_write(GroupWriteCommand::from(request.clone()), placement)?
+            {
+                GroupWriteResponse::CreateStream(response) => response,
+                other => {
+                    return Err(GroupEngineError::new(format!(
+                        "unexpected create stream preview response: {other:?}"
+                    )));
+                }
+            };
+            if !preview_response.already_exists {
+                self.check_cold_write_admission_bytes(
+                    &stream_id,
+                    admission,
+                    u64::try_from(request.initial_payload.len()).expect("payload len fits u64"),
+                )?;
+            }
+        }
         let response =
             match self.apply_committed_write(GroupWriteCommand::from(request), placement)? {
                 GroupWriteResponse::CreateStream(response) => response,
@@ -716,11 +731,26 @@ impl InMemoryGroupEngine {
         admission: ColdWriteAdmission,
     ) -> Result<AppendResponse, GroupEngineError> {
         let stream_id = request.stream_id.clone();
-        self.check_cold_write_admission_bytes(
-            &stream_id,
-            admission,
-            u64::try_from(request.payload.len()).expect("payload len fits u64"),
-        )?;
+        if admission.is_enabled() {
+            let mut preview = self.clone();
+            let preview_response = match preview
+                .apply_committed_write(GroupWriteCommand::from(request.clone()), placement)?
+            {
+                GroupWriteResponse::Append(response) => response,
+                other => {
+                    return Err(GroupEngineError::new(format!(
+                        "unexpected append preview response: {other:?}"
+                    )));
+                }
+            };
+            if !preview_response.deduplicated {
+                self.check_cold_write_admission_bytes(
+                    &stream_id,
+                    admission,
+                    u64::try_from(request.payload.len()).expect("payload len fits u64"),
+                )?;
+            }
+        }
         let response =
             match self.apply_committed_write(GroupWriteCommand::from(request), placement)? {
                 GroupWriteResponse::Append(response) => response,
@@ -745,7 +775,26 @@ impl InMemoryGroupEngine {
             .iter()
             .map(|payload| u64::try_from(payload.len()).expect("payload len fits u64"))
             .sum();
-        self.check_cold_write_admission_bytes(&stream_id, admission, incoming_bytes)?;
+        if admission.is_enabled() {
+            let mut preview = self.clone();
+            let preview_response = match preview
+                .apply_committed_write(GroupWriteCommand::from(request.clone()), placement)?
+            {
+                GroupWriteResponse::AppendBatch(response) => response,
+                other => {
+                    return Err(GroupEngineError::new(format!(
+                        "unexpected append batch preview response: {other:?}"
+                    )));
+                }
+            };
+            let mutates = preview_response
+                .items
+                .iter()
+                .any(|item| matches!(item, Ok(response) if !response.deduplicated));
+            if mutates {
+                self.check_cold_write_admission_bytes(&stream_id, admission, incoming_bytes)?;
+            }
+        }
         let response =
             match self.apply_committed_write(GroupWriteCommand::from(request), placement)? {
                 GroupWriteResponse::AppendBatch(response) => response,
