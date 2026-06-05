@@ -1930,6 +1930,94 @@ async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_write_admission_allows_deduplicated_append_retry_at_hot_limit() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
+        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
+        Some(cold_store),
+    )
+    .expect("spawn runtime");
+    let stream = BucketStreamId::new("benchcmp", "cold-admission-dedup-append");
+    create_stream(&runtime, &stream).await;
+
+    let mut first = AppendRequest::from_bytes(stream.clone(), b"abcd".to_vec());
+    first.producer = Some(producer("writer", 0, 0));
+    runtime.append(first).await.expect("append at hot limit");
+
+    let mut retry = AppendRequest::from_bytes(stream.clone(), b"ignored".to_vec());
+    retry.producer = Some(producer("writer", 0, 0));
+    let retry = runtime
+        .append(retry)
+        .await
+        .expect("deduplicated retry should bypass cold admission");
+    assert!(retry.deduplicated);
+    assert_eq!(retry.start_offset, 0);
+    assert_eq!(retry.next_offset, 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_write_admission_allows_deduplicated_append_batch_retry_at_hot_limit() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
+        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
+        Some(cold_store),
+    )
+    .expect("spawn runtime");
+    let stream = BucketStreamId::new("benchcmp", "cold-admission-dedup-batch");
+    create_stream(&runtime, &stream).await;
+
+    let mut first = AppendBatchRequest::new(
+        stream.clone(),
+        vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()],
+    );
+    first.producer = Some(producer("writer", 0, 0));
+    runtime
+        .append_batch(first)
+        .await
+        .expect("batch at hot limit");
+
+    let mut retry = AppendBatchRequest::new(stream.clone(), vec![b"ignored".to_vec()]);
+    retry.producer = Some(producer("writer", 0, 0));
+    let retry = runtime
+        .append_batch(retry)
+        .await
+        .expect("deduplicated batch retry should bypass cold admission");
+    assert!(
+        retry
+            .items
+            .iter()
+            .all(|item| item.as_ref().expect("deduplicated item").deduplicated)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_write_admission_allows_existing_create_retry_at_hot_limit() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
+        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
+        Some(cold_store),
+    )
+    .expect("spawn runtime");
+    let stream = BucketStreamId::new("benchcmp", "cold-admission-existing-create");
+    let mut request = CreateStreamRequest::new(stream.clone(), DEFAULT_CONTENT_TYPE);
+    request.initial_payload = Bytes::from_static(b"abcd");
+
+    runtime
+        .create_stream(request.clone())
+        .await
+        .expect("create at hot limit");
+    let retry = runtime
+        .create_stream(request)
+        .await
+        .expect("existing create should bypass cold admission");
+    assert!(retry.already_exists);
+    assert_eq!(retry.next_offset, 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raft_uncommitted_admission_disabled_by_default_lets_writes_through() {
     // Disabled admission must not interfere with the existing accept path
     // (acceptance criterion 6: existing cold behaviour unchanged when the

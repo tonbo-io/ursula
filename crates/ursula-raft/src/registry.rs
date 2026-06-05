@@ -796,6 +796,24 @@ impl Default for RaftGroupHandleRegistry {
     }
 }
 
+#[derive(Debug)]
+struct PrefetchedInstallSnapshot {
+    snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
+    guard: Option<PrefetchedSnapshotGuard>,
+}
+
+#[derive(Debug)]
+struct PrefetchedSnapshotGuard {
+    snapshot_install: SnapshotInstallCoordinator,
+    cache_key: String,
+}
+
+impl Drop for PrefetchedSnapshotGuard {
+    fn drop(&mut self) {
+        self.snapshot_install.clear_prefetched_key(&self.cache_key);
+    }
+}
+
 impl RaftGroupHandleRegistry {
     pub fn register(
         &self,
@@ -948,7 +966,9 @@ impl RaftGroupHandleRegistry {
     ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, GroupEngineError> {
         let raft = self.require_group(raft_group_id)?;
         let _install_permit = self.snapshot_install.acquire().await?;
-        let snapshot = self.prefetch_snapshot_for_install(snapshot).await?;
+        let prefetched = self.prefetch_snapshot_for_install(snapshot).await?;
+        let snapshot = prefetched.snapshot;
+        let _prefetch_guard = prefetched.guard;
         raft.install_full_snapshot(vote, snapshot)
             .await
             .map_err(|err| GroupEngineError::new(format!("OpenRaft install snapshot: {err}")))
@@ -957,7 +977,7 @@ impl RaftGroupHandleRegistry {
     async fn prefetch_snapshot_for_install(
         &self,
         snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
-    ) -> Result<TypeConfigSnapshotOf<UrsulaRaftTypeConfig>, GroupEngineError> {
+    ) -> Result<PrefetchedInstallSnapshot, GroupEngineError> {
         let pointer_bytes = snapshot.snapshot.into_inner();
         let pointer = SnapshotPointer::decode(&pointer_bytes).map_err(|err| {
             GroupEngineError::new(format!("decode OpenRaft snapshot pointer: {err}"))
@@ -967,9 +987,12 @@ impl RaftGroupHandleRegistry {
             location,
         } = pointer;
         if matches!(location, SnapshotLocation::Inline { .. }) {
-            return Ok(TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
-                meta: snapshot.meta,
-                snapshot: Cursor::new(pointer_bytes),
+            return Ok(PrefetchedInstallSnapshot {
+                snapshot: TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
+                    meta: snapshot.meta,
+                    snapshot: Cursor::new(pointer_bytes),
+                },
+                guard: None,
             });
         }
 
@@ -992,19 +1015,26 @@ impl RaftGroupHandleRegistry {
             snapshot_id,
             location,
         };
-        self.snapshot_install.cache_prefetched(
+        let cache_key = self.snapshot_install.cache_prefetched(
             &pointer.snapshot_id,
             &pointer.location,
             snapshot_bytes,
         );
+        let guard = PrefetchedSnapshotGuard {
+            snapshot_install: self.snapshot_install.clone(),
+            cache_key,
+        };
         let pointer_bytes = pointer.encode().map_err(|err| {
             GroupEngineError::new(format!(
                 "encode prefetched OpenRaft snapshot pointer: {err}"
             ))
         })?;
-        Ok(TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
-            meta: snapshot.meta,
-            snapshot: Cursor::new(pointer_bytes),
+        Ok(PrefetchedInstallSnapshot {
+            snapshot: TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
+                meta: snapshot.meta,
+                snapshot: Cursor::new(pointer_bytes),
+            },
+            guard: Some(guard),
         })
     }
 
@@ -1139,12 +1169,12 @@ mod tests {
             bytes: Some(group_snapshot_bytes()),
         })));
 
-        let snapshot = registry
+        let prefetched = registry
             .prefetch_snapshot_for_install(external_snapshot("snapshot-a"))
             .await
             .expect("prefetch external snapshot");
 
-        let pointer = SnapshotPointer::decode(&snapshot.snapshot.into_inner()).unwrap();
+        let pointer = SnapshotPointer::decode(prefetched.snapshot.snapshot.get_ref()).unwrap();
         assert_eq!(pointer.snapshot_id, "snapshot-a");
         assert!(matches!(pointer.location, SnapshotLocation::S3 { .. }));
         let bytes = registry
@@ -1163,7 +1193,7 @@ mod tests {
             bytes: Some(group_snapshot_bytes()),
         })));
 
-        let snapshot = registry
+        let prefetched = registry
             .prefetch_snapshot_for_install(external_snapshot("snapshot-drop"))
             .await
             .expect("prefetch external snapshot");
@@ -1182,9 +1212,32 @@ mod tests {
             coordinator,
         );
         state_machine
-            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .install_snapshot(&prefetched.snapshot.meta, prefetched.snapshot.snapshot)
             .await
             .expect("prefetched external snapshot installs without external store");
+    }
+
+    #[tokio::test]
+    async fn prefetch_snapshot_for_install_guard_clears_unconsumed_cache() {
+        let registry = RaftGroupHandleRegistry::default();
+        registry.set_snapshot_store(Some(Arc::new(StaticSnapshotStore {
+            bytes: Some(group_snapshot_bytes()),
+        })));
+
+        let prefetched = registry
+            .prefetch_snapshot_for_install(external_snapshot("snapshot-unconsumed"))
+            .await
+            .expect("prefetch external snapshot");
+        let pointer = SnapshotPointer::decode(prefetched.snapshot.snapshot.get_ref()).unwrap();
+        drop(prefetched);
+
+        assert!(
+            registry
+                .snapshot_install_coordinator()
+                .take_prefetched(&pointer)
+                .is_none(),
+            "unconsumed prefetched snapshot should be cleared when guard drops"
+        );
     }
 
     #[tokio::test]
@@ -1216,11 +1269,11 @@ mod tests {
             snapshot: Cursor::new(pointer.encode().expect("encode test pointer")),
         };
 
-        let snapshot = registry
+        let prefetched = registry
             .prefetch_snapshot_for_install(snapshot)
             .await
             .expect("inline snapshot does not touch snapshot store");
-        let pointer = SnapshotPointer::decode(&snapshot.snapshot.into_inner()).unwrap();
+        let pointer = SnapshotPointer::decode(&prefetched.snapshot.snapshot.into_inner()).unwrap();
         assert!(matches!(pointer.location, SnapshotLocation::Inline { .. }));
     }
 

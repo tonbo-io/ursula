@@ -5358,7 +5358,10 @@ mod cluster_egress {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
-    use crate::bootstrap::{ClusterEgressProbeScope, cluster_egress_probe_groups};
+    use crate::bootstrap::{
+        ClusterEgressProbeScope, ClusterEgressShedAction, cluster_egress_probe_groups,
+        plan_cluster_egress_shed,
+    };
     use axum::Router;
     use axum::http::StatusCode;
     use axum::routing::post;
@@ -5366,11 +5369,20 @@ mod cluster_egress {
     use ursula_shard::RaftGroupId;
 
     fn snap(group_id: u32, voters: Vec<u64>) -> RaftGroupMetricsSnapshot {
+        snap_with_leader(group_id, 1, Some(1), voters)
+    }
+
+    fn snap_with_leader(
+        group_id: u32,
+        node_id: u64,
+        leader: Option<u64>,
+        voters: Vec<u64>,
+    ) -> RaftGroupMetricsSnapshot {
         RaftGroupMetricsSnapshot {
             raft_group_id: group_id,
-            node_id: 1,
+            node_id,
             current_term: 1,
-            current_leader: Some(1),
+            current_leader: leader,
             last_log_index: Some(100),
             committed: Some(RaftLogProgressSnapshot {
                 term: 1,
@@ -5426,6 +5438,42 @@ mod cluster_egress {
             vec!["http://node2", "http://node3", "http://node4"]
         );
         assert_eq!(groups[0].needed_peers, 2);
+    }
+
+    #[test]
+    fn egress_shed_spreads_handoffs_across_peer_voters() {
+        let snaps = vec![
+            snap_with_leader(0, 3, Some(3), vec![1, 2, 3]),
+            snap_with_leader(1, 3, Some(3), vec![1, 2, 3]),
+            snap_with_leader(2, 3, Some(2), vec![1, 2, 3]),
+            snap_with_leader(3, 3, Some(3), vec![1, 2, 3]),
+            snap_with_leader(4, 3, Some(3), vec![1, 2, 3]),
+            snap_with_leader(5, 3, Some(2), vec![1, 2, 3]),
+        ];
+
+        let actions = plan_cluster_egress_shed(&snaps, 3);
+
+        assert_eq!(
+            actions,
+            vec![
+                ClusterEgressShedAction {
+                    group_id: 0,
+                    target: 1,
+                },
+                ClusterEgressShedAction {
+                    group_id: 1,
+                    target: 1,
+                },
+                ClusterEgressShedAction {
+                    group_id: 3,
+                    target: 1,
+                },
+                ClusterEgressShedAction {
+                    group_id: 4,
+                    target: 2,
+                },
+            ]
+        );
     }
 
     async fn serve_counting_probe_peer(
