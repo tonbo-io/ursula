@@ -894,14 +894,6 @@ impl RuntimeMetricsInner {
         self.cold_flush_publish_ns.fetch_add_relaxed(publish_ns);
     }
 
-    pub(crate) fn record_cold_orphan_cleanup(&self, bytes: u64, cleanup_failed: bool) {
-        self.cold_orphan_cleanup_attempts.fetch_add_relaxed(1);
-        if cleanup_failed {
-            self.cold_orphan_cleanup_errors.fetch_add_relaxed(1);
-            self.cold_orphan_bytes.fetch_add_relaxed(bytes);
-        }
-    }
-
     pub(crate) fn record_cold_gc_reclaimed(&self, entries: u64) {
         self.cold_gc_reclaimed.fetch_add_relaxed(entries);
     }
