@@ -24,20 +24,19 @@ use ursula_shard::BucketStreamId;
 use ursula_stream::ColdChunkRef;
 use ursula_stream::ObjectPayloadRef;
 
+use crate::cold_config::ColdCacheConfig;
+use crate::cold_config::ColdConfig;
+use crate::cold_config::ColdStorageBackend;
+use crate::cold_config::ColdStorageConfig;
+
 pub(crate) const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 // Keep this global atomic isolated from unrelated statics. This does not remove
 // contention on the counter itself, but avoids accidental false sharing with
 // adjacent data without adding a per-core sequence scheme to this low-frequency
 // object-key path.
 static COLD_CHUNK_SEQUENCE: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
-const DEFAULT_COLD_CACHE_BYTES: usize = 256 * 1024 * 1024;
-const DEFAULT_COLD_CACHE_BLOCK_BYTES: usize = 1024 * 1024;
-const DEFAULT_COLD_CACHE_READAHEAD_BLOCKS: usize = 4;
-const DEFAULT_S3_OP_TIMEOUT_MS: u64 = 10_000;
-const DEFAULT_S3_MAX_RETRIES: usize = 3;
 
-/// Wrap an S3 (opendal) operator with the resilience every external
-/// object-store call needs.
+/// Wrap an S3 (opendal) operator with timeout and bounded-retry layers.
 ///
 /// 1. **Per-attempt timeout** ([`TimeoutLayer`], inner): a blackholed endpoint
 ///    — chaos `s3_unavailable`, or a "busy ESTAB" TCP socket whose future never
@@ -52,21 +51,11 @@ const DEFAULT_S3_MAX_RETRIES: usize = 3;
 ///    snapshot upload/download, stalling a restarted node's rejoin/catch-up.
 ///    Retries are bounded, so a sustained outage still fails fast enough (each
 ///    attempt is timeout-bounded) and the cluster keeps progressing on quorum.
-///
-/// Timeout is applied before retry so each retry attempt is itself bounded
-/// (per opendal's layer-ordering requirement). Tunable via `URSULA_S3_TIMEOUT_MS`
-/// and `URSULA_S3_MAX_RETRIES`.
-pub(crate) fn with_s3_resilience(operator: Operator) -> Operator {
-    let timeout_ms = std::env::var("URSULA_S3_TIMEOUT_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|ms| *ms > 0)
-        .unwrap_or(DEFAULT_S3_OP_TIMEOUT_MS);
-    let timeout = Duration::from_millis(timeout_ms);
-    let max_retries = std::env::var("URSULA_S3_MAX_RETRIES")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_S3_MAX_RETRIES);
+pub(crate) fn with_s3_resilience(
+    operator: Operator,
+    timeout: Duration,
+    max_retries: usize,
+) -> Operator {
     operator
         .layer(
             TimeoutLayer::new()
@@ -260,12 +249,32 @@ impl ColdStore {
         }))
     }
 
-    pub fn s3_from_env() -> io::Result<Self> {
-        Self::s3_from_env_with_root(None)
+    /// Build a [`ColdStore`] from an explicit [`ColdConfig`].
+    ///
+    /// The bootstrap layer reads environment variables and assembles the config;
+    /// this method is purely functional — it does not touch `std::env`.
+    pub fn from_config(config: &ColdConfig) -> io::Result<Option<ColdStoreHandle>> {
+        let mut store = match config.storage.backend {
+            ColdStorageBackend::None => return Ok(None),
+            ColdStorageBackend::Memory => Self::memory()?,
+            ColdStorageBackend::S3 => Self::s3_from_config(&config.storage)?,
+        };
+        if let Some(cache_config) = config.cache {
+            store = store.with_read_cache(cache_config);
+        }
+        Ok(Some(Arc::new(store)))
     }
 
-    pub fn s3_from_env_with_root(root_override: Option<&str>) -> io::Result<Self> {
-        let bucket = std::env::var("URSULA_COLD_S3_BUCKET").map_err(|_| {
+    /// Convenience constructor that reads the process environment.
+    ///
+    /// Delegates to [`from_config`](Self::from_config) after assembling a
+    /// [`ColdConfig`] from `URSULA_COLD_*` env vars.
+    pub fn from_env() -> io::Result<Option<ColdStoreHandle>> {
+        Self::from_config(&ColdConfig::from_env())
+    }
+
+    fn s3_from_config(config: &ColdStorageConfig) -> io::Result<Self> {
+        let bucket = config.s3_bucket.as_deref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "URSULA_COLD_S3_BUCKET is required when URSULA_COLD_BACKEND=s3",
@@ -278,47 +287,42 @@ impl ColdStore {
             ));
         }
 
-        let mut builder = opendal::services::S3::default().bucket(&bucket);
+        let mut builder = opendal::services::S3::default().bucket(bucket);
         let mut configured_root = None;
-        if let Some(root) = root_override {
-            if !root.trim().is_empty() {
-                builder = builder.root(root);
-                configured_root = Some(root.to_owned());
-            }
-        } else if let Ok(root) = std::env::var("URSULA_COLD_ROOT")
+        if let Some(root) = config.s3_root.as_deref()
             && !root.trim().is_empty()
         {
-            builder = builder.root(&root);
-            configured_root = Some(root);
+            builder = builder.root(root);
+            configured_root = Some(root.to_owned());
         }
         let mut configured_region = None;
-        if let Ok(region) = std::env::var("URSULA_COLD_S3_REGION")
+        if let Some(region) = config.s3_region.as_deref()
             && !region.trim().is_empty()
         {
-            builder = builder.region(&region);
-            configured_region = Some(region);
+            builder = builder.region(region);
+            configured_region = Some(region.to_owned());
         }
         let mut configured_endpoint = None;
-        if let Ok(endpoint) = std::env::var("URSULA_COLD_S3_ENDPOINT")
+        if let Some(endpoint) = config.s3_endpoint.as_deref()
             && !endpoint.trim().is_empty()
         {
-            builder = builder.endpoint(&endpoint);
-            configured_endpoint = Some(endpoint);
+            builder = builder.endpoint(endpoint);
+            configured_endpoint = Some(endpoint.to_owned());
         }
-        if let Ok(access_key_id) = std::env::var("URSULA_COLD_S3_ACCESS_KEY_ID")
+        if let Some(access_key_id) = config.s3_access_key_id.as_deref()
             && !access_key_id.trim().is_empty()
         {
-            builder = builder.access_key_id(&access_key_id);
+            builder = builder.access_key_id(access_key_id);
         }
-        if let Ok(secret_access_key) = std::env::var("URSULA_COLD_S3_SECRET_ACCESS_KEY")
+        if let Some(secret_access_key) = config.s3_secret_access_key.as_deref()
             && !secret_access_key.trim().is_empty()
         {
-            builder = builder.secret_access_key(&secret_access_key);
+            builder = builder.secret_access_key(secret_access_key);
         }
-        if let Ok(session_token) = std::env::var("URSULA_COLD_S3_SESSION_TOKEN")
+        if let Some(session_token) = config.s3_session_token.as_deref()
             && !session_token.trim().is_empty()
         {
-            builder = builder.session_token(&session_token);
+            builder = builder.session_token(session_token);
         }
 
         Ok(Self::from_operator(
@@ -326,44 +330,24 @@ impl ColdStore {
                 Operator::new(builder)
                     .map_err(|err| io::Error::other(err.to_string()))?
                     .finish(),
+                config.s3_timeout,
+                config.s3_max_retries,
             ),
             ColdStoreInfo {
                 backend: "s3",
                 root: configured_root,
-                bucket: Some(bucket),
+                bucket: Some(bucket.to_owned()),
                 region: configured_region,
                 endpoint: configured_endpoint,
             },
         ))
     }
 
-    pub fn from_env() -> io::Result<Option<ColdStoreHandle>> {
-        let backend = std::env::var("URSULA_COLD_BACKEND")
-            .unwrap_or_else(|_| "none".to_owned())
-            .to_ascii_lowercase();
-        Self::from_backend(&backend)
-    }
-
-    fn from_backend(backend: &str) -> io::Result<Option<ColdStoreHandle>> {
-        let store = match backend {
-            "none" | "disabled" | "off" => return Ok(None),
-            "memory" | "mem" | "inmem" => Self::memory()?,
-            "s3" => Self::s3_from_env()?,
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unsupported URSULA_COLD_BACKEND '{other}'"),
-                ));
-            }
-        };
-        Ok(Some(Arc::new(store)))
-    }
-
-    pub fn from_operator(operator: Operator, info: ColdStoreInfo) -> Self {
+    fn from_operator(operator: Operator, info: ColdStoreInfo) -> Self {
         Self {
             info,
             operator,
-            read_cache: ColdReadCache::from_env().map(Arc::new),
+            read_cache: None,
             observer: Arc::new(Mutex::new(None)),
             fault_policy: Arc::new(Mutex::new(None)),
             delay_fn: Arc::new(Mutex::new(default_cold_store_delay_fn())),
@@ -374,7 +358,7 @@ impl ColdStore {
         &self.info
     }
 
-    pub fn with_read_cache(mut self, config: ColdReadCacheConfig) -> Self {
+    pub fn with_read_cache(mut self, config: ColdCacheConfig) -> Self {
         self.read_cache = Some(Arc::new(ColdReadCache::new(config)));
         self
     }
@@ -948,16 +932,9 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ColdReadCacheConfig {
-    pub max_bytes: usize,
-    pub block_bytes: usize,
-    pub max_readahead_blocks: usize,
-}
-
 #[derive(Debug)]
 struct ColdReadCache {
-    config: ColdReadCacheConfig,
+    config: ColdCacheConfig,
     inner: Mutex<ColdReadCacheInner>,
 }
 
@@ -989,26 +966,10 @@ struct StreamReadState {
 }
 
 impl ColdReadCache {
-    fn from_env() -> Option<Self> {
-        let max_bytes = env_usize("URSULA_COLD_CACHE_BYTES").unwrap_or(DEFAULT_COLD_CACHE_BYTES);
-        if max_bytes == 0 {
-            return None;
-        }
-        let block_bytes =
-            env_usize("URSULA_COLD_CACHE_BLOCK_BYTES").unwrap_or(DEFAULT_COLD_CACHE_BLOCK_BYTES);
-        let max_readahead_blocks = env_usize("URSULA_COLD_CACHE_READAHEAD_BLOCKS")
-            .unwrap_or(DEFAULT_COLD_CACHE_READAHEAD_BLOCKS);
-        Some(Self::new(ColdReadCacheConfig {
-            max_bytes,
-            block_bytes,
-            max_readahead_blocks,
-        }))
-    }
-
-    fn new(config: ColdReadCacheConfig) -> Self {
+    fn new(config: ColdCacheConfig) -> Self {
         let block_bytes = config.block_bytes.max(1);
         Self {
-            config: ColdReadCacheConfig {
+            config: ColdCacheConfig {
                 max_bytes: config.max_bytes,
                 block_bytes,
                 max_readahead_blocks: config.max_readahead_blocks,
@@ -1168,11 +1129,6 @@ impl ColdReadCache {
     }
 }
 
-fn env_usize(name: &str) -> Option<usize> {
-    let value = std::env::var(name).ok()?;
-    value.parse::<usize>().ok()
-}
-
 fn cold_store_io_error(path: &str, err: opendal::Error) -> io::Error {
     io::Error::other(format!("cold object '{path}': {err}"))
 }
@@ -1229,8 +1185,11 @@ mod tests {
     use bytes::Bytes;
 
     use super::ColdReadCache;
-    use super::ColdReadCacheConfig;
     use super::ColdStore;
+    use crate::cold_config::ColdCacheConfig as ColdReadCacheConfig;
+    use crate::cold_config::ColdConfig;
+    use crate::cold_config::ColdStorageBackend;
+    use crate::cold_config::ColdStorageConfig;
 
     #[test]
     fn lru_queue_stays_bounded_under_repeated_hits() {
@@ -1262,9 +1221,16 @@ mod tests {
     }
 
     #[test]
-    fn fs_backend_is_not_supported() {
-        let err = ColdStore::from_backend("fs").expect_err("fs backend should be unsupported");
+    fn s3_without_bucket_fails() {
+        let config = ColdConfig {
+            storage: ColdStorageConfig {
+                backend: ColdStorageBackend::S3,
+                ..Default::default()
+            },
+            cache: None,
+            worker: Default::default(),
+        };
+        let err = ColdStore::from_config(&config).expect_err("s3 without bucket should fail");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert_eq!(err.to_string(), "unsupported URSULA_COLD_BACKEND 'fs'");
     }
 }

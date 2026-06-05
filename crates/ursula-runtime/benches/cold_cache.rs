@@ -4,7 +4,7 @@ use criterion::Throughput;
 use criterion::black_box;
 use criterion::criterion_group;
 use criterion::criterion_main;
-use ursula_runtime::ColdReadCacheConfig;
+use ursula_runtime::ColdCacheConfig;
 use ursula_runtime::ColdStore;
 use ursula_shard::BucketStreamId;
 use ursula_stream::ObjectPayloadRef;
@@ -168,7 +168,7 @@ async fn bench_store_with_config(
 ) -> BenchStore {
     let store = ColdStore::memory().expect("memory cold store");
     let store = if cache_enabled {
-        store.with_read_cache(ColdReadCacheConfig {
+        store.with_read_cache(ColdCacheConfig {
             max_bytes: cache_bytes,
             block_bytes: cache_block_bytes,
             max_readahead_blocks: CACHE_READAHEAD_BLOCKS,

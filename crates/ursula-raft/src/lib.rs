@@ -77,6 +77,7 @@ pub use types::RaftGroupCommand;
 pub use types::RaftGroupMetricsSnapshot;
 pub use types::RaftGroupResponse;
 pub use types::RaftLogProgressSnapshot;
+pub use types::StaticGrpcRaftMembershipConfig;
 pub use types::UrsulaAppendEntriesRequest;
 pub use types::UrsulaAppendEntriesResponse;
 pub use types::UrsulaRaftTypeConfig;

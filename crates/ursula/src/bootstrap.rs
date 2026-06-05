@@ -1,5 +1,14 @@
-//! Process-level orchestration: env-driven `ShardRuntime` constructors and
-//! the cold-flush background worker.
+//! Prcess-level orchestration: env-driven `ShardRuntime` constructors and
+//! raft-related background workers.
+//!
+//! This module is responsible for:
+//! - reading process environment variables,
+//! - validating configuration,
+//! - constructing the [`ShardRuntime`]
+//! - spawning raft-related background workers.
+//!
+//! Runtime internals (engine factories, cold-store handles, etc.) do not leak
+//! here; they are assembled by the caller and passed to the builder.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -20,7 +29,10 @@ use ursula_raft::RaftGroupEngineFactory;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_raft::StaticGrpcRaftGroupEngineFactory;
+use ursula_raft::StaticGrpcRaftMembershipConfig;
+use ursula_runtime::ColdConfig;
 use ursula_runtime::ColdStore;
+use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::InMemoryGroupEngineFactory;
 use ursula_runtime::PlanGroupColdFlushRequest;
 use ursula_runtime::RuntimeConfig;
@@ -30,422 +42,325 @@ use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::WalGroupEngineFactory;
 use ursula_runtime::default_snapshot_store;
 use ursula_runtime::snapshot_store_from_env;
+use ursula_runtime::spawn_cold_flush_worker_if_configured;
+use ursula_runtime::spawn_cold_gc_worker_if_configured;
 use ursula_shard::RaftGroupId;
 
-#[derive(Debug, Clone, Default)]
-pub struct StaticGrpcRaftMembershipConfig {
-    pub initialize_membership_per_group: bool,
-    pub per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
+/// Persistence strategy for the runtime.
+#[derive(Debug, Clone)]
+pub enum Persistence {
+    InMemory,
+    Wal { wal_dir: PathBuf },
+    Raft { log_dir: Option<PathBuf> },
 }
 
-fn validate_static_grpc_membership_config(
-    raft_group_count: usize,
-    peers: &[(u64, String)],
-    membership_config: &StaticGrpcRaftMembershipConfig,
-) -> Result<(), RuntimeError> {
-    let per_group_voters = &membership_config.per_group_voters;
-    if per_group_voters.is_empty() {
-        return Ok(());
+/// Deployment topology.
+#[derive(Debug, Clone)]
+pub enum Topology {
+    SingleNode {
+        raft_group_count: usize,
+    },
+    StaticCluster {
+        node_id: u64,
+        peers: Vec<(u64, String)>,
+        raft_group_count: usize,
+        initialize_membership: bool,
+        membership_config: StaticGrpcRaftMembershipConfig,
+    },
+}
+
+impl Topology {
+    pub fn raft_group_count(&self) -> usize {
+        match self {
+            Topology::SingleNode { raft_group_count } => *raft_group_count,
+            Topology::StaticCluster {
+                raft_group_count, ..
+            } => *raft_group_count,
+        }
     }
 
-    let peer_ids: BTreeSet<u64> = peers.iter().map(|(node_id, _)| *node_id).collect();
-    let raft_group_count_u32 =
-        u32::try_from(raft_group_count).map_err(|_| RuntimeError::StaticMembershipConfig {
-            message: format!("raft_group_count {raft_group_count} exceeds u32::MAX"),
-        })?;
+    /// Construct a [`Topology::StaticCluster`] with validated membership.
+    pub fn static_cluster(
+        node_id: u64,
+        peers: Vec<(u64, String)>,
+        raft_group_count: usize,
+        initialize_membership: bool,
+        membership_config: StaticGrpcRaftMembershipConfig,
+    ) -> Result<Self, RuntimeError> {
+        Self::validate_static_cluster(raft_group_count, &peers, &membership_config)?;
+        Ok(Self::StaticCluster {
+            node_id,
+            peers,
+            raft_group_count,
+            initialize_membership,
+            membership_config,
+        })
+    }
 
-    for (raft_group_id, voters) in per_group_voters {
-        if raft_group_id.0 >= raft_group_count_u32 {
-            return Err(RuntimeError::InvalidRaftGroup {
-                raft_group_id: *raft_group_id,
-                raft_group_count: raft_group_count_u32,
-            });
+    fn validate_static_cluster(
+        raft_group_count: usize,
+        peers: &[(u64, String)],
+        membership_config: &StaticGrpcRaftMembershipConfig,
+    ) -> Result<(), RuntimeError> {
+        let per_group_voters = &membership_config.per_group_voters;
+        if per_group_voters.is_empty() {
+            return Ok(());
         }
-        if voters.is_empty() {
-            return Err(RuntimeError::StaticMembershipConfig {
-                message: format!("raft group {} has no voters", raft_group_id.0),
-            });
+
+        let peer_ids: BTreeSet<u64> = peers.iter().map(|(node_id, _)| *node_id).collect();
+        let raft_group_count_u32 =
+            u32::try_from(raft_group_count).map_err(|_| RuntimeError::StaticMembershipConfig {
+                message: format!("raft_group_count {raft_group_count} exceeds u32::MAX"),
+            })?;
+
+        for (raft_group_id, voters) in per_group_voters {
+            if raft_group_id.0 >= raft_group_count_u32 {
+                return Err(RuntimeError::InvalidRaftGroup {
+                    raft_group_id: *raft_group_id,
+                    raft_group_count: raft_group_count_u32,
+                });
+            }
+            if voters.is_empty() {
+                return Err(RuntimeError::StaticMembershipConfig {
+                    message: format!("raft group {} has no voters", raft_group_id.0),
+                });
+            }
+            for voter in voters {
+                if !peer_ids.contains(voter) {
+                    return Err(RuntimeError::StaticMembershipConfig {
+                        message: format!(
+                            "raft group {} voter {} is not present in static peer config",
+                            raft_group_id.0, voter
+                        ),
+                    });
+                }
+            }
         }
-        for voter in voters {
-            if !peer_ids.contains(voter) {
+
+        for raw_group_id in 0..raft_group_count_u32 {
+            let raft_group_id = RaftGroupId(raw_group_id);
+            if !per_group_voters.contains_key(&raft_group_id) {
                 return Err(RuntimeError::StaticMembershipConfig {
                     message: format!(
-                        "raft group {} voter {} is not present in static peer config",
-                        raft_group_id.0, voter
+                        "partial raft_group_voters config is not supported; missing raft group {} of {}",
+                        raw_group_id, raft_group_count
                     ),
                 });
             }
         }
+
+        Ok(())
     }
+}
 
-    for raw_group_id in 0..raft_group_count_u32 {
-        let raft_group_id = RaftGroupId(raw_group_id);
-        if !per_group_voters.contains_key(&raft_group_id) {
-            return Err(RuntimeError::StaticMembershipConfig {
-                message: format!(
-                    "partial raft_group_voters config is not supported; missing raft group {} of {}",
-                    raw_group_id, raft_group_count
-                ),
-            });
-        }
+/// Result of spawning a runtime.
+#[derive(Debug)]
+pub struct SpawnedRuntime {
+    pub runtime: ShardRuntime,
+    pub raft_registry: Option<RaftGroupHandleRegistry>,
+}
+
+/// Spawn a runtime with configuration read from the process environment.
+///
+/// Cold-store, worker, and runtime configuration are all parsed from the
+/// process environment inside this function so the caller does not need to
+/// deal with env vars.
+pub fn spawn_runtime(
+    core_count: usize,
+    persistence: Persistence,
+    topology: Topology,
+) -> Result<SpawnedRuntime, RuntimeError> {
+    let cold_config = ColdConfig::from_env();
+    let mut runtime_config = RuntimeConfig::from_env(core_count, topology.raft_group_count());
+    if cold_config.is_enabled() && runtime_config.cold_max_hot_bytes_per_group.is_none() {
+        runtime_config.cold_max_hot_bytes_per_group = Some(64 * 1024 * 1024);
     }
-
-    Ok(())
+    spawn_runtime_with_config(runtime_config, cold_config, persistence, topology)
 }
 
-pub fn spawn_default_runtime(
-    core_count: usize,
-    raft_group_count: usize,
-) -> Result<ShardRuntime, RuntimeError> {
-    let cold_store = cold_store_from_env()?;
-    let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        config,
-        InMemoryGroupEngineFactory::with_cold_store(cold_store.clone()),
-        cold_store,
+/// Core runtime construction from fully-resolved configuration.
+///
+/// This does **not** read environment variables; use [`spawn_runtime`] for
+/// env-driven construction.
+fn spawn_runtime_with_config(
+    runtime_config: RuntimeConfig,
+    cold_config: ColdConfig,
+    persistence: Persistence,
+    topology: Topology,
+) -> Result<SpawnedRuntime, RuntimeError> {
+    let cold_store =
+        ColdStore::from_config(&cold_config).map_err(|err| RuntimeError::ColdStoreConfig {
+            message: err.to_string(),
+        })?;
+    let snapshot_store = snapshot_store_from_env_or_error(&cold_config.storage)?;
+
+    let spawned = spawn_runtime_core(
+        runtime_config,
+        cold_store.clone(),
+        persistence,
+        &topology,
+        snapshot_store.clone(),
     )?;
-    spawn_cold_flush_worker_if_configured(&runtime);
-    spawn_cold_gc_worker_if_configured(&runtime);
-    Ok(runtime)
+
+    if spawned.runtime.has_cold_store() {
+        spawn_cold_flush_worker_if_configured(&spawned.runtime, &cold_config.worker);
+        spawn_cold_gc_worker_if_configured(&spawned.runtime, &cold_config.worker);
+    }
+    spawn_governance_tasks(&spawned, &topology, snapshot_store);
+    Ok(spawned)
 }
 
-pub fn spawn_wal_runtime(
-    core_count: usize,
-    raft_group_count: usize,
-    wal_dir: impl Into<PathBuf>,
-) -> Result<ShardRuntime, RuntimeError> {
-    let cold_store = cold_store_from_env()?;
-    let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        config,
-        WalGroupEngineFactory::with_cold_store(wal_dir, cold_store.clone()),
-        cold_store,
-    )?;
-    spawn_cold_flush_worker_if_configured(&runtime);
-    spawn_cold_gc_worker_if_configured(&runtime);
-    Ok(runtime)
-}
-
-pub fn spawn_raft_memory_runtime(
-    core_count: usize,
-    raft_group_count: usize,
-) -> Result<ShardRuntime, RuntimeError> {
-    let cold_store = cold_store_from_env()?;
-    let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
-    let runtime = match cold_store {
-        Some(cold_store) => ShardRuntime::spawn_with_engine_factory_and_cold_store(
-            config,
-            ColdRaftGroupEngineFactory::new(cold_store.clone()),
-            Some(cold_store),
+/// Core runtime construction — maps persistence + topology to the correct
+/// engine factory and spawns the runtime.  No background workers started here.
+fn spawn_runtime_core(
+    runtime_config: RuntimeConfig,
+    cold_store: Option<ColdStoreHandle>,
+    persistence: Persistence,
+    topology: &Topology,
+    snapshot_store: Option<SharedSnapshotStore>,
+) -> Result<SpawnedRuntime, RuntimeError> {
+    match topology {
+        Topology::SingleNode { .. } => spawn_singleton(runtime_config, cold_store, persistence),
+        Topology::StaticCluster {
+            node_id,
+            peers,
+            raft_group_count,
+            initialize_membership,
+            membership_config,
+        } => spawn_static_cluster(
+            runtime_config,
+            cold_store,
+            persistence,
+            *node_id,
+            peers.clone(),
+            *raft_group_count,
+            *initialize_membership,
+            membership_config.clone(),
+            snapshot_store,
         ),
-        None => ShardRuntime::spawn_with_engine_factory(config, RaftGroupEngineFactory),
-    }?;
-    spawn_cold_flush_worker_if_configured(&runtime);
-    spawn_cold_gc_worker_if_configured(&runtime);
-    Ok(runtime)
-}
-
-pub fn spawn_static_grpc_raft_memory_runtime(
-    core_count: usize,
-    raft_group_count: usize,
-    node_id: u64,
-    peers: impl IntoIterator<Item = (u64, String)>,
-    initialize_membership: bool,
-) -> Result<(ShardRuntime, RaftGroupHandleRegistry), RuntimeError> {
-    spawn_static_grpc_raft_memory_runtime_with_membership_config(
-        core_count,
-        raft_group_count,
-        node_id,
-        peers,
-        initialize_membership,
-        StaticGrpcRaftMembershipConfig::default(),
-    )
-}
-
-pub fn spawn_static_grpc_raft_memory_runtime_with_membership_config(
-    core_count: usize,
-    raft_group_count: usize,
-    node_id: u64,
-    peers: impl IntoIterator<Item = (u64, String)>,
-    initialize_membership: bool,
-    membership_config: StaticGrpcRaftMembershipConfig,
-) -> Result<(ShardRuntime, RaftGroupHandleRegistry), RuntimeError> {
-    let cold_store = cold_store_from_env()?;
-    let snapshot_store = snapshot_store_from_env_or_error()?;
-    let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
-    let peers: Vec<(u64, String)> = peers.into_iter().collect();
-    validate_static_grpc_membership_config(raft_group_count, &peers, &membership_config)?;
-    let registry = RaftGroupHandleRegistry::default();
-    let per_group_voters = membership_config.per_group_voters.clone();
-    let factory = StaticGrpcRaftGroupEngineFactory::new(
-        node_id,
-        peers.clone(),
-        initialize_membership,
-        registry.clone(),
-    )
-    .with_per_group_membership_initializers(membership_config.initialize_membership_per_group)
-    .with_per_group_voters(membership_config.per_group_voters)
-    .with_cold_store(cold_store.clone())
-    .with_snapshot_store(snapshot_store.clone());
-    let runtime =
-        ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
-    spawn_cold_flush_worker_if_configured(&runtime);
-    spawn_cold_gc_worker_if_configured(&runtime);
-    spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
-    spawn_leadership_balancer_if_configured(&registry, node_id, &peers);
-    spawn_cluster_egress_gate_if_configured(&registry, node_id, &peers, per_group_voters);
-    spawn_commit_stall_watchdog_if_configured(&registry);
-    spawn_cold_health_gate_if_configured(&runtime, &registry, node_id);
-    Ok((runtime, registry))
-}
-
-pub fn spawn_static_grpc_raft_memory_runtime_with_per_group_initializers(
-    core_count: usize,
-    raft_group_count: usize,
-    node_id: u64,
-    peers: impl IntoIterator<Item = (u64, String)>,
-    initialize_membership: bool,
-) -> Result<(ShardRuntime, RaftGroupHandleRegistry), RuntimeError> {
-    spawn_static_grpc_raft_memory_runtime_with_membership_config(
-        core_count,
-        raft_group_count,
-        node_id,
-        peers,
-        initialize_membership,
-        StaticGrpcRaftMembershipConfig {
-            initialize_membership_per_group: true,
-            per_group_voters: BTreeMap::new(),
-        },
-    )
-}
-
-pub fn spawn_static_grpc_raft_runtime(
-    core_count: usize,
-    raft_group_count: usize,
-    node_id: u64,
-    peers: impl IntoIterator<Item = (u64, String)>,
-    initialize_membership: bool,
-    raft_log_dir: impl Into<PathBuf>,
-) -> Result<(ShardRuntime, RaftGroupHandleRegistry), RuntimeError> {
-    spawn_static_grpc_raft_runtime_with_membership_config(
-        core_count,
-        raft_group_count,
-        node_id,
-        peers,
-        initialize_membership,
-        StaticGrpcRaftMembershipConfig::default(),
-        raft_log_dir,
-    )
-}
-
-pub fn spawn_static_grpc_raft_runtime_with_membership_config(
-    core_count: usize,
-    raft_group_count: usize,
-    node_id: u64,
-    peers: impl IntoIterator<Item = (u64, String)>,
-    initialize_membership: bool,
-    membership_config: StaticGrpcRaftMembershipConfig,
-    raft_log_dir: impl Into<PathBuf>,
-) -> Result<(ShardRuntime, RaftGroupHandleRegistry), RuntimeError> {
-    let cold_store = cold_store_from_env()?;
-    let snapshot_store = snapshot_store_from_env_or_error()?;
-    let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
-    let peers: Vec<(u64, String)> = peers.into_iter().collect();
-    validate_static_grpc_membership_config(raft_group_count, &peers, &membership_config)?;
-    let registry = RaftGroupHandleRegistry::default();
-    let per_group_voters = membership_config.per_group_voters.clone();
-    let factory = StaticGrpcRaftGroupEngineFactory::new(
-        node_id,
-        peers.clone(),
-        initialize_membership,
-        registry.clone(),
-    )
-    .with_per_group_membership_initializers(membership_config.initialize_membership_per_group)
-    .with_per_group_voters(membership_config.per_group_voters)
-    .with_cold_store(cold_store.clone())
-    .with_raft_log_dir(raft_log_dir)
-    .with_snapshot_store(snapshot_store.clone());
-    let runtime =
-        ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)?;
-    spawn_cold_flush_worker_if_configured(&runtime);
-    spawn_cold_gc_worker_if_configured(&runtime);
-    spawn_snapshot_driver_if_configured(&runtime, &registry, snapshot_store);
-    spawn_leadership_balancer_if_configured(&registry, node_id, &peers);
-    spawn_cluster_egress_gate_if_configured(&registry, node_id, &peers, per_group_voters);
-    spawn_commit_stall_watchdog_if_configured(&registry);
-    spawn_cold_health_gate_if_configured(&runtime, &registry, node_id);
-    Ok((runtime, registry))
-}
-
-pub fn spawn_static_grpc_raft_runtime_with_per_group_initializers(
-    core_count: usize,
-    raft_group_count: usize,
-    node_id: u64,
-    peers: impl IntoIterator<Item = (u64, String)>,
-    initialize_membership: bool,
-    raft_log_dir: impl Into<PathBuf>,
-) -> Result<(ShardRuntime, RaftGroupHandleRegistry), RuntimeError> {
-    spawn_static_grpc_raft_runtime_with_membership_config(
-        core_count,
-        raft_group_count,
-        node_id,
-        peers,
-        initialize_membership,
-        StaticGrpcRaftMembershipConfig {
-            initialize_membership_per_group: true,
-            per_group_voters: BTreeMap::new(),
-        },
-        raft_log_dir,
-    )
-}
-
-pub fn spawn_raft_runtime(
-    core_count: usize,
-    raft_group_count: usize,
-    raft_log_dir: impl Into<PathBuf>,
-) -> Result<ShardRuntime, RuntimeError> {
-    let cold_store = cold_store_from_env()?;
-    let config = runtime_config_from_env(core_count, raft_group_count, cold_store.is_some());
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        config,
-        DurableRaftGroupEngineFactory::with_cold_store(raft_log_dir, cold_store.clone()),
-        cold_store,
-    )?;
-    spawn_cold_flush_worker_if_configured(&runtime);
-    spawn_cold_gc_worker_if_configured(&runtime);
-    Ok(runtime)
-}
-
-fn snapshot_store_from_env_or_error() -> Result<Option<SharedSnapshotStore>, RuntimeError> {
-    snapshot_store_from_env().map_err(|err| RuntimeError::ColdStoreConfig {
-        message: err.to_string(),
-    })
-}
-
-fn cold_store_from_env() -> Result<Option<ursula_runtime::ColdStoreHandle>, RuntimeError> {
-    ColdStore::from_env().map_err(|err| RuntimeError::ColdStoreConfig {
-        message: err.to_string(),
-    })
-}
-
-fn runtime_config_from_env(
-    core_count: usize,
-    raft_group_count: usize,
-    cold_store_configured: bool,
-) -> RuntimeConfig {
-    let mut config = RuntimeConfig::new(core_count, raft_group_count);
-    let live_read_max_waiters = env_usize("URSULA_LIVE_READ_MAX_WAITERS_PER_CORE", 65_536);
-    config = config.with_live_read_max_waiters_per_core(if live_read_max_waiters == 0 {
-        None
-    } else {
-        Some(u64::try_from(live_read_max_waiters).unwrap_or(u64::MAX))
-    });
-    if cold_store_configured {
-        let max_hot_bytes = env_usize("URSULA_COLD_MAX_HOT_BYTES_PER_GROUP", 64 * 1024 * 1024);
-        if max_hot_bytes > 0 {
-            config = config.with_cold_max_hot_bytes_per_group(Some(
-                u64::try_from(max_hot_bytes).unwrap_or(u64::MAX),
-            ));
-        }
     }
-    if let Some(raft_max_uncommitted) =
-        env_optional_usize("URSULA_RAFT_MAX_UNCOMMITTED_BYTES_PER_GROUP")
-    {
-        config = config.with_raft_max_uncommitted_bytes_per_group(if raft_max_uncommitted == 0 {
-            None
-        } else {
-            Some(u64::try_from(raft_max_uncommitted).unwrap_or(u64::MAX))
+}
+
+fn spawn_singleton(
+    runtime_config: RuntimeConfig,
+    cold_store: Option<ColdStoreHandle>,
+    persistence: Persistence,
+) -> Result<SpawnedRuntime, RuntimeError> {
+    let runtime = match persistence {
+        Persistence::InMemory => {
+            let factory = InMemoryGroupEngineFactory::with_cold_store(cold_store.clone());
+            ShardRuntime::spawn_with_engine_factory_and_cold_store(
+                runtime_config,
+                factory,
+                cold_store,
+            )?
+        }
+        Persistence::Wal { wal_dir } => {
+            let factory = WalGroupEngineFactory::with_cold_store(wal_dir, cold_store.clone());
+            ShardRuntime::spawn_with_engine_factory_and_cold_store(
+                runtime_config,
+                factory,
+                cold_store,
+            )?
+        }
+        Persistence::Raft { log_dir: None } => match cold_store {
+            Some(ref cs) => ShardRuntime::spawn_with_engine_factory_and_cold_store(
+                runtime_config,
+                ColdRaftGroupEngineFactory::new(cs.clone()),
+                cold_store,
+            )?,
+            None => ShardRuntime::spawn_with_engine_factory_and_cold_store(
+                runtime_config,
+                RaftGroupEngineFactory,
+                cold_store,
+            )?,
+        },
+        Persistence::Raft { log_dir: Some(dir) } => {
+            let factory = DurableRaftGroupEngineFactory::with_cold_store(dir, cold_store.clone());
+            ShardRuntime::spawn_with_engine_factory_and_cold_store(
+                runtime_config,
+                factory,
+                cold_store,
+            )?
+        }
+    };
+    Ok(SpawnedRuntime {
+        runtime,
+        raft_registry: None,
+    })
+}
+
+fn spawn_static_cluster(
+    runtime_config: RuntimeConfig,
+    cold_store: Option<ColdStoreHandle>,
+    persistence: Persistence,
+    node_id: u64,
+    peers: Vec<(u64, String)>,
+    _raft_group_count: usize,
+    initialize_membership: bool,
+    membership_config: StaticGrpcRaftMembershipConfig,
+    snapshot_store: Option<SharedSnapshotStore>,
+) -> Result<SpawnedRuntime, RuntimeError> {
+    if !matches!(persistence, Persistence::Raft { .. }) {
+        return Err(RuntimeError::StaticMembershipConfig {
+            message: "static cluster topology requires Raft persistence".to_owned(),
         });
     }
-    config
+    let registry = RaftGroupHandleRegistry::default();
+    let mut factory = StaticGrpcRaftGroupEngineFactory::new(
+        node_id,
+        peers.clone(),
+        initialize_membership,
+        registry.clone(),
+    )
+    .with_per_group_membership_initializers(membership_config.initialize_membership_per_group)
+    .with_per_group_voters(membership_config.per_group_voters)
+    .with_cold_store(cold_store.clone())
+    .with_snapshot_store(snapshot_store);
+    if let Persistence::Raft { log_dir: Some(dir) } = persistence {
+        factory = factory.with_raft_log_dir(dir);
+    }
+    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        runtime_config,
+        factory,
+        cold_store,
+    )?;
+    Ok(SpawnedRuntime {
+        runtime,
+        raft_registry: Some(registry),
+    })
 }
 
-fn env_optional_usize(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-}
-
-pub fn spawn_cold_flush_worker_if_configured(runtime: &ShardRuntime) {
-    if !runtime.has_cold_store() {
-        return;
-    }
-    let interval_ms = env_usize("URSULA_COLD_FLUSH_INTERVAL_MS", 1_000);
-    if interval_ms == 0 {
-        return;
-    }
-    let flush_bytes = env_usize("URSULA_COLD_FLUSH_BYTES", 8 * 1024 * 1024);
-    let min_hot_bytes = env_usize("URSULA_COLD_FLUSH_MIN_HOT_BYTES", flush_bytes);
-    let max_flush_bytes = env_usize("URSULA_COLD_FLUSH_MAX_BYTES", flush_bytes);
-    let max_concurrency = env_usize("URSULA_COLD_FLUSH_MAX_CONCURRENCY", 4).max(1);
-    let runtime = runtime.clone();
-    tokio::spawn(async move {
-        let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX));
-        loop {
-            if let Err(err) = runtime
-                .flush_cold_all_groups_once_bounded(
-                    PlanGroupColdFlushRequest {
-                        min_hot_bytes,
-                        max_flush_bytes,
-                    },
-                    max_concurrency,
-                )
-                .await
-            {
-                tracing::error!("cold flush worker error: {err}");
-            }
-            tokio::time::sleep(interval).await;
-        }
-    });
-}
-
-/// Drains the cold-GC queue on each tick: the leader of every group physically
-/// reclaims the cold objects of deleted/expired streams and replicates an ack
-/// that pops them. A no-op when no cold store is configured or the interval is
-/// zero.
-pub fn spawn_cold_gc_worker_if_configured(runtime: &ShardRuntime) {
-    if !runtime.has_cold_store() {
-        return;
-    }
-    let interval_ms = env_usize("URSULA_COLD_GC_INTERVAL_MS", 5_000);
-    if interval_ms == 0 {
-        return;
-    }
-    let max_entries = env_usize("URSULA_COLD_GC_MAX_ENTRIES_PER_GROUP", 256).max(1);
-    let runtime = runtime.clone();
-    tokio::spawn(async move {
-        let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX));
-        loop {
-            if let Err(err) = runtime.run_cold_gc_all_groups_once(max_entries).await {
-                tracing::error!("cold gc worker error: {err}");
-            }
-            tokio::time::sleep(interval).await;
-        }
-    });
-}
-
-fn set_registered_group_elections(registry: &RaftGroupHandleRegistry, enabled: bool) {
-    for snapshot in registry.metrics_snapshot() {
-        if let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) {
-            raft.runtime_config().elect(enabled);
-        }
-    }
-}
-
-pub(crate) fn reenable_elections_if_campaign_allowed(
-    registry: &RaftGroupHandleRegistry,
-    context: &str,
+/// Start all governance tasks (M0–M4) after the runtime is constructed.
+fn spawn_governance_tasks(
+    spawned: &SpawnedRuntime,
+    topology: &Topology,
+    snapshot_store: Option<SharedSnapshotStore>,
 ) {
-    let shed_state = registry.leadership_shed_state();
-    if shed_state.should_campaign() {
-        set_registered_group_elections(registry, true);
-        tracing::warn!("{context}; re-enabling elections");
-    } else {
-        tracing::warn!(
-            "{context}; elections remain disabled while leadership-shed state={shed_state}"
-        );
-    }
+    let Topology::StaticCluster {
+        node_id,
+        peers,
+        raft_group_count: _,
+        initialize_membership: _,
+        membership_config,
+    } = topology
+    else {
+        return;
+    };
+    let Some(registry) = spawned.raft_registry.clone() else {
+        return;
+    };
+
+    let per_group_voters = membership_config.per_group_voters.clone();
+
+    spawn_snapshot_driver_if_configured(&spawned.runtime, &registry, snapshot_store);
+    spawn_leadership_balancer_if_configured(&registry, *node_id, peers);
+    spawn_cluster_egress_gate_if_configured(&registry, *node_id, peers, per_group_voters);
+    spawn_commit_stall_watchdog_if_configured(&registry);
+    spawn_cold_health_gate_if_configured(&spawned.runtime, &registry, *node_id);
 }
+
+// ── M0: Snapshot driver ──────────────────────────────────────────────────────
 
 /// Drives raft snapshots manually after first draining each group's hot tail to
 /// cold. The drain makes the resulting snapshot's `payload` field empty (no
@@ -657,6 +572,20 @@ pub(crate) fn should_drive_snapshot_for_group(snapshot: &RaftGroupMetricsSnapsho
     snapshot
         .snapshot
         .is_none_or(|current| current.index < last_applied.index)
+}
+
+// ── M1: Leadership balancer ──────────────────────────────────────────────────
+
+pub(crate) fn leader_counts(
+    snaps: &[ursula_raft::RaftGroupMetricsSnapshot],
+) -> HashMap<u64, usize> {
+    let mut leader_count = HashMap::new();
+    for snap in snaps {
+        if let Some(leader) = snap.current_leader {
+            *leader_count.entry(leader).or_insert(0) += 1;
+        }
+    }
+    leader_count
 }
 
 /// M1 — leadership balancing. Spreads raft-group leadership evenly across
@@ -901,18 +830,6 @@ pub(crate) fn plan_leadership_balance_with_eligible_nodes(
     actions
 }
 
-pub(crate) fn leader_counts(
-    snaps: &[ursula_raft::RaftGroupMetricsSnapshot],
-) -> HashMap<u64, usize> {
-    let mut leader_count = HashMap::new();
-    for snap in snaps {
-        if let Some(leader) = snap.current_leader {
-            *leader_count.entry(leader).or_insert(0) += 1;
-        }
-    }
-    leader_count
-}
-
 pub(crate) fn prioritized_transfer_targets(
     snap: &ursula_raft::RaftGroupMetricsSnapshot,
     my_id: u64,
@@ -928,6 +845,8 @@ pub(crate) fn prioritized_transfer_targets(
     targets
 }
 
+// ── M2: Cluster egress gate ──────────────────────────────────────────────────
+
 const DEFAULT_CLUSTER_PROBE_INTERVAL_MS: usize = 500;
 const DEFAULT_CLUSTER_PROBE_TIMEOUT_MS: usize = 200;
 const DEFAULT_CLUSTER_PROBE_UNHEALTHY_TICKS: usize = 2;
@@ -936,7 +855,7 @@ const DEFAULT_CLUSTER_PROBE_HEAL_TICKS: usize = 6;
 /// M2 — egress-health leadership gate. Each node actively measures its own
 /// egress to peers over the cluster plane (a payload POST with a tight
 /// deadline, sized so 15% loss / added delay fails it while a healthy link
-/// passes trivially — a heartbeat-sized probe would be masked by loss). A node
+/// passes trivially — a heartbeat-sized probe would mask loss). A node
 /// that cannot push to a quorum of peers cannot replicate, so it sheds
 /// leadership and disables elections; it clears this reason once its egress is
 /// clean and re-enables elections only if no other shed reason remains.
@@ -1196,6 +1115,8 @@ pub(crate) fn plan_cluster_egress_shed(
     actions
 }
 
+// ── M3: Commit stall watchdog ────────────────────────────────────────────────
+
 /// M3 — per-group commit-stall watchdog. A group's leader can wedge with
 /// `last_log_index > committed_index` indefinitely (replication queue choked,
 /// follower transport stuck, qdisc backlog never drains, etc.). The HTTP
@@ -1394,6 +1315,8 @@ impl CommitStallTracker {
         actions
     }
 }
+
+// ── M4: Cold health gate ─────────────────────────────────────────────────────
 
 /// M4 — cold-health leadership gate. Two signals declare this node
 /// "cold-impaired":
@@ -1622,9 +1545,51 @@ impl ColdHealthTracker {
     }
 }
 
-pub(crate) fn env_usize(name: &str, default: usize) -> usize {
+// ── Shared leadership helpers ────────────────────────────────────────────────
+
+fn set_registered_group_elections(registry: &RaftGroupHandleRegistry, enabled: bool) {
+    for snapshot in registry.metrics_snapshot() {
+        if let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) {
+            raft.runtime_config().elect(enabled);
+        }
+    }
+}
+
+pub(crate) fn reenable_elections_if_campaign_allowed(
+    registry: &RaftGroupHandleRegistry,
+    context: &str,
+) {
+    let shed_state = registry.leadership_shed_state();
+    if shed_state.should_campaign() {
+        set_registered_group_elections(registry, true);
+        tracing::warn!("{context}; re-enabling elections");
+    } else {
+        tracing::warn!(
+            "{context}; elections remain disabled while leadership-shed state={shed_state}"
+        );
+    }
+}
+
+// ── Env utilities ────────────────────────────────────────────────────────────
+
+fn env_optional_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+}
+
+/// Read an environment variable as `usize`, falling back to `default`.
+pub fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .unwrap_or(default)
+}
+
+fn snapshot_store_from_env_or_error(
+    cold_storage: &ursula_runtime::ColdStorageConfig,
+) -> Result<Option<SharedSnapshotStore>, RuntimeError> {
+    snapshot_store_from_env(cold_storage).map_err(|err| RuntimeError::ColdStoreConfig {
+        message: err.to_string(),
+    })
 }

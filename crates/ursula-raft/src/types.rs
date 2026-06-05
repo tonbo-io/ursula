@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io::Cursor;
 use std::time::Duration;
@@ -14,6 +16,7 @@ use serde::Serialize;
 use serde::Serializer;
 use ursula_proto as raft_app_proto;
 use ursula_runtime::GroupWriteCommand;
+use ursula_shard::RaftGroupId;
 
 // Used only by the cfg(not(madsim)) file-log writer thread in
 // log_store/file.rs::run_core_file_log_writer.
@@ -315,4 +318,14 @@ pub struct RaftGroupMetricsSnapshot {
     pub purged: Option<RaftLogProgressSnapshot>,
     pub voter_ids: Vec<u64>,
     pub learner_ids: Vec<u64>,
+}
+
+/// Static gRPC Raft cluster membership configuration.
+///
+/// Used by the bootstrap layer when constructing a
+/// [`StaticGrpcRaftGroupEngineFactory`].
+#[derive(Debug, Clone, Default)]
+pub struct StaticGrpcRaftMembershipConfig {
+    pub initialize_membership_per_group: bool,
+    pub per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
 }

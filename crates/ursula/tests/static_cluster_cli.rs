@@ -424,8 +424,12 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
         .expect("system time after unix epoch")
         .as_nanos();
     let cold_root = format!("ursula-cli-s3-cold-restart/{suffix}");
-    let cold_store =
-        ColdStore::s3_from_env_with_root(Some(&cold_root)).expect("S3 cold store from env");
+    unsafe {
+        std::env::set_var("URSULA_COLD_ROOT", &cold_root);
+    }
+    let cold_store = ColdStore::from_env()
+        .unwrap_or_else(|err| panic!("cold store creation failed: {err}"))
+        .unwrap_or_else(|| panic!("cold store not configured; set URSULA_COLD_BACKEND"));
     cold_store
         .remove_all("")
         .await
