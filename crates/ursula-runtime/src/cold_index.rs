@@ -61,6 +61,7 @@ impl ColdIndexPage {
 pub struct ColdIndexPageRollback {
     key: ColdIndexPageKey,
     previous: Option<ColdIndexPage>,
+    written_chunk: ColdChunkRef,
 }
 
 fn encode_page(key: &ColdIndexPageKey, page: &ColdIndexPage) -> Vec<u8> {
@@ -358,6 +359,7 @@ pub async fn write_cold_chunk_index_pages_with_rollback<S: ColdIndexPageStore + 
         rollback.push(ColdIndexPageRollback {
             key: key.clone(),
             previous,
+            written_chunk: chunk.clone(),
         });
         page.cold_chunks.retain(|existing| {
             existing.start_offset != chunk.start_offset || existing.end_offset != chunk.end_offset
@@ -374,6 +376,17 @@ pub async fn rollback_cold_index_pages<S: ColdIndexPageStore + ?Sized>(
     rollback: Vec<ColdIndexPageRollback>,
 ) -> io::Result<()> {
     for entry in rollback.into_iter().rev() {
+        let Some(current) = store.get_page(&entry.key).await? else {
+            continue;
+        };
+        let current_still_has_written_chunk = current.cold_chunks.iter().any(|chunk| {
+            chunk.start_offset == entry.written_chunk.start_offset
+                && chunk.end_offset == entry.written_chunk.end_offset
+                && chunk.s3_path == entry.written_chunk.s3_path
+        });
+        if !current_still_has_written_chunk {
+            continue;
+        }
         let page = entry.previous.unwrap_or_else(|| {
             let page_start = entry
                 .key
@@ -757,6 +770,54 @@ mod tests {
         );
         assert!(page.covers(127));
         assert!(!page.covers(128));
+    }
+
+    #[tokio::test]
+    async fn rollback_skips_page_updated_by_newer_writer() {
+        let store = InMemoryColdIndexPageStore::new();
+        let stream_id = BucketStreamId::new("benchcmp", "cold-index");
+        let first = ColdChunkRef {
+            start_offset: 0,
+            end_offset: 128,
+            s3_path: "benchcmp/cold-index/chunks/first.bin".to_owned(),
+            object_size: 128,
+        };
+        let stale = ColdChunkRef {
+            start_offset: 0,
+            end_offset: 128,
+            s3_path: "benchcmp/cold-index/chunks/stale.bin".to_owned(),
+            object_size: 128,
+        };
+        let newer = ColdChunkRef {
+            start_offset: 0,
+            end_offset: 128,
+            s3_path: "benchcmp/cold-index/chunks/newer.bin".to_owned(),
+            object_size: 128,
+        };
+        write_cold_chunk_index_pages(&store, &stream_id, &first)
+            .await
+            .expect("write first chunk");
+        let rollback = write_cold_chunk_index_pages_with_rollback(&store, &stream_id, &stale)
+            .await
+            .expect("write stale chunk");
+        write_cold_chunk_index_pages(&store, &stream_id, &newer)
+            .await
+            .expect("write newer chunk");
+
+        rollback_cold_index_pages(&store, rollback)
+            .await
+            .expect("rollback stale chunk");
+
+        let page = store
+            .get_page(&ColdIndexPageKey {
+                stream_id,
+                generation: 0,
+                page_id: 0,
+            })
+            .await
+            .expect("get page")
+            .expect("page exists");
+        assert_eq!(page.cold_chunks, vec![newer]);
     }
 
     #[test]
