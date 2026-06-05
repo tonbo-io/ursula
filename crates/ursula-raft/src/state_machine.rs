@@ -552,25 +552,41 @@ pub struct RaftGroupSnapshotBuilder {
 impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<UrsulaRaftTypeConfig>, io::Error> {
         let body = serde_json::to_vec(&self.snapshot).map_err(invalid_data)?;
+        let snapshot_id = self.meta.snapshot_id.clone();
         let key = SnapshotKey {
             raft_group_id: self.placement.raft_group_id.0,
-            snapshot_id: self.meta.snapshot_id.clone(),
+            snapshot_id: snapshot_id.clone(),
         };
-        let location = self
-            .snapshot_store
-            .upload(key, body)
-            .await
-            .map_err(|err| err.into_io())?;
-        // Re-stat immediately so a silent partial-success (multipart Complete
-        // failing after the parts uploaded, opendal retry caching, etc.) is
-        // caught HERE rather than 10 minutes later as an install_snapshot
-        // NotFound on a follower. Cheap relative to the upload itself.
-        self.snapshot_store
-            .verify_uploaded(&location)
-            .await
-            .map_err(|err| err.into_io())?;
+        let location = match self.snapshot_store.upload(key, body.clone()).await {
+            Ok(location) => {
+                // Re-stat immediately so a silent partial-success (multipart
+                // Complete failing after the parts uploaded, opendal retry
+                // caching, etc.) is caught HERE rather than 10 minutes later
+                // as an install_snapshot NotFound on a follower. Cheap
+                // relative to the upload itself.
+                match self.snapshot_store.verify_uploaded(&location).await {
+                    Ok(()) => location,
+                    Err(err) => {
+                        tracing::warn!(
+                            snapshot_id,
+                            error = %err,
+                            "falling back to inline OpenRaft snapshot after external snapshot verification failed"
+                        );
+                        SnapshotLocation::Inline { bytes: body }
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    snapshot_id,
+                    error = %err,
+                    "falling back to inline OpenRaft snapshot after external snapshot upload failed"
+                );
+                SnapshotLocation::Inline { bytes: body }
+            }
+        };
         let pointer = SnapshotPointer {
-            snapshot_id: self.meta.snapshot_id.clone(),
+            snapshot_id,
             location,
         };
         let pointer_bytes = pointer.encode().map_err(|err| err.into_io())?;
@@ -687,6 +703,72 @@ mod tests {
             serde_json::from_slice(&second_bytes).expect("decode second group snapshot");
         assert_eq!(first_group.group_commit_index, 1);
         assert_eq!(second_group.group_commit_index, 2);
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn snapshot_builder_falls_back_to_inline_when_external_upload_fails() {
+        use ursula_runtime::{SnapshotStore, SnapshotStoreError, SnapshotStoreFuture};
+        use ursula_shard::{CoreId, RaftGroupId, ShardId};
+
+        #[derive(Debug)]
+        struct FailingSnapshotStore;
+
+        impl SnapshotStore for FailingSnapshotStore {
+            fn upload<'a>(
+                &'a self,
+                _key: SnapshotKey,
+                _bytes: Vec<u8>,
+            ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+                Box::pin(async move {
+                    Err(SnapshotStoreError::Backend(
+                        "seeded upload failure".to_owned(),
+                    ))
+                })
+            }
+
+            fn download<'a>(
+                &'a self,
+                _location: &'a SnapshotLocation,
+            ) -> SnapshotStoreFuture<'a, Vec<u8>> {
+                Box::pin(async move {
+                    Err(SnapshotStoreError::Backend(
+                        "download should not be used".to_owned(),
+                    ))
+                })
+            }
+
+            fn delete<'a>(
+                &'a self,
+                _location: &'a SnapshotLocation,
+            ) -> SnapshotStoreFuture<'a, ()> {
+                Box::pin(async move { Ok(()) })
+            }
+        }
+
+        let placement = ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: RaftGroupId(7),
+        };
+        let current_snapshot = Arc::new(Mutex::new(None));
+        let mut builder = RaftGroupSnapshotBuilder {
+            placement,
+            snapshot: test_group_snapshot(placement, 3),
+            meta: test_snapshot_meta(3),
+            current_snapshot: current_snapshot.clone(),
+            snapshot_store: Arc::new(FailingSnapshotStore),
+        };
+
+        let snapshot = builder.build_snapshot().await.expect("inline fallback");
+        let pointer =
+            SnapshotPointer::decode(&snapshot.snapshot.into_inner()).expect("snapshot pointer");
+        let SnapshotLocation::Inline { bytes } = pointer.location else {
+            panic!("expected inline fallback");
+        };
+        let group: GroupSnapshot = serde_json::from_slice(&bytes).expect("decode inline snapshot");
+        assert_eq!(group.group_commit_index, 3);
+        assert!(current_snapshot.lock().expect("snapshot mutex").is_some());
     }
 
     #[tokio::test]
