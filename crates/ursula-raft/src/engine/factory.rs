@@ -6,7 +6,10 @@ use std::time::Duration;
 
 use openraft::BasicNode;
 use openraft::Config;
+use openraft::Raft;
 use openraft::SnapshotPolicy;
+use tokio::time::Instant;
+use tonic::transport::Endpoint;
 use ursula_runtime::{
     ColdStoreHandle, GroupEngine, GroupEngineCreateFuture, GroupEngineError, GroupEngineFactory,
     GroupEngineMetrics, SharedSnapshotStore,
@@ -16,6 +19,8 @@ use ursula_shard::{CoreId, RaftGroupId, ShardPlacement};
 use crate::grpc::GrpcRaftNetworkFactory;
 use crate::log_store::{CoreFileLogWriter, RaftGroupFileLogStore, RaftGroupLogStore};
 use crate::registry::RaftGroupHandleRegistry;
+use crate::state_machine::RaftGroupStateMachine;
+use crate::types::UrsulaRaftTypeConfig;
 
 use super::RaftGroupEngine;
 
@@ -32,6 +37,27 @@ fn rejoin_leader_probe_timeout() -> Duration {
         .filter(|ms| *ms > 0)
         .unwrap_or(6000);
     Duration::from_millis(ms)
+}
+
+fn bootstrap_peer_probe_timeout() -> Duration {
+    Duration::from_millis(parse_positive_millis_env(
+        "URSULA_RAFT_BOOTSTRAP_PEER_PROBE_MS",
+        60_000,
+    ))
+}
+
+fn bootstrap_peer_probe_interval() -> Duration {
+    Duration::from_millis(parse_positive_millis_env(
+        "URSULA_RAFT_BOOTSTRAP_PEER_PROBE_INTERVAL_MS",
+        250,
+    ))
+}
+
+fn bootstrap_peer_connect_timeout() -> Duration {
+    Duration::from_millis(parse_positive_millis_env(
+        "URSULA_RAFT_BOOTSTRAP_PEER_CONNECT_MS",
+        500,
+    ))
 }
 
 /// OpenRaft's `install_snapshot_timeout` covers the whole FullSnapshot RPC.
@@ -74,6 +100,106 @@ fn raft_memory_bootstrap_marker_dir() -> Option<PathBuf> {
         .ok()
         .filter(|raw| !raw.trim().is_empty())
         .map(PathBuf::from)
+}
+
+fn quorum_size(voter_count: usize) -> usize {
+    (voter_count / 2) + 1
+}
+
+async fn static_peer_reachable(address: &str, timeout: Duration) -> bool {
+    let Ok(endpoint) = Endpoint::from_shared(address.to_owned()) else {
+        return false;
+    };
+    endpoint.connect_timeout(timeout).connect().await.is_ok()
+}
+
+async fn wait_for_static_peer_quorum(
+    node_id: u64,
+    raft_group_id: RaftGroupId,
+    nodes: &BTreeMap<u64, BasicNode>,
+) {
+    let quorum = quorum_size(nodes.len());
+    let mut next_warning = Instant::now() + bootstrap_peer_probe_timeout();
+    let interval = bootstrap_peer_probe_interval();
+    let connect_timeout = bootstrap_peer_connect_timeout();
+
+    loop {
+        let mut reachable = usize::from(nodes.contains_key(&node_id));
+        for (peer_id, peer) in nodes {
+            if *peer_id == node_id {
+                continue;
+            }
+            if static_peer_reachable(&peer.addr, connect_timeout).await {
+                reachable += 1;
+            }
+        }
+
+        if reachable >= quorum {
+            return;
+        }
+
+        if Instant::now() >= next_warning {
+            tracing::warn!(
+                "raft bootstrap: node {node_id} group {} is waiting for static peer quorum; reachable {reachable}/{}, quorum {quorum}",
+                raft_group_id.0,
+                nodes.len()
+            );
+            next_warning = Instant::now() + bootstrap_peer_probe_timeout();
+        }
+
+        tokio::time::sleep(interval).await;
+    }
+}
+
+fn spawn_deferred_membership_initialization(
+    node_id: u64,
+    raft_group_id: RaftGroupId,
+    raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
+    nodes: BTreeMap<u64, BasicNode>,
+    marker_path: Option<PathBuf>,
+) {
+    tokio::spawn(async move {
+        wait_for_static_peer_quorum(node_id, raft_group_id, &nodes).await;
+
+        match raft.is_initialized().await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(err) => {
+                tracing::error!(
+                    "raft bootstrap: node {node_id} group {} failed to check initialization: {err}",
+                    raft_group_id.0
+                );
+                return;
+            }
+        }
+
+        if let Err(err) = raft.initialize(nodes).await {
+            tracing::error!(
+                "raft bootstrap: node {node_id} group {} failed to initialize membership: {err}",
+                raft_group_id.0
+            );
+            return;
+        }
+
+        if let Some(path) = marker_path {
+            if let Some(parent) = path.parent()
+                && let Err(err) = std::fs::create_dir_all(parent)
+            {
+                tracing::error!(
+                    "raft bootstrap: node {node_id} group {} failed to create marker dir: {err}",
+                    raft_group_id.0
+                );
+                return;
+            }
+            if let Err(err) = std::fs::write(&path, b"initialized\n") {
+                tracing::error!(
+                    "raft bootstrap: node {node_id} group {} failed to write marker {}: {err}",
+                    raft_group_id.0,
+                    path.display()
+                );
+            }
+        }
+    });
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -570,10 +696,13 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                         placement.raft_group_id.0
                     );
                 } else {
-                    engine
-                        .initialize_membership(self.peer_nodes_for_group(placement.raft_group_id)?)
-                        .await?;
-                    self.mark_raft_memory_bootstrap_seen(placement.raft_group_id)?;
+                    spawn_deferred_membership_initialization(
+                        self.node_id,
+                        placement.raft_group_id,
+                        engine.raft_handle(),
+                        self.peer_nodes_for_group(placement.raft_group_id)?,
+                        self.raft_memory_bootstrap_marker_path(placement.raft_group_id),
+                    );
                 }
             }
             let engine: Box<dyn GroupEngine> = Box::new(engine);
