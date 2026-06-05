@@ -20,8 +20,8 @@ use super::{
     GroupTouchStreamAccessFuture, GroupWriteResponse,
 };
 use crate::cold_index::{
-    ColdIndexPageCache, ColdStoreColdIndexPageStore, write_cold_chunk_index_pages,
-    write_external_segment_index_pages,
+    ColdIndexPageCache, ColdStoreColdIndexPageStore, rollback_cold_index_pages,
+    write_cold_chunk_index_pages_with_rollback, write_external_segment_index_pages,
 };
 use crate::cold_store::{ColdStoreHandle, DEFAULT_CONTENT_TYPE};
 use crate::command::{GroupSnapshot, GroupWriteCommand};
@@ -2125,18 +2125,43 @@ impl GroupEngine for InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> GroupFlushColdFuture<'a> {
         Box::pin(async move {
+            let mut index_rollback = None;
             if let Some(cold_store) = self.cold_store.as_ref() {
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-                write_cold_chunk_index_pages(&store, &request.stream_id, &request.chunk)
-                    .await
-                    .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                let rollback = write_cold_chunk_index_pages_with_rollback(
+                    &store,
+                    &request.stream_id,
+                    &request.chunk,
+                )
+                .await
+                .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                index_rollback = Some((store, rollback));
             }
             let command = GroupWriteCommand::from(request);
-            match self.apply_committed_write(command, placement)? {
-                GroupWriteResponse::FlushCold(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected flush cold write response: {other:?}"
-                ))),
+            match self.apply_committed_write(command, placement) {
+                Ok(GroupWriteResponse::FlushCold(response)) => Ok(response),
+                Ok(other) => {
+                    if let Some((store, rollback)) = index_rollback {
+                        rollback_cold_index_pages(&store, rollback)
+                            .await
+                            .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                    }
+                    Err(GroupEngineError::new(format!(
+                        "unexpected flush cold write response: {other:?}"
+                    )))
+                }
+                Err(err) => {
+                    if let Some((store, rollback)) = index_rollback {
+                        rollback_cold_index_pages(&store, rollback).await.map_err(
+                            |rollback_err| {
+                                GroupEngineError::new(format!(
+                                    "rollback cold index after flush failure: {rollback_err}"
+                                ))
+                            },
+                        )?;
+                    }
+                    Err(err)
+                }
             }
         })
     }

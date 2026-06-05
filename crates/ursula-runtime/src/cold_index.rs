@@ -57,6 +57,12 @@ impl ColdIndexPage {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ColdIndexPageRollback {
+    key: ColdIndexPageKey,
+    previous: Option<ColdIndexPage>,
+}
+
 fn encode_page(key: &ColdIndexPageKey, page: &ColdIndexPage) -> Vec<u8> {
     let mut body = Vec::new();
     put_string(&mut body, &key.stream_id.bucket_id);
@@ -318,11 +324,22 @@ pub async fn write_cold_chunk_index_pages<S: ColdIndexPageStore + ?Sized>(
     stream_id: &BucketStreamId,
     chunk: &ColdChunkRef,
 ) -> io::Result<()> {
+    write_cold_chunk_index_pages_with_rollback(store, stream_id, chunk)
+        .await
+        .map(|_| ())
+}
+
+pub async fn write_cold_chunk_index_pages_with_rollback<S: ColdIndexPageStore + ?Sized>(
+    store: &S,
+    stream_id: &BucketStreamId,
+    chunk: &ColdChunkRef,
+) -> io::Result<Vec<ColdIndexPageRollback>> {
     if chunk.end_offset <= chunk.start_offset {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let first_page_id = chunk.start_offset / ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
     let last_page_id = (chunk.end_offset - 1) / ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
+    let mut rollback = Vec::new();
     for page_id in first_page_id..=last_page_id {
         let key = ColdIndexPageKey {
             stream_id: stream_id.clone(),
@@ -331,21 +348,46 @@ pub async fn write_cold_chunk_index_pages<S: ColdIndexPageStore + ?Sized>(
         };
         let page_start = page_id.saturating_mul(ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES);
         let page_end = page_start.saturating_add(ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES);
-        let mut page = store
-            .get_page(&key)
-            .await?
-            .unwrap_or_else(|| ColdIndexPage {
-                start_offset: page_start,
-                end_offset: page_end,
-                cold_chunks: Vec::new(),
-                external_segments: Vec::new(),
-            });
+        let previous = store.get_page(&key).await?;
+        let mut page = previous.clone().unwrap_or_else(|| ColdIndexPage {
+            start_offset: page_start,
+            end_offset: page_end,
+            cold_chunks: Vec::new(),
+            external_segments: Vec::new(),
+        });
+        rollback.push(ColdIndexPageRollback {
+            key: key.clone(),
+            previous,
+        });
         page.cold_chunks.retain(|existing| {
             existing.start_offset != chunk.start_offset || existing.end_offset != chunk.end_offset
         });
         page.cold_chunks.push(chunk.clone());
         page.cold_chunks.sort_by_key(|chunk| chunk.start_offset);
         store.put_page(&key, &page).await?;
+    }
+    Ok(rollback)
+}
+
+pub async fn rollback_cold_index_pages<S: ColdIndexPageStore + ?Sized>(
+    store: &S,
+    rollback: Vec<ColdIndexPageRollback>,
+) -> io::Result<()> {
+    for entry in rollback.into_iter().rev() {
+        let page = entry.previous.unwrap_or_else(|| {
+            let page_start = entry
+                .key
+                .page_id
+                .saturating_mul(ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES);
+            let page_end = page_start.saturating_add(ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES);
+            ColdIndexPage {
+                start_offset: page_start,
+                end_offset: page_end,
+                cold_chunks: Vec::new(),
+                external_segments: Vec::new(),
+            }
+        });
+        store.put_page(&entry.key, &page).await?;
     }
     Ok(())
 }
