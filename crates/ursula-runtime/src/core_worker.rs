@@ -735,11 +735,7 @@ impl CoreWorker {
         Some(RuntimeError::GroupEngine {
             core_id: placement.core_id,
             raft_group_id: placement.raft_group_id,
-            message: format!(
-                "RaftUncommittedBackpressure: group uncommitted bytes {current} plus incoming {incoming_bytes} would exceed limit {limit}"
-            ),
-            next_offset: None,
-            leader_hint: None,
+            error: GroupEngineError::raft_uncommitted_backpressure(current, incoming_bytes, limit),
         })
     }
 
@@ -855,9 +851,7 @@ impl CoreWorker {
             return Err(RuntimeError::GroupEngine {
                 core_id: placement.core_id,
                 raft_group_id: placement.raft_group_id,
-                message: "group engine already installed".to_owned(),
-                next_offset: None,
-                leader_hint: None,
+                error: GroupEngineError::new("group engine already installed"),
             });
         }
         let (tx, rx) = mpsc::channel(self.group_mailbox_capacity);
@@ -1691,8 +1685,8 @@ impl CoreWorker {
             Err(err) => {
                 for pending in pending {
                     if admission.is_enabled()
-                        && let RuntimeError::GroupEngine { message, .. } = &err
-                        && message.contains("ColdBackpressure")
+                        && let RuntimeError::GroupEngine { error, .. } = &err
+                        && error.is_cold_backpressure()
                     {
                         runtime.metrics.record_cold_backpressure(
                             placement.core_id,
@@ -1711,13 +1705,11 @@ impl CoreWorker {
             let err = RuntimeError::GroupEngine {
                 core_id: placement.core_id,
                 raft_group_id: placement.raft_group_id,
-                message: format!(
+                error: GroupEngineError::new(format!(
                     "batched append response count {} does not match request count {}",
                     responses.len(),
                     pending.len()
-                ),
-                next_offset: None,
-                leader_hint: None,
+                )),
             };
             for pending in pending {
                 let _ = pending.response_tx.send(Err(err.clone()));
@@ -1731,9 +1723,9 @@ impl CoreWorker {
                 Ok(other) => Err(RuntimeError::GroupEngine {
                     core_id: placement.core_id,
                     raft_group_id: placement.raft_group_id,
-                    message: format!("unexpected batched append response: {other:?}"),
-                    next_offset: None,
-                    leader_hint: None,
+                    error: GroupEngineError::new(format!(
+                        "unexpected batched append response: {other:?}"
+                    )),
                 }),
                 Err(err) => Err(RuntimeError::group_engine(placement, err)),
             };
@@ -1780,8 +1772,8 @@ impl CoreWorker {
                 }
                 Err(err) => {
                     if admission.is_enabled()
-                        && let RuntimeError::GroupEngine { message, .. } = &err
-                        && message.contains("ColdBackpressure")
+                        && let RuntimeError::GroupEngine { error, .. } = &err
+                        && error.is_cold_backpressure()
                     {
                         runtime.metrics.record_cold_backpressure(
                             placement.core_id,

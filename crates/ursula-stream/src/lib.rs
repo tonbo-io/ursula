@@ -27,7 +27,7 @@ pub use model::{
     StreamReadColdIndexSegment, StreamReadColdSegment, StreamReadObjectSegment, StreamReadPlan,
     StreamReadSegment, StreamStatus, StreamVisibleSnapshot,
 };
-pub use response::{StreamErrorCode, StreamResponse};
+pub use response::{StreamErrorCode, StreamErrorContext, StreamResponse};
 pub use snapshot::{StreamSnapshot, StreamSnapshotEntry, StreamSnapshotError};
 pub use state_machine::StreamStateMachine;
 pub use validate::{validate_bucket_id, validate_stream_id};

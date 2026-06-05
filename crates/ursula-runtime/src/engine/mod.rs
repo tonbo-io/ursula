@@ -1,13 +1,14 @@
 pub mod in_memory;
 pub mod wal;
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use ursula_shard::{BucketStreamId, ShardPlacement};
-use ursula_stream::{ColdFlushCandidate, ColdGcEntry, StreamErrorCode};
+use ursula_stream::{ColdFlushCandidate, ColdGcEntry, StreamErrorCode, StreamErrorContext};
 
 use crate::command::{GroupSnapshot, GroupWriteCommand};
 use crate::metrics::{RaftWriteManySample, RuntimeMetricsInner};
@@ -705,22 +706,143 @@ pub struct GroupLeaderHint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GroupEngineError {
+pub struct StreamEngineError {
     message: String,
-    code: Option<StreamErrorCode>,
+    code: StreamErrorCode,
     next_offset: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    leader_hint: Option<GroupLeaderHint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    context: Vec<StreamErrorContext>,
+}
+
+/// Infra error variants with structured fields render their human message on
+/// demand (`message`) instead of storing a denormalized copy alongside the
+/// fields. `Internal` is the exception: it carries free-form text with no
+/// structured source, so it keeps an owned `message`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroupInfraError {
+    Internal {
+        message: String,
+    },
+    ProtoDecode {
+        field: String,
+    },
+    ColdBackpressure {
+        stream_id: BucketStreamId,
+        before_group_hot_bytes: u64,
+        after_group_hot_bytes: u64,
+        limit: u64,
+    },
+    RaftUncommittedBackpressure {
+        current: u64,
+        incoming: u64,
+        limit: u64,
+    },
+}
+
+impl GroupInfraError {
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self::Internal {
+            message: message.into(),
+        }
+    }
+
+    pub fn proto_decode(field: impl Into<String>) -> Self {
+        Self::ProtoDecode {
+            field: field.into(),
+        }
+    }
+
+    pub fn cold_backpressure(
+        stream_id: BucketStreamId,
+        before_group_hot_bytes: u64,
+        after_group_hot_bytes: u64,
+        limit: u64,
+    ) -> Self {
+        Self::ColdBackpressure {
+            stream_id,
+            before_group_hot_bytes,
+            after_group_hot_bytes,
+            limit,
+        }
+    }
+
+    pub fn raft_uncommitted_backpressure(current: u64, incoming: u64, limit: u64) -> Self {
+        Self::RaftUncommittedBackpressure {
+            current,
+            incoming,
+            limit,
+        }
+    }
+
+    pub fn message(&self) -> Cow<'_, str> {
+        match self {
+            Self::Internal { message } => Cow::Borrowed(message),
+            Self::ProtoDecode { field } => Cow::Owned(format!(
+                "ProtoDecode: protobuf raft payload missing {field}"
+            )),
+            Self::ColdBackpressure {
+                stream_id,
+                before_group_hot_bytes,
+                after_group_hot_bytes,
+                limit,
+            } => Cow::Owned(format!(
+                "ColdBackpressure: stream '{stream_id}' would raise group hot bytes from {before_group_hot_bytes} to {after_group_hot_bytes}, above limit {limit}"
+            )),
+            Self::RaftUncommittedBackpressure {
+                current,
+                incoming,
+                limit,
+            } => Cow::Owned(format!(
+                "RaftUncommittedBackpressure: group uncommitted bytes {current} plus incoming {incoming} would exceed limit {limit}"
+            )),
+        }
+    }
+
+    pub fn is_cold_backpressure(&self) -> bool {
+        matches!(self, Self::ColdBackpressure { .. })
+    }
+
+    pub fn is_backpressure(&self) -> bool {
+        matches!(
+            self,
+            Self::ColdBackpressure { .. } | Self::RaftUncommittedBackpressure { .. }
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GroupEngineError {
+    Stream(StreamEngineError),
+    Infra(GroupInfraError),
+    ForwardToLeader {
+        message: String,
+        leader_hint: GroupLeaderHint,
+    },
 }
 
 impl GroupEngineError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            code: None,
-            next_offset: None,
-            leader_hint: None,
-        }
+        Self::Infra(GroupInfraError::internal(message))
+    }
+
+    pub fn cold_backpressure(
+        stream_id: BucketStreamId,
+        before_group_hot_bytes: u64,
+        after_group_hot_bytes: u64,
+        limit: u64,
+    ) -> Self {
+        Self::Infra(GroupInfraError::cold_backpressure(
+            stream_id,
+            before_group_hot_bytes,
+            after_group_hot_bytes,
+            limit,
+        ))
+    }
+
+    pub fn raft_uncommitted_backpressure(current: u64, incoming: u64, limit: u64) -> Self {
+        Self::Infra(GroupInfraError::raft_uncommitted_backpressure(
+            current, incoming, limit,
+        ))
     }
 
     pub fn stream(code: StreamErrorCode, message: impl Into<String>) -> Self {
@@ -732,12 +854,35 @@ impl GroupEngineError {
         message: impl Into<String>,
         next_offset: Option<u64>,
     ) -> Self {
-        Self {
+        Self::stream_with_context(code, message, next_offset, vec![])
+    }
+
+    pub fn stream_with_context(
+        code: StreamErrorCode,
+        message: impl Into<String>,
+        next_offset: Option<u64>,
+        context: Vec<StreamErrorContext>,
+    ) -> Self {
+        Self::Stream(StreamEngineError {
             message: format!("{code:?}: {}", message.into()),
-            code: Some(code),
+            code,
             next_offset,
-            leader_hint: None,
-        }
+            context,
+        })
+    }
+
+    pub fn stream_from_replicated(
+        message: impl Into<String>,
+        code: StreamErrorCode,
+        next_offset: Option<u64>,
+        context: Vec<StreamErrorContext>,
+    ) -> Self {
+        Self::Stream(StreamEngineError {
+            message: message.into(),
+            code,
+            next_offset,
+            context,
+        })
     }
 
     pub fn forward_to_leader(
@@ -745,48 +890,77 @@ impl GroupEngineError {
         node_id: Option<u64>,
         address: Option<String>,
     ) -> Self {
-        Self {
+        Self::ForwardToLeader {
             message: message.into(),
-            code: None,
-            next_offset: None,
-            leader_hint: Some(GroupLeaderHint { node_id, address }),
+            leader_hint: GroupLeaderHint { node_id, address },
         }
     }
 
-    pub fn from_replicated_parts(
-        message: impl Into<String>,
-        code: Option<StreamErrorCode>,
-        next_offset: Option<u64>,
-        leader_hint: Option<GroupLeaderHint>,
-    ) -> Self {
-        Self {
-            message: message.into(),
-            code,
-            next_offset,
-            leader_hint,
+    pub fn message(&self) -> Cow<'_, str> {
+        match self {
+            Self::Stream(err) => Cow::Borrowed(&err.message),
+            Self::Infra(err) => err.message(),
+            Self::ForwardToLeader { message, .. } => Cow::Borrowed(message),
         }
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
     }
 
     pub fn code(&self) -> Option<StreamErrorCode> {
-        self.code
+        match self {
+            Self::Stream(err) => Some(err.code),
+            Self::Infra(_) | Self::ForwardToLeader { .. } => None,
+        }
+    }
+
+    pub fn stream_parts(
+        &self,
+    ) -> Option<(&str, StreamErrorCode, Option<u64>, &[StreamErrorContext])> {
+        match self {
+            Self::Stream(err) => Some((&err.message, err.code, err.next_offset, &err.context)),
+            Self::Infra(_) | Self::ForwardToLeader { .. } => None,
+        }
     }
 
     pub fn next_offset(&self) -> Option<u64> {
-        self.next_offset
+        match self {
+            Self::Stream(err) => err.next_offset,
+            Self::Infra(_) | Self::ForwardToLeader { .. } => None,
+        }
+    }
+
+    pub fn context(&self) -> &[StreamErrorContext] {
+        match self {
+            Self::Stream(err) => &err.context,
+            Self::Infra(_) | Self::ForwardToLeader { .. } => &[],
+        }
     }
 
     pub fn leader_hint(&self) -> Option<&GroupLeaderHint> {
-        self.leader_hint.as_ref()
+        match self {
+            Self::ForwardToLeader { leader_hint, .. } => Some(leader_hint),
+            Self::Stream(_) | Self::Infra(_) => None,
+        }
+    }
+
+    pub fn infra(&self) -> Option<&GroupInfraError> {
+        match self {
+            Self::Infra(err) => Some(err),
+            Self::Stream(_) | Self::ForwardToLeader { .. } => None,
+        }
+    }
+
+    pub fn is_cold_backpressure(&self) -> bool {
+        self.infra()
+            .is_some_and(GroupInfraError::is_cold_backpressure)
+    }
+
+    pub fn is_backpressure(&self) -> bool {
+        self.infra().is_some_and(GroupInfraError::is_backpressure)
     }
 }
 
 impl std::fmt::Display for GroupEngineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        f.write_str(&self.message())
     }
 }
 

@@ -3,9 +3,9 @@ use ursula_proto as raft_app_proto;
 use ursula_runtime::{
     AckColdGcResponse, AppendResponse, CloseStreamResponse, CreateStreamResponse,
     DeleteStreamResponse, FlushColdResponse, ForkRefResponse, GroupAppendBatchResponse,
-    GroupEngineError, GroupLeaderHint, GroupWriteCommand, GroupWriteResponse, HeadStreamResponse,
-    PublishSnapshotResponse, ReadStreamResponse, StreamErrorCode, StreamIntegritySnapshot,
-    TouchStreamAccessResponse,
+    GroupEngineError, GroupInfraError, GroupLeaderHint, GroupWriteCommand, GroupWriteResponse,
+    HeadStreamResponse, PublishSnapshotResponse, ReadStreamResponse, StreamErrorCode,
+    StreamErrorContext, StreamIntegritySnapshot, TouchStreamAccessResponse,
 };
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
@@ -173,7 +173,7 @@ pub(crate) fn placement_from_parts(
 }
 
 pub(crate) fn required<T>(value: Option<T>, field: &str) -> Result<T, GroupEngineError> {
-    value.ok_or_else(|| GroupEngineError::new(format!("protobuf raft payload missing {field}")))
+    value.ok_or_else(|| GroupEngineError::Infra(GroupInfraError::proto_decode(field)))
 }
 
 pub(crate) fn raft_blank_response() -> RaftGroupResponse {
@@ -724,26 +724,184 @@ pub(crate) fn encode_group_write_result(
 pub(crate) fn group_engine_error_to_proto(
     err: GroupEngineError,
 ) -> raft_app_proto::GroupEngineErrorV1 {
-    raft_app_proto::GroupEngineErrorV1 {
-        message: err.message().to_owned(),
-        code: err
-            .code()
-            .map(stream_error_code_to_proto)
-            .map(|code| code as i32),
-        next_offset: err.next_offset(),
-        leader_hint: err.leader_hint().cloned().map(group_leader_hint_to_proto),
-    }
+    use raft_app_proto::group_engine_error_v1::Error;
+
+    let error = match &err {
+        GroupEngineError::Stream(_) => {
+            let (message, code, next_offset, context) = err
+                .stream_parts()
+                .expect("GroupEngineError::stream_parts returns Some for stream errors");
+            Error::Stream(raft_app_proto::StreamEngineErrorV1 {
+                message: message.to_owned(),
+                code: stream_error_code_to_proto(code) as i32,
+                next_offset,
+                context: context
+                    .iter()
+                    .cloned()
+                    .map(stream_error_context_to_proto)
+                    .collect(),
+            })
+        }
+        GroupEngineError::Infra(infra) => Error::Infra(group_infra_error_to_proto(infra)),
+        GroupEngineError::ForwardToLeader {
+            message,
+            leader_hint,
+        } => Error::ForwardToLeader(raft_app_proto::ForwardToLeaderErrorV1 {
+            message: message.clone(),
+            leader_hint: Some(group_leader_hint_to_proto(leader_hint.clone())),
+        }),
+    };
+
+    raft_app_proto::GroupEngineErrorV1 { error: Some(error) }
 }
 
 pub(crate) fn group_engine_error_from_proto(
     err: raft_app_proto::GroupEngineErrorV1,
 ) -> Result<GroupEngineError, GroupEngineError> {
-    Ok(GroupEngineError::from_replicated_parts(
-        err.message,
-        err.code.map(stream_error_code_from_proto).transpose()?,
-        err.next_offset,
-        err.leader_hint.map(group_leader_hint_from_proto),
-    ))
+    use raft_app_proto::group_engine_error_v1::Error;
+
+    match required(err.error, "group_engine_error.error")? {
+        Error::Stream(err) => Ok(GroupEngineError::stream_from_replicated(
+            err.message,
+            stream_error_code_from_proto(err.code)?,
+            err.next_offset,
+            err.context
+                .into_iter()
+                .map(stream_error_context_from_proto)
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        Error::Infra(err) => Ok(GroupEngineError::Infra(group_infra_error_from_proto(err)?)),
+        Error::ForwardToLeader(err) => Ok(GroupEngineError::ForwardToLeader {
+            message: err.message,
+            leader_hint: group_leader_hint_from_proto(required(
+                err.leader_hint,
+                "group_engine_error.forward_to_leader.leader_hint",
+            )?),
+        }),
+    }
+}
+
+pub(crate) fn group_infra_error_to_proto(
+    err: &GroupInfraError,
+) -> raft_app_proto::GroupInfraErrorV1 {
+    use raft_app_proto::group_infra_error_v1::Error;
+
+    let error = match err {
+        GroupInfraError::Internal { message } => {
+            Error::Internal(raft_app_proto::InternalGroupInfraErrorV1 {
+                message: message.clone(),
+            })
+        }
+        GroupInfraError::ProtoDecode { field } => {
+            Error::ProtoDecode(raft_app_proto::ProtoDecodeErrorV1 {
+                field: field.clone(),
+            })
+        }
+        GroupInfraError::ColdBackpressure {
+            stream_id,
+            before_group_hot_bytes,
+            after_group_hot_bytes,
+            limit,
+        } => Error::ColdBackpressure(raft_app_proto::ColdBackpressureErrorV1 {
+            stream_id: Some(stream_id.into()),
+            before_group_hot_bytes: *before_group_hot_bytes,
+            after_group_hot_bytes: *after_group_hot_bytes,
+            limit: *limit,
+        }),
+        GroupInfraError::RaftUncommittedBackpressure {
+            current,
+            incoming,
+            limit,
+        } => {
+            Error::RaftUncommittedBackpressure(raft_app_proto::RaftUncommittedBackpressureErrorV1 {
+                current: *current,
+                incoming: *incoming,
+                limit: *limit,
+            })
+        }
+    };
+
+    raft_app_proto::GroupInfraErrorV1 { error: Some(error) }
+}
+
+pub(crate) fn group_infra_error_from_proto(
+    err: raft_app_proto::GroupInfraErrorV1,
+) -> Result<GroupInfraError, GroupEngineError> {
+    use raft_app_proto::group_infra_error_v1::Error;
+
+    match required(err.error, "group_infra_error.error")? {
+        Error::Internal(err) => Ok(GroupInfraError::Internal {
+            message: err.message,
+        }),
+        Error::ProtoDecode(err) => Ok(GroupInfraError::ProtoDecode { field: err.field }),
+        Error::ColdBackpressure(err) => Ok(GroupInfraError::ColdBackpressure {
+            stream_id: stream_id_from_proto(
+                err.stream_id,
+                "group_infra_error.cold_backpressure.stream_id",
+            )?,
+            before_group_hot_bytes: err.before_group_hot_bytes,
+            after_group_hot_bytes: err.after_group_hot_bytes,
+            limit: err.limit,
+        }),
+        Error::RaftUncommittedBackpressure(err) => {
+            Ok(GroupInfraError::RaftUncommittedBackpressure {
+                current: err.current,
+                incoming: err.incoming,
+                limit: err.limit,
+            })
+        }
+    }
+}
+
+pub(crate) fn stream_error_context_to_proto(
+    context: StreamErrorContext,
+) -> raft_app_proto::StreamErrorContextV1 {
+    use raft_app_proto::stream_error_context_v1::Context;
+    let context = match context {
+        StreamErrorContext::StreamClosed => {
+            Context::StreamClosed(raft_app_proto::BlankResponseV1 {})
+        }
+        StreamErrorContext::StaleColdFlushCandidate => {
+            Context::StaleColdFlushCandidate(raft_app_proto::BlankResponseV1 {})
+        }
+        StreamErrorContext::ProducerEpochStale { current_epoch } => {
+            Context::ProducerCurrentEpoch(current_epoch)
+        }
+        StreamErrorContext::ProducerSeqConflict {
+            expected_seq,
+            received_seq,
+        } => Context::ProducerSeqConflict(raft_app_proto::ProducerSeqConflictContextV1 {
+            expected_seq,
+            received_seq,
+        }),
+    };
+    raft_app_proto::StreamErrorContextV1 {
+        context: Some(context),
+    }
+}
+
+pub(crate) fn stream_error_context_from_proto(
+    context: raft_app_proto::StreamErrorContextV1,
+) -> Result<StreamErrorContext, GroupEngineError> {
+    use raft_app_proto::stream_error_context_v1::Context;
+    match context.context {
+        Some(Context::StreamClosed(_)) => Ok(StreamErrorContext::StreamClosed),
+        Some(Context::StaleColdFlushCandidate(_)) => {
+            Ok(StreamErrorContext::StaleColdFlushCandidate)
+        }
+        Some(Context::ProducerCurrentEpoch(current_epoch)) => {
+            Ok(StreamErrorContext::ProducerEpochStale { current_epoch })
+        }
+        Some(Context::ProducerSeqConflict(context)) => {
+            Ok(StreamErrorContext::ProducerSeqConflict {
+                expected_seq: context.expected_seq,
+                received_seq: context.received_seq,
+            })
+        }
+        None => Err(GroupEngineError::new(
+            "protobuf group engine error: missing context",
+        )),
+    }
 }
 
 pub(crate) fn group_leader_hint_to_proto(

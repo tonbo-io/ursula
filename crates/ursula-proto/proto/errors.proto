@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+package ursula.durable.v1;
+
+import "types.proto";
+
+message GroupEngineErrorV1 {
+  oneof error {
+    StreamEngineErrorV1 stream = 1;
+    GroupInfraErrorV1 infra = 2;
+    ForwardToLeaderErrorV1 forward_to_leader = 3;
+  }
+}
+
+message StreamEngineErrorV1 {
+  string message = 1;
+  StreamErrorCodeV1 code = 2;
+  optional uint64 next_offset = 3;
+  repeated StreamErrorContextV1 context = 4;
+}
+
+message GroupInfraErrorV1 {
+  oneof error {
+    InternalGroupInfraErrorV1 internal = 1;
+    ColdBackpressureErrorV1 cold_backpressure = 2;
+    RaftUncommittedBackpressureErrorV1 raft_uncommitted_backpressure = 3;
+    ProtoDecodeErrorV1 proto_decode = 4;
+  }
+}
+
+message InternalGroupInfraErrorV1 {
+  string message = 1;
+}
+
+message ProtoDecodeErrorV1 {
+  string field = 1;
+}
+
+message ColdBackpressureErrorV1 {
+  BucketStreamIdV1 stream_id = 1;
+  uint64 before_group_hot_bytes = 2;
+  uint64 after_group_hot_bytes = 3;
+  uint64 limit = 4;
+}
+
+message RaftUncommittedBackpressureErrorV1 {
+  uint64 current = 1;
+  uint64 incoming = 2;
+  uint64 limit = 3;
+}
+
+message ForwardToLeaderErrorV1 {
+  string message = 1;
+  GroupLeaderHintV1 leader_hint = 2;
+}
+
+message StreamErrorContextV1 {
+  oneof context {
+    BlankResponseV1 stream_closed = 1;
+    uint64 producer_current_epoch = 2;
+    ProducerSeqConflictContextV1 producer_seq_conflict = 3;
+    BlankResponseV1 stale_cold_flush_candidate = 4;
+  }
+}
+
+message ProducerSeqConflictContextV1 {
+  uint64 expected_seq = 1;
+  uint64 received_seq = 2;
+}
+
+enum StreamErrorCodeV1 {
+  STREAM_ERROR_CODE_UNSPECIFIED = 0;
+  STREAM_ERROR_CODE_INVALID_BUCKET_ID = 1;
+  STREAM_ERROR_CODE_INVALID_STREAM_ID = 2;
+  STREAM_ERROR_CODE_BUCKET_NOT_FOUND = 3;
+  STREAM_ERROR_CODE_BUCKET_NOT_EMPTY = 4;
+  STREAM_ERROR_CODE_STREAM_NOT_FOUND = 5;
+  STREAM_ERROR_CODE_STREAM_GONE = 6;
+  STREAM_ERROR_CODE_STREAM_ALREADY_EXISTS_CONFLICT = 7;
+  STREAM_ERROR_CODE_MISSING_CONTENT_TYPE = 8;
+  STREAM_ERROR_CODE_CONTENT_TYPE_MISMATCH = 9;
+  STREAM_ERROR_CODE_EMPTY_APPEND = 10;
+  STREAM_ERROR_CODE_STREAM_CLOSED = 11;
+  STREAM_ERROR_CODE_STREAM_SEQ_CONFLICT = 12;
+  STREAM_ERROR_CODE_INVALID_PRODUCER = 13;
+  STREAM_ERROR_CODE_PRODUCER_EPOCH_STALE = 14;
+  STREAM_ERROR_CODE_PRODUCER_SEQ_CONFLICT = 15;
+  STREAM_ERROR_CODE_INVALID_RETENTION = 16;
+  STREAM_ERROR_CODE_INVALID_FORK = 17;
+  STREAM_ERROR_CODE_OFFSET_OUT_OF_RANGE = 18;
+  STREAM_ERROR_CODE_INVALID_COLD_FLUSH = 19;
+  STREAM_ERROR_CODE_INVALID_SNAPSHOT = 20;
+  STREAM_ERROR_CODE_SNAPSHOT_NOT_FOUND = 21;
+  STREAM_ERROR_CODE_SNAPSHOT_CONFLICT = 22;
+}

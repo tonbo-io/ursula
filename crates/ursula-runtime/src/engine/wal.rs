@@ -118,7 +118,7 @@ impl WalGroupEngine {
                 log_path,
                 placement,
                 metrics,
-                init_error: Some(err.message().to_owned()),
+                init_error: Some(err.message().into_owned()),
             },
         }
     }

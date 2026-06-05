@@ -14,6 +14,7 @@ use ursula_raft::{RaftGroupMetricsSnapshot, RaftLogProgressSnapshot};
 use ursula_runtime::{
     AppendResponse, BootstrapStreamResponse, ColdStoreInfo, ProducerRequest, ReadSnapshotResponse,
     ReadStreamResponse, RuntimeError, RuntimeMailboxSnapshot, RuntimeMetricsSnapshot,
+    StreamErrorCode, StreamErrorContext,
 };
 use ursula_shard::BucketStreamId;
 
@@ -41,33 +42,40 @@ pub(crate) fn runtime_error_status(err: &RuntimeError) -> StatusCode {
         // Normal static-cluster path redirects GroupNotHosted to a voter. This is the
         // fallback when no routing target is available.
         RuntimeError::GroupNotHosted { .. } => StatusCode::SERVICE_UNAVAILABLE,
-        RuntimeError::GroupEngine { message, .. } => stream_error_status(message),
+        RuntimeError::GroupEngine { error, .. } if error.is_backpressure() => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        RuntimeError::GroupEngine { error, .. } => match error.code() {
+            Some(code) => stream_error_code_status(code),
+            None => StatusCode::INTERNAL_SERVER_ERROR,
+        },
     }
 }
 
-pub(crate) fn stream_error_status(message: &str) -> StatusCode {
-    if message.contains("ColdBackpressure") {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else if message.contains("StreamGone") {
-        StatusCode::GONE
-    } else if message.contains("NotFound") {
-        StatusCode::NOT_FOUND
-    } else if message.contains("ContentTypeMismatch")
-        || message.contains("StreamAlreadyExistsConflict")
-        || message.contains("StreamClosed")
-        || message.contains("StreamSeqConflict")
-        || message.contains("SnapshotConflict")
-        || message.contains("ProducerSeqConflict")
-    {
-        StatusCode::CONFLICT
-    } else if message.contains("ProducerEpochStale") {
-        StatusCode::FORBIDDEN
-    } else if message.contains("Invalid") || message.contains("EmptyAppend") {
-        StatusCode::BAD_REQUEST
-    } else if message.contains("OffsetOutOfRange") {
-        StatusCode::RANGE_NOT_SATISFIABLE
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
+pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
+    match code {
+        StreamErrorCode::StreamGone => StatusCode::GONE,
+        StreamErrorCode::BucketNotFound
+        | StreamErrorCode::StreamNotFound
+        | StreamErrorCode::SnapshotNotFound => StatusCode::NOT_FOUND,
+        StreamErrorCode::ContentTypeMismatch
+        | StreamErrorCode::StreamAlreadyExistsConflict
+        | StreamErrorCode::StreamClosed
+        | StreamErrorCode::StreamSeqConflict
+        | StreamErrorCode::SnapshotConflict
+        | StreamErrorCode::ProducerSeqConflict => StatusCode::CONFLICT,
+        StreamErrorCode::ProducerEpochStale => StatusCode::FORBIDDEN,
+        StreamErrorCode::OffsetOutOfRange => StatusCode::RANGE_NOT_SATISFIABLE,
+        StreamErrorCode::InvalidBucketId
+        | StreamErrorCode::InvalidStreamId
+        | StreamErrorCode::BucketNotEmpty
+        | StreamErrorCode::MissingContentType
+        | StreamErrorCode::EmptyAppend
+        | StreamErrorCode::InvalidProducer
+        | StreamErrorCode::InvalidRetention
+        | StreamErrorCode::InvalidFork
+        | StreamErrorCode::InvalidColdFlush
+        | StreamErrorCode::InvalidSnapshot => StatusCode::BAD_REQUEST,
     }
 }
 
@@ -146,50 +154,38 @@ pub(crate) fn insert_producer_ack(headers: &mut HeaderMap, producer: Option<&Pro
 }
 
 pub(crate) fn insert_producer_error_headers(headers: &mut HeaderMap, err: &RuntimeError) {
-    let RuntimeError::GroupEngine { message, .. } = err else {
-        return;
-    };
-    if let Some(current_epoch) = parse_u64_after(message, "current epoch is ") {
-        insert_u64_header(headers, HEADER_PRODUCER_EPOCH, current_epoch);
-    }
-    if let Some(expected_seq) = parse_u64_after(message, "expected sequence ") {
-        insert_u64_header(headers, "producer-expected-seq", expected_seq);
-    }
-    if let Some(received_seq) = parse_u64_after(message, "received ") {
-        insert_u64_header(headers, "producer-received-seq", received_seq);
+    for context in err.stream_error_context() {
+        match context {
+            StreamErrorContext::ProducerEpochStale { current_epoch } => {
+                insert_u64_header(headers, HEADER_PRODUCER_EPOCH, *current_epoch);
+            }
+            StreamErrorContext::ProducerSeqConflict {
+                expected_seq,
+                received_seq,
+            } => {
+                insert_u64_header(headers, "producer-expected-seq", *expected_seq);
+                insert_u64_header(headers, "producer-received-seq", *received_seq);
+            }
+            StreamErrorContext::StreamClosed | StreamErrorContext::StaleColdFlushCandidate => {}
+        }
     }
 }
 
 pub(crate) fn insert_stream_error_headers(headers: &mut HeaderMap, err: &RuntimeError) {
-    let RuntimeError::GroupEngine { message, .. } = err else {
-        return;
-    };
-    if message.contains("StreamClosed") || message.contains(" is closed") {
+    if err
+        .stream_error_context()
+        .iter()
+        .any(|context| matches!(context, StreamErrorContext::StreamClosed))
+    {
         insert_static(headers, HEADER_STREAM_CLOSED, "true");
     }
 }
 
 pub(crate) fn insert_stream_error_offset(headers: &mut HeaderMap, err: &RuntimeError) {
-    let RuntimeError::GroupEngine {
-        next_offset: Some(next_offset),
-        ..
-    } = err
-    else {
+    let Some(next_offset) = err.stream_next_offset() else {
         return;
     };
-    insert_offset(headers, *next_offset);
-}
-
-pub(crate) fn parse_u64_after(message: &str, marker: &str) -> Option<u64> {
-    let start = message.find(marker)? + marker.len();
-    let digits = message[start..]
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>();
-    if digits.is_empty() {
-        return None;
-    }
-    digits.parse().ok()
+    insert_offset(headers, next_offset);
 }
 
 pub(crate) fn insert_u64_header(headers: &mut HeaderMap, name: &'static str, value: u64) {

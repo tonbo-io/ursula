@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package ursula.durable.v1;
+
+message BucketStreamIdV1 {
+  string bucket_id = 1;
+  string stream_id = 2;
+}
+
+message ProducerRequestV1 {
+  string producer_id = 1;
+  uint64 producer_epoch = 2;
+  uint64 producer_seq = 3;
+}
+
+message ExternalPayloadRefV1 {
+  string s3_path = 1;
+  uint64 payload_len = 2;
+  uint64 object_size = 3;
+}
+
+message ColdChunkRefV1 {
+  uint64 start_offset = 1;
+  uint64 end_offset = 2;
+  string s3_path = 3;
+  uint64 object_size = 4;
+}
+
+message ShardPlacementV1 {
+  uint32 core_id = 1;
+  uint32 shard_id = 2;
+  uint32 raft_group_id = 3;
+}
+
+message GroupLeaderHintV1 {
+  optional uint64 node_id = 1;
+  optional string address = 2;
+}
+
+message BlankResponseV1 {}

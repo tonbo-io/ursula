@@ -55,9 +55,10 @@ use ursula_raft::{
 use ursula_runtime::{
     AppendBatchRequest, AppendExternalRequest, AppendRequest, AppendResponse,
     BootstrapStreamRequest, CloseStreamRequest, CreateStreamExternalRequest, CreateStreamRequest,
-    CreateStreamResponse, DeleteSnapshotRequest, DeleteStreamRequest, ExternalPayloadRef,
-    HeadStreamRequest, PlanColdFlushRequest, ProducerRequest, PublishSnapshotRequest,
-    ReadSnapshotRequest, ReadStreamRequest, RuntimeError, ShardRuntime, new_external_payload_path,
+    CreateStreamResponse, DeleteSnapshotRequest, DeleteStreamRequest, ErrorStatus,
+    ExternalPayloadRef, HeadStreamRequest, PlanColdFlushRequest, ProducerRequest,
+    PublishSnapshotRequest, ReadSnapshotRequest, ReadStreamRequest, RuntimeError, ShardRuntime,
+    new_external_payload_path,
 };
 use ursula_shard::{BucketStreamId, RaftGroupId};
 
@@ -316,13 +317,7 @@ impl ClientWriteLeaderRouter {
     }
 
     fn leader_base(&self, err: &RuntimeError) -> Option<(u64, String)> {
-        let RuntimeError::GroupEngine {
-            leader_hint: Some(leader_hint),
-            ..
-        } = err
-        else {
-            return None;
-        };
+        let leader_hint = err.leader_hint()?;
         let leader_id = leader_hint.node_id?;
         let leader_base = self
             .peers
@@ -2586,10 +2581,20 @@ fn runtime_error_response(err: RuntimeError) -> Response {
     }
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
+    insert_retry_after_for_temporary(&mut headers, &err);
     insert_producer_error_headers(&mut headers, &err);
     insert_stream_error_headers(&mut headers, &err);
     insert_stream_error_offset(&mut headers, &err);
     (status, headers, err.to_string()).into_response()
+}
+
+fn insert_retry_after_for_temporary(headers: &mut HeaderMap, err: &RuntimeError) {
+    if err.status() == ErrorStatus::Temporary {
+        headers.insert(
+            axum::http::header::RETRY_AFTER,
+            HeaderValue::from_static("1"),
+        );
+    }
 }
 
 pub(crate) async fn runtime_error_or_leader_redirect_async(
@@ -2620,13 +2625,7 @@ pub(crate) async fn runtime_error_or_leader_redirect_async(
 /// leader (carries a leader hint), regardless of whether the leader is yet
 /// known.
 fn is_forward_to_leader(err: &RuntimeError) -> bool {
-    matches!(
-        err,
-        RuntimeError::GroupEngine {
-            leader_hint: Some(_),
-            ..
-        }
-    )
+    err.leader_hint().is_some()
 }
 
 /// 503 + `Retry-After: 1` for a write that hit a non-leader while the group has

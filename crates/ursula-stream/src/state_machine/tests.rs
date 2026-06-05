@@ -337,6 +337,7 @@ fn flush_cold_moves_hot_prefix_to_manifest_and_read_plan_splits() {
             code: StreamErrorCode::InvalidColdFlush,
             message: "stream 'benchcmp/cold' read requires object payload store".to_owned(),
             next_offset: Some(6),
+            context: Vec::new(),
         })
     );
     assert_eq!(
@@ -879,7 +880,12 @@ fn stale_cold_flush_candidate_after_delete_recreate_is_invalid_without_mutation(
             code: StreamErrorCode::InvalidColdFlush,
             message,
             next_offset: Some(17),
-        } => assert!(message.contains("beyond stream")),
+            context,
+            ..
+        } => {
+            assert!(message.contains("beyond stream"));
+            assert_eq!(context, vec![StreamErrorContext::StaleColdFlushCandidate]);
+        }
         other => panic!("expected stale invalid cold flush, got {other:?}"),
     }
 

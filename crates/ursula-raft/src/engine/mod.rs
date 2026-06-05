@@ -1274,7 +1274,7 @@ impl GroupEngine for RaftGroupEngine {
 }
 
 pub(crate) fn group_engine_io_error(err: ursula_runtime::GroupEngineError) -> io::Error {
-    io::Error::other(err.message().to_owned())
+    io::Error::other(err.message().into_owned())
 }
 
 pub(crate) fn invalid_data(err: impl std::error::Error + Send + Sync + 'static) -> io::Error {
