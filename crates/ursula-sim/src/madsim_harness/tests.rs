@@ -349,12 +349,16 @@ fn cold_delete_fault_workload_replays_with_same_seed_and_trace() {
     assert_eq!(first.outcome.seed, 58);
     assert!(first.outcome.trace.events.iter().any(|event| matches!(
         event,
-        SimEvent::ColdDeleteFaultObserved {
-            cleanup_attempts: 1,
-            cleanup_errors: 1,
-            ..
-        }
+        SimEvent::FaultApplied { phase } if phase == "before_cold_cleanup"
     )));
+    assert!(
+        !first
+            .outcome
+            .trace
+            .events
+            .iter()
+            .any(|event| matches!(event, SimEvent::ColdDeleteFaultObserved { .. }))
+    );
 }
 
 #[test]
