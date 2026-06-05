@@ -656,23 +656,13 @@ pub(super) async fn run_cold_delete_fault_inner(
     let flushed = runtime
         .flush_cold_candidates_batch_for_simulation(candidates)
         .await
-        .expect("stale cold candidate should be skipped after cleanup attempt");
+        .expect("stale cold candidate should be skipped after uncertain publish");
     assert!(flushed.is_empty());
     let metrics = runtime.metrics().snapshot();
     assert_eq!(metrics.cold_flush_uploads, 1);
     assert_eq!(metrics.cold_flush_publishes, 0);
-    assert_eq!(metrics.cold_orphan_cleanup_attempts, 1);
-    assert_eq!(
-        metrics.cold_orphan_cleanup_errors,
-        u64::from(inject_delete_fault)
-    );
-    if inject_delete_fault {
-        trace.push(SimEvent::ColdDeleteFaultObserved {
-            stream: config.stream.clone(),
-            cleanup_attempts: metrics.cold_orphan_cleanup_attempts,
-            cleanup_errors: metrics.cold_orphan_cleanup_errors,
-        });
-    }
+    assert_eq!(metrics.cold_orphan_cleanup_attempts, 0);
+    assert_eq!(metrics.cold_orphan_cleanup_errors, 0);
 
     let read = runtime
         .read_stream(ReadStreamRequest {

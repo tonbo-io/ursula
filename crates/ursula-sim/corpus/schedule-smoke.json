@@ -444,15 +444,6 @@
           {
             "event": "fault_applied",
             "phase": "before_cold_cleanup"
-          },
-          {
-            "event": "cold_delete_fault_observed",
-            "stream": {
-              "bucket_id": "benchcmp",
-              "stream_id": "ursula-sim-schedule-58-cold-delete-fault"
-            },
-            "cleanup_attempts": 1,
-            "cleanup_errors": 1
           }
         ]
       }
