@@ -579,6 +579,10 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
         if let Some(page) = self.get_cached(key) {
             return Ok(Some(page));
         }
+        self.reload_page(key).await
+    }
+
+    async fn reload_page(&self, key: &ColdIndexPageKey) -> io::Result<Option<Arc<ColdIndexPage>>> {
         let Some(page) = self.store.get_page(key).await? else {
             return Ok(None);
         };
@@ -612,22 +616,12 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
                     "cold index read range overflows",
                 )
             })?;
-        let mut objects = Vec::new();
-        for chunk in &page.cold_chunks {
-            if let Some(object) = intersect_object(
-                &ObjectPayloadRef::from(chunk),
-                segment.read_start_offset,
-                read_end,
-            ) {
-                objects.push(object);
-            }
+        let mut objects = objects_for_read(&page, segment.read_start_offset, read_end);
+        if !objects_cover_range(&objects, segment.read_start_offset, read_end)
+            && let Some(reloaded) = self.reload_page(&key).await?
+        {
+            objects = objects_for_read(&reloaded, segment.read_start_offset, read_end);
         }
-        for object in &page.external_segments {
-            if let Some(object) = intersect_object(object, segment.read_start_offset, read_end) {
-                objects.push(object);
-            }
-        }
-        objects.sort_by_key(|object| object.start_offset);
         if !objects_cover_range(&objects, segment.read_start_offset, read_end) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -697,6 +691,23 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
             inner.pages.remove(&key);
         }
     }
+}
+
+fn objects_for_read(page: &ColdIndexPage, read_start: u64, read_end: u64) -> Vec<ObjectPayloadRef> {
+    let mut objects = Vec::new();
+    for chunk in &page.cold_chunks {
+        if let Some(object) = intersect_object(&ObjectPayloadRef::from(chunk), read_start, read_end)
+        {
+            objects.push(object);
+        }
+    }
+    for object in &page.external_segments {
+        if let Some(object) = intersect_object(object, read_start, read_end) {
+            objects.push(object);
+        }
+    }
+    objects.sort_by_key(|object| object.start_offset);
+    objects
 }
 
 fn intersect_object(
@@ -818,6 +829,62 @@ mod tests {
             .expect("get page")
             .expect("page exists");
         assert_eq!(page.cold_chunks, vec![newer]);
+    }
+
+    #[tokio::test]
+    async fn read_reload_repairs_stale_cached_page() {
+        let store = Arc::new(InMemoryColdIndexPageStore::new());
+        let stream_id = BucketStreamId::new("benchcmp", "cold-index");
+        let cache = ColdIndexPageCache::new(store.clone(), 8);
+        let first = ColdChunkRef {
+            start_offset: 0,
+            end_offset: 128,
+            s3_path: "benchcmp/cold-index/chunks/first.bin".to_owned(),
+            object_size: 128,
+        };
+        write_cold_chunk_index_pages(store.as_ref(), &stream_id, &first)
+            .await
+            .expect("write first chunk");
+        assert_eq!(
+            cache
+                .object_segments_for_read(
+                    &stream_id,
+                    &StreamReadColdIndexSegment {
+                        generation: 0,
+                        page_id: 0,
+                        read_start_offset: 0,
+                        len: 1,
+                    },
+                )
+                .await
+                .expect("read first byte")
+                .len(),
+            1
+        );
+
+        let second = ColdChunkRef {
+            start_offset: 128,
+            end_offset: 256,
+            s3_path: "benchcmp/cold-index/chunks/second.bin".to_owned(),
+            object_size: 128,
+        };
+        write_cold_chunk_index_pages(store.as_ref(), &stream_id, &second)
+            .await
+            .expect("write second chunk behind cache");
+
+        let objects = cache
+            .object_segments_for_read(
+                &stream_id,
+                &StreamReadColdIndexSegment {
+                    generation: 0,
+                    page_id: 0,
+                    read_start_offset: 128,
+                    len: 1,
+                },
+            )
+            .await
+            .expect("reload stale page");
+        assert_eq!(objects[0].s3_path, second.s3_path);
     }
 
     #[test]
