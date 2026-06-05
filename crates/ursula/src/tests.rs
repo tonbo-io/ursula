@@ -3568,7 +3568,7 @@ async fn static_grpc_raft_durable_cold_flush_replicates_manifest() {
                 .find(|entry| entry.metadata.stream_id == stream_id)
                 .cloned()
                 .expect("stream snapshot entry");
-            if !entry.cold_chunks.is_empty() && entry.payload.len() < payload.len() {
+            if entry.cold_frontier_offset > 0 && entry.payload.len() < payload.len() {
                 last_snapshot = Some(entry);
                 break;
             }
@@ -3577,8 +3577,8 @@ async fn static_grpc_raft_durable_cold_flush_replicates_manifest() {
         }
         let entry = last_snapshot.expect("stream snapshot entry");
         assert!(
-            !entry.cold_chunks.is_empty(),
-            "replicated stream should have cold manifest chunks"
+            entry.cold_frontier_offset > 0,
+            "replicated stream should advance cold frontier"
         );
         assert!(
             entry.payload.len() < payload.len(),
