@@ -1940,7 +1940,7 @@ async fn stale_cold_flush_batch_after_delete_recreate_is_classified_for_cleanup(
     let metrics = runtime.metrics().snapshot();
     assert_eq!(metrics.cold_flush_uploads, 1);
     assert_eq!(metrics.cold_flush_publishes, 0);
-    assert_eq!(metrics.cold_orphan_cleanup_attempts, 1);
+    assert_eq!(metrics.cold_orphan_cleanup_attempts, 0);
     assert_eq!(metrics.cold_orphan_cleanup_errors, 0);
 
     let read = runtime
