@@ -434,6 +434,7 @@ class ChaosAgent:
         self.last_read_availability_error: str | None = None
         self.last_integrity_check: datetime | None = None
         self.last_read_check: dict[str, Any] | None = None
+        self.last_read_error_check: dict[str, Any] | None = None
         self.last_cold_flush: dict[str, Any] | None = None
         self.last_checked_expected_live_setsum: str | None = None
         self.last_server_integrity: dict[str, Any] | None = None
@@ -1009,6 +1010,7 @@ class ChaosAgent:
             "offset": offset,
             "nodes": node_results,
         }
+        self.last_read_error_check = self.last_read_check
         summary = "; ".join(
             f"{result['node']}={result.get('status')}"
             + (f":{result['error']}" if result.get("error") else "")
@@ -1043,8 +1045,6 @@ class ChaosAgent:
                 if availability_error:
                     self.read_availability_errors += 1
                     self.last_read_availability_error = error
-                if level == "error":
-                    self.last_integrity_error = error
                 self.event(level, f"reader availability failed: {error}")
 
     def record_producer_probe_result(self, ok: bool, message: str) -> None:
@@ -2613,6 +2613,8 @@ class ChaosAgent:
                 "gc_churn_deleted_total": self.gc_churn_deleted,
                 "gc_churn_error_total": self.gc_churn_errors,
                 "gc_churn_pending": len(self.gc_churn_pending),
+                "last_read_check": self.last_read_check,
+                "last_read_error_check": self.last_read_error_check,
                 "coverage": self.workload_coverage(storage),
             },
             "integrity": {
