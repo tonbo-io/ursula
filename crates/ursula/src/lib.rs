@@ -2581,6 +2581,9 @@ pub(crate) fn parse_producer_integer(name: &str, raw: &str) -> Result<u64, Strin
 
 fn runtime_error_response(err: RuntimeError) -> Response {
     let status = runtime_error_status(&err);
+    if status.is_server_error() {
+        tracing::warn!(%status, error = %err, "runtime request failed");
+    }
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     insert_producer_error_headers(&mut headers, &err);
