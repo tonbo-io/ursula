@@ -1,7 +1,16 @@
 use ursula_shard::{CoreId, RaftGroupId, ShardMapError, ShardPlacement};
-use ursula_stream::StreamErrorCode;
+use ursula_stream::{StreamErrorCode, StreamErrorContext};
 
 use crate::engine::{GroupEngineError, GroupLeaderHint};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorStatus {
+    Permanent,
+    Temporary,
+    // Persistent is reserved for non-retryable service-side failures. HTTP currently
+    // treats it like Permanent; keeping it distinct leaves room for logging/alerting.
+    Persistent,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
@@ -36,9 +45,7 @@ pub enum RuntimeError {
     GroupEngine {
         core_id: CoreId,
         raft_group_id: RaftGroupId,
-        message: String,
-        next_offset: Option<u64>,
-        leader_hint: Option<GroupLeaderHint>,
+        error: GroupEngineError,
     },
     MailboxClosed {
         core_id: CoreId,
@@ -57,9 +64,50 @@ impl RuntimeError {
         Self::GroupEngine {
             core_id: placement.core_id,
             raft_group_id: placement.raft_group_id,
-            message: err.message().to_owned(),
-            next_offset: err.next_offset(),
-            leader_hint: err.leader_hint().cloned(),
+            error: err,
+        }
+    }
+
+    pub fn stream_error_code(&self) -> Option<StreamErrorCode> {
+        match self {
+            Self::GroupEngine { error, .. } => error.code(),
+            _ => None,
+        }
+    }
+
+    pub fn stream_next_offset(&self) -> Option<u64> {
+        match self {
+            Self::GroupEngine { error, .. } => error.next_offset(),
+            _ => None,
+        }
+    }
+
+    pub fn stream_error_context(&self) -> &[StreamErrorContext] {
+        match self {
+            Self::GroupEngine { error, .. } => error.context(),
+            _ => &[],
+        }
+    }
+
+    pub fn leader_hint(&self) -> Option<&GroupLeaderHint> {
+        match self {
+            Self::GroupEngine { error, .. } => error.leader_hint(),
+            _ => None,
+        }
+    }
+
+    pub fn status(&self) -> ErrorStatus {
+        match self {
+            Self::LiveReadBackpressure { .. } | Self::GroupNotHosted { .. } => {
+                ErrorStatus::Temporary
+            }
+            Self::GroupEngine { error, .. } if error.leader_hint().is_some() => {
+                ErrorStatus::Temporary
+            }
+            Self::GroupEngine { error, .. } if error.is_backpressure() => ErrorStatus::Temporary,
+            Self::GroupEngine { error, .. } if error.code().is_some() => ErrorStatus::Permanent,
+            Self::GroupEngine { .. } => ErrorStatus::Persistent,
+            _ => ErrorStatus::Permanent,
         }
     }
 }
@@ -109,12 +157,14 @@ impl std::fmt::Display for RuntimeError {
             Self::GroupEngine {
                 core_id,
                 raft_group_id,
-                message,
+                error,
                 ..
             } => write!(
                 f,
-                "core {} raft group {} operation failed: {message}",
-                core_id.0, raft_group_id.0
+                "core {} raft group {} operation failed: {}",
+                core_id.0,
+                raft_group_id.0,
+                error.message()
             ),
             Self::MailboxClosed { core_id } => {
                 write!(f, "core {} mailbox is closed", core_id.0)
@@ -141,9 +191,7 @@ pub(crate) fn map_fork_source_ref_error(
     err: RuntimeError,
     placement: ShardPlacement,
 ) -> RuntimeError {
-    if let RuntimeError::GroupEngine { message, .. } = &err
-        && message.contains("StreamGone")
-    {
+    if err.stream_error_code() == Some(StreamErrorCode::StreamGone) {
         return RuntimeError::group_engine(
             placement,
             GroupEngineError::stream(

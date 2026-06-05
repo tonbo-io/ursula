@@ -2,73 +2,8 @@ syntax = "proto3";
 
 package ursula.durable.v1;
 
-message BucketStreamIdV1 {
-  string bucket_id = 1;
-  string stream_id = 2;
-}
-
-message ProducerRequestV1 {
-  string producer_id = 1;
-  uint64 producer_epoch = 2;
-  uint64 producer_seq = 3;
-}
-
-message ExternalPayloadRefV1 {
-  string s3_path = 1;
-  uint64 payload_len = 2;
-  uint64 object_size = 3;
-}
-
-message ColdChunkRefV1 {
-  uint64 start_offset = 1;
-  uint64 end_offset = 2;
-  string s3_path = 3;
-  uint64 object_size = 4;
-}
-
-message ShardPlacementV1 {
-  uint32 core_id = 1;
-  uint32 shard_id = 2;
-  uint32 raft_group_id = 3;
-}
-
-message GroupLeaderHintV1 {
-  optional uint64 node_id = 1;
-  optional string address = 2;
-}
-
-message GroupEngineErrorV1 {
-  string message = 1;
-  optional StreamErrorCodeV1 code = 2;
-  optional uint64 next_offset = 3;
-  GroupLeaderHintV1 leader_hint = 4;
-}
-
-enum StreamErrorCodeV1 {
-  STREAM_ERROR_CODE_UNSPECIFIED = 0;
-  STREAM_ERROR_CODE_INVALID_BUCKET_ID = 1;
-  STREAM_ERROR_CODE_INVALID_STREAM_ID = 2;
-  STREAM_ERROR_CODE_BUCKET_NOT_FOUND = 3;
-  STREAM_ERROR_CODE_BUCKET_NOT_EMPTY = 4;
-  STREAM_ERROR_CODE_STREAM_NOT_FOUND = 5;
-  STREAM_ERROR_CODE_STREAM_GONE = 6;
-  STREAM_ERROR_CODE_STREAM_ALREADY_EXISTS_CONFLICT = 7;
-  STREAM_ERROR_CODE_MISSING_CONTENT_TYPE = 8;
-  STREAM_ERROR_CODE_CONTENT_TYPE_MISMATCH = 9;
-  STREAM_ERROR_CODE_EMPTY_APPEND = 10;
-  STREAM_ERROR_CODE_STREAM_CLOSED = 11;
-  STREAM_ERROR_CODE_STREAM_SEQ_CONFLICT = 12;
-  STREAM_ERROR_CODE_INVALID_PRODUCER = 13;
-  STREAM_ERROR_CODE_PRODUCER_EPOCH_STALE = 14;
-  STREAM_ERROR_CODE_PRODUCER_SEQ_CONFLICT = 15;
-  STREAM_ERROR_CODE_INVALID_RETENTION = 16;
-  STREAM_ERROR_CODE_INVALID_FORK = 17;
-  STREAM_ERROR_CODE_OFFSET_OUT_OF_RANGE = 18;
-  STREAM_ERROR_CODE_INVALID_COLD_FLUSH = 19;
-  STREAM_ERROR_CODE_INVALID_SNAPSHOT = 20;
-  STREAM_ERROR_CODE_SNAPSHOT_NOT_FOUND = 21;
-  STREAM_ERROR_CODE_SNAPSHOT_CONFLICT = 22;
-}
+import "errors.proto";
+import "types.proto";
 
 message RaftGroupCommandV1 {
   oneof command {
@@ -200,8 +135,6 @@ message RaftGroupResponseV1 {
     GroupEngineErrorV1 write_rejected = 4;
   }
 }
-
-message BlankResponseV1 {}
 
 message MembershipResponseV1 {}
 

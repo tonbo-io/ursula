@@ -49,14 +49,14 @@ pub use engine::{
     GroupBootstrapStreamFuture, GroupCloseStreamFuture, GroupColdHotBacklogFuture,
     GroupCreateStreamFuture, GroupDeleteSnapshotFuture, GroupDeleteStreamFuture, GroupEngine,
     GroupEngineCreateFuture, GroupEngineError, GroupEngineFactory, GroupEngineMetrics,
-    GroupFlushColdFuture, GroupForkRefFuture, GroupHeadStreamFuture, GroupInstallSnapshotFuture,
-    GroupLeaderHint, GroupPlanColdFlushFuture, GroupPlanColdGcFuture,
+    GroupFlushColdFuture, GroupForkRefFuture, GroupHeadStreamFuture, GroupInfraError,
+    GroupInstallSnapshotFuture, GroupLeaderHint, GroupPlanColdFlushFuture, GroupPlanColdGcFuture,
     GroupPlanNextColdFlushBatchFuture, GroupPlanNextColdFlushFuture, GroupPublishSnapshotFuture,
     GroupReadSnapshotFuture, GroupReadStreamFuture, GroupReadStreamPartsFuture,
     GroupRequireLiveReadOwnerFuture, GroupShutdownFuture, GroupSnapshotFuture,
     GroupTouchStreamAccessFuture, GroupWriteBatchFuture, GroupWriteResponse,
 };
-pub use error::RuntimeError;
+pub use error::{ErrorStatus, RuntimeError};
 pub use metrics::{RuntimeMailboxSnapshot, RuntimeMetrics, RuntimeMetricsSnapshot};
 pub use request::{
     AckColdGcResponse, AppendBatchRequest, AppendBatchResponse, AppendExternalRequest,
@@ -80,7 +80,7 @@ pub use snapshot_store::{LocalSnapshotStore, S3SnapshotStore};
 
 pub use ursula_stream::{
     ColdChunkRef, ColdFlushCandidate, ColdGcEntry, ColdGcTarget, ExternalPayloadRef,
-    ProducerRequest, StreamErrorCode, StreamIntegritySnapshot,
+    ProducerRequest, StreamErrorCode, StreamErrorContext, StreamIntegritySnapshot,
 };
 
 #[cfg(test)]

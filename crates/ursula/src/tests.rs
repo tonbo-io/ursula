@@ -14,8 +14,8 @@ use tower::ServiceExt;
 use ursula_raft::StaticGrpcRaftGroupEngineFactory;
 use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_runtime::{
-    ColdStore, ColdStoreHandle, InMemoryGroupEngineFactory, PlanGroupColdFlushRequest,
-    RuntimeConfig, RuntimeError,
+    ColdStore, ColdStoreHandle, GroupEngineError, InMemoryGroupEngineFactory,
+    PlanGroupColdFlushRequest, RuntimeConfig, RuntimeError, StreamErrorCode, StreamErrorContext,
 };
 use ursula_shard::RaftGroupId;
 
@@ -110,6 +110,107 @@ fn raft_group_metric_index_at_least(
         .and_then(|group| group.get(&field_name))
         .and_then(serde_json::Value::as_u64)
         .is_some_and(|index| index >= min_index)
+}
+
+#[test]
+fn runtime_error_status_prefers_stream_error_code_over_message_text() {
+    let err = RuntimeError::GroupEngine {
+        core_id: ursula_shard::CoreId(0),
+        raft_group_id: RaftGroupId(0),
+        error: GroupEngineError::stream_from_replicated(
+            "misleading message says NotFound",
+            StreamErrorCode::StreamGone,
+            None,
+            Vec::new(),
+        ),
+    };
+
+    assert_eq!(crate::render::runtime_error_status(&err), StatusCode::GONE);
+}
+
+#[test]
+fn runtime_error_status_does_not_parse_infra_message_as_stream_error() {
+    let err = RuntimeError::GroupEngine {
+        core_id: ursula_shard::CoreId(0),
+        raft_group_id: RaftGroupId(0),
+        error: GroupEngineError::new("misleading infra message says StreamGone"),
+    };
+
+    assert_eq!(
+        crate::render::runtime_error_status(&err),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+}
+
+#[test]
+fn group_engine_leader_hint_is_detected_without_matching_message() {
+    let err = RuntimeError::GroupEngine {
+        core_id: ursula_shard::CoreId(0),
+        raft_group_id: RaftGroupId(0),
+        error: GroupEngineError::forward_to_leader("forward request", None, None),
+    };
+
+    assert!(super::is_forward_to_leader(&err));
+}
+
+#[test]
+fn runtime_error_response_marks_temporary_errors_retryable() {
+    let response = super::runtime_error_response(RuntimeError::LiveReadBackpressure {
+        core_id: ursula_shard::CoreId(0),
+        current_waiters: 1,
+        limit: 1,
+    });
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.headers().get(axum::http::header::RETRY_AFTER),
+        Some(&axum::http::HeaderValue::from_static("1"))
+    );
+}
+
+#[test]
+fn runtime_error_response_uses_structured_context_for_producer_headers() {
+    let response = super::runtime_error_response(RuntimeError::GroupEngine {
+        core_id: ursula_shard::CoreId(0),
+        raft_group_id: RaftGroupId(0),
+        error: GroupEngineError::stream_with_context(
+            StreamErrorCode::ProducerSeqConflict,
+            "producer conflict without parseable header fields",
+            None,
+            vec![StreamErrorContext::ProducerSeqConflict {
+                expected_seq: 7,
+                received_seq: 3,
+            }],
+        ),
+    });
+
+    assert_eq!(
+        response.headers().get("producer-expected-seq"),
+        Some(&axum::http::HeaderValue::from_static("7"))
+    );
+    assert_eq!(
+        response.headers().get("producer-received-seq"),
+        Some(&axum::http::HeaderValue::from_static("3"))
+    );
+}
+
+#[test]
+fn runtime_error_response_uses_structured_context_for_stream_closed_header() {
+    let response = super::runtime_error_response(RuntimeError::GroupEngine {
+        core_id: ursula_shard::CoreId(0),
+        raft_group_id: RaftGroupId(0),
+        error: GroupEngineError::stream_with_context(
+            StreamErrorCode::StreamClosed,
+            "stream unavailable",
+            None,
+            vec![StreamErrorContext::StreamClosed],
+        ),
+    });
+
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_CLOSED),
+        Some(&axum::http::HeaderValue::from_static("true"))
+    );
 }
 
 #[test]
@@ -1433,6 +1534,10 @@ async fn long_poll_returns_service_unavailable_when_live_waiters_are_full() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.headers().get(axum::http::header::RETRY_AFTER),
+        Some(&axum::http::HeaderValue::from_static("1"))
+    );
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");

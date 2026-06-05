@@ -16,6 +16,7 @@ use ursula_stream::{
 use crate::cold_store::{ColdReadCacheConfig, DEFAULT_CONTENT_TYPE};
 use crate::core_worker::{CoreWorker, ReadWatcher, ReadWatchers};
 use crate::engine::wal::group_log_path;
+use crate::error::ErrorStatus;
 use crate::metrics::RuntimeMetricsInner;
 
 fn runtime(core_count: usize, group_count: usize) -> ShardRuntime {
@@ -71,6 +72,136 @@ fn empty_integrity() -> StreamIntegritySnapshot {
         evicted_records: 0,
         total_records: 0,
     }
+}
+
+#[test]
+fn stream_from_replicated_preserves_wire_message() {
+    let err = GroupEngineError::stream_from_replicated(
+        "wire message already includes code",
+        StreamErrorCode::StreamGone,
+        Some(7),
+        vec![StreamErrorContext::StreamClosed],
+    );
+
+    assert_eq!(err.message(), "wire message already includes code");
+    assert_eq!(err.code(), Some(StreamErrorCode::StreamGone));
+    assert_eq!(err.next_offset(), Some(7));
+    assert_eq!(err.context(), &[StreamErrorContext::StreamClosed]);
+}
+
+#[test]
+fn stream_parts_returns_stream_fields_only() {
+    let err = GroupEngineError::stream_from_replicated(
+        "wire stream message",
+        StreamErrorCode::ProducerSeqConflict,
+        Some(11),
+        vec![StreamErrorContext::ProducerSeqConflict {
+            expected_seq: 10,
+            received_seq: 7,
+        }],
+    );
+
+    let (message, code, next_offset, context) = err
+        .stream_parts()
+        .expect("stream error exposes stream parts");
+    assert_eq!(message, "wire stream message");
+    assert_eq!(code, StreamErrorCode::ProducerSeqConflict);
+    assert_eq!(next_offset, Some(11));
+    assert_eq!(
+        context,
+        &[StreamErrorContext::ProducerSeqConflict {
+            expected_seq: 10,
+            received_seq: 7,
+        }]
+    );
+
+    assert!(GroupEngineError::new("infra").stream_parts().is_none());
+    assert!(
+        GroupEngineError::forward_to_leader("forward", None, None)
+            .stream_parts()
+            .is_none()
+    );
+}
+
+#[test]
+fn runtime_error_status_classifies_retryable_and_permanent_errors() {
+    let backpressure = RuntimeError::LiveReadBackpressure {
+        core_id: CoreId(0),
+        current_waiters: 65_536,
+        limit: 65_536,
+    };
+    assert_eq!(backpressure.status(), ErrorStatus::Temporary);
+
+    let conflict = RuntimeError::GroupEngine {
+        core_id: CoreId(0),
+        raft_group_id: RaftGroupId(0),
+        error: GroupEngineError::stream(
+            StreamErrorCode::StreamSeqConflict,
+            "expected sequence 1 received 0",
+        ),
+    };
+    assert_eq!(conflict.status(), ErrorStatus::Permanent);
+
+    let internal = RuntimeError::GroupEngine {
+        core_id: CoreId(0),
+        raft_group_id: RaftGroupId(0),
+        error: GroupEngineError::new("OpenRaft client_write: timeout after retries"),
+    };
+    assert_eq!(internal.status(), ErrorStatus::Persistent);
+}
+
+#[test]
+fn group_engine_error_variants_separate_stream_infra_and_forwarding() {
+    let stream = GroupEngineError::stream_with_context(
+        StreamErrorCode::ProducerSeqConflict,
+        "producer conflict",
+        Some(9),
+        vec![StreamErrorContext::ProducerSeqConflict {
+            expected_seq: 8,
+            received_seq: 3,
+        }],
+    );
+    assert!(matches!(stream, GroupEngineError::Stream(_)));
+
+    let infra = GroupEngineError::new("OpenRaft client_write failed");
+    assert!(matches!(
+        infra,
+        GroupEngineError::Infra(GroupInfraError::Internal { .. })
+    ));
+
+    let forward = GroupEngineError::forward_to_leader("forward to leader", Some(2), None);
+    assert!(matches!(forward, GroupEngineError::ForwardToLeader { .. }));
+}
+
+#[test]
+fn stale_cold_flush_candidate_classification_uses_context_not_message_text() {
+    let placement = ShardPlacement {
+        core_id: CoreId(0),
+        shard_id: ShardId(0),
+        raft_group_id: RaftGroupId(0),
+    };
+    let message = "cold chunk end 18 is beyond stream 'benchcmp/stale' tail 17";
+    let without_context = RuntimeError::group_engine(
+        placement,
+        GroupEngineError::stream(StreamErrorCode::InvalidColdFlush, message),
+    );
+    assert!(
+        !crate::metrics::is_stale_cold_flush_candidate_error(&without_context),
+        "stale classification must not be inferred from message text"
+    );
+
+    let with_context = RuntimeError::group_engine(
+        placement,
+        GroupEngineError::stream_with_context(
+            StreamErrorCode::InvalidColdFlush,
+            "cold flush candidate is stale",
+            None,
+            vec![StreamErrorContext::StaleColdFlushCandidate],
+        ),
+    );
+    assert!(crate::metrics::is_stale_cold_flush_candidate_error(
+        &with_context
+    ));
 }
 
 fn placement() -> ShardPlacement {
@@ -1505,11 +1636,13 @@ async fn append_before_stream_setup_uses_stream_state_machine_error() {
         RuntimeError::GroupEngine {
             core_id,
             raft_group_id,
-            message,
+            error,
             ..
         } => {
             assert_eq!(core_id, placement.core_id);
             assert_eq!(raft_group_id, placement.raft_group_id);
+            assert_eq!(error.code(), Some(StreamErrorCode::BucketNotFound));
+            let message = error.message();
             assert!(message.contains("BucketNotFound"), "message={message}");
         }
         other => panic!("expected group engine error, got {other:?}"),
@@ -1678,11 +1811,10 @@ async fn flush_cold_publishes_chunk_metadata_on_owner_group() {
         .await
         .expect_err("cold read needs store");
     match err {
-        RuntimeError::GroupEngine {
-            message,
-            next_offset: Some(6),
-            ..
-        } if message.contains("InvalidColdFlush") => {}
+        RuntimeError::GroupEngine { error, .. } => {
+            assert_eq!(error.code(), Some(StreamErrorCode::InvalidColdFlush));
+            assert_eq!(error.next_offset(), Some(6));
+        }
         other => panic!("expected cold read error, got {other:?}"),
     }
 }
@@ -1977,7 +2109,22 @@ async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
         .await
         .expect_err("append should be backpressured");
     match err {
-        RuntimeError::GroupEngine { message, .. } if message.contains("ColdBackpressure") => {}
+        RuntimeError::GroupEngine {
+            error:
+                GroupEngineError::Infra(GroupInfraError::ColdBackpressure {
+                    stream_id,
+                    before_group_hot_bytes,
+                    after_group_hot_bytes,
+                    limit,
+                    ..
+                }),
+            ..
+        } => {
+            assert_eq!(stream_id, stream);
+            assert_eq!(before_group_hot_bytes, 4);
+            assert_eq!(after_group_hot_bytes, 5);
+            assert_eq!(limit, 4);
+        }
         other => panic!("expected cold backpressure, got {other:?}"),
     }
     let metrics = runtime.metrics().snapshot();
@@ -2147,8 +2294,20 @@ async fn raft_uncommitted_admission_rejects_when_incoming_would_exceed_limit() {
         .await
         .expect_err("oversized append should trip raft uncommitted admission");
     match err {
-        RuntimeError::GroupEngine { message, .. }
-            if message.contains("RaftUncommittedBackpressure") => {}
+        RuntimeError::GroupEngine {
+            error:
+                GroupEngineError::Infra(GroupInfraError::RaftUncommittedBackpressure {
+                    current,
+                    incoming,
+                    limit,
+                    ..
+                }),
+            ..
+        } => {
+            assert_eq!(current, 0);
+            assert_eq!(incoming, 5);
+            assert_eq!(limit, 4);
+        }
         other => panic!("expected raft uncommitted backpressure, got {other:?}"),
     }
 
@@ -2183,7 +2342,22 @@ async fn cold_write_admission_rejects_append_batch_without_partial_mutation() {
         .await
         .expect_err("batch should be backpressured");
     match err {
-        RuntimeError::GroupEngine { message, .. } if message.contains("ColdBackpressure") => {}
+        RuntimeError::GroupEngine {
+            error:
+                GroupEngineError::Infra(GroupInfraError::ColdBackpressure {
+                    stream_id,
+                    before_group_hot_bytes,
+                    after_group_hot_bytes,
+                    limit,
+                    ..
+                }),
+            ..
+        } => {
+            assert_eq!(stream_id, stream);
+            assert_eq!(before_group_hot_bytes, 3);
+            assert_eq!(after_group_hot_bytes, 5);
+            assert_eq!(limit, 4);
+        }
         other => panic!("expected cold backpressure, got {other:?}"),
     }
     let read = runtime
@@ -2716,7 +2890,8 @@ async fn close_stream_allows_close_only_and_rejects_later_appends() {
         .await
         .expect_err("append after close rejected");
     match err {
-        RuntimeError::GroupEngine { message, .. } => {
+        RuntimeError::GroupEngine { error, .. } => {
+            let message = error.message();
             assert!(message.contains("StreamClosed"), "message={message}");
         }
         other => panic!("expected group engine error, got {other:?}"),
@@ -2764,7 +2939,8 @@ async fn delete_stream_removes_state_on_owner_group() {
         .await
         .expect_err("head after delete rejected");
     match err {
-        RuntimeError::GroupEngine { message, .. } => {
+        RuntimeError::GroupEngine { error, .. } => {
+            let message = error.message();
             assert!(message.contains("StreamNotFound"), "message={message}");
         }
         other => panic!("expected group engine error, got {other:?}"),
@@ -2775,7 +2951,8 @@ async fn delete_stream_removes_state_on_owner_group() {
         .await
         .expect_err("append after delete rejected");
     match err {
-        RuntimeError::GroupEngine { message, .. } => {
+        RuntimeError::GroupEngine { error, .. } => {
+            let message = error.message();
             assert!(message.contains("StreamNotFound"), "message={message}");
         }
         other => panic!("expected group engine error, got {other:?}"),
@@ -2815,7 +2992,8 @@ async fn fork_ref_keeps_deleted_source_gone_until_last_fork_delete() {
         .await
         .expect_err("soft-deleted source is gone");
     match err {
-        RuntimeError::GroupEngine { message, .. } => {
+        RuntimeError::GroupEngine { error, .. } => {
+            let message = error.message();
             assert!(message.contains("StreamGone"), "message={message}");
         }
         other => panic!("expected group engine error, got {other:?}"),
@@ -2844,7 +3022,8 @@ async fn fork_ref_keeps_deleted_source_gone_until_last_fork_delete() {
         .await
         .expect_err("source is hard-deleted after last fork");
     match err {
-        RuntimeError::GroupEngine { message, .. } => {
+        RuntimeError::GroupEngine { error, .. } => {
+            let message = error.message();
             assert!(message.contains("StreamNotFound"), "message={message}");
         }
         other => panic!("expected group engine error, got {other:?}"),
@@ -3204,9 +3383,7 @@ async fn group_engine_errors_include_group_context_and_do_not_record_success_met
         RuntimeError::GroupEngine {
             core_id: placement.core_id,
             raft_group_id: placement.raft_group_id,
-            message: "proposal rejected".to_owned(),
-            next_offset: None,
-            leader_hint: None,
+            error: GroupEngineError::new("proposal rejected"),
         }
     );
     assert_eq!(runtime.metrics().snapshot().accepted_appends, 0);

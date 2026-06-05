@@ -1,6 +1,12 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let proto = "proto/durable.proto";
-    println!("cargo:rerun-if-changed={proto}");
+    let protos = [
+        "proto/types.proto",
+        "proto/errors.proto",
+        "proto/durable.proto",
+    ];
+    for proto in protos {
+        println!("cargo:rerun-if-changed={proto}");
+    }
     unsafe {
         std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
     }
@@ -21,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "ColdChunkRefV1",
             "#[derive(serde::Serialize, serde::Deserialize)]",
         )
-        .compile_protos(&[proto], &["proto"])?;
+        .compile_protos(&protos, &["proto"])?;
 
     Ok(())
 }

@@ -26,7 +26,8 @@ use prost::Message;
 use ursula_proto as raft_app_proto;
 use ursula_runtime::{
     AppendBatchRequest, AppendRequest, CloseStreamRequest, ColdWriteAdmission, CreateStreamRequest,
-    GroupEngine, GroupWriteCommand, GroupWriteResponse, HeadStreamRequest, ReadStreamRequest,
+    GroupEngine, GroupEngineError, GroupInfraError, GroupWriteCommand, GroupWriteResponse,
+    HeadStreamRequest, ReadStreamRequest, StreamErrorCode, StreamErrorContext,
 };
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
@@ -46,6 +47,87 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ursula_runtime::{ProducerRequest, RuntimeConfig, RuntimeThreading, ShardRuntime};
 
 type CommittedLeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
+
+#[test]
+fn group_engine_error_codec_round_trips_stream_context() {
+    let err = GroupEngineError::stream_with_context(
+        StreamErrorCode::ProducerSeqConflict,
+        "producer conflict",
+        Some(9),
+        vec![StreamErrorContext::ProducerSeqConflict {
+            expected_seq: 8,
+            received_seq: 3,
+        }],
+    );
+
+    let proto = group_engine_error_to_proto(err.clone());
+    let decoded = group_engine_error_from_proto(proto).expect("decode group engine error");
+
+    assert_eq!(decoded, err);
+}
+
+#[test]
+fn group_engine_error_codec_round_trips_stale_cold_flush_context() {
+    let err = GroupEngineError::stream_with_context(
+        StreamErrorCode::InvalidColdFlush,
+        "cold flush candidate is stale",
+        Some(17),
+        vec![StreamErrorContext::StaleColdFlushCandidate],
+    );
+
+    let proto = group_engine_error_to_proto(err.clone());
+    let decoded = group_engine_error_from_proto(proto).expect("decode group engine error");
+
+    assert_eq!(decoded, err);
+}
+
+#[test]
+fn group_engine_error_codec_round_trips_cold_backpressure_kind() {
+    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "cold-backpressure-codec");
+    let err = GroupEngineError::cold_backpressure(stream_id.clone(), 4, 5, 4);
+
+    let proto = group_engine_error_to_proto(err.clone());
+    let decoded = group_engine_error_from_proto(proto).expect("decode group engine error");
+
+    assert_eq!(decoded, err);
+    assert!(matches!(
+        decoded,
+        GroupEngineError::Infra(GroupInfraError::ColdBackpressure {
+            stream_id: decoded_stream_id,
+            before_group_hot_bytes: 4,
+            after_group_hot_bytes: 5,
+            limit: 4,
+            ..
+        }) if decoded_stream_id == stream_id
+    ));
+}
+
+#[test]
+fn required_missing_proto_field_returns_typed_proto_decode_error() {
+    let err =
+        required::<raft_app_proto::group_engine_error_v1::Error>(None, "group_engine_error.error")
+            .expect_err("missing required field should decode to an error");
+
+    assert!(matches!(
+        err,
+        GroupEngineError::Infra(GroupInfraError::ProtoDecode {
+            field,
+            ..
+        }) if field == "group_engine_error.error"
+    ));
+}
+
+#[test]
+fn group_engine_error_codec_round_trips_proto_decode_kind() {
+    let err = GroupEngineError::Infra(GroupInfraError::ProtoDecode {
+        field: "group_engine_error.error".to_owned(),
+    });
+
+    let proto = group_engine_error_to_proto(err.clone());
+    let decoded = group_engine_error_from_proto(proto).expect("decode group engine error");
+
+    assert_eq!(decoded, err);
+}
 
 fn placement() -> ShardPlacement {
     ShardPlacement {

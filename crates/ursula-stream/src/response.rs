@@ -67,6 +67,7 @@ pub enum StreamResponse {
         code: StreamErrorCode,
         message: String,
         next_offset: Option<u64>,
+        context: Vec<StreamErrorContext>,
     },
 }
 
@@ -96,12 +97,34 @@ pub enum StreamErrorCode {
     SnapshotConflict,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamErrorContext {
+    StreamClosed,
+    StaleColdFlushCandidate,
+    ProducerEpochStale {
+        current_epoch: u64,
+    },
+    ProducerSeqConflict {
+        expected_seq: u64,
+        received_seq: u64,
+    },
+}
+
 impl StreamResponse {
     pub(crate) fn error(code: StreamErrorCode, message: impl Into<String>) -> Self {
+        Self::error_with_context(code, message, Vec::new())
+    }
+
+    pub(crate) fn error_with_context(
+        code: StreamErrorCode,
+        message: impl Into<String>,
+        context: Vec<StreamErrorContext>,
+    ) -> Self {
         Self::Error {
             code,
             message: message.into(),
             next_offset: None,
+            context,
         }
     }
 
@@ -110,10 +133,20 @@ impl StreamResponse {
         message: impl Into<String>,
         next_offset: u64,
     ) -> Self {
+        Self::error_with_next_offset_and_context(code, message, next_offset, Vec::new())
+    }
+
+    pub(crate) fn error_with_next_offset_and_context(
+        code: StreamErrorCode,
+        message: impl Into<String>,
+        next_offset: u64,
+        context: Vec<StreamErrorContext>,
+    ) -> Self {
         Self::Error {
             code,
             message: message.into(),
             next_offset: Some(next_offset),
+            context,
         }
     }
 }
