@@ -95,9 +95,8 @@ fn format_leaders(counts: &BTreeMap<u64, usize>) -> String {
     out
 }
 
-/// Block until every node reports `expected_groups` raft groups and every
-/// initialized group has a leader observed by that node. Empty groups with no
-/// voters are allowed because raft groups are initialized lazily.
+/// Block until every node reports `expected_groups` raft groups and every group
+/// has initialized voter membership plus a leader observed by that node.
 pub async fn wait_ready(
     client: &MetricsClient,
     nodes: &[NodeInfo],
@@ -141,10 +140,21 @@ fn cluster_ready(
             );
             return false;
         }
+        let uninitialized_groups = view
+            .groups
+            .iter()
+            .filter(|g| !group_is_initialized(g))
+            .count();
+        if uninitialized_groups > 0 {
+            *summary = format!(
+                "node {} has {uninitialized_groups} uninitialized group(s)",
+                view.node.id
+            );
+            return false;
+        }
         let groups_without_leader = view
             .groups
             .iter()
-            .filter(|g| group_is_initialized(g))
             .filter(|g| g.current_leader.is_none())
             .count();
         if groups_without_leader > 0 {
@@ -156,7 +166,7 @@ fn cluster_ready(
         }
     }
     *summary = format!(
-        "all {expected_nodes} nodes report {expected_groups} groups; initialized groups have leaders"
+        "all {expected_nodes} nodes report {expected_groups} initialized groups with leaders"
     );
     true
 }
@@ -236,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_ready_allows_uninitialized_empty_groups() {
+    fn cluster_ready_false_when_group_is_uninitialized() {
         let snapshot = ClusterSnapshot {
             per_node: vec![NodeMetricsView {
                 node: node(1),
@@ -244,7 +254,8 @@ mod tests {
             }],
         };
         let mut summary = String::new();
-        assert!(cluster_ready(&snapshot, 1, 2, &mut summary));
+        assert!(!cluster_ready(&snapshot, 1, 2, &mut summary));
+        assert!(summary.contains("uninitialized"));
     }
 
     #[test]
