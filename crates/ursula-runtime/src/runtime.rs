@@ -771,12 +771,7 @@ impl ShardRuntime {
                     .record_cold_publish(object_size, elapsed_ns(publish_started_at));
                 Ok(response)
             }
-            Err(err) => {
-                let cleanup_failed = cold_store.delete_chunk(&path).await.is_err();
-                self.metrics
-                    .record_cold_orphan_cleanup(object_size, cleanup_failed);
-                Err(err)
-            }
+            Err(err) => Err(err),
         }
     }
 
