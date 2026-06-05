@@ -1645,6 +1645,7 @@ class ChaosAgent:
         now = utc_now()
         if self.disable_faults:
             return
+        self.reconcile_active_fault_from_injection(now)
         # Self-heal scheduler: if we are completely idle (no in-flight fault,
         # no injection waiting to be resolved, no future tick scheduled), pick
         # the next firing time. This rescues the agent from a single race
@@ -2060,6 +2061,41 @@ class ChaosAgent:
                 return injection
         return None
 
+    def reconcile_active_fault_from_injection(self, now: datetime) -> None:
+        if self.active_fault is not None:
+            return
+        latest = self.injections[-1] if self.injections else None
+        if latest is None or latest.get("recovered_at") is not None:
+            return
+        if latest.get("start_requested_at") is not None:
+            return
+        cleanup = latest.get("cleanup", "start_instances")
+        if cleanup != "clear_impairment":
+            return
+        target_names = latest.get("target_nodes")
+        if not isinstance(target_names, list) or not target_names:
+            target_names = [latest.get("node_name")]
+        targets = [node for node in self.nodes if node.name in set(target_names)]
+        if not targets:
+            return
+        injection_id = latest.get("id")
+        if isinstance(injection_id, int):
+            self.active_injection_id = injection_id
+        recover_at = parse_iso(latest.get("recover_after")) or now
+        self.active_fault = {
+            "scenario": latest.get("scenario", "fault"),
+            "targets": targets,
+            "recover_at": recover_at,
+            "allow_revert": latest.get("allow_next_revert", True),
+            "cleanup": cleanup,
+        }
+
+    def active_fault_label(self) -> str | None:
+        if self.active_fault is None:
+            return None
+        targets = ", ".join(node.name for node in self.active_fault["targets"])
+        return f"{self.active_fault['scenario']} on {targets} until {iso(self.active_fault['recover_at'])}"
+
     def chaos_coverage(self) -> dict[str, Any]:
         scenarios: dict[str, dict[str, Any]] = {}
         for scenario in self.fault_scenarios:
@@ -2334,6 +2370,7 @@ class ChaosAgent:
         return not reasons, reasons
 
     def build_status(self) -> dict[str, Any]:
+        self.reconcile_active_fault_from_injection(utc_now())
         nodes = [self.sample_node(node) for node in self.nodes]
         topology = self.build_topology(nodes)
         expected_nodes = len(self.nodes)
@@ -2460,10 +2497,7 @@ class ChaosAgent:
             overall = "partial_outage"
         else:
             overall = "major_outage"
-        active_fault = None
-        if self.active_fault is not None:
-            targets = ", ".join(node.name for node in self.active_fault["targets"])
-            active_fault = f"{self.active_fault['scenario']} on {targets} until {iso(self.active_fault['recover_at'])}"
+        active_fault = self.active_fault_label()
         published_at = utc_now()
         status_interval_secs = self.status_every
         if self.last_status_published_at is not None:
@@ -2475,6 +2509,7 @@ class ChaosAgent:
         health = {
             "expected_nodes": expected_nodes,
             "expected_raft_groups": expected_groups,
+            "active_fault": active_fault,
             "running_nodes": running_nodes,
             "metrics_ok": metrics_ok,
             "full_raft_nodes": full_raft_nodes,
@@ -2594,6 +2629,7 @@ class ChaosAgent:
             "overall": overall,
             "started_at": iso(self.started_at),
             "updated_at": updated_at,
+            "active_fault": active_fault,
             "summary": f"{running_nodes}/{expected_nodes} nodes running, {metrics_ok}/{expected_nodes} metrics endpoints healthy",
             "health": health,
             "history": published_history,
