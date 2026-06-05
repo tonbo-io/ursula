@@ -12,7 +12,7 @@ use crate::model::{
     StreamMetadata, StreamRead, StreamReadColdIndexSegment, StreamReadObjectSegment,
     StreamReadPlan, StreamReadSegment, StreamStatus, StreamVisibleSnapshot,
 };
-use crate::response::{StreamErrorCode, StreamResponse};
+use crate::response::{StreamErrorCode, StreamErrorContext, StreamResponse};
 use crate::snapshot::{StreamSnapshot, StreamSnapshotEntry, StreamSnapshotError};
 use crate::validate::{validate_bucket_id, validate_stream_id};
 
@@ -1295,36 +1295,40 @@ impl StreamStateMachine {
             );
         }
         if chunk.end_offset > stream.tail_offset {
-            return StreamResponse::error_with_next_offset(
+            return StreamResponse::error_with_next_offset_and_context(
                 StreamErrorCode::InvalidColdFlush,
                 format!(
                     "cold chunk end {} is beyond stream '{}' tail {}",
                     chunk.end_offset, stream_id, stream.tail_offset
                 ),
                 stream.tail_offset,
+                vec![StreamErrorContext::StaleColdFlushCandidate],
             );
         }
         let Some(hot_buffer) = self.hot_buffers.get(&stream_id) else {
-            return StreamResponse::error_with_next_offset(
+            return StreamResponse::error_with_next_offset_and_context(
                 StreamErrorCode::InvalidColdFlush,
                 format!("cold chunk for stream '{stream_id}' does not match hot payload"),
                 stream.tail_offset,
+                vec![StreamErrorContext::StaleColdFlushCandidate],
             );
         };
         if hot_buffer.hot_start_offset() != chunk.start_offset {
-            return StreamResponse::error_with_next_offset(
+            return StreamResponse::error_with_next_offset_and_context(
                 StreamErrorCode::InvalidColdFlush,
                 format!("cold chunk for stream '{stream_id}' must start at the hot prefix"),
                 stream.tail_offset,
+                vec![StreamErrorContext::StaleColdFlushCandidate],
             );
         }
         if !hot_buffer.covers_prefix(chunk.start_offset, chunk.end_offset) {
-            return StreamResponse::error_with_next_offset(
+            return StreamResponse::error_with_next_offset_and_context(
                 StreamErrorCode::InvalidColdFlush,
                 format!(
                     "cold chunk for stream '{stream_id}' does not cover contiguous hot payload"
                 ),
                 stream.tail_offset,
+                vec![StreamErrorContext::StaleColdFlushCandidate],
             );
         }
         self.hot_buffers
@@ -1394,12 +1398,16 @@ impl StreamStateMachine {
         if let Some(producer) = input.producer.as_ref()
             && producer.producer_seq != 0
         {
-            return StreamResponse::error(
+            return StreamResponse::error_with_context(
                 StreamErrorCode::ProducerSeqConflict,
                 format!(
                     "producer '{}' expected sequence 0, received {}",
                     producer.producer_id, producer.producer_seq
                 ),
+                vec![StreamErrorContext::ProducerSeqConflict {
+                    expected_seq: 0,
+                    received_seq: producer.producer_seq,
+                }],
             );
         }
         if self
@@ -1529,12 +1537,16 @@ impl StreamStateMachine {
         if let Some(producer) = input.producer.as_ref()
             && producer.producer_seq != 0
         {
-            return StreamResponse::error(
+            return StreamResponse::error_with_context(
                 StreamErrorCode::ProducerSeqConflict,
                 format!(
                     "producer '{}' expected sequence 0, received {}",
                     producer.producer_id, producer.producer_seq
                 ),
+                vec![StreamErrorContext::ProducerSeqConflict {
+                    expected_seq: 0,
+                    received_seq: producer.producer_seq,
+                }],
             );
         }
         if self
@@ -1726,10 +1738,11 @@ impl StreamStateMachine {
                     producer: None,
                 };
             }
-            return StreamResponse::error_with_next_offset(
+            return StreamResponse::error_with_next_offset_and_context(
                 StreamErrorCode::StreamClosed,
                 format!("stream '{stream_id}' is closed"),
                 stream.tail_offset,
+                vec![StreamErrorContext::StreamClosed],
             );
         }
 
@@ -1887,10 +1900,11 @@ impl StreamStateMachine {
             unreachable!("stream existence checked before producer evaluation");
         };
         if stream.status == StreamStatus::Closed {
-            return StreamResponse::error_with_next_offset(
+            return StreamResponse::error_with_next_offset_and_context(
                 StreamErrorCode::StreamClosed,
                 format!("stream '{stream_id}' is closed"),
                 stream.tail_offset,
+                vec![StreamErrorContext::StreamClosed],
             );
         }
         let Some(content_type) = content_type else {
@@ -2029,10 +2043,11 @@ impl StreamStateMachine {
             ));
         };
         if stream.status == StreamStatus::Closed {
-            return Err(StreamResponse::error_with_next_offset(
+            return Err(StreamResponse::error_with_next_offset_and_context(
                 StreamErrorCode::StreamClosed,
                 format!("stream '{stream_id}' is closed"),
                 stream.tail_offset,
+                vec![StreamErrorContext::StreamClosed],
             ));
         }
         let Some(content_type) = content_type else {
@@ -2474,22 +2489,29 @@ impl StreamStateMachine {
             if producer.producer_seq == 0 {
                 return Ok(ProducerDecision::Accept);
             }
-            return Err(StreamResponse::error(
+            return Err(StreamResponse::error_with_context(
                 StreamErrorCode::ProducerSeqConflict,
                 format!(
                     "producer '{}' expected sequence 0, received {}",
                     producer.producer_id, producer.producer_seq
                 ),
+                vec![StreamErrorContext::ProducerSeqConflict {
+                    expected_seq: 0,
+                    received_seq: producer.producer_seq,
+                }],
             ));
         };
 
         if producer.producer_epoch < state.producer_epoch {
-            return Err(StreamResponse::error(
+            return Err(StreamResponse::error_with_context(
                 StreamErrorCode::ProducerEpochStale,
                 format!(
                     "producer '{}' epoch {} is stale; current epoch is {}",
                     producer.producer_id, producer.producer_epoch, state.producer_epoch
                 ),
+                vec![StreamErrorContext::ProducerEpochStale {
+                    current_epoch: state.producer_epoch,
+                }],
             ));
         }
         if producer.producer_epoch > state.producer_epoch {
@@ -2521,7 +2543,7 @@ impl StreamStateMachine {
         if producer.producer_seq == state.producer_seq + 1 {
             return Ok(ProducerDecision::Accept);
         }
-        Err(StreamResponse::error(
+        Err(StreamResponse::error_with_context(
             StreamErrorCode::ProducerSeqConflict,
             format!(
                 "producer '{}' expected sequence {}, received {}",
@@ -2529,6 +2551,10 @@ impl StreamStateMachine {
                 state.producer_seq + 1,
                 producer.producer_seq
             ),
+            vec![StreamErrorContext::ProducerSeqConflict {
+                expected_seq: state.producer_seq + 1,
+                received_seq: producer.producer_seq,
+            }],
         ))
     }
 

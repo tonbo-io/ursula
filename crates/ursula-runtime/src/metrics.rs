@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::rt::time::Instant;
 
 use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardPlacement};
+use ursula_stream::{StreamErrorCode, StreamErrorContext};
 
 use crate::engine::{GroupEngine, GroupEngineError};
 use crate::error::RuntimeError;
@@ -972,7 +973,7 @@ pub(crate) fn record_cold_backpressure_error(
     admission: ColdWriteAdmission,
     err: &GroupEngineError,
 ) {
-    if !err.message().contains("ColdBackpressure") {
+    if !err.is_cold_backpressure() {
         return;
     }
     metrics.record_cold_backpressure(
@@ -984,19 +985,14 @@ pub(crate) fn record_cold_backpressure_error(
 }
 
 pub(crate) fn is_stale_cold_flush_candidate_error(err: &RuntimeError) -> bool {
-    let RuntimeError::GroupEngine { message, .. } = err else {
-        return false;
-    };
-    message.contains("StreamGone")
-        || message.contains("StreamNotFound")
-        || (message.contains("InvalidColdFlush")
-            && (message.contains("beyond stream")
-                || message.contains("does not match the start of a hot payload segment")
-                || message.contains("must start at the hot prefix")
-                || message.contains("does not cover contiguous hot payload")
-                || message.contains("does not cover contiguous hot payload segments")
-                || message.contains("exceeds stream")
-                || message.contains("non-contiguous hot payload metadata")))
+    match err.stream_error_code() {
+        Some(StreamErrorCode::StreamGone | StreamErrorCode::StreamNotFound) => true,
+        Some(StreamErrorCode::InvalidColdFlush) => err
+            .stream_error_context()
+            .iter()
+            .any(|context| matches!(context, StreamErrorContext::StaleColdFlushCandidate)),
+        _ => false,
+    }
 }
 
 pub(crate) async fn record_cold_hot_backlog(

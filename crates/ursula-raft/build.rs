@@ -1,11 +1,12 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto = "proto/raft_internal.proto";
     println!("cargo:rerun-if-changed={proto}");
-    // durable.proto is a symlink to ../ursula-proto/proto/durable.proto so the
-    // file ships inside the ursula-raft tarball (cargo follows symlinks on
-    // package). This keeps the .proto a single source of truth in
-    // ursula-proto while letting ursula-raft compile standalone from
-    // crates.io.
+    // Durable shared protos are symlinks to ../ursula-proto/proto so they ship
+    // inside the ursula-raft tarball (cargo follows symlinks on package). This
+    // keeps the .proto files a single source of truth in ursula-proto while
+    // letting ursula-raft compile standalone from crates.io.
+    println!("cargo:rerun-if-changed=proto/types.proto");
+    println!("cargo:rerun-if-changed=proto/errors.proto");
     println!("cargo:rerun-if-changed=proto/durable.proto");
     // Build scripts run single-threaded for this crate, so setting PROTOC is scoped to
     // the current process and safe for tonic/prost code generation.

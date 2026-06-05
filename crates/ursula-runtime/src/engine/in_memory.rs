@@ -140,10 +140,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected create stream response: {other:?}"
@@ -207,10 +209,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected create external stream response: {other:?}"
@@ -287,10 +291,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected append external response: {other:?}"
@@ -411,10 +417,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected publish snapshot response: {other:?}"
@@ -449,10 +457,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected touch stream access response: {other:?}"
@@ -478,10 +488,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected add fork ref response: {other:?}"
@@ -511,10 +523,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected release fork ref response: {other:?}"
@@ -538,10 +552,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected flush cold response: {other:?}"
@@ -580,10 +596,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected close stream response: {other:?}"
@@ -617,10 +635,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected delete stream response: {other:?}"
@@ -680,9 +700,12 @@ impl InMemoryGroupEngine {
         if after <= limit {
             return Ok(());
         }
-        Err(GroupEngineError::new(format!(
-            "ColdBackpressure: stream '{stream_id}' would raise group hot bytes from {before} to {after}, above limit {limit}"
-        )))
+        Err(GroupEngineError::cold_backpressure(
+            stream_id.clone(),
+            before,
+            after,
+            limit,
+        ))
     }
 
     pub(crate) fn create_stream_with_admission_inner(
@@ -903,10 +926,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected replay create bucket response: {other:?}"
@@ -926,10 +951,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected replay delete bucket response: {other:?}"
@@ -973,10 +1000,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected replay create stream response: {other:?}"
@@ -1020,10 +1049,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected replay external create stream response: {other:?}"
@@ -1070,10 +1101,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected replay append response: {other:?}"
@@ -1114,10 +1147,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected replay external append response: {other:?}"
@@ -1176,10 +1211,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected replay publish snapshot response: {other:?}"
@@ -1207,10 +1244,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected replay touch stream access response: {other:?}"
@@ -1230,10 +1269,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected replay add fork ref response: {other:?}"
@@ -1253,10 +1294,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected replay release fork ref response: {other:?}"
@@ -1276,10 +1319,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected replay flush cold response: {other:?}"
@@ -1309,10 +1354,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected replay close stream response: {other:?}"
@@ -1332,10 +1379,12 @@ impl InMemoryGroupEngine {
                         code,
                         message,
                         next_offset,
-                    } => Err(GroupEngineError::stream_with_next_offset(
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
                         code,
                         message,
                         next_offset,
+                        context,
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected replay delete stream response: {other:?}"
@@ -1415,10 +1464,12 @@ impl InMemoryGroupEngine {
                 code,
                 message,
                 next_offset,
-            } => Err(GroupEngineError::stream_with_next_offset(
+                context,
+            } => Err(GroupEngineError::stream_with_context(
                 code,
                 message,
                 next_offset,
+                context,
             )),
             other => Err(GroupEngineError::new(format!(
                 "unexpected append response: {other:?}"
@@ -1850,10 +1901,12 @@ impl GroupEngine for InMemoryGroupEngine {
                     code,
                     message,
                     next_offset,
-                } => Err(GroupEngineError::stream_with_next_offset(
+                    context,
+                } => Err(GroupEngineError::stream_with_context(
                     code,
                     message,
                     next_offset,
+                    context,
                 )),
                 other => Err(GroupEngineError::new(format!(
                     "unexpected delete snapshot response: {other:?}"
@@ -2285,10 +2338,12 @@ pub(crate) fn ensure_bucket_exists(
             code,
             message,
             next_offset,
-        } => Err(GroupEngineError::stream_with_next_offset(
+            context,
+        } => Err(GroupEngineError::stream_with_context(
             code,
             message,
             next_offset,
+            context,
         )),
         other => Err(GroupEngineError::new(format!(
             "unexpected create bucket response: {other:?}"
@@ -2302,7 +2357,8 @@ pub(crate) fn stream_response_error(response: StreamResponse) -> GroupEngineErro
             code,
             message,
             next_offset,
-        } => GroupEngineError::stream_with_next_offset(code, message, next_offset),
+            context,
+        } => GroupEngineError::stream_with_context(code, message, next_offset, context),
         other => GroupEngineError::new(format!("unexpected stream response error: {other:?}")),
     }
 }
