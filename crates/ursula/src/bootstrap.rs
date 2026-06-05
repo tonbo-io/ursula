@@ -1092,15 +1092,23 @@ pub fn spawn_cluster_egress_gate_if_configured(
                 // hand off, so any peer's M1 transfer that races our shed sees
                 // the flag and gets rejected at our gRPC handler.
                 registry.mark_leadership_shed(LeadershipShedReason::ClusterEgress);
+                let handoffs = plan_cluster_egress_shed(&snaps, node_id);
                 for snap in &snaps {
                     let Some(raft) = registry.get(RaftGroupId(snap.raft_group_id)) else {
                         continue;
                     };
                     raft.runtime_config().elect(false);
-                    if snap.current_leader == Some(node_id)
-                        && let Some(target) = snap.voter_ids.iter().copied().find(|v| *v != node_id)
-                    {
-                        let _ = raft.trigger().transfer_leader(target).await;
+                }
+                for handoff in handoffs {
+                    let Some(raft) = registry.get(RaftGroupId(handoff.group_id)) else {
+                        continue;
+                    };
+                    if let Err(err) = raft.trigger().transfer_leader(handoff.target).await {
+                        tracing::error!(
+                            "cluster-egress: transfer_leader group {} -> {} failed while yielding: {err}",
+                            handoff.group_id,
+                            handoff.target,
+                        );
                     }
                 }
                 if let Some((scope, healthy_peers, peer_count, needed_peers)) = degraded_probe {
@@ -1118,6 +1126,47 @@ pub fn spawn_cluster_egress_gate_if_configured(
             }
         }
     });
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClusterEgressShedAction {
+    pub group_id: u32,
+    pub target: u64,
+}
+
+pub(crate) fn plan_cluster_egress_shed(
+    snaps: &[RaftGroupMetricsSnapshot],
+    node_id: u64,
+) -> Vec<ClusterEgressShedAction> {
+    let mut planned_load = leader_counts(snaps);
+    let mut groups_we_lead: Vec<&RaftGroupMetricsSnapshot> = snaps
+        .iter()
+        .filter(|snap| snap.current_leader == Some(node_id))
+        .collect();
+    groups_we_lead.sort_by_key(|snap| snap.raft_group_id);
+
+    let mut actions = Vec::new();
+    for snap in groups_we_lead {
+        let mut targets: Vec<u64> = snap
+            .voter_ids
+            .iter()
+            .copied()
+            .filter(|voter| *voter != node_id)
+            .collect();
+        targets.sort_by_key(|target| (planned_load.get(target).copied().unwrap_or(0), *target));
+        let Some(target) = targets.into_iter().next() else {
+            continue;
+        };
+        actions.push(ClusterEgressShedAction {
+            group_id: snap.raft_group_id,
+            target,
+        });
+        *planned_load.entry(target).or_insert(0) += 1;
+        if let Some(load) = planned_load.get_mut(&node_id) {
+            *load = load.saturating_sub(1);
+        }
+    }
+    actions
 }
 
 /// M3 — per-group commit-stall watchdog. A group's leader can wedge with
