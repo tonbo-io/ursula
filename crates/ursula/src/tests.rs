@@ -15,6 +15,7 @@ use openraft::raft::SnapshotResponse;
 use openraft::rt::WatchReceiver;
 use tower::ServiceExt;
 use ursula_raft::StaticGrpcRaftGroupEngineFactory;
+use ursula_raft::StaticGrpcRaftMembershipConfig;
 use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_runtime::ColdStore;
 use ursula_runtime::ColdStoreHandle;
@@ -234,17 +235,16 @@ fn parses_membership_voter_ids() {
 
 #[test]
 fn static_grpc_membership_config_rejects_partial_group_voters() {
-    let result = crate::bootstrap::spawn_static_grpc_raft_memory_runtime_with_membership_config(
+    let result = crate::bootstrap::Topology::static_cluster(
         1,
-        2,
-        1,
-        [
+        vec![
             (1, "http://node-1".to_owned()),
             (2, "http://node-2".to_owned()),
             (3, "http://node-3".to_owned()),
         ],
+        2,
         true,
-        crate::bootstrap::StaticGrpcRaftMembershipConfig {
+        StaticGrpcRaftMembershipConfig {
             initialize_membership_per_group: true,
             per_group_voters: BTreeMap::from([(RaftGroupId(0), BTreeSet::from([1, 2, 3]))]),
         },
@@ -1744,7 +1744,19 @@ async fn wal_runtime_recovers_http_stream_after_restart() {
     let _ = std::fs::remove_dir_all(&wal_root);
 
     {
-        let app = router(spawn_wal_runtime(2, 8, &wal_root).expect("runtime"));
+        let app = router(
+            spawn_runtime(
+                2,
+                Persistence::Wal {
+                    wal_dir: wal_root.clone(),
+                },
+                Topology::SingleNode {
+                    raft_group_count: 8,
+                },
+            )
+            .expect("runtime")
+            .runtime,
+        );
         let response = app
             .clone()
             .oneshot(
@@ -1797,7 +1809,19 @@ async fn wal_runtime_recovers_http_stream_after_restart() {
         assert!(body.contains("\"wal_sync_ns\":"));
     }
 
-    let app = router(spawn_wal_runtime(2, 8, &wal_root).expect("recovered runtime"));
+    let app = router(
+        spawn_runtime(
+            2,
+            Persistence::Wal {
+                wal_dir: wal_root.clone(),
+            },
+            Topology::SingleNode {
+                raft_group_count: 8,
+            },
+        )
+        .expect("recovered runtime")
+        .runtime,
+    );
     let response = app
         .oneshot(
             Request::builder()
@@ -1829,7 +1853,19 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
     ));
     let _ = std::fs::remove_dir_all(&raft_root);
 
-    let app = router(spawn_raft_runtime(1, 1, &raft_root).expect("runtime"));
+    let app = router(
+        spawn_runtime(
+            1,
+            Persistence::Raft {
+                log_dir: Some(raft_root.clone()),
+            },
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    );
     let response = app
         .clone()
         .oneshot(
@@ -1921,15 +1957,23 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
     ));
     let _ = std::fs::remove_dir_all(&raft_root);
 
-    let (runtime, registry) = spawn_static_grpc_raft_runtime(
+    let spawned = spawn_runtime(
         1,
-        1,
-        1,
-        [(1, "http://127.0.0.1:4477".to_owned())],
-        true,
-        &raft_root,
+        Persistence::Raft {
+            log_dir: Some(raft_root.as_path().into()),
+        },
+        Topology::static_cluster(
+            1,
+            vec![(1, "http://127.0.0.1:4477".to_owned())],
+            1,
+            true,
+            Default::default(),
+        )
+        .expect("valid static cluster topology"),
     )
     .expect("runtime");
+    let runtime = spawned.runtime;
+    let registry = spawned.raft_registry.expect("registry");
     runtime.warm_all_groups().await.expect("warm group");
     let raft = registry
         .get(RaftGroupId(0))
@@ -2041,9 +2085,17 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
     let peers = [(1, "http://127.0.0.1:4477".to_owned())];
 
     {
-        let (runtime, registry) =
-            spawn_static_grpc_raft_runtime(1, 1, 1, peers.clone(), true, &raft_root)
-                .expect("runtime");
+        let spawned = spawn_runtime(
+            1,
+            Persistence::Raft {
+                log_dir: Some(raft_root.as_path().into()),
+            },
+            Topology::static_cluster(1, peers.to_vec(), 1, true, Default::default())
+                .expect("valid static cluster topology"),
+        )
+        .expect("runtime");
+        let runtime = spawned.runtime;
+        let registry = spawned.raft_registry.expect("registry");
         runtime.warm_all_groups().await.expect("warm group");
         let raft = registry
             .get(RaftGroupId(0))
@@ -2093,9 +2145,17 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
     );
 
     {
-        let (runtime, registry) =
-            spawn_static_grpc_raft_runtime(1, 1, 1, peers.clone(), false, &raft_root)
-                .expect("restarted runtime");
+        let spawned = spawn_runtime(
+            1,
+            Persistence::Raft {
+                log_dir: Some(raft_root.as_path().into()),
+            },
+            Topology::static_cluster(1, peers.to_vec(), 1, false, Default::default())
+                .expect("valid static cluster topology"),
+        )
+        .expect("restarted runtime");
+        let runtime = spawned.runtime;
+        let registry = spawned.raft_registry.expect("registry");
         runtime
             .warm_all_groups()
             .await
@@ -2131,7 +2191,17 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
 
 #[tokio::test]
 async fn raft_memory_runtime_serves_http_subset_without_wal_metrics() {
-    let app = router(spawn_raft_memory_runtime(1, 1).expect("runtime"));
+    let app = router(
+        spawn_runtime(
+            1,
+            Persistence::Raft { log_dir: None },
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    );
     let response = app
         .clone()
         .oneshot(
@@ -4682,7 +4752,13 @@ async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
 }
 
 fn test_router() -> Router {
-    router(spawn_default_runtime(2, 8).expect("runtime"))
+    router(
+        spawn_runtime(2, Persistence::InMemory, Topology::SingleNode {
+            raft_group_count: 8,
+        })
+        .expect("runtime")
+        .runtime,
+    )
 }
 
 #[tokio::test]
@@ -4696,7 +4772,13 @@ async fn client_router_does_not_serve_cluster_plane_via_grpc_service() {
     // format produces a different status. We assert the cluster router gives
     // a tonic-style response (200/415/501) while the client router stays in
     // HTTP append's error space (4xx, never 200).
-    let state = HttpState::new(spawn_default_runtime(1, 1).expect("runtime"));
+    let state = HttpState::new(
+        spawn_runtime(1, Persistence::InMemory, Topology::SingleNode {
+            raft_group_count: 1,
+        })
+        .expect("runtime")
+        .runtime,
+    );
     let client = client_router_from_state(state.clone());
     let response = client
         .oneshot(
@@ -4726,7 +4808,13 @@ async fn client_router_does_not_serve_cluster_plane_via_grpc_service() {
 
 #[tokio::test]
 async fn cluster_router_does_not_expose_client_plane_routes() {
-    let state = HttpState::new(spawn_default_runtime(1, 1).expect("runtime"));
+    let state = HttpState::new(
+        spawn_runtime(1, Persistence::InMemory, Topology::SingleNode {
+            raft_group_count: 1,
+        })
+        .expect("runtime")
+        .runtime,
+    );
     let cluster = cluster_router_from_state(state.clone());
     // A normal client append must be 404 on the cluster router.
     let response = cluster
@@ -4751,8 +4839,14 @@ async fn cluster_router_does_not_expose_client_plane_routes() {
 async fn cluster_router_reports_leadership_shed_policy() {
     let registry = RaftGroupHandleRegistry::default();
     registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::ColdHealth);
-    let state =
-        HttpState::with_raft_registry(spawn_default_runtime(1, 1).expect("runtime"), registry);
+    let state = HttpState::with_raft_registry(
+        spawn_runtime(1, Persistence::InMemory, Topology::SingleNode {
+            raft_group_count: 1,
+        })
+        .expect("runtime")
+        .runtime,
+        registry,
+    );
     let cluster = cluster_router_from_state(state);
     let response = cluster
         .oneshot(
@@ -4781,8 +4875,14 @@ async fn cluster_router_reports_leadership_shed_policy() {
 #[tokio::test]
 async fn maintenance_drain_endpoint_marks_and_clears_leadership_shed() {
     let registry = RaftGroupHandleRegistry::default();
-    let state =
-        HttpState::with_raft_registry(spawn_default_runtime(1, 1).expect("runtime"), registry);
+    let state = HttpState::with_raft_registry(
+        spawn_runtime(1, Persistence::InMemory, Topology::SingleNode {
+            raft_group_count: 1,
+        })
+        .expect("runtime")
+        .runtime,
+        registry,
+    );
     let router = router_with_http_state(state);
 
     let response = router
@@ -4829,7 +4929,13 @@ async fn maintenance_drain_endpoint_marks_and_clears_leadership_shed() {
 async fn merged_router_serves_both_planes() {
     // The single-listener router (backwards compat / in-process tests) must
     // still answer both client and cluster routes from one bind.
-    let state = HttpState::new(spawn_default_runtime(1, 1).expect("runtime"));
+    let state = HttpState::new(
+        spawn_runtime(1, Persistence::InMemory, Topology::SingleNode {
+            raft_group_count: 1,
+        })
+        .expect("runtime")
+        .runtime,
+    );
     let merged = router_with_http_state(state);
     let merged_for_cluster = merged.clone();
 
@@ -4868,11 +4974,16 @@ async fn merged_router_serves_both_planes() {
 #[tokio::test]
 async fn http_state_wall_clock_drives_protocol_now_ms() {
     let now_ms = Arc::new(AtomicU64::new(1_000));
-    let state = HttpState::new(spawn_default_runtime(1, 1).expect("runtime")).with_wall_clock(
-        TestWallClock {
-            now_ms: Arc::clone(&now_ms),
-        },
-    );
+    let state = HttpState::new(
+        spawn_runtime(1, Persistence::InMemory, Topology::SingleNode {
+            raft_group_count: 1,
+        })
+        .expect("runtime")
+        .runtime,
+    )
+    .with_wall_clock(TestWallClock {
+        now_ms: Arc::clone(&now_ms),
+    });
     let app = router_with_http_state(state);
 
     let response = app

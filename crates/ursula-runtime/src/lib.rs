@@ -17,11 +17,14 @@
 //! - [`metrics`]: runtime metrics shared across cores; lock-free counters.
 
 mod admission;
+pub mod cold_config;
 pub mod cold_index;
 mod cold_store;
+pub mod cold_worker;
 mod command;
 mod core_worker;
 mod engine;
+pub(crate) mod env;
 mod error;
 mod group_actor;
 mod metrics;
@@ -32,6 +35,10 @@ mod snapshot_store;
 mod trace;
 
 pub use admission::RaftUncommittedAdmission;
+pub use cold_config::ColdCacheConfig;
+pub use cold_config::ColdConfig;
+pub use cold_config::ColdStorageConfig;
+pub use cold_config::ColdWorkerConfig;
 pub use cold_index::ColdIndexPage;
 pub use cold_index::ColdIndexPageCache;
 pub use cold_index::ColdIndexPageKey;
@@ -41,7 +48,6 @@ pub use cold_index::InMemoryColdIndexPageStore;
 pub use cold_index::cold_index_prefix;
 pub use cold_index::write_cold_chunk_index_pages;
 pub use cold_index::write_external_segment_index_pages;
-pub use cold_store::ColdReadCacheConfig;
 pub use cold_store::ColdStore;
 pub use cold_store::ColdStoreEvent;
 pub use cold_store::ColdStoreFault;
@@ -52,6 +58,8 @@ pub use cold_store::ColdStoreInfo;
 pub use cold_store::ColdStoreOperation;
 pub use cold_store::new_cold_chunk_path;
 pub use cold_store::new_external_payload_path;
+pub use cold_worker::spawn_cold_flush_worker_if_configured;
+pub use cold_worker::spawn_cold_gc_worker_if_configured;
 pub use command::GroupSnapshot;
 pub use command::GroupWriteCommand;
 pub use engine::GroupAckColdGcFuture;

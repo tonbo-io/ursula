@@ -10,17 +10,12 @@ use axum::Router;
 use clap::Parser;
 use serde::Deserialize;
 use ursula::HttpState;
-use ursula::StaticGrpcRaftMembershipConfig;
+use ursula::Persistence;
+use ursula::Topology;
 use ursula::client_router_from_state;
 use ursula::cluster_router_from_state;
-use ursula::spawn_cold_flush_worker_if_configured;
-use ursula::spawn_cold_gc_worker_if_configured;
-use ursula::spawn_default_runtime;
-use ursula::spawn_raft_memory_runtime;
-use ursula::spawn_raft_runtime;
-use ursula::spawn_static_grpc_raft_memory_runtime_with_membership_config;
-use ursula::spawn_static_grpc_raft_runtime_with_membership_config;
-use ursula::spawn_wal_runtime;
+use ursula::spawn_runtime;
+use ursula_raft::StaticGrpcRaftMembershipConfig;
 use ursula_shard::RaftGroupId;
 
 // glibc malloc held ~1 GB of cached arena chunks under the chaos workload
@@ -69,32 +64,33 @@ async fn init_static_grpc_state(args: &Args) -> Result<HttpState, Box<dyn std::e
     let node_id = args
         .raft_node_id
         .expect("static gRPC Raft validation required node id");
-    let raft_peers = args.raft_peers.clone();
+    let raft_peers: Vec<(u64, String)> = args
+        .raft_peers
+        .iter()
+        .map(|(k, v)| (*k, v.clone()))
+        .collect();
     let raft_group_voters = args.raft_group_voters.clone();
     let membership_config = StaticGrpcRaftMembershipConfig {
         initialize_membership_per_group: args.raft_init_membership_per_group,
         per_group_voters: raft_group_voters,
     };
-    let (runtime, registry) = if let Some(raft_log_dir) = args.raft_log_dir.clone() {
-        spawn_static_grpc_raft_runtime_with_membership_config(
-            args.core_count,
-            args.raft_group_count,
+    let spawned = spawn_runtime(
+        args.core_count,
+        Persistence::Raft {
+            log_dir: args.raft_log_dir.clone(),
+        },
+        Topology::static_cluster(
             node_id,
-            raft_peers,
+            raft_peers.clone(),
+            args.raft_group_count,
             args.raft_init_membership,
             membership_config,
-            raft_log_dir,
-        )?
-    } else {
-        spawn_static_grpc_raft_memory_runtime_with_membership_config(
-            args.core_count,
-            args.raft_group_count,
-            node_id,
-            raft_peers,
-            args.raft_init_membership,
-            membership_config,
-        )?
-    };
+        )?,
+    )?;
+    let runtime = spawned.runtime;
+    let registry = spawned
+        .raft_registry
+        .expect("static grpc topology returns registry");
     warm_static_grpc_groups(
         &runtime,
         args.raft_group_count,
@@ -102,34 +98,33 @@ async fn init_static_grpc_state(args: &Args) -> Result<HttpState, Box<dyn std::e
         &args.raft_group_voters,
     )
     .await?;
-    spawn_cold_flush_worker_if_configured(&runtime);
-    spawn_cold_gc_worker_if_configured(&runtime);
     Ok(HttpState::with_static_raft_cluster_topology(
         runtime,
         registry,
         node_id,
-        args.raft_peers.clone(),
+        raft_peers,
         args.raft_group_voters.clone(),
     ))
 }
 
 fn init_local_runtime_state(args: &Args) -> Result<HttpState, Box<dyn std::error::Error>> {
-    let runtime = match (
+    let persistence = match (
         args.wal_dir.clone(),
         args.raft_log_dir.clone(),
         args.raft_memory,
     ) {
-        (Some(wal_dir), None, false) => {
-            spawn_wal_runtime(args.core_count, args.raft_group_count, wal_dir)?
-        }
-        (None, Some(raft_log_dir), false) => {
-            spawn_raft_runtime(args.core_count, args.raft_group_count, raft_log_dir)?
-        }
-        (None, None, true) => spawn_raft_memory_runtime(args.core_count, args.raft_group_count)?,
-        (None, None, false) => spawn_default_runtime(args.core_count, args.raft_group_count)?,
+        (Some(wal_dir), None, false) => Persistence::Wal { wal_dir },
+        (None, Some(raft_log_dir), false) => Persistence::Raft {
+            log_dir: Some(raft_log_dir),
+        },
+        (None, None, true) => Persistence::Raft { log_dir: None },
+        (None, None, false) => Persistence::InMemory,
         _ => unreachable!("storage mode exclusivity is checked above"),
     };
-    Ok(HttpState::new(runtime))
+    let spawned = spawn_runtime(args.core_count, persistence, Topology::SingleNode {
+        raft_group_count: args.raft_group_count,
+    })?;
+    Ok(HttpState::new(spawned.runtime))
 }
 
 /// Start the HTTP server(s).

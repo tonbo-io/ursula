@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -21,7 +20,9 @@ async fn s3_cold_path_flushes_reads_and_cleans_up_object() {
         return;
     }
 
-    let cold_store = Arc::new(ColdStore::s3_from_env().expect("S3 cold store from env"));
+    let cold_store = ColdStore::from_env()
+        .unwrap_or_else(|err| panic!("cold store creation failed: {err}"))
+        .unwrap_or_else(|| panic!("cold store not configured; set URSULA_COLD_BACKEND"));
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
         RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(8 * 1024 * 1024)),
         InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),

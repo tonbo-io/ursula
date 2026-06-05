@@ -260,11 +260,14 @@ mod s3 {
             Ok(Self::new(operator, prefix))
         }
 
-        /// Build an S3 operator from the cold-store `URSULA_COLD_S3_*` env.
-        /// Snapshot blobs share the cold bucket/credentials and use
-        /// `URSULA_SNAPSHOT_S3_PREFIX` (defaults to `snapshots`) for separation.
-        pub fn s3_from_env() -> Result<Self, SnapshotStoreError> {
-            let bucket = std::env::var("URSULA_COLD_S3_BUCKET").map_err(|_| {
+        /// Build an S3 snapshot store from a [`ColdStorageConfig`].
+        /// Snapshot blobs share the cold bucket/credentials and use `prefix`
+        /// (defaults to `snapshots`) for separation.
+        pub fn from_cold_config(
+            config: &crate::cold_config::ColdStorageConfig,
+            prefix: impl Into<String>,
+        ) -> Result<Self, SnapshotStoreError> {
+            let bucket = config.s3_bucket.as_deref().ok_or_else(|| {
                 SnapshotStoreError::Backend(
                     "URSULA_COLD_S3_BUCKET is required for snapshot s3 backend".into(),
                 )
@@ -274,46 +277,44 @@ mod s3 {
                     "snapshot s3 bucket must not be empty".into(),
                 ));
             }
-            let mut builder = opendal::services::S3::default().bucket(&bucket);
-            // Root pins all blobs into a snapshot-only sub-tree of the bucket,
-            // letting the cold store reuse the same bucket with different keys.
-            if let Ok(root) = std::env::var("URSULA_COLD_ROOT")
+            let mut builder = opendal::services::S3::default().bucket(bucket);
+            if let Some(root) = config.s3_root.as_deref()
                 && !root.trim().is_empty()
             {
-                builder = builder.root(&root);
+                builder = builder.root(root);
             }
-            if let Ok(region) = std::env::var("URSULA_COLD_S3_REGION")
+            if let Some(region) = config.s3_region.as_deref()
                 && !region.trim().is_empty()
             {
-                builder = builder.region(&region);
+                builder = builder.region(region);
             }
-            if let Ok(endpoint) = std::env::var("URSULA_COLD_S3_ENDPOINT")
+            if let Some(endpoint) = config.s3_endpoint.as_deref()
                 && !endpoint.trim().is_empty()
             {
-                builder = builder.endpoint(&endpoint);
+                builder = builder.endpoint(endpoint);
             }
-            if let Ok(access) = std::env::var("URSULA_COLD_S3_ACCESS_KEY_ID")
+            if let Some(access) = config.s3_access_key_id.as_deref()
                 && !access.trim().is_empty()
             {
-                builder = builder.access_key_id(&access);
+                builder = builder.access_key_id(access);
             }
-            if let Ok(secret) = std::env::var("URSULA_COLD_S3_SECRET_ACCESS_KEY")
+            if let Some(secret) = config.s3_secret_access_key.as_deref()
                 && !secret.trim().is_empty()
             {
-                builder = builder.secret_access_key(&secret);
+                builder = builder.secret_access_key(secret);
             }
-            if let Ok(token) = std::env::var("URSULA_COLD_S3_SESSION_TOKEN")
+            if let Some(token) = config.s3_session_token.as_deref()
                 && !token.trim().is_empty()
             {
-                builder = builder.session_token(&token);
+                builder = builder.session_token(token);
             }
             let operator = crate::cold_store::with_s3_resilience(
                 Operator::new(builder)
                     .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?
                     .finish(),
+                config.s3_timeout,
+                config.s3_max_retries,
             );
-            let prefix = std::env::var("URSULA_SNAPSHOT_S3_PREFIX")
-                .unwrap_or_else(|_| "snapshots".to_owned());
             Ok(Self::new(operator, prefix))
         }
 
@@ -460,7 +461,9 @@ pub use s3::S3SnapshotStore;
 ///
 /// Recognized values for `URSULA_SNAPSHOT_BACKEND`: `inline`, `local`, `s3`.
 /// Under `madsim`, only `inline` is recognized; the others have no I/O.
-pub fn snapshot_store_from_env() -> Result<Option<SharedSnapshotStore>, SnapshotStoreError> {
+pub fn snapshot_store_from_env(
+    #[allow(unused_variables)] cold_config: &crate::cold_config::ColdStorageConfig,
+) -> Result<Option<SharedSnapshotStore>, SnapshotStoreError> {
     let backend = std::env::var("URSULA_SNAPSHOT_BACKEND")
         .unwrap_or_else(|_| "inline".to_owned())
         .to_ascii_lowercase();
@@ -481,7 +484,14 @@ pub fn snapshot_store_from_env() -> Result<Option<SharedSnapshotStore>, Snapshot
             Ok(Some(Arc::new(LocalSnapshotStore::new(root))))
         }
         #[cfg(not(madsim))]
-        "s3" => Ok(Some(Arc::new(S3SnapshotStore::s3_from_env()?))),
+        "s3" => {
+            let prefix = std::env::var("URSULA_SNAPSHOT_S3_PREFIX")
+                .unwrap_or_else(|_| "snapshots".to_owned());
+            Ok(Some(Arc::new(S3SnapshotStore::from_cold_config(
+                cold_config,
+                prefix,
+            )?)))
+        }
         #[cfg(madsim)]
         "local" | "s3" => Err(SnapshotStoreError::Backend(format!(
             "URSULA_SNAPSHOT_BACKEND '{backend}' has no I/O under madsim; use 'inline'"
@@ -766,7 +776,8 @@ mod tests {
         unsafe {
             std::env::remove_var("URSULA_SNAPSHOT_BACKEND");
         }
-        let result = snapshot_store_from_env().unwrap();
+        let result =
+            snapshot_store_from_env(&crate::cold_config::ColdStorageConfig::default()).unwrap();
         assert!(result.is_none());
         if let Some(prev) = prev {
             unsafe {
