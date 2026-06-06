@@ -18,7 +18,8 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// Identifier the store uses to derive a key/path for a snapshot blob.
 ///
@@ -64,7 +65,9 @@ impl SnapshotLocation {
 }
 
 mod serde_bytes_vec {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::Deserialize;
+    use serde::Deserializer;
+    use serde::Serializer;
 
     pub fn serialize<S: Serializer>(bytes: &[u8], ser: S) -> Result<S::Ok, S::Error> {
         ser.serialize_bytes(bytes)
@@ -218,10 +221,14 @@ impl SnapshotStore for InlineSnapshotStore {
 
 #[cfg(not(madsim))]
 mod s3 {
-    use super::{
-        SnapshotKey, SnapshotLocation, SnapshotStore, SnapshotStoreError, SnapshotStoreFuture,
-    };
-    use opendal::{Operator, Scheme};
+    use opendal::Operator;
+    use opendal::Scheme;
+
+    use super::SnapshotKey;
+    use super::SnapshotLocation;
+    use super::SnapshotStore;
+    use super::SnapshotStoreError;
+    use super::SnapshotStoreFuture;
 
     /// Bytes live in an opendal-managed S3 bucket under `{prefix}/group-{gid}/`.
     pub struct S3SnapshotStore {
@@ -318,7 +325,8 @@ mod s3 {
         /// S3 key unique per upload attempt without changing the openraft-visible
         /// snapshot_id.
         fn object_key(&self, key: &SnapshotKey) -> String {
-            use std::sync::atomic::{AtomicU64, Ordering};
+            use std::sync::atomic::AtomicU64;
+            use std::sync::atomic::Ordering;
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let nonce_nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -484,9 +492,11 @@ mod local {
     use std::io;
     use std::path::PathBuf;
 
-    use super::{
-        SnapshotKey, SnapshotLocation, SnapshotStore, SnapshotStoreError, SnapshotStoreFuture,
-    };
+    use super::SnapshotKey;
+    use super::SnapshotLocation;
+    use super::SnapshotStore;
+    use super::SnapshotStoreError;
+    use super::SnapshotStoreFuture;
 
     /// Bytes live on the local filesystem under a root directory.
     #[derive(Debug, Clone)]

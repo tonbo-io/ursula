@@ -1,5 +1,3 @@
-use openraft::RaftNetworkV2;
-use openraft::raft::TransferLeaderRequest;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;
@@ -11,6 +9,7 @@ use std::sync::OnceLock;
 use openraft::BasicNode;
 use openraft::OptionalSend;
 use openraft::RaftNetworkFactory;
+use openraft::RaftNetworkV2;
 use openraft::alias::SnapshotOf;
 use openraft::alias::VoteOf;
 use openraft::error::NetworkError;
@@ -20,40 +19,59 @@ use openraft::error::StreamingError;
 use openraft::error::Unreachable;
 use openraft::network::RPCOption;
 use openraft::raft::SnapshotResponse;
+use openraft::raft::TransferLeaderRequest;
 use prost::Message;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 use ursula_proto as raft_app_proto;
-use ursula_runtime::{
-    ColdIndexPageCache, ColdStoreColdIndexPageStore, ColdStoreHandle, GroupEngine,
-    GroupEngineError, HeadStreamRequest, ReadStreamRequest,
-};
+use ursula_runtime::ColdIndexPageCache;
+use ursula_runtime::ColdStoreColdIndexPageStore;
+use ursula_runtime::ColdStoreHandle;
+use ursula_runtime::GroupEngine;
+use ursula_runtime::GroupEngineError;
+use ursula_runtime::HeadStreamRequest;
+use ursula_runtime::ReadStreamRequest;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 
-use crate::codec::{
-    encode_group_write_result, group_engine_error_to_proto, group_write_command_from_proto,
-    head_stream_response_to_proto, placement_from_parts, read_stream_response_to_proto, required,
-};
+use crate::codec::encode_group_write_result;
+use crate::codec::group_engine_error_to_proto;
+use crate::codec::group_write_command_from_proto;
+use crate::codec::head_stream_response_to_proto;
+use crate::codec::placement_from_parts;
+use crate::codec::read_stream_response_to_proto;
+use crate::codec::required;
 use crate::engine::RaftGroupEngine;
 use crate::forward::write_commands_on_raft;
-use crate::log_store::{
-    append_entries_request_from_proto, append_entries_request_to_proto,
-    append_entries_response_from_proto, append_entries_response_to_proto,
-    log_id_from_required_proto, log_id_to_proto, snapshot_meta_from_required_proto,
-    snapshot_meta_to_proto, snapshot_response_from_required_proto, snapshot_response_to_proto,
-    vote_from_required_proto, vote_request_from_proto, vote_request_to_proto,
-    vote_response_from_proto, vote_response_to_proto, vote_to_proto,
-};
+use crate::log_store::append_entries_request_from_proto;
+use crate::log_store::append_entries_request_to_proto;
+use crate::log_store::append_entries_response_from_proto;
+use crate::log_store::append_entries_response_to_proto;
+use crate::log_store::log_id_from_required_proto;
+use crate::log_store::log_id_to_proto;
+use crate::log_store::snapshot_meta_from_required_proto;
+use crate::log_store::snapshot_meta_to_proto;
+use crate::log_store::snapshot_response_from_required_proto;
+use crate::log_store::snapshot_response_to_proto;
+use crate::log_store::vote_from_required_proto;
+use crate::log_store::vote_request_from_proto;
+use crate::log_store::vote_request_to_proto;
+use crate::log_store::vote_response_from_proto;
+use crate::log_store::vote_response_to_proto;
+use crate::log_store::vote_to_proto;
 use crate::raft_internal_proto;
-use crate::types::{
-    RaftGroupCommand, UrsulaAppendEntriesRequest, UrsulaAppendEntriesResponse,
-    UrsulaRaftTypeConfig, UrsulaVoteRequest, UrsulaVoteResponse,
-};
+use crate::types::RaftGroupCommand;
+use crate::types::UrsulaAppendEntriesRequest;
+use crate::types::UrsulaAppendEntriesResponse;
+use crate::types::UrsulaRaftTypeConfig;
+use crate::types::UrsulaVoteRequest;
+use crate::types::UrsulaVoteResponse;
 
 pub(crate) static GRPC_LEADER_CHANNELS: OnceLock<Mutex<BTreeMap<String, Channel>>> =
     OnceLock::new();
-use crate::registry::{LeadershipShedFlag, LeadershipShedState, RaftGroupHandleRegistry};
+use crate::registry::LeadershipShedFlag;
+use crate::registry::LeadershipShedState;
+use crate::registry::RaftGroupHandleRegistry;
 
 pub const RAFT_GRPC_APPEND_PATH: &str = "/ursula.raft.v1.RaftInternal/Append";
 pub const RAFT_GRPC_VOTE_PATH: &str = "/ursula.raft.v1.RaftInternal/Vote";

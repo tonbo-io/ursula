@@ -1,9 +1,7 @@
-use futures_util::TryStreamExt;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use crate::rt::time::Instant;
-
+use futures_util::TryStreamExt;
 use openraft::BasicNode;
 use openraft::Raft;
 use openraft::rt::WatchReceiver;
@@ -11,21 +9,26 @@ use prost::Message;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 use ursula_proto as raft_app_proto;
-use ursula_runtime::{
-    GroupEngineError, GroupEngineMetrics, GroupWriteCommand, GroupWriteResponse, HeadStreamRequest,
-    HeadStreamResponse, ReadStreamRequest, ReadStreamResponse,
-};
+use ursula_runtime::GroupEngineError;
+use ursula_runtime::GroupEngineMetrics;
+use ursula_runtime::GroupWriteCommand;
+use ursula_runtime::GroupWriteResponse;
+use ursula_runtime::HeadStreamRequest;
+use ursula_runtime::HeadStreamResponse;
+use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::ReadStreamResponse;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 
-use crate::codec::{
-    group_engine_error_from_proto, group_write_result_from_raft_response,
-    head_stream_response_from_proto, read_stream_response_from_proto,
-};
+use crate::codec::group_engine_error_from_proto;
+use crate::codec::group_write_result_from_raft_response;
+use crate::codec::head_stream_response_from_proto;
+use crate::codec::read_stream_response_from_proto;
 use crate::grpc::GRPC_LEADER_CHANNELS;
 use crate::grpc::RAFT_GRPC_MAX_MESSAGE_BYTES;
 use crate::log_store::elapsed_ns;
 use crate::raft_internal_proto;
+use crate::rt::time::Instant;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::types::UrsulaRaftTypeConfig;
 

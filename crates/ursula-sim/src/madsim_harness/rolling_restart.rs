@@ -16,9 +16,12 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use openraft::rt::WatchReceiver;
+use ursula_ctl::ClusterSnapshot;
+use ursula_ctl::NodeInfo;
+use ursula_ctl::RaftGroupView;
 use ursula_ctl::metrics::NodeMetricsView;
-use ursula_ctl::plan::{check_readiness, plan_drain};
-use ursula_ctl::{ClusterSnapshot, NodeInfo, RaftGroupView};
+use ursula_ctl::plan::check_readiness;
+use ursula_ctl::plan::plan_drain;
 use ursula_raft::InProcessRaftRegistry;
 
 use super::placement;
@@ -212,10 +215,15 @@ fn synthetic_node_info(node_id: u64) -> NodeInfo {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::MutexGuard;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
-    use super::super::{build_restartable_three_node_cluster, run_with_madsim, sim_network_policy};
+    use super::super::build_restartable_three_node_cluster;
+    use super::super::run_with_madsim;
+    use super::super::sim_network_policy;
     use super::*;
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());

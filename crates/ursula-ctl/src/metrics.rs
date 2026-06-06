@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use reqwest::Client;
 use serde::Deserialize;
 

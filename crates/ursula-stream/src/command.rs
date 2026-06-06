@@ -1,7 +1,10 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use ursula_shard::BucketStreamId;
 
-use crate::model::{ColdChunkRef, ExternalPayloadRef, ProducerRequest};
+use crate::model::ColdChunkRef;
+use crate::model::ExternalPayloadRef;
+use crate::model::ProducerRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamCommand {

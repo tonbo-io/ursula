@@ -1,17 +1,26 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
+use anyhow::Result;
 use bytes::Bytes;
 use clap::Args;
 use futures::StreamExt;
 use hdrhistogram::Histogram;
 use serde::Serialize;
-use tokio::sync::{Barrier, Mutex};
+use tokio::sync::Barrier;
+use tokio::sync::Mutex;
 
-use crate::backend::{ApiStyle, Backend};
-use crate::common::{Counts, LatencySummary, build_client, fill_payload, new_histogram, summarize};
+use crate::backend::ApiStyle;
+use crate::backend::Backend;
+use crate::common::Counts;
+use crate::common::LatencySummary;
+use crate::common::build_client;
+use crate::common::fill_payload;
+use crate::common::new_histogram;
+use crate::common::summarize;
 
 #[derive(Args, Debug, Clone)]
 pub struct BootstrapArgs {

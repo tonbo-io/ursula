@@ -14,9 +14,10 @@ use openraft::storage::LogState;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 
+use super::RaftGroupLogStoreInner;
+use super::ensure_consecutive_entries;
+use super::ensure_log_append_boundary;
 use crate::types::UrsulaRaftTypeConfig;
-
-use super::{RaftGroupLogStoreInner, ensure_consecutive_entries, ensure_log_append_boundary};
 
 #[derive(Debug, Default)]
 pub struct RaftGroupLogStore {

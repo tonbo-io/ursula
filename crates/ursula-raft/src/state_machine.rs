@@ -1,4 +1,3 @@
-use futures_util::TryStreamExt;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io;
@@ -6,11 +5,8 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use crate::rt::sync::OwnedSemaphorePermit;
-use crate::rt::sync::Semaphore;
-use crate::rt::time::Instant;
-
 use futures_util::Stream;
+use futures_util::TryStreamExt;
 use openraft::EntryPayload;
 use openraft::alias::LogIdOf;
 use openraft::alias::SnapshotDataOf;
@@ -20,24 +16,49 @@ use openraft::alias::StoredMembershipOf;
 use openraft::storage::EntryResponder;
 use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
-use ursula_runtime::{
-    AppendBatchRequest, AppendRequest, BootstrapStreamRequest, BootstrapStreamResponse,
-    ColdFlushCandidate, ColdGcEntry, ColdHotBacklog, ColdStoreHandle, ColdWriteAdmission,
-    CreateStreamRequest, DeleteSnapshotRequest, GroupEngine, GroupEngineError, GroupEngineMetrics,
-    GroupSnapshot, HeadStreamRequest, HeadStreamResponse, InMemoryGroupEngine,
-    PlanColdFlushRequest, PlanGroupColdFlushRequest, ReadSnapshotRequest, ReadSnapshotResponse,
-    ReadStreamRequest, ReadStreamResponse, SharedSnapshotStore, SnapshotKey, SnapshotLocation,
-    SnapshotPointer, default_snapshot_store,
-};
+use ursula_runtime::AppendBatchRequest;
+use ursula_runtime::AppendRequest;
+use ursula_runtime::BootstrapStreamRequest;
+use ursula_runtime::BootstrapStreamResponse;
+use ursula_runtime::ColdFlushCandidate;
+use ursula_runtime::ColdGcEntry;
+use ursula_runtime::ColdHotBacklog;
+use ursula_runtime::ColdStoreHandle;
+use ursula_runtime::ColdWriteAdmission;
+use ursula_runtime::CreateStreamRequest;
+use ursula_runtime::DeleteSnapshotRequest;
+use ursula_runtime::GroupEngine;
+use ursula_runtime::GroupEngineError;
+use ursula_runtime::GroupEngineMetrics;
+use ursula_runtime::GroupSnapshot;
+use ursula_runtime::HeadStreamRequest;
+use ursula_runtime::HeadStreamResponse;
+use ursula_runtime::InMemoryGroupEngine;
+use ursula_runtime::PlanColdFlushRequest;
+use ursula_runtime::PlanGroupColdFlushRequest;
+use ursula_runtime::ReadSnapshotRequest;
+use ursula_runtime::ReadSnapshotResponse;
+use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::ReadStreamResponse;
+use ursula_runtime::SharedSnapshotStore;
+use ursula_runtime::SnapshotKey;
+use ursula_runtime::SnapshotLocation;
+use ursula_runtime::SnapshotPointer;
+use ursula_runtime::default_snapshot_store;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 
-use crate::codec::{
-    group_write_command_from_proto, raft_blank_response, raft_membership_response,
-    raft_write_applied_response, raft_write_rejected_response,
-};
-use crate::engine::{group_engine_io_error, invalid_data};
+use crate::codec::group_write_command_from_proto;
+use crate::codec::raft_blank_response;
+use crate::codec::raft_membership_response;
+use crate::codec::raft_write_applied_response;
+use crate::codec::raft_write_rejected_response;
+use crate::engine::group_engine_io_error;
+use crate::engine::invalid_data;
 use crate::log_store::elapsed_ns;
+use crate::rt::sync::OwnedSemaphorePermit;
+use crate::rt::sync::Semaphore;
+use crate::rt::time::Instant;
 use crate::types::UrsulaRaftTypeConfig;
 
 #[derive(Debug, Clone)]
@@ -422,11 +443,9 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
     }
 
     async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), io::Error>
-    where
-        Strm: Stream<Item = Result<EntryResponder<UrsulaRaftTypeConfig>, io::Error>>
+    where Strm: Stream<Item = Result<EntryResponder<UrsulaRaftTypeConfig>, io::Error>>
             + Unpin
-            + openraft::OptionalSend,
-    {
+            + openraft::OptionalSend {
         let mut applied_entries = 0usize;
         let mut apply_ns = 0u64;
         while let Some((entry, responder)) = entries.try_next().await? {
@@ -648,9 +667,12 @@ mod tests {
     #[tokio::test]
     async fn snapshot_builder_keeps_previous_external_snapshot_objects() {
         use std::sync::Arc;
+
         use ursula_runtime::S3SnapshotStore;
         use ursula_runtime::SnapshotStore;
-        use ursula_shard::{CoreId, RaftGroupId, ShardId};
+        use ursula_shard::CoreId;
+        use ursula_shard::RaftGroupId;
+        use ursula_shard::ShardId;
 
         let placement = ShardPlacement {
             core_id: CoreId(0),
@@ -708,8 +730,12 @@ mod tests {
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn snapshot_builder_falls_back_to_inline_when_external_upload_fails() {
-        use ursula_runtime::{SnapshotStore, SnapshotStoreError, SnapshotStoreFuture};
-        use ursula_shard::{CoreId, RaftGroupId, ShardId};
+        use ursula_runtime::SnapshotStore;
+        use ursula_runtime::SnapshotStoreError;
+        use ursula_runtime::SnapshotStoreFuture;
+        use ursula_shard::CoreId;
+        use ursula_shard::RaftGroupId;
+        use ursula_shard::ShardId;
 
         #[derive(Debug)]
         struct FailingSnapshotStore;

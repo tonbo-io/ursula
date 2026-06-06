@@ -1,20 +1,45 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
 
 use ursula_shard::BucketStreamId;
 
 use crate::command::StreamCommand;
 use crate::integrity::StreamIntegrity;
-use crate::model::{
-    AppendExternalInput, AppendStreamInput, COLD_INDEX_PAGE_SPAN_BYTES, ColdChunkRef,
-    ColdFlushCandidate, ColdGcEntry, ColdGcTarget, ExternalPayloadRef, HotPayloadSegment,
-    ObjectPayloadRef, ProducerAppendRecord, ProducerRequest, ProducerSnapshot, ProducerState,
-    StreamBatchAppend, StreamBatchAppendItem, StreamBootstrapPlan, StreamMessageRecord,
-    StreamMetadata, StreamRead, StreamReadColdIndexSegment, StreamReadObjectSegment,
-    StreamReadPlan, StreamReadSegment, StreamStatus, StreamVisibleSnapshot,
-};
-use crate::response::{StreamErrorCode, StreamErrorContext, StreamResponse};
-use crate::snapshot::{StreamSnapshot, StreamSnapshotEntry, StreamSnapshotError};
-use crate::validate::{validate_bucket_id, validate_stream_id};
+use crate::model::AppendExternalInput;
+use crate::model::AppendStreamInput;
+use crate::model::COLD_INDEX_PAGE_SPAN_BYTES;
+use crate::model::ColdChunkRef;
+use crate::model::ColdFlushCandidate;
+use crate::model::ColdGcEntry;
+use crate::model::ColdGcTarget;
+use crate::model::ExternalPayloadRef;
+use crate::model::HotPayloadSegment;
+use crate::model::ObjectPayloadRef;
+use crate::model::ProducerAppendRecord;
+use crate::model::ProducerRequest;
+use crate::model::ProducerSnapshot;
+use crate::model::ProducerState;
+use crate::model::StreamBatchAppend;
+use crate::model::StreamBatchAppendItem;
+use crate::model::StreamBootstrapPlan;
+use crate::model::StreamMessageRecord;
+use crate::model::StreamMetadata;
+use crate::model::StreamRead;
+use crate::model::StreamReadColdIndexSegment;
+use crate::model::StreamReadObjectSegment;
+use crate::model::StreamReadPlan;
+use crate::model::StreamReadSegment;
+use crate::model::StreamStatus;
+use crate::model::StreamVisibleSnapshot;
+use crate::response::StreamErrorCode;
+use crate::response::StreamErrorContext;
+use crate::response::StreamResponse;
+use crate::snapshot::StreamSnapshot;
+use crate::snapshot::StreamSnapshotEntry;
+use crate::snapshot::StreamSnapshotError;
+use crate::validate::validate_bucket_id;
+use crate::validate::validate_stream_id;
 
 #[derive(Debug, Clone, Default)]
 pub struct StreamStateMachine {
@@ -1247,14 +1272,12 @@ impl StreamStateMachine {
             );
         }
 
-        self.visible_snapshots.insert(
-            stream_id.clone(),
-            StreamVisibleSnapshot {
+        self.visible_snapshots
+            .insert(stream_id.clone(), StreamVisibleSnapshot {
                 offset: snapshot_offset,
                 content_type,
                 payload,
-            },
-        );
+            });
         self.compact_retained_prefix(&stream_id, snapshot_offset);
         StreamResponse::SnapshotPublished { snapshot_offset }
     }
@@ -1483,13 +1506,11 @@ impl StreamStateMachine {
         }
         self.integrities.insert(input.stream_id.clone(), integrity);
         if initial_len > 0 {
-            self.message_records.insert(
-                input.stream_id.clone(),
-                vec![StreamMessageRecord {
+            self.message_records
+                .insert(input.stream_id.clone(), vec![StreamMessageRecord {
                     start_offset: 0,
                     end_offset: initial_len,
-                }],
-            );
+                }]);
         }
         let mut producer_states = HashMap::new();
         if let Some(producer) = input.producer {
@@ -1498,17 +1519,14 @@ impl StreamStateMachine {
                 next_offset: initial_len,
                 closed: input.close_after,
             };
-            producer_states.insert(
-                producer.producer_id,
-                ProducerState {
-                    producer_epoch: producer.producer_epoch,
-                    producer_seq: producer.producer_seq,
-                    last_start_offset: last_item.start_offset,
-                    last_next_offset: last_item.next_offset,
-                    last_closed: last_item.closed,
-                    last_items: vec![last_item],
-                },
-            );
+            producer_states.insert(producer.producer_id, ProducerState {
+                producer_epoch: producer.producer_epoch,
+                producer_seq: producer.producer_seq,
+                last_start_offset: last_item.start_offset,
+                last_next_offset: last_item.next_offset,
+                last_closed: last_item.closed,
+                last_items: vec![last_item],
+            });
         }
         self.producers
             .insert(input.stream_id.clone(), producer_states);
@@ -1628,13 +1646,11 @@ impl StreamStateMachine {
             );
         }
         self.integrities.insert(input.stream_id.clone(), integrity);
-        self.message_records.insert(
-            input.stream_id.clone(),
-            vec![StreamMessageRecord {
+        self.message_records
+            .insert(input.stream_id.clone(), vec![StreamMessageRecord {
                 start_offset: 0,
                 end_offset: initial_len,
-            }],
-        );
+            }]);
         let mut producer_states = HashMap::new();
         if let Some(producer) = input.producer {
             let last_item = ProducerAppendRecord {
@@ -1642,17 +1658,14 @@ impl StreamStateMachine {
                 next_offset: initial_len,
                 closed: input.close_after,
             };
-            producer_states.insert(
-                producer.producer_id,
-                ProducerState {
-                    producer_epoch: producer.producer_epoch,
-                    producer_seq: producer.producer_seq,
-                    last_start_offset: last_item.start_offset,
-                    last_next_offset: last_item.next_offset,
-                    last_closed: last_item.closed,
-                    last_items: vec![last_item],
-                },
-            );
+            producer_states.insert(producer.producer_id, ProducerState {
+                producer_epoch: producer.producer_epoch,
+                producer_seq: producer.producer_seq,
+                last_start_offset: last_item.start_offset,
+                last_next_offset: last_item.next_offset,
+                last_closed: last_item.closed,
+                last_items: vec![last_item],
+            });
         }
         self.producers
             .insert(input.stream_id.clone(), producer_states);
@@ -2565,17 +2578,17 @@ impl StreamStateMachine {
         last: ProducerAppendRecord,
         last_items: Vec<ProducerAppendRecord>,
     ) {
-        self.producers.entry(stream_id).or_default().insert(
-            producer.producer_id,
-            ProducerState {
+        self.producers
+            .entry(stream_id)
+            .or_default()
+            .insert(producer.producer_id, ProducerState {
                 producer_epoch: producer.producer_epoch,
                 producer_seq: producer.producer_seq,
                 last_start_offset: last.start_offset,
                 last_next_offset: last.next_offset,
                 last_closed: last.closed,
                 last_items,
-            },
-        );
+            });
     }
 }
 
@@ -2758,17 +2771,14 @@ fn restore_producer_states(
     let mut states = HashMap::with_capacity(snapshots.len());
     for snapshot in snapshots {
         if states
-            .insert(
-                snapshot.producer_id.clone(),
-                ProducerState {
-                    producer_epoch: snapshot.producer_epoch,
-                    producer_seq: snapshot.producer_seq,
-                    last_start_offset: snapshot.last_start_offset,
-                    last_next_offset: snapshot.last_next_offset,
-                    last_closed: snapshot.last_closed,
-                    last_items: snapshot.last_items,
-                },
-            )
+            .insert(snapshot.producer_id.clone(), ProducerState {
+                producer_epoch: snapshot.producer_epoch,
+                producer_seq: snapshot.producer_seq,
+                last_start_offset: snapshot.last_start_offset,
+                last_next_offset: snapshot.last_next_offset,
+                last_closed: snapshot.last_closed,
+                last_items: snapshot.last_items,
+            })
             .is_some()
         {
             return Err(StreamSnapshotError::DuplicateProducer {

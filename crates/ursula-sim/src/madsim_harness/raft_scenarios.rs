@@ -2,18 +2,35 @@
 //! restart-follower, leader-failover) extracted from `madsim_harness/mod.rs`
 //! (DoD #3 modularity refactor — workloads axis).
 
-use super::{
-    AppendRequest, BasicNode, CreateStreamRequest, Duration, GroupEngine, InProcessRaftFaultAction,
-    InProcessRaftFaultScript, InProcessRaftNetworkFactory, RaftGroupEngine, SimEvent, SimTrace,
-    ThreeNodeRaftSimConfig, ThreeNodeRaftSimOutcome, build_lagging_learner_snapshot_cluster,
-    build_restartable_three_node_cluster, build_three_node_cluster, placement,
-    read_local_payload_eventually, seeded_follower_id, sim_network_policy,
-    verify_all_nodes_can_read, wait_all_nodes_applied,
-};
-#[cfg(test)]
-use super::{GroupWriteCommand, build_three_node_snapshot_purge_cluster};
 #[cfg(test)]
 use openraft::storage::RaftLogStorage;
+
+use super::AppendRequest;
+use super::BasicNode;
+use super::CreateStreamRequest;
+use super::Duration;
+use super::GroupEngine;
+#[cfg(test)]
+use super::GroupWriteCommand;
+use super::InProcessRaftFaultAction;
+use super::InProcessRaftFaultScript;
+use super::InProcessRaftNetworkFactory;
+use super::RaftGroupEngine;
+use super::SimEvent;
+use super::SimTrace;
+use super::ThreeNodeRaftSimConfig;
+use super::ThreeNodeRaftSimOutcome;
+use super::build_lagging_learner_snapshot_cluster;
+use super::build_restartable_three_node_cluster;
+use super::build_three_node_cluster;
+#[cfg(test)]
+use super::build_three_node_snapshot_purge_cluster;
+use super::placement;
+use super::read_local_payload_eventually;
+use super::seeded_follower_id;
+use super::sim_network_policy;
+use super::verify_all_nodes_can_read;
+use super::wait_all_nodes_applied;
 
 pub(super) async fn run_no_fault_inner(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
     let mut trace = SimTrace::default();

@@ -14,8 +14,6 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::mpsc;
 
-use crate::rt::time::Instant;
-
 use openraft::OptionalSend;
 use openraft::alias::EntryOf;
 use openraft::alias::LogIdOf;
@@ -28,18 +26,26 @@ use prost::Message;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_shard::ShardPlacement;
 
+use super::CoreJournalRecord;
+use super::RaftGroupLogRecord;
+use super::RaftGroupLogStoreInner;
+use super::StoredLogEntry;
+use super::append_record;
+use super::ensure_consecutive_entries;
+use super::ensure_log_append_boundary;
+use super::log_id_from_required_proto;
+use super::purge_record;
+use super::save_committed_record;
+use super::save_vote_record;
+use super::stored_log_entry_into_entry;
+use super::truncate_after_record;
+use super::vote_from_required_proto;
 use crate::engine::invalid_data;
 use crate::raft_internal_proto;
-use crate::types::{
-    CORE_LOG_GROUP_COMMIT_DELAY, CORE_LOG_GROUP_COMMIT_MAX_BATCH, UrsulaRaftTypeConfig,
-};
-
-use super::{
-    CoreJournalRecord, RaftGroupLogRecord, RaftGroupLogStoreInner, StoredLogEntry, append_record,
-    ensure_consecutive_entries, ensure_log_append_boundary, log_id_from_required_proto,
-    purge_record, save_committed_record, save_vote_record, stored_log_entry_into_entry,
-    truncate_after_record, vote_from_required_proto,
-};
+use crate::rt::time::Instant;
+use crate::types::CORE_LOG_GROUP_COMMIT_DELAY;
+use crate::types::CORE_LOG_GROUP_COMMIT_MAX_BATCH;
+use crate::types::UrsulaRaftTypeConfig;
 
 #[derive(Debug)]
 pub struct RaftGroupFileLogStore {
@@ -480,9 +486,7 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
 pub(crate) async fn spawn_log_store_blocking<T>(
     f: impl FnOnce() -> Result<T, io::Error> + Send + 'static,
 ) -> Result<T, io::Error>
-where
-    T: Send + 'static,
-{
+where T: Send + 'static {
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|err| io::Error::other(format!("join OpenRaft file log task: {err}")))?
@@ -747,11 +751,14 @@ pub(crate) fn apply_log_store_record(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    use ursula_shard::CoreId;
+    use ursula_shard::RaftGroupId;
+    use ursula_shard::ShardId;
+
     use super::*;
-
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    use ursula_shard::{CoreId, RaftGroupId, ShardId};
 
     static TEMP_JOURNAL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -825,14 +832,10 @@ mod tests {
             file: None,
             parent_needs_sync: true,
         };
-        write_protobuf_frame_to_file(
-            &path,
-            &mut handle,
-            &CoreJournalRecord {
-                group_id: placement.raft_group_id.0,
-                record: Some(save_vote_record(vote)),
-            },
-        )
+        write_protobuf_frame_to_file(&path, &mut handle, &CoreJournalRecord {
+            group_id: placement.raft_group_id.0,
+            record: Some(save_vote_record(vote)),
+        })
         .expect("write complete core journal record");
         sync_file_handle(&path, &mut handle).expect("sync complete core journal record");
         drop(handle);

@@ -1,15 +1,32 @@
 //! HTTP protocol-surface scenarios extracted from `madsim_harness/mod.rs`
 //! (DoD #3 modularity refactor — workloads axis, HTTP/axum in-process scenarios).
 
-use super::{
-    Arc, AtomicU64, Body, Duration, HttpProtocolSurfacePlan, HttpRequest, HttpState,
-    InMemoryGroupEngineFactory, Ordering, RuntimeConfig, RuntimeThreading, ServiceExt,
-    ShardRuntime, SimEvent, SimHttpWallClock, SimTrace, StatusCode, ThreeNodeRaftSimConfig,
-    ThreeNodeRaftSimOutcome, assert_http_protocol_surface_randomized_final_read,
-    assert_http_protocol_surface_randomized_live_backpressure,
-    assert_http_protocol_surface_randomized_sse_next_offset, http_offset, parse_http_offset,
-    router_with_http_state, to_bytes,
-};
+use super::Arc;
+use super::AtomicU64;
+use super::Body;
+use super::Duration;
+use super::HttpProtocolSurfacePlan;
+use super::HttpRequest;
+use super::HttpState;
+use super::InMemoryGroupEngineFactory;
+use super::Ordering;
+use super::RuntimeConfig;
+use super::RuntimeThreading;
+use super::ServiceExt;
+use super::ShardRuntime;
+use super::SimEvent;
+use super::SimHttpWallClock;
+use super::SimTrace;
+use super::StatusCode;
+use super::ThreeNodeRaftSimConfig;
+use super::ThreeNodeRaftSimOutcome;
+use super::assert_http_protocol_surface_randomized_final_read;
+use super::assert_http_protocol_surface_randomized_live_backpressure;
+use super::assert_http_protocol_surface_randomized_sse_next_offset;
+use super::http_offset;
+use super::parse_http_offset;
+use super::router_with_http_state;
+use super::to_bytes;
 
 pub(super) async fn run_http_protocol_surface_inner(
     config: ThreeNodeRaftSimConfig,

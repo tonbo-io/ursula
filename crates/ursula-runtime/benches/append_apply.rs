@@ -1,8 +1,15 @@
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
-};
+use criterion::BatchSize;
+use criterion::BenchmarkId;
+use criterion::Criterion;
+use criterion::Throughput;
+use criterion::black_box;
+use criterion::criterion_group;
+use criterion::criterion_main;
 use ursula_shard::BucketStreamId;
-use ursula_stream::{ProducerRequest, StreamCommand, StreamResponse, StreamStateMachine};
+use ursula_stream::ProducerRequest;
+use ursula_stream::StreamCommand;
+use ursula_stream::StreamResponse;
+use ursula_stream::StreamStateMachine;
 
 const CONTENT_TYPE: &str = "application/octet-stream";
 const APPENDS_PER_ITER: usize = 1024;

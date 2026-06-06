@@ -12,12 +12,11 @@
 //! compile time under `RUSTFLAGS="--cfg madsim" cargo build`, satisfying
 //! DoD #6 ("renaming step is a compile error, not a CI failure").
 
-use std::process::ExitCode;
-
 #[cfg(madsim)]
 use std::env;
 #[cfg(madsim)]
 use std::error::Error;
+use std::process::ExitCode;
 
 #[cfg(not(madsim))]
 fn main() -> ExitCode {
@@ -127,7 +126,8 @@ fn print_help() {
 mod madsim_shapes {
     use std::error::Error;
 
-    use ursula_sim::{SimFaultAction, SimSchedule};
+    use ursula_sim::SimFaultAction;
+    use ursula_sim::SimSchedule;
 
     /// Names of every registered shape. Kept in sync with `dispatch` below by
     /// the compiler: each name must be reachable from a match arm.

@@ -1,13 +1,16 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use ursula_shard::BucketStreamId;
-use ursula_stream::{
-    ColdChunkRef, ExternalPayloadRef, ObjectPayloadRef, StreamReadColdIndexSegment,
-};
+use ursula_stream::ColdChunkRef;
+use ursula_stream::ExternalPayloadRef;
+use ursula_stream::ObjectPayloadRef;
+use ursula_stream::StreamReadColdIndexSegment;
 
 use crate::cold_store::ColdStoreHandle;
 
@@ -847,15 +850,12 @@ mod tests {
             .expect("write first chunk");
         assert_eq!(
             cache
-                .object_segments_for_read(
-                    &stream_id,
-                    &StreamReadColdIndexSegment {
-                        generation: 0,
-                        page_id: 0,
-                        read_start_offset: 0,
-                        len: 1,
-                    },
-                )
+                .object_segments_for_read(&stream_id, &StreamReadColdIndexSegment {
+                    generation: 0,
+                    page_id: 0,
+                    read_start_offset: 0,
+                    len: 1,
+                },)
                 .await
                 .expect("read first byte")
                 .len(),
@@ -873,15 +873,12 @@ mod tests {
             .expect("write second chunk behind cache");
 
         let objects = cache
-            .object_segments_for_read(
-                &stream_id,
-                &StreamReadColdIndexSegment {
-                    generation: 0,
-                    page_id: 0,
-                    read_start_offset: 128,
-                    len: 1,
-                },
-            )
+            .object_segments_for_read(&stream_id, &StreamReadColdIndexSegment {
+                generation: 0,
+                page_id: 0,
+                read_start_offset: 128,
+                len: 1,
+            })
             .await
             .expect("reload stale page");
         assert_eq!(objects[0].s3_path, second.s3_path);

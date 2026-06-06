@@ -1,7 +1,12 @@
-use ursula_shard::{CoreId, RaftGroupId, ShardMapError, ShardPlacement};
-use ursula_stream::{StreamErrorCode, StreamErrorContext};
+use ursula_shard::CoreId;
+use ursula_shard::RaftGroupId;
+use ursula_shard::ShardMapError;
+use ursula_shard::ShardPlacement;
+use ursula_stream::StreamErrorCode;
+use ursula_stream::StreamErrorContext;
 
-use crate::engine::{GroupEngineError, GroupLeaderHint};
+use crate::engine::GroupEngineError;
+use crate::engine::GroupLeaderHint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorStatus {

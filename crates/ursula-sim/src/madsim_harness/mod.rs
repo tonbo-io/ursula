@@ -1,40 +1,107 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use axum::body::{Body, to_bytes};
-use axum::http::{HeaderValue, Request as HttpRequest, StatusCode};
-use openraft::{BasicNode, Config, SnapshotPolicy, storage::RaftLogStorage};
-use serde::{Deserialize, Serialize};
+use axum::body::Body;
+use axum::body::to_bytes;
+use axum::http::HeaderValue;
+use axum::http::Request as HttpRequest;
+use axum::http::StatusCode;
+use openraft::BasicNode;
+use openraft::Config;
+use openraft::SnapshotPolicy;
+use openraft::storage::RaftLogStorage;
+use serde::Deserialize;
+use serde::Serialize;
 use tower::ServiceExt;
-use ursula::{HttpState, WallClock, router_with_http_state};
-use ursula_raft::{
-    InProcessRaftFaultAction, InProcessRaftFaultScript, InProcessRaftNetworkEvent,
-    InProcessRaftNetworkFactory, InProcessRaftNetworkPolicy, InProcessRaftNetworkPolicyEvent,
-    InProcessRaftRegistry, InProcessRaftRpcKind, MadsimOpenRaftRuntime, RaftGroupEngine,
-    RaftGroupEngineFactory, RaftGroupLogStore, RaftGroupStateMachine, UrsulaRaftTypeConfig,
-};
-use ursula_runtime::{
-    AppendBatchRequest, AppendExternalRequest, AppendRequest, AppendResponse,
-    BootstrapStreamRequest, CloseStreamRequest, CloseStreamResponse, ColdStore, ColdStoreEvent,
-    ColdStoreFaultEffect, ColdStoreHandle, ColdStoreOperation, ColdWriteAdmission,
-    CreateStreamExternalRequest, CreateStreamRequest, DeleteSnapshotRequest, DeleteStreamRequest,
-    FlushColdRequest, GroupAppendBatchFuture, GroupAppendFuture, GroupBootstrapStreamFuture,
-    GroupCloseStreamFuture, GroupColdHotBacklogFuture, GroupCreateStreamFuture,
-    GroupDeleteSnapshotFuture, GroupDeleteStreamFuture, GroupEngine, GroupEngineCreateFuture,
-    GroupEngineError, GroupEngineFactory, GroupEngineMetrics, GroupFlushColdFuture,
-    GroupForkRefFuture, GroupHeadStreamFuture, GroupInstallSnapshotFuture,
-    GroupPlanColdFlushFuture, GroupPlanNextColdFlushBatchFuture, GroupPlanNextColdFlushFuture,
-    GroupPublishSnapshotFuture, GroupReadSnapshotFuture, GroupReadStreamFuture,
-    GroupReadStreamPartsFuture, GroupRequireLiveReadOwnerFuture, GroupShutdownFuture,
-    GroupSnapshot, GroupSnapshotFuture, GroupTouchStreamAccessFuture, GroupWriteBatchFuture,
-    GroupWriteCommand, HeadStreamRequest, InMemoryGroupEngineFactory, PlanColdFlushRequest,
-    PlanGroupColdFlushRequest, ProducerRequest, PublishSnapshotRequest, ReadSnapshotRequest,
-    ReadStreamRequest, RuntimeConfig, RuntimeError, RuntimeThreading, ShardRuntime,
-};
-use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardId, ShardPlacement};
+use ursula::HttpState;
+use ursula::WallClock;
+use ursula::router_with_http_state;
+use ursula_raft::InProcessRaftFaultAction;
+use ursula_raft::InProcessRaftFaultScript;
+use ursula_raft::InProcessRaftNetworkEvent;
+use ursula_raft::InProcessRaftNetworkFactory;
+use ursula_raft::InProcessRaftNetworkPolicy;
+use ursula_raft::InProcessRaftNetworkPolicyEvent;
+use ursula_raft::InProcessRaftRegistry;
+use ursula_raft::InProcessRaftRpcKind;
+use ursula_raft::MadsimOpenRaftRuntime;
+use ursula_raft::RaftGroupEngine;
+use ursula_raft::RaftGroupEngineFactory;
+use ursula_raft::RaftGroupLogStore;
+use ursula_raft::RaftGroupStateMachine;
+use ursula_raft::UrsulaRaftTypeConfig;
+use ursula_runtime::AppendBatchRequest;
+use ursula_runtime::AppendExternalRequest;
+use ursula_runtime::AppendRequest;
+use ursula_runtime::AppendResponse;
+use ursula_runtime::BootstrapStreamRequest;
+use ursula_runtime::CloseStreamRequest;
+use ursula_runtime::CloseStreamResponse;
+use ursula_runtime::ColdStore;
+use ursula_runtime::ColdStoreEvent;
+use ursula_runtime::ColdStoreFaultEffect;
+use ursula_runtime::ColdStoreHandle;
+use ursula_runtime::ColdStoreOperation;
+use ursula_runtime::ColdWriteAdmission;
+use ursula_runtime::CreateStreamExternalRequest;
+use ursula_runtime::CreateStreamRequest;
+use ursula_runtime::DeleteSnapshotRequest;
+use ursula_runtime::DeleteStreamRequest;
+use ursula_runtime::FlushColdRequest;
+use ursula_runtime::GroupAppendBatchFuture;
+use ursula_runtime::GroupAppendFuture;
+use ursula_runtime::GroupBootstrapStreamFuture;
+use ursula_runtime::GroupCloseStreamFuture;
+use ursula_runtime::GroupColdHotBacklogFuture;
+use ursula_runtime::GroupCreateStreamFuture;
+use ursula_runtime::GroupDeleteSnapshotFuture;
+use ursula_runtime::GroupDeleteStreamFuture;
+use ursula_runtime::GroupEngine;
+use ursula_runtime::GroupEngineCreateFuture;
+use ursula_runtime::GroupEngineError;
+use ursula_runtime::GroupEngineFactory;
+use ursula_runtime::GroupEngineMetrics;
+use ursula_runtime::GroupFlushColdFuture;
+use ursula_runtime::GroupForkRefFuture;
+use ursula_runtime::GroupHeadStreamFuture;
+use ursula_runtime::GroupInstallSnapshotFuture;
+use ursula_runtime::GroupPlanColdFlushFuture;
+use ursula_runtime::GroupPlanNextColdFlushBatchFuture;
+use ursula_runtime::GroupPlanNextColdFlushFuture;
+use ursula_runtime::GroupPublishSnapshotFuture;
+use ursula_runtime::GroupReadSnapshotFuture;
+use ursula_runtime::GroupReadStreamFuture;
+use ursula_runtime::GroupReadStreamPartsFuture;
+use ursula_runtime::GroupRequireLiveReadOwnerFuture;
+use ursula_runtime::GroupShutdownFuture;
+use ursula_runtime::GroupSnapshot;
+use ursula_runtime::GroupSnapshotFuture;
+use ursula_runtime::GroupTouchStreamAccessFuture;
+use ursula_runtime::GroupWriteBatchFuture;
+use ursula_runtime::GroupWriteCommand;
+use ursula_runtime::HeadStreamRequest;
+use ursula_runtime::InMemoryGroupEngineFactory;
+use ursula_runtime::PlanColdFlushRequest;
+use ursula_runtime::PlanGroupColdFlushRequest;
+use ursula_runtime::ProducerRequest;
+use ursula_runtime::PublishSnapshotRequest;
+use ursula_runtime::ReadSnapshotRequest;
+use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::RuntimeConfig;
+use ursula_runtime::RuntimeError;
+use ursula_runtime::RuntimeThreading;
+use ursula_runtime::ShardRuntime;
+use ursula_shard::BucketStreamId;
+use ursula_shard::CoreId;
+use ursula_shard::RaftGroupId;
+use ursula_shard::ShardId;
+use ursula_shard::ShardPlacement;
 
 pub const SIM_REGRESSION_SCHEMA_VERSION: u32 = 1;
 
@@ -451,58 +518,72 @@ impl SimFailureRegressionRecord {
 }
 
 mod trace;
-pub use self::trace::{SimEvent, SimTrace};
+pub use self::trace::SimEvent;
+pub use self::trace::SimTrace;
 
 mod cold_path;
 mod generators;
-use cold_path::{
-    run_cold_delete_fault_inner, run_cold_live_read_inner, run_cold_read_delay_inner,
-    run_cold_read_fault_inner, run_cold_read_truncate_inner, run_cold_write_delay_inner,
-    run_cold_write_fault_inner,
-};
+use cold_path::run_cold_delete_fault_inner;
+use cold_path::run_cold_live_read_inner;
+use cold_path::run_cold_read_delay_inner;
+use cold_path::run_cold_read_fault_inner;
+use cold_path::run_cold_read_truncate_inner;
+use cold_path::run_cold_write_delay_inner;
+use cold_path::run_cold_write_fault_inner;
 mod http;
-use http::{
-    run_http_live_limit_protocol_surface_inner, run_http_live_protocol_surface_inner,
-    run_http_producer_protocol_surface_inner, run_http_protocol_surface_inner,
-    run_http_protocol_surface_randomized_inner,
-};
+use http::run_http_live_limit_protocol_surface_inner;
+use http::run_http_live_protocol_surface_inner;
+use http::run_http_producer_protocol_surface_inner;
+use http::run_http_protocol_surface_inner;
+use http::run_http_protocol_surface_randomized_inner;
 mod runtime_scenarios;
-use runtime_scenarios::{
-    run_runtime_actor_scheduling_inner, run_runtime_cold_flush_worker_inner,
-    run_runtime_multi_client_actors_inner, run_runtime_raft_engine_inner,
-    run_runtime_raft_network_inner, run_runtime_raft_snapshot_install_inner,
-    run_runtime_seeded_interleaving_inner,
-};
+use runtime_scenarios::run_runtime_actor_scheduling_inner;
+use runtime_scenarios::run_runtime_cold_flush_worker_inner;
+use runtime_scenarios::run_runtime_multi_client_actors_inner;
+use runtime_scenarios::run_runtime_raft_engine_inner;
+use runtime_scenarios::run_runtime_raft_network_inner;
+use runtime_scenarios::run_runtime_raft_snapshot_install_inner;
+use runtime_scenarios::run_runtime_seeded_interleaving_inner;
 mod raft_scenarios;
 #[cfg(test)]
 use raft_scenarios::run_isolated_leader_pending_write_snapshot_purge_inner;
-use raft_scenarios::{
-    run_leader_failover_inner, run_no_fault_inner, run_partition_heal_inner,
-    run_restart_follower_inner, run_snapshot_catch_up_inner,
-};
+use raft_scenarios::run_leader_failover_inner;
+use raft_scenarios::run_no_fault_inner;
+use raft_scenarios::run_partition_heal_inner;
+use raft_scenarios::run_restart_follower_inner;
+use raft_scenarios::run_snapshot_catch_up_inner;
 mod faults_inner;
 pub use faults_inner::*;
 mod dispatch;
 mod introspect;
-use introspect::{
-    cold_read_delay_ms_from_fault_plan, cold_read_truncate_len_from_fault_plan,
-    cold_write_delay_ms_from_fault_plan, corrupt_cold_live_read_node_from_fault_plan,
-    has_cold_delete_fault_in_fault_plan, has_cold_read_fault_in_fault_plan,
-    has_cold_write_fault_in_fault_plan,
-    has_corrupt_http_live_limit_backpressure_expectation_in_fault_plan,
-    has_corrupt_http_live_sse_next_offset_expectation_in_fault_plan,
-    has_corrupt_http_producer_duplicate_expectation_in_fault_plan,
-    has_corrupt_http_snapshot_body_expectation_in_fault_plan,
-    has_corrupt_runtime_raft_snapshot_append_counts_in_fault_plan,
-    has_heal_seeded_follower_in_fault_plan, has_partition_seeded_follower_in_fault_plan,
-    has_restart_stopped_follower_in_fault_plan, has_restart_stopped_leader_in_fault_plan,
-    has_retry_cold_read_after_failure_in_fault_plan,
-    has_retry_cold_write_after_failure_in_fault_plan, has_stop_current_leader_in_fault_plan,
-    has_stop_seeded_follower_in_fault_plan, has_verify_runtime_cold_live_reads_in_fault_plan,
-    http_protocol_surface_plan_from_fault_plan, invariant_failed, panic_payload_to_string,
-    runtime_interleaving_plan_from_fault_plan, runtime_raft_network_workload_plan_from_fault_plan,
-    sim_event_from_cold_store_event, sim_event_from_network_event,
-};
+use introspect::cold_read_delay_ms_from_fault_plan;
+use introspect::cold_read_truncate_len_from_fault_plan;
+use introspect::cold_write_delay_ms_from_fault_plan;
+use introspect::corrupt_cold_live_read_node_from_fault_plan;
+use introspect::has_cold_delete_fault_in_fault_plan;
+use introspect::has_cold_read_fault_in_fault_plan;
+use introspect::has_cold_write_fault_in_fault_plan;
+use introspect::has_corrupt_http_live_limit_backpressure_expectation_in_fault_plan;
+use introspect::has_corrupt_http_live_sse_next_offset_expectation_in_fault_plan;
+use introspect::has_corrupt_http_producer_duplicate_expectation_in_fault_plan;
+use introspect::has_corrupt_http_snapshot_body_expectation_in_fault_plan;
+use introspect::has_corrupt_runtime_raft_snapshot_append_counts_in_fault_plan;
+use introspect::has_heal_seeded_follower_in_fault_plan;
+use introspect::has_partition_seeded_follower_in_fault_plan;
+use introspect::has_restart_stopped_follower_in_fault_plan;
+use introspect::has_restart_stopped_leader_in_fault_plan;
+use introspect::has_retry_cold_read_after_failure_in_fault_plan;
+use introspect::has_retry_cold_write_after_failure_in_fault_plan;
+use introspect::has_stop_current_leader_in_fault_plan;
+use introspect::has_stop_seeded_follower_in_fault_plan;
+use introspect::has_verify_runtime_cold_live_reads_in_fault_plan;
+use introspect::http_protocol_surface_plan_from_fault_plan;
+use introspect::invariant_failed;
+use introspect::panic_payload_to_string;
+use introspect::runtime_interleaving_plan_from_fault_plan;
+use introspect::runtime_raft_network_workload_plan_from_fault_plan;
+use introspect::sim_event_from_cold_store_event;
+use introspect::sim_event_from_network_event;
 #[cfg(test)]
 mod rolling_restart;
 
@@ -990,16 +1071,13 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
             groups
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
-                .insert(
-                    placement.raft_group_id.0,
-                    RuntimeRaftNetworkGroupControl {
-                        placement,
-                        config: config.clone(),
-                        registry: registry.clone(),
-                        metrics: metrics.clone(),
-                        log_stores,
-                    },
-                );
+                .insert(placement.raft_group_id.0, RuntimeRaftNetworkGroupControl {
+                    placement,
+                    config: config.clone(),
+                    registry: registry.clone(),
+                    metrics: metrics.clone(),
+                    log_stores,
+                });
 
             let leader_index = engines
                 .iter()

@@ -1,11 +1,16 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use ursula_shard::BucketStreamId;
 
 use crate::integrity::StreamIntegritySnapshot;
-use crate::model::{
-    ColdChunkRef, ColdGcEntry, HotPayloadSegment, ObjectPayloadRef, ProducerSnapshot,
-    StreamMessageRecord, StreamMetadata, StreamVisibleSnapshot,
-};
+use crate::model::ColdChunkRef;
+use crate::model::ColdGcEntry;
+use crate::model::HotPayloadSegment;
+use crate::model::ObjectPayloadRef;
+use crate::model::ProducerSnapshot;
+use crate::model::StreamMessageRecord;
+use crate::model::StreamMetadata;
+use crate::model::StreamVisibleSnapshot;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamSnapshot {

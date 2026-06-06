@@ -1,15 +1,25 @@
 use std::fmt;
 
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
-use ursula_shard::{BucketStreamId, ShardPlacement};
-use ursula_stream::{ColdChunkRef, ExternalPayloadRef, ProducerRequest, StreamSnapshot};
+use serde::Deserialize;
+use serde::Serialize;
+use ursula_shard::BucketStreamId;
+use ursula_shard::ShardPlacement;
+use ursula_stream::ColdChunkRef;
+use ursula_stream::ExternalPayloadRef;
+use ursula_stream::ProducerRequest;
+use ursula_stream::StreamSnapshot;
 
-use crate::request::{
-    AppendBatchRequest, AppendExternalRequest, AppendRequest, CloseStreamRequest,
-    CreateStreamExternalRequest, CreateStreamRequest, DeleteStreamRequest, FlushColdRequest,
-    PublishSnapshotRequest, StreamAppendCount,
-};
+use crate::request::AppendBatchRequest;
+use crate::request::AppendExternalRequest;
+use crate::request::AppendRequest;
+use crate::request::CloseStreamRequest;
+use crate::request::CreateStreamExternalRequest;
+use crate::request::CreateStreamRequest;
+use crate::request::DeleteStreamRequest;
+use crate::request::FlushColdRequest;
+use crate::request::PublishSnapshotRequest;
+use crate::request::StreamAppendCount;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupSnapshot {

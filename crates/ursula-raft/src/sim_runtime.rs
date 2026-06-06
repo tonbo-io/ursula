@@ -1,15 +1,32 @@
 use std::future::Future;
-use std::ops::{Add, AddAssign, Sub, SubAssign};
-use std::task::{Context, Poll};
+use std::ops::Add;
+use std::ops::AddAssign;
+use std::ops::Sub;
+use std::ops::SubAssign;
+use std::task::Context;
+use std::task::Poll;
 use std::time::Duration;
 
 use futures_util::TryFutureExt;
-use openraft_rt::{
-    AsyncRuntime, Instant, Mpsc, MpscReceiver, MpscSender, MpscWeakSender, Mutex, Oneshot,
-    OneshotSender, OptionalSend, OptionalSync, RecvError, SendError, TryRecvError, Watch,
-    WatchReceiver, WatchSender,
-};
-use sim_tokio::sync::{mpsc, watch};
+use openraft_rt::AsyncRuntime;
+use openraft_rt::Instant;
+use openraft_rt::Mpsc;
+use openraft_rt::MpscReceiver;
+use openraft_rt::MpscSender;
+use openraft_rt::MpscWeakSender;
+use openraft_rt::Mutex;
+use openraft_rt::Oneshot;
+use openraft_rt::OneshotSender;
+use openraft_rt::OptionalSend;
+use openraft_rt::OptionalSync;
+use openraft_rt::RecvError;
+use openraft_rt::SendError;
+use openraft_rt::TryRecvError;
+use openraft_rt::Watch;
+use openraft_rt::WatchReceiver;
+use openraft_rt::WatchSender;
+use sim_tokio::sync::mpsc;
+use sim_tokio::sync::watch;
 
 pub type MadsimOpenRaftRuntime = openraft_rt::deterministic_rng::DeterministicRng<MadsimRuntime>;
 
@@ -32,8 +49,7 @@ impl<T> MadsimTimeout<T> {
 }
 
 impl<T> Future for MadsimTimeout<T>
-where
-    T: Future,
+where T: Future
 {
     type Output = Result<T::Output, sim_tokio::time::error::Elapsed>;
 
@@ -208,8 +224,7 @@ impl Mpsc for MadsimMpsc {
 }
 
 impl<T> MpscSender<MadsimMpsc, T> for MadsimMpscSender<T>
-where
-    T: OptionalSend,
+where T: OptionalSend
 {
     fn send(&self, msg: T) -> impl Future<Output = Result<(), SendError<T>>> + OptionalSend {
         self.0.send(msg).map_err(|err| SendError(err.0))
@@ -221,8 +236,7 @@ where
 }
 
 impl<T> MpscReceiver<T> for MadsimMpscReceiver<T>
-where
-    T: OptionalSend,
+where T: OptionalSend
 {
     fn recv(&mut self) -> impl Future<Output = Option<T>> + OptionalSend {
         self.0.recv()
@@ -237,8 +251,7 @@ where
 }
 
 impl<T> MpscWeakSender<MadsimMpsc, T> for MadsimMpscWeakSender<T>
-where
-    T: OptionalSend,
+where T: OptionalSend
 {
     fn upgrade(&self) -> Option<<MadsimMpsc as Mpsc>::Sender<T>> {
         self.0.upgrade().map(MadsimMpscSender)
@@ -255,17 +268,14 @@ impl Oneshot for MadsimOneshot {
     type ReceiverError = sim_tokio::sync::oneshot::error::RecvError;
 
     fn channel<T>() -> (Self::Sender<T>, Self::Receiver<T>)
-    where
-        T: OptionalSend,
-    {
+    where T: OptionalSend {
         let (tx, rx) = sim_tokio::sync::oneshot::channel();
         (MadsimOneshotSender(tx), rx)
     }
 }
 
 impl<T> OneshotSender<T> for MadsimOneshotSender<T>
-where
-    T: OptionalSend,
+where T: OptionalSend
 {
     fn send(self, t: T) -> Result<(), T> {
         self.0.send(t)
@@ -275,8 +285,7 @@ where
 pub struct MadsimMutex<T>(sim_tokio::sync::Mutex<T>);
 
 impl<T> Mutex<T> for MadsimMutex<T>
-where
-    T: OptionalSend + 'static,
+where T: OptionalSend + 'static
 {
     type Guard<'a> = sim_tokio::sync::MutexGuard<'a, T>;
 
@@ -318,8 +327,7 @@ impl Watch for MadsimWatch {
 }
 
 impl<T> WatchSender<MadsimWatch, T> for MadsimWatchSender<T>
-where
-    T: OptionalSend + OptionalSync,
+where T: OptionalSend + OptionalSync
 {
     fn send(&self, value: T) -> Result<(), openraft_rt::watch::SendError<T>> {
         self.0
@@ -328,9 +336,7 @@ where
     }
 
     fn send_if_modified<F>(&self, modify: F) -> bool
-    where
-        F: FnOnce(&mut T) -> bool,
-    {
+    where F: FnOnce(&mut T) -> bool {
         self.0.send_if_modified(modify)
     }
 
@@ -344,8 +350,7 @@ where
 }
 
 impl<T> WatchReceiver<MadsimWatch, T> for MadsimWatchReceiver<T>
-where
-    T: OptionalSend + OptionalSync,
+where T: OptionalSend + OptionalSync
 {
     async fn changed(&mut self) -> Result<(), RecvError> {
         self.0.changed().await.map_err(|_| RecvError(()))

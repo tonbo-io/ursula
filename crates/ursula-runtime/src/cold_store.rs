@@ -1,19 +1,27 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 #[cfg(not(madsim))]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
+#[cfg(not(madsim))]
+use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
-use opendal::layers::{RetryLayer, TimeoutLayer};
-use opendal::{Operator, Scheme};
+use opendal::Operator;
+use opendal::Scheme;
+use opendal::layers::RetryLayer;
+use opendal::layers::TimeoutLayer;
 use ursula_shard::BucketStreamId;
-use ursula_stream::{ColdChunkRef, ObjectPayloadRef};
+use ursula_stream::ColdChunkRef;
+use ursula_stream::ObjectPayloadRef;
 
 pub(crate) const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 static COLD_CHUNK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -238,16 +246,13 @@ impl ColdStore {
     pub fn memory() -> io::Result<Self> {
         let operator = Operator::via_iter(Scheme::Memory, [])
             .map_err(|err| io::Error::other(err.to_string()))?;
-        Ok(Self::from_operator(
-            operator,
-            ColdStoreInfo {
-                backend: "memory",
-                root: None,
-                bucket: None,
-                region: None,
-                endpoint: None,
-            },
-        ))
+        Ok(Self::from_operator(operator, ColdStoreInfo {
+            backend: "memory",
+            root: None,
+            bucket: None,
+            region: None,
+            endpoint: None,
+        }))
     }
 
     pub fn s3_from_env() -> io::Result<Self> {

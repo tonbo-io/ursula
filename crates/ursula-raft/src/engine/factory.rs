@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -10,19 +11,25 @@ use openraft::Raft;
 use openraft::SnapshotPolicy;
 use tokio::time::Instant;
 use tonic::transport::Endpoint;
-use ursula_runtime::{
-    ColdStoreHandle, GroupEngine, GroupEngineCreateFuture, GroupEngineError, GroupEngineFactory,
-    GroupEngineMetrics, SharedSnapshotStore,
-};
-use ursula_shard::{CoreId, RaftGroupId, ShardPlacement};
+use ursula_runtime::ColdStoreHandle;
+use ursula_runtime::GroupEngine;
+use ursula_runtime::GroupEngineCreateFuture;
+use ursula_runtime::GroupEngineError;
+use ursula_runtime::GroupEngineFactory;
+use ursula_runtime::GroupEngineMetrics;
+use ursula_runtime::SharedSnapshotStore;
+use ursula_shard::CoreId;
+use ursula_shard::RaftGroupId;
+use ursula_shard::ShardPlacement;
 
+use super::RaftGroupEngine;
 use crate::grpc::GrpcRaftNetworkFactory;
-use crate::log_store::{CoreFileLogWriter, RaftGroupFileLogStore, RaftGroupLogStore};
+use crate::log_store::CoreFileLogWriter;
+use crate::log_store::RaftGroupFileLogStore;
+use crate::log_store::RaftGroupLogStore;
 use crate::registry::RaftGroupHandleRegistry;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::types::UrsulaRaftTypeConfig;
-
-use super::RaftGroupEngine;
 
 const RAFT_INSTALL_SNAPSHOT_TIMEOUT_DEFAULT_MS: u64 = 120_000;
 /// How long a restarting bootstrap node waits to observe an already-established
