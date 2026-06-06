@@ -23,6 +23,8 @@ use openraft::raft::TransferLeaderRequest;
 use prost::Message;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use ursula_proto as raft_app_proto;
 use ursula_runtime::ColdIndexPageCache;
 use ursula_runtime::ColdStoreColdIndexPageStore;
@@ -229,37 +231,46 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         &self,
         request: tonic::Request<raft_internal_proto::GroupWriteRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::GroupWriteResponseV1>, tonic::Status> {
-        let request = request.into_inner();
-        let placement = placement_from_parts(
-            request.core_id,
-            request.shard_id,
-            request.raft_group_id,
-            "group_write_request",
-        )
-        .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
-        let raft = self
-            .registry
-            .get(placement.raft_group_id)
-            .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
-        let commands = request
-            .command_payloads
-            .into_iter()
-            .map(|payload| {
-                let command = raft_app_proto::RaftGroupCommandV1::decode(payload.as_slice())
-                    .map_err(|err| GroupEngineError::new(format!("decode group command: {err}")))?;
-                group_write_command_from_proto(RaftGroupCommand(command))
-            })
-            .collect::<Result<Vec<_>, _>>()
+        // Link this forwarded write to the originating request's trace.
+        let span = tracing::info_span!("raft.group_write");
+        span.set_parent(crate::telemetry::extract_parent_context(request.metadata()));
+        async move {
+            let request = request.into_inner();
+            let placement = placement_from_parts(
+                request.core_id,
+                request.shard_id,
+                request.raft_group_id,
+                "group_write_request",
+            )
             .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
-        let results = write_commands_on_raft(raft, placement, None, commands)
-            .await
-            .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?
-            .into_iter()
-            .map(encode_group_write_result)
-            .collect();
-        Ok(tonic::Response::new(
-            raft_internal_proto::GroupWriteResponseV1 { results },
-        ))
+            let raft = self
+                .registry
+                .get(placement.raft_group_id)
+                .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
+            let commands = request
+                .command_payloads
+                .into_iter()
+                .map(|payload| {
+                    let command = raft_app_proto::RaftGroupCommandV1::decode(payload.as_slice())
+                        .map_err(|err| {
+                            GroupEngineError::new(format!("decode group command: {err}"))
+                        })?;
+                    group_write_command_from_proto(RaftGroupCommand(command))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+            let results = write_commands_on_raft(raft, placement, None, commands)
+                .await
+                .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?
+                .into_iter()
+                .map(encode_group_write_result)
+                .collect();
+            Ok(tonic::Response::new(
+                raft_internal_proto::GroupWriteResponseV1 { results },
+            ))
+        }
+        .instrument(span)
+        .await
     }
 
     async fn transfer_leader(
@@ -311,57 +322,42 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         &self,
         request: tonic::Request<raft_internal_proto::GroupReadRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::GroupReadResponseV1>, tonic::Status> {
-        let request = request.into_inner();
-        let placement = placement_from_parts(
-            request.core_id,
-            request.shard_id,
-            request.raft_group_id,
-            "group_read_request",
-        )
-        .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
-        let raft = self
-            .registry
-            .get(placement.raft_group_id)
-            .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
-        let mut engine = RaftGroupEngine {
-            raft,
-            placement,
-            metrics: None,
-            cold_store: self.cold_store.clone(),
-            cold_index_cache: self.cold_store.as_ref().map(|cold_store| {
-                Arc::new(ColdIndexPageCache::new(
-                    Arc::new(ColdStoreColdIndexPageStore::new(cold_store.clone())),
-                    1024,
-                ))
-            }),
-        };
-        let stream_id = BucketStreamId::new(request.bucket_id, request.stream_id);
-        let result = match required(request.read, "group_read.read")
-            .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?
-        {
-            raft_internal_proto::group_read_request_v1::Read::Head(_) => engine
-                .head_stream(
-                    HeadStreamRequest {
-                        stream_id,
-                        now_ms: request.now_ms,
-                    },
-                    placement,
-                )
-                .await
-                .map(|response| raft_internal_proto::GroupReadResponseV1 {
-                    ok: true,
-                    payload: head_stream_response_to_proto(response).encode_to_vec(),
+        // Link this forwarded read to the originating request's trace.
+        let span = tracing::info_span!("raft.group_read");
+        span.set_parent(crate::telemetry::extract_parent_context(request.metadata()));
+        async move {
+            let request = request.into_inner();
+            let placement = placement_from_parts(
+                request.core_id,
+                request.shard_id,
+                request.raft_group_id,
+                "group_read_request",
+            )
+            .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+            let raft = self
+                .registry
+                .get(placement.raft_group_id)
+                .ok_or_else(|| tonic::Status::not_found("raft group is not registered"))?;
+            let mut engine = RaftGroupEngine {
+                raft,
+                placement,
+                metrics: None,
+                cold_store: self.cold_store.clone(),
+                cold_index_cache: self.cold_store.as_ref().map(|cold_store| {
+                    Arc::new(ColdIndexPageCache::new(
+                        Arc::new(ColdStoreColdIndexPageStore::new(cold_store.clone())),
+                        1024,
+                    ))
                 }),
-            raft_internal_proto::group_read_request_v1::Read::ReadStream(read) => {
-                let max_len = usize::try_from(read.max_len).map_err(|_| {
-                    tonic::Status::invalid_argument("group_read.read_stream.max_len too large")
-                })?;
-                engine
-                    .read_stream(
-                        ReadStreamRequest {
+            };
+            let stream_id = BucketStreamId::new(request.bucket_id, request.stream_id);
+            let result = match required(request.read, "group_read.read")
+                .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?
+            {
+                raft_internal_proto::group_read_request_v1::Read::Head(_) => engine
+                    .head_stream(
+                        HeadStreamRequest {
                             stream_id,
-                            offset: read.offset,
-                            max_len,
                             now_ms: request.now_ms,
                         },
                         placement,
@@ -369,18 +365,40 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     .await
                     .map(|response| raft_internal_proto::GroupReadResponseV1 {
                         ok: true,
-                        payload: read_stream_response_to_proto(response).encode_to_vec(),
-                    })
-            }
-        };
-        let response = match result {
-            Ok(response) => response,
-            Err(err) => raft_internal_proto::GroupReadResponseV1 {
-                ok: false,
-                payload: group_engine_error_to_proto(err).encode_to_vec(),
-            },
-        };
-        Ok(tonic::Response::new(response))
+                        payload: head_stream_response_to_proto(response).encode_to_vec(),
+                    }),
+                raft_internal_proto::group_read_request_v1::Read::ReadStream(read) => {
+                    let max_len = usize::try_from(read.max_len).map_err(|_| {
+                        tonic::Status::invalid_argument("group_read.read_stream.max_len too large")
+                    })?;
+                    engine
+                        .read_stream(
+                            ReadStreamRequest {
+                                stream_id,
+                                offset: read.offset,
+                                max_len,
+                                now_ms: request.now_ms,
+                            },
+                            placement,
+                        )
+                        .await
+                        .map(|response| raft_internal_proto::GroupReadResponseV1 {
+                            ok: true,
+                            payload: read_stream_response_to_proto(response).encode_to_vec(),
+                        })
+                }
+            };
+            let response = match result {
+                Ok(response) => response,
+                Err(err) => raft_internal_proto::GroupReadResponseV1 {
+                    ok: false,
+                    payload: group_engine_error_to_proto(err).encode_to_vec(),
+                },
+            };
+            Ok(tonic::Response::new(response))
+        }
+        .instrument(span)
+        .await
     }
 }
 
@@ -572,6 +590,9 @@ impl GrpcRaftNetwork {
 
     pub(crate) fn apply_rpc_timeout<T>(&self, request: &mut tonic::Request<T>, option: RPCOption) {
         request.set_timeout(option.hard_ttl());
+        // Carry the originating request's trace context to the peer. No-op when
+        // no OpenTelemetry propagator is installed.
+        crate::telemetry::inject_current_context(request.metadata_mut());
     }
 
     pub(crate) fn map_tonic_status(

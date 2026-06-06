@@ -123,6 +123,11 @@ mod otlp {
         // Stay fmt-only unless an OTLP endpoint is configured.
         std::env::var_os(ENDPOINT_ENV)?;
 
+        // W3C traceparent propagation so spans cross the Raft gRPC transport.
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+
         // HTTP/protobuf exporter reuses the existing reqwest stack and avoids a
         // second gRPC/tonic dependency tree alongside the Raft transport. The
         // endpoint is read from `OTEL_EXPORTER_OTLP_ENDPOINT`.
