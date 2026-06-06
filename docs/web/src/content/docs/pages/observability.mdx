@@ -30,6 +30,19 @@ Spans batch-export continuously and metrics export on a fixed interval
 (`OTEL_METRIC_EXPORT_INTERVAL`, milliseconds). A final flush on clean shutdown
 is only a backstop — don't rely on it to observe data.
 
+### Identifying the node
+
+Every span and metric carries the process's OpenTelemetry **resource**. The
+server sets `service.name=ursula` and, when running with a Raft node id,
+`service.instance.id=<node_id>` so a cluster's nodes are distinguishable. Add
+more resource attributes (e.g. `host.name`, region, AZ) with the standard
+variable — bounded by cluster size, so this is a resource dimension, not a
+high-cardinality label:
+
+```bash
+export OTEL_RESOURCE_ATTRIBUTES="host.name=$(hostname),deployment.environment=prod"
+```
+
 ## Traces
 
 A single request produces one boundary span (`http.append`, `http.read`, or

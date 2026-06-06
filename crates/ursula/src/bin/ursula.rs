@@ -32,16 +32,25 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // tokio-console, when active, owns the global subscriber; otherwise install
-    // the shared fmt + optional OTLP subscriber. Hold the guard for the whole
-    // process so buffered spans are flushed on shutdown.
     let tokio_console = init_tokio_console_if_enabled();
-    let _telemetry = (!tokio_console.installed())
-        .then(|| ursula_observability::init(ursula_observability::InitOptions::new("ursula")));
-    tokio_console.warn_if_needed();
 
     let raw = RawArgs::parse();
     let args = Args::try_from(raw)?;
+
+    // tokio-console, when active, owns the global subscriber; otherwise install
+    // the shared fmt + optional OTLP subscriber. Tag telemetry with this node's
+    // identity as a resource attribute (applies to every span/metric, bounded
+    // by cluster size) — extra attributes like host.name can be added via the
+    // standard OTEL_RESOURCE_ATTRIBUTES env var. Hold the guard for the whole
+    // process so buffered telemetry is flushed on shutdown.
+    let _telemetry = (!tokio_console.installed()).then(|| {
+        let mut options = ursula_observability::InitOptions::new("ursula");
+        if let Some(node_id) = args.raft_node_id {
+            options = options.with_resource("service.instance.id", node_id.to_string());
+        }
+        ursula_observability::init(options)
+    });
+    tokio_console.warn_if_needed();
     apply_profile_env_defaults(&args);
     apply_admission_env_overrides(&args);
 
