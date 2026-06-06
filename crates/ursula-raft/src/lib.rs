@@ -30,6 +30,7 @@ mod rt;
 #[cfg(madsim)]
 mod sim_runtime;
 mod state_machine;
+mod telemetry;
 mod types;
 
 pub use engine::ColdRaftGroupEngineFactory;

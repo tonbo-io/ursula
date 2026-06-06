@@ -32,6 +32,11 @@ use crate::rt::time::Instant;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::types::UrsulaRaftTypeConfig;
 
+#[tracing::instrument(
+    name = "raft.forward_head",
+    skip_all,
+    fields(group = placement.raft_group_id.0, bucket = %request.stream_id.bucket_id, stream = %request.stream_id.stream_id),
+)]
 pub(crate) async fn forward_head_stream_to_leader(
     placement: ShardPlacement,
     leader_node: &BasicNode,
@@ -61,6 +66,11 @@ pub(crate) async fn forward_head_stream_to_leader(
     }
 }
 
+#[tracing::instrument(
+    name = "raft.forward_read",
+    skip_all,
+    fields(group = placement.raft_group_id.0, bucket = %request.stream_id.bucket_id, stream = %request.stream_id.stream_id, offset = request.offset),
+)]
 pub(crate) async fn forward_read_stream_to_leader(
     placement: ShardPlacement,
     leader_node: &BasicNode,
@@ -106,16 +116,20 @@ pub(crate) async fn forward_group_read_to_leader(
     let mut client = raft_internal_proto::raft_internal_client::RaftInternalClient::new(channel)
         .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
         .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES);
+    let mut grpc_request = tonic::Request::new(raft_internal_proto::GroupReadRequestV1 {
+        raft_group_id: placement.raft_group_id.0,
+        core_id: u32::from(placement.core_id.0),
+        shard_id: placement.shard_id.0,
+        bucket_id: stream_id.bucket_id,
+        stream_id: stream_id.stream_id,
+        now_ms,
+        read: Some(read),
+    });
+    // Carry this request's trace context to the leader so the forwarded read
+    // joins the originating trace. No-op when no propagator is installed.
+    crate::telemetry::inject_current_context(grpc_request.metadata_mut());
     client
-        .group_read(raft_internal_proto::GroupReadRequestV1 {
-            raft_group_id: placement.raft_group_id.0,
-            core_id: u32::from(placement.core_id.0),
-            shard_id: placement.shard_id.0,
-            bucket_id: stream_id.bucket_id,
-            stream_id: stream_id.stream_id,
-            now_ms,
-            read: Some(read),
-        })
+        .group_read(grpc_request)
         .await
         .map(|response| response.into_inner())
         .map_err(|err| GroupEngineError::new(format!("forward group read to leader: {err}")))
