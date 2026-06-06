@@ -1,4 +1,6 @@
 # syntax=docker/dockerfile:1
+# RUST_VERSION only selects the base image (cargo/rustup bootstrap). The actual
+# build toolchain is pinned by rust-toolchain.toml and installed below.
 ARG RUST_VERSION=1.95.0
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
@@ -8,6 +10,12 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /ursula
+
+# Install the toolchain pinned in rust-toolchain.toml before copying the full
+# source so the layer is cached until the pin changes.
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install
+
 COPY . .
 
 RUN --mount=type=cache,sharing=locked,target=/usr/local/cargo/registry \

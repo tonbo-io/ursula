@@ -1,7 +1,9 @@
 use std::path::Path;
 
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use anyhow::Context;
+use anyhow::Result;
+use serde::Deserialize;
+use serde::Serialize;
 use url::Url;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

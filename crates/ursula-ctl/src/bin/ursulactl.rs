@@ -1,14 +1,22 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
-use clap::{Args, Parser, Subcommand};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use clap::Args;
+use clap::Parser;
+use clap::Subcommand;
 use tracing_subscriber::EnvFilter;
+use ursula_ctl::MetricsClient;
+use ursula_ctl::NodeProvider;
+use ursula_ctl::RestartOptions;
+use ursula_ctl::RestartOutcome;
+use ursula_ctl::StaticNodeProvider;
 use ursula_ctl::observe::collect_status;
-use ursula_ctl::{
-    MetricsClient, NodeProvider, RestartOptions, RestartOutcome, StaticNodeProvider, run_restart,
-    wait_ready, write_status,
-};
+use ursula_ctl::run_restart;
+use ursula_ctl::wait_ready;
+use ursula_ctl::write_status;
 
 #[derive(Parser, Debug)]
 #[command(

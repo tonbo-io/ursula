@@ -1,36 +1,68 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::rt::time::Instant;
-use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardPlacement};
-use ursula_stream::{ColdFlushCandidate, ColdGcEntry};
+use ursula_shard::BucketStreamId;
+use ursula_shard::CoreId;
+use ursula_shard::RaftGroupId;
+use ursula_shard::ShardPlacement;
+use ursula_stream::ColdFlushCandidate;
+use ursula_stream::ColdGcEntry;
 
-use crate::admission::{
-    RaftUncommittedAdmission, SharedRaftUncommittedBytes, UncommittedBytesGuard,
-};
+use crate::admission::RaftUncommittedAdmission;
+use crate::admission::SharedRaftUncommittedBytes;
+use crate::admission::UncommittedBytesGuard;
 use crate::command::GroupSnapshot;
-use crate::engine::{
-    GroupEngine, GroupEngineError, GroupEngineFactory, GroupEngineMetrics, GroupWriteResponse,
-};
+use crate::engine::GroupEngine;
+use crate::engine::GroupEngineError;
+use crate::engine::GroupEngineFactory;
+use crate::engine::GroupEngineMetrics;
+use crate::engine::GroupWriteResponse;
 use crate::error::RuntimeError;
-use crate::group_actor::{
-    AppendBatchEntry, GroupActor, GroupCommand, GroupMailbox, PendingAppendBatch,
-};
-use crate::metrics::{
-    RuntimeMetricsInner, append_batch_payload_bytes, elapsed_ns, record_cold_backpressure_error,
-    record_cold_hot_backlog,
-};
-use crate::request::{
-    AckColdGcResponse, AppendBatchRequest, AppendBatchResponse, AppendExternalRequest,
-    AppendRequest, AppendResponse, BootstrapStreamRequest, BootstrapStreamResponse,
-    CloseStreamRequest, CloseStreamResponse, ColdWriteAdmission, CreateStreamExternalRequest,
-    CreateStreamRequest, CreateStreamResponse, DeleteSnapshotRequest, DeleteStreamRequest,
-    DeleteStreamResponse, FlushColdRequest, FlushColdResponse, ForkRefResponse,
-    GroupReadStreamParts, HeadStreamRequest, HeadStreamResponse, PlanColdFlushRequest,
-    PlanGroupColdFlushRequest, PublishSnapshotRequest, PublishSnapshotResponse,
-    ReadSnapshotRequest, ReadSnapshotResponse, ReadStreamRequest, ReadStreamResponse,
-};
-use crate::rt::sync::{Semaphore, mpsc, oneshot};
+use crate::group_actor::AppendBatchEntry;
+use crate::group_actor::GroupActor;
+use crate::group_actor::GroupCommand;
+use crate::group_actor::GroupMailbox;
+use crate::group_actor::PendingAppendBatch;
+use crate::metrics::RuntimeMetricsInner;
+use crate::metrics::append_batch_payload_bytes;
+use crate::metrics::elapsed_ns;
+use crate::metrics::record_cold_backpressure_error;
+use crate::metrics::record_cold_hot_backlog;
+use crate::request::AckColdGcResponse;
+use crate::request::AppendBatchRequest;
+use crate::request::AppendBatchResponse;
+use crate::request::AppendExternalRequest;
+use crate::request::AppendRequest;
+use crate::request::AppendResponse;
+use crate::request::BootstrapStreamRequest;
+use crate::request::BootstrapStreamResponse;
+use crate::request::CloseStreamRequest;
+use crate::request::CloseStreamResponse;
+use crate::request::ColdWriteAdmission;
+use crate::request::CreateStreamExternalRequest;
+use crate::request::CreateStreamRequest;
+use crate::request::CreateStreamResponse;
+use crate::request::DeleteSnapshotRequest;
+use crate::request::DeleteStreamRequest;
+use crate::request::DeleteStreamResponse;
+use crate::request::FlushColdRequest;
+use crate::request::FlushColdResponse;
+use crate::request::ForkRefResponse;
+use crate::request::GroupReadStreamParts;
+use crate::request::HeadStreamRequest;
+use crate::request::HeadStreamResponse;
+use crate::request::PlanColdFlushRequest;
+use crate::request::PlanGroupColdFlushRequest;
+use crate::request::PublishSnapshotRequest;
+use crate::request::PublishSnapshotResponse;
+use crate::request::ReadSnapshotRequest;
+use crate::request::ReadSnapshotResponse;
+use crate::request::ReadStreamRequest;
+use crate::request::ReadStreamResponse;
+use crate::rt::sync::Semaphore;
+use crate::rt::sync::mpsc;
+use crate::rt::sync::oneshot;
+use crate::rt::time::Instant;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CoreMailbox {
@@ -294,14 +326,11 @@ impl CoreWorker {
                     }
                     let raft_uncommitted =
                         self.acquire_raft_uncommitted_guard(placement, incoming_bytes);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::CreateStream {
-                            request,
-                            response_tx,
-                            raft_uncommitted,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::CreateStream {
+                        request,
+                        response_tx,
+                        raft_uncommitted,
+                    })
                     .await;
                 }
                 CoreCommand::CreateExternal {
@@ -310,13 +339,10 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::CreateExternal {
-                            request,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::CreateExternal {
+                        request,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::HeadStream {
@@ -325,13 +351,10 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::HeadStream {
-                            request,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::HeadStream {
+                        request,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::ReadStream {
@@ -340,13 +363,10 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::ReadStream {
-                            request,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::ReadStream {
+                        request,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::PublishSnapshot {
@@ -355,13 +375,10 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::PublishSnapshot {
-                            request,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::PublishSnapshot {
+                        request,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::ReadSnapshot {
@@ -370,13 +387,10 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::ReadSnapshot {
-                            request,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::ReadSnapshot {
+                        request,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::DeleteSnapshot {
@@ -385,13 +399,10 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::DeleteSnapshot {
-                            request,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::DeleteSnapshot {
+                        request,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::BootstrapStream {
@@ -400,13 +411,10 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::BootstrapStream {
-                            request,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::BootstrapStream {
+                        request,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::WaitRead {
@@ -416,14 +424,11 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::WaitRead {
-                            request,
-                            waiter_id,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::WaitRead {
+                        request,
+                        waiter_id,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::RequireLiveReadOwner {
@@ -431,10 +436,9 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::RequireLiveReadOwner { response_tx },
-                    )
+                    self.send_group_command(placement, GroupCommand::RequireLiveReadOwner {
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::CancelWaitRead {
@@ -443,13 +447,10 @@ impl CoreWorker {
                     waiter_id,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::CancelWaitRead {
-                            stream_id,
-                            waiter_id,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::CancelWaitRead {
+                        stream_id,
+                        waiter_id,
+                    })
                     .await;
                 }
                 CoreCommand::CloseStream {
@@ -458,13 +459,10 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::CloseStream {
-                            request,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::CloseStream {
+                        request,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::AddForkRef {
@@ -474,14 +472,11 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::AddForkRef {
-                            stream_id,
-                            now_ms,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::AddForkRef {
+                        stream_id,
+                        now_ms,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::ReleaseForkRef {
@@ -490,13 +485,10 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::ReleaseForkRef {
-                            stream_id,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::ReleaseForkRef {
+                        stream_id,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::DeleteStream {
@@ -505,13 +497,10 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::DeleteStream {
-                            request,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::DeleteStream {
+                        request,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::FlushCold {
@@ -520,13 +509,10 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::FlushCold {
-                            request,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::FlushCold {
+                        request,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::PlanColdFlush {
@@ -535,13 +521,10 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::PlanColdFlush {
-                            request,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::PlanColdFlush {
+                        request,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::PlanNextColdFlush {
@@ -550,13 +533,10 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::PlanNextColdFlush {
-                            request,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::PlanNextColdFlush {
+                        request,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::PlanNextColdFlushBatch {
@@ -566,14 +546,11 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::PlanNextColdFlushBatch {
-                            request,
-                            max_candidates,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::PlanNextColdFlushBatch {
+                        request,
+                        max_candidates,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::PlanColdGc {
@@ -582,10 +559,10 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::PlanColdGc { max, response_tx },
-                    )
+                    self.send_group_command(placement, GroupCommand::PlanColdGc {
+                        max,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::AckColdGc {
@@ -594,13 +571,10 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::AckColdGc {
-                            up_to_seq,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::AckColdGc {
+                        up_to_seq,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::Append {
@@ -618,14 +592,11 @@ impl CoreWorker {
                     }
                     let raft_uncommitted =
                         self.acquire_raft_uncommitted_guard(placement, incoming_bytes);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::Append {
-                            request,
-                            response_tx,
-                            raft_uncommitted,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::Append {
+                        request,
+                        response_tx,
+                        raft_uncommitted,
+                    })
                     .await;
                 }
                 CoreCommand::AppendExternal {
@@ -634,13 +605,10 @@ impl CoreWorker {
                     response_tx,
                 } => {
                     debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::AppendExternal {
-                            request,
-                            response_tx,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::AppendExternal {
+                        request,
+                        response_tx,
+                    })
                     .await;
                 }
                 CoreCommand::AppendBatch {
@@ -658,14 +626,11 @@ impl CoreWorker {
                     }
                     let raft_uncommitted =
                         self.acquire_raft_uncommitted_guard(placement, incoming_bytes);
-                    self.send_group_command(
-                        placement,
-                        GroupCommand::AppendBatch {
-                            request,
-                            response_tx,
-                            raft_uncommitted,
-                        },
-                    )
+                    self.send_group_command(placement, GroupCommand::AppendBatch {
+                        request,
+                        response_tx,
+                        raft_uncommitted,
+                    })
                     .await;
                 }
                 CoreCommand::WarmGroup {
@@ -805,14 +770,11 @@ impl CoreWorker {
                 read_materialization: self.read_materialization.clone(),
             };
             crate::rt::spawn(actor.run());
-            self.groups.insert(
-                placement.raft_group_id,
-                GroupMailbox {
-                    group_id: placement.raft_group_id,
-                    tx,
-                    metrics: self.metrics.clone(),
-                },
-            );
+            self.groups.insert(placement.raft_group_id, GroupMailbox {
+                group_id: placement.raft_group_id,
+                tx,
+                metrics: self.metrics.clone(),
+            });
         }
         Ok(self
             .groups
@@ -866,14 +828,11 @@ impl CoreWorker {
             read_materialization: self.read_materialization.clone(),
         };
         crate::rt::spawn(actor.run());
-        self.groups.insert(
-            placement.raft_group_id,
-            GroupMailbox {
-                group_id: placement.raft_group_id,
-                tx,
-                metrics: self.metrics.clone(),
-            },
-        );
+        self.groups.insert(placement.raft_group_id, GroupMailbox {
+            group_id: placement.raft_group_id,
+            tx,
+            metrics: self.metrics.clone(),
+        });
         Ok(())
     }
 

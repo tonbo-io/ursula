@@ -4,7 +4,8 @@
 
 use std::cell::RefCell;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use ursula_shard::BucketStreamId;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

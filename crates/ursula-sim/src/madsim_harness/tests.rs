@@ -2,7 +2,8 @@
 //! See crates/ursula-sim/src/madsim_harness/mod.rs for the rest.
 
 use std::collections::BTreeSet;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 
 use super::*;
 
@@ -775,10 +776,9 @@ fn runtime_raft_network_delay_snapshot_purge_probe() {
                             madsim::time::sleep(Duration::from_millis((append_id % 8) * 3)).await;
                         }
                         runtime
-                            .append_batch(AppendBatchRequest::new(
-                                stream,
-                                vec![format!("delay-{append_id};").into_bytes()],
-                            ))
+                            .append_batch(AppendBatchRequest::new(stream, vec![
+                                format!("delay-{append_id};").into_bytes(),
+                            ]))
                             .await
                     }));
                 }
@@ -862,10 +862,9 @@ fn runtime_raft_network_delay_snapshot_purge_probe() {
                 let probe_payload = format!("after-delay-{sim_seed}-{delay_ms};").into_bytes();
                 let probe = leader_raft
                     .client_write(
-                        GroupWriteCommand::from(AppendBatchRequest::new(
-                            stream,
-                            vec![probe_payload],
-                        ))
+                        GroupWriteCommand::from(AppendBatchRequest::new(stream, vec![
+                            probe_payload,
+                        ]))
                         .into(),
                     )
                     .await;
@@ -1284,10 +1283,9 @@ fn retry_cold_read_seeds(seeds: std::ops::RangeInclusive<u64>) -> Vec<u64> {
         .filter(|seed| {
             let schedule = SimSchedule::generate_runtime_raft_network_randomized(*seed);
             has_action(&schedule, |action| {
-                matches!(
-                    action,
-                    SimFaultAction::TruncateNextColdRead { returned_len: 0 }
-                )
+                matches!(action, SimFaultAction::TruncateNextColdRead {
+                    returned_len: 0
+                })
             }) && has_action(&schedule, |action| {
                 matches!(action, SimFaultAction::RetryColdReadAfterFailure)
             })
@@ -1393,10 +1391,9 @@ fn assert_failure_corpus_covers_expected_invariants_and_seeds() {
             actions[0],
             SimFaultAction::VerifyRuntimeColdLiveReads
         ));
-        assert!(matches!(
-            actions[1],
-            SimFaultAction::TruncateNextColdRead { returned_len: 0 }
-        ));
+        assert!(matches!(actions[1], SimFaultAction::TruncateNextColdRead {
+            returned_len: 0
+        }));
     });
     assert_failure_record_actions(&failure_records, 232, |actions| {
         assert_eq!(actions.len(), 1);
@@ -1569,10 +1566,9 @@ fn assert_failure_corpus_covers_expected_invariants_and_seeds() {
             actions[1],
             SimFaultAction::VerifyRuntimeColdLiveReads
         ));
-        assert!(matches!(
-            actions[2],
-            SimFaultAction::TruncateNextColdRead { returned_len: 0 }
-        ));
+        assert!(matches!(actions[2], SimFaultAction::TruncateNextColdRead {
+            returned_len: 0
+        }));
     });
 }
 
@@ -1694,10 +1690,12 @@ fn assert_schedule_corpus_covers_expected_scenarios_and_seeds() {
             .trace
             .events
             .iter()
-            .filter(|event| matches!(
-                event,
-                SimEvent::RuntimeRaftNetworkColdWriteDelayVerified { delay_ms: 125, .. }
-            ))
+            .filter(
+                |event| matches!(event, SimEvent::RuntimeRaftNetworkColdWriteDelayVerified {
+                    delay_ms: 125,
+                    ..
+                })
+            )
             .count(),
         1
     );
@@ -1716,10 +1714,12 @@ fn assert_schedule_corpus_covers_expected_scenarios_and_seeds() {
             .trace
             .events
             .iter()
-            .filter(|event| matches!(
-                event,
-                SimEvent::RuntimeRaftNetworkColdReadDelayVerified { delay_ms: 125, .. }
-            ))
+            .filter(
+                |event| matches!(event, SimEvent::RuntimeRaftNetworkColdReadDelayVerified {
+                    delay_ms: 125,
+                    ..
+                })
+            )
             .count(),
         1
     );
@@ -1767,17 +1767,14 @@ fn assert_schedule_corpus_covers_expected_scenarios_and_seeds() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        seed_155_stages,
-        vec![
-            "old_leader_stopped",
-            "replacement_leader_installed",
-            "failover_appends_applied",
-            "old_leader_caught_up",
-            "cold_flush_started_after_failover",
-            "cold_flush_applied_after_failover",
-        ]
-    );
+    assert_eq!(seed_155_stages, vec![
+        "old_leader_stopped",
+        "replacement_leader_installed",
+        "failover_appends_applied",
+        "old_leader_caught_up",
+        "cold_flush_started_after_failover",
+        "cold_flush_applied_after_failover",
+    ]);
 
     let seed_317 = schedule_records
         .iter()

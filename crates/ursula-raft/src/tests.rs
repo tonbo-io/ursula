@@ -1,7 +1,3 @@
-use openraft::entry::RaftEntry;
-use openraft::rt::WatchReceiver;
-use openraft::storage::RaftLogStorage;
-use openraft::vote::RaftLeaderId;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -11,24 +7,46 @@ use std::sync::Arc;
 #[cfg(madsim)]
 use std::sync::Mutex;
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
+use futures_util::stream;
 use openraft::BasicNode;
 use openraft::Config;
 use openraft::Entry;
 use openraft::EntryPayload;
+use openraft::LogId;
 use openraft::Raft;
+use openraft::SnapshotPolicy;
 use openraft::alias::VoteOf;
+use openraft::entry::RaftEntry;
+use openraft::rt::WatchReceiver;
 use openraft::storage::IOFlushed;
 use openraft::storage::RaftLogReader;
+use openraft::storage::RaftLogStorage;
 use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
+use openraft::vote::RaftLeaderId;
 use prost::Message;
 use ursula_proto as raft_app_proto;
-use ursula_runtime::{
-    AppendBatchRequest, AppendRequest, CloseStreamRequest, ColdWriteAdmission, CreateStreamRequest,
-    GroupEngine, GroupEngineError, GroupInfraError, GroupWriteCommand, GroupWriteResponse,
-    HeadStreamRequest, ReadStreamRequest, StreamErrorCode, StreamErrorContext,
-};
+use ursula_runtime::AppendBatchRequest;
+use ursula_runtime::AppendRequest;
+use ursula_runtime::CloseStreamRequest;
+use ursula_runtime::ColdWriteAdmission;
+use ursula_runtime::CreateStreamRequest;
+use ursula_runtime::GroupEngine;
+use ursula_runtime::GroupEngineError;
+use ursula_runtime::GroupInfraError;
+use ursula_runtime::GroupWriteCommand;
+use ursula_runtime::GroupWriteResponse;
+use ursula_runtime::HeadStreamRequest;
+use ursula_runtime::ProducerRequest;
+use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::RuntimeConfig;
+use ursula_runtime::RuntimeThreading;
+use ursula_runtime::ShardRuntime;
+use ursula_runtime::StreamErrorCode;
+use ursula_runtime::StreamErrorContext;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardId;
@@ -40,11 +58,6 @@ use crate::engine::*;
 use crate::log_store::*;
 use crate::registry::*;
 use crate::types::*;
-
-use futures_util::stream;
-use openraft::{LogId, SnapshotPolicy};
-use std::time::{SystemTime, UNIX_EPOCH};
-use ursula_runtime::{ProducerRequest, RuntimeConfig, RuntimeThreading, ShardRuntime};
 
 type CommittedLeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
 
@@ -2076,10 +2089,10 @@ async fn raft_group_engine_applies_batched_runtime_writes() {
                     stream_id.clone(),
                     "application/octet-stream",
                 )),
-                GroupWriteCommand::from(AppendBatchRequest::new(
-                    stream_id.clone(),
-                    vec![b"ab".to_vec(), b"cd".to_vec()],
-                )),
+                GroupWriteCommand::from(AppendBatchRequest::new(stream_id.clone(), vec![
+                    b"ab".to_vec(),
+                    b"cd".to_vec(),
+                ])),
             ],
             placement(),
         )

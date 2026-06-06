@@ -1,12 +1,25 @@
 use prost::Message;
 use ursula_proto as raft_app_proto;
-use ursula_runtime::{
-    AckColdGcResponse, AppendResponse, CloseStreamResponse, CreateStreamResponse,
-    DeleteStreamResponse, FlushColdResponse, ForkRefResponse, GroupAppendBatchResponse,
-    GroupEngineError, GroupInfraError, GroupLeaderHint, GroupWriteCommand, GroupWriteResponse,
-    HeadStreamResponse, PublishSnapshotResponse, ReadStreamResponse, StreamErrorCode,
-    StreamErrorContext, StreamIntegritySnapshot, TouchStreamAccessResponse,
-};
+use ursula_runtime::AckColdGcResponse;
+use ursula_runtime::AppendResponse;
+use ursula_runtime::CloseStreamResponse;
+use ursula_runtime::CreateStreamResponse;
+use ursula_runtime::DeleteStreamResponse;
+use ursula_runtime::FlushColdResponse;
+use ursula_runtime::ForkRefResponse;
+use ursula_runtime::GroupAppendBatchResponse;
+use ursula_runtime::GroupEngineError;
+use ursula_runtime::GroupInfraError;
+use ursula_runtime::GroupLeaderHint;
+use ursula_runtime::GroupWriteCommand;
+use ursula_runtime::GroupWriteResponse;
+use ursula_runtime::HeadStreamResponse;
+use ursula_runtime::PublishSnapshotResponse;
+use ursula_runtime::ReadStreamResponse;
+use ursula_runtime::StreamErrorCode;
+use ursula_runtime::StreamErrorContext;
+use ursula_runtime::StreamIntegritySnapshot;
+use ursula_runtime::TouchStreamAccessResponse;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
@@ -14,7 +27,8 @@ use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 
 use crate::raft_internal_proto;
-use crate::types::{RaftGroupCommand, RaftGroupResponse};
+use crate::types::RaftGroupCommand;
+use crate::types::RaftGroupResponse;
 
 pub(crate) fn placement_to_proto(placement: ShardPlacement) -> raft_app_proto::ShardPlacementV1 {
     raft_app_proto::ShardPlacementV1 {

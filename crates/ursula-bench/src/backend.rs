@@ -1,8 +1,13 @@
-use anyhow::{Context, Result};
+use anyhow::Context;
+use anyhow::Result;
 use bytes::Bytes;
 use clap::ValueEnum;
 use reqwest::Client;
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::ACCEPT;
+use reqwest::header::AUTHORIZATION;
+use reqwest::header::CONTENT_TYPE;
+use reqwest::header::HeaderMap;
+use reqwest::header::HeaderValue;
 use serde::Serialize;
 use serde_json::json;
 

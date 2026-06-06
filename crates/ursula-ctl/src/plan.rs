@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
-use crate::metrics::{ClusterSnapshot, RaftGroupView};
+use crate::metrics::ClusterSnapshot;
+use crate::metrics::RaftGroupView;
 
 #[derive(Debug, Clone)]
 pub struct GroupTransfer {
@@ -162,17 +163,14 @@ pub fn check_readiness(
         if !ready {
             all_ready = false;
         }
-        per_group.insert(
-            group_id,
-            GroupReadiness {
-                raft_group_id: group_id,
-                voter_member,
-                target_applied_index: target_applied,
-                peer_max_committed_index: peer_max_committed,
-                catch_up_gap,
-                ready,
-            },
-        );
+        per_group.insert(group_id, GroupReadiness {
+            raft_group_id: group_id,
+            voter_member,
+            target_applied_index: target_applied,
+            peer_max_committed_index: peer_max_committed,
+            catch_up_gap,
+            ready,
+        });
     }
     ReadinessReport {
         all_ready,
@@ -186,10 +184,11 @@ fn group_is_initialized(group: &RaftGroupView) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use url::Url;
+
     use super::*;
     use crate::metrics::NodeMetricsView;
     use crate::provider::NodeInfo;
-    use url::Url;
 
     fn node(id: u64) -> NodeInfo {
         NodeInfo {
@@ -242,18 +241,15 @@ mod tests {
     fn plan_drain_picks_most_caught_up_successor() {
         let snapshot = ClusterSnapshot {
             per_node: vec![
-                view(
-                    1,
-                    vec![group(7, 1, Some(1), Some(100), Some(100), vec![1, 2, 3])],
-                ),
-                view(
-                    2,
-                    vec![group(7, 2, Some(1), Some(98), Some(100), vec![1, 2, 3])],
-                ),
-                view(
-                    3,
-                    vec![group(7, 3, Some(1), Some(95), Some(100), vec![1, 2, 3])],
-                ),
+                view(1, vec![group(7, 1, Some(1), Some(100), Some(100), vec![
+                    1, 2, 3,
+                ])]),
+                view(2, vec![group(7, 2, Some(1), Some(98), Some(100), vec![
+                    1, 2, 3,
+                ])]),
+                view(3, vec![group(7, 3, Some(1), Some(95), Some(100), vec![
+                    1, 2, 3,
+                ])]),
             ],
         };
         let plan = plan_drain(&snapshot, 1);
@@ -265,10 +261,14 @@ mod tests {
     #[test]
     fn plan_drain_empty_when_target_leads_nothing() {
         let snapshot = ClusterSnapshot {
-            per_node: vec![view(
+            per_node: vec![view(1, vec![group(
+                7,
                 1,
-                vec![group(7, 1, Some(2), Some(100), Some(100), vec![1, 2, 3])],
-            )],
+                Some(2),
+                Some(100),
+                Some(100),
+                vec![1, 2, 3],
+            )])],
         };
         assert!(plan_drain(&snapshot, 1).is_empty());
     }
@@ -306,14 +306,12 @@ mod tests {
     fn readiness_requires_voter_membership_and_low_lag() {
         let snapshot = ClusterSnapshot {
             per_node: vec![
-                view(
-                    1,
-                    vec![group(7, 1, Some(2), Some(99), Some(99), vec![1, 2, 3])],
-                ),
-                view(
-                    2,
-                    vec![group(7, 2, Some(2), Some(100), Some(100), vec![1, 2, 3])],
-                ),
+                view(1, vec![group(7, 1, Some(2), Some(99), Some(99), vec![
+                    1, 2, 3,
+                ])]),
+                view(2, vec![group(7, 2, Some(2), Some(100), Some(100), vec![
+                    1, 2, 3,
+                ])]),
             ],
         };
         let report = check_readiness(&snapshot, 1, 5);
@@ -322,14 +320,12 @@ mod tests {
         // Same snapshot but target is missing from voter_ids on every peer.
         let snapshot = ClusterSnapshot {
             per_node: vec![
-                view(
-                    1,
-                    vec![group(7, 1, Some(2), Some(99), Some(99), vec![2, 3])],
-                ),
-                view(
-                    2,
-                    vec![group(7, 2, Some(2), Some(100), Some(100), vec![2, 3])],
-                ),
+                view(1, vec![group(7, 1, Some(2), Some(99), Some(99), vec![
+                    2, 3,
+                ])]),
+                view(2, vec![group(7, 2, Some(2), Some(100), Some(100), vec![
+                    2, 3,
+                ])]),
             ],
         };
         let report = check_readiness(&snapshot, 1, 5);
@@ -340,14 +336,12 @@ mod tests {
     fn readiness_fails_on_large_gap() {
         let snapshot = ClusterSnapshot {
             per_node: vec![
-                view(
-                    1,
-                    vec![group(7, 1, Some(2), Some(50), Some(50), vec![1, 2, 3])],
-                ),
-                view(
-                    2,
-                    vec![group(7, 2, Some(2), Some(100), Some(100), vec![1, 2, 3])],
-                ),
+                view(1, vec![group(7, 1, Some(2), Some(50), Some(50), vec![
+                    1, 2, 3,
+                ])]),
+                view(2, vec![group(7, 2, Some(2), Some(100), Some(100), vec![
+                    1, 2, 3,
+                ])]),
             ],
         };
         let report = check_readiness(&snapshot, 1, 5);
@@ -360,20 +354,14 @@ mod tests {
     fn readiness_ignores_uninitialized_empty_groups() {
         let snapshot = ClusterSnapshot {
             per_node: vec![
-                view(
-                    1,
-                    vec![
-                        group(7, 1, Some(2), Some(99), Some(99), vec![1, 2, 3]),
-                        empty_group(8, 1),
-                    ],
-                ),
-                view(
-                    2,
-                    vec![
-                        group(7, 2, Some(2), Some(100), Some(100), vec![1, 2, 3]),
-                        empty_group(8, 2),
-                    ],
-                ),
+                view(1, vec![
+                    group(7, 1, Some(2), Some(99), Some(99), vec![1, 2, 3]),
+                    empty_group(8, 1),
+                ]),
+                view(2, vec![
+                    group(7, 2, Some(2), Some(100), Some(100), vec![1, 2, 3]),
+                    empty_group(8, 2),
+                ]),
             ],
         };
         let report = check_readiness(&snapshot, 1, 5);

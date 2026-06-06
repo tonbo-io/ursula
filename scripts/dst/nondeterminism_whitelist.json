@@ -51,14 +51,14 @@
   {
     "category": "std_time_instant_import",
     "path": "crates/ursula-ctl/src/observe.rs",
-    "snippet_contains": "use std::time::{Duration, Instant};",
+    "snippet_contains": "use std::time::Instant;",
     "reason": "not-sim-reachable",
     "plan": "no action: ursula-ctl is a host-side CLI; the DST harness only consumes ursula_ctl::plan + ursula_ctl::metrics (see crates/ursula-sim/src/madsim_harness/rolling_restart.rs). The Instant-based wait loops in observe.rs (collect_status timeout) are exercised exclusively by the ursulactl binary, never by madsim scenarios."
   },
   {
     "category": "std_time_instant_import",
     "path": "crates/ursula-ctl/src/orchestrate.rs",
-    "snippet_contains": "use std::time::{Duration, Instant};",
+    "snippet_contains": "use std::time::Instant;",
     "reason": "not-sim-reachable",
     "plan": "no action: orchestrate.rs holds the host-only drain / wait-ready deadline loops invoked by the ursulactl binary. DST reaches ursula-ctl through ursula_ctl::plan helpers only, which take pre-built ClusterSnapshot/NodeMetricsView arguments and don't touch wall-clock time."
   }

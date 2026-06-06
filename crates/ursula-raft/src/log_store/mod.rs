@@ -1,16 +1,16 @@
 mod file;
 mod memory;
 
-pub use file::RaftGroupFileLogStore;
-#[cfg(test)]
-pub(crate) use file::read_protobuf_frames;
-pub(crate) use file::{CoreFileLogWriter, elapsed_ns};
-pub use memory::RaftGroupLogStore;
-
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io;
 
+pub(crate) use file::CoreFileLogWriter;
+pub use file::RaftGroupFileLogStore;
+pub(crate) use file::elapsed_ns;
+#[cfg(test)]
+pub(crate) use file::read_protobuf_frames;
+pub use memory::RaftGroupLogStore;
 use openraft::BasicNode;
 use openraft::Entry;
 use openraft::EntryPayload;
@@ -29,10 +29,12 @@ use openraft::vote::RaftLeaderId;
 use crate::engine::invalid_data;
 use crate::grpc::GrpcRpcError;
 use crate::raft_internal_proto;
-use crate::types::{
-    RaftGroupCommand, UrsulaAppendEntriesRequest, UrsulaAppendEntriesResponse,
-    UrsulaRaftTypeConfig, UrsulaVoteRequest, UrsulaVoteResponse,
-};
+use crate::types::RaftGroupCommand;
+use crate::types::UrsulaAppendEntriesRequest;
+use crate::types::UrsulaAppendEntriesResponse;
+use crate::types::UrsulaRaftTypeConfig;
+use crate::types::UrsulaVoteRequest;
+use crate::types::UrsulaVoteResponse;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RaftGroupLogStoreInner {
@@ -111,12 +113,9 @@ pub(crate) fn stored_log_entry_into_entry(
                             "membership node missing basic node",
                         )
                     })?;
-                    Ok((
-                        node.node_id,
-                        BasicNode {
-                            addr: basic_node.addr,
-                        },
-                    ))
+                    Ok((node.node_id, BasicNode {
+                        addr: basic_node.addr,
+                    }))
                 })
                 .collect::<Result<BTreeMap<_, _>, io::Error>>()?;
             let membership = Membership::new(configs, nodes).map_err(invalid_data)?;
@@ -217,12 +216,9 @@ pub(crate) fn membership_from_proto(
                     "membership node missing basic node",
                 )
             })?;
-            Ok((
-                node.node_id,
-                BasicNode {
-                    addr: basic_node.addr,
-                },
-            ))
+            Ok((node.node_id, BasicNode {
+                addr: basic_node.addr,
+            }))
         })
         .collect::<Result<BTreeMap<_, _>, io::Error>>()?;
     Membership::new(configs, nodes).map_err(invalid_data)

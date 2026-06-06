@@ -1,9 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
-use axum::body::{Body, to_bytes};
+use axum::body::Body;
+use axum::body::to_bytes;
 use axum::http::Request;
 use openraft::RaftNetworkV2;
 use openraft::error::ReplicationClosed;
@@ -13,10 +16,15 @@ use openraft::rt::WatchReceiver;
 use tower::ServiceExt;
 use ursula_raft::StaticGrpcRaftGroupEngineFactory;
 use ursula_raft::UrsulaRaftTypeConfig;
-use ursula_runtime::{
-    ColdStore, ColdStoreHandle, GroupEngineError, InMemoryGroupEngineFactory,
-    PlanGroupColdFlushRequest, RuntimeConfig, RuntimeError, StreamErrorCode, StreamErrorContext,
-};
+use ursula_runtime::ColdStore;
+use ursula_runtime::ColdStoreHandle;
+use ursula_runtime::GroupEngineError;
+use ursula_runtime::InMemoryGroupEngineFactory;
+use ursula_runtime::PlanGroupColdFlushRequest;
+use ursula_runtime::RuntimeConfig;
+use ursula_runtime::RuntimeError;
+use ursula_runtime::StreamErrorCode;
+use ursula_runtime::StreamErrorContext;
 use ursula_shard::RaftGroupId;
 
 use super::*;
@@ -1930,11 +1938,10 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
         .current_leader(1, "static durable gRPC Raft group should elect node 1")
         .await
         .expect("wait for leader");
-    let app = router_with_static_raft_cluster(
-        runtime,
-        registry,
-        [(1, "http://127.0.0.1:4477".to_owned())],
-    );
+    let app = router_with_static_raft_cluster(runtime, registry, [(
+        1,
+        "http://127.0.0.1:4477".to_owned(),
+    )]);
 
     let response = app
         .clone()
@@ -5032,7 +5039,9 @@ async fn ingress_body_budget_holds_credit_until_response_finishes() {
 }
 
 mod cold_health {
-    use crate::bootstrap::{ColdHealthDecision, ColdHealthSample, ColdHealthTracker};
+    use crate::bootstrap::ColdHealthDecision;
+    use crate::bootstrap::ColdHealthSample;
+    use crate::bootstrap::ColdHealthTracker;
 
     fn sample(errors: u64, hot_max: u64) -> ColdHealthSample {
         ColdHealthSample {
@@ -5172,10 +5181,12 @@ mod cold_health {
 }
 
 mod snapshot_driver {
-    use crate::bootstrap::{
-        next_snapshot_to_drive, resolve_snapshot_drive_interval_ms, should_drive_snapshot_for_group,
-    };
-    use ursula_raft::{RaftGroupMetricsSnapshot, RaftLogProgressSnapshot};
+    use ursula_raft::RaftGroupMetricsSnapshot;
+    use ursula_raft::RaftLogProgressSnapshot;
+
+    use crate::bootstrap::next_snapshot_to_drive;
+    use crate::bootstrap::resolve_snapshot_drive_interval_ms;
+    use crate::bootstrap::should_drive_snapshot_for_group;
 
     fn snap_with_group(
         raft_group_id: u32,
@@ -5244,12 +5255,15 @@ mod snapshot_driver {
 }
 
 mod leadership_balance {
-    use crate::bootstrap::{
-        leader_counts, plan_leadership_balance, plan_leadership_balance_with_eligible_nodes,
-        prioritized_transfer_targets,
-    };
     use std::collections::HashSet;
-    use ursula_raft::{RaftGroupMetricsSnapshot, RaftLogProgressSnapshot};
+
+    use ursula_raft::RaftGroupMetricsSnapshot;
+    use ursula_raft::RaftLogProgressSnapshot;
+
+    use crate::bootstrap::leader_counts;
+    use crate::bootstrap::plan_leadership_balance;
+    use crate::bootstrap::plan_leadership_balance_with_eligible_nodes;
+    use crate::bootstrap::prioritized_transfer_targets;
 
     fn snap(group_id: u32, leader: Option<u64>) -> RaftGroupMetricsSnapshot {
         RaftGroupMetricsSnapshot {
@@ -5463,28 +5477,32 @@ mod leadership_balance {
             snap(3, Some(3)),
         ];
         let counts = leader_counts(&snaps);
-        assert_eq!(
-            prioritized_transfer_targets(&snaps[0], 1, &counts),
-            vec![3, 2]
-        );
+        assert_eq!(prioritized_transfer_targets(&snaps[0], 1, &counts), vec![
+            3, 2
+        ]);
     }
 }
 
 mod cluster_egress {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    use crate::bootstrap::{
-        ClusterEgressProbeScope, ClusterEgressShedAction, cluster_egress_probe_groups,
-        plan_cluster_egress_shed,
-    };
     use axum::Router;
     use axum::http::StatusCode;
     use axum::routing::post;
-    use ursula_raft::{RaftGroupHandleRegistry, RaftGroupMetricsSnapshot, RaftLogProgressSnapshot};
+    use ursula_raft::RaftGroupHandleRegistry;
+    use ursula_raft::RaftGroupMetricsSnapshot;
+    use ursula_raft::RaftLogProgressSnapshot;
     use ursula_shard::RaftGroupId;
+
+    use crate::bootstrap::ClusterEgressProbeScope;
+    use crate::bootstrap::ClusterEgressShedAction;
+    use crate::bootstrap::cluster_egress_probe_groups;
+    use crate::bootstrap::plan_cluster_egress_shed;
 
     fn snap(group_id: u32, voters: Vec<u64>) -> RaftGroupMetricsSnapshot {
         snap_with_leader(group_id, 1, Some(1), voters)
@@ -5551,10 +5569,11 @@ mod cluster_egress {
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].scope, ClusterEgressProbeScope::Global);
-        assert_eq!(
-            groups[0].peer_urls,
-            vec!["http://node2", "http://node3", "http://node4"]
-        );
+        assert_eq!(groups[0].peer_urls, vec![
+            "http://node2",
+            "http://node3",
+            "http://node4"
+        ]);
         assert_eq!(groups[0].needed_peers, 2);
     }
 
@@ -5571,27 +5590,24 @@ mod cluster_egress {
 
         let actions = plan_cluster_egress_shed(&snaps, 3);
 
-        assert_eq!(
-            actions,
-            vec![
-                ClusterEgressShedAction {
-                    group_id: 0,
-                    target: 1,
-                },
-                ClusterEgressShedAction {
-                    group_id: 1,
-                    target: 1,
-                },
-                ClusterEgressShedAction {
-                    group_id: 3,
-                    target: 1,
-                },
-                ClusterEgressShedAction {
-                    group_id: 4,
-                    target: 2,
-                },
-            ]
-        );
+        assert_eq!(actions, vec![
+            ClusterEgressShedAction {
+                group_id: 0,
+                target: 1,
+            },
+            ClusterEgressShedAction {
+                group_id: 1,
+                target: 1,
+            },
+            ClusterEgressShedAction {
+                group_id: 3,
+                target: 1,
+            },
+            ClusterEgressShedAction {
+                group_id: 4,
+                target: 2,
+            },
+        ]);
     }
 
     async fn serve_counting_probe_peer(
@@ -5660,10 +5676,14 @@ mod cluster_egress {
 }
 
 mod commit_stall {
-    use crate::bootstrap::{CommitStallAction, CommitStallTracker};
     use std::time::Duration;
+
     use tokio::time::Instant;
-    use ursula_raft::{RaftGroupMetricsSnapshot, RaftLogProgressSnapshot};
+    use ursula_raft::RaftGroupMetricsSnapshot;
+    use ursula_raft::RaftLogProgressSnapshot;
+
+    use crate::bootstrap::CommitStallAction;
+    use crate::bootstrap::CommitStallTracker;
 
     fn snap(
         group_id: u32,
@@ -5735,18 +5755,15 @@ mod commit_stall {
             t0 + Duration::from_secs(16),
             Duration::from_secs(15),
         );
-        assert_eq!(
-            actions,
-            vec![CommitStallAction {
-                group_id: 3,
-                // Both peer voters (1 and 3) are equally idle (0 leaderships)
-                // and tie-broken by id ascending → [1, 3].
-                targets: vec![1, 3],
-                stalled_for: Duration::from_secs(16),
-                last_log: Some(19172),
-                committed: Some(19171),
-            }]
-        );
+        assert_eq!(actions, vec![CommitStallAction {
+            group_id: 3,
+            // Both peer voters (1 and 3) are equally idle (0 leaderships)
+            // and tie-broken by id ascending → [1, 3].
+            targets: vec![1, 3],
+            stalled_for: Duration::from_secs(16),
+            last_log: Some(19172),
+            committed: Some(19171),
+        }]);
         // After emitting, baseline is cleared → another full threshold wait
         // before re-firing, even though the gap still exists.
         let actions = tracker.evaluate(

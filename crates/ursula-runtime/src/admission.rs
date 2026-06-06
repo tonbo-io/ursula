@@ -10,7 +10,8 @@
 //! Call sites consult the relevant subset; errors surface as HTTP 503.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use ursula_shard::RaftGroupId;
 

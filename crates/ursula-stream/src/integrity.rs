@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use setsum::Setsum;
 use ursula_shard::BucketStreamId;
 
@@ -42,13 +43,10 @@ impl StreamIntegrity {
         object_size: u64,
     ) {
         let object_size = object_size.to_le_bytes();
-        let record = record_setsum(
-            stream_id,
-            start_offset,
-            end_offset,
-            b"external",
-            &[s3_path.as_bytes(), &object_size],
-        );
+        let record = record_setsum(stream_id, start_offset, end_offset, b"external", &[
+            s3_path.as_bytes(),
+            &object_size,
+        ]);
         self.append_record(start_offset, end_offset, record);
     }
 

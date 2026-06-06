@@ -1,5 +1,8 @@
-use serde::{Deserialize, Serialize};
-use ursula_proto::{ColdChunkRefV1, ExternalPayloadRefV1, ProducerRequestV1};
+use serde::Deserialize;
+use serde::Serialize;
+use ursula_proto::ColdChunkRefV1;
+use ursula_proto::ExternalPayloadRefV1;
+use ursula_proto::ProducerRequestV1;
 use ursula_shard::BucketStreamId;
 
 pub const COLD_INDEX_PAGE_SPAN_BYTES: u64 = 64 * 1024 * 1024;

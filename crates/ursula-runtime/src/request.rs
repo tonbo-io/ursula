@@ -1,15 +1,21 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
-use ursula_shard::{BucketStreamId, ShardPlacement};
-use ursula_stream::{
-    ColdChunkRef, ExternalPayloadRef, ProducerRequest, StreamIntegritySnapshot, StreamReadPlan,
-    StreamReadSegment,
-};
+use serde::Deserialize;
+use serde::Serialize;
+use ursula_shard::BucketStreamId;
+use ursula_shard::ShardPlacement;
+use ursula_stream::ColdChunkRef;
+use ursula_stream::ExternalPayloadRef;
+use ursula_stream::ProducerRequest;
+use ursula_stream::StreamIntegritySnapshot;
+use ursula_stream::StreamReadPlan;
+use ursula_stream::StreamReadSegment;
 
-use crate::cold_index::{ColdIndexPageCache, ColdStoreColdIndexPageStore};
-use crate::cold_store::{ColdStoreHandle, DEFAULT_CONTENT_TYPE};
+use crate::cold_index::ColdIndexPageCache;
+use crate::cold_index::ColdStoreColdIndexPageStore;
+use crate::cold_store::ColdStoreHandle;
+use crate::cold_store::DEFAULT_CONTENT_TYPE;
 use crate::engine::GroupEngineError;
 use crate::engine::in_memory::InMemoryGroupEngine;
 use crate::error::RuntimeError;
@@ -496,9 +502,7 @@ pub struct AppendBatchRequest {
 
 impl AppendBatchRequest {
     pub fn new<P>(stream_id: BucketStreamId, payloads: Vec<P>) -> Self
-    where
-        P: Into<Bytes>,
-    {
+    where P: Into<Bytes> {
         Self {
             stream_id,
             content_type: DEFAULT_CONTENT_TYPE.to_owned(),

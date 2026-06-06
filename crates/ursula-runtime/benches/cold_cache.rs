@@ -1,5 +1,11 @@
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use ursula_runtime::{ColdReadCacheConfig, ColdStore};
+use criterion::BenchmarkId;
+use criterion::Criterion;
+use criterion::Throughput;
+use criterion::black_box;
+use criterion::criterion_group;
+use criterion::criterion_main;
+use ursula_runtime::ColdReadCacheConfig;
+use ursula_runtime::ColdStore;
 use ursula_shard::BucketStreamId;
 use ursula_stream::ObjectPayloadRef;
 

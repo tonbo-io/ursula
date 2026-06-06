@@ -1,25 +1,53 @@
 //! Runtime-actor + runtime/Raft scenarios extracted from `madsim_harness/mod.rs`
 //! (DoD #3 modularity refactor — workloads axis).
 
-use super::{
-    AppendBatchRequest, AppendRequest, Arc, BTreeSet, ColdStoreFaultEffect, ColdStoreOperation,
-    CreateStreamRequest, Duration, HeadStreamRequest, InMemoryGroupEngineFactory,
-    MadsimRuntimeRaftNetworkFactory, MadsimScopedRaftGroupEngineFactory, Mutex,
-    PlanGroupColdFlushRequest, ReadStreamRequest, RuntimeConfig, RuntimeInterleavingPlan,
-    RuntimeRaftNetworkOptions, RuntimeThreading, ShardRuntime, SimEvent, SimTrace,
-    ThreeNodeRaftSimConfig, ThreeNodeRaftSimOutcome, assert_cold_live_read_consistency,
-    assert_runtime_interleaving_read_your_write,
-    assert_runtime_raft_leader_failover_read_consistency, assert_runtime_raft_producer_duplicate,
-    assert_runtime_raft_producer_stale_epoch, assert_runtime_raft_read_consistency,
-    choose_runtime_streams_spanning_placement, duration_ms,
-    maybe_panic_after_runtime_interleaving_event, runtime_interleaving_payload,
-    runtime_raft_network_batch_payloads, runtime_raft_network_duplicate_payloads,
-    runtime_raft_network_producer, runtime_raft_network_producer_with_lane,
-    runtime_raft_network_streams, seeded_follower_id, sim_cold_store, sim_network_policy,
-    verify_runtime_raft_close_stream, verify_runtime_raft_partial_read,
-    verify_runtime_raft_snapshot_publish, verify_runtime_raft_tail_read,
-    wait_raft_applied_index_at_least,
-};
+use super::AppendBatchRequest;
+use super::AppendRequest;
+use super::Arc;
+use super::BTreeSet;
+use super::ColdStoreFaultEffect;
+use super::ColdStoreOperation;
+use super::CreateStreamRequest;
+use super::Duration;
+use super::HeadStreamRequest;
+use super::InMemoryGroupEngineFactory;
+use super::MadsimRuntimeRaftNetworkFactory;
+use super::MadsimScopedRaftGroupEngineFactory;
+use super::Mutex;
+use super::PlanGroupColdFlushRequest;
+use super::ReadStreamRequest;
+use super::RuntimeConfig;
+use super::RuntimeInterleavingPlan;
+use super::RuntimeRaftNetworkOptions;
+use super::RuntimeThreading;
+use super::ShardRuntime;
+use super::SimEvent;
+use super::SimTrace;
+use super::ThreeNodeRaftSimConfig;
+use super::ThreeNodeRaftSimOutcome;
+use super::assert_cold_live_read_consistency;
+use super::assert_runtime_interleaving_read_your_write;
+use super::assert_runtime_raft_leader_failover_read_consistency;
+use super::assert_runtime_raft_producer_duplicate;
+use super::assert_runtime_raft_producer_stale_epoch;
+use super::assert_runtime_raft_read_consistency;
+use super::choose_runtime_streams_spanning_placement;
+use super::duration_ms;
+use super::maybe_panic_after_runtime_interleaving_event;
+use super::runtime_interleaving_payload;
+use super::runtime_raft_network_batch_payloads;
+use super::runtime_raft_network_duplicate_payloads;
+use super::runtime_raft_network_producer;
+use super::runtime_raft_network_producer_with_lane;
+use super::runtime_raft_network_streams;
+use super::seeded_follower_id;
+use super::sim_cold_store;
+use super::sim_network_policy;
+use super::verify_runtime_raft_close_stream;
+use super::verify_runtime_raft_partial_read;
+use super::verify_runtime_raft_snapshot_publish;
+use super::verify_runtime_raft_tail_read;
+use super::wait_raft_applied_index_at_least;
 
 pub(super) async fn run_runtime_actor_scheduling_inner(
     config: ThreeNodeRaftSimConfig,
@@ -149,10 +177,10 @@ pub(super) async fn run_runtime_raft_engine_inner(
     });
 
     let append_batch = runtime
-        .append_batch(AppendBatchRequest::new(
-            config.stream.clone(),
-            vec![b"raft-".to_vec(), b"runtime".to_vec()],
-        ))
+        .append_batch(AppendBatchRequest::new(config.stream.clone(), vec![
+            b"raft-".to_vec(),
+            b"runtime".to_vec(),
+        ]))
         .await
         .expect("append through runtime-owned raft engine");
     let append_items = append_batch
@@ -248,10 +276,10 @@ pub(super) async fn run_runtime_raft_snapshot_install_inner(
     });
 
     let append_batch = source_runtime
-        .append_batch(AppendBatchRequest::new(
-            config.stream.clone(),
-            vec![b"snapshot-".to_vec(), b"runtime".to_vec()],
-        ))
+        .append_batch(AppendBatchRequest::new(config.stream.clone(), vec![
+            b"snapshot-".to_vec(),
+            b"runtime".to_vec(),
+        ]))
         .await
         .expect("append before runtime raft snapshot");
     let append_items = append_batch
@@ -405,10 +433,9 @@ pub(super) async fn run_runtime_raft_snapshot_install_inner(
     assert_eq!(restored_read.next_offset, append.next_offset);
 
     let restore_append_batch = restore_runtime
-        .append_batch(AppendBatchRequest::new(
-            config.stream.clone(),
-            vec![b"-restored".to_vec()],
-        ))
+        .append_batch(AppendBatchRequest::new(config.stream.clone(), vec![
+            b"-restored".to_vec(),
+        ]))
         .await
         .expect("append after runtime raft snapshot install");
     let restore_append_items = restore_append_batch

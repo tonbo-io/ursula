@@ -1,14 +1,20 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
-use crate::rt::time::Instant;
+use ursula_shard::BucketStreamId;
+use ursula_shard::CoreId;
+use ursula_shard::RaftGroupId;
+use ursula_shard::ShardPlacement;
+use ursula_stream::StreamErrorCode;
+use ursula_stream::StreamErrorContext;
 
-use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardPlacement};
-use ursula_stream::{StreamErrorCode, StreamErrorContext};
-
-use crate::engine::{GroupEngine, GroupEngineError};
+use crate::engine::GroupEngine;
+use crate::engine::GroupEngineError;
 use crate::error::RuntimeError;
-use crate::request::{AppendBatchRequest, ColdWriteAdmission};
+use crate::request::AppendBatchRequest;
+use crate::request::ColdWriteAdmission;
+use crate::rt::time::Instant;
 
 pub(crate) const GROUP_ACTOR_MAX_WRITE_BATCH: usize = 64;
 pub(crate) const COLD_FLUSH_GROUP_BATCH_MAX_CHUNKS: usize = 64;

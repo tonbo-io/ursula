@@ -5,11 +5,14 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Write;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+use anyhow::bail;
 
-use crate::metrics::{ClusterSnapshot, MetricsClient};
+use crate::metrics::ClusterSnapshot;
+use crate::metrics::MetricsClient;
 use crate::provider::NodeInfo;
 
 #[derive(Debug, Clone)]
@@ -177,9 +180,11 @@ fn group_is_initialized(group: &crate::metrics::RaftGroupView) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::metrics::{NodeMetricsView, RaftGroupView};
     use url::Url;
+
+    use super::*;
+    use crate::metrics::NodeMetricsView;
+    use crate::metrics::RaftGroupView;
 
     fn node(id: u64) -> NodeInfo {
         NodeInfo {

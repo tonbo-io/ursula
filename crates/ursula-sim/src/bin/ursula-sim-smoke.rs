@@ -7,10 +7,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     use std::fs;
     use std::panic;
 
-    use ursula_sim::{
-        SIM_REGRESSION_SCHEMA_VERSION, SimFailureRegressionRecord, SimRegressionRecord,
-        SimSchedule, SimScheduledRecord, SimTrace,
-    };
+    use ursula_sim::SIM_REGRESSION_SCHEMA_VERSION;
+    use ursula_sim::SimFailureRegressionRecord;
+    use ursula_sim::SimRegressionRecord;
+    use ursula_sim::SimSchedule;
+    use ursula_sim::SimScheduledRecord;
+    use ursula_sim::SimTrace;
 
     let args = Args::parse()?;
 

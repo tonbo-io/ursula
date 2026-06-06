@@ -1,6 +1,8 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
+use anyhow::Result;
 use hdrhistogram::Histogram;
 use reqwest::Client;
 use serde::Serialize;

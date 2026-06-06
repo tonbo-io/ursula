@@ -3,9 +3,15 @@ use std::io::Cursor;
 use std::time::Duration;
 
 use openraft::alias::VoteOf;
-use openraft::raft::{AppendEntriesRequest, AppendEntriesResponse, VoteRequest, VoteResponse};
+use openraft::raft::AppendEntriesRequest;
+use openraft::raft::AppendEntriesResponse;
+use openraft::raft::VoteRequest;
+use openraft::raft::VoteResponse;
 use prost::Message;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::Deserialize;
+use serde::Deserializer;
+use serde::Serialize;
+use serde::Serializer;
 use ursula_proto as raft_app_proto;
 use ursula_runtime::GroupWriteCommand;
 
@@ -44,18 +50,14 @@ pub struct RaftGroupResponse(pub raft_app_proto::RaftGroupResponseV1);
 
 impl Serialize for RaftGroupCommand {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
+    where S: Serializer {
         serializer.serialize_bytes(&self.0.encode_to_vec())
     }
 }
 
 impl<'de> Deserialize<'de> for RaftGroupCommand {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
+    where D: Deserializer<'de> {
         let bytes = Vec::<u8>::deserialize(deserializer)?;
         let command = raft_app_proto::RaftGroupCommandV1::decode(bytes.as_slice())
             .map_err(serde::de::Error::custom)?;
@@ -65,18 +67,14 @@ impl<'de> Deserialize<'de> for RaftGroupCommand {
 
 impl Serialize for RaftGroupResponse {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
+    where S: Serializer {
         serializer.serialize_bytes(&self.0.encode_to_vec())
     }
 }
 
 impl<'de> Deserialize<'de> for RaftGroupResponse {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
+    where D: Deserializer<'de> {
         let bytes = Vec::<u8>::deserialize(deserializer)?;
         let response = raft_app_proto::RaftGroupResponseV1::decode(bytes.as_slice())
             .map_err(serde::de::Error::custom)?;

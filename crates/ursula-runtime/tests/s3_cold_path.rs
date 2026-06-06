@@ -1,10 +1,15 @@
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
-use ursula_runtime::{
-    AppendRequest, ColdStore, CreateStreamRequest, InMemoryGroupEngineFactory,
-    PlanColdFlushRequest, ReadStreamRequest, RuntimeConfig, ShardRuntime,
-};
+use ursula_runtime::AppendRequest;
+use ursula_runtime::ColdStore;
+use ursula_runtime::CreateStreamRequest;
+use ursula_runtime::InMemoryGroupEngineFactory;
+use ursula_runtime::PlanColdFlushRequest;
+use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::RuntimeConfig;
+use ursula_runtime::ShardRuntime;
 use ursula_shard::BucketStreamId;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

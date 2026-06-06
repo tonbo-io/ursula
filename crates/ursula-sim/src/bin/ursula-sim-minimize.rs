@@ -950,15 +950,12 @@ fn shrink_schedule(
     }
 
     let (outcome, record, failure) = run_minimized_schedule(&current_schedule, target);
-    (
-        accepted,
-        MinimizedSchedule {
-            schedule: current_schedule,
-            outcome,
-            record,
-            failure,
-        },
-    )
+    (accepted, MinimizedSchedule {
+        schedule: current_schedule,
+        outcome,
+        record,
+        failure,
+    })
 }
 
 #[cfg(madsim)]
@@ -1001,15 +998,12 @@ fn shrink_cold_path_schedule(
     }
 
     let (outcome, record, failure) = run_minimized_schedule(&current_schedule, target);
-    (
-        accepted,
-        MinimizedSchedule {
-            schedule: current_schedule,
-            outcome,
-            record,
-            failure,
-        },
-    )
+    (accepted, MinimizedSchedule {
+        schedule: current_schedule,
+        outcome,
+        record,
+        failure,
+    })
 }
 
 #[cfg(madsim)]
@@ -1056,15 +1050,12 @@ fn shrink_raft_partition_schedule(
     }
 
     let (outcome, record, failure) = run_minimized_schedule(&current_schedule, target);
-    (
-        accepted,
-        MinimizedSchedule {
-            schedule: current_schedule,
-            outcome,
-            record,
-            failure,
-        },
-    )
+    (accepted, MinimizedSchedule {
+        schedule: current_schedule,
+        outcome,
+        record,
+        failure,
+    })
 }
 
 #[cfg(madsim)]
@@ -1094,15 +1085,12 @@ fn shrink_runtime_raft_network_schedule(
     }
 
     let (outcome, record, failure) = run_minimized_schedule(&current_schedule, target);
-    (
-        accepted,
-        MinimizedSchedule {
-            schedule: current_schedule,
-            outcome,
-            record,
-            failure,
-        },
-    )
+    (accepted, MinimizedSchedule {
+        schedule: current_schedule,
+        outcome,
+        record,
+        failure,
+    })
 }
 
 #[cfg(madsim)]
@@ -1132,15 +1120,12 @@ fn shrink_runtime_raft_snapshot_install_schedule(
     }
 
     let (outcome, record, failure) = run_minimized_schedule(&current_schedule, target);
-    (
-        accepted,
-        MinimizedSchedule {
-            schedule: current_schedule,
-            outcome,
-            record,
-            failure,
-        },
-    )
+    (accepted, MinimizedSchedule {
+        schedule: current_schedule,
+        outcome,
+        record,
+        failure,
+    })
 }
 
 #[cfg(madsim)]
@@ -1170,15 +1155,12 @@ fn shrink_http_producer_protocol_surface_schedule(
     }
 
     let (outcome, record, failure) = run_minimized_schedule(&current_schedule, target);
-    (
-        accepted,
-        MinimizedSchedule {
-            schedule: current_schedule,
-            outcome,
-            record,
-            failure,
-        },
-    )
+    (accepted, MinimizedSchedule {
+        schedule: current_schedule,
+        outcome,
+        record,
+        failure,
+    })
 }
 
 #[cfg(madsim)]
@@ -1208,15 +1190,12 @@ fn shrink_http_snapshot_protocol_surface_schedule(
     }
 
     let (outcome, record, failure) = run_minimized_schedule(&current_schedule, target);
-    (
-        accepted,
-        MinimizedSchedule {
-            schedule: current_schedule,
-            outcome,
-            record,
-            failure,
-        },
-    )
+    (accepted, MinimizedSchedule {
+        schedule: current_schedule,
+        outcome,
+        record,
+        failure,
+    })
 }
 
 #[cfg(madsim)]
@@ -1246,15 +1225,12 @@ fn shrink_http_live_protocol_surface_schedule(
     }
 
     let (outcome, record, failure) = run_minimized_schedule(&current_schedule, target);
-    (
-        accepted,
-        MinimizedSchedule {
-            schedule: current_schedule,
-            outcome,
-            record,
-            failure,
-        },
-    )
+    (accepted, MinimizedSchedule {
+        schedule: current_schedule,
+        outcome,
+        record,
+        failure,
+    })
 }
 
 #[cfg(madsim)]
@@ -1284,15 +1260,12 @@ fn shrink_http_live_limit_protocol_surface_schedule(
     }
 
     let (outcome, record, failure) = run_minimized_schedule(&current_schedule, target);
-    (
-        accepted,
-        MinimizedSchedule {
-            schedule: current_schedule,
-            outcome,
-            record,
-            failure,
-        },
-    )
+    (accepted, MinimizedSchedule {
+        schedule: current_schedule,
+        outcome,
+        record,
+        failure,
+    })
 }
 
 #[cfg(madsim)]
@@ -1322,15 +1295,12 @@ fn shrink_http_protocol_surface_randomized_schedule(
     }
 
     let (outcome, record, failure) = run_minimized_schedule(&current_schedule, target);
-    (
-        accepted,
-        MinimizedSchedule {
-            schedule: current_schedule,
-            outcome,
-            record,
-            failure,
-        },
-    )
+    (accepted, MinimizedSchedule {
+        schedule: current_schedule,
+        outcome,
+        record,
+        failure,
+    })
 }
 
 #[cfg(madsim)]

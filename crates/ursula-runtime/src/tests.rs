@@ -1,20 +1,32 @@
-use super::*;
-
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::{Notify, Semaphore, oneshot};
-use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardId, ShardPlacement};
-use ursula_stream::{
-    ExternalPayloadRef, ObjectPayloadRef, StreamReadSegment, StreamSnapshot, StreamStateMachine,
-};
+use tokio::sync::Notify;
+use tokio::sync::Semaphore;
+use tokio::sync::oneshot;
+use ursula_shard::BucketStreamId;
+use ursula_shard::CoreId;
+use ursula_shard::RaftGroupId;
+use ursula_shard::ShardId;
+use ursula_shard::ShardPlacement;
+use ursula_stream::ExternalPayloadRef;
+use ursula_stream::ObjectPayloadRef;
+use ursula_stream::StreamReadSegment;
+use ursula_stream::StreamSnapshot;
+use ursula_stream::StreamStateMachine;
 
-use crate::cold_store::{ColdReadCacheConfig, DEFAULT_CONTENT_TYPE};
-use crate::core_worker::{CoreWorker, ReadWatcher, ReadWatchers};
+use super::*;
+use crate::cold_store::ColdReadCacheConfig;
+use crate::cold_store::DEFAULT_CONTENT_TYPE;
+use crate::core_worker::CoreWorker;
+use crate::core_worker::ReadWatcher;
+use crate::core_worker::ReadWatchers;
 use crate::engine::wal::group_log_path;
 use crate::error::ErrorStatus;
 use crate::metrics::RuntimeMetricsInner;
@@ -107,13 +119,10 @@ fn stream_parts_returns_stream_fields_only() {
     assert_eq!(message, "wire stream message");
     assert_eq!(code, StreamErrorCode::ProducerSeqConflict);
     assert_eq!(next_offset, Some(11));
-    assert_eq!(
-        context,
-        &[StreamErrorContext::ProducerSeqConflict {
-            expected_seq: 10,
-            received_seq: 7,
-        }]
-    );
+    assert_eq!(context, &[StreamErrorContext::ProducerSeqConflict {
+        expected_seq: 10,
+        received_seq: 7,
+    }]);
 
     assert!(GroupEngineError::new("infra").stream_parts().is_none());
     assert!(
@@ -850,10 +859,10 @@ fn committed_write_batch_preserves_logical_command_responses() {
                         stream.clone(),
                         DEFAULT_CONTENT_TYPE,
                     )),
-                    GroupWriteCommand::from(AppendBatchRequest::new(
-                        stream.clone(),
-                        vec![Bytes::from_static(b"ab"), Bytes::from_static(b"cd")],
-                    )),
+                    GroupWriteCommand::from(AppendBatchRequest::new(stream.clone(), vec![
+                        Bytes::from_static(b"ab"),
+                        Bytes::from_static(b"cd"),
+                    ])),
                 ],
             },
             placement,
@@ -1031,10 +1040,11 @@ async fn append_batch_routes_once_and_applies_each_payload_on_owner_core() {
 
     create_stream(&runtime, &stream).await;
     let response = runtime
-        .append_batch(AppendBatchRequest::new(
-            stream.clone(),
-            vec![b"ab".to_vec(), b"c".to_vec(), b"def".to_vec()],
-        ))
+        .append_batch(AppendBatchRequest::new(stream.clone(), vec![
+            b"ab".to_vec(),
+            b"c".to_vec(),
+            b"def".to_vec(),
+        ]))
         .await
         .expect("append batch");
     assert_eq!(response.items.len(), 3);
@@ -1070,10 +1080,11 @@ async fn append_batch_reports_item_errors_without_stopping_later_payloads() {
     create_stream(&runtime, &stream).await;
 
     let response = runtime
-        .append_batch(AppendBatchRequest::new(
-            stream.clone(),
-            vec![b"a".to_vec(), Vec::new(), b"b".to_vec()],
-        ))
+        .append_batch(AppendBatchRequest::new(stream.clone(), vec![
+            b"a".to_vec(),
+            Vec::new(),
+            b"b".to_vec(),
+        ]))
         .await
         .expect("append batch");
     assert!(response.items[0].is_ok());
@@ -1290,13 +1301,10 @@ async fn snapshot_group_rejects_out_of_range_group_before_routing() {
         .snapshot_group(RaftGroupId(8))
         .await
         .expect_err("invalid group");
-    assert_eq!(
-        err,
-        RuntimeError::InvalidRaftGroup {
-            raft_group_id: RaftGroupId(8),
-            raft_group_count: 8,
-        }
-    );
+    assert_eq!(err, RuntimeError::InvalidRaftGroup {
+        raft_group_id: RaftGroupId(8),
+        raft_group_count: 8,
+    });
     assert_eq!(runtime.metrics().snapshot().routed_requests, 0);
 }
 
@@ -1320,13 +1328,10 @@ async fn install_group_snapshot_restores_group_state_and_append_counts() {
         .await
         .expect("snapshot group");
     assert_eq!(snapshot.group_commit_index, 3);
-    assert_eq!(
-        snapshot.stream_append_counts,
-        vec![StreamAppendCount {
-            stream_id: stream.clone(),
-            append_count: 2,
-        }]
-    );
+    assert_eq!(snapshot.stream_append_counts, vec![StreamAppendCount {
+        stream_id: stream.clone(),
+        append_count: 2,
+    }]);
 
     let target = runtime(2, 8);
     target
@@ -1423,21 +1428,18 @@ async fn install_group_snapshot_rejects_mismatched_placement_before_routing() {
         .install_group_snapshot(snapshot)
         .await
         .expect_err("mismatched placement rejected");
-    assert_eq!(
-        err,
-        RuntimeError::SnapshotPlacementMismatch {
-            expected: ShardPlacement {
-                core_id: CoreId(0),
-                shard_id: ShardId(0),
-                raft_group_id: RaftGroupId(0),
-            },
-            actual: ShardPlacement {
-                core_id: CoreId(1),
-                shard_id: ShardId(0),
-                raft_group_id: RaftGroupId(0),
-            },
-        }
-    );
+    assert_eq!(err, RuntimeError::SnapshotPlacementMismatch {
+        expected: ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: RaftGroupId(0),
+        },
+        actual: ShardPlacement {
+            core_id: CoreId(1),
+            shard_id: ShardId(0),
+            raft_group_id: RaftGroupId(0),
+        },
+    });
     assert_eq!(runtime.metrics().snapshot().routed_requests, 0);
 }
 
@@ -2204,10 +2206,12 @@ async fn cold_write_admission_allows_deduplicated_append_batch_retry_at_hot_limi
     let stream = BucketStreamId::new("benchcmp", "cold-admission-dedup-batch");
     create_stream(&runtime, &stream).await;
 
-    let mut first = AppendBatchRequest::new(
-        stream.clone(),
-        vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()],
-    );
+    let mut first = AppendBatchRequest::new(stream.clone(), vec![
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+    ]);
     first.producer = Some(producer("writer", 0, 0));
     runtime
         .append_batch(first)
@@ -2335,10 +2339,10 @@ async fn cold_write_admission_rejects_append_batch_without_partial_mutation() {
         .expect("append below limit");
 
     let err = runtime
-        .append_batch(AppendBatchRequest::new(
-            stream.clone(),
-            vec![b"d".to_vec(), b"e".to_vec()],
-        ))
+        .append_batch(AppendBatchRequest::new(stream.clone(), vec![
+            b"d".to_vec(),
+            b"e".to_vec(),
+        ]))
         .await
         .expect_err("batch should be backpressured");
     match err {
@@ -2426,13 +2430,10 @@ async fn flush_cold_group_once_selects_stream_inside_owner_group() {
         .expect("append");
 
     let flushed = runtime
-        .flush_cold_group_once(
-            group_id,
-            PlanGroupColdFlushRequest {
-                min_hot_bytes: 4,
-                max_flush_bytes: 4,
-            },
-        )
+        .flush_cold_group_once(group_id, PlanGroupColdFlushRequest {
+            min_hot_bytes: 4,
+            max_flush_bytes: 4,
+        })
         .await
         .expect("flush group")
         .expect("candidate flushed");
@@ -2706,14 +2707,11 @@ async fn live_read_waiter_limit_rejects_excess_waiters_on_owner_core() {
         })
         .await
         .expect_err("second waiter should hit owner-core limit");
-    assert_eq!(
-        err,
-        RuntimeError::LiveReadBackpressure {
-            core_id: CoreId(0),
-            current_waiters: 1,
-            limit: 1,
-        }
-    );
+    assert_eq!(err, RuntimeError::LiveReadBackpressure {
+        core_id: CoreId(0),
+        current_waiters: 1,
+        limit: 1,
+    });
     let snapshot = runtime.metrics().snapshot();
     assert_eq!(snapshot.live_read_waiters, 1);
     assert_eq!(snapshot.live_read_backpressure_events, 1);
@@ -2730,31 +2728,28 @@ fn cancel_read_watcher_removes_group_local_waiter() {
     let mut read_watchers = ReadWatchers::new();
     let (first_tx, _first_rx) = oneshot::channel();
     let (second_tx, _second_rx) = oneshot::channel();
-    read_watchers.insert(
-        stream.clone(),
-        vec![
-            ReadWatcher {
-                waiter_id: 1,
-                request: ReadStreamRequest {
-                    stream_id: stream.clone(),
-                    offset: 0,
-                    max_len: 16,
-                    now_ms: 0,
-                },
-                response_tx: first_tx,
+    read_watchers.insert(stream.clone(), vec![
+        ReadWatcher {
+            waiter_id: 1,
+            request: ReadStreamRequest {
+                stream_id: stream.clone(),
+                offset: 0,
+                max_len: 16,
+                now_ms: 0,
             },
-            ReadWatcher {
-                waiter_id: 2,
-                request: ReadStreamRequest {
-                    stream_id: stream.clone(),
-                    offset: 0,
-                    max_len: 16,
-                    now_ms: 0,
-                },
-                response_tx: second_tx,
+            response_tx: first_tx,
+        },
+        ReadWatcher {
+            waiter_id: 2,
+            request: ReadStreamRequest {
+                stream_id: stream.clone(),
+                offset: 0,
+                max_len: 16,
+                now_ms: 0,
             },
-        ],
-    );
+            response_tx: second_tx,
+        },
+    ]);
 
     let metrics = Arc::new(RuntimeMetricsInner::new(1, 1));
     metrics.record_read_watchers_added(CoreId(0), 2);
@@ -2803,30 +2798,24 @@ async fn notify_read_watchers_shares_identical_reads_across_watchers() {
     let mut read_watchers = ReadWatchers::new();
     let (first_tx, _first_rx) = oneshot::channel();
     let (second_tx, _second_rx) = oneshot::channel();
-    read_watchers.insert(
-        stream.clone(),
-        vec![
-            ReadWatcher {
-                waiter_id: 1,
-                request: request.clone(),
-                response_tx: first_tx,
-            },
-            ReadWatcher {
-                waiter_id: 2,
-                request,
-                response_tx: second_tx,
-            },
-        ],
-    );
+    read_watchers.insert(stream.clone(), vec![
+        ReadWatcher {
+            waiter_id: 1,
+            request: request.clone(),
+            response_tx: first_tx,
+        },
+        ReadWatcher {
+            waiter_id: 2,
+            request,
+            response_tx: second_tx,
+        },
+    ]);
 
     let metrics = Arc::new(RuntimeMetricsInner::new(1, 1));
     let mut engine = factory
-        .create(
-            placement,
-            GroupEngineMetrics {
-                inner: metrics.clone(),
-            },
-        )
+        .create(placement, GroupEngineMetrics {
+            inner: metrics.clone(),
+        })
         .await
         .expect("create engine");
     let notify = {
@@ -3378,14 +3367,11 @@ async fn group_engine_errors_include_group_context_and_do_not_record_success_met
         .await
         .expect_err("engine failure");
 
-    assert_eq!(
-        err,
-        RuntimeError::GroupEngine {
-            core_id: placement.core_id,
-            raft_group_id: placement.raft_group_id,
-            error: GroupEngineError::new("proposal rejected"),
-        }
-    );
+    assert_eq!(err, RuntimeError::GroupEngine {
+        core_id: placement.core_id,
+        raft_group_id: placement.raft_group_id,
+        error: GroupEngineError::new("proposal rejected"),
+    });
     assert_eq!(runtime.metrics().snapshot().accepted_appends, 0);
 }
 
@@ -3664,10 +3650,11 @@ async fn wal_group_engine_batches_append_records_and_recovers() {
         placement = runtime.locate(&stream);
         create_stream(&runtime, &stream).await;
         let response = runtime
-            .append_batch(AppendBatchRequest::new(
-                stream.clone(),
-                vec![b"ab".to_vec(), b"cd".to_vec(), b"ef".to_vec()],
-            ))
+            .append_batch(AppendBatchRequest::new(stream.clone(), vec![
+                b"ab".to_vec(),
+                b"cd".to_vec(),
+                b"ef".to_vec(),
+            ]))
             .await
             .expect("append batch");
         assert_eq!(response.items.len(), 3);
@@ -4448,7 +4435,7 @@ impl GroupEngine for RecordingEngine {
                 content_type: _,
                 payloads,
                 producer: _,
-                ..
+                now_ms: _,
             } = request;
             let mut items = Vec::with_capacity(payloads.len());
             for payload in payloads {

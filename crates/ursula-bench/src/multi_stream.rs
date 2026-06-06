@@ -1,20 +1,30 @@
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Result;
 use clap::Args;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::FuturesUnordered;
+use futures::stream::StreamExt;
 use hdrhistogram::Histogram;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-use crate::backend::{ApiStyle, Backend, Producer};
-use crate::common::{
-    Counts, LatencySummary, build_client, fill_payload, merge, new_histogram, record, summarize,
-};
+use crate::backend::ApiStyle;
+use crate::backend::Backend;
+use crate::backend::Producer;
+use crate::common::Counts;
+use crate::common::LatencySummary;
+use crate::common::build_client;
+use crate::common::fill_payload;
+use crate::common::merge;
+use crate::common::new_histogram;
+use crate::common::record;
+use crate::common::summarize;
 
 #[derive(Args, Debug, Clone)]
 pub struct MultiStreamArgs {

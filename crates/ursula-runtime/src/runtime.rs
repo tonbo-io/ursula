@@ -1,38 +1,80 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
-use crate::rt::time::Instant;
 use bytes::Bytes;
-use ursula_shard::{BucketStreamId, CoreId, RaftGroupId, ShardId, ShardPlacement, StaticShardMap};
-use ursula_stream::{ColdChunkRef, ColdFlushCandidate, ColdGcEntry, ColdGcTarget, StreamErrorCode};
-
-use crate::admission::{RaftUncommittedAdmission, RaftUncommittedBytesTracker};
-use crate::cold_index::cold_index_prefix;
-use crate::cold_store::{ColdStoreHandle, ColdStoreInfo, cold_chunk_prefix, new_cold_chunk_path};
-use crate::command::GroupSnapshot;
-use crate::core_worker::{CoreCommand, CoreMailbox, CoreWorker, WaitReadCancel};
-use crate::engine::in_memory::InMemoryGroupEngineFactory;
-use crate::engine::{GroupEngineError, GroupEngineFactory};
-use crate::error::{RuntimeError, map_fork_source_ref_error};
-use crate::metrics::{
-    COLD_FLUSH_GROUP_BATCH_MAX_CHUNKS, RuntimeMailboxSnapshot, RuntimeMetrics, RuntimeMetricsInner,
-    elapsed_ns, is_stale_cold_flush_candidate_error,
-};
-use crate::request::{
-    AckColdGcResponse, AppendBatchRequest, AppendBatchResponse, AppendExternalRequest,
-    AppendRequest, AppendResponse, BootstrapStreamRequest, BootstrapStreamResponse,
-    CloseStreamRequest, CloseStreamResponse, ColdWriteAdmission, CreateStreamExternalRequest,
-    CreateStreamRequest, CreateStreamResponse, DeleteSnapshotRequest, DeleteStreamRequest,
-    DeleteStreamResponse, FlushColdRequest, FlushColdResponse, ForkRefResponse, HeadStreamRequest,
-    HeadStreamResponse, PlanColdFlushRequest, PlanGroupColdFlushRequest, PublishSnapshotRequest,
-    PublishSnapshotResponse, ReadSnapshotRequest, ReadSnapshotResponse, ReadStreamRequest,
-    ReadStreamResponse,
-};
-use crate::rt::sync::{Semaphore, mpsc, oneshot};
-
 #[cfg(not(madsim))]
 use tokio::task::JoinSet;
+use ursula_shard::BucketStreamId;
+use ursula_shard::CoreId;
+use ursula_shard::RaftGroupId;
+use ursula_shard::ShardId;
+use ursula_shard::ShardPlacement;
+use ursula_shard::StaticShardMap;
+use ursula_stream::ColdChunkRef;
+use ursula_stream::ColdFlushCandidate;
+use ursula_stream::ColdGcEntry;
+use ursula_stream::ColdGcTarget;
+use ursula_stream::StreamErrorCode;
+
+use crate::admission::RaftUncommittedAdmission;
+use crate::admission::RaftUncommittedBytesTracker;
+use crate::cold_index::cold_index_prefix;
+use crate::cold_store::ColdStoreHandle;
+use crate::cold_store::ColdStoreInfo;
+use crate::cold_store::cold_chunk_prefix;
+use crate::cold_store::new_cold_chunk_path;
+use crate::command::GroupSnapshot;
+use crate::core_worker::CoreCommand;
+use crate::core_worker::CoreMailbox;
+use crate::core_worker::CoreWorker;
+use crate::core_worker::WaitReadCancel;
+use crate::engine::GroupEngineError;
+use crate::engine::GroupEngineFactory;
+use crate::engine::in_memory::InMemoryGroupEngineFactory;
+use crate::error::RuntimeError;
+use crate::error::map_fork_source_ref_error;
+use crate::metrics::COLD_FLUSH_GROUP_BATCH_MAX_CHUNKS;
+use crate::metrics::RuntimeMailboxSnapshot;
+use crate::metrics::RuntimeMetrics;
+use crate::metrics::RuntimeMetricsInner;
+use crate::metrics::elapsed_ns;
+use crate::metrics::is_stale_cold_flush_candidate_error;
+use crate::request::AckColdGcResponse;
+use crate::request::AppendBatchRequest;
+use crate::request::AppendBatchResponse;
+use crate::request::AppendExternalRequest;
+use crate::request::AppendRequest;
+use crate::request::AppendResponse;
+use crate::request::BootstrapStreamRequest;
+use crate::request::BootstrapStreamResponse;
+use crate::request::CloseStreamRequest;
+use crate::request::CloseStreamResponse;
+use crate::request::ColdWriteAdmission;
+use crate::request::CreateStreamExternalRequest;
+use crate::request::CreateStreamRequest;
+use crate::request::CreateStreamResponse;
+use crate::request::DeleteSnapshotRequest;
+use crate::request::DeleteStreamRequest;
+use crate::request::DeleteStreamResponse;
+use crate::request::FlushColdRequest;
+use crate::request::FlushColdResponse;
+use crate::request::ForkRefResponse;
+use crate::request::HeadStreamRequest;
+use crate::request::HeadStreamResponse;
+use crate::request::PlanColdFlushRequest;
+use crate::request::PlanGroupColdFlushRequest;
+use crate::request::PublishSnapshotRequest;
+use crate::request::PublishSnapshotResponse;
+use crate::request::ReadSnapshotRequest;
+use crate::request::ReadSnapshotResponse;
+use crate::request::ReadStreamRequest;
+use crate::request::ReadStreamResponse;
+use crate::rt::sync::Semaphore;
+use crate::rt::sync::mpsc;
+use crate::rt::sync::oneshot;
+use crate::rt::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -443,15 +485,12 @@ impl ShardRuntime {
         let waiter_id = self.next_waiter_id.fetch_add(1, Ordering::Relaxed);
         let stream_id = request.stream_id.clone();
         let (response_tx, response_rx) = oneshot::channel();
-        self.enqueue_core_command(
-            mailbox,
-            CoreCommand::WaitRead {
-                request,
-                placement,
-                waiter_id,
-                response_tx,
-            },
-        )
+        self.enqueue_core_command(mailbox, CoreCommand::WaitRead {
+            request,
+            placement,
+            waiter_id,
+            response_tx,
+        })
         .await?;
         let mut cancel = WaitReadCancel::new(mailbox.tx.clone(), stream_id, placement, waiter_id);
         let response = response_rx

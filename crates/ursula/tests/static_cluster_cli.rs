@@ -1,10 +1,16 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::net::TcpListener;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Child;
+use std::process::Command;
+use std::process::Stdio;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use ursula_runtime::ColdStore;
 
@@ -378,14 +384,10 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
         &format!("\"snapshot_index\":{snapshot_index}"),
     )
     .await;
-    wait_metrics_contains_all(
-        &client,
-        &peers[2].1,
-        &[
-            format!("\"snapshot_index\":{snapshot_index}"),
-            "\"learner_ids\":[3]".to_owned(),
-        ],
-    )
+    wait_metrics_contains_all(&client, &peers[2].1, &[
+        format!("\"snapshot_index\":{snapshot_index}"),
+        "\"learner_ids\":[3]".to_owned(),
+    ])
     .await;
 
     let late_payload = read_until_replicated(

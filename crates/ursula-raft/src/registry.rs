@@ -1,5 +1,3 @@
-use openraft::RaftNetworkV2;
-use openraft::rt::WatchReceiver;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -16,6 +14,7 @@ use openraft::BasicNode;
 use openraft::OptionalSend;
 use openraft::Raft;
 use openraft::RaftNetworkFactory;
+use openraft::RaftNetworkV2;
 use openraft::alias::LogIdOf;
 use openraft::alias::VoteOf;
 use openraft::error::NetworkError;
@@ -30,18 +29,24 @@ use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
+use openraft::rt::WatchReceiver;
 use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
 use openraft::type_config::alias::SnapshotOf as TypeConfigSnapshotOf;
-use ursula_runtime::{
-    GroupEngineError, GroupSnapshot, SharedSnapshotStore, SnapshotLocation, SnapshotPointer,
-    default_snapshot_store,
-};
+use ursula_runtime::GroupEngineError;
+use ursula_runtime::GroupSnapshot;
+use ursula_runtime::SharedSnapshotStore;
+use ursula_runtime::SnapshotLocation;
+use ursula_runtime::SnapshotPointer;
+use ursula_runtime::default_snapshot_store;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 
-use crate::state_machine::{RaftGroupStateMachine, SnapshotInstallCoordinator};
-use crate::types::{RaftGroupMetricsSnapshot, RaftLogProgressSnapshot, UrsulaRaftTypeConfig};
+use crate::state_machine::RaftGroupStateMachine;
+use crate::state_machine::SnapshotInstallCoordinator;
+use crate::types::RaftGroupMetricsSnapshot;
+use crate::types::RaftLogProgressSnapshot;
+use crate::types::UrsulaRaftTypeConfig;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SingleNodeRaftNetworkFactory;
@@ -1091,8 +1096,11 @@ pub(crate) fn log_progress_snapshot(
 
 #[cfg(test)]
 mod tests {
+    use ursula_runtime::SnapshotStore;
+    use ursula_runtime::SnapshotStoreError;
+    use ursula_runtime::SnapshotStoreFuture;
+
     use super::*;
-    use ursula_runtime::{SnapshotStore, SnapshotStoreError, SnapshotStoreFuture};
 
     #[derive(Debug)]
     struct StaticSnapshotStore {
@@ -1186,7 +1194,9 @@ mod tests {
 
     #[tokio::test]
     async fn prefetch_snapshot_for_install_installs_without_snapshot_store_download() {
-        use ursula_shard::{CoreId, RaftGroupId, ShardId};
+        use ursula_shard::CoreId;
+        use ursula_shard::RaftGroupId;
+        use ursula_shard::ShardId;
 
         let registry = RaftGroupHandleRegistry::default();
         registry.set_snapshot_store(Some(Arc::new(StaticSnapshotStore {

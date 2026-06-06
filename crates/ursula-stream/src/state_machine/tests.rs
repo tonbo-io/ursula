@@ -1,8 +1,10 @@
-use super::*;
-use crate::integrity::StreamIntegritySnapshot;
+use std::collections::HashMap;
+
 use proptest::collection::vec;
 use proptest::prelude::*;
-use std::collections::HashMap;
+
+use super::*;
+use crate::integrity::StreamIntegritySnapshot;
 
 fn stream(id: &str) -> BucketStreamId {
     BucketStreamId::new("benchcmp", id)
@@ -449,13 +451,10 @@ fn flush_cold_compacts_message_records_to_cold_prefix() {
         .iter()
         .find(|entry| entry.metadata.stream_id == stream("cold-records"))
         .expect("stream snapshot");
-    assert_eq!(
-        entry.message_records,
-        vec![StreamMessageRecord {
-            start_offset: 0,
-            end_offset: 6,
-        }]
-    );
+    assert_eq!(entry.message_records, vec![StreamMessageRecord {
+        start_offset: 0,
+        end_offset: 6,
+    }]);
     assert_eq!(
         machine.apply(StreamCommand::PublishSnapshot {
             stream_id: stream("cold-records"),
@@ -1583,23 +1582,20 @@ fn producer_append_batch_deduplicates_retries_without_partial_mutation() {
             0,
         )
         .expect("first batch");
-    assert_eq!(
-        first.items,
-        vec![
-            StreamBatchAppendItem {
-                offset: 0,
-                next_offset: 2,
-                closed: false,
-                deduplicated: false,
-            },
-            StreamBatchAppendItem {
-                offset: 2,
-                next_offset: 3,
-                closed: false,
-                deduplicated: false,
-            },
-        ]
-    );
+    assert_eq!(first.items, vec![
+        StreamBatchAppendItem {
+            offset: 0,
+            next_offset: 2,
+            closed: false,
+            deduplicated: false,
+        },
+        StreamBatchAppendItem {
+            offset: 2,
+            next_offset: 3,
+            closed: false,
+            deduplicated: false,
+        },
+    ]);
     assert!(!first.deduplicated);
 
     let duplicate = machine
@@ -1681,14 +1677,13 @@ fn producer_state_survives_snapshot_restore() {
 
     let snapshot = machine.snapshot();
     assert_eq!(snapshot.streams[0].producer_states.len(), 1);
-    assert_eq!(
-        snapshot.streams[0].producer_states[0].last_items,
-        vec![ProducerAppendRecord {
+    assert_eq!(snapshot.streams[0].producer_states[0].last_items, vec![
+        ProducerAppendRecord {
             start_offset: 0,
             next_offset: 1,
             closed: false,
-        }]
-    );
+        }
+    ]);
     let mut restored = StreamStateMachine::restore(snapshot).expect("restore snapshot");
 
     assert!(matches!(
@@ -2161,13 +2156,10 @@ fn publish_snapshot_advances_retention_on_message_boundary() {
         bootstrap.snapshot.as_ref().map(|snapshot| snapshot.offset),
         Some(3)
     );
-    assert_eq!(
-        bootstrap.updates,
-        vec![StreamMessageRecord {
-            start_offset: 3,
-            end_offset: 5,
-        }]
-    );
+    assert_eq!(bootstrap.updates, vec![StreamMessageRecord {
+        start_offset: 3,
+        end_offset: 5,
+    }]);
     let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
     assert_eq!(
         restored

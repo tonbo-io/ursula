@@ -5,7 +5,8 @@ mod fanout;
 mod multi_stream;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::Parser;
+use clap::Subcommand;
 
 #[derive(Parser, Debug)]
 #[command(

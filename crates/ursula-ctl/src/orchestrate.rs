@@ -1,12 +1,18 @@
 use std::collections::BTreeSet;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use tokio::process::Command;
 
-use crate::metrics::{ClusterSnapshot, MetricsClient};
-use crate::plan::{check_readiness, plan_drain};
+use crate::metrics::ClusterSnapshot;
+use crate::metrics::MetricsClient;
+use crate::plan::check_readiness;
+use crate::plan::plan_drain;
 use crate::provider::NodeInfo;
 
 #[derive(Debug, Clone)]
@@ -111,12 +117,9 @@ pub async fn run_restart(
                     "aborting rollout: target_node_id={} reason={reason}",
                     target.id
                 );
-                report.per_node.push((
-                    target.id,
-                    RestartOutcome::Aborted {
-                        reason: reason.clone(),
-                    },
-                ));
+                report.per_node.push((target.id, RestartOutcome::Aborted {
+                    reason: reason.clone(),
+                }));
                 return Ok(report);
             }
             Ok(o) => {
@@ -499,7 +502,9 @@ fn render_template(template: &str, node: &NodeInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::{ClusterSnapshot, NodeMetricsView, RaftGroupView};
+    use crate::metrics::ClusterSnapshot;
+    use crate::metrics::NodeMetricsView;
+    use crate::metrics::RaftGroupView;
 
     fn n(id: u64, host: &str) -> NodeInfo {
         NodeInfo {

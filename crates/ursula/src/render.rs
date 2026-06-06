@@ -1,29 +1,51 @@
 use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
+use std::hash::Hasher;
 
 use axum::body::Bytes;
 use axum::http::StatusCode;
-use axum::http::header::{
-    CACHE_CONTROL, CONTENT_TYPE, ETAG, HOST, HeaderMap, HeaderValue, IF_NONE_MATCH, LOCATION,
-};
-use axum::response::{IntoResponse, Response};
+use axum::http::header::CACHE_CONTROL;
+use axum::http::header::CONTENT_TYPE;
+use axum::http::header::ETAG;
+use axum::http::header::HOST;
+use axum::http::header::HeaderMap;
+use axum::http::header::HeaderValue;
+use axum::http::header::IF_NONE_MATCH;
+use axum::http::header::LOCATION;
+use axum::response::IntoResponse;
+use axum::response::Response;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use chrono::{DateTime, SecondsFormat, Utc};
-use ursula_raft::{RaftGroupMetricsSnapshot, RaftLogProgressSnapshot};
-use ursula_runtime::{
-    AppendResponse, BootstrapStreamResponse, ColdStoreInfo, ProducerRequest, ReadSnapshotResponse,
-    ReadStreamResponse, RuntimeError, RuntimeMailboxSnapshot, RuntimeMetricsSnapshot,
-    StreamErrorCode, StreamErrorContext,
-};
+use chrono::DateTime;
+use chrono::SecondsFormat;
+use chrono::Utc;
+use ursula_raft::RaftGroupMetricsSnapshot;
+use ursula_raft::RaftLogProgressSnapshot;
+use ursula_runtime::AppendResponse;
+use ursula_runtime::BootstrapStreamResponse;
+use ursula_runtime::ColdStoreInfo;
+use ursula_runtime::ProducerRequest;
+use ursula_runtime::ReadSnapshotResponse;
+use ursula_runtime::ReadStreamResponse;
+use ursula_runtime::RuntimeError;
+use ursula_runtime::RuntimeMailboxSnapshot;
+use ursula_runtime::RuntimeMetricsSnapshot;
+use ursula_runtime::StreamErrorCode;
+use ursula_runtime::StreamErrorContext;
 use ursula_shard::BucketStreamId;
 
-use crate::{
-    HEADER_CROSS_ORIGIN_RESOURCE_POLICY, HEADER_PRODUCER_EPOCH, HEADER_PRODUCER_SEQ,
-    HEADER_STREAM_CLOSED, HEADER_STREAM_CURSOR, HEADER_STREAM_EXPIRES_AT,
-    HEADER_STREAM_NEXT_OFFSET, HEADER_STREAM_SNAPSHOT_OFFSET, HEADER_STREAM_TTL,
-    HEADER_STREAM_UP_TO_DATE, HEADER_X_CONTENT_TYPE_OPTIONS, HttpMetricsSnapshot,
-};
+use crate::HEADER_CROSS_ORIGIN_RESOURCE_POLICY;
+use crate::HEADER_PRODUCER_EPOCH;
+use crate::HEADER_PRODUCER_SEQ;
+use crate::HEADER_STREAM_CLOSED;
+use crate::HEADER_STREAM_CURSOR;
+use crate::HEADER_STREAM_EXPIRES_AT;
+use crate::HEADER_STREAM_NEXT_OFFSET;
+use crate::HEADER_STREAM_SNAPSHOT_OFFSET;
+use crate::HEADER_STREAM_TTL;
+use crate::HEADER_STREAM_UP_TO_DATE;
+use crate::HEADER_X_CONTENT_TYPE_OPTIONS;
+use crate::HttpMetricsSnapshot;
 
 pub(crate) fn runtime_error_status(err: &RuntimeError) -> StatusCode {
     match err {
