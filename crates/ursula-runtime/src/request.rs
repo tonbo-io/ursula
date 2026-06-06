@@ -143,6 +143,7 @@ pub enum GroupReadStreamBody {
     #[cfg(test)]
     Blocking {
         entered: Arc<crate::rt::sync::Notify>,
+        materialized: Arc<crate::rt::sync::Notify>,
         release: Arc<crate::rt::sync::Notify>,
         payload: Vec<u8>,
     },
@@ -214,10 +215,12 @@ impl GroupReadStreamParts {
             #[cfg(test)]
             GroupReadStreamBody::Blocking {
                 entered,
+                materialized,
                 release,
                 payload,
             } => {
                 entered.notify_one();
+                materialized.notify_one();
                 release.notified().await;
                 payload.clone()
             }

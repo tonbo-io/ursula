@@ -3304,7 +3304,7 @@ async fn read_materialization_is_bounded_without_blocking_group_actor() {
     });
     tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        factory.entered.notified(),
+        factory.materialized.notified(),
     )
     .await
     .expect("first materialization acquired the only permit");
@@ -3343,7 +3343,7 @@ async fn read_materialization_is_bounded_without_blocking_group_actor() {
     assert_eq!(first.payload, b"ready");
     tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        factory.entered.notified(),
+        factory.materialized.notified(),
     )
     .await
     .expect("second materialization acquired permit after first released it");
@@ -4035,6 +4035,7 @@ struct RecordingEngine {
 #[derive(Clone)]
 struct BlockingReadFactory {
     entered: Arc<Notify>,
+    materialized: Arc<Notify>,
     release: Arc<Notify>,
     read_count: Arc<AtomicU64>,
     block_parts: bool,
@@ -4044,6 +4045,7 @@ impl Default for BlockingReadFactory {
     fn default() -> Self {
         Self {
             entered: Arc::new(Notify::new()),
+            materialized: Arc::new(Notify::new()),
             release: Arc::new(Notify::new()),
             read_count: Arc::new(AtomicU64::new(0)),
             block_parts: false,
@@ -4071,6 +4073,7 @@ impl GroupEngineFactory for BlockingReadFactory {
                 inner: InMemoryGroupEngine::default(),
                 placement,
                 entered: self.entered.clone(),
+                materialized: self.materialized.clone(),
                 release: self.release.clone(),
                 read_count: self.read_count.clone(),
                 block_parts: self.block_parts,
@@ -4084,6 +4087,7 @@ struct BlockingReadEngine {
     inner: InMemoryGroupEngine,
     placement: ShardPlacement,
     entered: Arc<Notify>,
+    materialized: Arc<Notify>,
     release: Arc<Notify>,
     read_count: Arc<AtomicU64>,
     block_parts: bool,
@@ -4153,6 +4157,7 @@ impl GroupEngine for BlockingReadEngine {
                     closed: false,
                     body: GroupReadStreamBody::Blocking {
                         entered: self.entered.clone(),
+                        materialized: self.materialized.clone(),
                         release: self.release.clone(),
                         payload: b"ready".to_vec(),
                     },
