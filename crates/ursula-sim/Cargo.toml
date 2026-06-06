@@ -14,7 +14,7 @@ openraft = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+ursula-observability = { workspace = true }
 ursula-raft = { workspace = true }
 ursula-runtime = { workspace = true }
 ursula-shard = { workspace = true }

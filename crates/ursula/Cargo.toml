@@ -10,6 +10,10 @@ readme.workspace = true
 description = "Ursula durable-stream server: thread-per-core, multi-Raft, HTTP front door."
 
 [features]
+default = ["release-max-info"]
+# Compile out trace!/debug! in release builds to keep the hot path free. Drop
+# it (`--no-default-features --features tokio-console`) when using tokio-console.
+release-max-info = ["ursula-observability/release-max-info"]
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]
 
 [dependencies]
@@ -28,7 +32,7 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 tonic = { workspace = true, features = ["transport"] }
 tower = { workspace = true, features = ["util", "limit", "load-shed"] }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+ursula-observability = { workspace = true, features = ["otlp"] }
 ursula-raft = { workspace = true }
 ursula-runtime = { workspace = true }
 ursula-shard = { workspace = true }

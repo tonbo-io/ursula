@@ -32,10 +32,12 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // tokio-console, when active, owns the global subscriber; otherwise install
+    // the shared fmt + optional OTLP subscriber. Hold the guard for the whole
+    // process so buffered spans are flushed on shutdown.
     let tokio_console = init_tokio_console_if_enabled();
-    if !tokio_console.installed() {
-        init_tracing();
-    }
+    let _telemetry = (!tokio_console.installed())
+        .then(|| ursula_observability::init(ursula_observability::InitOptions::new("ursula")));
     tokio_console.warn_if_needed();
 
     let raw = RawArgs::parse();
@@ -512,19 +514,6 @@ fn init_tokio_console_if_enabled() -> TokioConsoleInit {
     {
         TokioConsoleInit::MissingFeature
     }
-}
-
-/// Install a stderr tracing subscriber filtered by `RUST_LOG` (default `info`).
-/// `try_init` is a no-op if a global subscriber was already installed.
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_target(true)
-        .try_init();
 }
 
 // CLI argument schema for clap derive.

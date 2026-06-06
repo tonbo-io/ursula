@@ -1,0 +1,36 @@
+[package]
+name = "ursula-observability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Shared tracing/OpenTelemetry initialization for Ursula binaries."
+
+[features]
+# Compile out `trace!`/`debug!` in release builds so the hot read/write path
+# stays free even if diagnostics are added later. Not compatible with
+# tokio-console, which needs tokio's TRACE-level instrumentation; build the
+# server with `--no-default-features --features tokio-console` in that case.
+release-max-info = ["tracing/release_max_level_info"]
+# Export spans to an OTLP collector. Enabled by the server binary; the CLI
+# tools stay fmt-only.
+otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+
+[dependencies]
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[lints.clippy]
+wildcard_imports = "deny"
