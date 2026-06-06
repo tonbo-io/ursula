@@ -471,6 +471,7 @@ impl ColdStore {
         Ok(u64::try_from(payload.len()).expect("payload len fits u64"))
     }
 
+    #[tracing::instrument(name = "cold.read_index", level = "debug", skip_all)]
     pub(crate) async fn read_cold_index_page(&self, path: &str) -> io::Result<Option<Vec<u8>>> {
         if path.trim().is_empty() {
             return Err(io::Error::new(
@@ -588,6 +589,17 @@ impl ColdStore {
             .await
     }
 
+    #[tracing::instrument(
+        name = "cold.read_chunk",
+        level = "debug",
+        skip_all,
+        fields(
+            start_offset = object.start_offset,
+            end_offset = object.end_offset,
+            object_size = object.object_size,
+            len = len,
+        ),
+    )]
     async fn read_object_range_inner(
         &self,
         stream_id: Option<&BucketStreamId>,

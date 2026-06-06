@@ -1250,6 +1250,18 @@ impl CoreWorker {
         response
     }
 
+    #[tracing::instrument(
+        name = "runtime.cold_flush",
+        skip_all,
+        fields(
+            group = placement.raft_group_id.0,
+            bucket = %request.stream_id.bucket_id,
+            stream = %request.stream_id.stream_id,
+            start_offset = request.chunk.start_offset,
+            end_offset = request.chunk.end_offset,
+            bytes = request.chunk.object_size,
+        ),
+    )]
     pub(crate) async fn flush_cold(
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,
