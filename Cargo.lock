@@ -3580,6 +3580,7 @@ dependencies = [
  "madsim",
  "mimalloc",
  "openraft",
+ "opentelemetry",
  "reqwest",
  "serde",
  "serde_json",

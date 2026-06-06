@@ -7,6 +7,7 @@
 //! - [`bootstrap`]: env-driven `spawn_*_runtime` constructors and cold-flush worker.
 
 mod bootstrap;
+mod otel_metrics;
 mod http_time {
     #[cfg(madsim)]
     pub use madsim::time::timeout;
@@ -214,6 +215,13 @@ pub struct HttpState {
 }
 
 impl HttpState {
+    /// Bridge the runtime's metrics to the global OTLP meter (export-time
+    /// observable instruments; no hot-path cost). Inert when no OTLP meter
+    /// provider is installed.
+    pub fn register_otel_metrics(&self) {
+        otel_metrics::register(&self.runtime.metrics());
+    }
+
     pub fn new(runtime: ShardRuntime) -> Self {
         Self {
             runtime,

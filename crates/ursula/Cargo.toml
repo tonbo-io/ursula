@@ -25,6 +25,7 @@ console-subscriber = { workspace = true, optional = true }
 futures-util = { workspace = true }
 mimalloc = { workspace = true }
 openraft = { workspace = true }
+opentelemetry = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -50,6 +50,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         init_local_runtime_state(&args)?
     };
+    // Bridge runtime metrics to OTLP (inert unless export is configured).
+    state.register_otel_metrics();
 
     serve(state, &args).await
 }
