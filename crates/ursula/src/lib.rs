@@ -1658,6 +1658,11 @@ pub(crate) async fn append_stream_v1(
     append_stream_by_id(state, request_target(&uri), stream_id, headers, body).await
 }
 
+#[tracing::instrument(
+    name = "http.append",
+    skip_all,
+    fields(bucket = %stream_id.bucket_id, stream = %stream_id.stream_id),
+)]
 pub(crate) async fn append_stream_by_id(
     state: HttpState,
     request_target: String,
@@ -1863,6 +1868,11 @@ pub(crate) async fn head_stream_v1(
     head_stream_by_id(state, request_target(&uri), stream_id).await
 }
 
+#[tracing::instrument(
+    name = "http.head",
+    skip_all,
+    fields(bucket = %stream_id.bucket_id, stream = %stream_id.stream_id),
+)]
 pub(crate) async fn head_stream_by_id(
     state: HttpState,
     request_target: String,
@@ -1965,6 +1975,11 @@ pub(crate) async fn read_stream_v1(
     read_stream_by_id(state, request_target(&uri), stream_id, headers, raw_query).await
 }
 
+#[tracing::instrument(
+    name = "http.read",
+    skip_all,
+    fields(bucket = %stream_id.bucket_id, stream = %stream_id.stream_id),
+)]
 pub(crate) async fn read_stream_by_id(
     state: HttpState,
     request_target: String,
