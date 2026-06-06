@@ -1,0 +1,78 @@
+---
+title: Observability
+---
+
+Ursula emits OpenTelemetry traces and metrics over OTLP, and keeps a built-in
+JSON metrics endpoint for quick inspection. Telemetry export is **off by
+default**: with no collector configured the server runs exactly as before and
+the hot read/write path pays nothing.
+
+## Enabling OTLP export
+
+Set the standard OpenTelemetry environment variables before starting `ursula`:
+
+```bash
+# Send traces and metrics to a collector (Tempo, Jaeger, the OTel Collector, …).
+export OTEL_EXPORTER_OTLP_ENDPOINT="http://otel-collector:4318"
+
+# Optional: head-sampling ratio for new root traces (0.0–1.0, default 1.0).
+export OTEL_TRACES_SAMPLER_ARG="0.1"
+
+ursula --listen 0.0.0.0:8080 # …
+```
+
+The exporter uses OTLP over HTTP/protobuf (port `4318`), reusing the server's
+HTTP stack rather than opening a second gRPC tree alongside Raft. When the
+endpoint is unset, the process stays on the stderr `fmt` logger driven by
+`RUST_LOG` (default `info`).
+
+Buffered spans and a final metrics reading are flushed on a clean shutdown.
+
+## Traces
+
+A single request produces one boundary span (`http.append`, `http.read`, or
+`http.head`) tagged with `bucket` and `stream` — never the payload. That span
+is propagated across the internal actor mailboxes, so on-core work
+(`core.append`, `core.read`, …) nests underneath it. When a follower forwards a
+read to the leader, the W3C `traceparent` rides the Raft gRPC request, so the
+follower and leader appear in the **same trace** end to end.
+
+Trace context travels only in gRPC transport metadata; it is never written to
+the Raft log, so state-machine determinism and replay are unaffected.
+
+### Sampling and the hot path
+
+Request-boundary spans are `info` level so they remain available in release
+builds when export is on. Very hot in-memory reads should stay cheap, so
+diagnostic spans below the boundary are `debug`/`trace` level and are compiled
+out of release builds (`release-max-info`, on by default) — measured cost:
+
+| Operation                                   | Cost    |
+| ------------------------------------------- | ------- |
+| `info` boundary span (export off, fmt only) | ~285 ns |
+| `debug` span filtered at `info`             | ~1 ns   |
+| cross-mailbox context capture               | ~5 ns   |
+
+For high-throughput deployments, lower `OTEL_TRACES_SAMPLER_ARG` to bound
+export volume.
+
+> `tokio-console` needs tokio's `TRACE`-level instrumentation, which
+> `release-max-info` compiles out. Build with
+> `--no-default-features --features tokio-console` when using it.
+
+## Metrics
+
+Two surfaces expose the same counters:
+
+- **OTLP** — when an endpoint is configured, runtime metrics are exported
+  periodically as OpenTelemetry instruments (`ursula.appends.accepted`,
+  `ursula.mutations.applied`, `ursula.raft_apply.ns`, `ursula.wal.records`,
+  `ursula.group_mailbox.depth`, …), ready for Prometheus/Grafana via a
+  collector.
+- **JSON** — `GET /__ursula/metrics` returns the full per-core/per-group
+  snapshot for quick inspection and is what `ursulactl status` reads.
+
+Metrics are gathered on the hot path with lock-free per-core counters. The OTLP
+layer is an *export-time bridge*: it reads a snapshot at the collection
+interval rather than calling the metrics SDK per record, so enabling export
+adds nothing to the append/read path.

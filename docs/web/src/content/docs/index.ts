@@ -74,7 +74,8 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   // Operate - day-2 entrypoints. `ursulactl` is the first one to reach for.
   cli: { group: "Operate", order: 1, title: "ursulactl" },
   operations: { group: "Operate", order: 2 },
-  troubleshooting: { group: "Operate", order: 3 },
+  observability: { group: "Operate", order: 3 },
+  troubleshooting: { group: "Operate", order: 4 },
 
   // Architecture - internals for users who want to dig deeper.
   "architecture/overview": { group: "Architecture", order: 1 },
