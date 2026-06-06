@@ -26,7 +26,9 @@ HTTP stack rather than opening a second gRPC tree alongside Raft. When the
 endpoint is unset, the process stays on the stderr `fmt` logger driven by
 `RUST_LOG` (default `info`).
 
-Buffered spans and a final metrics reading are flushed on a clean shutdown.
+Spans batch-export continuously and metrics export on a fixed interval
+(`OTEL_METRIC_EXPORT_INTERVAL`, milliseconds). A final flush on clean shutdown
+is only a backstop — don't rely on it to observe data.
 
 ## Traces
 
@@ -42,10 +44,11 @@ the Raft log, so state-machine determinism and replay are unaffected.
 
 ### Sampling and the hot path
 
-Request-boundary spans are `info` level so they remain available in release
-builds when export is on. Very hot in-memory reads should stay cheap, so
-diagnostic spans below the boundary are `debug`/`trace` level and are compiled
-out of release builds (`release-max-info`, on by default) — measured cost:
+Request-boundary spans (`http.*`) are `info` level, so production traces always
+carry one span per request. The on-core spans below them (`core.append`,
+`core.read`, …) are `debug` level: filtered out at the default `info` and
+compiled out of release builds entirely (`release-max-info`, on by default), so
+the hot read/write path pays nothing for them. Measured cost:
 
 | Operation                                   | Cost    |
 | ------------------------------------------- | ------- |
@@ -55,6 +58,22 @@ out of release builds (`release-max-info`, on by default) — measured cost:
 
 For high-throughput deployments, lower `OTEL_TRACES_SAMPLER_ARG` to bound
 export volume.
+
+### Seeing on-core detail
+
+The `core.*` spans only materialize in a build without `release-max-info` (e.g.
+a debug build), and only when their target is enabled. Use a **crate-scoped**
+filter — never a global `debug`:
+
+```bash
+# Good: only Ursula's own crates emit debug spans.
+export RUST_LOG="info,ursula_runtime=debug,ursula_raft=debug"
+```
+
+A global `RUST_LOG=debug` turns on debug spans/logs from OpenRaft, the
+OpenTelemetry SDK, reqwest, and every other dependency, which floods the
+collector and bloats the OTLP payload. Scope the filter to the `ursula_*`
+crates instead.
 
 > `tokio-console` needs tokio's `TRACE`-level instrumentation, which
 > `release-max-info` compiles out. Build with
@@ -76,3 +95,10 @@ Metrics are gathered on the hot path with lock-free per-core counters. The OTLP
 layer is an *export-time bridge*: it reads a snapshot at the collection
 interval rather than calling the metrics SDK per record, so enabling export
 adds nothing to the append/read path.
+
+The OTLP collection interval defaults to 60s. For a quick check, shorten it so
+readings arrive without waiting (and without relying on the shutdown flush):
+
+```bash
+export OTEL_METRIC_EXPORT_INTERVAL=1000  # milliseconds
+```
