@@ -1,7 +1,6 @@
 ---
 title: Configure cold storage
 sidebarTitle: Configure S3
-description: Configure Ursula cold storage with S3-compatible object storage.
 ---
 
 Ursula keeps recent data in an in-memory hot ring on every replica and flushes older segments and snapshot blobs to a cold backend. Multi-node clusters should use S3 or an S3-compatible object store so every replica can read chunks flushed by any leader.

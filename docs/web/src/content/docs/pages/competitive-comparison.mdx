@@ -1,6 +1,5 @@
 ---
 title: Comparisons
-description: How Ursula relates to other stream and storage systems for application-facing timelines.
 ---
 
 Ursula's niche: distributed Durable Streams over HTTP, one timeline per application resource, served from a thread-per-core multi-Raft cluster. The frame that drove the design: every other server we evaluated forces you to give up one of four things this primitive deserves to keep: open-source self-hosting, low write latency, plain S3 economics, or quorum-replicated durability. Each section below maps a competitor against that four-way frame.

@@ -1,7 +1,6 @@
 ---
 title: Length-Prefixed Framing
 sidebarTitle: Len-Prefixed Framing
-description: A simple convention for delimiting messages inside raw byte streams.
 ---
 
 Streams are raw byte sequences. The protocol does not impose message boundaries. Every append and every read returns whatever bytes are in flight, possibly mid-record. For streams carrying many small messages (CRDT operations, agent events), Ursula recommends a simple framing convention:

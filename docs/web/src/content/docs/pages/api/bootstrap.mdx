@@ -1,7 +1,6 @@
 ---
 title: Bootstrap
 api: "GET /{bucket}/{stream}/bootstrap"
-description: Recover full stream state from snapshot plus retained updates in a single request.
 ---
 
 Returns the stream's latest snapshot (if any) plus all retained updates after the snapshot offset, packed as a `multipart/mixed` response. This is the recommended way to initialize a client that needs the complete current state of a stream.

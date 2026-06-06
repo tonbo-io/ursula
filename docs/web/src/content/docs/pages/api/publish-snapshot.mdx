@@ -1,7 +1,6 @@
 ---
 title: Publish snapshot
 api: "PUT /{bucket}/{stream}/snapshot/{offset}"
-description: Upload a snapshot blob at a specific stream offset.
 ---
 
 Publishes a new snapshot blob at the given offset. The snapshot replaces any previously published snapshot and enables cold storage cleanup of data before this offset.
