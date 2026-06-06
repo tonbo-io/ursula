@@ -590,9 +590,11 @@ impl GrpcRaftNetwork {
 
     pub(crate) fn apply_rpc_timeout<T>(&self, request: &mut tonic::Request<T>, option: RPCOption) {
         request.set_timeout(option.hard_ttl());
-        // Carry the originating request's trace context to the peer. No-op when
-        // no OpenTelemetry propagator is installed.
-        crate::telemetry::inject_current_context(request.metadata_mut());
+        // Note: trace context is intentionally NOT injected here. These are
+        // OpenRaft consensus RPCs (append_entries/vote/snapshot) driven by the
+        // replication loop, decoupled from any client request, so there is no
+        // request span to propagate. Request-synchronous leader forwarding
+        // injects its own context (see `crate::forward`).
     }
 
     pub(crate) fn map_tonic_status(

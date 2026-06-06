@@ -846,6 +846,7 @@ impl CoreWorker {
 
     #[tracing::instrument(
         name = "core.read",
+        level = "debug",
         skip_all,
         fields(
             group = placement.raft_group_id.0,
@@ -1508,6 +1509,7 @@ impl CoreWorker {
 
     #[tracing::instrument(
         name = "core.append",
+        level = "debug",
         skip_all,
         fields(
             group = placement.raft_group_id.0,
@@ -1570,6 +1572,7 @@ impl CoreWorker {
 
     #[tracing::instrument(
         name = "core.append_external",
+        level = "debug",
         skip_all,
         fields(
             group = placement.raft_group_id.0,
@@ -1637,11 +1640,8 @@ impl CoreWorker {
         (requests, pending)
     }
 
-    #[tracing::instrument(
-        name = "core.append_batch",
-        skip_all,
-        fields(group = runtime.placement.raft_group_id.0, batch = requests.len()),
-    )]
+    // The `core.append_batch` span is created by the caller so it can link
+    // (follows_from) every coalesced request, not just the triggering one.
     pub(crate) async fn apply_prepared_append_batch_requests(
         group: &mut Box<dyn GroupEngine>,
         runtime: AppendBatchRuntime,
