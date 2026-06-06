@@ -133,6 +133,24 @@ mod otlp {
     /// stay fmt-only so the default deployment pays nothing for telemetry.
     const ENDPOINT_ENV: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
 
+    /// Standard OTel head-sampling ratio (`0.0..=1.0`). Defaults to 1.0 (sample
+    /// every trace) when unset or unparseable.
+    const SAMPLE_RATIO_ENV: &str = "OTEL_TRACES_SAMPLER_ARG";
+
+    /// Head-based parent sampler: honor the upstream decision, otherwise sample
+    /// a configured fraction of new root traces. Keeps span-export volume (and
+    /// thus the sensitive hot-read path's export cost) under operator control.
+    fn parent_based_sampler() -> opentelemetry_sdk::trace::Sampler {
+        let ratio = std::env::var(SAMPLE_RATIO_ENV)
+            .ok()
+            .and_then(|raw| raw.parse::<f64>().ok())
+            .map(|ratio| ratio.clamp(0.0, 1.0))
+            .unwrap_or(1.0);
+        opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(
+            opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(ratio),
+        ))
+    }
+
     type Layer<S> = OpenTelemetryLayer<S, opentelemetry_sdk::trace::Tracer>;
 
     /// Build the OpenTelemetry tracing layer, or return `None` when no endpoint
@@ -174,6 +192,7 @@ mod otlp {
         let provider = SdkTracerProvider::builder()
             .with_batch_exporter(exporter)
             .with_resource(resource)
+            .with_sampler(parent_based_sampler())
             .build();
 
         let tracer = provider.tracer("ursula");

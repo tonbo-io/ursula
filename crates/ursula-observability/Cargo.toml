@@ -32,5 +32,12 @@ opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "span_overhead"
+harness = false
+
 [lints.clippy]
 wildcard_imports = "deny"
