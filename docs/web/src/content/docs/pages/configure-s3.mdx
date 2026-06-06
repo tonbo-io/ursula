@@ -1,7 +1,7 @@
 ---
 title: Configure cold storage
 sidebarTitle: Configure S3
-description: Configure Ursula cold storage with S3-compatible object storage or a local filesystem.
+description: Configure Ursula cold storage with S3-compatible object storage.
 ---
 
 Ursula keeps recent data in an in-memory hot ring on every replica and flushes older segments and snapshot blobs to a cold backend. Multi-node clusters should use S3 or an S3-compatible object store so every replica can read chunks flushed by any leader.
@@ -31,15 +31,6 @@ For S3-compatible stores (MinIO, R2, etc.):
 export URSULA_COLD_S3_ENDPOINT=http://127.0.0.1:9000
 ```
 
-## Filesystem backend
-
-For single-node smoke testing only - multi-node clusters cannot share filesystem chunks across hosts:
-
-```bash
-export URSULA_COLD_BACKEND=fs
-export URSULA_COLD_ROOT=./data/cold   # optional; defaults to data/cold
-```
-
 ## Flush tuning
 
 The cold-flush worker runs in the background and decides when to move hot segments to the cold backend. Defaults are conservative. Tune them under load.
@@ -47,12 +38,13 @@ The cold-flush worker runs in the background and decides when to move hot segmen
 | Variable | Default | Meaning |
 | -------- | ------- | ------- |
 | `URSULA_COLD_FLUSH_INTERVAL_MS` | `1000` | Background tick interval |
-| `URSULA_COLD_FLUSH_MIN_HOT_BYTES` | `8 MiB` | Don't flush a group whose hot ring is below this size |
-| `URSULA_COLD_FLUSH_MAX_BYTES` | `8 MiB` | Max bytes flushed per group per tick |
+| `URSULA_COLD_FLUSH_BYTES` | `8 MiB` | Target bytes flushed per group per tick |
 | `URSULA_COLD_FLUSH_MAX_CONCURRENCY` | `4` | Parallel cold writes in flight |
 | `URSULA_COLD_MAX_HOT_BYTES_PER_GROUP` | `64 MiB` | Backpressure ceiling: appends to a group above this size return `503` until cold flush catches up |
 
 A typical benchmark profile drops the interval to `200ms`, raises concurrency to `32`, and bumps the per-group ceiling.
+
+Advanced deployments can still split the flush threshold and batch size with `URSULA_COLD_FLUSH_MIN_HOT_BYTES` and `URSULA_COLD_FLUSH_MAX_BYTES`, but the single `URSULA_COLD_FLUSH_BYTES` knob is the normal path.
 
 ## Operating notes
 

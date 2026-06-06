@@ -364,8 +364,9 @@ pub fn spawn_cold_flush_worker_if_configured(runtime: &ShardRuntime) {
     if interval_ms == 0 {
         return;
     }
-    let min_hot_bytes = env_usize("URSULA_COLD_FLUSH_MIN_HOT_BYTES", 8 * 1024 * 1024);
-    let max_flush_bytes = env_usize("URSULA_COLD_FLUSH_MAX_BYTES", 8 * 1024 * 1024);
+    let flush_bytes = env_usize("URSULA_COLD_FLUSH_BYTES", 8 * 1024 * 1024);
+    let min_hot_bytes = env_usize("URSULA_COLD_FLUSH_MIN_HOT_BYTES", flush_bytes);
+    let max_flush_bytes = env_usize("URSULA_COLD_FLUSH_MAX_BYTES", flush_bytes);
     let max_concurrency = env_usize("URSULA_COLD_FLUSH_MAX_CONCURRENCY", 4).max(1);
     let runtime = runtime.clone();
     tokio::spawn(async move {
@@ -440,15 +441,17 @@ pub(crate) fn reenable_elections_if_campaign_allowed(
 /// cold. The drain makes the resulting snapshot's `payload` field empty (no
 /// uncommitted hot bytes), shrinking the manifest install_snapshot has to ship.
 ///
-/// When `URSULA_SNAPSHOT_DRIVE_INTERVAL_MS` is unset or zero this is a no-op
-/// and openraft's automatic [`SnapshotPolicy::LogsSinceLast`] still drives
-/// snapshot timing.
+/// When an external snapshot store is configured, the driver runs by default so
+/// snapshots are built after first draining hot tails to cold. Set
+/// `URSULA_SNAPSHOT_DRIVE_INTERVAL_MS=0` to disable it. Without an external
+/// store, this is a no-op unless the interval is set explicitly, and openraft's
+/// automatic [`SnapshotPolicy::LogsSinceLast`] still drives snapshot timing.
 pub fn spawn_snapshot_driver_if_configured(
     runtime: &ShardRuntime,
     registry: &RaftGroupHandleRegistry,
     snapshot_store: Option<SharedSnapshotStore>,
 ) {
-    let interval_ms = env_usize("URSULA_SNAPSHOT_DRIVE_INTERVAL_MS", 0);
+    let interval_ms = snapshot_drive_interval_ms(snapshot_store.is_some());
     if interval_ms == 0 {
         return;
     }
@@ -601,6 +604,20 @@ pub fn spawn_snapshot_driver_if_configured(
             tokio::time::sleep(interval).await;
         }
     });
+}
+
+pub(crate) fn snapshot_drive_interval_ms(snapshot_store_configured: bool) -> usize {
+    resolve_snapshot_drive_interval_ms(
+        env_optional_usize("URSULA_SNAPSHOT_DRIVE_INTERVAL_MS"),
+        snapshot_store_configured,
+    )
+}
+
+pub(crate) fn resolve_snapshot_drive_interval_ms(
+    configured: Option<usize>,
+    snapshot_store_configured: bool,
+) -> usize {
+    configured.unwrap_or(if snapshot_store_configured { 60_000 } else { 0 })
 }
 
 pub(crate) fn next_snapshot_to_drive(
