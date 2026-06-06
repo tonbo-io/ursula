@@ -75,6 +75,7 @@ use crate::rt::sync::Semaphore;
 use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
 use crate::rt::time::Instant;
+use crate::trace::Traced;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -1240,7 +1241,7 @@ impl ShardRuntime {
         let started_at = Instant::now();
         mailbox
             .tx
-            .send(command)
+            .send(Traced::capture(command))
             .await
             .map_err(|_| RuntimeError::MailboxClosed {
                 core_id: mailbox.core_id,

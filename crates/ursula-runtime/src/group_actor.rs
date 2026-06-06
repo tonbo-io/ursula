@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
+use tracing::Instrument;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
@@ -51,18 +53,20 @@ use crate::rt::sync::Semaphore;
 use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
 use crate::rt::time::Instant;
+use crate::trace::Traced;
 
 #[derive(Clone)]
 pub(crate) struct GroupMailbox {
     pub(crate) group_id: RaftGroupId,
-    pub(crate) tx: mpsc::Sender<GroupCommand>,
+    pub(crate) tx: mpsc::Sender<Traced<GroupCommand>>,
     pub(crate) metrics: Arc<RuntimeMetricsInner>,
 }
 
 impl GroupMailbox {
     pub(crate) async fn send(&self, command: GroupCommand) -> Result<(), Box<GroupCommand>> {
         self.metrics.record_group_mailbox_enqueued(self.group_id);
-        match self.tx.try_send(command) {
+        // Capture the sender's span so the group actor can re-parent the work.
+        match self.tx.try_send(Traced::capture(command)) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(command)) => {
                 self.metrics.record_group_mailbox_dequeued(self.group_id);
@@ -72,13 +76,13 @@ impl GroupMailbox {
                     Ok(()) => Ok(()),
                     Err(err) => {
                         self.metrics.record_group_mailbox_dequeued(self.group_id);
-                        Err(Box::new(err.0))
+                        Err(Box::new(err.0.value))
                     }
                 }
             }
             Err(mpsc::error::TrySendError::Closed(command)) => {
                 self.metrics.record_group_mailbox_dequeued(self.group_id);
-                Err(Box::new(command))
+                Err(Box::new(command.value))
             }
         }
     }
@@ -305,7 +309,7 @@ impl GroupCommand {
 pub(crate) struct GroupActor {
     pub(crate) placement: ShardPlacement,
     pub(crate) engine: Box<dyn GroupEngine>,
-    pub(crate) rx: mpsc::Receiver<GroupCommand>,
+    pub(crate) rx: mpsc::Receiver<Traced<GroupCommand>>,
     pub(crate) read_watchers: ReadWatchers,
     pub(crate) metrics: Arc<RuntimeMetricsInner>,
     pub(crate) cold_write_admission: ColdWriteAdmission,
@@ -317,385 +321,406 @@ impl GroupActor {
     pub(crate) async fn run(mut self) {
         let mut pending = VecDeque::new();
         loop {
-            let Some(command) = self.next_command(&mut pending).await else {
+            let Some(Traced {
+                value: command,
+                parent,
+            }) = self.next_command(&mut pending).await
+            else {
                 break;
             };
-            match command {
-                GroupCommand::CreateStream {
-                    request,
-                    response_tx,
-                    raft_uncommitted,
-                } => {
-                    let response = CoreWorker::create_stream(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        request,
-                        self.placement,
-                        self.cold_write_admission,
-                    )
-                    .await;
-                    drop(raft_uncommitted);
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::CreateExternal {
-                    request,
-                    response_tx,
-                } => {
-                    let response = CoreWorker::create_stream_external(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        request,
-                        self.placement,
-                    )
-                    .await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::HeadStream {
-                    request,
-                    response_tx,
-                } => {
-                    let response = CoreWorker::head_stream(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        request,
-                        self.placement,
-                    )
-                    .await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::ReadStream {
-                    request,
-                    response_tx,
-                } => {
-                    CoreWorker::read_stream(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        self.read_materialization.clone(),
-                        request,
-                        self.placement,
-                        response_tx,
-                    )
-                    .await;
-                }
-                GroupCommand::PublishSnapshot {
-                    request,
-                    response_tx,
-                } => {
-                    let response = CoreWorker::publish_snapshot(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        self.read_materialization.clone(),
-                        &mut self.read_watchers,
-                        request,
-                        self.placement,
-                    )
-                    .await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::ReadSnapshot {
-                    request,
-                    response_tx,
-                } => {
-                    let response = CoreWorker::read_snapshot(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        request,
-                        self.placement,
-                    )
-                    .await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::DeleteSnapshot {
-                    request,
-                    response_tx,
-                } => {
-                    let response = CoreWorker::delete_snapshot(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        request,
-                        self.placement,
-                    )
-                    .await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::BootstrapStream {
-                    request,
-                    response_tx,
-                } => {
-                    let response = CoreWorker::bootstrap_stream(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        request,
-                        self.placement,
-                    )
-                    .await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::WaitRead {
-                    request,
-                    waiter_id,
-                    response_tx,
-                } => {
-                    let watcher = ReadWatcher {
-                        waiter_id,
-                        request,
-                        response_tx,
-                    };
-                    CoreWorker::wait_read_stream(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        self.read_materialization.clone(),
-                        &mut self.read_watchers,
-                        self.placement,
-                        watcher,
-                        self.live_read_max_waiters_per_core,
-                    )
-                    .await;
-                }
-                GroupCommand::CancelWaitRead {
-                    stream_id,
-                    waiter_id,
-                } => {
-                    CoreWorker::cancel_read_watcher(
-                        &mut self.read_watchers,
-                        self.metrics.clone(),
-                        self.placement.core_id,
-                        stream_id,
-                        waiter_id,
-                    );
-                }
-                GroupCommand::RequireLiveReadOwner { response_tx } => {
-                    let response = self
-                        .engine
-                        .require_local_live_read_owner(self.placement)
-                        .await
-                        .map_err(|err| RuntimeError::group_engine(self.placement, err));
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::CloseStream {
-                    request,
-                    response_tx,
-                } => {
-                    let response = CoreWorker::close_stream(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        self.read_materialization.clone(),
-                        &mut self.read_watchers,
-                        request,
-                        self.placement,
-                    )
-                    .await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::AddForkRef {
-                    stream_id,
-                    now_ms,
-                    response_tx,
-                } => {
-                    let response = CoreWorker::add_fork_ref(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        stream_id,
-                        now_ms,
-                        self.placement,
-                    )
-                    .await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::ReleaseForkRef {
-                    stream_id,
-                    response_tx,
-                } => {
-                    let response = CoreWorker::release_fork_ref(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        self.read_materialization.clone(),
-                        &mut self.read_watchers,
-                        stream_id,
-                        self.placement,
-                    )
-                    .await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::DeleteStream {
-                    request,
-                    response_tx,
-                } => {
-                    let response = CoreWorker::delete_stream(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        self.read_materialization.clone(),
-                        &mut self.read_watchers,
-                        request,
-                        self.placement,
-                    )
-                    .await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::FlushCold {
-                    request,
-                    response_tx,
-                } => {
-                    let response = CoreWorker::flush_cold(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        self.read_materialization.clone(),
-                        &mut self.read_watchers,
-                        request,
-                        self.placement,
-                    )
-                    .await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::PlanColdFlush {
-                    request,
-                    response_tx,
-                } => {
-                    let response = CoreWorker::plan_cold_flush(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        request,
-                        self.placement,
-                    )
-                    .await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::PlanNextColdFlush {
-                    request,
-                    response_tx,
-                } => {
-                    let response = CoreWorker::plan_next_cold_flush(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        request,
-                        self.placement,
-                    )
-                    .await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::PlanNextColdFlushBatch {
-                    request,
-                    max_candidates,
-                    response_tx,
-                } => {
-                    let response = CoreWorker::plan_next_cold_flush_batch(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        request,
-                        self.placement,
-                        max_candidates,
-                    )
-                    .await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::PlanColdGc { max, response_tx } => {
-                    let response =
-                        CoreWorker::plan_cold_gc(&mut self.engine, max, self.placement).await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::AckColdGc {
-                    up_to_seq,
-                    response_tx,
-                } => {
-                    let response =
-                        CoreWorker::ack_cold_gc(&mut self.engine, up_to_seq, self.placement).await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::Append {
-                    request,
-                    response_tx,
-                    raft_uncommitted,
-                } => {
-                    let response = CoreWorker::apply_append(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        self.read_materialization.clone(),
-                        &mut self.read_watchers,
-                        request,
-                        self.placement,
-                        self.cold_write_admission,
-                    )
-                    .await;
-                    drop(raft_uncommitted);
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::AppendExternal {
-                    request,
-                    response_tx,
-                } => {
-                    let response = CoreWorker::apply_append_external(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        self.read_materialization.clone(),
-                        &mut self.read_watchers,
-                        request,
-                        self.placement,
-                    )
-                    .await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::AppendBatch {
-                    request,
-                    response_tx,
-                    raft_uncommitted,
-                } => {
-                    let mut batch = vec![(request, response_tx, raft_uncommitted)];
-                    self.collect_append_batch_commands(&mut pending, &mut batch);
-                    let (requests, pending_batch) =
-                        CoreWorker::prepare_append_batch_requests(batch);
-                    CoreWorker::apply_prepared_append_batch_requests(
-                        &mut self.engine,
-                        AppendBatchRuntime {
-                            metrics: self.metrics.clone(),
-                            read_materialization: self.read_materialization.clone(),
-                            placement: self.placement,
-                        },
-                        &mut self.read_watchers,
-                        pending_batch,
-                        requests,
-                        self.cold_write_admission,
-                    )
-                    .await;
-                }
-                GroupCommand::SnapshotGroup { response_tx } => {
-                    let response = CoreWorker::snapshot_group(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        self.placement,
-                    )
-                    .await;
-                    let _ = response_tx.send(response);
-                }
-                GroupCommand::InstallGroupSnapshot {
-                    snapshot,
-                    response_tx,
-                } => {
-                    let response = CoreWorker::install_group_snapshot(
-                        &mut self.engine,
-                        self.metrics.clone(),
-                        snapshot,
-                    )
-                    .await;
-                    let _ = response_tx.send(response);
-                }
-                #[cfg(madsim)]
-                GroupCommand::ShutdownEngine { response_tx } => {
-                    let response = self
-                        .engine
-                        .shutdown()
-                        .await
-                        .map_err(|err| RuntimeError::group_engine(self.placement, err));
-                    let _ = response_tx.send(response);
-                    break;
-                }
+            // Re-establish the sender's span so on-core apply work links back to
+            // the originating request.
+            if self
+                .handle(command, &mut pending)
+                .instrument(parent)
+                .await
+                .is_break()
+            {
+                break;
             }
         }
     }
 
+    async fn handle(
+        &mut self,
+        command: GroupCommand,
+        pending: &mut VecDeque<Traced<GroupCommand>>,
+    ) -> ControlFlow<()> {
+        match command {
+            GroupCommand::CreateStream {
+                request,
+                response_tx,
+                raft_uncommitted,
+            } => {
+                let response = CoreWorker::create_stream(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    request,
+                    self.placement,
+                    self.cold_write_admission,
+                )
+                .await;
+                drop(raft_uncommitted);
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::CreateExternal {
+                request,
+                response_tx,
+            } => {
+                let response = CoreWorker::create_stream_external(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    request,
+                    self.placement,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::HeadStream {
+                request,
+                response_tx,
+            } => {
+                let response = CoreWorker::head_stream(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    request,
+                    self.placement,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::ReadStream {
+                request,
+                response_tx,
+            } => {
+                CoreWorker::read_stream(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    self.read_materialization.clone(),
+                    request,
+                    self.placement,
+                    response_tx,
+                )
+                .await;
+            }
+            GroupCommand::PublishSnapshot {
+                request,
+                response_tx,
+            } => {
+                let response = CoreWorker::publish_snapshot(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    self.read_materialization.clone(),
+                    &mut self.read_watchers,
+                    request,
+                    self.placement,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::ReadSnapshot {
+                request,
+                response_tx,
+            } => {
+                let response = CoreWorker::read_snapshot(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    request,
+                    self.placement,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::DeleteSnapshot {
+                request,
+                response_tx,
+            } => {
+                let response = CoreWorker::delete_snapshot(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    request,
+                    self.placement,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::BootstrapStream {
+                request,
+                response_tx,
+            } => {
+                let response = CoreWorker::bootstrap_stream(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    request,
+                    self.placement,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::WaitRead {
+                request,
+                waiter_id,
+                response_tx,
+            } => {
+                let watcher = ReadWatcher {
+                    waiter_id,
+                    request,
+                    response_tx,
+                };
+                CoreWorker::wait_read_stream(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    self.read_materialization.clone(),
+                    &mut self.read_watchers,
+                    self.placement,
+                    watcher,
+                    self.live_read_max_waiters_per_core,
+                )
+                .await;
+            }
+            GroupCommand::CancelWaitRead {
+                stream_id,
+                waiter_id,
+            } => {
+                CoreWorker::cancel_read_watcher(
+                    &mut self.read_watchers,
+                    self.metrics.clone(),
+                    self.placement.core_id,
+                    stream_id,
+                    waiter_id,
+                );
+            }
+            GroupCommand::RequireLiveReadOwner { response_tx } => {
+                let response = self
+                    .engine
+                    .require_local_live_read_owner(self.placement)
+                    .await
+                    .map_err(|err| RuntimeError::group_engine(self.placement, err));
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::CloseStream {
+                request,
+                response_tx,
+            } => {
+                let response = CoreWorker::close_stream(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    self.read_materialization.clone(),
+                    &mut self.read_watchers,
+                    request,
+                    self.placement,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::AddForkRef {
+                stream_id,
+                now_ms,
+                response_tx,
+            } => {
+                let response = CoreWorker::add_fork_ref(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    stream_id,
+                    now_ms,
+                    self.placement,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::ReleaseForkRef {
+                stream_id,
+                response_tx,
+            } => {
+                let response = CoreWorker::release_fork_ref(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    self.read_materialization.clone(),
+                    &mut self.read_watchers,
+                    stream_id,
+                    self.placement,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::DeleteStream {
+                request,
+                response_tx,
+            } => {
+                let response = CoreWorker::delete_stream(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    self.read_materialization.clone(),
+                    &mut self.read_watchers,
+                    request,
+                    self.placement,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::FlushCold {
+                request,
+                response_tx,
+            } => {
+                let response = CoreWorker::flush_cold(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    self.read_materialization.clone(),
+                    &mut self.read_watchers,
+                    request,
+                    self.placement,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::PlanColdFlush {
+                request,
+                response_tx,
+            } => {
+                let response = CoreWorker::plan_cold_flush(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    request,
+                    self.placement,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::PlanNextColdFlush {
+                request,
+                response_tx,
+            } => {
+                let response = CoreWorker::plan_next_cold_flush(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    request,
+                    self.placement,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::PlanNextColdFlushBatch {
+                request,
+                max_candidates,
+                response_tx,
+            } => {
+                let response = CoreWorker::plan_next_cold_flush_batch(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    request,
+                    self.placement,
+                    max_candidates,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::PlanColdGc { max, response_tx } => {
+                let response =
+                    CoreWorker::plan_cold_gc(&mut self.engine, max, self.placement).await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::AckColdGc {
+                up_to_seq,
+                response_tx,
+            } => {
+                let response =
+                    CoreWorker::ack_cold_gc(&mut self.engine, up_to_seq, self.placement).await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::Append {
+                request,
+                response_tx,
+                raft_uncommitted,
+            } => {
+                let response = CoreWorker::apply_append(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    self.read_materialization.clone(),
+                    &mut self.read_watchers,
+                    request,
+                    self.placement,
+                    self.cold_write_admission,
+                )
+                .await;
+                drop(raft_uncommitted);
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::AppendExternal {
+                request,
+                response_tx,
+            } => {
+                let response = CoreWorker::apply_append_external(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    self.read_materialization.clone(),
+                    &mut self.read_watchers,
+                    request,
+                    self.placement,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::AppendBatch {
+                request,
+                response_tx,
+                raft_uncommitted,
+            } => {
+                let mut batch = vec![(request, response_tx, raft_uncommitted)];
+                self.collect_append_batch_commands(pending, &mut batch);
+                let (requests, pending_batch) = CoreWorker::prepare_append_batch_requests(batch);
+                CoreWorker::apply_prepared_append_batch_requests(
+                    &mut self.engine,
+                    AppendBatchRuntime {
+                        metrics: self.metrics.clone(),
+                        read_materialization: self.read_materialization.clone(),
+                        placement: self.placement,
+                    },
+                    &mut self.read_watchers,
+                    pending_batch,
+                    requests,
+                    self.cold_write_admission,
+                )
+                .await;
+            }
+            GroupCommand::SnapshotGroup { response_tx } => {
+                let response = CoreWorker::snapshot_group(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    self.placement,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::InstallGroupSnapshot {
+                snapshot,
+                response_tx,
+            } => {
+                let response = CoreWorker::install_group_snapshot(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    snapshot,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            #[cfg(madsim)]
+            GroupCommand::ShutdownEngine { response_tx } => {
+                let response = self
+                    .engine
+                    .shutdown()
+                    .await
+                    .map_err(|err| RuntimeError::group_engine(self.placement, err));
+                let _ = response_tx.send(response);
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
     pub(crate) async fn next_command(
         &mut self,
-        pending: &mut VecDeque<GroupCommand>,
-    ) -> Option<GroupCommand> {
+        pending: &mut VecDeque<Traced<GroupCommand>>,
+    ) -> Option<Traced<GroupCommand>> {
         match pending.pop_front() {
             Some(command) => Some(command),
             None => {
@@ -711,7 +736,7 @@ impl GroupActor {
 
     pub(crate) fn collect_append_batch_commands(
         &mut self,
-        pending: &mut VecDeque<GroupCommand>,
+        pending: &mut VecDeque<Traced<GroupCommand>>,
         batch: &mut Vec<AppendBatchEntry>,
     ) {
         while batch.len() < GROUP_ACTOR_MAX_WRITE_BATCH {
@@ -727,10 +752,16 @@ impl GroupActor {
                 },
             };
             match command {
-                Some(GroupCommand::AppendBatch {
-                    request,
-                    response_tx,
-                    raft_uncommitted,
+                // Coalesced appends carry distinct parent spans; the batch
+                // apply runs under the triggering command's span.
+                Some(Traced {
+                    value:
+                        GroupCommand::AppendBatch {
+                            request,
+                            response_tx,
+                            raft_uncommitted,
+                        },
+                    ..
                 }) => batch.push((request, response_tx, raft_uncommitted)),
                 Some(other) => {
                     pending.push_front(other);
