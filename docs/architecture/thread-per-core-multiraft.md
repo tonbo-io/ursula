@@ -121,9 +121,9 @@ group-local and that public batches do not have to devolve into per-frame
 fsyncs. It is not a substitute for the production OpenRaft log, snapshots, or a
 production group-commit policy.
 
-`ursula --wal-dir DIR` wires this optional engine into the HTTP prototype.
-The flag is explicit so normal in-memory throughput smokes keep their existing
-shape, while durability/recovery smokes can use the same protocol surface.
+The legacy `--wal-dir DIR` flag wires this optional engine into the HTTP prototype.
+It is kept for diagnostic recovery smokes, while user-facing disk storage uses
+the production OpenRaft log path.
 
 `RuntimeConfig::new` defaults to `RuntimeThreading::ThreadPerCore`: each core
 worker runs on its own OS thread with a current-thread Tokio event loop. Tests
@@ -229,7 +229,7 @@ node 1 with three voters for every group, writes streams placed on all four
 groups through node 1, and waits until the replicated payloads are readable
 from every runtime.
 `ursula` now
-exposes this static cluster shape with `--raft-memory --raft-node-id ID
+exposes this static cluster shape with `--storage-backend memory --raft-node-id ID
 --raft-peer ID=URL ... --raft-init-membership`, or with a JSON
 `--raft-cluster-config FILE` containing `node_id`, `peers`, and
 `init_membership`. It warms every group at startup so followers can receive
@@ -274,14 +274,14 @@ production work still needs an indexed/high-throughput OpenRaft log format,
 dynamic deployment membership management, and long-running EC2
 conformance/performance validation of the multi-group static cluster path.
 
-`ursula --raft-memory` selects the OpenRaft group-engine factory with the
+`ursula --storage-backend memory` selects the OpenRaft group-engine factory with the
 in-memory `RaftGroupLogStore`. That path lets the HTTP subset drive OpenRaft
 `client_write` without local WAL persistence, which is the right benchmark mode
 when isolating OpenRaft/runtime overhead from disk durability. `ursula
---raft-log-dir DIR` selects the durable OpenRaft group-engine factory and adds
+--storage-backend disk --disk-path DIR` selects the durable OpenRaft group-engine factory and adds
 group-local file-log persistence through the same shard-owned runtime boundary.
 The static gRPC cluster path can now use the same durable log backend by
-combining `--raft-log-dir DIR` with `--raft-node-id`/`--raft-peer` or
+combining `--storage-backend disk --disk-path DIR` with `--raft-node-id`/`--raft-peer` or
 `--raft-cluster-config FILE`; the HTTP layer chooses the backend through
 `DurableRaftLogStoreFactory` instead of owning the core journal writer. The
 local `static_grpc_raft_runtime_recovers_from_core_journal_after_restart` test
@@ -315,7 +315,7 @@ waits for snapshot installation, reads the restored stream through the learner
 HTTP endpoint, and verifies non-empty core journals on leader, follower, and
 learner. The binary-level `cli_static_grpc_raft_log_dir_recovers_after_restart`
 test covers the same public `ursula` CLI used in EC2 deployment: static
-cluster JSON config, `--raft-log-dir`, HTTP write, process restart without
+cluster JSON config, `--storage-backend disk --disk-path DIR`, HTTP write, process restart without
 reinitializing membership, and HTTP readback from the recovered journal.
 `cli_static_grpc_raft_log_dir_replicates_between_nodes` extends that binary
 coverage to three real `ursula` processes with independent log dirs,
@@ -397,7 +397,7 @@ can return `204 No Content`; partial failures still return the JSON per-item
 status array.
 Current local validation separates protocol correctness from local disk
 latency. A three-process static gRPC cluster with 32 Raft groups and
-`--raft-memory` passes the official Durable Streams suite (`300 / 300`) both
+`--storage-backend memory` passes the official Durable Streams suite (`300 / 300`) both
 with the background cold worker disabled and with memory cold storage actively
 flushing 1024-byte chunks. The same local three-process shape with durable
 OpenRaft file logs is protocol-correct but can exceed the official property
@@ -406,9 +406,8 @@ fsync/replication latency and, for 1-byte cold flush, cold-manifest
 write-amplification. This is why EC2 and in-memory Raft-log conformance remain
 the current gates for multi-node protocol behavior, while local durable-log
 runs are treated as latency diagnostics.
-The `ursula` binary can be launched with `--raft-memory` for the OpenRaft
-in-memory log engine, `--wal-dir DIR` for the diagnostic per-group WAL engine,
-or `--raft-log-dir DIR` for the OpenRaft-backed file-log engine. These modes
+The `ursula` binary can be launched with `--storage-backend memory` for the OpenRaft
+in-memory log engine or `--storage-backend disk --disk-path DIR` for the OpenRaft-backed file-log engine. These modes
 keep protocol handling in the same HTTP adapter while changing only the
 runtime's group-engine factory.
 Append, close-only, and append-batch requests parse `Producer-Id`,

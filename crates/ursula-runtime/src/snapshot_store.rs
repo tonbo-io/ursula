@@ -253,19 +253,15 @@ mod s3 {
             Ok(Self::new(operator, prefix))
         }
 
-        /// Build an S3 operator from `URSULA_SNAPSHOT_S3_*` env, falling back to
-        /// the cold-store's `URSULA_COLD_S3_*` for shared bucket/credentials.
-        /// Returns the configured prefix from `URSULA_SNAPSHOT_S3_PREFIX`
-        /// (defaults to `snapshots`).
+        /// Build an S3 operator from the cold-store `URSULA_COLD_S3_*` env.
+        /// Snapshot blobs share the cold bucket/credentials and use
+        /// `URSULA_SNAPSHOT_S3_PREFIX` (defaults to `snapshots`) for separation.
         pub fn s3_from_env() -> Result<Self, SnapshotStoreError> {
-            let bucket = env_first(&["URSULA_SNAPSHOT_S3_BUCKET", "URSULA_COLD_S3_BUCKET"])
-                .ok_or_else(|| {
-                    SnapshotStoreError::Backend(
-                        "URSULA_SNAPSHOT_S3_BUCKET (or URSULA_COLD_S3_BUCKET) is required for \
-                         snapshot s3 backend"
-                            .into(),
-                    )
-                })?;
+            let bucket = std::env::var("URSULA_COLD_S3_BUCKET").map_err(|_| {
+                SnapshotStoreError::Backend(
+                    "URSULA_COLD_S3_BUCKET is required for snapshot s3 backend".into(),
+                )
+            })?;
             if bucket.trim().is_empty() {
                 return Err(SnapshotStoreError::Backend(
                     "snapshot s3 bucket must not be empty".into(),
@@ -274,40 +270,33 @@ mod s3 {
             let mut builder = opendal::services::S3::default().bucket(&bucket);
             // Root pins all blobs into a snapshot-only sub-tree of the bucket,
             // letting the cold store reuse the same bucket with different keys.
-            if let Some(root) = env_first(&["URSULA_SNAPSHOT_S3_ROOT", "URSULA_COLD_ROOT"])
+            if let Ok(root) = std::env::var("URSULA_COLD_ROOT")
                 && !root.trim().is_empty()
             {
                 builder = builder.root(&root);
             }
-            if let Some(region) = env_first(&["URSULA_SNAPSHOT_S3_REGION", "URSULA_COLD_S3_REGION"])
+            if let Ok(region) = std::env::var("URSULA_COLD_S3_REGION")
                 && !region.trim().is_empty()
             {
                 builder = builder.region(&region);
             }
-            if let Some(endpoint) =
-                env_first(&["URSULA_SNAPSHOT_S3_ENDPOINT", "URSULA_COLD_S3_ENDPOINT"])
+            if let Ok(endpoint) = std::env::var("URSULA_COLD_S3_ENDPOINT")
                 && !endpoint.trim().is_empty()
             {
                 builder = builder.endpoint(&endpoint);
             }
-            if let Some(access) = env_first(&[
-                "URSULA_SNAPSHOT_S3_ACCESS_KEY_ID",
-                "URSULA_COLD_S3_ACCESS_KEY_ID",
-            ]) && !access.trim().is_empty()
+            if let Ok(access) = std::env::var("URSULA_COLD_S3_ACCESS_KEY_ID")
+                && !access.trim().is_empty()
             {
                 builder = builder.access_key_id(&access);
             }
-            if let Some(secret) = env_first(&[
-                "URSULA_SNAPSHOT_S3_SECRET_ACCESS_KEY",
-                "URSULA_COLD_S3_SECRET_ACCESS_KEY",
-            ]) && !secret.trim().is_empty()
+            if let Ok(secret) = std::env::var("URSULA_COLD_S3_SECRET_ACCESS_KEY")
+                && !secret.trim().is_empty()
             {
                 builder = builder.secret_access_key(&secret);
             }
-            if let Some(token) = env_first(&[
-                "URSULA_SNAPSHOT_S3_SESSION_TOKEN",
-                "URSULA_COLD_S3_SESSION_TOKEN",
-            ]) && !token.trim().is_empty()
+            if let Ok(token) = std::env::var("URSULA_COLD_S3_SESSION_TOKEN")
+                && !token.trim().is_empty()
             {
                 builder = builder.session_token(&token);
             }
@@ -341,15 +330,6 @@ mod s3 {
                 self.prefix, key.raft_group_id, key.snapshot_id,
             )
         }
-    }
-
-    fn env_first(names: &[&str]) -> Option<String> {
-        for name in names {
-            if let Ok(v) = std::env::var(name) {
-                return Some(v);
-            }
-        }
-        None
     }
 
     impl SnapshotStore for S3SnapshotStore {

@@ -5172,7 +5172,9 @@ mod cold_health {
 }
 
 mod snapshot_driver {
-    use crate::bootstrap::{next_snapshot_to_drive, should_drive_snapshot_for_group};
+    use crate::bootstrap::{
+        next_snapshot_to_drive, resolve_snapshot_drive_interval_ms, should_drive_snapshot_for_group,
+    };
     use ursula_raft::{RaftGroupMetricsSnapshot, RaftLogProgressSnapshot};
 
     fn snap_with_group(
@@ -5206,6 +5208,17 @@ mod snapshot_driver {
         assert!(should_drive_snapshot_for_group(&snap(Some(42), Some(41))));
         assert!(!should_drive_snapshot_for_group(&snap(Some(42), Some(42))));
         assert!(!should_drive_snapshot_for_group(&snap(Some(42), Some(43))));
+    }
+
+    #[test]
+    fn snapshot_driver_default_interval_follows_external_store() {
+        assert_eq!(resolve_snapshot_drive_interval_ms(None, false), 0);
+        assert_eq!(resolve_snapshot_drive_interval_ms(None, true), 60_000);
+        assert_eq!(resolve_snapshot_drive_interval_ms(Some(0), true), 0);
+        assert_eq!(
+            resolve_snapshot_drive_interval_ms(Some(15_000), false),
+            15_000
+        );
     }
 
     #[test]

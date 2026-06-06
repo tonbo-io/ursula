@@ -75,7 +75,7 @@ ursulactl restart --config cluster.json --restart-cmd '...' --only 2,3
 ```
 
 <Warning>
-The naive manual procedure — "restart followers, then leader" — does **not** wait for `applied_index` to catch up between steps. Under `--raft-memory` mode a target can come back as a voter while still missing committed entries, and a second restart pointed at a different node can corner the group with no live leader. `ursulactl restart` is the path that closes this gap.
+The naive manual procedure — "restart followers, then leader" — does **not** wait for `applied_index` to catch up between steps. Under `--storage-backend memory` mode a target can come back as a voter while still missing committed entries, and a second restart pointed at a different node can corner the group with no live leader. `ursulactl restart` is the path that closes this gap.
 </Warning>
 
 ## `status`

@@ -12,10 +12,10 @@ Start a local node from the workspace root. The default is in-memory (no on-disk
 cargo run --bin ursula
 ```
 
-It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses the in-memory engine. For local WAL-backed persistence instead, point `--wal-dir` at an empty directory:
+It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses the in-memory engine. For local disk-backed persistence instead, point `--disk-path` at an empty directory:
 
 ```bash
-cargo run --bin ursula -- --wal-dir ./data/wal
+cargo run --bin ursula -- --storage-backend disk --disk-path ./data
 ```
 
 Then drive the HTTP API with `curl` in another terminal.
