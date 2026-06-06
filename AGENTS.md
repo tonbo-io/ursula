@@ -30,6 +30,11 @@ Use `tracing` logging macros for Rust diagnostics and operational logging. Do no
 
 ## Before Commit
 
+Use semantic commit messages. Prefer a component scope when the change maps to
+a crate, module, doc area, or script, such as `feat(ursula-stream): add snapshot
+validation`, `fix(ursula-raft): preserve snapshot metadata`, or
+`docs(web): remove redundant subtitles`.
+
 Run formatting and lint checks before committing:
 
 ```bash
