@@ -48,16 +48,25 @@ impl InitOptions {
 #[must_use = "hold the guard until shutdown so buffered telemetry is flushed"]
 pub struct ObservabilityGuard {
     #[cfg(feature = "otlp")]
-    provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+    tracer_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+    #[cfg(feature = "otlp")]
+    meter_provider: Option<opentelemetry_sdk::metrics::SdkMeterProvider>,
 }
 
 impl Drop for ObservabilityGuard {
     fn drop(&mut self) {
         #[cfg(feature = "otlp")]
-        if let Some(provider) = self.provider.take() {
+        if let Some(provider) = self.tracer_provider.take() {
             // Flush buffered spans before the exporter task is torn down.
             if let Err(err) = provider.shutdown() {
                 tracing::warn!(%err, "failed to flush OTLP span exporter on shutdown");
+            }
+        }
+        #[cfg(feature = "otlp")]
+        if let Some(provider) = self.meter_provider.take() {
+            // Flush the final metrics reading before exit.
+            if let Err(err) = provider.shutdown() {
+                tracing::warn!(%err, "failed to flush OTLP metric exporter on shutdown");
             }
         }
     }
@@ -75,14 +84,22 @@ pub fn init(options: InitOptions) -> ObservabilityGuard {
 
     #[cfg(feature = "otlp")]
     {
-        if let Some((otel_layer, provider)) = otlp::build_layer(&options) {
+        if let Some((otel_layer, tracer_provider)) = otlp::build_layer(&options) {
             let _ = tracing_subscriber::registry()
                 .with(env_filter(options.default_directives))
                 .with(fmt_layer)
                 .with(otel_layer)
                 .try_init();
+            // Metrics export is independent of the span layer; set the global
+            // meter provider so the rest of the process can register
+            // instruments via `opentelemetry::global::meter`.
+            let meter_provider = otlp::build_meter_provider(&options);
+            if let Some(provider) = meter_provider.as_ref() {
+                opentelemetry::global::set_meter_provider(provider.clone());
+            }
             return ObservabilityGuard {
-                provider: Some(provider),
+                tracer_provider: Some(tracer_provider),
+                meter_provider,
             };
         }
     }
@@ -94,7 +111,9 @@ pub fn init(options: InitOptions) -> ObservabilityGuard {
 
     ObservabilityGuard {
         #[cfg(feature = "otlp")]
-        provider: None,
+        tracer_provider: None,
+        #[cfg(feature = "otlp")]
+        meter_provider: None,
     }
 }
 
@@ -160,5 +179,41 @@ mod otlp {
         let tracer = provider.tracer("ursula");
         let layer = tracing_opentelemetry::layer().with_tracer(tracer);
         Some((layer, provider))
+    }
+
+    /// Build a periodic OTLP metrics exporter, or `None` when no endpoint is
+    /// configured or the exporter cannot be constructed.
+    pub(super) fn build_meter_provider(
+        options: &InitOptions,
+    ) -> Option<opentelemetry_sdk::metrics::SdkMeterProvider> {
+        std::env::var_os(ENDPOINT_ENV)?;
+
+        let exporter = match opentelemetry_otlp::MetricExporter::builder()
+            .with_http()
+            .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+            .build()
+        {
+            Ok(exporter) => exporter,
+            Err(err) => {
+                tracing::warn!(%err, "OTLP metric exporter unavailable; continuing without export");
+                return None;
+            }
+        };
+
+        let mut attributes = vec![KeyValue::new("service.name", options.service_name)];
+        attributes.extend(
+            options
+                .resource
+                .iter()
+                .map(|(key, value)| KeyValue::new(*key, value.clone())),
+        );
+        let resource = Resource::builder().with_attributes(attributes).build();
+
+        Some(
+            opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+                .with_periodic_exporter(exporter)
+                .with_resource(resource)
+                .build(),
+        )
     }
 }
