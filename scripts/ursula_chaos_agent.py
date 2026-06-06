@@ -301,6 +301,23 @@ def _downsample_history(raw: list[dict[str, Any]], now_ms: int) -> list[dict[str
     return bucketed + [entry for _, entry in recent]
 
 
+def _published_started_at(
+    process_started_at: datetime,
+    history: list[dict[str, Any]],
+    restored_started_at: datetime | None = None,
+) -> datetime:
+    started_at = restored_started_at or process_started_at
+    if process_started_at < started_at:
+        started_at = process_started_at
+    for entry in history:
+        if not isinstance(entry, dict):
+            continue
+        entry_started_at = parse_iso(entry.get("time"))
+        if entry_started_at is not None and entry_started_at < started_at:
+            started_at = entry_started_at
+    return started_at
+
+
 def _slim_injection(injection: dict[str, Any]) -> dict[str, Any]:
     timeline = injection.get("timeline")
     slim = dict(injection)
@@ -471,6 +488,7 @@ class ChaosAgent:
         self.gc_churn_pending: deque[tuple[str, float]] = deque()
         self.last_gc_churn_success = 0
         self.restored_workload_coverage: dict[str, Any] = {}
+        self.restored_started_at: datetime | None = None
         self.restore_published_state()
 
     def choose_next_fault(self, *, initial: bool = False) -> datetime | None:
@@ -491,6 +509,7 @@ class ChaosAgent:
 
         self.history.extend(status.get("history", []))
         self.events.extend(status.get("events", []))
+        self.restored_started_at = parse_iso(status.get("started_at"))
         workload_coverage = status.get("workload", {}).get("coverage", {})
         if isinstance(workload_coverage, dict):
             self.restored_workload_coverage = workload_coverage
@@ -2614,8 +2633,10 @@ class ChaosAgent:
                 "reasons": reasons,
             }
         )
-        published_history = _downsample_history(
-            list(self.history), int(time.time() * 1000)
+        raw_history = list(self.history)
+        published_history = _downsample_history(raw_history, int(time.time() * 1000))
+        published_started_at = _published_started_at(
+            self.started_at, raw_history, self.restored_started_at
         )
         published_injections = [
             _slim_injection(inj) for inj in list(self.injections)[-_PUBLISHED_INJECTIONS:]
@@ -2627,7 +2648,7 @@ class ChaosAgent:
         status = {
             "schema_version": 1,
             "overall": overall,
-            "started_at": iso(self.started_at),
+            "started_at": iso(published_started_at),
             "updated_at": updated_at,
             "active_fault": active_fault,
             "summary": f"{running_nodes}/{expected_nodes} nodes running, {metrics_ok}/{expected_nodes} metrics endpoints healthy",
