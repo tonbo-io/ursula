@@ -9,6 +9,7 @@ members = [
     "crates/ursula-bench",
     "crates/ursula-ctl",
     "crates/ursula-sim",
+    "crates/ursula-observability",
 ]
 resolver = "3"
 
@@ -38,6 +39,9 @@ hdrhistogram = "7"
 madsim = "0.2.34"
 mimalloc = { version = "0.1", default-features = false }
 opendal = "0.51"
+opentelemetry = "0.30"
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.30", default-features = false, features = ["http-proto", "reqwest-client", "trace"] }
 openraft = { version = "0.10.0-alpha.20", default-features = false, features = ["tokio-rt", "type-alias", "serde"] }
 openraft-rt = "0.10.0-alpha.20"
 pin-project-lite = "0.2"
@@ -59,6 +63,7 @@ tonic = "0.12"
 tonic-build = "0.12"
 tower = "0.5"
 tracing = "0.1"
+tracing-opentelemetry = "0.31"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 ursula = { path = "crates/ursula", version = "0.1.0" }
@@ -68,6 +73,7 @@ ursula-raft = { path = "crates/ursula-raft", version = "0.1.0" }
 ursula-runtime = { path = "crates/ursula-runtime", version = "0.1.0" }
 ursula-shard = { path = "crates/ursula-shard", version = "0.1.0" }
 ursula-stream = { path = "crates/ursula-stream", version = "0.1.0" }
+ursula-observability = { path = "crates/ursula-observability", version = "0.1.0" }
 
 [patch.crates-io]
 openraft = { git = "https://github.com/databendlabs/openraft.git", rev = "13df5b32288b7937a293759264712b5a144987ac" }

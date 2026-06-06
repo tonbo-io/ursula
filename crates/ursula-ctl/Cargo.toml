@@ -22,8 +22,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "time"] }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 url = { workspace = true, features = ["serde"] }
+ursula-observability = { workspace = true }
 
 [lints.clippy]
 wildcard_imports = "deny"

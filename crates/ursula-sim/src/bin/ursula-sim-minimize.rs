@@ -1014,13 +1014,11 @@ fn trace_minimize_candidate(mutation: &str) {
 }
 
 fn init_stderr_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .try_init();
+    // fmt-only: this crate pulls observability without the `otlp` feature, so
+    // the returned guard is inert and can be dropped immediately.
+    let _ = ursula_observability::init(ursula_observability::InitOptions::new(
+        "ursula-sim-minimize",
+    ));
 }
 
 #[cfg(madsim)]
