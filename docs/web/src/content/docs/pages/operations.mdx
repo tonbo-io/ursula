@@ -1,6 +1,5 @@
 ---
 title: Operations
-description: Day-2 surfaces around `ursulactl` — metrics, admin endpoints, SSH-side lifecycle, S3 cleanup, backup posture, and logs.
 ---
 
 The first tool to reach for is [`ursulactl`](/docs/cli). It covers the raft-aware verbs operators run most often — rolling restart, status, readiness gate. This page covers everything **around** it: the metrics shape ursulactl reads, the admin endpoints it (and your custom tooling) can call, the SSH-side lifecycle that still lives in Python, and the operational policies ursulactl does not encode (backups, log levels, S3 cleanup).

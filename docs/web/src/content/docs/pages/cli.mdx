@@ -1,6 +1,5 @@
 ---
 title: ursulactl
-description: The operator CLI for an Ursula cluster. Raft-aware rolling restarts, status, and readiness gates over plain HTTP.
 ---
 
 `ursulactl` is the first interface to reach for once a cluster is running. It speaks only to each node's HTTP surface (`/__ursula/*`), so it needs neither SSH keys nor a control-plane daemon. Its verbs encode the safety properties an operator otherwise has to remember manually:

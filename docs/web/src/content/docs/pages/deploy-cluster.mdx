@@ -1,6 +1,5 @@
 ---
 title: Deploy a cluster
-description: Run a three-node Ursula cluster with static-membership Raft and shared cold storage.
 ---
 
 Production-style Ursula runs as a static-membership Raft cluster: a fixed list of nodes with stable IDs, gRPC peer-to-peer Raft traffic, and a shared S3 cold backend. The migration benchmark target is three voting nodes across availability zones.

@@ -1,7 +1,6 @@
 ---
 title: Binary SSE
 sidebarTitle: Binary SSE
-description: How Ursula delivers binary payloads over the Server-Sent Events transport.
 ---
 
 The SSE wire format is text-only: every `data:` field must be valid UTF-8. For streams with text-shaped content types (`text/*`, `application/json`), SSE works out of the box: each event's `data` field carries the bytes verbatim.

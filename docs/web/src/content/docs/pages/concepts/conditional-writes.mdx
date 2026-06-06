@@ -1,7 +1,6 @@
 ---
 title: Conditional Writes
 sidebarTitle: Conditional Writes
-description: Coordinate writers using Stream-Seq to enforce ordering without locks or transactions.
 ---
 
 Writers appending to the same stream sometimes need coordination. Ursula currently supports one form of optimistic concurrency control via request headers, without locks or transactions.
