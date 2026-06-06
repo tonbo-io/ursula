@@ -1762,6 +1762,11 @@ pub(crate) async fn append_stream_external_by_id(
     }
 }
 
+#[tracing::instrument(
+    name = "http.append_batch",
+    skip_all,
+    fields(bucket = %bucket, stream = %stream, bytes = body.len(), payloads = tracing::field::Empty),
+)]
 pub(crate) async fn append_batch(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
@@ -1781,6 +1786,7 @@ pub(crate) async fn append_batch(
         Ok(payloads) => payloads,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
+    tracing::Span::current().record("payloads", payloads.len());
     if payloads.len() > APPEND_BATCH_MAX_ITEMS {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -2064,6 +2070,11 @@ pub(crate) async fn read_stream_by_id(
     }
 }
 
+#[tracing::instrument(
+    name = "http.snapshot_publish",
+    skip_all,
+    fields(bucket = %bucket, stream = %stream, snapshot_offset = %snapshot_offset, bytes = body.len()),
+)]
 pub(crate) async fn publish_snapshot(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
@@ -2096,6 +2107,11 @@ pub(crate) async fn publish_snapshot(
     }
 }
 
+#[tracing::instrument(
+    name = "http.snapshot_read_latest",
+    skip_all,
+    fields(bucket = %bucket, stream = %stream),
+)]
 pub(crate) async fn read_latest_snapshot(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
@@ -2128,6 +2144,11 @@ pub(crate) async fn read_latest_snapshot(
     (StatusCode::TEMPORARY_REDIRECT, response_headers).into_response()
 }
 
+#[tracing::instrument(
+    name = "http.snapshot_read",
+    skip_all,
+    fields(bucket = %bucket, stream = %stream, snapshot_offset = %snapshot_offset),
+)]
 pub(crate) async fn read_snapshot(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
@@ -2154,6 +2175,11 @@ pub(crate) async fn read_snapshot(
     }
 }
 
+#[tracing::instrument(
+    name = "http.snapshot_delete",
+    skip_all,
+    fields(bucket = %bucket, stream = %stream, snapshot_offset = %snapshot_offset),
+)]
 pub(crate) async fn delete_snapshot(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
