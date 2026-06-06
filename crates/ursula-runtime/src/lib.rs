@@ -29,6 +29,7 @@ mod request;
 mod rt;
 mod runtime;
 mod snapshot_store;
+mod trace;
 
 pub use admission::RaftUncommittedAdmission;
 pub use cold_index::ColdIndexPage;

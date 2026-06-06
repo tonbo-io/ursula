@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tracing::Instrument;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
@@ -63,11 +64,12 @@ use crate::rt::sync::Semaphore;
 use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
 use crate::rt::time::Instant;
+use crate::trace::Traced;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CoreMailbox {
     pub(crate) core_id: CoreId,
-    pub(crate) tx: mpsc::Sender<CoreCommand>,
+    pub(crate) tx: mpsc::Sender<Traced<CoreCommand>>,
 }
 
 impl CoreMailbox {
@@ -230,7 +232,7 @@ pub(crate) enum CoreCommand {
 
 pub(crate) struct CoreWorker {
     pub(crate) core_id: CoreId,
-    pub(crate) rx: mpsc::Receiver<CoreCommand>,
+    pub(crate) rx: mpsc::Receiver<Traced<CoreCommand>>,
     pub(crate) engine_factory: Arc<dyn GroupEngineFactory>,
     pub(crate) groups: HashMap<RaftGroupId, GroupMailbox>,
     pub(crate) metrics: Arc<RuntimeMetricsInner>,
@@ -265,7 +267,7 @@ fn live_read_watcher_count(read_watchers: &HashMap<BucketStreamId, Vec<ReadWatch
 }
 
 pub(crate) struct WaitReadCancel {
-    tx: mpsc::Sender<CoreCommand>,
+    tx: mpsc::Sender<Traced<CoreCommand>>,
     stream_id: Option<BucketStreamId>,
     placement: ShardPlacement,
     waiter_id: u64,
@@ -273,7 +275,7 @@ pub(crate) struct WaitReadCancel {
 
 impl WaitReadCancel {
     pub(crate) fn new(
-        tx: mpsc::Sender<CoreCommand>,
+        tx: mpsc::Sender<Traced<CoreCommand>>,
         stream_id: BucketStreamId,
         placement: ShardPlacement,
         waiter_id: u64,
@@ -297,390 +299,396 @@ impl Drop for WaitReadCancel {
             // Drop cannot await. If the owner mailbox is full, the stale
             // waiter is still removed when the next stream notification
             // consumes the closed oneshot sender.
-            let _ = self.tx.try_send(CoreCommand::CancelWaitRead {
-                stream_id,
-                placement: self.placement,
-                waiter_id: self.waiter_id,
-            });
+            let _ = self
+                .tx
+                .try_send(Traced::capture(CoreCommand::CancelWaitRead {
+                    stream_id,
+                    placement: self.placement,
+                    waiter_id: self.waiter_id,
+                }));
         }
     }
 }
 
 impl CoreWorker {
     pub(crate) async fn run(mut self) {
-        while let Some(command) = self.rx.recv().await {
-            match command {
-                CoreCommand::CreateStream {
-                    request,
-                    placement,
-                    response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    let incoming_bytes =
-                        u64::try_from(request.initial_payload.len()).expect("payload len fits u64");
-                    if let Some(err) =
-                        self.early_raft_uncommitted_backpressure(placement, incoming_bytes)
-                    {
-                        let _ = response_tx.send(Err(err));
-                        continue;
-                    }
-                    let raft_uncommitted =
-                        self.acquire_raft_uncommitted_guard(placement, incoming_bytes);
-                    self.send_group_command(placement, GroupCommand::CreateStream {
-                        request,
-                        response_tx,
-                        raft_uncommitted,
-                    })
-                    .await;
+        while let Some(Traced {
+            value: command,
+            parent,
+        }) = self.rx.recv().await
+        {
+            // Re-establish the sender's span so on-core work links back to the
+            // originating request, then dispatch under it.
+            self.dispatch(command).instrument(parent).await;
+        }
+    }
+
+    async fn dispatch(&mut self, command: CoreCommand) {
+        match command {
+            CoreCommand::CreateStream {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                let incoming_bytes =
+                    u64::try_from(request.initial_payload.len()).expect("payload len fits u64");
+                if let Some(err) =
+                    self.early_raft_uncommitted_backpressure(placement, incoming_bytes)
+                {
+                    let _ = response_tx.send(Err(err));
+                    return;
                 }
-                CoreCommand::CreateExternal {
+                let raft_uncommitted =
+                    self.acquire_raft_uncommitted_guard(placement, incoming_bytes);
+                self.send_group_command(placement, GroupCommand::CreateStream {
                     request,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::CreateExternal {
-                        request,
-                        response_tx,
-                    })
-                    .await;
-                }
-                CoreCommand::HeadStream {
+                    raft_uncommitted,
+                })
+                .await;
+            }
+            CoreCommand::CreateExternal {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::CreateExternal {
                     request,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::HeadStream {
-                        request,
-                        response_tx,
-                    })
-                    .await;
-                }
-                CoreCommand::ReadStream {
+                })
+                .await;
+            }
+            CoreCommand::HeadStream {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::HeadStream {
                     request,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::ReadStream {
-                        request,
-                        response_tx,
-                    })
-                    .await;
-                }
-                CoreCommand::PublishSnapshot {
+                })
+                .await;
+            }
+            CoreCommand::ReadStream {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::ReadStream {
                     request,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::PublishSnapshot {
-                        request,
-                        response_tx,
-                    })
-                    .await;
-                }
-                CoreCommand::ReadSnapshot {
+                })
+                .await;
+            }
+            CoreCommand::PublishSnapshot {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::PublishSnapshot {
                     request,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::ReadSnapshot {
-                        request,
-                        response_tx,
-                    })
-                    .await;
-                }
-                CoreCommand::DeleteSnapshot {
+                })
+                .await;
+            }
+            CoreCommand::ReadSnapshot {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::ReadSnapshot {
                     request,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::DeleteSnapshot {
-                        request,
-                        response_tx,
-                    })
-                    .await;
-                }
-                CoreCommand::BootstrapStream {
+                })
+                .await;
+            }
+            CoreCommand::DeleteSnapshot {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::DeleteSnapshot {
                     request,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::BootstrapStream {
-                        request,
-                        response_tx,
-                    })
-                    .await;
-                }
-                CoreCommand::WaitRead {
+                })
+                .await;
+            }
+            CoreCommand::BootstrapStream {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::BootstrapStream {
                     request,
-                    placement,
+                    response_tx,
+                })
+                .await;
+            }
+            CoreCommand::WaitRead {
+                request,
+                placement,
+                waiter_id,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::WaitRead {
+                    request,
                     waiter_id,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::WaitRead {
-                        request,
-                        waiter_id,
-                        response_tx,
-                    })
-                    .await;
-                }
-                CoreCommand::RequireLiveReadOwner {
-                    placement,
+                })
+                .await;
+            }
+            CoreCommand::RequireLiveReadOwner {
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::RequireLiveReadOwner {
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::RequireLiveReadOwner {
-                        response_tx,
-                    })
-                    .await;
-                }
-                CoreCommand::CancelWaitRead {
+                })
+                .await;
+            }
+            CoreCommand::CancelWaitRead {
+                stream_id,
+                placement,
+                waiter_id,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::CancelWaitRead {
                     stream_id,
-                    placement,
                     waiter_id,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::CancelWaitRead {
-                        stream_id,
-                        waiter_id,
-                    })
-                    .await;
-                }
-                CoreCommand::CloseStream {
+                })
+                .await;
+            }
+            CoreCommand::CloseStream {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::CloseStream {
                     request,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::CloseStream {
-                        request,
-                        response_tx,
-                    })
-                    .await;
-                }
-                CoreCommand::AddForkRef {
+                })
+                .await;
+            }
+            CoreCommand::AddForkRef {
+                stream_id,
+                now_ms,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::AddForkRef {
                     stream_id,
                     now_ms,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::AddForkRef {
-                        stream_id,
-                        now_ms,
-                        response_tx,
-                    })
-                    .await;
-                }
-                CoreCommand::ReleaseForkRef {
+                })
+                .await;
+            }
+            CoreCommand::ReleaseForkRef {
+                stream_id,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::ReleaseForkRef {
                     stream_id,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::ReleaseForkRef {
-                        stream_id,
-                        response_tx,
-                    })
-                    .await;
-                }
-                CoreCommand::DeleteStream {
+                })
+                .await;
+            }
+            CoreCommand::DeleteStream {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::DeleteStream {
                     request,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::DeleteStream {
-                        request,
-                        response_tx,
-                    })
-                    .await;
-                }
-                CoreCommand::FlushCold {
+                })
+                .await;
+            }
+            CoreCommand::FlushCold {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::FlushCold {
                     request,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::FlushCold {
-                        request,
-                        response_tx,
-                    })
-                    .await;
-                }
-                CoreCommand::PlanColdFlush {
+                })
+                .await;
+            }
+            CoreCommand::PlanColdFlush {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::PlanColdFlush {
                     request,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::PlanColdFlush {
-                        request,
-                        response_tx,
-                    })
-                    .await;
-                }
-                CoreCommand::PlanNextColdFlush {
+                })
+                .await;
+            }
+            CoreCommand::PlanNextColdFlush {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::PlanNextColdFlush {
                     request,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::PlanNextColdFlush {
-                        request,
-                        response_tx,
-                    })
-                    .await;
-                }
-                CoreCommand::PlanNextColdFlushBatch {
+                })
+                .await;
+            }
+            CoreCommand::PlanNextColdFlushBatch {
+                request,
+                placement,
+                max_candidates,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::PlanNextColdFlushBatch {
                     request,
-                    placement,
                     max_candidates,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::PlanNextColdFlushBatch {
-                        request,
-                        max_candidates,
-                        response_tx,
-                    })
+                })
+                .await;
+            }
+            CoreCommand::PlanColdGc {
+                max,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::PlanColdGc { max, response_tx })
                     .await;
-                }
-                CoreCommand::PlanColdGc {
-                    max,
-                    placement,
-                    response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::PlanColdGc {
-                        max,
-                        response_tx,
-                    })
-                    .await;
-                }
-                CoreCommand::AckColdGc {
+            }
+            CoreCommand::AckColdGc {
+                up_to_seq,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::AckColdGc {
                     up_to_seq,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::AckColdGc {
-                        up_to_seq,
-                        response_tx,
-                    })
-                    .await;
+                })
+                .await;
+            }
+            CoreCommand::Append {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                let incoming_bytes = request.payload_len();
+                if let Some(err) =
+                    self.early_raft_uncommitted_backpressure(placement, incoming_bytes)
+                {
+                    let _ = response_tx.send(Err(err));
+                    return;
                 }
-                CoreCommand::Append {
+                let raft_uncommitted =
+                    self.acquire_raft_uncommitted_guard(placement, incoming_bytes);
+                self.send_group_command(placement, GroupCommand::Append {
                     request,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    let incoming_bytes = request.payload_len();
-                    if let Some(err) =
-                        self.early_raft_uncommitted_backpressure(placement, incoming_bytes)
-                    {
-                        let _ = response_tx.send(Err(err));
-                        continue;
-                    }
-                    let raft_uncommitted =
-                        self.acquire_raft_uncommitted_guard(placement, incoming_bytes);
-                    self.send_group_command(placement, GroupCommand::Append {
-                        request,
-                        response_tx,
-                        raft_uncommitted,
-                    })
-                    .await;
-                }
-                CoreCommand::AppendExternal {
+                    raft_uncommitted,
+                })
+                .await;
+            }
+            CoreCommand::AppendExternal {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::AppendExternal {
                     request,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::AppendExternal {
-                        request,
-                        response_tx,
-                    })
-                    .await;
+                })
+                .await;
+            }
+            CoreCommand::AppendBatch {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                let incoming_bytes = append_batch_payload_bytes(&request);
+                if let Some(err) =
+                    self.early_raft_uncommitted_backpressure(placement, incoming_bytes)
+                {
+                    let _ = response_tx.send(Err(err));
+                    return;
                 }
-                CoreCommand::AppendBatch {
+                let raft_uncommitted =
+                    self.acquire_raft_uncommitted_guard(placement, incoming_bytes);
+                self.send_group_command(placement, GroupCommand::AppendBatch {
                     request,
-                    placement,
                     response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    let incoming_bytes = append_batch_payload_bytes(&request);
-                    if let Some(err) =
-                        self.early_raft_uncommitted_backpressure(placement, incoming_bytes)
-                    {
-                        let _ = response_tx.send(Err(err));
-                        continue;
-                    }
-                    let raft_uncommitted =
-                        self.acquire_raft_uncommitted_guard(placement, incoming_bytes);
-                    self.send_group_command(placement, GroupCommand::AppendBatch {
-                        request,
-                        response_tx,
-                        raft_uncommitted,
-                    })
+                    raft_uncommitted,
+                })
+                .await;
+            }
+            CoreCommand::WarmGroup {
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                let response = self.group(placement).await.map(|_| placement);
+                let _ = response_tx.send(response);
+            }
+            CoreCommand::SnapshotGroup {
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::SnapshotGroup { response_tx })
                     .await;
-                }
-                CoreCommand::WarmGroup {
-                    placement,
-                    response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    let response = self.group(placement).await.map(|_| placement);
-                    let _ = response_tx.send(response);
-                }
-                CoreCommand::SnapshotGroup {
-                    placement,
-                    response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.send_group_command(placement, GroupCommand::SnapshotGroup { response_tx })
-                        .await;
-                }
-                CoreCommand::InstallGroupSnapshot {
+            }
+            CoreCommand::InstallGroupSnapshot {
+                snapshot,
+                response_tx,
+            } => {
+                debug_assert_eq!(snapshot.placement.core_id, self.core_id);
+                self.send_group_command(snapshot.placement, GroupCommand::InstallGroupSnapshot {
                     snapshot,
                     response_tx,
-                } => {
-                    debug_assert_eq!(snapshot.placement.core_id, self.core_id);
-                    self.send_group_command(
-                        snapshot.placement,
-                        GroupCommand::InstallGroupSnapshot {
-                            snapshot,
-                            response_tx,
-                        },
-                    )
-                    .await;
-                }
-                #[cfg(madsim)]
-                CoreCommand::ShutdownGroupEngine {
-                    placement,
-                    response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    self.shutdown_group_engine(placement, response_tx).await;
-                }
-                #[cfg(madsim)]
-                CoreCommand::InstallGroupEngine {
-                    placement,
-                    engine,
-                    response_tx,
-                } => {
-                    debug_assert_eq!(placement.core_id, self.core_id);
-                    let response = self.install_group_engine(placement, engine).await;
-                    let _ = response_tx.send(response);
-                }
+                })
+                .await;
+            }
+            #[cfg(madsim)]
+            CoreCommand::ShutdownGroupEngine {
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.shutdown_group_engine(placement, response_tx).await;
+            }
+            #[cfg(madsim)]
+            CoreCommand::InstallGroupEngine {
+                placement,
+                engine,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                let response = self.install_group_engine(placement, engine).await;
+                let _ = response_tx.send(response);
             }
         }
     }
@@ -836,6 +844,16 @@ impl CoreWorker {
         Ok(())
     }
 
+    #[tracing::instrument(
+        name = "core.read",
+        skip_all,
+        fields(
+            group = placement.raft_group_id.0,
+            bucket = %request.stream_id.bucket_id,
+            stream = %request.stream_id.stream_id,
+            offset = request.offset,
+        ),
+    )]
     pub(crate) async fn read_stream(
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,
@@ -1488,6 +1506,15 @@ impl CoreWorker {
         Ok(response)
     }
 
+    #[tracing::instrument(
+        name = "core.append",
+        skip_all,
+        fields(
+            group = placement.raft_group_id.0,
+            bucket = %request.stream_id.bucket_id,
+            stream = %request.stream_id.stream_id,
+        ),
+    )]
     pub(crate) async fn apply_append(
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,
@@ -1541,6 +1568,15 @@ impl CoreWorker {
         Ok(response)
     }
 
+    #[tracing::instrument(
+        name = "core.append_external",
+        skip_all,
+        fields(
+            group = placement.raft_group_id.0,
+            bucket = %request.stream_id.bucket_id,
+            stream = %request.stream_id.stream_id,
+        ),
+    )]
     pub(crate) async fn apply_append_external(
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,
@@ -1601,6 +1637,11 @@ impl CoreWorker {
         (requests, pending)
     }
 
+    #[tracing::instrument(
+        name = "core.append_batch",
+        skip_all,
+        fields(group = runtime.placement.raft_group_id.0, batch = requests.len()),
+    )]
     pub(crate) async fn apply_prepared_append_batch_requests(
         group: &mut Box<dyn GroupEngine>,
         runtime: AppendBatchRuntime,
