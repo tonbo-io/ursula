@@ -40,8 +40,8 @@ madsim = "0.2.34"
 mimalloc = { version = "0.1", default-features = false }
 opendal = "0.51"
 opentelemetry = "0.30"
-opentelemetry_sdk = { version = "0.30", features = ["rt-tokio", "metrics"] }
-opentelemetry-otlp = { version = "0.30", default-features = false, features = ["http-proto", "reqwest-client", "trace", "metrics"] }
+opentelemetry_sdk = { version = "0.30", features = ["metrics"] }
+opentelemetry-otlp = { version = "0.30", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"] }
 openraft = { version = "0.10.0-alpha.20", default-features = false, features = ["tokio-rt", "type-alias", "serde"] }
 openraft-rt = "0.10.0-alpha.20"
 pin-project-lite = "0.2"
