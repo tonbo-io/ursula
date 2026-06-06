@@ -3,6 +3,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use tracing::Instrument;
+use tracing::Span;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
@@ -666,7 +667,21 @@ impl GroupActor {
                 raft_uncommitted,
             } => {
                 let mut batch = vec![(request, response_tx, raft_uncommitted)];
-                self.collect_append_batch_commands(pending, &mut batch);
+                let mut coalesced_parents = Vec::new();
+                self.collect_append_batch_commands(pending, &mut batch, &mut coalesced_parents);
+                // One apply span for the coalesced batch: a child of the
+                // triggering request (the current span), linked via
+                // follows_from to every other coalesced request so their
+                // traces show the shared apply instead of being silently
+                // attributed to the triggering request alone.
+                let span = tracing::debug_span!(
+                    "core.append_batch",
+                    group = self.placement.raft_group_id.0,
+                    batch = batch.len(),
+                );
+                for parent in &coalesced_parents {
+                    span.follows_from(parent);
+                }
                 let (requests, pending_batch) = CoreWorker::prepare_append_batch_requests(batch);
                 CoreWorker::apply_prepared_append_batch_requests(
                     &mut self.engine,
@@ -680,6 +695,7 @@ impl GroupActor {
                     requests,
                     self.cold_write_admission,
                 )
+                .instrument(span)
                 .await;
             }
             GroupCommand::SnapshotGroup { response_tx } => {
@@ -738,6 +754,7 @@ impl GroupActor {
         &mut self,
         pending: &mut VecDeque<Traced<GroupCommand>>,
         batch: &mut Vec<AppendBatchEntry>,
+        coalesced_parents: &mut Vec<Span>,
     ) {
         while batch.len() < GROUP_ACTOR_MAX_WRITE_BATCH {
             let command = match pending.pop_front() {
@@ -752,8 +769,8 @@ impl GroupActor {
                 },
             };
             match command {
-                // Coalesced appends carry distinct parent spans; the batch
-                // apply runs under the triggering command's span.
+                // Coalesced appends carry distinct parent spans; keep each so
+                // the batch apply span can follows_from-link them all.
                 Some(Traced {
                     value:
                         GroupCommand::AppendBatch {
@@ -761,8 +778,11 @@ impl GroupActor {
                             response_tx,
                             raft_uncommitted,
                         },
-                    ..
-                }) => batch.push((request, response_tx, raft_uncommitted)),
+                    parent,
+                }) => {
+                    batch.push((request, response_tx, raft_uncommitted));
+                    coalesced_parents.push(parent);
+                }
                 Some(other) => {
                     pending.push_front(other);
                     break;
