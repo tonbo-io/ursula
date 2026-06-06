@@ -63,7 +63,7 @@ IMPAIRMENT_SCENARIOS = {
     "cluster_partition",
     "s3_unavailable",
 }
-# The public --raft-memory chaos run should keep a surviving quorum. Dropping
+# The public storage-backend=memory chaos run should keep a surviving quorum. Dropping
 # two nodes in a three-node cluster tests data-loss behavior rather than
 # recovery, especially when the leader is among the stopped nodes.
 UNSUPPORTED_QUORUM_LOSS_SCENARIOS = {"two_node_stop", "quorum_loss"}
@@ -366,7 +366,7 @@ class ChaosAgent:
             raise SystemExit(
                 "unsupported --fault-scenarios for the default chaos run: "
                 + ",".join(configured_unsupported)
-                + "; a 3-node --raft-memory run should not intentionally drop quorum"
+                + "; a 3-node storage-backend=memory run should not intentionally drop quorum"
             )
         self.recovery_slo_secs = args.recovery_slo_secs
         self.first_fault_secs = args.first_fault_secs
@@ -1056,7 +1056,7 @@ class ChaosAgent:
 
     def record_producer_probe_skipped(self, message: str) -> None:
         # Server forgot the producer's dedup/fence state (e.g. leader change under
-        # --raft-memory where producer state lives only on the current leader).
+        # storage-backend=memory where producer state lives only on the current leader).
         # The protocol allows this; the probe just cannot exercise the invariant
         # this round, so it neither succeeds nor fails.
         self.producer_probe_skipped += 1
@@ -2902,8 +2902,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verify-modes", default="latest,recent,old,cold")
     parser.add_argument("--verify-every", type=int, default=50)
     parser.add_argument("--old-sample-every", type=int, default=128)
-    parser.add_argument("--burst-every", type=int, default=300)
-    parser.add_argument("--burst-appends", type=int, default=200)
+    parser.add_argument("--burst-every", type=int, default=0)
+    parser.add_argument("--burst-appends", type=int, default=0)
     parser.add_argument("--gc-churn-every", type=int, default=50,
                         help="appends between GC-churn rounds (0 disables)")
     parser.add_argument("--gc-churn-batch", type=int, default=4,

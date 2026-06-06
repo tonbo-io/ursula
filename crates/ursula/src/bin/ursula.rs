@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use axum::Router;
 use clap::Parser;
@@ -33,6 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let raw = RawArgs::parse();
     let args = Args::try_from(raw)?;
+    apply_profile_env_defaults(&args);
     apply_admission_env_overrides(&args);
 
     let state = if args.static_grpc_raft_configured() {
@@ -159,6 +161,288 @@ fn apply_admission_env_overrides(args: &Args) {
     }
 }
 
+fn apply_profile_env_defaults(args: &Args) {
+    for default in runtime_profile_defaults(args.profile) {
+        set_env_default(default.name, default.value);
+    }
+}
+
+fn set_env_default(name: &str, value: &str) {
+    if std::env::var_os(name).is_some() {
+        return;
+    }
+    // SAFETY: env mutation happens before any runtime, router, or background
+    // worker is spawned. Later layers only read these vars during startup.
+    unsafe {
+        std::env::set_var(name, value);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RuntimeProfile {
+    #[default]
+    Default,
+    Tiny,
+    Small,
+    Standard,
+    Large,
+}
+
+impl RuntimeProfile {
+    #[cfg(test)]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Tiny => "tiny",
+            Self::Small => "small",
+            Self::Standard => "standard",
+            Self::Large => "large",
+        }
+    }
+}
+
+impl FromStr for RuntimeProfile {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "default" | "dev" => Ok(Self::Default),
+            "tiny" => Ok(Self::Tiny),
+            "small" => Ok(Self::Small),
+            "standard" => Ok(Self::Standard),
+            "large" => Ok(Self::Large),
+            _ => Err(format!(
+                "invalid runtime profile '{raw}': expected default, dev, tiny, small, standard, or large"
+            )),
+        }
+    }
+}
+
+fn parse_runtime_profile(raw: &str) -> Result<RuntimeProfile, String> {
+    RuntimeProfile::from_str(raw)
+}
+
+fn runtime_profile_from_env(cli_profile: Option<RuntimeProfile>) -> Result<RuntimeProfile, String> {
+    if let Some(profile) = cli_profile {
+        return Ok(profile);
+    }
+    match std::env::var("URSULA_PROFILE") {
+        Ok(raw) => RuntimeProfile::from_str(&raw),
+        Err(_) => Ok(RuntimeProfile::Default),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnvDefault {
+    name: &'static str,
+    value: &'static str,
+}
+
+fn runtime_profile_defaults(profile: RuntimeProfile) -> &'static [EnvDefault] {
+    match profile {
+        RuntimeProfile::Default => &[],
+        RuntimeProfile::Tiny => &[
+            EnvDefault {
+                name: "URSULA_COLD_CACHE_BYTES",
+                value: "67108864",
+            },
+            EnvDefault {
+                name: "URSULA_COLD_FLUSH_BYTES",
+                value: "4194304",
+            },
+            EnvDefault {
+                name: "URSULA_COLD_FLUSH_MAX_CONCURRENCY",
+                value: "2",
+            },
+            EnvDefault {
+                name: "URSULA_COLD_MAX_HOT_BYTES_PER_GROUP",
+                value: "8388608",
+            },
+            EnvDefault {
+                name: "URSULA_RAFT_MAX_UNCOMMITTED_BYTES_PER_GROUP",
+                value: "8388608",
+            },
+            EnvDefault {
+                name: "URSULA_HTTP_INFLIGHT_BODY_BYTES",
+                value: "67108864",
+            },
+            EnvDefault {
+                name: "URSULA_LIVE_READ_MAX_WAITERS_PER_CORE",
+                value: "8192",
+            },
+        ],
+        RuntimeProfile::Small => &[
+            EnvDefault {
+                name: "URSULA_COLD_CACHE_BYTES",
+                value: "67108864",
+            },
+            EnvDefault {
+                name: "URSULA_COLD_FLUSH_BYTES",
+                value: "4194304",
+            },
+            EnvDefault {
+                name: "URSULA_COLD_FLUSH_MAX_CONCURRENCY",
+                value: "2",
+            },
+            EnvDefault {
+                name: "URSULA_COLD_MAX_HOT_BYTES_PER_GROUP",
+                value: "16777216",
+            },
+            EnvDefault {
+                name: "URSULA_RAFT_MAX_UNCOMMITTED_BYTES_PER_GROUP",
+                value: "16777216",
+            },
+            EnvDefault {
+                name: "URSULA_HTTP_INFLIGHT_BODY_BYTES",
+                value: "67108864",
+            },
+            EnvDefault {
+                name: "URSULA_LIVE_READ_MAX_WAITERS_PER_CORE",
+                value: "8192",
+            },
+        ],
+        RuntimeProfile::Standard => &[
+            EnvDefault {
+                name: "URSULA_COLD_CACHE_BYTES",
+                value: "268435456",
+            },
+            EnvDefault {
+                name: "URSULA_COLD_FLUSH_BYTES",
+                value: "8388608",
+            },
+            EnvDefault {
+                name: "URSULA_COLD_FLUSH_MAX_CONCURRENCY",
+                value: "4",
+            },
+            EnvDefault {
+                name: "URSULA_COLD_MAX_HOT_BYTES_PER_GROUP",
+                value: "67108864",
+            },
+            EnvDefault {
+                name: "URSULA_RAFT_MAX_UNCOMMITTED_BYTES_PER_GROUP",
+                value: "67108864",
+            },
+            EnvDefault {
+                name: "URSULA_HTTP_INFLIGHT_BODY_BYTES",
+                value: "268435456",
+            },
+            EnvDefault {
+                name: "URSULA_LIVE_READ_MAX_WAITERS_PER_CORE",
+                value: "65536",
+            },
+        ],
+        RuntimeProfile::Large => &[
+            EnvDefault {
+                name: "URSULA_COLD_CACHE_BYTES",
+                value: "536870912",
+            },
+            EnvDefault {
+                name: "URSULA_COLD_FLUSH_BYTES",
+                value: "16777216",
+            },
+            EnvDefault {
+                name: "URSULA_COLD_FLUSH_MAX_CONCURRENCY",
+                value: "8",
+            },
+            EnvDefault {
+                name: "URSULA_COLD_MAX_HOT_BYTES_PER_GROUP",
+                value: "134217728",
+            },
+            EnvDefault {
+                name: "URSULA_RAFT_MAX_UNCOMMITTED_BYTES_PER_GROUP",
+                value: "134217728",
+            },
+            EnvDefault {
+                name: "URSULA_HTTP_INFLIGHT_BODY_BYTES",
+                value: "536870912",
+            },
+            EnvDefault {
+                name: "URSULA_LIVE_READ_MAX_WAITERS_PER_CORE",
+                value: "131072",
+            },
+        ],
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageBackend {
+    Memory,
+    Disk,
+}
+
+impl FromStr for StorageBackend {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "memory" => Ok(Self::Memory),
+            // Legacy aliases kept for 0.1.x compatibility. New invocations
+            // should use `--storage-backend disk`.
+            "disk" | "raft-log" | "raft_log" => Ok(Self::Disk),
+            _ => Err(format!(
+                "invalid storage backend '{raw}': expected memory or disk"
+            )),
+        }
+    }
+}
+
+fn parse_storage_backend(raw: &str) -> Result<StorageBackend, String> {
+    StorageBackend::from_str(raw)
+}
+
+fn resolve_storage_backend(
+    profile: RuntimeProfile,
+    storage_backend: Option<StorageBackend>,
+    disk_path: Option<PathBuf>,
+    legacy_wal_dir: Option<PathBuf>,
+    legacy_raft_log_dir: Option<PathBuf>,
+    legacy_raft_memory: bool,
+) -> Result<(Option<PathBuf>, Option<PathBuf>, bool), String> {
+    if disk_path.is_some()
+        && (legacy_wal_dir.is_some() || legacy_raft_log_dir.is_some() || legacy_raft_memory)
+    {
+        return Err("--disk-path cannot be combined with legacy storage flags".to_owned());
+    }
+
+    if storage_backend.is_none()
+        && (legacy_wal_dir.is_some() || legacy_raft_log_dir.is_some() || legacy_raft_memory)
+    {
+        return Ok((legacy_wal_dir, legacy_raft_log_dir, legacy_raft_memory));
+    }
+
+    if storage_backend.is_none() {
+        if let Some(disk_path) = disk_path {
+            return Ok((None, Some(disk_path.join("raft-log")), false));
+        }
+        if profile_defaults_to_raft(profile) {
+            return Ok((None, None, true));
+        }
+        return Ok((None, None, false));
+    }
+
+    match storage_backend.expect("checked above") {
+        StorageBackend::Memory => {
+            if let Some(disk_path) = disk_path {
+                return Err(format!(
+                    "--storage-backend memory does not accept --disk-path '{}'",
+                    disk_path.display()
+                ));
+            }
+            Ok((None, None, true))
+        }
+        StorageBackend::Disk => {
+            let Some(disk_path) = disk_path else {
+                return Err("--storage-backend disk requires --disk-path DIR".to_owned());
+            };
+            Ok((None, Some(disk_path.join("raft-log")), false))
+        }
+    }
+}
+
+fn profile_defaults_to_raft(profile: RuntimeProfile) -> bool {
+    !matches!(profile, RuntimeProfile::Default)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum TokioConsoleInit {
     Disabled,
@@ -269,16 +553,28 @@ struct RawArgs {
     #[arg(long)]
     raft_group_count: Option<usize>,
 
-    /// Persist write-ahead log to the given directory.
-    #[arg(long, group = "storage")]
+    /// Resource profile for process-local memory and IO budgets.
+    #[arg(long, value_parser = parse_runtime_profile)]
+    profile: Option<RuntimeProfile>,
+
+    /// Storage backend for the local process: memory or durable disk Raft log.
+    #[arg(long, value_parser = parse_storage_backend, group = "storage")]
+    storage_backend: Option<StorageBackend>,
+
+    /// Disk root used by `--storage-backend disk`.
+    #[arg(long, alias = "storage-dir")]
+    disk_path: Option<PathBuf>,
+
+    /// Legacy diagnostic WAL path. Use `--storage-backend disk --disk-path DIR`.
+    #[arg(long, group = "storage", hide = true)]
     wal_dir: Option<PathBuf>,
 
-    /// Persist Raft log entries to the given directory.
-    #[arg(long, group = "storage")]
+    /// Legacy durable Raft log path. Use `--storage-backend disk --disk-path DIR`.
+    #[arg(long, group = "storage", hide = true)]
     raft_log_dir: Option<PathBuf>,
 
-    /// Run Raft entirely in-memory (no disk persistence).
-    #[arg(long, group = "storage")]
+    /// Legacy memory-Raft selector. Use `--storage-backend memory`.
+    #[arg(long, group = "storage", hide = true)]
     raft_memory: bool,
 
     /// Static gRPC Raft cluster JSON config file path.
@@ -332,17 +628,27 @@ impl TryFrom<RawArgs> for Args {
         }
 
         let raft_init_membership = raw.raft_init_membership || raw.raft_init_membership_per_group;
+        let profile = runtime_profile_from_env(raw.profile)?;
+        let (wal_dir, raft_log_dir, raft_memory) = resolve_storage_backend(
+            profile,
+            raw.storage_backend,
+            raw.disk_path,
+            raw.wal_dir,
+            raw.raft_log_dir,
+            raw.raft_memory,
+        )?;
 
         let mut args = Args {
             listen: raw.listen,
             cluster_listen: raw.cluster_listen,
             core_count: raw.core_count,
+            profile,
             raft_group_count: raw
                 .raft_group_count
                 .unwrap_or_else(|| raw.core_count.saturating_mul(16).max(1)),
-            wal_dir: raw.wal_dir,
-            raft_log_dir: raw.raft_log_dir,
-            raft_memory: raw.raft_memory,
+            wal_dir,
+            raft_log_dir,
+            raft_memory,
             raft_cluster_config: raw.raft_cluster_config.clone(),
             raft_node_id: raw.raft_node_id,
             raft_peers,
@@ -374,6 +680,7 @@ struct Args {
     listen: SocketAddr,
     cluster_listen: Option<SocketAddr>,
     core_count: usize,
+    profile: RuntimeProfile,
     raft_group_count: usize,
     wal_dir: Option<PathBuf>,
     raft_log_dir: Option<PathBuf>,
@@ -433,10 +740,13 @@ impl Args {
             return Ok(());
         }
         if self.wal_dir.is_some() {
-            return Err("static gRPC Raft does not support --wal-dir".into());
+            return Err("static gRPC Raft does not support legacy --wal-dir".into());
         }
         if !self.raft_memory && self.raft_log_dir.is_none() {
-            return Err("static gRPC Raft requires --raft-memory or --raft-log-dir".into());
+            return Err(
+                "static gRPC Raft requires --storage-backend memory or --storage-backend disk --disk-path DIR"
+                    .into(),
+            );
         }
         if self.raft_peers.is_empty() {
             return Err("static gRPC Raft requires at least one --raft-peer NODE_ID=URL".into());
@@ -684,7 +994,8 @@ mod tests {
             "4",
             "--raft-group-count",
             "16",
-            "--raft-memory",
+            "--storage-backend",
+            "memory",
             "--raft-node-id",
             "2",
             "--raft-peer",
@@ -717,9 +1028,193 @@ mod tests {
     }
 
     #[test]
+    fn parses_runtime_profile_flag() {
+        let args =
+            Args::parse_from(["--profile", "small"]).expect("runtime profile flag should parse");
+
+        assert_eq!(args.profile, RuntimeProfile::Small);
+    }
+
+    #[test]
+    fn default_profile_keeps_default_non_raft_runtime() {
+        let args = Args::parse_from(["--profile", "dev"]).expect("dev profile should parse");
+
+        assert!(!args.raft_memory);
+        assert!(args.wal_dir.is_none());
+        assert!(args.raft_log_dir.is_none());
+    }
+
+    #[test]
+    fn production_profiles_default_to_raft_memory() {
+        let args =
+            Args::parse_from(["--profile", "standard"]).expect("standard profile should parse");
+
+        assert!(args.raft_memory);
+        assert!(args.wal_dir.is_none());
+        assert!(args.raft_log_dir.is_none());
+    }
+
+    #[test]
+    fn parses_storage_backend_memory() {
+        let args = Args::parse_from(["--storage-backend", "memory"])
+            .expect("memory storage backend should parse");
+
+        assert!(args.raft_memory);
+        assert!(args.wal_dir.is_none());
+        assert!(args.raft_log_dir.is_none());
+    }
+
+    #[test]
+    fn parses_storage_backend_disk_with_disk_path() {
+        let args = Args::parse_from(["--storage-backend", "disk", "--disk-path", "./data"])
+            .expect("disk storage backend should parse");
+
+        assert_eq!(
+            args.raft_log_dir.as_deref(),
+            Some(Path::new("./data/raft-log"))
+        );
+        assert!(args.wal_dir.is_none());
+        assert!(!args.raft_memory);
+    }
+
+    #[test]
+    fn parses_storage_backend_raft_log_alias_with_disk_path() {
+        let args = Args::parse_from(["--storage-backend", "raft-log", "--disk-path", "./data"])
+            .expect("raft-log storage backend should parse");
+
+        assert_eq!(
+            args.raft_log_dir.as_deref(),
+            Some(Path::new("./data/raft-log"))
+        );
+        assert!(args.wal_dir.is_none());
+        assert!(!args.raft_memory);
+    }
+
+    #[test]
+    fn legacy_storage_flags_still_parse() {
+        let args =
+            Args::parse_from(["--wal-dir", "./data/wal"]).expect("legacy wal flag should parse");
+
+        assert_eq!(args.wal_dir.as_deref(), Some(Path::new("./data/wal")));
+    }
+
+    #[test]
+    fn parses_storage_dir_as_legacy_alias_for_disk_path() {
+        let args = Args::parse_from(["--storage-backend", "disk", "--storage-dir", "./data"])
+            .expect("legacy storage-dir alias should parse");
+
+        assert_eq!(
+            args.raft_log_dir.as_deref(),
+            Some(Path::new("./data/raft-log"))
+        );
+    }
+
+    #[test]
+    fn disk_path_without_backend_selects_disk_storage() {
+        let args = Args::parse_from(["--disk-path", "./data"])
+            .expect("disk path without backend should select disk storage");
+
+        assert_eq!(
+            args.raft_log_dir.as_deref(),
+            Some(Path::new("./data/raft-log"))
+        );
+        assert!(args.wal_dir.is_none());
+        assert!(!args.raft_memory);
+    }
+
+    #[test]
+    fn rejects_storage_backend_disk_without_storage_dir() {
+        let err = Args::parse_from(["--storage-backend", "disk"])
+            .expect_err("disk storage backend without dir should be rejected");
+
+        assert!(err.contains("--storage-backend disk requires --disk-path DIR"));
+    }
+
+    #[test]
+    fn rejects_storage_backend_memory_with_disk_path() {
+        let err = Args::parse_from(["--storage-backend", "memory", "--disk-path", "./data"])
+            .expect_err("memory storage backend with disk path should be rejected");
+
+        assert!(err.contains("--storage-backend memory does not accept --disk-path"));
+    }
+
+    #[test]
+    fn runtime_profile_parser_accepts_expected_names() {
+        assert_eq!(
+            "default".parse::<RuntimeProfile>(),
+            Ok(RuntimeProfile::Default)
+        );
+        assert_eq!("dev".parse::<RuntimeProfile>(), Ok(RuntimeProfile::Default));
+        assert_eq!("tiny".parse::<RuntimeProfile>(), Ok(RuntimeProfile::Tiny));
+        assert_eq!("small".parse::<RuntimeProfile>(), Ok(RuntimeProfile::Small));
+        assert_eq!(
+            "standard".parse::<RuntimeProfile>(),
+            Ok(RuntimeProfile::Standard)
+        );
+        assert_eq!("large".parse::<RuntimeProfile>(), Ok(RuntimeProfile::Large));
+        assert_eq!(RuntimeProfile::Large.as_str(), "large");
+        assert!("chaos-raft-memory".parse::<RuntimeProfile>().is_err());
+    }
+
+    #[test]
+    fn runtime_profiles_expand_to_expected_env_defaults() {
+        assert!(runtime_profile_defaults(RuntimeProfile::Default).is_empty());
+
+        let tiny = runtime_profile_defaults(RuntimeProfile::Tiny);
+        assert!(tiny.contains(&EnvDefault {
+            name: "URSULA_COLD_CACHE_BYTES",
+            value: "67108864",
+        }));
+        assert!(tiny.contains(&EnvDefault {
+            name: "URSULA_COLD_MAX_HOT_BYTES_PER_GROUP",
+            value: "8388608",
+        }));
+        assert!(tiny.contains(&EnvDefault {
+            name: "URSULA_HTTP_INFLIGHT_BODY_BYTES",
+            value: "67108864",
+        }));
+
+        let small = runtime_profile_defaults(RuntimeProfile::Small);
+        assert!(small.contains(&EnvDefault {
+            name: "URSULA_COLD_MAX_HOT_BYTES_PER_GROUP",
+            value: "16777216",
+        }));
+        assert!(small.contains(&EnvDefault {
+            name: "URSULA_HTTP_INFLIGHT_BODY_BYTES",
+            value: "67108864",
+        }));
+
+        let standard = runtime_profile_defaults(RuntimeProfile::Standard);
+        assert!(standard.contains(&EnvDefault {
+            name: "URSULA_RAFT_MAX_UNCOMMITTED_BYTES_PER_GROUP",
+            value: "67108864",
+        }));
+
+        for profile in [
+            RuntimeProfile::Tiny,
+            RuntimeProfile::Small,
+            RuntimeProfile::Standard,
+            RuntimeProfile::Large,
+        ] {
+            let defaults = runtime_profile_defaults(profile);
+            assert!(
+                !defaults
+                    .iter()
+                    .any(|default| default.name == "URSULA_NODE_MEMORY_ABORT_CAP_BYTES")
+            );
+            assert!(
+                !defaults
+                    .iter()
+                    .any(|default| default.name == "URSULA_SNAPSHOT_DRIVE_INTERVAL_MS")
+            );
+        }
+    }
+
+    #[test]
     fn parses_static_grpc_per_group_membership_initializers() {
         let args = Args::parse_from([
-            "--raft-memory",
+            "--storage-backend",
+            "memory",
             "--raft-node-id",
             "2",
             "--raft-peer",
@@ -752,7 +1247,8 @@ mod tests {
         .expect("write cluster config");
 
         let args = Args::parse_from([
-            "--raft-memory",
+            "--storage-backend",
+            "memory",
             "--raft-group-count",
             "2",
             "--raft-cluster-config",
@@ -794,7 +1290,8 @@ mod tests {
         .expect("write cluster config");
 
         let args = Args::parse_from([
-            "--raft-memory",
+            "--storage-backend",
+            "memory",
             "--raft-group-count",
             "2",
             "--raft-cluster-config",
@@ -831,7 +1328,8 @@ mod tests {
         .expect("write cluster config");
 
         let args = Args::parse_from([
-            "--raft-memory",
+            "--storage-backend",
+            "memory",
             "--raft-group-count",
             "2",
             "--raft-cluster-config",
@@ -871,7 +1369,8 @@ mod tests {
         .expect("write cluster config");
 
         let err = Args::parse_from([
-            "--raft-memory",
+            "--storage-backend",
+            "memory",
             "--raft-group-count",
             "2",
             "--raft-cluster-config",
@@ -902,8 +1401,10 @@ mod tests {
     #[test]
     fn parses_static_grpc_raft_cluster_with_durable_log_dir() {
         let args = Args::parse_from([
-            "--raft-log-dir",
-            "/tmp/ursula-raft-log",
+            "--storage-backend",
+            "disk",
+            "--disk-path",
+            "/tmp/ursula-data",
             "--raft-node-id",
             "1",
             "--raft-peer",
@@ -915,7 +1416,7 @@ mod tests {
         assert!(args.static_grpc_raft_configured());
         assert_eq!(
             args.raft_log_dir.as_deref(),
-            Some(Path::new("/tmp/ursula-raft-log"))
+            Some(Path::new("/tmp/ursula-data/raft-log"))
         );
         assert!(!args.raft_memory);
         assert_eq!(args.raft_node_id, Some(1));
@@ -1012,10 +1513,10 @@ mod tests {
             "1=http://127.0.0.1:4437",
             "--raft-init-membership",
         ])
-        .expect_err("static gRPC with --wal-dir should be rejected");
+        .expect_err("static gRPC with legacy wal storage should be rejected");
 
         assert!(
-            err.contains("static gRPC Raft does not support --wal-dir"),
+            err.contains("static gRPC Raft does not support legacy --wal-dir"),
             "got: {err}"
         );
     }
@@ -1029,10 +1530,10 @@ mod tests {
             "1=http://127.0.0.1:4437",
             "--raft-init-membership",
         ])
-        .expect_err("static gRPC without --raft-memory or --raft-log-dir should be rejected");
+        .expect_err("static gRPC without storage backend should be rejected");
 
         assert!(
-            err.contains("static gRPC Raft requires --raft-memory or --raft-log-dir"),
+            err.contains("static gRPC Raft requires --storage-backend memory"),
             "got: {err}"
         );
     }
@@ -1040,7 +1541,8 @@ mod tests {
     #[test]
     fn rejects_static_grpc_without_peers() {
         let err = Args::parse_from([
-            "--raft-memory",
+            "--storage-backend",
+            "memory",
             "--raft-node-id",
             "1",
             "--raft-init-membership",
@@ -1056,7 +1558,8 @@ mod tests {
     #[test]
     fn rejects_static_grpc_without_node_id() {
         let err = Args::parse_from([
-            "--raft-memory",
+            "--storage-backend",
+            "memory",
             "--raft-peer",
             "1=http://127.0.0.1:4437",
             "--raft-init-membership",
@@ -1072,7 +1575,8 @@ mod tests {
     #[test]
     fn rejects_static_grpc_when_node_id_not_in_peers() {
         let err = Args::parse_from([
-            "--raft-memory",
+            "--storage-backend",
+            "memory",
             "--raft-node-id",
             "2",
             "--raft-peer",

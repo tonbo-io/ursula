@@ -12,7 +12,7 @@ Each node needs:
 - a stable Raft `node_id`
 - a TCP listen address (the same address every peer dials over gRPC)
 - the full peer list (including itself)
-- the same storage mode (`--raft-memory` or `--raft-log-dir DIR`) on every peer
+- the same storage mode (`--storage-backend memory` or `--storage-backend disk --disk-path DIR`) on every peer
 - a one-time membership initializer on the first start (`--raft-init-membership-per-group`)
 - a shared cold backend (filesystem path for single-host smoke, S3 for production)
 
@@ -43,7 +43,8 @@ ursula \
   --listen 0.0.0.0:4437 \
   --core-count 16 \
   --raft-group-count 256 \
-  --raft-log-dir /var/lib/ursula/raft \
+  --storage-backend disk \
+  --disk-path /var/lib/ursula \
   --raft-cluster-config /etc/ursula/cluster.json
 ```
 
@@ -51,7 +52,7 @@ ursula \
 
 ## Start nodes 2 and 3
 
-Same command, same JSON file with `node_id` adjusted to 2 and 3 respectively. Use `--raft-memory` instead of `--raft-log-dir` if you want a non-durable test cluster.
+Same command, same JSON file with `node_id` adjusted to 2 and 3 respectively. Use `--storage-backend memory` instead of `--storage-backend disk --disk-path DIR` if you want a non-durable test cluster.
 
 ## Verify with ursulactl
 
@@ -84,11 +85,10 @@ done
 
 ## Storage exclusivity
 
-These flags are mutually exclusive: pick one storage mode per cluster.
+Pick one storage backend per cluster.
 
-- `--raft-memory` - fast, volatile. Survives no restart
-- `--raft-log-dir DIR` - durable gRPC-Raft mode (recommended for clusters)
-- `--wal-dir DIR` - single-node WAL mode **not compatible with static gRPC Raft**
+- `--storage-backend memory` - fast, volatile. Survives no restart
+- `--storage-backend disk --disk-path DIR` - durable OpenRaft log mode under `DIR/raft-log` (recommended for clusters)
 
 ## Cold storage
 

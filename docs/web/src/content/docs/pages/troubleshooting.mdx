@@ -26,13 +26,15 @@ Ursula does **not** expose `/healthz`, `/readyz`, Prometheus `/metrics`, or `/cl
 
 ## Startup failures
 
-### `use only one of --wal-dir or --raft-log-dir`
+### `--storage-backend memory does not accept --disk-path`
 
-Storage flags are mutually exclusive. Pick one of `--raft-memory`, `--wal-dir`, `--raft-log-dir`.
+`--disk-path` selects disk storage when `--storage-backend` is omitted. Do not pass it with `--storage-backend memory`.
 
-### `static gRPC Raft does not support --wal-dir`
+### `static gRPC Raft does not support legacy --wal-dir`
 
-`--wal-dir` is the standalone WAL runtime. Cluster mode needs `--raft-log-dir` or `--raft-memory`.
+The hidden legacy `--wal-dir` flag selects the standalone WAL runtime. Cluster mode needs `--storage-backend disk --disk-path DIR` or `--storage-backend memory`.
+
+Legacy storage flags are compatibility-only and will be removed in a future 0.1.x cleanup.
 
 ### `static gRPC Raft requires --raft-node-id` / `--raft-peer ID=URL`
 
@@ -50,7 +52,7 @@ Leave `URSULA_COLD_BACKEND` unset if you don't want cold storage.
 
 `--listen` is taken. Public HTTP and inter-node gRPC share the same port.
 
-### I/O error on `--wal-dir` or `--raft-log-dir`
+### I/O error on `--disk-path`
 
 The directory must be writable. No lock file to clear, Ursula trusts the directory.
 
@@ -133,7 +135,7 @@ Either an election is in progress or quorum is lost for that group. Only streams
 State-machine apply runs on the follower's owner core. If CPU is pinned, `last_applied` trails. Check:
 
 - Per-core mailbox depth (sustained queueing means saturation).
-- Disk pressure if `--raft-log-dir` (fsync latency).
+- Disk pressure if `--storage-backend disk` (fsync latency).
 - A pathological hot stream forcing constant cold flushes (`hot_bytes_total` per group).
 
 ### Manually trigger a snapshot
@@ -149,7 +151,7 @@ Purge only after the snapshot replicates. Otherwise a slow follower may need log
 
 ### Writes succeed but data never reaches S3
 
-- `URSULA_COLD_BACKEND` not set, or set to `fs` when you expected `s3`.
+- `URSULA_COLD_BACKEND` not set, or set to `memory` when you expected `s3`.
 - IAM permissions missing. Required: `s3:GetObject`, `s3:PutObject`, `s3:ListBucket`, `s3:DeleteObject`.
 - `URSULA_COLD_S3_ENDPOINT` unreachable.
 - Cold flush worker stalled (`cold_backpressure_events_total` climbing).

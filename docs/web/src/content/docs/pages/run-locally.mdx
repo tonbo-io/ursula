@@ -20,18 +20,18 @@ It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses the in-mem
 OpenRaft with an in-memory log. Fast iteration, no persistence, but the runtime exercises the real Raft path:
 
 ```bash
-cargo run --bin ursula -- --raft-memory
+cargo run --bin ursula -- --storage-backend memory
 ```
 
-## WAL-backed single node
+## Disk-backed single node
 
 Persistent local storage. Streams survive a restart:
 
 ```bash
-cargo run --bin ursula -- --wal-dir ./data/wal
+cargo run --bin ursula -- --storage-backend disk --disk-path ./data
 ```
 
-The `--wal-dir` directory will contain protobuf-framed Raft log records per group plus a shared `journal.bin` per core. Removing the directory wipes state cleanly.
+The `--disk-path` directory will contain a `raft-log/` subdirectory with protobuf-framed Raft log records per group plus a shared `journal.bin` per core. Removing the directory wipes state cleanly.
 
 ## Smoke test
 
@@ -59,15 +59,14 @@ curl http://127.0.0.1:4437/__ursula/metrics | jq .
 | `--listen ADDR` | `127.0.0.1:4437` | TCP bind address |
 | `--core-count N` | `available_parallelism` | Worker threads (each pinned to its mailbox event loop) |
 | `--raft-group-count N` | `core_count × 16` | Total Raft groups. Higher = better stream-to-group hash spread |
-| `--raft-memory` | off | In-memory Raft log. No persistence |
-| `--wal-dir DIR` | none | Per-group WAL + per-core journal under `DIR` |
-| `--raft-log-dir DIR` | none | Durable Raft log directory (used with static gRPC cluster mode) |
+| `--storage-backend BACKEND` | default runtime | `memory` or `disk` |
+| `--disk-path DIR` | none | Required for `disk`; Raft logs live under `DIR/raft-log` |
 | `--raft-node-id ID` | none | Required for static gRPC cluster mode |
 | `--raft-peer ID=URL` | none (repeatable) | Static peer list for the cluster |
 | `--raft-cluster-config FILE` | none | JSON file equivalent of `--raft-node-id` + `--raft-peer` |
 | `--raft-init-membership[-per-group]` | off | One-time membership bootstrap |
 
-Storage flags (`--raft-memory`, `--wal-dir`, `--raft-log-dir`) are mutually exclusive.
+`--storage-backend disk` uses the durable OpenRaft log store. Static gRPC clusters use the same `disk` backend or `memory` for volatile tests.
 
 ## Environment variables
 
@@ -75,7 +74,7 @@ A small set of knobs are read at startup:
 
 - `URSULA_LIVE_READ_MAX_WAITERS_PER_CORE` (default `65536`) - SSE waiter cap per core
 - `URSULA_COLD_MAX_HOT_BYTES_PER_GROUP` (default 64 MiB) - when a group's hot ring exceeds this, cold flush kicks in
-- `URSULA_COLD_BACKEND` (`fs` or `s3`), `URSULA_COLD_S3_*`, `URSULA_COLD_ROOT`, `URSULA_COLD_FLUSH_*` - cold-storage configuration. See [configure S3](/docs/configure-s3)
+- `URSULA_COLD_BACKEND` (`memory` or `s3`), `URSULA_COLD_S3_*`, `URSULA_COLD_ROOT`, `URSULA_COLD_FLUSH_*` - cold-storage configuration. See [configure S3](/docs/configure-s3)
 - `URSULA_TOKIO_CONSOLE` - when set, initializes the Tokio console subscriber (requires building with `--features tokio-console` and `RUSTFLAGS="--cfg tokio_unstable"`)
 
 ## Next

@@ -287,9 +287,14 @@ class Ec2Ops:
             *self.all_peer_flags(),
         ]
         if self.config.raft_memory:
-            args.append("--raft-memory")
+            args += ["--storage-backend", "memory"]
         elif self.config.raft_log_prefix:
-            args += ["--raft-log-dir", f"{self.config.raft_log_prefix}-{node.id}"]
+            args += [
+                "--storage-backend",
+                "disk",
+                "--disk-path",
+                f"{self.config.raft_log_prefix}-{node.id}",
+            ]
         if self.config.init_membership_per_group:
             args.append("--raft-init-membership-per-group")
         return args
@@ -788,14 +793,14 @@ def build_parser() -> argparse.ArgumentParser:
     chaos_agent.add_argument("--payload-sizes", default="128,1024,16384,65536")
     chaos_agent.add_argument("--payload-kinds", default="ascii,binary,zero,utf8")
     chaos_agent.add_argument("--producer-count", type=int, default=8)
-    chaos_agent.add_argument("--epoch-bump-every", type=int, default=5000)
+    chaos_agent.add_argument("--epoch-bump-every", type=int, default=0)
     chaos_agent.add_argument("--producer-probe-every", type=int, default=200)
     chaos_agent.add_argument("--reader-count", type=int, default=2)
     chaos_agent.add_argument("--verify-modes", default="latest,recent,old,cold")
     chaos_agent.add_argument("--verify-every", type=int, default=50)
     chaos_agent.add_argument("--old-sample-every", type=int, default=128)
-    chaos_agent.add_argument("--burst-every", type=int, default=300)
-    chaos_agent.add_argument("--burst-appends", type=int, default=200)
+    chaos_agent.add_argument("--burst-every", type=int, default=0)
+    chaos_agent.add_argument("--burst-appends", type=int, default=0)
     chaos_agent.add_argument("--status-every", type=int, default=15)
     chaos_agent.add_argument("--fault-min-secs", type=int, default=900)
     chaos_agent.add_argument("--fault-max-secs", type=int, default=1800)

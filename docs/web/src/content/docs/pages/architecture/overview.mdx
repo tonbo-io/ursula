@@ -50,7 +50,7 @@ The API is the [Durable Streams protocol](https://durablestreams.com/), an open 
                                    │
                                    v
                        ┌────────────────────────┐
-                       │ Cold storage (S3 / fs) │
+                       │ Cold storage (S3)      │
                        │ per-stream chunks      │
                        └────────────────────────┘
 ```
@@ -75,7 +75,7 @@ Every stream is replicated to all voting members of its Raft group. Hot data liv
       │
       ├── hot state and live watchers
       │
-      └── cold chunks in S3 / fs
+      └── cold chunks in S3
 ```
 
 A request enters the HTTP server, routing maps the bucket and stream name to one owner core and one Raft group, and the rest of the request runs inside that group. The group owns its hot bytes, live-tail watchers, producer dedup state, and Raft state machine, so mutable stream state does not cross cores after routing.
@@ -85,8 +85,8 @@ A request enters the HTTP server, routing maps the bucket and stream name to one
 The `GroupEngine` trait is the seam between the runtime and a group's storage and replication strategy. Three engines ship today:
 
 - **In-memory, non-replicated.** Used in tests and as a performance baseline.
-- **WAL-backed Raft engine** (`--wal-dir`). OpenRaft over a per-group write-ahead log of protobuf-framed records, plus a shared per-core journal. Durable across restarts.
-- **Memory-log Raft engine** (`--raft-memory`). OpenRaft with an in-memory log store. Fast iteration, no persistence.
+- **Disk-backed Raft engine** (`--storage-backend disk --disk-path DIR`). OpenRaft over a per-group write-ahead log of protobuf-framed records under `DIR/raft-log`, plus a shared per-core journal. Durable across restarts.
+- **Memory-log Raft engine** (`--storage-backend memory`). OpenRaft with an in-memory log store. Fast iteration, no persistence.
 
 A factory selected at startup picks which engine each group opens, leaving the runtime code identical across modes.
 
@@ -131,7 +131,7 @@ Each Raft group has two storage planes: a replicated log and a stream state mach
                     ┌─────────┴─────────┐
                     v                   v
               hot ring memory      cold chunk refs
-              recent bytes         S3 / fs objects
+              recent bytes         S3 objects
 ```
 
 The Raft log is the ordering and durability boundary for writes. A write is acknowledged only after a majority of that group's replicas persist the entry. The entry carries the stream command and metadata needed to apply it deterministically.

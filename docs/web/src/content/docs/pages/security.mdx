@@ -58,7 +58,7 @@ CORS is permissive (`Access-Control-Allow-Origin: *`). Restrict at the proxy for
 - **Authenticate at the proxy.** Validate the caller (OAuth2, mTLS, signed requests) and reject unauthenticated traffic before it reaches Ursula.
 - **Block admin paths from public traffic.** Deny `/__ursula/*` from the public listener; allow it only on an internal or ops network.
 - **Use IAM roles for S3.** Omit the static `URSULA_COLD_S3_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` and let the AWS SDK credential chain discover credentials.
-- **Encrypt data volumes.** Apply full-disk encryption to `--wal-dir` / `--raft-log-dir`.
+- **Encrypt data volumes.** Apply full-disk encryption to `--disk-path`.
 - **Keep peer traffic private.** Never route gRPC peer traffic across the public internet.
 
 ## Reporting vulnerabilities
