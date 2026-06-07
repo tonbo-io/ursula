@@ -3612,6 +3612,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ursula-control"
+version = "0.1.3"
+dependencies = [
+ "serde",
+ "ursula-shard",
+]
+
+[[package]]
 name = "ursula-ctl"
 version = "0.1.3"
 dependencies = [

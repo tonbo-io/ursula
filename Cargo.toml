@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/ursula-proto",
+    "crates/ursula-control",
     "crates/ursula-runtime",
     "crates/ursula-raft",
     "crates/ursula",
@@ -67,6 +68,7 @@ tracing-opentelemetry = "0.31"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 ursula = { path = "crates/ursula", version = "0.1.0" }
+ursula-control = { path = "crates/ursula-control", version = "0.1.0" }
 ursula-ctl = { path = "crates/ursula-ctl", version = "0.1.0" }
 ursula-proto = { path = "crates/ursula-proto", version = "0.1.0" }
 ursula-raft = { path = "crates/ursula-raft", version = "0.1.0" }
