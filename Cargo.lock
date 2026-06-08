@@ -3567,7 +3567,7 @@ dependencies = [
 
 [[package]]
 name = "ursula"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "axum 0.8.9",
  "base64 0.22.1",
@@ -3594,7 +3594,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-bench"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3613,7 +3613,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-ctl"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -3629,7 +3629,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-observability"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "criterion",
  "opentelemetry",
@@ -3642,7 +3642,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-proto"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "prost 0.13.5",
  "prost-build",
@@ -3652,7 +3652,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-raft"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "futures-util",
  "madsim",
@@ -3678,7 +3678,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-runtime"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "criterion",
@@ -3696,7 +3696,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-shard"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "serde",
  "ursula-proto",
@@ -3704,7 +3704,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-sim"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "axum 0.8.9",
  "madsim",
@@ -3723,7 +3723,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-stream"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "proptest",
  "serde",
