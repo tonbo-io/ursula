@@ -62,7 +62,26 @@ IMPAIRMENT_SCENARIOS = {
     "cluster_netem_loss",
     "cluster_partition",
     "s3_unavailable",
+    # Process faults recover via systemd auto-restart (kill) or faultd thaw
+    # (freeze) — both driven by the clear_impairment recovery path, which clears
+    # every node and waits for the cluster to go ready again without needing an
+    # EC2 instance-state change. They must NOT use the stop/start state machine,
+    # which waits for instance_state to flip to "stopped" (it never does here:
+    # the instance stays running, only the ursula process restarts).
+    "process_kill",
+    "process_freeze",
+    "oneway_partition",
+    "netem_reorder",
+    "netem_duplicate",
 }
+# process_kill restarts a --raft-memory node, which must rebuild every raft group
+# from the S3 snapshot + peer logs (millions of entries) before it rejoins quorum
+# — minutes, not the seconds an impairment /clear takes. Reusing the normal
+# recovery SLO flags every node-crash recovery as slo_missed and trips
+# repair_failed even though the node recovers fine (observed on #526), so
+# catch-up scenarios get a much longer SLO.
+CATCH_UP_SCENARIOS = {"process_kill"}
+CATCH_UP_RECOVERY_SLO_SECS = 900
 # The public storage-backend=memory chaos run should keep a surviving quorum. Dropping
 # two nodes in a three-node cluster tests data-loss behavior rather than
 # recovery, especially when the leader is among the stopped nodes.
@@ -93,6 +112,9 @@ CLUSTER_IPS_BY_NAME = {
     "ursula-chaos-node-2": "172.31.31.150",
     "ursula-chaos-node-3": "172.31.47.237",
 }
+# systemd unit running the ursula node process on each node, targeted by the
+# process kill/freeze faults (faultd runs `systemctl` against it).
+NODE_SERVICE_UNIT = "ursula-chaos.service"
 SETSUM_PRIMES = [
     4294967291,
     4294967279,
@@ -2012,6 +2034,69 @@ class ChaosAgent:
                 ) and applied
             self.mark_current_injection_apply_result(applied)
             return
+        if scenario == "process_kill":
+            applied = True
+            for node in targets:
+                applied = self.apply_node_impairment(
+                    node, {"kind": "process", "action": "kill", "units": [NODE_SERVICE_UNIT]}
+                ) and applied
+            self.mark_current_injection_apply_result(applied)
+            return
+        if scenario == "process_freeze":
+            applied = True
+            for node in targets:
+                applied = self.apply_node_impairment(
+                    node, {"kind": "process", "action": "freeze", "units": [NODE_SERVICE_UNIT]}
+                ) and applied
+            self.mark_current_injection_apply_result(applied)
+            return
+        if scenario == "oneway_partition":
+            peer_cluster_ips = [
+                CLUSTER_IPS_BY_NAME[node.name]
+                for node in self.nodes
+                if node not in targets and node.name in CLUSTER_IPS_BY_NAME
+            ]
+            if not peer_cluster_ips:
+                self.event("warn", "oneway_partition: no cluster IPs known for peers; skipping")
+                self.mark_current_injection_apply_result(False)
+                return
+            applied = True
+            for node in targets:
+                applied = self.apply_node_impairment(
+                    node,
+                    {"kind": "partition", "direction": "inbound", "peer_hosts": peer_cluster_ips},
+                ) and applied
+            self.mark_current_injection_apply_result(applied)
+            return
+        if scenario == "netem_reorder":
+            applied = True
+            for node in targets:
+                applied = self.apply_node_impairment(
+                    node,
+                    {
+                        "kind": "netem",
+                        "scope": "cluster",
+                        "delay_ms": 50,
+                        "reorder_percent": 25,
+                        "cluster_subnets": CLUSTER_SUBNETS,
+                    },
+                ) and applied
+            self.mark_current_injection_apply_result(applied)
+            return
+        if scenario == "netem_duplicate":
+            applied = True
+            for node in targets:
+                applied = self.apply_node_impairment(
+                    node,
+                    {
+                        "kind": "netem",
+                        "scope": "cluster",
+                        "duplicate_percent": 1,
+                        "cluster_subnets": CLUSTER_SUBNETS,
+                    },
+                ) and applied
+            self.mark_current_injection_apply_result(applied)
+            return
         self.event("warn", f"unknown fault scenario {scenario}; falling back to clean stop")
         run(["aws", "ec2", "stop-instances", "--instance-ids", *[node.instance_id for node in targets]], check=False)
 
@@ -2045,7 +2130,11 @@ class ChaosAgent:
             )
             if host
         ]
-        return {"kind": "clear", "peer_hosts": list(dict.fromkeys(peer_hosts))}
+        return {
+            "kind": "clear",
+            "peer_hosts": list(dict.fromkeys(peer_hosts)),
+            "units": [NODE_SERVICE_UNIT],
+        }
 
     def clear_node_impairment(self, node: Node) -> bool:
         payload = self.faultd_clear_payload()
@@ -2388,6 +2477,13 @@ class ChaosAgent:
                 reasons.append(f"{cold_backpressure_event_delta} cold write backpressure events since last publish")
         return not reasons, reasons
 
+    def effective_recovery_slo_secs(self, scenario: str | None) -> int:
+        # Node-crash (catch-up) scenarios rebuild raft-memory state from S3 + peer
+        # logs and need far longer than an impairment /clear; see CATCH_UP_SCENARIOS.
+        if scenario in CATCH_UP_SCENARIOS:
+            return max(self.recovery_slo_secs, CATCH_UP_RECOVERY_SLO_SECS)
+        return self.recovery_slo_secs
+
     def build_status(self) -> dict[str, Any]:
         self.reconcile_active_fault_from_injection(utc_now())
         nodes = [self.sample_node(node) for node in self.nodes]
@@ -2569,11 +2665,12 @@ class ChaosAgent:
                     }
                 )
             start_requested_at = parse_iso(injection.get("start_requested_at"))
+            effective_slo = self.effective_recovery_slo_secs(injection.get("scenario"))
             if (
                 start_requested_at is not None
                 and injection.get("recovered_at") is None
                 and injection.get("slo_missed_at") is None
-                and (utc_now() - start_requested_at).total_seconds() > self.recovery_slo_secs
+                and (utc_now() - start_requested_at).total_seconds() > effective_slo
             ):
                 expected_revert_detection = injection.get("expected_result") == "revert_detection"
                 injection["status"] = "detected" if expected_revert_detection else "slo_missed"
@@ -2586,7 +2683,7 @@ class ChaosAgent:
                         "message": (
                             "revert protection detected; node did not recover without allow-next-revert"
                             if expected_revert_detection
-                            else f"recovery exceeded {self.recovery_slo_secs}s SLO"
+                            else f"recovery exceeded {effective_slo}s SLO"
                         ),
                     }
                 )
@@ -2605,7 +2702,7 @@ class ChaosAgent:
                 injection["slo_met"] = (
                     injection.get("slo_missed_at") is None
                     and recovery_ms is not None
-                    and recovery_ms <= self.recovery_slo_secs * 1000
+                    and recovery_ms <= effective_slo * 1000
                 )
                 injection["timeline"].append(
                     {

@@ -327,12 +327,19 @@ mod s3 {
         fn object_key(&self, key: &SnapshotKey) -> String {
             use std::sync::atomic::AtomicU64;
             use std::sync::atomic::Ordering;
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            // Cache-line padded so this per-upload nonce counter does not false-
+            // share with adjacent statics. A true per-core counter would need a
+            // core context this path does not carry, but snapshot uploads are
+            // low frequency, so padding is enough; the counter stays a single
+            // monotonic global to keep object keys unique per upload attempt.
+            #[repr(align(128))]
+            struct PaddedCounter(AtomicU64);
+            static COUNTER: PaddedCounter = PaddedCounter(AtomicU64::new(0));
             let nonce_nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
-            let nonce_seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nonce_seq = COUNTER.0.fetch_add(1, Ordering::Relaxed);
             format!(
                 "{}/group-{}/{}-{nonce_nanos:032}-{nonce_seq:020}.snap",
                 self.prefix, key.raft_group_id, key.snapshot_id,
