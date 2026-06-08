@@ -7,6 +7,7 @@ use anyhow::anyhow;
 use anyhow::bail;
 use reqwest::Client;
 use serde::Deserialize;
+use url::Url;
 
 use crate::provider::NodeInfo;
 
@@ -168,6 +169,47 @@ impl MetricsClient {
             ))
         }
     }
+
+    pub async fn register_node(
+        &self,
+        admin_url: &Url,
+        node_id: u64,
+        client_url: &str,
+        cluster_url: &str,
+    ) -> Result<RegisterNodeResponse> {
+        let path = register_node_path(node_id, client_url, cluster_url);
+        let url = admin_url
+            .join(&path)
+            .with_context(|| format!("compose node-register url at {admin_url}"))?;
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str::<RegisterNodeResponse>(&body)
+                .with_context(|| format!("decode node-register response: {body}"))
+        } else {
+            Err(anyhow!(
+                "node-register at {admin_url} for node {node_id} returned {status}: {body}"
+            ))
+        }
+    }
+}
+
+fn register_node_path(node_id: u64, client_url: &str, cluster_url: &str) -> String {
+    format!(
+        "/__ursula/admin/nodes/{node_id}/register?client_url={client_url}&cluster_url={cluster_url}"
+    )
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegisterNodeResponse {
+    pub node_id: u64,
+    pub registered: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -304,5 +346,18 @@ impl ClusterSnapshot {
             }
         }
         map
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_register_path_preserves_raw_urls_for_server_query_parser() {
+        assert_eq!(
+            register_node_path(5, "http://node5:4491", "http://node5:4492"),
+            "/__ursula/admin/nodes/5/register?client_url=http://node5:4491&cluster_url=http://node5:4492"
+        );
     }
 }

@@ -7,6 +7,7 @@ use anyhow::bail;
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
+use url::Url;
 use ursula_ctl::MetricsClient;
 use ursula_ctl::NodeProvider;
 use ursula_ctl::RestartOptions;
@@ -32,10 +33,37 @@ struct Cli {
 enum Command {
     /// Rolling restart with raft-aware leadership drain and applied_index catch-up checks.
     Restart(RestartArgs),
+    /// Node registration and lifecycle operations.
+    #[command(subcommand)]
+    Node(NodeCommand),
     /// Print per-node raft group count and leadership distribution from /__ursula/metrics.
     Status(ObserveArgs),
     /// Block until every node reports the expected number of raft groups and initialized groups have leaders.
     WaitReady(WaitReadyArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum NodeCommand {
+    /// Register a data-capable node through the meta group admin endpoint.
+    Register(NodeRegisterArgs),
+}
+
+#[derive(Args, Debug)]
+struct NodeRegisterArgs {
+    /// Base URL of a server with the meta group admin endpoint.
+    #[arg(long)]
+    admin_url: Url,
+    /// Node id to register in the meta group.
+    #[arg(long)]
+    node_id: u64,
+    /// Client-plane URL used for HTTP routing and redirects.
+    #[arg(long)]
+    client_url: String,
+    /// Cluster-plane URL used by Raft/internal admin traffic.
+    #[arg(long)]
+    cluster_url: String,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
 }
 
 #[derive(Args, Debug)]
@@ -109,9 +137,30 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Restart(args) => run_restart_subcommand(args).await,
+        Command::Node(NodeCommand::Register(args)) => run_node_register_subcommand(args).await,
         Command::Status(args) => run_status_subcommand(args).await,
         Command::WaitReady(args) => run_wait_ready_subcommand(args).await,
     }
+}
+
+async fn run_node_register_subcommand(args: NodeRegisterArgs) -> Result<()> {
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let response = client
+        .register_node(
+            &args.admin_url,
+            args.node_id,
+            &args.client_url,
+            &args.cluster_url,
+        )
+        .await?;
+    if !response.registered {
+        bail!(
+            "node-register response for node {} did not confirm registration",
+            response.node_id
+        );
+    }
+    println!("node {}: registered", response.node_id);
+    Ok(())
 }
 
 async fn run_status_subcommand(args: ObserveArgs) -> Result<()> {
@@ -177,4 +226,36 @@ async fn run_restart_subcommand(args: RestartArgs) -> Result<()> {
         std::process::exit(2);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_node_register_command() {
+        let cli = Cli::try_parse_from([
+            "ursulactl",
+            "node",
+            "register",
+            "--admin-url",
+            "http://node1:4491",
+            "--node-id",
+            "5",
+            "--client-url",
+            "http://node5:4491",
+            "--cluster-url",
+            "http://node5:4492",
+        ])
+        .expect("parse node register command");
+
+        let Command::Node(NodeCommand::Register(args)) = cli.command else {
+            panic!("expected node register command");
+        };
+        assert_eq!(args.admin_url.as_str(), "http://node1:4491/");
+        assert_eq!(args.node_id, 5);
+        assert_eq!(args.client_url, "http://node5:4491");
+        assert_eq!(args.cluster_url, "http://node5:4492");
+        assert_eq!(args.http_timeout_secs, 10);
+    }
 }
