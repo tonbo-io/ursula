@@ -642,6 +642,90 @@ async fn raft_file_log_store_recovers_truncate_and_purge() {
 }
 
 #[tokio::test]
+async fn single_node_meta_raft_applies_node_registration() {
+    let config = Arc::new(
+        Config {
+            cluster_name: "ursula-meta-single-node-test".to_owned(),
+            heartbeat_interval: 10,
+            election_timeout_min: 30,
+            election_timeout_max: 60,
+            ..Default::default()
+        }
+        .validate()
+        .expect("valid raft config"),
+    );
+    let mut log_store = MetaRaftLogStore::shared();
+    let state_machine = MetaRaftStateMachine::default();
+    let raft = Raft::<MetaRaftTypeConfig, MetaRaftStateMachine>::new(
+        1,
+        config,
+        SingleNodeRaftNetworkFactory,
+        log_store.clone(),
+        state_machine,
+    )
+    .await
+    .expect("create single-node meta raft group");
+
+    let mut nodes = BTreeMap::new();
+    nodes.insert(1, BasicNode::new("meta-local"));
+    raft.initialize(nodes)
+        .await
+        .expect("initialize single-node meta raft group");
+    raft.wait(Some(Duration::from_secs(2)))
+        .current_leader(1, "single-node meta group should elect itself")
+        .await
+        .expect("wait for meta leadership");
+
+    let registered = raft
+        .client_write(ControlCommand::RegisterNode {
+            node_id: 4,
+            client_url: "http://node4:4491/".to_owned(),
+            cluster_url: "http://node4:4492/".to_owned(),
+            labels: BTreeMap::from([("rack".to_owned(), "r1".to_owned())]),
+            now_ms: 10,
+        })
+        .await
+        .expect("register node through meta raft");
+    assert_eq!(registered.data, ursula_control::ControlResponse::Ok);
+
+    let updated = raft
+        .client_write(ControlCommand::SetNodeState {
+            node_id: 4,
+            state: ursula_control::NodeState::Draining,
+            now_ms: 20,
+        })
+        .await
+        .expect("update registered node through meta raft");
+    assert_eq!(updated.data, ursula_control::ControlResponse::Ok);
+
+    let (applied, node) = raft
+        .with_state_machine(|state_machine| {
+            Box::pin(async move {
+                let node = state_machine
+                    .state()
+                    .nodes
+                    .get(&4)
+                    .expect("node registered through raft")
+                    .clone();
+                (state_machine.applied_log_id(), node)
+            })
+        })
+        .await
+        .expect("read meta state machine");
+    assert_eq!(node.client_url, "http://node4:4491");
+    assert_eq!(node.cluster_url, "http://node4:4492");
+    assert_eq!(node.state, ursula_control::NodeState::Draining);
+    assert_eq!(node.labels.get("rack").map(String::as_str), Some("r1"));
+    assert!(applied.is_some());
+
+    let log_state = log_store.get_log_state().await.expect("meta log state");
+    assert!(log_state.last_log_id.is_some());
+    raft.shutdown()
+        .await
+        .expect("shutdown single-node meta raft group");
+}
+
+#[tokio::test]
 async fn single_node_openraft_group_applies_client_writes() {
     let config = Arc::new(
         Config {
