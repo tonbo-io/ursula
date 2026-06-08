@@ -170,11 +170,10 @@ pub fn spawn_runtime(
     persistence: Persistence,
     topology: Topology,
 ) -> Result<SpawnedRuntime, RuntimeError> {
-    let cold_config = ColdConfig::from_env();
-    let mut runtime_config = RuntimeConfig::from_env(core_count, topology.raft_group_count());
-    if cold_config.is_enabled() && runtime_config.cold_max_hot_bytes_per_group.is_none() {
-        runtime_config.cold_max_hot_bytes_per_group = Some(64 * 1024 * 1024);
-    }
+    let cold_config = ColdConfig::from_env().map_err(|err| RuntimeError::ColdStoreConfig {
+        message: err.to_string(),
+    })?;
+    let runtime_config = RuntimeConfig::from_env(core_count, topology.raft_group_count());
     spawn_runtime_with_config(runtime_config, cold_config, persistence, topology)
 }
 

@@ -4,6 +4,7 @@
 //! subsystem it describes.  Configuration can be built explicitly or parsed
 //! from the process environment via [`ColdConfig::from_env`].
 
+use std::io;
 use std::time::Duration;
 
 use crate::env::env_optional_usize;
@@ -42,12 +43,12 @@ pub struct ColdConfig {
 
 impl ColdConfig {
     /// Parse cold-tier configuration from the process environment.
-    pub fn from_env() -> Self {
-        Self {
-            storage: ColdStorageConfig::from_env(),
+    pub fn from_env() -> io::Result<Self> {
+        Ok(Self {
+            storage: ColdStorageConfig::from_env()?,
             cache: ColdCacheConfig::from_env(),
             worker: ColdWorkerConfig::from_env(),
-        }
+        })
     }
 
     /// Returns `true` when a real cold-storage backend is configured.
@@ -90,21 +91,25 @@ impl Default for ColdStorageConfig {
 
 impl ColdStorageConfig {
     /// Parse from the process environment.
-    pub fn from_env() -> Self {
+    pub fn from_env() -> io::Result<Self> {
         let backend = std::env::var("URSULA_COLD_BACKEND")
             .unwrap_or_else(|_| "none".to_owned())
             .to_ascii_lowercase();
 
-        Self {
-            backend: match backend.as_str() {
-                "none" | "disabled" | "off" => ColdStorageBackend::None,
-                "memory" | "mem" | "inmem" => ColdStorageBackend::Memory,
-                "s3" => ColdStorageBackend::S3,
-                other => {
-                    tracing::warn!("unsupported URSULA_COLD_BACKEND '{other}', defaulting to none");
-                    ColdStorageBackend::None
-                }
-            },
+        let backend = match backend.as_str() {
+            "none" | "disabled" | "off" => ColdStorageBackend::None,
+            "memory" | "mem" | "inmem" => ColdStorageBackend::Memory,
+            "s3" => ColdStorageBackend::S3,
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unsupported URSULA_COLD_BACKEND '{other}'"),
+                ));
+            }
+        };
+
+        Ok(Self {
+            backend,
             s3_bucket: std::env::var("URSULA_COLD_S3_BUCKET").ok(),
             s3_root: std::env::var("URSULA_COLD_ROOT").ok(),
             s3_region: std::env::var("URSULA_COLD_S3_REGION").ok(),
@@ -118,7 +123,7 @@ impl ColdStorageConfig {
                     .unwrap_or(10_000),
             ),
             s3_max_retries: env_optional_usize("URSULA_S3_MAX_RETRIES").unwrap_or(3),
-        }
+        })
     }
 }
 
@@ -173,13 +178,14 @@ impl Default for ColdWorkerConfig {
 impl ColdWorkerConfig {
     /// Parse from the process environment.
     pub fn from_env() -> Self {
+        let flush_bytes = env_usize("URSULA_COLD_FLUSH_BYTES", 8 * 1024 * 1024);
         Self {
             flush_interval_ms: env_usize("URSULA_COLD_FLUSH_INTERVAL_MS", 1_000),
-            flush_min_hot_bytes: env_usize("URSULA_COLD_FLUSH_MIN_HOT_BYTES", 8 * 1024 * 1024),
-            flush_max_bytes: env_usize("URSULA_COLD_FLUSH_MAX_BYTES", 8 * 1024 * 1024),
-            flush_max_concurrency: env_usize("URSULA_COLD_FLUSH_MAX_CONCURRENCY", 4),
+            flush_min_hot_bytes: env_usize("URSULA_COLD_FLUSH_MIN_HOT_BYTES", flush_bytes),
+            flush_max_bytes: env_usize("URSULA_COLD_FLUSH_MAX_BYTES", flush_bytes),
+            flush_max_concurrency: env_usize("URSULA_COLD_FLUSH_MAX_CONCURRENCY", 4).max(1),
             gc_interval_ms: env_usize("URSULA_COLD_GC_INTERVAL_MS", 5_000),
-            gc_max_entries: env_usize("URSULA_COLD_GC_MAX_ENTRIES_PER_GROUP", 256),
+            gc_max_entries: env_usize("URSULA_COLD_GC_MAX_ENTRIES_PER_GROUP", 256).max(1),
         }
     }
 }
