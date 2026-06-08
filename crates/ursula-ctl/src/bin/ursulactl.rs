@@ -61,6 +61,9 @@ enum GroupCommand {
     /// Start or inspect group migration intents through the meta group.
     #[command(subcommand)]
     Migration(GroupMigrationCommand),
+    /// Prepare local data-group raft engines on this node.
+    #[command(subcommand)]
+    LocalEngine(GroupLocalEngineCommand),
 }
 
 #[derive(Subcommand, Debug)]
@@ -73,6 +76,12 @@ enum GroupPlacementCommand {
 enum GroupMigrationCommand {
     /// Start a durable meta-group migration intent for one data group.
     Begin(GroupMigrationBeginArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum GroupLocalEngineCommand {
+    /// Allow and warm a local raft engine for one data group on this node.
+    Prepare(GroupLocalEnginePrepareArgs),
 }
 
 #[derive(Args, Debug)]
@@ -119,6 +128,18 @@ struct GroupMigrationBeginArgs {
     /// Keep removed voters as non-serving learners after the voter change.
     #[arg(long, default_value_t = false)]
     retain_removed: bool,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+struct GroupLocalEnginePrepareArgs {
+    /// Base URL of the target node's admin endpoint.
+    #[arg(long)]
+    admin_url: Url,
+    /// Raft group id to prepare on this node.
+    #[arg(long)]
+    raft_group_id: u64,
     #[arg(long, default_value_t = 10)]
     http_timeout_secs: u64,
 }
@@ -201,6 +222,9 @@ async fn main() -> Result<()> {
         Command::Group(GroupCommand::Migration(GroupMigrationCommand::Begin(args))) => {
             run_group_migration_begin_subcommand(args).await
         }
+        Command::Group(GroupCommand::LocalEngine(GroupLocalEngineCommand::Prepare(args))) => {
+            run_group_local_engine_prepare_subcommand(args).await
+        }
         Command::Status(args) => run_status_subcommand(args).await,
         Command::WaitReady(args) => run_wait_ready_subcommand(args).await,
     }
@@ -261,6 +285,31 @@ async fn run_group_migration_begin_subcommand(args: GroupMigrationBeginArgs) -> 
     println!(
         "group {}: migration {} started",
         response.raft_group_id, response.migration_id
+    );
+    Ok(())
+}
+
+async fn run_group_local_engine_prepare_subcommand(
+    args: GroupLocalEnginePrepareArgs,
+) -> Result<()> {
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let response = client
+        .prepare_local_engine(&args.admin_url, args.raft_group_id)
+        .await?;
+    if !response.prepared {
+        bail!(
+            "prepare-local-engine response for group {} did not confirm preparation",
+            response.raft_group_id
+        );
+    }
+    let suffix = if response.already_allowed {
+        " (already allowed)"
+    } else {
+        ""
+    };
+    println!(
+        "group {}: local engine prepared on core {}{}",
+        response.raft_group_id, response.core_id, suffix
     );
     Ok(())
 }
@@ -410,6 +459,30 @@ mod tests {
         assert_eq!(args.raft_group_id, 2);
         assert_eq!(args.target_voters, vec![2, 3, 4]);
         assert!(args.retain_removed);
+        assert_eq!(args.http_timeout_secs, 10);
+    }
+
+    #[test]
+    fn parses_group_local_engine_prepare_command() {
+        let cli = Cli::try_parse_from([
+            "ursulactl",
+            "group",
+            "local-engine",
+            "prepare",
+            "--admin-url",
+            "http://node4:4491",
+            "--raft-group-id",
+            "2",
+        ])
+        .expect("parse group local-engine prepare command");
+
+        let Command::Group(GroupCommand::LocalEngine(GroupLocalEngineCommand::Prepare(args))) =
+            cli.command
+        else {
+            panic!("expected group local-engine prepare command");
+        };
+        assert_eq!(args.admin_url.as_str(), "http://node4:4491/");
+        assert_eq!(args.raft_group_id, 2);
         assert_eq!(args.http_timeout_secs, 10);
     }
 }

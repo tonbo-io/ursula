@@ -257,6 +257,33 @@ impl MetricsClient {
             ))
         }
     }
+
+    pub async fn prepare_local_engine(
+        &self,
+        admin_url: &Url,
+        raft_group_id: u64,
+    ) -> Result<PrepareLocalEngineResponse> {
+        let path = prepare_local_engine_path(raft_group_id);
+        let url = admin_url
+            .join(&path)
+            .with_context(|| format!("compose prepare-local-engine url at {admin_url}"))?;
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str::<PrepareLocalEngineResponse>(&body)
+                .with_context(|| format!("decode prepare-local-engine response: {body}"))
+        } else {
+            Err(anyhow!(
+                "prepare-local-engine at {admin_url} for group {raft_group_id} returned {status}: {body}"
+            ))
+        }
+    }
 }
 
 fn register_node_path(node_id: u64, client_url: &str, cluster_url: &str) -> String {
@@ -282,6 +309,10 @@ fn begin_migration_path(
     format!(
         "/__ursula/admin/groups/{raft_group_id}/migrations?target_voters={target_voters}&retain_removed={retain_removed}"
     )
+}
+
+fn prepare_local_engine_path(raft_group_id: u64) -> String {
+    format!("/__ursula/admin/groups/{raft_group_id}/local-engine")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -313,6 +344,14 @@ pub struct BeginMigrationResponse {
     pub raft_group_id: u64,
     pub migration_id: u64,
     pub started: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrepareLocalEngineResponse {
+    pub raft_group_id: u64,
+    pub core_id: u64,
+    pub prepared: bool,
+    pub already_allowed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -477,6 +516,14 @@ mod tests {
         assert_eq!(
             begin_migration_path(2, &BTreeSet::from([2, 3, 4]), true),
             "/__ursula/admin/groups/2/migrations?target_voters=2,3,4&retain_removed=true"
+        );
+    }
+
+    #[test]
+    fn prepare_local_engine_path_builds_admin_path() {
+        assert_eq!(
+            prepare_local_engine_path(2),
+            "/__ursula/admin/groups/2/local-engine"
         );
     }
 }
