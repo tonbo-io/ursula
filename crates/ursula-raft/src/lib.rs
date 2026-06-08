@@ -57,6 +57,7 @@ pub use log_store::MemoryRaftLogStore;
 pub use log_store::MetaRaftLogStore;
 pub use log_store::RaftGroupFileLogStore;
 pub use log_store::RaftGroupLogStore;
+pub use meta::MetaNodeRegistration;
 pub use meta::MetaRaft;
 pub use meta::MetaRaftError;
 pub use meta::MetaRaftHandle;

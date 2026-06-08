@@ -715,6 +715,108 @@ async fn single_node_meta_raft_applies_node_registration() {
 }
 
 #[tokio::test]
+async fn meta_raft_handle_registers_initial_data_nodes() {
+    let config = Arc::new(
+        Config {
+            cluster_name: "ursula-meta-initial-data-nodes-test".to_owned(),
+            heartbeat_interval: 10,
+            election_timeout_min: 30,
+            election_timeout_max: 60,
+            ..Default::default()
+        }
+        .validate()
+        .expect("valid raft config"),
+    );
+    let handle = MetaRaftHandle::new_single_node_with_log_store(
+        1,
+        BasicNode::new("meta-local"),
+        config,
+        MetaRaftLogStore::shared(),
+    )
+    .await
+    .expect("create single-node meta raft handle");
+
+    handle
+        .register_initial_data_nodes(
+            [
+                MetaNodeRegistration::new(1, "http://node1:4491/", "http://node1:4492/"),
+                MetaNodeRegistration::new(2, "http://node2:4491", "http://node2:4492"),
+                MetaNodeRegistration::new(3, "http://node3:4491", "http://node3:4492"),
+            ],
+            10,
+        )
+        .await
+        .expect("register initial data nodes");
+
+    let nodes = handle
+        .read_state(|state| state.nodes.clone())
+        .await
+        .expect("read meta state");
+    assert_eq!(nodes.len(), 3);
+    let node1 = nodes.get(&1).expect("node 1 registered");
+    assert_eq!(node1.client_url, "http://node1:4491");
+    assert_eq!(node1.cluster_url, "http://node1:4492");
+    assert_eq!(node1.state, ursula_control::NodeState::Active);
+    assert_eq!(
+        nodes.get(&2).map(|node| node.cluster_url.as_str()),
+        Some("http://node2:4492")
+    );
+    assert_eq!(
+        nodes.get(&3).map(|node| node.client_url.as_str()),
+        Some("http://node3:4491")
+    );
+
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown single-node meta raft handle");
+}
+
+#[tokio::test]
+async fn meta_raft_handle_rejects_invalid_initial_data_nodes() {
+    let config = Arc::new(
+        Config {
+            cluster_name: "ursula-meta-invalid-initial-data-nodes-test".to_owned(),
+            heartbeat_interval: 10,
+            election_timeout_min: 30,
+            election_timeout_max: 60,
+            ..Default::default()
+        }
+        .validate()
+        .expect("valid raft config"),
+    );
+    let handle = MetaRaftHandle::new_single_node_with_log_store(
+        1,
+        BasicNode::new("meta-local"),
+        config,
+        MetaRaftLogStore::shared(),
+    )
+    .await
+    .expect("create single-node meta raft handle");
+
+    let err = handle
+        .register_initial_data_nodes(
+            [
+                MetaNodeRegistration::new(1, "http://node1:4491", "http://node1:4492"),
+                MetaNodeRegistration::new(2, "  ", "http://node2:4492"),
+            ],
+            10,
+        )
+        .await
+        .expect_err("reject invalid initial data node");
+    assert!(
+        err.to_string()
+            .contains("node 2 rejected: client_url must not be empty"),
+        "unexpected error: {err}"
+    );
+
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown single-node meta raft handle");
+}
+
+#[tokio::test]
 async fn single_node_openraft_group_applies_client_writes() {
     let config = Arc::new(
         Config {

@@ -27,6 +27,7 @@ use openraft::storage::RaftStateMachine;
 use ursula_control::ControlCommand;
 use ursula_control::ControlPlaneState;
 use ursula_control::ControlResponse;
+use ursula_control::NodeId;
 
 use crate::registry::SingleNodeRaftNetworkFactory;
 
@@ -93,6 +94,44 @@ impl Error for MetaRaftError {
         self.source
             .as_ref()
             .map(|source| &**source as &(dyn Error + 'static))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetaNodeRegistration {
+    pub node_id: NodeId,
+    pub client_url: String,
+    pub cluster_url: String,
+    pub labels: BTreeMap<String, String>,
+}
+
+impl MetaNodeRegistration {
+    pub fn new(
+        node_id: NodeId,
+        client_url: impl Into<String>,
+        cluster_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            node_id,
+            client_url: client_url.into(),
+            cluster_url: cluster_url.into(),
+            labels: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_labels(mut self, labels: BTreeMap<String, String>) -> Self {
+        self.labels = labels;
+        self
+    }
+
+    pub fn into_command(self, now_ms: u64) -> ControlCommand {
+        ControlCommand::RegisterNode {
+            node_id: self.node_id,
+            client_url: self.client_url,
+            cluster_url: self.cluster_url,
+            labels: self.labels,
+            now_ms,
+        }
     }
 }
 
@@ -196,6 +235,40 @@ impl MetaRaftHandle {
             .await
             .map(|response| response.data)
             .map_err(|err| MetaRaftError::with_source("write meta OpenRaft command", err))
+    }
+
+    pub async fn register_node(
+        &self,
+        registration: MetaNodeRegistration,
+        now_ms: u64,
+    ) -> Result<ControlResponse, MetaRaftError> {
+        self.write(registration.into_command(now_ms)).await
+    }
+
+    pub async fn register_initial_data_nodes(
+        &self,
+        registrations: impl IntoIterator<Item = MetaNodeRegistration>,
+        now_ms: u64,
+    ) -> Result<(), MetaRaftError> {
+        for registration in registrations {
+            let node_id = registration.node_id;
+            match self.register_node(registration, now_ms).await? {
+                ControlResponse::Ok => {}
+                ControlResponse::Rejected { reason } => {
+                    return Err(MetaRaftError::new(
+                        "register initial data-capable node",
+                        format!("node {node_id} rejected: {reason}"),
+                    ));
+                }
+                response => {
+                    return Err(MetaRaftError::new(
+                        "register initial data-capable node",
+                        format!("node {node_id} returned unexpected response {response}"),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn with_state_machine<V>(
