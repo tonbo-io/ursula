@@ -2477,6 +2477,39 @@ class ChaosAgent:
                 reasons.append(f"{cold_backpressure_event_delta} cold write backpressure events since last publish")
         return not reasons, reasons
 
+    @staticmethod
+    def _overall_status(
+        *,
+        integrity_status: str,
+        running_nodes: int,
+        metrics_ok: int,
+        fully_healthy: bool,
+        has_active_fault: bool,
+        serving_on_quorum: bool,
+        workload_started: bool,
+    ) -> str:
+        # partial_outage means the majority is up but the data plane is NOT
+        # serving (writes stalled). It must NOT be driven by full_raft_nodes,
+        # which sags on every fault injection while the quorum keeps committing
+        # writes — see serving_on_quorum in build_status.
+        if integrity_status != "operational" or running_nodes < 2 or metrics_ok < 2:
+            return "major_outage"
+        if fully_healthy and not has_active_fault:
+            return "operational"
+        if serving_on_quorum:
+            return "degraded_performance"
+        if running_nodes >= 2 and not workload_started:
+            # Startup grace: the agent's own workload hasn't begun yet (no
+            # successful append this run), so append_success_delta is 0 and would
+            # otherwise read as a write stall. With the majority up and metrics
+            # healthy that's the agent ramping up, not a cluster outage —
+            # without this, every agent restart (e.g. a deploy) stamps false
+            # partial_outage hours into the history.
+            return "operational"
+        if running_nodes >= 2:
+            return "partial_outage"
+        return "major_outage"
+
     def effective_recovery_slo_secs(self, scenario: str | None) -> int:
         # Node-crash (catch-up) scenarios rebuild raft-memory state from S3 + peer
         # logs and need far longer than an impairment /clear; see CATCH_UP_SCENARIOS.
@@ -2574,6 +2607,16 @@ class ChaosAgent:
             reasons.append(self.last_integrity_error or "integrity check failed")
 
         quorum_healthy = running_nodes >= 2 and metrics_ok >= 2 and full_raft_nodes >= 2
+        # overall status keys off whether the data plane is actually serving on a
+        # majority, NOT off full_raft_nodes. That metric sags to 0/3-1/3 on every
+        # fault injection (a node catching up or briefly unreachable makes the
+        # agent's whole-cluster raft-view sample read low) even while the 2/3
+        # quorum commits writes fine — gating partial_outage on it turned every
+        # injection into a false outage across whole hours. partial_outage now
+        # means the majority is up but writes are NOT progressing (a real serving
+        # failure); full_raft_nodes still gates the stricter `fully_healthy`
+        # (operational) check above.
+        serving_on_quorum = running_nodes >= 2 and metrics_ok >= 2 and workload_progressing
         fully_healthy = (
             running_nodes == expected_nodes
             and metrics_ok == expected_nodes
@@ -2602,16 +2645,15 @@ class ChaosAgent:
             and workload_progressing
             and integrity_status == "operational"
         )
-        if integrity_status != "operational" or running_nodes < 2 or metrics_ok < 2:
-            overall = "major_outage"
-        elif fully_healthy and self.active_fault is None:
-            overall = "operational"
-        elif quorum_healthy and workload_progressing:
-            overall = "degraded_performance"
-        elif running_nodes >= 2:
-            overall = "partial_outage"
-        else:
-            overall = "major_outage"
+        overall = self._overall_status(
+            integrity_status=integrity_status,
+            running_nodes=running_nodes,
+            metrics_ok=metrics_ok,
+            fully_healthy=fully_healthy,
+            has_active_fault=self.active_fault is not None,
+            serving_on_quorum=serving_on_quorum,
+            workload_started=self.append_success > 0,
+        )
         active_fault = self.active_fault_label()
         published_at = utc_now()
         status_interval_secs = self.status_every
