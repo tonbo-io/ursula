@@ -720,6 +720,10 @@ pub fn client_router_from_state(state: HttpState) -> Router {
             post(register_admin_node),
         )
         .route(
+            "/__ursula/admin/groups/{raft_group_id}/placement",
+            get(admin_group_placement),
+        )
+        .route(
             "/__ursula/flush-cold/{bucket}/{stream}",
             post(flush_cold_stream),
         )
@@ -1138,6 +1142,47 @@ pub(crate) async fn register_admin_node(
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("register node in meta raft: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+pub(crate) async fn admin_group_placement(
+    State(state): State<HttpState>,
+    Path(raft_group_id): Path<u64>,
+) -> Response {
+    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
+    };
+    let Some(meta_raft) = state.meta_raft() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "meta raft is not configured for this server",
+        )
+            .into_response();
+    };
+
+    let view = match meta_raft
+        .read_state(move |meta_state| meta_state.placement_view(raft_group_id))
+        .await
+    {
+        Ok(Some(view)) => view,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, "group placement is not registered").into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read group placement from meta raft: {err}"),
+            )
+                .into_response();
+        }
+    };
+    match serde_json::to_string(&view) {
+        Ok(body) => (StatusCode::OK, [("content-type", "application/json")], body).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize group placement: {err}"),
         )
             .into_response(),
     }
