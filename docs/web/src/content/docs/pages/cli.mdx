@@ -105,6 +105,71 @@ ursulactl wait-ready --config cluster.json --expected-groups 4
 
 Exits non-zero with a one-line reason if the timeout passes (`cluster not ready after 120s: node 3 has 1 group(s) without a leader`).
 
+## Group placement and migration
+
+The current dynamic-membership workflow is manual-first. Ursula persists node registration, placement projections, and the active migration lock in the meta group, but the operator still chooses each group and runs the data-group OpenRaft membership calls. Only one group migration may be active at a time.
+
+The bootstrap nodes are both meta-group voters and data-capable nodes. When adding a new node, start the Ursula process out-of-band with its stable `node_id`, matching storage/cold configuration, and a reachable cluster URL before registering it. The CLI registers metadata and drives Raft calls; it does not start daemons.
+
+Example: add `node4` and migrate group `2` from voters `[1,2,3]` to `[2,3,4]`, keeping node `1` as a draining learner.
+
+```bash
+ursulactl node register \
+  --admin-url http://node1:4437 \
+  --node-id 4 \
+  --client-url http://node4:4437 \
+  --cluster-url http://node4:4437
+
+ursulactl group placement get \
+  --admin-url http://node1:4437 \
+  --raft-group-id 2
+
+ursulactl group migration begin \
+  --admin-url http://node1:4437 \
+  --raft-group-id 2 \
+  --target-voters 2,3,4 \
+  --retain-removed
+
+ursulactl group local-engine prepare \
+  --admin-url http://node4:4437 \
+  --raft-group-id 2
+
+ursulactl group learner add \
+  --leader-url http://node2:4437 \
+  --raft-group-id 2 \
+  --node-id 4 \
+  --cluster-url http://node4:4437
+
+ursulactl group membership change \
+  --leader-url http://node2:4437 \
+  --raft-group-id 2 \
+  --voters 2,3,4
+
+ursulactl group placement commit \
+  --admin-url http://node1:4437 \
+  --raft-group-id 2 \
+  --voters 2,3,4 \
+  --learners 1 \
+  --draining 1
+
+ursulactl group migration finish \
+  --admin-url http://node1:4437 \
+  --migration-id 1 \
+  --success
+```
+
+Use an initial meta-group node for `--admin-url` unless you have explicitly configured meta Raft elsewhere. Use the current data-group leader for `--leader-url`; `ursulactl status` or raw `/__ursula/metrics` tells you which node currently leads a group. `group membership change` accepts a full voter set, so one command can add and remove voters in the same OpenRaft membership change.
+
+If a migration cannot be completed, omit `--success` when finishing it:
+
+```bash
+ursulactl group migration finish \
+  --admin-url http://node1:4437 \
+  --migration-id 1
+```
+
+That releases the meta-group migration lock without committing success. Inspect placement again before retrying the group.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -130,6 +195,14 @@ For custom tooling, every verb maps onto a small set of HTTP endpoints on each n
 | Verb | Endpoint |
 |------|----------|
 | `status`, `wait-ready` | `GET /__ursula/metrics` |
+| `node register` | `POST /__ursula/admin/nodes/{node_id}/register` |
+| `group placement get` | `GET /__ursula/admin/groups/{raft_group_id}/placement` |
+| `group migration begin` | `POST /__ursula/admin/groups/{raft_group_id}/migrations` |
+| `group local-engine prepare` | `POST /__ursula/admin/groups/{raft_group_id}/local-engine` |
+| `group learner add` | `POST /__ursula/raft/{raft_group_id}/learners/{node_id}` |
+| `group membership change` | `POST /__ursula/raft/{raft_group_id}/membership` |
+| `group placement commit` | `POST /__ursula/admin/groups/{raft_group_id}/placement/commit` |
+| `group migration finish` | `POST /__ursula/admin/migrations/{migration_id}/finish` |
 | `restart` (drain step) | `POST /__ursula/raft/{raft_group_id}/leader/transfer/{node_id}` |
 | `restart` (readiness step) | `GET /__ursula/metrics` polled across all peers |
 
