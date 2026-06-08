@@ -141,8 +141,10 @@ impl RuntimeConfig {
             non_zero(env_usize("URSULA_LIVE_READ_MAX_WAITERS_PER_CORE", 65_536));
         config.raft_max_uncommitted_bytes_per_group =
             env_optional_usize("URSULA_RAFT_MAX_UNCOMMITTED_BYTES_PER_GROUP").and_then(non_zero);
-        config.cold_max_hot_bytes_per_group =
-            non_zero(env_usize("URSULA_COLD_MAX_HOT_BYTES_PER_GROUP", 0));
+        config.cold_max_hot_bytes_per_group = non_zero(env_usize(
+            "URSULA_COLD_MAX_HOT_BYTES_PER_GROUP",
+            64 * 1024 * 1024,
+        ));
         config
     }
 }
