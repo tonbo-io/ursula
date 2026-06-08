@@ -4862,6 +4862,98 @@ async fn admin_group_placement_requires_meta_group() {
 }
 
 #[tokio::test]
+async fn admin_begin_migration_writes_meta_migration() {
+    let now_ms = Arc::new(AtomicU64::new(2_000));
+    let meta = single_node_meta_handle_for_test("ursula-admin-begin-migration-test").await;
+    meta.register_initial_data_nodes(
+        [
+            ursula_raft::MetaNodeRegistration::new(1, "http://node1:4491", "http://node1:4492"),
+            ursula_raft::MetaNodeRegistration::new(2, "http://node2:4491", "http://node2:4492"),
+            ursula_raft::MetaNodeRegistration::new(3, "http://node3:4491", "http://node3:4492"),
+            ursula_raft::MetaNodeRegistration::new(4, "http://node4:4491", "http://node4:4492"),
+        ],
+        10,
+    )
+    .await
+    .expect("register initial data nodes");
+    meta.write(ursula_control::ControlCommand::SeedPlacement {
+        raft_group_id: RaftGroupId(2),
+        voters: BTreeSet::from([1, 2, 3]),
+        now_ms: 20,
+    })
+    .await
+    .expect("seed placement");
+
+    let client = client_router_from_state(
+        HttpState::new(spawn_default_runtime(1, 1).expect("runtime"))
+            .with_meta_raft_handle(meta.clone())
+            .with_wall_clock(TestWallClock {
+                now_ms: Arc::clone(&now_ms),
+            }),
+    );
+    let response = client
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/__ursula/admin/groups/2/migrations?target_voters=2,3,4&retain_removed=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("migration json");
+    assert_eq!(json.get("raft_group_id").and_then(|v| v.as_u64()), Some(2));
+    assert_eq!(json.get("migration_id").and_then(|v| v.as_u64()), Some(1));
+    assert_eq!(json.get("started").and_then(|v| v.as_bool()), Some(true));
+
+    let migration = meta
+        .read_state(|state| state.active_migration().cloned())
+        .await
+        .expect("read meta state")
+        .expect("active migration");
+    assert_eq!(migration.raft_group_id, RaftGroupId(2));
+    assert_eq!(migration.from_voters, BTreeSet::from([1, 2, 3]));
+    assert_eq!(migration.target_voters, BTreeSet::from([2, 3, 4]));
+    assert_eq!(migration.added_nodes, BTreeSet::from([4]));
+    assert_eq!(migration.removed_voters, BTreeSet::from([1]));
+    assert!(migration.retain_removed);
+    assert_eq!(migration.created_at_ms, 2_000);
+
+    meta.shutdown().await.expect("shutdown meta raft");
+}
+
+#[tokio::test]
+async fn admin_begin_migration_requires_meta_group() {
+    let client = client_router_from_state(HttpState::new(
+        spawn_default_runtime(1, 1).expect("runtime"),
+    ));
+
+    let response = client
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/__ursula/admin/groups/2/migrations?target_voters=2,3,4")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body = std::str::from_utf8(&body).expect("migration response utf8");
+    assert!(
+        body.contains("meta raft is not configured for this server"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn client_router_does_not_serve_cluster_plane_via_grpc_service() {
     // The gRPC path `/ursula.raft.v1.RaftInternal/Append` has the same shape
     // as a client `/{bucket}/{stream}` URL, so axum's wildcard does match it

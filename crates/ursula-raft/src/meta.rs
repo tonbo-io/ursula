@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::io;
@@ -28,6 +29,7 @@ use ursula_control::ControlCommand;
 use ursula_control::ControlPlaneState;
 use ursula_control::ControlResponse;
 use ursula_control::NodeId;
+use ursula_shard::RaftGroupId;
 
 use crate::registry::SingleNodeRaftNetworkFactory;
 
@@ -243,6 +245,22 @@ impl MetaRaftHandle {
         now_ms: u64,
     ) -> Result<ControlResponse, MetaRaftError> {
         self.write(registration.into_command(now_ms)).await
+    }
+
+    pub async fn begin_migration(
+        &self,
+        raft_group_id: RaftGroupId,
+        target_voters: BTreeSet<u64>,
+        retain_removed: bool,
+        now_ms: u64,
+    ) -> Result<ControlResponse, MetaRaftError> {
+        self.write(ControlCommand::BeginMigration {
+            raft_group_id,
+            target_voters,
+            retain_removed,
+            now_ms,
+        })
+        .await
     }
 
     pub async fn register_initial_data_nodes(

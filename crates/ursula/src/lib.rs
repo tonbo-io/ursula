@@ -724,6 +724,10 @@ pub fn client_router_from_state(state: HttpState) -> Router {
             get(admin_group_placement),
         )
         .route(
+            "/__ursula/admin/groups/{raft_group_id}/migrations",
+            post(admin_begin_migration),
+        )
+        .route(
             "/__ursula/flush-cold/{bucket}/{stream}",
             post(flush_cold_stream),
         )
@@ -1188,6 +1192,79 @@ pub(crate) async fn admin_group_placement(
     }
 }
 
+pub(crate) async fn admin_begin_migration(
+    State(state): State<HttpState>,
+    Path(raft_group_id): Path<u64>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let query = match parse_query(raw_query.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
+    };
+    let Some(raw_target_voters) = query
+        .get("target_voters")
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "target_voters query parameter is required",
+        )
+            .into_response();
+    };
+    let target_voters = match parse_voter_ids(raw_target_voters) {
+        Ok(voters) => voters,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let retain_removed =
+        match parse_optional_bool_query(query.get("retain_removed"), "retain_removed") {
+            Ok(retain_removed) => retain_removed,
+            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        };
+    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
+    };
+    let Some(meta_raft) = state.meta_raft() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "meta raft is not configured for this server",
+        )
+            .into_response();
+    };
+
+    match meta_raft
+        .begin_migration(
+            raft_group_id,
+            target_voters,
+            retain_removed,
+            state.unix_time_ms(),
+        )
+        .await
+    {
+        Ok(ControlResponse::MigrationStarted { migration_id }) => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            format!(
+                "{{\"raft_group_id\":{},\"migration_id\":{},\"started\":true}}",
+                raft_group_id.0, migration_id
+            ),
+        )
+            .into_response(),
+        Ok(ControlResponse::Rejected { reason }) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+        Ok(response) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unexpected meta raft response: {response}"),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("begin migration in meta raft: {err}"),
+        )
+            .into_response(),
+    }
+}
+
 pub(crate) async fn flush_cold_stream(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
@@ -1492,6 +1569,17 @@ pub(crate) fn parse_voter_ids(raw: &str) -> Result<BTreeSet<u64>, String> {
         return Err("voters must not be empty".to_owned());
     }
     Ok(voters)
+}
+
+fn parse_optional_bool_query(raw: Option<&String>, name: &str) -> Result<bool, String> {
+    match raw.map(String::as_str) {
+        None => Ok(false),
+        Some("true") | Some("1") => Ok(true),
+        Some("false") | Some("0") => Ok(false),
+        Some(value) => Err(format!(
+            "invalid {name} query parameter '{value}': expected true or false"
+        )),
+    }
 }
 
 pub(crate) async fn allow_raft_node_next_revert(
