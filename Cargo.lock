@@ -3679,6 +3679,7 @@ dependencies = [
  "tonic-build",
  "tracing",
  "tracing-opentelemetry",
+ "ursula-control",
  "ursula-proto",
  "ursula-runtime",
  "ursula-shard",

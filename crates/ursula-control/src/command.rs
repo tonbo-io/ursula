@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::fmt;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -88,6 +89,23 @@ impl ControlCommand {
     }
 }
 
+impl fmt::Display for ControlCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::RegisterNode { .. } => "register_node",
+            Self::SetNodeState { .. } => "set_node_state",
+            Self::SeedPlacement { .. } => "seed_placement",
+            Self::BeginMigration { .. } => "begin_migration",
+            Self::AdvanceMigration { .. } => "advance_migration",
+            Self::SetLearnerStatus { .. } => "set_learner_status",
+            Self::RecordMigrationError { .. } => "record_migration_error",
+            Self::CommitPlacement { .. } => "commit_placement",
+            Self::FinishMigration { .. } => "finish_migration",
+            Self::EvictLearner { .. } => "evict_learner",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlResponse {
     Ok,
@@ -98,5 +116,15 @@ pub enum ControlResponse {
 impl ControlResponse {
     pub fn is_rejected(&self) -> bool {
         matches!(self, Self::Rejected { .. })
+    }
+}
+
+impl fmt::Display for ControlResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Ok => "ok",
+            Self::MigrationStarted { .. } => "migration_started",
+            Self::Rejected { .. } => "rejected",
+        })
     }
 }

@@ -92,6 +92,123 @@ use crate::ControlPlaneState;
 use crate::ControlResponse;
 
 #[test]
+fn control_command_display_names_variants() {
+    let cases = [
+        (
+            ControlCommand::RegisterNode {
+                node_id: 1,
+                client_url: "http://node1:4491".to_owned(),
+                cluster_url: "http://node1:4492".to_owned(),
+                labels: BTreeMap::new(),
+                now_ms: 10,
+            },
+            "register_node",
+        ),
+        (
+            ControlCommand::SetNodeState {
+                node_id: 1,
+                state: NodeState::Active,
+                now_ms: 10,
+            },
+            "set_node_state",
+        ),
+        (
+            ControlCommand::SeedPlacement {
+                raft_group_id: RaftGroupId(1),
+                voters: set([1, 2, 3]),
+                now_ms: 10,
+            },
+            "seed_placement",
+        ),
+        (
+            ControlCommand::BeginMigration {
+                raft_group_id: RaftGroupId(1),
+                target_voters: set([2, 3, 4]),
+                retain_removed: true,
+                now_ms: 10,
+            },
+            "begin_migration",
+        ),
+        (
+            ControlCommand::AdvanceMigration {
+                migration_id: 1,
+                phase: crate::MigrationPhase::AddingLearners,
+                now_ms: 10,
+            },
+            "advance_migration",
+        ),
+        (
+            ControlCommand::SetLearnerStatus {
+                migration_id: 1,
+                node_id: 4,
+                status: crate::LearnerStatus::CaughtUp,
+                now_ms: 10,
+            },
+            "set_learner_status",
+        ),
+        (
+            ControlCommand::RecordMigrationError {
+                migration_id: 1,
+                error: "timeout".to_owned(),
+                now_ms: 10,
+            },
+            "record_migration_error",
+        ),
+        (
+            ControlCommand::CommitPlacement {
+                raft_group_id: RaftGroupId(1),
+                voters: set([2, 3, 4]),
+                learners: set([1]),
+                draining: set([1]),
+                now_ms: 10,
+            },
+            "commit_placement",
+        ),
+        (
+            ControlCommand::FinishMigration {
+                migration_id: 1,
+                success: true,
+                now_ms: 10,
+            },
+            "finish_migration",
+        ),
+        (
+            ControlCommand::EvictLearner {
+                raft_group_id: RaftGroupId(1),
+                node_id: 1,
+                now_ms: 10,
+            },
+            "evict_learner",
+        ),
+    ];
+
+    for (command, expected) in cases {
+        assert_eq!(command.to_string(), expected);
+    }
+}
+
+#[test]
+fn control_response_display_names_variants() {
+    let cases = [
+        (ControlResponse::Ok, "ok"),
+        (
+            ControlResponse::MigrationStarted { migration_id: 1 },
+            "migration_started",
+        ),
+        (
+            ControlResponse::Rejected {
+                reason: "invalid".to_owned(),
+            },
+            "rejected",
+        ),
+    ];
+
+    for (response, expected) in cases {
+        assert_eq!(response.to_string(), expected);
+    }
+}
+
+#[test]
 fn register_node_command_persists_addresses_and_active_state() {
     let mut state = ControlPlaneState::default();
 
