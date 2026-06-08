@@ -1,8 +1,9 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.7
 # RUST_VERSION only selects the base image (cargo/rustup bootstrap). The actual
 # build toolchain is pinned by rust-toolchain.toml and installed below.
-ARG RUST_VERSION=1.95.0
+ARG RUST_VERSION=1.96.0
 FROM rust:${RUST_VERSION}-bookworm AS builder
+
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -21,19 +22,34 @@ COPY . .
 RUN --mount=type=cache,sharing=locked,target=/usr/local/cargo/registry \
   --mount=type=cache,sharing=locked,target=/usr/local/cargo/git \
   --mount=type=cache,sharing=locked,target=/app/target \
-  cargo build --release --locked --bin ursula \
+  cargo build --release --locked --bin ursula --bin ursulagw \
   && strip --strip-debug target/release/ursula \
-  && install -Dm755 target/release/ursula /usr/local/bin/ursula
+  && strip --strip-debug target/release/ursulagw \
+  && install -Dm755 target/release/ursula /usr/local/bin/ursula \
+  && install -Dm755 target/release/ursulagw /usr/local/bin/ursulagw
 
 FROM debian:bookworm-slim
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates \
-  && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/* \
+  && groupadd --gid 10001 ursula \
+  && useradd \
+  --uid 10001 \
+  --gid 10001 \
+  --home-dir /var/lib/ursula \
+  --no-create-home \
+  --shell /usr/sbin/nologin \
+  ursula \
+  && mkdir -p /var/lib/ursula /etc/ursula \
+  && chown -R 10001:10001 /var/lib/ursula /etc/ursula /tmp
 
 COPY --from=builder /usr/local/bin/ursula /usr/local/bin/ursula
+COPY --from=builder /usr/local/bin/ursulagw /usr/local/bin/ursulagw
 
-ENV RUST_LOG=info
+USER 10001:10001
+WORKDIR /var/lib/ursula
+
 EXPOSE 4437
 
 ENTRYPOINT ["/usr/local/bin/ursula"]

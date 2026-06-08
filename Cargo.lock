@@ -3641,6 +3641,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ursula-gateway"
+version = "0.1.3"
+dependencies = [
+ "axum 0.8.9",
+ "bytes",
+ "clap",
+ "http-body-util",
+ "rand 0.10.1",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ursula-proto"
 version = "0.1.3"
 dependencies = [

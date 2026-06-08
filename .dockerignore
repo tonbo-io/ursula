@@ -1,0 +1,8 @@
+*
+!Dockerfile
+!Cargo.toml
+!Cargo.lock
+!clippy.toml
+!rustfmt.toml
+!crates
+!crates/**
