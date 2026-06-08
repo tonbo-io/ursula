@@ -263,6 +263,38 @@ impl MetaRaftHandle {
         .await
     }
 
+    pub async fn commit_placement(
+        &self,
+        raft_group_id: RaftGroupId,
+        voters: BTreeSet<u64>,
+        learners: BTreeSet<u64>,
+        draining: BTreeSet<u64>,
+        now_ms: u64,
+    ) -> Result<ControlResponse, MetaRaftError> {
+        self.write(ControlCommand::CommitPlacement {
+            raft_group_id,
+            voters,
+            learners,
+            draining,
+            now_ms,
+        })
+        .await
+    }
+
+    pub async fn finish_migration(
+        &self,
+        migration_id: u64,
+        success: bool,
+        now_ms: u64,
+    ) -> Result<ControlResponse, MetaRaftError> {
+        self.write(ControlCommand::FinishMigration {
+            migration_id,
+            success,
+            now_ms,
+        })
+        .await
+    }
+
     pub async fn register_initial_data_nodes(
         &self,
         registrations: impl IntoIterator<Item = MetaNodeRegistration>,

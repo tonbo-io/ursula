@@ -724,8 +724,16 @@ pub fn client_router_from_state(state: HttpState) -> Router {
             get(admin_group_placement),
         )
         .route(
+            "/__ursula/admin/groups/{raft_group_id}/placement/commit",
+            post(admin_commit_placement),
+        )
+        .route(
             "/__ursula/admin/groups/{raft_group_id}/migrations",
             post(admin_begin_migration),
+        )
+        .route(
+            "/__ursula/admin/migrations/{migration_id}/finish",
+            post(admin_finish_migration),
         )
         .route(
             "/__ursula/admin/groups/{raft_group_id}/local-engine",
@@ -1269,6 +1277,130 @@ pub(crate) async fn admin_begin_migration(
     }
 }
 
+pub(crate) async fn admin_commit_placement(
+    State(state): State<HttpState>,
+    Path(raft_group_id): Path<u64>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let query = match parse_query(raw_query.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
+    };
+    let Some(raw_voters) = query.get("voters").filter(|value| !value.trim().is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "voters query parameter is required",
+        )
+            .into_response();
+    };
+    let voters = match parse_voter_ids(raw_voters) {
+        Ok(voters) => voters,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let learners = match parse_optional_node_ids_query(query.get("learners"), "learners") {
+        Ok(learners) => learners,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let draining = match parse_optional_node_ids_query(query.get("draining"), "draining") {
+        Ok(draining) => draining,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
+    };
+    let Some(meta_raft) = state.meta_raft() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "meta raft is not configured for this server",
+        )
+            .into_response();
+    };
+
+    match meta_raft
+        .commit_placement(
+            raft_group_id,
+            voters,
+            learners,
+            draining,
+            state.unix_time_ms(),
+        )
+        .await
+    {
+        Ok(ControlResponse::Ok) => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            format!(
+                "{{\"raft_group_id\":{},\"committed\":true}}",
+                raft_group_id.0
+            ),
+        )
+            .into_response(),
+        Ok(ControlResponse::Rejected { reason }) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+        Ok(response) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unexpected meta raft response: {response}"),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("commit placement in meta raft: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+pub(crate) async fn admin_finish_migration(
+    State(state): State<HttpState>,
+    Path(migration_id): Path<u64>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let query = match parse_query(raw_query.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
+    };
+    let success = match parse_optional_bool_query(query.get("success"), "success") {
+        Ok(success) => success,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let Some(meta_raft) = state.meta_raft() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "meta raft is not configured for this server",
+        )
+            .into_response();
+    };
+
+    match meta_raft
+        .finish_migration(migration_id, success, state.unix_time_ms())
+        .await
+    {
+        Ok(ControlResponse::Ok) => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            format!(
+                "{{\"migration_id\":{},\"success\":{},\"finished\":true}}",
+                migration_id, success
+            ),
+        )
+            .into_response(),
+        Ok(ControlResponse::Rejected { reason }) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+        Ok(response) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unexpected meta raft response: {response}"),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("finish migration in meta raft: {err}"),
+        )
+            .into_response(),
+    }
+}
+
 pub(crate) async fn admin_prepare_local_engine(
     State(state): State<HttpState>,
     Path(raft_group_id): Path<u64>,
@@ -1617,6 +1749,17 @@ fn parse_optional_bool_query(raw: Option<&String>, name: &str) -> Result<bool, S
         Some(value) => Err(format!(
             "invalid {name} query parameter '{value}': expected true or false"
         )),
+    }
+}
+
+fn parse_optional_node_ids_query(
+    raw: Option<&String>,
+    name: &str,
+) -> Result<BTreeSet<u64>, String> {
+    match raw.map(String::as_str).map(str::trim) {
+        None | Some("") => Ok(BTreeSet::new()),
+        Some(raw) => parse_voter_ids(raw)
+            .map_err(|message| format!("invalid {name} query parameter: {message}")),
     }
 }
 
