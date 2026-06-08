@@ -228,6 +228,35 @@ impl MetricsClient {
             ))
         }
     }
+
+    pub async fn begin_migration(
+        &self,
+        admin_url: &Url,
+        raft_group_id: u64,
+        target_voters: &BTreeSet<u64>,
+        retain_removed: bool,
+    ) -> Result<BeginMigrationResponse> {
+        let path = begin_migration_path(raft_group_id, target_voters, retain_removed);
+        let url = admin_url
+            .join(&path)
+            .with_context(|| format!("compose begin-migration url at {admin_url}"))?;
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str::<BeginMigrationResponse>(&body)
+                .with_context(|| format!("decode begin-migration response: {body}"))
+        } else {
+            Err(anyhow!(
+                "begin-migration at {admin_url} for group {raft_group_id} returned {status}: {body}"
+            ))
+        }
+    }
 }
 
 fn register_node_path(node_id: u64, client_url: &str, cluster_url: &str) -> String {
@@ -238,6 +267,21 @@ fn register_node_path(node_id: u64, client_url: &str, cluster_url: &str) -> Stri
 
 fn group_placement_path(raft_group_id: u64) -> String {
     format!("/__ursula/admin/groups/{raft_group_id}/placement")
+}
+
+fn begin_migration_path(
+    raft_group_id: u64,
+    target_voters: &BTreeSet<u64>,
+    retain_removed: bool,
+) -> String {
+    let target_voters = target_voters
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "/__ursula/admin/groups/{raft_group_id}/migrations?target_voters={target_voters}&retain_removed={retain_removed}"
+    )
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -262,6 +306,13 @@ pub struct PlacementNodeResponse {
     pub client_url: String,
     pub cluster_url: String,
     pub state: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BeginMigrationResponse {
+    pub raft_group_id: u64,
+    pub migration_id: u64,
+    pub started: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -418,6 +469,14 @@ mod tests {
         assert_eq!(
             group_placement_path(7),
             "/__ursula/admin/groups/7/placement"
+        );
+    }
+
+    #[test]
+    fn begin_migration_path_builds_admin_query() {
+        assert_eq!(
+            begin_migration_path(2, &BTreeSet::from([2, 3, 4]), true),
+            "/__ursula/admin/groups/2/migrations?target_voters=2,3,4&retain_removed=true"
         );
     }
 }

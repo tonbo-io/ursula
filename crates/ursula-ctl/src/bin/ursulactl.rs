@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -57,12 +58,21 @@ enum GroupCommand {
     /// Read or change group placement through the meta group admin endpoint.
     #[command(subcommand)]
     Placement(GroupPlacementCommand),
+    /// Start or inspect group migration intents through the meta group.
+    #[command(subcommand)]
+    Migration(GroupMigrationCommand),
 }
 
 #[derive(Subcommand, Debug)]
 enum GroupPlacementCommand {
     /// Print the current meta-group placement projection for one data group.
     Get(GroupPlacementGetArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum GroupMigrationCommand {
+    /// Start a durable meta-group migration intent for one data group.
+    Begin(GroupMigrationBeginArgs),
 }
 
 #[derive(Args, Debug)]
@@ -91,6 +101,24 @@ struct GroupPlacementGetArgs {
     /// Raft group id to inspect.
     #[arg(long)]
     raft_group_id: u64,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+struct GroupMigrationBeginArgs {
+    /// Base URL of a server with the meta group admin endpoint.
+    #[arg(long)]
+    admin_url: Url,
+    /// Raft group id to migrate.
+    #[arg(long)]
+    raft_group_id: u64,
+    /// Target data-group voters, comma separated.
+    #[arg(long, value_delimiter = ',')]
+    target_voters: Vec<u64>,
+    /// Keep removed voters as non-serving learners after the voter change.
+    #[arg(long, default_value_t = false)]
+    retain_removed: bool,
     #[arg(long, default_value_t = 10)]
     http_timeout_secs: u64,
 }
@@ -170,6 +198,9 @@ async fn main() -> Result<()> {
         Command::Group(GroupCommand::Placement(GroupPlacementCommand::Get(args))) => {
             run_group_placement_get_subcommand(args).await
         }
+        Command::Group(GroupCommand::Migration(GroupMigrationCommand::Begin(args))) => {
+            run_group_migration_begin_subcommand(args).await
+        }
         Command::Status(args) => run_status_subcommand(args).await,
         Command::WaitReady(args) => run_wait_ready_subcommand(args).await,
     }
@@ -204,6 +235,33 @@ async fn run_group_placement_get_subcommand(args: GroupPlacementGetArgs) -> Resu
     let mut stdout = stdout.lock();
     serde_json::to_writer_pretty(&mut stdout, &response).context("write group placement json")?;
     writeln!(&mut stdout).context("write group placement newline")?;
+    Ok(())
+}
+
+async fn run_group_migration_begin_subcommand(args: GroupMigrationBeginArgs) -> Result<()> {
+    let target_voters = args.target_voters.into_iter().collect::<BTreeSet<_>>();
+    if target_voters.is_empty() {
+        bail!("--target-voters must not be empty");
+    }
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let response = client
+        .begin_migration(
+            &args.admin_url,
+            args.raft_group_id,
+            &target_voters,
+            args.retain_removed,
+        )
+        .await?;
+    if !response.started {
+        bail!(
+            "begin-migration response for group {} did not confirm start",
+            response.raft_group_id
+        );
+    }
+    println!(
+        "group {}: migration {} started",
+        response.raft_group_id, response.migration_id
+    );
     Ok(())
 }
 
@@ -323,6 +381,35 @@ mod tests {
         };
         assert_eq!(args.admin_url.as_str(), "http://node1:4491/");
         assert_eq!(args.raft_group_id, 7);
+        assert_eq!(args.http_timeout_secs, 10);
+    }
+
+    #[test]
+    fn parses_group_migration_begin_command() {
+        let cli = Cli::try_parse_from([
+            "ursulactl",
+            "group",
+            "migration",
+            "begin",
+            "--admin-url",
+            "http://node1:4491",
+            "--raft-group-id",
+            "2",
+            "--target-voters",
+            "2,3,4",
+            "--retain-removed",
+        ])
+        .expect("parse group migration begin command");
+
+        let Command::Group(GroupCommand::Migration(GroupMigrationCommand::Begin(args))) =
+            cli.command
+        else {
+            panic!("expected group migration begin command");
+        };
+        assert_eq!(args.admin_url.as_str(), "http://node1:4491/");
+        assert_eq!(args.raft_group_id, 2);
+        assert_eq!(args.target_voters, vec![2, 3, 4]);
+        assert!(args.retain_removed);
         assert_eq!(args.http_timeout_secs, 10);
     }
 }
