@@ -728,6 +728,10 @@ pub fn client_router_from_state(state: HttpState) -> Router {
             post(admin_begin_migration),
         )
         .route(
+            "/__ursula/admin/groups/{raft_group_id}/local-engine",
+            post(admin_prepare_local_engine),
+        )
+        .route(
             "/__ursula/flush-cold/{bucket}/{stream}",
             post(flush_cold_stream),
         )
@@ -1260,6 +1264,40 @@ pub(crate) async fn admin_begin_migration(
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("begin migration in meta raft: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+pub(crate) async fn admin_prepare_local_engine(
+    State(state): State<HttpState>,
+    Path(raft_group_id): Path<u64>,
+) -> Response {
+    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
+    };
+    let Some(registry) = state.raft_registry() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "raft registry is not configured for this server",
+        )
+            .into_response();
+    };
+    let newly_allowed = registry.allow_dynamic_group_hosting(raft_group_id);
+
+    match state.runtime().warm_group(raft_group_id).await {
+        Ok(placement) => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            format!(
+                "{{\"raft_group_id\":{},\"core_id\":{},\"prepared\":true,\"already_allowed\":{}}}",
+                placement.raft_group_id.0, placement.core_id.0, !newly_allowed
+            ),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("prepare local raft group engine: {err}"),
         )
             .into_response(),
     }

@@ -830,6 +830,7 @@ impl fmt::Display for LeadershipShedState {
 #[derive(Debug, Clone)]
 pub struct RaftGroupHandleRegistry {
     groups: Arc<Mutex<BTreeMap<u32, Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>>>>,
+    dynamic_hosted_groups: Arc<Mutex<BTreeSet<RaftGroupId>>>,
     leadership_shed: LeadershipShedFlag,
     snapshot_store: Arc<Mutex<SharedSnapshotStore>>,
     snapshot_install: SnapshotInstallCoordinator,
@@ -839,6 +840,7 @@ impl Default for RaftGroupHandleRegistry {
     fn default() -> Self {
         Self {
             groups: Arc::new(Mutex::new(BTreeMap::new())),
+            dynamic_hosted_groups: Arc::new(Mutex::new(BTreeSet::new())),
             leadership_shed: Arc::new(AtomicU8::new(0)),
             snapshot_store: Arc::new(Mutex::new(default_snapshot_store())),
             snapshot_install: SnapshotInstallCoordinator::default(),
@@ -892,6 +894,20 @@ impl RaftGroupHandleRegistry {
             .lock()
             .expect("raft group handle registry mutex")
             .contains_key(&raft_group_id.0)
+    }
+
+    pub fn allow_dynamic_group_hosting(&self, raft_group_id: RaftGroupId) -> bool {
+        self.dynamic_hosted_groups
+            .lock()
+            .expect("raft dynamic hosted groups mutex")
+            .insert(raft_group_id)
+    }
+
+    pub fn dynamic_group_hosting_allowed(&self, raft_group_id: RaftGroupId) -> bool {
+        self.dynamic_hosted_groups
+            .lock()
+            .expect("raft dynamic hosted groups mutex")
+            .contains(&raft_group_id)
     }
 
     pub fn len(&self) -> usize {

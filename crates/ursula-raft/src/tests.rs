@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -37,6 +38,7 @@ use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineError;
+use ursula_runtime::GroupEngineFactory;
 use ursula_runtime::GroupInfraError;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
@@ -814,6 +816,35 @@ async fn meta_raft_handle_rejects_invalid_initial_data_nodes() {
         .shutdown()
         .await
         .expect("shutdown single-node meta raft handle");
+}
+
+#[test]
+fn dynamic_group_hosting_allows_non_voter_warmup() {
+    let registry = RaftGroupHandleRegistry::default();
+    let factory = StaticGrpcRaftGroupEngineFactory::new(
+        4,
+        [
+            (1, "node1".to_owned()),
+            (2, "node2".to_owned()),
+            (3, "node3".to_owned()),
+            (4, "node4".to_owned()),
+        ],
+        false,
+        registry.clone(),
+    )
+    .with_per_group_voters(BTreeMap::from([(
+        RaftGroupId(2),
+        BTreeSet::from([1, 2, 3]),
+    )]));
+    let placement = ShardPlacement {
+        shard_id: ShardId(0),
+        core_id: CoreId(0),
+        raft_group_id: RaftGroupId(2),
+    };
+
+    assert!(!factory.hosts_group(placement));
+    registry.allow_dynamic_group_hosting(RaftGroupId(2));
+    assert!(factory.hosts_group(placement));
 }
 
 #[tokio::test]
