@@ -28,6 +28,7 @@ use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
 use openraft::vote::RaftLeaderId;
 use prost::Message;
+use ursula_control::ControlCommand;
 use ursula_proto as raft_app_proto;
 use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendRequest;
@@ -60,6 +61,7 @@ use crate::registry::*;
 use crate::types::*;
 
 type CommittedLeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
+type MetaLeaderId = <MetaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
 
 #[test]
 fn group_engine_error_codec_round_trips_stream_context() {
@@ -162,6 +164,33 @@ fn normal_entry(
     command: GroupWriteCommand,
 ) -> <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::Entry {
     Entry::new(log_id(index), EntryPayload::Normal(command.into()))
+}
+
+fn meta_log_id(index: u64) -> LogId<MetaLeaderId> {
+    LogId {
+        leader_id: MetaLeaderId::new(1, 1),
+        index,
+    }
+}
+
+fn meta_entry(
+    index: u64,
+    command: ControlCommand,
+) -> <MetaRaftTypeConfig as openraft::RaftTypeConfig>::Entry {
+    <MetaRaftTypeConfig as openraft::RaftTypeConfig>::Entry::new(
+        meta_log_id(index),
+        EntryPayload::Normal(command),
+    )
+}
+
+fn register_node_command(node_id: u64) -> ControlCommand {
+    ControlCommand::RegisterNode {
+        node_id,
+        client_url: format!("http://node{node_id}:4491"),
+        cluster_url: format!("http://node{node_id}:4492"),
+        labels: BTreeMap::new(),
+        now_ms: 10,
+    }
 }
 
 fn create_stream_command(name: &str) -> GroupWriteCommand {
@@ -363,6 +392,126 @@ async fn raft_log_store_rejects_holes() {
         .expect_err("cross-append hole should be rejected");
 
     assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+}
+
+#[tokio::test]
+async fn meta_raft_log_store_appends_reads_truncates_and_purges() {
+    let mut store = MetaRaftLogStore::shared();
+    store
+        .append(
+            vec![
+                meta_entry(1, register_node_command(1)),
+                meta_entry(2, register_node_command(2)),
+                meta_entry(3, register_node_command(3)),
+            ],
+            IOFlushed::noop(),
+        )
+        .await
+        .expect("append meta log entries");
+
+    let state = store.get_log_state().await.expect("log state");
+    assert_eq!(state.last_purged_log_id, None);
+    assert_eq!(state.last_log_id, Some(meta_log_id(3)));
+
+    let mut reader = store.get_log_reader().await;
+    let entries = reader
+        .try_get_log_entries(1..4)
+        .await
+        .expect("read meta entries");
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].log_id, meta_log_id(1));
+    assert_eq!(entries[2].log_id, meta_log_id(3));
+
+    store
+        .truncate_after(Some(meta_log_id(1)))
+        .await
+        .expect("truncate meta log");
+    assert_eq!(
+        store.get_log_state().await.expect("log state").last_log_id,
+        Some(meta_log_id(1))
+    );
+
+    store
+        .append(
+            vec![
+                meta_entry(2, register_node_command(4)),
+                meta_entry(3, register_node_command(5)),
+            ],
+            IOFlushed::noop(),
+        )
+        .await
+        .expect("append after truncate");
+    store.purge(meta_log_id(2)).await.expect("purge meta log");
+
+    let state = store.get_log_state().await.expect("log state after purge");
+    assert_eq!(state.last_purged_log_id, Some(meta_log_id(2)));
+    assert_eq!(state.last_log_id, Some(meta_log_id(3)));
+
+    let entries = reader
+        .try_get_log_entries(1..4)
+        .await
+        .expect("read after purge");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].log_id, meta_log_id(3));
+}
+
+#[tokio::test]
+async fn meta_raft_log_store_persists_vote_and_committed_pointer() {
+    let mut store = MetaRaftLogStore::shared();
+    let vote: VoteOf<MetaRaftTypeConfig> = openraft::Vote::new_committed(7, 1);
+
+    store.save_vote(&vote).await.expect("save vote");
+    let mut reader = store.get_log_reader().await;
+    assert_eq!(reader.read_vote().await.expect("read vote"), Some(vote));
+
+    store
+        .save_committed(Some(meta_log_id(9)))
+        .await
+        .expect("save committed");
+    assert_eq!(
+        store.read_committed().await.expect("read committed"),
+        Some(meta_log_id(9))
+    );
+}
+
+#[tokio::test]
+async fn meta_raft_log_store_rejects_holes() {
+    let mut store = MetaRaftLogStore::shared();
+    let err = store
+        .append(
+            vec![
+                meta_entry(1, register_node_command(1)),
+                meta_entry(3, register_node_command(3)),
+            ],
+            IOFlushed::noop(),
+        )
+        .await
+        .expect_err("hole should be rejected");
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+    store
+        .append(
+            vec![meta_entry(1, register_node_command(1))],
+            IOFlushed::noop(),
+        )
+        .await
+        .expect("append first entry");
+    let err = store
+        .append(
+            vec![meta_entry(3, register_node_command(3))],
+            IOFlushed::noop(),
+        )
+        .await
+        .expect_err("cross-append hole should be rejected");
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn public_meta_log_store_type_is_exported_from_crate_root() {
+    let _store = crate::MetaRaftLogStore::shared();
+    let _generic = crate::MemoryRaftLogStore::<crate::MetaRaftTypeConfig>::shared();
 }
 
 #[tokio::test]

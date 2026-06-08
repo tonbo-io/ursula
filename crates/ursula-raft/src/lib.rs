@@ -53,6 +53,8 @@ pub use grpc::RAFT_GRPC_TRANSFER_LEADER_PATH;
 pub use grpc::RAFT_GRPC_VOTE_PATH;
 pub use grpc::RaftGrpcService;
 pub use grpc::raft_grpc_service;
+pub use log_store::MemoryRaftLogStore;
+pub use log_store::MetaRaftLogStore;
 pub use log_store::RaftGroupFileLogStore;
 pub use log_store::RaftGroupLogStore;
 pub use meta::MetaRaftSnapshotBuilder;
