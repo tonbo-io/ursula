@@ -1,0 +1,61 @@
+{{- if .Values.tests.enabled -}}
+{{- $testName := printf "%s-wait-ready" (include "ursula.fullname" . | trunc 52 | trimSuffix "-") -}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ $testName }}
+  labels:
+    helm.sh/chart: {{ include "ursula.chart" . }}
+    app.kubernetes.io/name: {{ include "ursula.name" . }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/component: helm-test
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  serviceAccountName: {{ include "ursula.serviceAccountName" . }}
+  automountServiceAccountToken: false
+  {{- with .Values.server.podSecurityContext }}
+  securityContext:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.global.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  containers:
+    - name: wait-ready
+      image: {{ include "ursula.testImage" . | quote }}
+      imagePullPolicy: {{ include "ursula.testPullPolicy" . }}
+      command:
+        - /usr/local/bin/ursulactl
+      args:
+        - wait-ready
+        - --config
+        - /etc/ursula/test/cluster-manifest.json
+        - --expected-groups
+        - {{ .Values.raft.groupCount | quote }}
+        - --timeout-secs
+        - {{ .Values.tests.timeoutSeconds | quote }}
+      volumeMounts:
+        - name: test-config
+          mountPath: /etc/ursula/test
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+      {{- with .Values.server.securityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  volumes:
+    - name: test-config
+      configMap:
+        name: {{ include "ursula.fullname" . }}
+        items:
+          - key: cluster-manifest.json
+            path: cluster-manifest.json
+    - name: tmp
+      emptyDir: {}
+{{- end }}

@@ -69,7 +69,8 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   configuration: { group: "Install & Deploy", order: 3 },
   "configure-s3": { group: "Install & Deploy", order: 4 },
   "deploy-cluster": { group: "Install & Deploy", order: 5 },
-  security: { group: "Install & Deploy", order: 6 },
+  "deploy-kubernetes": { group: "Install & Deploy", order: 6 },
+  security: { group: "Install & Deploy", order: 7 },
 
   // Operate - day-2 entrypoints. `ursulactl` is the first one to reach for.
   cli: { group: "Operate", order: 1, title: "ursulactl" },

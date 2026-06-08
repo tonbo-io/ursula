@@ -1,0 +1,130 @@
+---
+title: Deploy on Kubernetes
+description: Run Ursula on Kubernetes with the Helm chart.
+---
+
+The Ursula Helm chart starts a static-membership Raft cluster with stable
+StatefulSet pod identities, durable per-pod Raft logs, a headless peer Service,
+a client/admin Service, a quorum-protecting PodDisruptionBudget, and a Helm test
+powered by `ursulactl`. The default chart also separates the client/admin port
+from the Raft peer port and adds soft multi-pod spread hints.
+
+The chart is for fresh static-membership clusters. It does not perform online
+Raft voter expansion, voter removal, leader handoff during Kubernetes rolling
+updates, or post-bootstrap membership flag mutation. Those operations belong to
+the future Ursula operator workflow.
+
+## Build an image
+
+```bash
+docker build -t ursula:dev .
+```
+
+For kind:
+
+```bash
+kind load docker-image ursula:dev
+```
+
+## Install
+
+For a local image loaded into the cluster:
+
+```bash
+helm install ursula charts/ursula \
+  --set image.repository=ursula \
+  --set image.tag=dev \
+  --set image.pullPolicy=Never
+```
+
+The default install starts three voters and 64 Raft groups. For a registry
+image, set `image.repository`, `image.tag`, and optionally `image.pullSecrets`.
+
+## Verify readiness
+
+```bash
+helm test ursula
+```
+
+The test mounts the chart-generated `cluster-manifest.json` and runs
+`ursulactl wait-ready`. It succeeds only when every configured node reports the
+expected Raft group count and every group has a leader.
+
+## Finish bootstrap
+
+Fresh clusters start with `raft.initMembershipPerGroup=true` so Ursula can
+initialize per-group Raft membership automatically. After `helm test` passes,
+update your values and run:
+
+```bash
+helm upgrade ursula charts/ursula \
+  --reuse-values \
+  --set raft.initMembershipPerGroup=false
+```
+
+If you do not use `--reuse-values`, repeat your image overrides or use a values
+file so the upgrade does not roll pods back to the chart default image.
+
+Keep this value false for normal restarts and upgrades. A future Kubernetes
+operator will own this transition automatically.
+
+## Static membership
+
+`replicaCount` controls the initial voter set for a fresh cluster. The chart
+supports `1`, `3`, and `5`; production clusters should use `3` or `5`.
+
+Changing `replicaCount` on an initialized cluster is not safe Raft voter
+reconfiguration. Safe scaling requires an operator workflow that adds learners,
+waits for catch-up, promotes voters, and removes old voters.
+
+## Cold storage
+
+Cold storage is disabled by default. Production multi-node clusters should use
+S3 or an S3-compatible object store:
+
+```yaml
+s3:
+  bucket: my-ursula-bucket
+  region: us-east-1
+  prefix: ursula-prod
+
+coldStorage:
+  enabled: true
+```
+
+Prefer workload identity through ServiceAccount annotations instead of static
+S3 credentials:
+
+```yaml
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-s3
+```
+
+For MinIO or another S3-compatible backend, set `s3.endpoint`.
+
+## Operational endpoints
+
+Ursula exposes a single admin endpoint on the client plane:
+
+- `GET /__ursula/metrics` — per-node JSON snapshot with Raft group state, hot
+  bytes, cold backpressure counters, and per-core mailbox depth.
+
+There are no dedicated `/__ursula/healthz` or `/__ursula/readyz` probes yet.
+Kubernetes probes are disabled in the current chart (`FIXME` in
+`statefulset.yaml`). Use `helm test` or `ursulactl wait-ready` for cluster-level
+readiness.
+
+## Access locally
+
+```bash
+kubectl port-forward svc/ursula 4437:4437
+curl http://127.0.0.1:4437/__ursula/metrics
+```
+
+## Upgrade limits
+
+Until the operator exists, Kubernetes StatefulSet rolling updates do not
+transfer leaders, coordinate applied-index catch-up, or mutate Raft membership.
+Use `ursulactl restart` manually for drain-aware rolling restarts when you need
+operationally safe restarts on an initialized cluster.
