@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -36,6 +37,9 @@ enum Command {
     /// Node registration and lifecycle operations.
     #[command(subcommand)]
     Node(NodeCommand),
+    /// Group placement inspection and migration operations.
+    #[command(subcommand)]
+    Group(GroupCommand),
     /// Print per-node raft group count and leadership distribution from /__ursula/metrics.
     Status(ObserveArgs),
     /// Block until every node reports the expected number of raft groups and initialized groups have leaders.
@@ -46,6 +50,19 @@ enum Command {
 enum NodeCommand {
     /// Register a data-capable node through the meta group admin endpoint.
     Register(NodeRegisterArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum GroupCommand {
+    /// Read or change group placement through the meta group admin endpoint.
+    #[command(subcommand)]
+    Placement(GroupPlacementCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum GroupPlacementCommand {
+    /// Print the current meta-group placement projection for one data group.
+    Get(GroupPlacementGetArgs),
 }
 
 #[derive(Args, Debug)]
@@ -62,6 +79,18 @@ struct NodeRegisterArgs {
     /// Cluster-plane URL used by Raft/internal admin traffic.
     #[arg(long)]
     cluster_url: String,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+struct GroupPlacementGetArgs {
+    /// Base URL of a server with the meta group admin endpoint.
+    #[arg(long)]
+    admin_url: Url,
+    /// Raft group id to inspect.
+    #[arg(long)]
+    raft_group_id: u64,
     #[arg(long, default_value_t = 10)]
     http_timeout_secs: u64,
 }
@@ -138,6 +167,9 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Restart(args) => run_restart_subcommand(args).await,
         Command::Node(NodeCommand::Register(args)) => run_node_register_subcommand(args).await,
+        Command::Group(GroupCommand::Placement(GroupPlacementCommand::Get(args))) => {
+            run_group_placement_get_subcommand(args).await
+        }
         Command::Status(args) => run_status_subcommand(args).await,
         Command::WaitReady(args) => run_wait_ready_subcommand(args).await,
     }
@@ -160,6 +192,18 @@ async fn run_node_register_subcommand(args: NodeRegisterArgs) -> Result<()> {
         );
     }
     println!("node {}: registered", response.node_id);
+    Ok(())
+}
+
+async fn run_group_placement_get_subcommand(args: GroupPlacementGetArgs) -> Result<()> {
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let response = client
+        .group_placement(&args.admin_url, args.raft_group_id)
+        .await?;
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    serde_json::to_writer_pretty(&mut stdout, &response).context("write group placement json")?;
+    writeln!(&mut stdout).context("write group placement newline")?;
     Ok(())
 }
 
@@ -256,6 +300,29 @@ mod tests {
         assert_eq!(args.node_id, 5);
         assert_eq!(args.client_url, "http://node5:4491");
         assert_eq!(args.cluster_url, "http://node5:4492");
+        assert_eq!(args.http_timeout_secs, 10);
+    }
+
+    #[test]
+    fn parses_group_placement_get_command() {
+        let cli = Cli::try_parse_from([
+            "ursulactl",
+            "group",
+            "placement",
+            "get",
+            "--admin-url",
+            "http://node1:4491",
+            "--raft-group-id",
+            "7",
+        ])
+        .expect("parse group placement get command");
+
+        let Command::Group(GroupCommand::Placement(GroupPlacementCommand::Get(args))) = cli.command
+        else {
+            panic!("expected group placement get command");
+        };
+        assert_eq!(args.admin_url.as_str(), "http://node1:4491/");
+        assert_eq!(args.raft_group_id, 7);
         assert_eq!(args.http_timeout_secs, 10);
     }
 }

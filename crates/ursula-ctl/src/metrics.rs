@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -7,6 +9,7 @@ use anyhow::anyhow;
 use anyhow::bail;
 use reqwest::Client;
 use serde::Deserialize;
+use serde::Serialize;
 use url::Url;
 
 use crate::provider::NodeInfo;
@@ -198,6 +201,33 @@ impl MetricsClient {
             ))
         }
     }
+
+    pub async fn group_placement(
+        &self,
+        admin_url: &Url,
+        raft_group_id: u64,
+    ) -> Result<GroupPlacementResponse> {
+        let path = group_placement_path(raft_group_id);
+        let url = admin_url
+            .join(&path)
+            .with_context(|| format!("compose group-placement url at {admin_url}"))?;
+        let resp = self
+            .client
+            .get(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str::<GroupPlacementResponse>(&body)
+                .with_context(|| format!("decode group-placement response: {body}"))
+        } else {
+            Err(anyhow!(
+                "group-placement at {admin_url} for group {raft_group_id} returned {status}: {body}"
+            ))
+        }
+    }
 }
 
 fn register_node_path(node_id: u64, client_url: &str, cluster_url: &str) -> String {
@@ -206,10 +236,32 @@ fn register_node_path(node_id: u64, client_url: &str, cluster_url: &str) -> Stri
     )
 }
 
+fn group_placement_path(raft_group_id: u64) -> String {
+    format!("/__ursula/admin/groups/{raft_group_id}/placement")
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegisterNodeResponse {
     pub node_id: u64,
     pub registered: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GroupPlacementResponse {
+    pub raft_group_id: u64,
+    pub voters: BTreeSet<u64>,
+    pub learners: BTreeSet<u64>,
+    pub draining: BTreeSet<u64>,
+    pub epoch: u64,
+    pub nodes: BTreeMap<u64, PlacementNodeResponse>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlacementNodeResponse {
+    pub node_id: u64,
+    pub client_url: String,
+    pub cluster_url: String,
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -358,6 +410,14 @@ mod tests {
         assert_eq!(
             register_node_path(5, "http://node5:4491", "http://node5:4492"),
             "/__ursula/admin/nodes/5/register?client_url=http://node5:4491&cluster_url=http://node5:4492"
+        );
+    }
+
+    #[test]
+    fn group_placement_path_builds_admin_projection_path() {
+        assert_eq!(
+            group_placement_path(7),
+            "/__ursula/admin/groups/7/placement"
         );
     }
 }
