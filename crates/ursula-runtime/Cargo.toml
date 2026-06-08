@@ -11,6 +11,7 @@ description = "Per-core actor runtime for Ursula: hot ring, cold-tier flush, and
 
 [dependencies]
 bytes = { workspace = true, features = ["serde"] }
+crossbeam-utils = { workspace = true }
 opendal = { workspace = true, features = ["services-memory", "services-s3"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -36,6 +37,10 @@ harness = false
 
 [[bench]]
 name = "append_apply"
+harness = false
+
+[[bench]]
+name = "atomic_padding"
 harness = false
 
 [lints.rust]
