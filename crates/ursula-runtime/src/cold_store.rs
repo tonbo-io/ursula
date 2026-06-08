@@ -270,7 +270,7 @@ impl ColdStore {
     /// Delegates to [`from_config`](Self::from_config) after assembling a
     /// [`ColdConfig`] from `URSULA_COLD_*` env vars.
     pub fn from_env() -> io::Result<Option<ColdStoreHandle>> {
-        Self::from_config(&ColdConfig::from_env())
+        Self::from_config(&ColdConfig::from_env()?)
     }
 
     fn s3_from_config(config: &ColdStorageConfig) -> io::Result<Self> {
