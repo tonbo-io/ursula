@@ -1,0 +1,137 @@
+{{- include "ursula.validateGatewayConfig" . -}}
+{{- if .Values.gateway.enabled }}
+{{- $fullname := include "ursula.fullname" . -}}
+{{- $headless := include "ursula.headlessServiceName" . -}}
+{{- $namespace := .Release.Namespace -}}
+{{- $clusterDomain := .Values.global.clusterDomain | toString -}}
+{{- $clientPort := .Values.server.ports.client | int -}}
+{{- $replicaCount := .Values.server.replicaCount | int -}}
+{{- $manualUpstreams := .Values.gateway.upstreams -}}
+{{- $upstreams := list -}}
+{{- if $manualUpstreams -}}
+{{- $upstreams = $manualUpstreams -}}
+{{- else -}}
+{{- range $i := until $replicaCount -}}
+{{- $podName := printf "%s-%d" $fullname $i -}}
+{{- $host := printf "%s.%s.%s.svc.%s" $podName $headless $namespace $clusterDomain -}}
+{{- $upstreams = append $upstreams (printf "http://%s:%d" $host $clientPort) -}}
+{{- end -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ursula.gatewayFullname" . }}
+  labels:
+    {{- include "ursula.gatewayLabels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.gateway.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "ursula.gatewaySelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ursula.gatewaySelectorLabels" . | nindent 8 }}
+        {{- with .Values.gateway.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- with .Values.gateway.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "ursula.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      enableServiceLinks: false
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.initContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: gateway
+          image: {{ include "ursula.gatewayImage" . | quote }}
+          imagePullPolicy: {{ default .Values.global.image.pullPolicy .Values.gateway.image.pullPolicy }}
+          command:
+            - /usr/local/bin/ursulagw
+          args:
+            - --listen
+            - {{ printf "0.0.0.0:%d" (.Values.gateway.ports.http | int) | quote }}
+            - --connect-timeout
+            - {{ .Values.gateway.connectTimeoutSeconds | quote }}
+            - --response-header-timeout
+            - {{ .Values.gateway.responseHeaderTimeoutSeconds | quote }}
+            {{- range $upstreams }}
+            - --upstream
+            - {{ . | quote }}
+            {{- end }}
+            {{- with .Values.gateway.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: gateway
+              containerPort: {{ .Values.gateway.ports.http }}
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.gateway.rustLog | quote }}
+            {{- with .Values.gateway.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.gateway.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.gateway.probes.startup.enabled }}
+          startupProbe:
+            tcpSocket:
+              port: gateway
+            failureThreshold: {{ .Values.gateway.probes.startup.failureThreshold }}
+            periodSeconds: {{ .Values.gateway.probes.startup.periodSeconds }}
+          {{- end }}
+          {{- if .Values.gateway.probes.readiness.enabled }}
+          readinessProbe:
+            tcpSocket:
+              port: gateway
+            periodSeconds: {{ .Values.gateway.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.gateway.probes.readiness.timeoutSeconds }}
+          {{- end }}
+          {{- if .Values.gateway.probes.liveness.enabled }}
+          livenessProbe:
+            tcpSocket:
+              port: gateway
+            periodSeconds: {{ .Values.gateway.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.gateway.probes.liveness.timeoutSeconds }}
+          {{- end }}
+          {{- with .Values.gateway.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.gateway.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.gateway.scheduling.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.scheduling.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.scheduling.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.gateway.scheduling.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

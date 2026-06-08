@@ -1,0 +1,26 @@
+# Git and CI
+.git
+.gitignore
+.github
+
+# Python / tooling environments
+.venv-openapi
+.hypothesis
+.worktrees
+
+# Build artifacts
+target
+
+# Non-build files
+charts
+docs
+scripts
+AGENTS.md
+CLAUDE.md
+LICENSE
+README.md
+justfile
+updated-values.yaml
+
+# Docker metadata
+.dockerignore

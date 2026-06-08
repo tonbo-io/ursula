@@ -1,0 +1,34 @@
+[package]
+name = "ursula-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "Ursula Gateway: routes client HTTP traffic while hiding internal leader redirects."
+
+[[bin]]
+name = "ursulagw"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+http-body-util = "0.1"
+reqwest = { workspace = true, features = ["rustls-tls", "stream"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true, features = ["thread_rng"] }
+
+[dev-dependencies]
+tokio-stream = { workspace = true }
+
+[lints]
+workspace = true

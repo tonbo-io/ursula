@@ -1,0 +1,21 @@
+{{- if .Values.gateway.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ursula.gatewayFullname" . }}
+  labels:
+    {{- include "ursula.gatewayLabels" . | nindent 4 }}
+  {{- with .Values.gateway.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.gateway.service.type }}
+  ports:
+    - name: gateway
+      port: {{ .Values.gateway.service.port }}
+      targetPort: gateway
+      protocol: TCP
+  selector:
+    {{- include "ursula.gatewaySelectorLabels" . | nindent 4 }}
+{{- end }}

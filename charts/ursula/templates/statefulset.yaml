@@ -1,0 +1,273 @@
+{{- range $label := list "app.kubernetes.io/name" "app.kubernetes.io/instance" -}}
+{{- if hasKey $.Values.server.podLabels $label -}}
+{{- fail (printf "server.podLabels must not set reserved selector label %q" $label) -}}
+{{- end -}}
+{{- end -}}
+{{- $s3Bucket := .Values.s3.bucket | toString -}}
+{{- $s3Region := .Values.s3.region | toString -}}
+{{- $s3Endpoint := .Values.s3.endpoint | toString -}}
+{{- $s3Prefix := .Values.s3.prefix | toString -}}
+{{- $coldRoot := include "ursula.joinPath" (list $s3Prefix .Values.coldStorage.prefix) -}}
+{{- $snapshotRoot := include "ursula.joinPath" (list $s3Prefix) -}}
+{{- $snapshotPrefix := .Values.snapshotStore.prefix | toString | trimAll "/" -}}
+{{- $s3CredentialSecret := include "ursula.s3SecretName" . -}}
+{{- $hasS3Credentials := include "ursula.hasS3Credentials" . -}}
+{{- $coldFlushIntervalMs := .Values.coldStorage.flush.intervalMs | int64 -}}
+{{- $coldFlushMinHotBytes := .Values.coldStorage.flush.minHotBytes | int64 -}}
+{{- $coldFlushMaxBytes := .Values.coldStorage.flush.maxBytes | int64 -}}
+{{- $coldFlushMaxConcurrency := .Values.coldStorage.flush.maxConcurrency | int64 -}}
+{{- $coldMaxHotBytesPerGroup := .Values.coldStorage.flush.maxHotBytesPerGroup | int64 -}}
+{{- $renderColdFlushIntervalMs := $coldFlushIntervalMs | toString | ne "1000" -}}
+{{- $renderColdFlushMinHotBytes := $coldFlushMinHotBytes | toString | ne "8388608" -}}
+{{- $renderColdFlushMaxBytes := $coldFlushMaxBytes | toString | ne "8388608" -}}
+{{- $renderColdFlushMaxConcurrency := $coldFlushMaxConcurrency | toString | ne "4" -}}
+{{- $renderColdMaxHotBytesPerGroup := $coldMaxHotBytesPerGroup | toString | ne "67108864" -}}
+{{- $replicaCount := .Values.server.replicaCount | int -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "ursula.fullname" . }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "ursula.headlessServiceName" . }}
+  replicas: {{ $replicaCount }}
+  podManagementPolicy: {{ .Values.server.podManagementPolicy }}
+  selector:
+    matchLabels:
+      {{- include "ursula.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ursula.selectorLabels" . | nindent 8 }}
+        {{- with .Values.server.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.server.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "ursula.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      enableServiceLinks: false
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ursula
+          image: {{ include "ursula.image" . | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - /opt/ursula/entrypoint/ursula-entrypoint.sh
+          {{- with .Values.server.extraArgs }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: client
+              containerPort: {{ .Values.server.ports.client }}
+              protocol: TCP
+            - name: cluster
+              containerPort: {{ .Values.server.ports.cluster }}
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.server.rustLog | quote }}
+            {{- if .Values.raft.maxUncommittedBytesPerGroup }}
+            - name: URSULA_RAFT_MAX_UNCOMMITTED_BYTES_PER_GROUP
+              value: {{ .Values.raft.maxUncommittedBytesPerGroup | int64 | quote }}
+            {{- end }}
+            {{- if .Values.coldStorage.enabled }}
+            - name: URSULA_COLD_BACKEND
+              value: {{ .Values.coldStorage.backend | quote }}
+            {{- if $coldRoot }}
+            - name: URSULA_COLD_ROOT
+              value: {{ $coldRoot | quote }}
+            {{- end }}
+            - name: URSULA_COLD_S3_BUCKET
+              value: {{ $s3Bucket | quote }}
+            {{- if $s3Region }}
+            - name: URSULA_COLD_S3_REGION
+              value: {{ $s3Region | quote }}
+            {{- end }}
+            {{- if $s3Endpoint }}
+            - name: URSULA_COLD_S3_ENDPOINT
+              value: {{ $s3Endpoint | quote }}
+            {{- end }}
+            {{- if $renderColdFlushIntervalMs }}
+            - name: URSULA_COLD_FLUSH_INTERVAL_MS
+              value: {{ $coldFlushIntervalMs | quote }}
+            {{- end }}
+            {{- if $renderColdFlushMinHotBytes }}
+            - name: URSULA_COLD_FLUSH_MIN_HOT_BYTES
+              value: {{ $coldFlushMinHotBytes | quote }}
+            {{- end }}
+            {{- if $renderColdFlushMaxBytes }}
+            - name: URSULA_COLD_FLUSH_MAX_BYTES
+              value: {{ $coldFlushMaxBytes | quote }}
+            {{- end }}
+            {{- if $renderColdFlushMaxConcurrency }}
+            - name: URSULA_COLD_FLUSH_MAX_CONCURRENCY
+              value: {{ $coldFlushMaxConcurrency | quote }}
+            {{- end }}
+            {{- if $renderColdMaxHotBytesPerGroup }}
+            - name: URSULA_COLD_MAX_HOT_BYTES_PER_GROUP
+              value: {{ $coldMaxHotBytesPerGroup | quote }}
+            {{- end }}
+            {{- if $hasS3Credentials }}
+            - name: URSULA_COLD_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s3CredentialSecret | quote }}
+                  key: "accessKeyId"
+            - name: URSULA_COLD_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s3CredentialSecret | quote }}
+                  key: "secretAccessKey"
+            - name: URSULA_COLD_S3_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s3CredentialSecret | quote }}
+                  key: "sessionToken"
+                  optional: true
+            {{- end }}
+            {{- end }}
+            {{- if .Values.snapshotStore.backend | eq "s3" }}
+            - name: URSULA_SNAPSHOT_BACKEND
+              value: {{ .Values.snapshotStore.backend | quote }}
+            - name: URSULA_SNAPSHOT_S3_BUCKET
+              value: {{ $s3Bucket | quote }}
+            {{- if $s3Region }}
+            - name: URSULA_SNAPSHOT_S3_REGION
+              value: {{ $s3Region | quote }}
+            {{- end }}
+            {{- if $snapshotRoot }}
+            - name: URSULA_SNAPSHOT_S3_ROOT
+              value: {{ $snapshotRoot | quote }}
+            {{- end }}
+            {{- if $snapshotPrefix }}
+            - name: URSULA_SNAPSHOT_S3_PREFIX
+              value: {{ $snapshotPrefix | quote }}
+            {{- end }}
+            {{- if $s3Endpoint }}
+            - name: URSULA_SNAPSHOT_S3_ENDPOINT
+              value: {{ $s3Endpoint | quote }}
+            {{- end }}
+            {{- if $hasS3Credentials }}
+            - name: URSULA_SNAPSHOT_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s3CredentialSecret | quote }}
+                  key: "accessKeyId"
+            - name: URSULA_SNAPSHOT_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s3CredentialSecret | quote }}
+                  key: "secretAccessKey"
+            - name: URSULA_SNAPSHOT_S3_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s3CredentialSecret | quote }}
+                  key: "sessionToken"
+                  optional: true
+            {{- end }}
+            {{- end }}
+            {{- with .Values.server.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.server.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.server.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.server.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: entrypoint
+              mountPath: /opt/ursula/entrypoint
+              readOnly: true
+            - name: generated-config
+              mountPath: /etc/ursula/generated
+            - name: tmp
+              mountPath: /tmp
+            - name: raft-data
+              mountPath: {{ .Values.raft.logDir }}
+      volumes:
+        - name: entrypoint
+          configMap:
+            name: {{ include "ursula.fullname" . }}
+            defaultMode: 0555
+        - name: generated-config
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        {{- if not .Values.persistence.enabled }}
+        - name: raft-data
+          emptyDir: {}
+        {{- end }}
+      {{- with .Values.server.scheduling.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.server.scheduling.affinity }}
+      affinity:
+        {{- toYaml .Values.server.scheduling.affinity | nindent 8 }}
+      {{- else if gt $replicaCount 1 }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "ursula.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- with .Values.server.scheduling.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.server.scheduling.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml .Values.server.scheduling.topologySpreadConstraints | nindent 8 }}
+      {{- else if gt $replicaCount 1 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "ursula.selectorLabels" . | nindent 14 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: raft-data
+        {{- with .Values.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+  {{- end }}
