@@ -1,22 +1,34 @@
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt;
 use std::io;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use futures_util::Stream;
 use futures_util::TryStreamExt;
+use openraft::BasicNode;
+use openraft::Config;
 use openraft::EntryPayload;
+use openraft::OptionalSend;
+use openraft::Raft;
+use openraft::RaftNetworkFactory;
 use openraft::alias::LogIdOf;
 use openraft::alias::SnapshotDataOf;
 use openraft::alias::SnapshotMetaOf;
 use openraft::alias::SnapshotOf;
 use openraft::alias::StoredMembershipOf;
 use openraft::storage::EntryResponder;
+use openraft::storage::RaftLogStorage;
 use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
 use ursula_control::ControlCommand;
 use ursula_control::ControlPlaneState;
 use ursula_control::ControlResponse;
+
+use crate::registry::SingleNodeRaftNetworkFactory;
 
 #[cfg(madsim)]
 type MetaOpenRaftRuntime = crate::sim_runtime::MadsimOpenRaftRuntime;
@@ -31,6 +43,197 @@ openraft::declare_raft_types!(
         SnapshotData = Cursor<Vec<u8>>,
         AsyncRuntime = MetaOpenRaftRuntime,
 );
+
+pub type MetaRaft = Raft<MetaRaftTypeConfig, MetaRaftStateMachine>;
+
+#[derive(Debug)]
+pub struct MetaRaftError {
+    operation: &'static str,
+    message: String,
+    source: Option<Box<dyn Error + Send + Sync + 'static>>,
+}
+
+impl MetaRaftError {
+    pub fn new(operation: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            operation,
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    pub fn with_source(
+        operation: &'static str,
+        source: impl Error + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            operation,
+            message: source.to_string(),
+            source: Some(Box::new(source)),
+        }
+    }
+
+    pub fn operation(&self) -> &'static str {
+        self.operation
+    }
+}
+
+impl fmt::Display for MetaRaftError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.message.is_empty() {
+            f.write_str(self.operation)
+        } else {
+            write!(f, "{}: {}", self.operation, self.message)
+        }
+    }
+}
+
+impl Error for MetaRaftError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| &**source as &(dyn Error + 'static))
+    }
+}
+
+#[derive(Clone)]
+pub struct MetaRaftHandle {
+    raft: MetaRaft,
+}
+
+impl MetaRaftHandle {
+    pub async fn new_node_with_log_store_and_network<NF, LS>(
+        node_id: u64,
+        config: Arc<Config>,
+        network_factory: NF,
+        log_store: LS,
+    ) -> Result<Self, MetaRaftError>
+    where
+        NF: RaftNetworkFactory<MetaRaftTypeConfig>,
+        LS: RaftLogStorage<MetaRaftTypeConfig>,
+    {
+        let raft = MetaRaft::new(
+            node_id,
+            config,
+            network_factory,
+            log_store,
+            MetaRaftStateMachine::default(),
+        )
+        .await
+        .map_err(|err| MetaRaftError::with_source("create meta OpenRaft group", err))?;
+
+        Ok(Self { raft })
+    }
+
+    pub async fn new_single_node_with_log_store<LS>(
+        node_id: u64,
+        node: BasicNode,
+        config: Arc<Config>,
+        log_store: LS,
+    ) -> Result<Self, MetaRaftError>
+    where
+        LS: RaftLogStorage<MetaRaftTypeConfig>,
+    {
+        let handle = Self::new_node_with_log_store_and_network(
+            node_id,
+            config,
+            SingleNodeRaftNetworkFactory,
+            log_store,
+        )
+        .await?;
+
+        let mut nodes = BTreeMap::new();
+        nodes.insert(node_id, node);
+        handle.initialize_membership(nodes).await?;
+        handle
+            .wait_for_current_leader(node_id, Duration::from_secs(2))
+            .await?;
+
+        Ok(handle)
+    }
+
+    pub async fn initialize_membership(
+        &self,
+        nodes: BTreeMap<u64, BasicNode>,
+    ) -> Result<(), MetaRaftError> {
+        let initialized =
+            self.raft.is_initialized().await.map_err(|err| {
+                MetaRaftError::with_source("check meta OpenRaft initialization", err)
+            })?;
+        if initialized {
+            return Ok(());
+        }
+
+        self.raft
+            .initialize(nodes)
+            .await
+            .map_err(|err| MetaRaftError::with_source("initialize meta OpenRaft group", err))
+    }
+
+    pub async fn wait_for_current_leader(
+        &self,
+        node_id: u64,
+        timeout: Duration,
+    ) -> Result<(), MetaRaftError> {
+        self.raft
+            .wait(Some(timeout))
+            .current_leader(
+                node_id,
+                "meta OpenRaft group should observe expected leader",
+            )
+            .await
+            .map(|_| ())
+            .map_err(|err| MetaRaftError::with_source("wait for meta OpenRaft leadership", err))
+    }
+
+    pub fn raft_handle(&self) -> MetaRaft {
+        self.raft.clone()
+    }
+
+    pub async fn write(&self, command: ControlCommand) -> Result<ControlResponse, MetaRaftError> {
+        self.raft
+            .client_write(command)
+            .await
+            .map(|response| response.data)
+            .map_err(|err| MetaRaftError::with_source("write meta OpenRaft command", err))
+    }
+
+    pub async fn with_state_machine<V>(
+        &self,
+        f: impl FnOnce(&mut MetaRaftStateMachine) -> openraft::base::BoxFuture<V>
+        + OptionalSend
+        + 'static,
+    ) -> Result<V, MetaRaftError>
+    where
+        V: OptionalSend + 'static,
+    {
+        self.raft
+            .with_state_machine(f)
+            .await
+            .map_err(|err| MetaRaftError::with_source("access meta OpenRaft state machine", err))
+    }
+
+    pub async fn read_state<V>(
+        &self,
+        f: impl FnOnce(&ControlPlaneState) -> V + OptionalSend + 'static,
+    ) -> Result<V, MetaRaftError>
+    where
+        V: OptionalSend + 'static,
+    {
+        self.with_state_machine(move |state_machine| {
+            let value = f(state_machine.state());
+            Box::pin(async move { value })
+        })
+        .await
+    }
+
+    pub async fn shutdown(&self) -> Result<(), MetaRaftError> {
+        self.raft
+            .shutdown()
+            .await
+            .map_err(|err| MetaRaftError::with_source("shutdown meta OpenRaft group", err))
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct MetaRaftStateMachine {

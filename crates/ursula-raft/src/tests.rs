@@ -655,29 +655,17 @@ async fn single_node_meta_raft_applies_node_registration() {
         .expect("valid raft config"),
     );
     let mut log_store = MetaRaftLogStore::shared();
-    let state_machine = MetaRaftStateMachine::default();
-    let raft = Raft::<MetaRaftTypeConfig, MetaRaftStateMachine>::new(
+    let handle = MetaRaftHandle::new_single_node_with_log_store(
         1,
+        BasicNode::new("meta-local"),
         config,
-        SingleNodeRaftNetworkFactory,
         log_store.clone(),
-        state_machine,
     )
     .await
-    .expect("create single-node meta raft group");
+    .expect("create single-node meta raft handle");
 
-    let mut nodes = BTreeMap::new();
-    nodes.insert(1, BasicNode::new("meta-local"));
-    raft.initialize(nodes)
-        .await
-        .expect("initialize single-node meta raft group");
-    raft.wait(Some(Duration::from_secs(2)))
-        .current_leader(1, "single-node meta group should elect itself")
-        .await
-        .expect("wait for meta leadership");
-
-    let registered = raft
-        .client_write(ControlCommand::RegisterNode {
+    let registered = handle
+        .write(ControlCommand::RegisterNode {
             node_id: 4,
             client_url: "http://node4:4491/".to_owned(),
             cluster_url: "http://node4:4492/".to_owned(),
@@ -686,19 +674,19 @@ async fn single_node_meta_raft_applies_node_registration() {
         })
         .await
         .expect("register node through meta raft");
-    assert_eq!(registered.data, ursula_control::ControlResponse::Ok);
+    assert_eq!(registered, ursula_control::ControlResponse::Ok);
 
-    let updated = raft
-        .client_write(ControlCommand::SetNodeState {
+    let updated = handle
+        .write(ControlCommand::SetNodeState {
             node_id: 4,
             state: ursula_control::NodeState::Draining,
             now_ms: 20,
         })
         .await
         .expect("update registered node through meta raft");
-    assert_eq!(updated.data, ursula_control::ControlResponse::Ok);
+    assert_eq!(updated, ursula_control::ControlResponse::Ok);
 
-    let (applied, node) = raft
+    let (applied, node) = handle
         .with_state_machine(|state_machine| {
             Box::pin(async move {
                 let node = state_machine
@@ -720,9 +708,10 @@ async fn single_node_meta_raft_applies_node_registration() {
 
     let log_state = log_store.get_log_state().await.expect("meta log state");
     assert!(log_state.last_log_id.is_some());
-    raft.shutdown()
+    handle
+        .shutdown()
         .await
-        .expect("shutdown single-node meta raft group");
+        .expect("shutdown single-node meta raft handle");
 }
 
 #[tokio::test]
