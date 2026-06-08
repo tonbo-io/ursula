@@ -131,6 +131,49 @@ class ChaosAgentStateTest(unittest.TestCase):
         agent.apply_fault_scenario("netem_duplicate", [target])
         self.assertEqual(calls[-1][1]["duplicate_percent"], 1)
 
+    def test_overall_status_full_raft_sag_reads_degraded_not_outage(self) -> None:
+        # full_raft_nodes sags to 0/3 on every injection while the 2/3 quorum
+        # keeps committing writes; that must be degraded, not partial_outage —
+        # the systemic false-outage bug that polluted whole hours of history.
+        overall = ChaosAgent._overall_status(
+            integrity_status="operational",
+            running_nodes=3,
+            metrics_ok=3,
+            fully_healthy=False,  # full_raft < expected during the injection
+            has_active_fault=True,
+            serving_on_quorum=True,  # writes still progressing on the quorum
+            workload_started=True,
+        )
+        self.assertEqual(overall, "degraded_performance")
+
+    def test_overall_status_stalled_writes_is_partial_outage(self) -> None:
+        # Majority up but the data plane is not serving -> a real partial_outage.
+        overall = ChaosAgent._overall_status(
+            integrity_status="operational",
+            running_nodes=3,
+            metrics_ok=2,
+            fully_healthy=False,
+            has_active_fault=True,
+            serving_on_quorum=False,  # workload not progressing
+            workload_started=True,  # already ramped up, so this is a real stall
+        )
+        self.assertEqual(overall, "partial_outage")
+
+    def test_overall_status_startup_grace_is_not_outage(self) -> None:
+        # Agent restart: workload hasn't begun (append_success == 0) so serving
+        # reads false, but the majority is up. Must read operational, not a
+        # false partial_outage that would stamp the deploy into the history bar.
+        overall = ChaosAgent._overall_status(
+            integrity_status="operational",
+            running_nodes=3,
+            metrics_ok=3,
+            fully_healthy=False,
+            has_active_fault=False,
+            serving_on_quorum=False,
+            workload_started=False,
+        )
+        self.assertEqual(overall, "operational")
+
     def test_catch_up_scenarios_get_longer_recovery_slo(self) -> None:
         # process_kill recovers via raft-memory catch-up (minutes); reusing the
         # short impairment SLO false-trips slo_missed -> repair_failed (#526).
