@@ -3682,6 +3682,7 @@ version = "0.1.3"
 dependencies = [
  "bytes",
  "criterion",
+ "crossbeam-utils",
  "madsim-tokio",
  "opendal",
  "serde",

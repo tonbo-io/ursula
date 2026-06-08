@@ -15,6 +15,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
+use crossbeam_utils::CachePadded;
 use opendal::Operator;
 use opendal::Scheme;
 use opendal::layers::RetryLayer;
@@ -24,13 +25,11 @@ use ursula_stream::ColdChunkRef;
 use ursula_stream::ObjectPayloadRef;
 
 pub(crate) const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
-// Padded to its own cache line: this global is fetch_add-ed from every core's
-// cold-flush path, so false sharing with neighbouring statics would bounce the
-// line across cores. A true per-core sequence would need core context these
-// low-frequency flush/path helpers don't carry, so padding is the pragmatic fix.
-#[repr(align(128))]
-struct PaddedSequence(AtomicU64);
-static COLD_CHUNK_SEQUENCE: PaddedSequence = PaddedSequence(AtomicU64::new(0));
+// Keep this global atomic isolated from unrelated statics. This does not remove
+// contention on the counter itself, but avoids accidental false sharing with
+// adjacent data without adding a per-core sequence scheme to this low-frequency
+// object-key path.
+static COLD_CHUNK_SEQUENCE: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
 const DEFAULT_COLD_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_COLD_CACHE_BLOCK_BYTES: usize = 1024 * 1024;
 const DEFAULT_COLD_CACHE_READAHEAD_BLOCKS: usize = 4;
@@ -1197,7 +1196,7 @@ pub fn new_cold_chunk_path(
     end_offset: u64,
 ) -> String {
     let unix_nanos = cold_object_unix_nanos();
-    let sequence = COLD_CHUNK_SEQUENCE.0.fetch_add(1, Ordering::Relaxed);
+    let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!(
         "{stream_id}/chunks/{start_offset:016x}-{end_offset:016x}-{unix_nanos:032x}-{sequence:016x}.bin"
     )
@@ -1212,7 +1211,7 @@ pub fn cold_chunk_prefix(stream_id: &BucketStreamId) -> String {
 
 pub fn new_external_payload_path(stream_id: &BucketStreamId) -> String {
     let unix_nanos = cold_object_unix_nanos();
-    let sequence = COLD_CHUNK_SEQUENCE.0.fetch_add(1, Ordering::Relaxed);
+    let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("{stream_id}/external/{unix_nanos:032x}-{sequence:016x}.bin")
 }
 
@@ -1222,7 +1221,7 @@ pub fn new_external_payload_path(stream_id: &BucketStreamId) -> String {
 #[cfg(madsim)]
 #[allow(dead_code)]
 pub fn reset_cold_chunk_sequence_for_sim() {
-    COLD_CHUNK_SEQUENCE.0.store(0, Ordering::Relaxed);
+    COLD_CHUNK_SEQUENCE.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]
