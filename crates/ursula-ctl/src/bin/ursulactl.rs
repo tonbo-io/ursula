@@ -76,12 +76,16 @@ enum GroupCommand {
 enum GroupPlacementCommand {
     /// Print the current meta-group placement projection for one data group.
     Get(GroupPlacementGetArgs),
+    /// Commit final placement to the meta group after Raft membership changes.
+    Commit(GroupPlacementCommitArgs),
 }
 
 #[derive(Subcommand, Debug)]
 enum GroupMigrationCommand {
     /// Start a durable meta-group migration intent for one data group.
     Begin(GroupMigrationBeginArgs),
+    /// Finish a durable migration intent.
+    Finish(GroupMigrationFinishArgs),
 }
 
 #[derive(Subcommand, Debug)]
@@ -133,6 +137,27 @@ struct GroupPlacementGetArgs {
 }
 
 #[derive(Args, Debug)]
+struct GroupPlacementCommitArgs {
+    /// Base URL of a server with the meta group admin endpoint.
+    #[arg(long)]
+    admin_url: Url,
+    /// Raft group id whose placement should be committed.
+    #[arg(long)]
+    raft_group_id: u64,
+    /// Final data-group voters, comma separated.
+    #[arg(long, value_delimiter = ',')]
+    voters: Vec<u64>,
+    /// Final data-group learners, comma separated.
+    #[arg(long, value_delimiter = ',')]
+    learners: Vec<u64>,
+    /// Draining nodes that remain non-serving during migration cleanup, comma separated.
+    #[arg(long, value_delimiter = ',')]
+    draining: Vec<u64>,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
 struct GroupMigrationBeginArgs {
     /// Base URL of a server with the meta group admin endpoint.
     #[arg(long)]
@@ -146,6 +171,21 @@ struct GroupMigrationBeginArgs {
     /// Keep removed voters as non-serving learners after the voter change.
     #[arg(long, default_value_t = false)]
     retain_removed: bool,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+struct GroupMigrationFinishArgs {
+    /// Base URL of a server with the meta group admin endpoint.
+    #[arg(long)]
+    admin_url: Url,
+    /// Migration id to finish.
+    #[arg(long)]
+    migration_id: u64,
+    /// Mark the migration as successful. Omit to finish as failed.
+    #[arg(long, default_value_t = false)]
+    success: bool,
     #[arg(long, default_value_t = 10)]
     http_timeout_secs: u64,
 }
@@ -270,8 +310,14 @@ async fn main() -> Result<()> {
         Command::Group(GroupCommand::Placement(GroupPlacementCommand::Get(args))) => {
             run_group_placement_get_subcommand(args).await
         }
+        Command::Group(GroupCommand::Placement(GroupPlacementCommand::Commit(args))) => {
+            run_group_placement_commit_subcommand(args).await
+        }
         Command::Group(GroupCommand::Migration(GroupMigrationCommand::Begin(args))) => {
             run_group_migration_begin_subcommand(args).await
+        }
+        Command::Group(GroupCommand::Migration(GroupMigrationCommand::Finish(args))) => {
+            run_group_migration_finish_subcommand(args).await
         }
         Command::Group(GroupCommand::LocalEngine(GroupLocalEngineCommand::Prepare(args))) => {
             run_group_local_engine_prepare_subcommand(args).await
@@ -319,6 +365,33 @@ async fn run_group_placement_get_subcommand(args: GroupPlacementGetArgs) -> Resu
     Ok(())
 }
 
+async fn run_group_placement_commit_subcommand(args: GroupPlacementCommitArgs) -> Result<()> {
+    let voters = args.voters.into_iter().collect::<BTreeSet<_>>();
+    if voters.is_empty() {
+        bail!("--voters must not be empty");
+    }
+    let learners = args.learners.into_iter().collect::<BTreeSet<_>>();
+    let draining = args.draining.into_iter().collect::<BTreeSet<_>>();
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let response = client
+        .commit_placement(
+            &args.admin_url,
+            args.raft_group_id,
+            &voters,
+            &learners,
+            &draining,
+        )
+        .await?;
+    if !response.committed {
+        bail!(
+            "commit-placement response for group {} did not confirm commit",
+            response.raft_group_id
+        );
+    }
+    println!("group {}: placement committed", response.raft_group_id);
+    Ok(())
+}
+
 async fn run_group_migration_begin_subcommand(args: GroupMigrationBeginArgs) -> Result<()> {
     let target_voters = args.target_voters.into_iter().collect::<BTreeSet<_>>();
     if target_voters.is_empty() {
@@ -342,6 +415,24 @@ async fn run_group_migration_begin_subcommand(args: GroupMigrationBeginArgs) -> 
     println!(
         "group {}: migration {} started",
         response.raft_group_id, response.migration_id
+    );
+    Ok(())
+}
+
+async fn run_group_migration_finish_subcommand(args: GroupMigrationFinishArgs) -> Result<()> {
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let response = client
+        .finish_migration(&args.admin_url, args.migration_id, args.success)
+        .await?;
+    if !response.finished {
+        bail!(
+            "finish-migration response for migration {} did not confirm finish",
+            response.migration_id
+        );
+    }
+    println!(
+        "migration {}: finished success={}",
+        response.migration_id, response.success
     );
     Ok(())
 }
@@ -536,6 +627,39 @@ mod tests {
     }
 
     #[test]
+    fn parses_group_placement_commit_command() {
+        let cli = Cli::try_parse_from([
+            "ursulactl",
+            "group",
+            "placement",
+            "commit",
+            "--admin-url",
+            "http://node1:4491",
+            "--raft-group-id",
+            "2",
+            "--voters",
+            "2,3,4",
+            "--learners",
+            "1",
+            "--draining",
+            "1",
+        ])
+        .expect("parse group placement commit command");
+
+        let Command::Group(GroupCommand::Placement(GroupPlacementCommand::Commit(args))) =
+            cli.command
+        else {
+            panic!("expected group placement commit command");
+        };
+        assert_eq!(args.admin_url.as_str(), "http://node1:4491/");
+        assert_eq!(args.raft_group_id, 2);
+        assert_eq!(args.voters, vec![2, 3, 4]);
+        assert_eq!(args.learners, vec![1]);
+        assert_eq!(args.draining, vec![1]);
+        assert_eq!(args.http_timeout_secs, 10);
+    }
+
+    #[test]
     fn parses_group_migration_begin_command() {
         let cli = Cli::try_parse_from([
             "ursulactl",
@@ -561,6 +685,32 @@ mod tests {
         assert_eq!(args.raft_group_id, 2);
         assert_eq!(args.target_voters, vec![2, 3, 4]);
         assert!(args.retain_removed);
+        assert_eq!(args.http_timeout_secs, 10);
+    }
+
+    #[test]
+    fn parses_group_migration_finish_command() {
+        let cli = Cli::try_parse_from([
+            "ursulactl",
+            "group",
+            "migration",
+            "finish",
+            "--admin-url",
+            "http://node1:4491",
+            "--migration-id",
+            "7",
+            "--success",
+        ])
+        .expect("parse group migration finish command");
+
+        let Command::Group(GroupCommand::Migration(GroupMigrationCommand::Finish(args))) =
+            cli.command
+        else {
+            panic!("expected group migration finish command");
+        };
+        assert_eq!(args.admin_url.as_str(), "http://node1:4491/");
+        assert_eq!(args.migration_id, 7);
+        assert!(args.success);
         assert_eq!(args.http_timeout_secs, 10);
     }
 

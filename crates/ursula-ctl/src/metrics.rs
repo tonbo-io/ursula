@@ -258,6 +258,64 @@ impl MetricsClient {
         }
     }
 
+    pub async fn commit_placement(
+        &self,
+        admin_url: &Url,
+        raft_group_id: u64,
+        voters: &BTreeSet<u64>,
+        learners: &BTreeSet<u64>,
+        draining: &BTreeSet<u64>,
+    ) -> Result<CommitPlacementResponse> {
+        let path = commit_placement_path(raft_group_id, voters, learners, draining);
+        let url = admin_url
+            .join(&path)
+            .with_context(|| format!("compose commit-placement url at {admin_url}"))?;
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str::<CommitPlacementResponse>(&body)
+                .with_context(|| format!("decode commit-placement response: {body}"))
+        } else {
+            Err(anyhow!(
+                "commit-placement at {admin_url} for group {raft_group_id} returned {status}: {body}"
+            ))
+        }
+    }
+
+    pub async fn finish_migration(
+        &self,
+        admin_url: &Url,
+        migration_id: u64,
+        success: bool,
+    ) -> Result<FinishMigrationResponse> {
+        let path = finish_migration_path(migration_id, success);
+        let url = admin_url
+            .join(&path)
+            .with_context(|| format!("compose finish-migration url at {admin_url}"))?;
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str::<FinishMigrationResponse>(&body)
+                .with_context(|| format!("decode finish-migration response: {body}"))
+        } else {
+            Err(anyhow!(
+                "finish-migration at {admin_url} for migration {migration_id} returned {status}: {body}"
+            ))
+        }
+    }
+
     pub async fn prepare_local_engine(
         &self,
         admin_url: &Url,
@@ -368,6 +426,36 @@ fn begin_migration_path(
     )
 }
 
+fn commit_placement_path(
+    raft_group_id: u64,
+    voters: &BTreeSet<u64>,
+    learners: &BTreeSet<u64>,
+    draining: &BTreeSet<u64>,
+) -> String {
+    let voters = voters
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let learners = learners
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let draining = draining
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "/__ursula/admin/groups/{raft_group_id}/placement/commit?voters={voters}&learners={learners}&draining={draining}"
+    )
+}
+
+fn finish_migration_path(migration_id: u64, success: bool) -> String {
+    format!("/__ursula/admin/migrations/{migration_id}/finish?success={success}")
+}
+
 fn prepare_local_engine_path(raft_group_id: u64) -> String {
     format!("/__ursula/admin/groups/{raft_group_id}/local-engine")
 }
@@ -414,6 +502,19 @@ pub struct BeginMigrationResponse {
     pub raft_group_id: u64,
     pub migration_id: u64,
     pub started: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitPlacementResponse {
+    pub raft_group_id: u64,
+    pub committed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FinishMigrationResponse {
+    pub migration_id: u64,
+    pub success: bool,
+    pub finished: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -601,6 +702,27 @@ mod tests {
         assert_eq!(
             begin_migration_path(2, &BTreeSet::from([2, 3, 4]), true),
             "/__ursula/admin/groups/2/migrations?target_voters=2,3,4&retain_removed=true"
+        );
+    }
+
+    #[test]
+    fn commit_placement_path_builds_admin_query() {
+        assert_eq!(
+            commit_placement_path(
+                2,
+                &BTreeSet::from([2, 3, 4]),
+                &BTreeSet::from([1]),
+                &BTreeSet::from([1]),
+            ),
+            "/__ursula/admin/groups/2/placement/commit?voters=2,3,4&learners=1&draining=1"
+        );
+    }
+
+    #[test]
+    fn finish_migration_path_builds_admin_query() {
+        assert_eq!(
+            finish_migration_path(7, true),
+            "/__ursula/admin/migrations/7/finish?success=true"
         );
     }
 
