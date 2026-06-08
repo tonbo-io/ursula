@@ -170,7 +170,6 @@ accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 {{- $replicaCount := .Values.server.replicaCount | int -}}
 {{- $coreCount := .Values.server.coreCount | int -}}
 {{- $clientPort := .Values.server.ports.client | int -}}
-{{- $clusterPort := .Values.server.ports.cluster | int -}}
 {{- $clusterDomain := .Values.global.clusterDomain | toString -}}
 {{- $raftGroupCount := .Values.raft.groupCount | int -}}
 {{- $storageMode := .Values.raft.storageMode | toString -}}
@@ -194,12 +193,6 @@ accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 {{- end -}}
 {{- if or (lt $clientPort 1) (gt $clientPort 65535) -}}
 {{- fail (printf "server.ports.client must be between 1 and 65535; got %v" .Values.server.ports.client) -}}
-{{- end -}}
-{{- if or (lt $clusterPort 1) (gt $clusterPort 65535) -}}
-{{- fail (printf "server.ports.cluster must be between 1 and 65535; got %v" .Values.server.ports.cluster) -}}
-{{- end -}}
-{{- if eq $clientPort $clusterPort -}}
-{{- fail (printf "server.ports.client and server.ports.cluster must be distinct; got %v" .Values.server.ports.client) -}}
 {{- end -}}
 {{- $storageModeIsValid := or ($storageMode | eq "logDir") ($storageMode | eq "memory") -}}
 {{- if $storageModeIsValid | not -}}
@@ -279,8 +272,16 @@ Validate gateway values before manifests are accepted.
 {{- include "ursula.validateComponentNames" . -}}
 {{- if .Values.gateway.enabled -}}
 {{- $gatewayPort := .Values.gateway.ports.http | int -}}
+{{- $maxRequestBodyBytes := .Values.gateway.maxRequestBodyBytes | int64 -}}
+{{- $gracefulShutdownTimeoutSeconds := .Values.gateway.gracefulShutdownTimeoutSeconds | int -}}
 {{- if or (lt $gatewayPort 1) (gt $gatewayPort 65535) -}}
 {{- fail (printf "gateway.ports.http must be between 1 and 65535; got %v" .Values.gateway.ports.http) -}}
+{{- end -}}
+{{- if lt $maxRequestBodyBytes 1 -}}
+{{- fail (printf "gateway.maxRequestBodyBytes must be at least 1; got %v" .Values.gateway.maxRequestBodyBytes) -}}
+{{- end -}}
+{{- if lt $gracefulShutdownTimeoutSeconds 1 -}}
+{{- fail (printf "gateway.gracefulShutdownTimeoutSeconds must be at least 1; got %v" .Values.gateway.gracefulShutdownTimeoutSeconds) -}}
 {{- end -}}
 {{- range $label := list "app.kubernetes.io/name" "app.kubernetes.io/instance" -}}
 {{- if hasKey $.Values.gateway.podLabels $label -}}

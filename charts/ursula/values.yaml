@@ -39,8 +39,6 @@ server:
   ports:
     # Ursula HTTP/admin client-plane process port.
     client: 4437
-    # Ursula cluster/Raft peer-plane process port.
-    cluster: 4438
   service:
     # Render the internal client/admin Service.
     enabled: true
@@ -223,6 +221,10 @@ gateway:
   connectTimeoutSeconds: 5
   # Timeout for upstream response headers in seconds.
   responseHeaderTimeoutSeconds: 30
+  # Maximum request body bytes the gateway buffers for leader-redirect replay.
+  maxRequestBodyBytes: 33554432
+  # Maximum graceful shutdown drain time after SIGTERM, in seconds.
+  gracefulShutdownTimeoutSeconds: 3600
   # Extra CLI args appended after the generated gateway args.
   extraArgs: []
   # Extra environment variables for the gateway.

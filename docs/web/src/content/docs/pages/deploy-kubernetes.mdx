@@ -6,8 +6,8 @@ description: Run Ursula on Kubernetes with the Helm chart.
 The Ursula Helm chart starts a static-membership Raft cluster with stable
 StatefulSet pod identities, durable per-pod Raft logs, a headless peer Service,
 a client/admin Service, a quorum-protecting PodDisruptionBudget, and a Helm test
-powered by `ursulactl`. The default chart also separates the client/admin port
-from the Raft peer port and adds soft multi-pod spread hints.
+powered by `ursulactl`. The default chart also adds a stateless gateway for
+single-URL external access and soft multi-pod spread hints.
 
 The chart is for fresh static-membership clusters. It does not perform online
 Raft voter expansion, voter removal, leader handoff during Kubernetes rolling
@@ -32,13 +32,14 @@ For a local image loaded into the cluster:
 
 ```bash
 helm install ursula charts/ursula \
-  --set image.repository=ursula \
-  --set image.tag=dev \
-  --set image.pullPolicy=Never
+  --set global.image.repository=ursula \
+  --set global.image.tag=dev \
+  --set global.image.pullPolicy=Never
 ```
 
 The default install starts three voters and 64 Raft groups. For a registry
-image, set `image.repository`, `image.tag`, and optionally `image.pullSecrets`.
+image, set `global.image.repository`, `global.image.tag`, and optionally
+`global.imagePullSecrets`.
 
 ## Verify readiness
 
@@ -70,10 +71,10 @@ operator will own this transition automatically.
 
 ## Static membership
 
-`replicaCount` controls the initial voter set for a fresh cluster. The chart
-supports `1`, `3`, and `5`; production clusters should use `3` or `5`.
+`server.replicaCount` controls the initial voter set for a fresh cluster. The
+chart supports `1`, `3`, and `5`; production clusters should use `3` or `5`.
 
-Changing `replicaCount` on an initialized cluster is not safe Raft voter
+Changing `server.replicaCount` on an initialized cluster is not safe Raft voter
 reconfiguration. Safe scaling requires an operator workflow that adds learners,
 waits for catch-up, promotes voters, and removes old voters.
 
@@ -111,9 +112,9 @@ Ursula exposes a single admin endpoint on the client plane:
   bytes, cold backpressure counters, and per-core mailbox depth.
 
 There are no dedicated `/__ursula/healthz` or `/__ursula/readyz` probes yet.
-Kubernetes probes are disabled in the current chart (`FIXME` in
-`statefulset.yaml`). Use `helm test` or `ursulactl wait-ready` for cluster-level
-readiness.
+Server HTTP probes are disabled in the current chart. Gateway probes use TCP
+socket checks, and cluster-level readiness should come from `helm test` or
+`ursulactl wait-ready`.
 
 ## Access locally
 

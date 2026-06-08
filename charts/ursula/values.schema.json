@@ -150,10 +150,9 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "client": { "type": "integer", "minimum": 1, "maximum": 65535 },
-            "cluster": { "type": "integer", "minimum": 1, "maximum": 65535 }
+            "client": { "type": "integer", "minimum": 1, "maximum": 65535 }
           },
-          "required": ["client", "cluster"]
+          "required": ["client"]
         },
         "service": {
           "type": "object",
@@ -414,6 +413,16 @@
           "minimum": 1,
           "description": "Timeout for upstream response headers in seconds."
         },
+        "maxRequestBodyBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum request body bytes buffered for leader-redirect replay."
+        },
+        "gracefulShutdownTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum graceful shutdown drain time after SIGTERM, in seconds."
+        },
         "extraArgs": {
           "type": "array",
           "description": "Extra CLI args appended after generated gateway args.",
@@ -590,6 +599,8 @@
         "rustLog",
         "connectTimeoutSeconds",
         "responseHeaderTimeoutSeconds",
+        "maxRequestBodyBytes",
+        "gracefulShutdownTimeoutSeconds",
         "extraArgs",
         "extraEnv",
         "extraEnvFrom",

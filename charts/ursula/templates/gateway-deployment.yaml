@@ -68,6 +68,10 @@ spec:
             - {{ .Values.gateway.connectTimeoutSeconds | quote }}
             - --response-header-timeout
             - {{ .Values.gateway.responseHeaderTimeoutSeconds | quote }}
+            - --max-request-body-bytes
+            - {{ .Values.gateway.maxRequestBodyBytes | int64 | quote }}
+            - --graceful-shutdown-timeout
+            - {{ .Values.gateway.gracefulShutdownTimeoutSeconds | quote }}
             {{- range $upstreams }}
             - --upstream
             - {{ . | quote }}

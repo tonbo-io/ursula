@@ -5,22 +5,31 @@ clients one stable HTTP endpoint while keeping internal Ursula node addresses
 out of public responses.
 
 The gateway is intentionally thin: it does not parse the Durable Streams
-Protocol, own stream routing state, buffer request bodies, terminate SSE
-streams, or follow redirects internally.
+Protocol, own stream routing state, terminate SSE streams, or cache Raft
+leaders. It buffers request bodies up to a configured limit only so it can
+replay requests when Ursula identifies the Raft leader.
 
 ## Behavior
 
 - Picks one configured upstream Ursula node for each incoming request.
-- Streams request and response bodies without buffering them.
-- Returns redirects to clients instead of following them internally.
-- Rewrites redirect targets so clients continue through the gateway.
+- Buffers request bodies up to `--max-request-body-bytes`; larger requests
+  receive `413 Payload Too Large` before reaching an upstream.
+- Follows Ursula Raft leader redirects internally when the response includes
+  `x-ursula-raft-leader-id` and the leader URL matches a configured upstream.
+- Returns other redirects to clients and rewrites redirect targets so clients
+  continue through the gateway.
 - Keeps long-lived SSE reads open after response headers arrive.
 
 ## Redirects
 
-The gateway returns Ursula `307 Temporary Redirect` responses to the client.
-Redirect-following clients such as `curl -L` continue through the gateway
-instead of connecting to internal Ursula nodes directly.
+The gateway follows Ursula `307 Temporary Redirect` responses internally when
+they are marked as Raft leader redirects with `x-ursula-raft-leader-id` and the
+leader target resolves to one of the configured upstreams.
+
+Other `307` responses remain visible to the client. Their `Location` header is
+reduced to the path and query so redirect-following clients such as `curl -L`
+continue through the gateway instead of connecting to internal Ursula nodes
+directly.
 
 ## SSE Behavior
 
@@ -76,14 +85,21 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
 
 --connect-timeout <SECONDS>
     TCP connect timeout per upstream request attempt. Defaults to 5.
+
+--max-request-body-bytes <BYTES>
+    Maximum request body bytes buffered for leader-redirect replay.
+    Larger requests return 413 before upstream forwarding. Defaults to 33554432.
+
+--graceful-shutdown-timeout <SECONDS>
+    Maximum graceful shutdown drain time after SIGTERM/CTRL-C. Defaults to 3600.
 ```
 
 ## Operational Notes
 
 - Upstream URLs support `http` and `https`.
 - Upstreams are selected randomly per request.
-- Request bodies are streamed; body size limits are enforced by the upstream
-  Ursula server, not by the gateway.
+- Request bodies are buffered up to `--max-request-body-bytes` because internal
+  leader redirects require replaying the request to a different upstream.
 - The gateway is stateless. It does not cache Raft leaders or maintain cluster
   membership.
 - `RUST_LOG=ursula_gateway=debug` enables request forwarding and redirect logs.

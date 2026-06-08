@@ -66,8 +66,7 @@ group count and every group has a leader.
 
 ```bash
 kubectl port-forward svc/ursula 4437:4437
-curl http://127.0.0.1:4437/__ursula/healthz
-curl http://127.0.0.1:4437/__ursula/readyz
+curl http://127.0.0.1:4437/__ursula/metrics
 ```
 
 ## Expose With Ingress
@@ -97,9 +96,11 @@ gateway:
 The chart routes all configured Ingress paths to the gateway Service and its
 named Service port `gateway`.
 
-The internal server Service and headless peer Service expose the `client` port
-(`server.ports.client`) for stable pod DNS resolution during bootstrap and for
-in-cluster access.
+The internal server Service and headless peer Service expose the same
+`server.ports.client` process port. Ursula's current static peer URL is used
+both for Raft/gRPC traffic and for leader redirects, so the chart keeps those
+addresses on the client-reachable port until Ursula has separate peer and
+redirect URL configuration.
 
 ## Required Post-Bootstrap Step
 
@@ -279,13 +280,12 @@ operationally safe restarts on an initialized cluster.
 | --- | --- | --- |
 | `server.replicaCount` | `3` | Fresh-cluster static voter pod count. Supported values are `1`, `3`, and `5`. Changing this on an initialized cluster is unsafe without the future operator workflow. |
 | `server.podManagementPolicy` | `Parallel` | StatefulSet pod management policy. `Parallel` starts all static voters without serializing on per-pod readiness. |
-| `server.ports.client` | `4437` | Ursula HTTP/admin client-plane process port. Kubernetes probes and the client Service target this port. |
-| `server.ports.cluster` | `4438` | Ursula cluster/Raft peer-plane process port. The headless peer Service and generated Raft peer URLs target this port. |
+| `server.ports.client` | `4437` | Ursula HTTP/admin process port. The client Service, headless peer Service, generated Raft peer URLs, and leader redirects target this port in the current chart. |
 | `server.service.enabled` | `true` | Render the internal client/admin Service. |
 | `server.service.type` | `ClusterIP` | Client/admin Service type. Allowed values are `ClusterIP`, `NodePort`, and `LoadBalancer`. |
 | `server.service.port` | `4437` | Client/admin Service port. |
 | `server.service.annotations` | `{}` | Client/admin Service annotations. |
-| `server.headlessService.annotations` | `{}` | Headless peer Service annotations. The headless Service targets `server.ports.cluster` and uses `publishNotReadyAddresses: true` for stable peer DNS during bootstrap. |
+| `server.headlessService.annotations` | `{}` | Headless peer Service annotations. The headless Service targets `server.ports.client` and uses `publishNotReadyAddresses: true` for stable peer DNS during bootstrap. |
 | `server.podAnnotations` | `{}` | Extra annotations applied to Ursula server pods. |
 | `server.podLabels` | `{}` | Extra labels applied to Ursula server pods. Must not set selector labels `app.kubernetes.io/name` or `app.kubernetes.io/instance`; the chart fails rendering if those keys are used. |
 | `server.rustLog` | `ursula=info,ursula_runtime=info,ursula_raft=info` | `RUST_LOG` tracing filter. |
@@ -393,6 +393,8 @@ or `server.extraEnvFrom` entries.
 | `gateway.rustLog` | `ursula_gateway=info` | `RUST_LOG` tracing filter for the gateway. |
 | `gateway.connectTimeoutSeconds` | `5` | TCP connect timeout per upstream attempt in seconds. |
 | `gateway.responseHeaderTimeoutSeconds` | `30` | Timeout for upstream response headers in seconds. |
+| `gateway.maxRequestBodyBytes` | `33554432` | Maximum request body bytes the gateway buffers for leader-redirect replay before returning `413 Payload Too Large`. |
+| `gateway.gracefulShutdownTimeoutSeconds` | `3600` | Maximum graceful shutdown drain time after SIGTERM, in seconds. |
 | `gateway.extraArgs` | `[]` | Extra CLI args appended after generated gateway args. |
 | `gateway.extraEnv` | `[]` | Extra environment variables for the gateway. |
 | `gateway.extraEnvFrom` | `[]` | Extra `envFrom` blocks for the gateway. |

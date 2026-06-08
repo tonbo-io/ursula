@@ -4,7 +4,6 @@
 {{- $namespace := .Release.Namespace -}}
 {{- $clusterDomain := .Values.global.clusterDomain | toString -}}
 {{- $clientPort := .Values.server.ports.client | int -}}
-{{- $clusterPort := .Values.server.ports.cluster | int -}}
 {{- $replicaCount := .Values.server.replicaCount | int -}}
 {{- $peers := list -}}
 {{- $nodes := list -}}
@@ -12,7 +11,6 @@
 {{- $podName := printf "%s-%d" $fullname $i -}}
 {{- $host := printf "%s.%s.%s.svc.%s" $podName $headless $namespace $clusterDomain -}}
 {{- $clientUrl := printf "http://%s:%d" $host $clientPort -}}
-{{- $clusterUrl := printf "http://%s:%d" $host $clusterPort -}}
 {{- $nodeId := add1 $i -}}
 {{- $peers = append $peers (dict "node_id" $nodeId "url" $clientUrl) -}}
 {{- $nodes = append $nodes (dict "id" $nodeId "http_url" $clientUrl "host" $host "name" $podName) -}}

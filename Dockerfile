@@ -4,7 +4,6 @@
 ARG RUST_VERSION=1.96.0
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
-
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
   ca-certificates \
@@ -17,11 +16,19 @@ WORKDIR /ursula
 COPY rust-toolchain.toml ./
 RUN rustup toolchain install
 
-COPY . .
+# Copy dependency manifests first to leverage Docker layer caching for
+# dependency downloads.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
 
+# Build with buildx cache mounts for cargo registry, git deps, and build
+# artifacts. sharing=locked prevents concurrent writes during parallel builds.
+# Because target/ is mounted as a cache and not persisted to the layer, install
+# the final binaries into a persistent path within the same RUN so they can be
+# extracted in the runtime stage.
 RUN --mount=type=cache,sharing=locked,target=/usr/local/cargo/registry \
   --mount=type=cache,sharing=locked,target=/usr/local/cargo/git \
-  --mount=type=cache,sharing=locked,target=/app/target \
+  --mount=type=cache,sharing=locked,target=/ursula/target \
   cargo build --release --locked --bin ursula --bin ursulactl --bin ursulagw \
   && strip --strip-debug target/release/ursula \
   && strip --strip-debug target/release/ursulactl \
@@ -51,10 +58,6 @@ WORKDIR /var/lib/ursula
 COPY --from=builder /usr/local/bin/ursula /usr/local/bin/ursula
 COPY --from=builder /usr/local/bin/ursulactl /usr/local/bin/ursulactl
 COPY --from=builder /usr/local/bin/ursulagw /usr/local/bin/ursulagw
-
-
-USER 10001:10001
-WORKDIR /var/lib/ursula
 
 EXPOSE 4437
 

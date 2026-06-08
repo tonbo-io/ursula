@@ -1,5 +1,7 @@
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use axum::Router;
@@ -8,6 +10,7 @@ use axum::http::StatusCode;
 use axum::http::header::LOCATION;
 use axum::routing::any;
 use axum::routing::get;
+use axum::routing::post;
 use axum::routing::put;
 use http_body_util::BodyExt;
 use tokio_stream::StreamExt;
@@ -113,6 +116,7 @@ fn test_config(upstreams: Vec<String>) -> GatewayConfig {
         upstreams,
         response_header_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(1),
+        max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
     }
 }
 
@@ -141,6 +145,37 @@ async fn gateway_handle_returns_service_unavailable_without_upstreams() {
     let resp = gateway.handle(req).await;
 
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn gateway_rejects_body_larger_than_configured_limit_before_forwarding() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let app_hits = Arc::clone(&hits);
+    let upstream = spawn_upstream(Router::new().route(
+        "/bucket/stream",
+        post(move || {
+            let app_hits = Arc::clone(&app_hits);
+            async move {
+                app_hits.fetch_add(1, Ordering::Relaxed);
+                StatusCode::OK
+            }
+        }),
+    ))
+    .await;
+
+    let mut config = test_config(vec![upstream.url.clone()]);
+    config.max_request_body_bytes = 4;
+    let gateway = Gateway::new(config);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/bucket/stream")
+        .body(Body::from(bytes::Bytes::from_static(b"12345")))
+        .unwrap();
+
+    let resp = gateway.handle(req).await;
+
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]

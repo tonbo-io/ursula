@@ -75,9 +75,6 @@ spec:
             - name: client
               containerPort: {{ .Values.server.ports.client }}
               protocol: TCP
-            - name: cluster
-              containerPort: {{ .Values.server.ports.cluster }}
-              protocol: TCP
           env:
             - name: RUST_LOG
               value: {{ .Values.server.rustLog | quote }}

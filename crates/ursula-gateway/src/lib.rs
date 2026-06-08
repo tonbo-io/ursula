@@ -9,6 +9,7 @@
 //! leaking internal node addresses to clients and prevents SSE live reads from
 //! looping when the initial random upstream lands on a follower.
 
+use std::error::Error as _;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -28,6 +29,7 @@ use tracing::debug;
 use tracing::error;
 
 const HEADER_URSULA_RAFT_LEADER_ID: &str = "x-ursula-raft-leader-id";
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct GatewayConfig {
@@ -36,6 +38,7 @@ pub struct GatewayConfig {
     /// Covers only response headers so SSE bodies stay open.
     pub response_header_timeout: Duration,
     pub connect_timeout: Duration,
+    pub max_request_body_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -72,10 +75,18 @@ impl Gateway {
     pub async fn handle(&self, req: Request<Body>) -> AxumResponse {
         let (parts, body) = req.into_parts();
 
-        let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        let body_bytes = match axum::body::to_bytes(body, self.config.max_request_body_bytes).await
+        {
             Ok(b) => b,
-            Err(_) => {
-                return StatusCode::BAD_REQUEST.into_response();
+            Err(err) => {
+                if err
+                    .source()
+                    .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+                {
+                    return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+                } else {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
             }
         };
 
