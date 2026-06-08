@@ -284,6 +284,63 @@ impl MetricsClient {
             ))
         }
     }
+
+    pub async fn add_learner(
+        &self,
+        leader_url: &Url,
+        raft_group_id: u64,
+        node_id: u64,
+        cluster_url: &str,
+    ) -> Result<AddLearnerResponse> {
+        let path = add_learner_path(raft_group_id, node_id, cluster_url);
+        let url = leader_url
+            .join(&path)
+            .with_context(|| format!("compose add-learner url at {leader_url}"))?;
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str::<AddLearnerResponse>(&body)
+                .with_context(|| format!("decode add-learner response: {body}"))
+        } else {
+            Err(anyhow!(
+                "add-learner at {leader_url} for group {raft_group_id} node {node_id} returned {status}: {body}"
+            ))
+        }
+    }
+
+    pub async fn change_membership(
+        &self,
+        leader_url: &Url,
+        raft_group_id: u64,
+        voters: &BTreeSet<u64>,
+    ) -> Result<ChangeMembershipResponse> {
+        let path = change_membership_path(raft_group_id, voters);
+        let url = leader_url
+            .join(&path)
+            .with_context(|| format!("compose change-membership url at {leader_url}"))?;
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str::<ChangeMembershipResponse>(&body)
+                .with_context(|| format!("decode change-membership response: {body}"))
+        } else {
+            Err(anyhow!(
+                "change-membership at {leader_url} for group {raft_group_id} returned {status}: {body}"
+            ))
+        }
+    }
 }
 
 fn register_node_path(node_id: u64, client_url: &str, cluster_url: &str) -> String {
@@ -313,6 +370,19 @@ fn begin_migration_path(
 
 fn prepare_local_engine_path(raft_group_id: u64) -> String {
     format!("/__ursula/admin/groups/{raft_group_id}/local-engine")
+}
+
+fn add_learner_path(raft_group_id: u64, node_id: u64, cluster_url: &str) -> String {
+    format!("/__ursula/raft/{raft_group_id}/learners/{node_id}?addr={cluster_url}")
+}
+
+fn change_membership_path(raft_group_id: u64, voters: &BTreeSet<u64>) -> String {
+    let voters = voters
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("/__ursula/raft/{raft_group_id}/membership?voters={voters}")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -352,6 +422,21 @@ pub struct PrepareLocalEngineResponse {
     pub core_id: u64,
     pub prepared: bool,
     pub already_allowed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddLearnerResponse {
+    pub raft_group_id: u64,
+    pub node_id: u64,
+    pub log_index: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChangeMembershipResponse {
+    pub raft_group_id: u64,
+    pub voter_ids: Vec<u64>,
+    pub log_index: u64,
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -524,6 +609,22 @@ mod tests {
         assert_eq!(
             prepare_local_engine_path(2),
             "/__ursula/admin/groups/2/local-engine"
+        );
+    }
+
+    #[test]
+    fn add_learner_path_preserves_raw_addr_for_server_query_parser() {
+        assert_eq!(
+            add_learner_path(2, 4, "http://node4:4492"),
+            "/__ursula/raft/2/learners/4?addr=http://node4:4492"
+        );
+    }
+
+    #[test]
+    fn change_membership_path_builds_voter_query() {
+        assert_eq!(
+            change_membership_path(2, &BTreeSet::from([2, 3, 4])),
+            "/__ursula/raft/2/membership?voters=2,3,4"
         );
     }
 }

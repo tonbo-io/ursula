@@ -64,6 +64,12 @@ enum GroupCommand {
     /// Prepare local data-group raft engines on this node.
     #[command(subcommand)]
     LocalEngine(GroupLocalEngineCommand),
+    /// Add learners to data-group Raft membership.
+    #[command(subcommand)]
+    Learner(GroupLearnerCommand),
+    /// Change data-group Raft voter membership.
+    #[command(subcommand)]
+    Membership(GroupMembershipCommand),
 }
 
 #[derive(Subcommand, Debug)]
@@ -82,6 +88,18 @@ enum GroupMigrationCommand {
 enum GroupLocalEngineCommand {
     /// Allow and warm a local raft engine for one data group on this node.
     Prepare(GroupLocalEnginePrepareArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum GroupLearnerCommand {
+    /// Add a prepared node as a learner to one data group.
+    Add(GroupLearnerAddArgs),
+}
+
+#[derive(Subcommand, Debug)]
+enum GroupMembershipCommand {
+    /// Change one data group's voter set.
+    Change(GroupMembershipChangeArgs),
 }
 
 #[derive(Args, Debug)]
@@ -140,6 +158,39 @@ struct GroupLocalEnginePrepareArgs {
     /// Raft group id to prepare on this node.
     #[arg(long)]
     raft_group_id: u64,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+struct GroupLearnerAddArgs {
+    /// Base URL of the current data-group leader.
+    #[arg(long)]
+    leader_url: Url,
+    /// Raft group id to change.
+    #[arg(long)]
+    raft_group_id: u64,
+    /// Node id to add as a learner.
+    #[arg(long)]
+    node_id: u64,
+    /// Cluster-plane URL for the learner node.
+    #[arg(long)]
+    cluster_url: String,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+struct GroupMembershipChangeArgs {
+    /// Base URL of the current data-group leader.
+    #[arg(long)]
+    leader_url: Url,
+    /// Raft group id to change.
+    #[arg(long)]
+    raft_group_id: u64,
+    /// Target voter ids, comma separated.
+    #[arg(long, value_delimiter = ',')]
+    voters: Vec<u64>,
     #[arg(long, default_value_t = 10)]
     http_timeout_secs: u64,
 }
@@ -224,6 +275,12 @@ async fn main() -> Result<()> {
         }
         Command::Group(GroupCommand::LocalEngine(GroupLocalEngineCommand::Prepare(args))) => {
             run_group_local_engine_prepare_subcommand(args).await
+        }
+        Command::Group(GroupCommand::Learner(GroupLearnerCommand::Add(args))) => {
+            run_group_learner_add_subcommand(args).await
+        }
+        Command::Group(GroupCommand::Membership(GroupMembershipCommand::Change(args))) => {
+            run_group_membership_change_subcommand(args).await
         }
         Command::Status(args) => run_status_subcommand(args).await,
         Command::WaitReady(args) => run_wait_ready_subcommand(args).await,
@@ -310,6 +367,51 @@ async fn run_group_local_engine_prepare_subcommand(
     println!(
         "group {}: local engine prepared on core {}{}",
         response.raft_group_id, response.core_id, suffix
+    );
+    Ok(())
+}
+
+async fn run_group_learner_add_subcommand(args: GroupLearnerAddArgs) -> Result<()> {
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let response = client
+        .add_learner(
+            &args.leader_url,
+            args.raft_group_id,
+            args.node_id,
+            &args.cluster_url,
+        )
+        .await?;
+    println!(
+        "group {}: learner {} added at log index {}",
+        response.raft_group_id, response.node_id, response.log_index
+    );
+    Ok(())
+}
+
+async fn run_group_membership_change_subcommand(args: GroupMembershipChangeArgs) -> Result<()> {
+    let voters = args.voters.into_iter().collect::<BTreeSet<_>>();
+    if voters.is_empty() {
+        bail!("--voters must not be empty");
+    }
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let response = client
+        .change_membership(&args.leader_url, args.raft_group_id, &voters)
+        .await?;
+    if !response.changed {
+        bail!(
+            "change-membership response for group {} did not confirm change",
+            response.raft_group_id
+        );
+    }
+    let voters = response
+        .voter_ids
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    println!(
+        "group {}: membership changed to [{}] at log index {}",
+        response.raft_group_id, voters, response.log_index
     );
     Ok(())
 }
@@ -483,6 +585,62 @@ mod tests {
         };
         assert_eq!(args.admin_url.as_str(), "http://node4:4491/");
         assert_eq!(args.raft_group_id, 2);
+        assert_eq!(args.http_timeout_secs, 10);
+    }
+
+    #[test]
+    fn parses_group_learner_add_command() {
+        let cli = Cli::try_parse_from([
+            "ursulactl",
+            "group",
+            "learner",
+            "add",
+            "--leader-url",
+            "http://node2:4491",
+            "--raft-group-id",
+            "2",
+            "--node-id",
+            "4",
+            "--cluster-url",
+            "http://node4:4492",
+        ])
+        .expect("parse group learner add command");
+
+        let Command::Group(GroupCommand::Learner(GroupLearnerCommand::Add(args))) = cli.command
+        else {
+            panic!("expected group learner add command");
+        };
+        assert_eq!(args.leader_url.as_str(), "http://node2:4491/");
+        assert_eq!(args.raft_group_id, 2);
+        assert_eq!(args.node_id, 4);
+        assert_eq!(args.cluster_url, "http://node4:4492");
+        assert_eq!(args.http_timeout_secs, 10);
+    }
+
+    #[test]
+    fn parses_group_membership_change_command() {
+        let cli = Cli::try_parse_from([
+            "ursulactl",
+            "group",
+            "membership",
+            "change",
+            "--leader-url",
+            "http://node2:4491",
+            "--raft-group-id",
+            "2",
+            "--voters",
+            "2,3,4",
+        ])
+        .expect("parse group membership change command");
+
+        let Command::Group(GroupCommand::Membership(GroupMembershipCommand::Change(args))) =
+            cli.command
+        else {
+            panic!("expected group membership change command");
+        };
+        assert_eq!(args.leader_url.as_str(), "http://node2:4491/");
+        assert_eq!(args.raft_group_id, 2);
+        assert_eq!(args.voters, vec![2, 3, 4]);
         assert_eq!(args.http_timeout_secs, 10);
     }
 }
