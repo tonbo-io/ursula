@@ -24,7 +24,13 @@ use ursula_stream::ColdChunkRef;
 use ursula_stream::ObjectPayloadRef;
 
 pub(crate) const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
-static COLD_CHUNK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+// Padded to its own cache line: this global is fetch_add-ed from every core's
+// cold-flush path, so false sharing with neighbouring statics would bounce the
+// line across cores. A true per-core sequence would need core context these
+// low-frequency flush/path helpers don't carry, so padding is the pragmatic fix.
+#[repr(align(128))]
+struct PaddedSequence(AtomicU64);
+static COLD_CHUNK_SEQUENCE: PaddedSequence = PaddedSequence(AtomicU64::new(0));
 const DEFAULT_COLD_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_COLD_CACHE_BLOCK_BYTES: usize = 1024 * 1024;
 const DEFAULT_COLD_CACHE_READAHEAD_BLOCKS: usize = 4;
@@ -1043,6 +1049,7 @@ impl ColdReadCache {
             .insert(key.clone(), ColdCacheEntry { bytes, generation });
         inner.lru.push_back((key, generation));
         self.evict_locked(&mut inner);
+        Self::compact_lru_if_needed(&mut inner);
     }
 
     fn record_stream_read(
@@ -1111,6 +1118,30 @@ impl ColdReadCache {
             entry.generation = generation;
         }
         inner.lru.push_back((key, generation));
+        Self::compact_lru_if_needed(inner);
+    }
+
+    fn compact_lru_if_needed(inner: &mut ColdReadCacheInner) {
+        // `touch` appends a fresh (key, generation) on every hit without removing
+        // the stale prior entry, and `evict_locked` only reclaims those when the
+        // cache is over `max_bytes`. With a working set at or below the cap but
+        // repeated hits, the deque would otherwise grow without bound. Rebuild it
+        // from the live blocks once it bloats past 2x the live entry count —
+        // amortized O(1) per touch, since each rebuild shrinks it back to
+        // `blocks.len()` so the next rebuild is `blocks.len()` touches away.
+        if inner.lru.len() <= inner.blocks.len() * 2 + 16 {
+            return;
+        }
+        let mut live: Vec<(u64, ColdCacheKey)> = inner
+            .blocks
+            .iter()
+            .map(|(key, entry)| (entry.generation, key.clone()))
+            .collect();
+        live.sort_unstable_by_key(|(generation, _)| *generation);
+        inner.lru = live
+            .into_iter()
+            .map(|(generation, key)| (key, generation))
+            .collect();
     }
 
     fn next_generation(inner: &mut ColdReadCacheInner) -> u64 {
@@ -1166,7 +1197,7 @@ pub fn new_cold_chunk_path(
     end_offset: u64,
 ) -> String {
     let unix_nanos = cold_object_unix_nanos();
-    let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = COLD_CHUNK_SEQUENCE.0.fetch_add(1, Ordering::Relaxed);
     format!(
         "{stream_id}/chunks/{start_offset:016x}-{end_offset:016x}-{unix_nanos:032x}-{sequence:016x}.bin"
     )
@@ -1181,7 +1212,7 @@ pub fn cold_chunk_prefix(stream_id: &BucketStreamId) -> String {
 
 pub fn new_external_payload_path(stream_id: &BucketStreamId) -> String {
     let unix_nanos = cold_object_unix_nanos();
-    let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let sequence = COLD_CHUNK_SEQUENCE.0.fetch_add(1, Ordering::Relaxed);
     format!("{stream_id}/external/{unix_nanos:032x}-{sequence:016x}.bin")
 }
 
@@ -1191,12 +1222,45 @@ pub fn new_external_payload_path(stream_id: &BucketStreamId) -> String {
 #[cfg(madsim)]
 #[allow(dead_code)]
 pub fn reset_cold_chunk_sequence_for_sim() {
-    COLD_CHUNK_SEQUENCE.store(0, Ordering::Relaxed);
+    COLD_CHUNK_SEQUENCE.0.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
+    use super::ColdReadCache;
+    use super::ColdReadCacheConfig;
     use super::ColdStore;
+
+    #[test]
+    fn lru_queue_stays_bounded_under_repeated_hits() {
+        // Working set fits entirely in the cache (4 blocks == max_bytes), so there
+        // is no eviction pressure and the recency deque is the only thing that
+        // could grow. Before compaction it grew by one entry per hit (~40k here);
+        // it must stay bounded to the live set instead.
+        let cache = ColdReadCache::new(ColdReadCacheConfig {
+            max_bytes: 4 * 1024,
+            block_bytes: 1024,
+            max_readahead_blocks: 0,
+        });
+        for index in 0..4 {
+            cache.insert("p".to_owned(), index, Bytes::from(vec![0u8; 1024]));
+        }
+        for _ in 0..10_000 {
+            for index in 0..4 {
+                assert!(cache.get("p", index).is_some());
+            }
+        }
+        let inner = cache.inner.lock().expect("cache mutex");
+        assert_eq!(inner.blocks.len(), 4, "live blocks unchanged");
+        assert!(
+            inner.lru.len() <= inner.blocks.len() * 2 + 16,
+            "lru deque grew unbounded: {} entries for {} live blocks",
+            inner.lru.len(),
+            inner.blocks.len(),
+        );
+    }
 
     #[test]
     fn fs_backend_is_not_supported() {

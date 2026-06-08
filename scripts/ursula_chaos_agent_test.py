@@ -3,7 +3,14 @@ import unittest
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
-from ursula_chaos_agent import ChaosAgent, Node, _published_started_at
+from ursula_chaos_agent import (
+    CATCH_UP_RECOVERY_SLO_SECS,
+    IMPAIRMENT_SCENARIOS,
+    NODE_SERVICE_UNIT,
+    ChaosAgent,
+    Node,
+    _published_started_at,
+)
 
 
 class ChaosAgentStateTest(unittest.TestCase):
@@ -72,6 +79,68 @@ class ChaosAgentStateTest(unittest.TestCase):
             agent.active_fault_label(),
             f"cluster_netem_delay on ursula-chaos-node-1 until {recover_at.isoformat().replace('+00:00', 'Z')}",
         )
+
+    def test_process_and_network_scenarios_recover_as_impairments(self) -> None:
+        # These recover via faultd /clear (thaw) or systemd auto-restart, not via
+        # the EC2 stop/start state machine. If one ever drops out of this set it
+        # would wrongly wait for instance_state to flip to "stopped" and wedge.
+        for scenario in (
+            "process_kill",
+            "process_freeze",
+            "oneway_partition",
+            "netem_reorder",
+            "netem_duplicate",
+        ):
+            self.assertIn(scenario, IMPAIRMENT_SCENARIOS)
+
+    def test_apply_fault_scenario_emits_expected_faultd_payloads(self) -> None:
+        agent = object.__new__(ChaosAgent)
+        agent.nodes = [
+            Node("ursula-chaos-node-1", "i-1", "http://172.31.80.22:4491"),
+            Node("ursula-chaos-node-2", "i-2", "http://172.31.31.150:4491"),
+            Node("ursula-chaos-node-3", "i-3", "http://172.31.47.237:4491"),
+        ]
+        calls: list[tuple[str, dict]] = []
+        agent.apply_node_impairment = lambda node, payload: bool(
+            calls.append((node.name, payload))
+        ) or True
+        agent.mark_current_injection_apply_result = lambda applied: None
+        agent.event = lambda level, message: None
+        target = agent.nodes[0]
+
+        agent.apply_fault_scenario("process_kill", [target])
+        self.assertEqual(
+            calls[-1],
+            ("ursula-chaos-node-1", {"kind": "process", "action": "kill", "units": [NODE_SERVICE_UNIT]}),
+        )
+
+        agent.apply_fault_scenario("process_freeze", [target])
+        self.assertEqual(calls[-1][1]["action"], "freeze")
+
+        agent.apply_fault_scenario("oneway_partition", [target])
+        payload = calls[-1][1]
+        self.assertEqual(payload["kind"], "partition")
+        self.assertEqual(payload["direction"], "inbound")
+        # peers are the two non-target nodes, never the target itself.
+        self.assertEqual(set(payload["peer_hosts"]), {"172.31.31.150", "172.31.47.237"})
+
+        agent.apply_fault_scenario("netem_reorder", [target])
+        self.assertEqual(calls[-1][1]["reorder_percent"], 25)
+        self.assertEqual(calls[-1][1]["scope"], "cluster")
+
+        agent.apply_fault_scenario("netem_duplicate", [target])
+        self.assertEqual(calls[-1][1]["duplicate_percent"], 1)
+
+    def test_catch_up_scenarios_get_longer_recovery_slo(self) -> None:
+        # process_kill recovers via raft-memory catch-up (minutes); reusing the
+        # short impairment SLO false-trips slo_missed -> repair_failed (#526).
+        agent = object.__new__(ChaosAgent)
+        agent.recovery_slo_secs = 120
+        self.assertEqual(
+            agent.effective_recovery_slo_secs("process_kill"), CATCH_UP_RECOVERY_SLO_SECS
+        )
+        self.assertEqual(agent.effective_recovery_slo_secs("cluster_netem_delay"), 120)
+        self.assertEqual(agent.effective_recovery_slo_secs(None), 120)
 
 
 if __name__ == "__main__":
