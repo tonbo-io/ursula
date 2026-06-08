@@ -71,8 +71,11 @@ use chrono::DateTime;
 use futures_util::stream;
 use openraft::BasicNode;
 use openraft::rt::WatchReceiver;
+use ursula_control::ControlResponse;
 use ursula_raft::LeadershipShedFlag;
 use ursula_raft::LeadershipShedReason;
+use ursula_raft::MetaNodeRegistration;
+use ursula_raft::MetaRaftHandle;
 use ursula_raft::RAFT_GRPC_APPEND_PATH;
 use ursula_raft::RAFT_GRPC_FULL_SNAPSHOT_PATH;
 use ursula_raft::RAFT_GRPC_GROUP_READ_PATH;
@@ -207,6 +210,7 @@ impl WallClock for SystemWallClock {
 pub struct HttpState {
     runtime: ShardRuntime,
     raft_registry: Option<RaftGroupHandleRegistry>,
+    meta_raft: Option<MetaRaftHandle>,
     client_write_router: Option<ClientWriteLeaderRouter>,
     http_metrics: Arc<HttpMetrics>,
     wall_clock: Arc<dyn WallClock>,
@@ -226,6 +230,7 @@ impl HttpState {
         Self {
             runtime,
             raft_registry: None,
+            meta_raft: None,
             client_write_router: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
@@ -242,6 +247,7 @@ impl HttpState {
         Self {
             runtime,
             raft_registry: Some(raft_registry),
+            meta_raft: None,
             client_write_router: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
@@ -275,6 +281,7 @@ impl HttpState {
         Self {
             runtime,
             raft_registry: Some(raft_registry),
+            meta_raft: None,
             client_write_router: Some(ClientWriteLeaderRouter::with_static_topology(
                 node_id,
                 peers,
@@ -285,6 +292,11 @@ impl HttpState {
             node_memory: NodeMemoryMonitor::from_env(),
             leadership_shed,
         }
+    }
+
+    pub fn with_meta_raft_handle(mut self, meta_raft: MetaRaftHandle) -> Self {
+        self.meta_raft = Some(meta_raft);
+        self
     }
 
     pub fn leadership_shed_flag(&self) -> LeadershipShedFlag {
@@ -316,6 +328,10 @@ impl HttpState {
 
     pub fn raft_registry(&self) -> Option<&RaftGroupHandleRegistry> {
         self.raft_registry.as_ref()
+    }
+
+    pub fn meta_raft(&self) -> Option<&MetaRaftHandle> {
+        self.meta_raft.as_ref()
     }
 
     pub fn client_write_router(&self) -> Option<&ClientWriteLeaderRouter> {
@@ -700,6 +716,10 @@ pub fn client_router_from_state(state: HttpState) -> Router {
         .route("/__ursula/metrics", get(metrics))
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route(
+            "/__ursula/admin/nodes/{node_id}/register",
+            post(register_admin_node),
+        )
+        .route(
             "/__ursula/flush-cold/{bucket}/{stream}",
             post(flush_cold_stream),
         )
@@ -1055,6 +1075,72 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         body.push('}');
     }
     (StatusCode::OK, headers, body).into_response()
+}
+
+pub(crate) async fn register_admin_node(
+    State(state): State<HttpState>,
+    Path(node_id): Path<u64>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let query = match parse_query(raw_query.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
+    };
+    let Some(client_url) = query
+        .get("client_url")
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "client_url query parameter is required",
+        )
+            .into_response();
+    };
+    let Some(cluster_url) = query
+        .get("cluster_url")
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "cluster_url query parameter is required",
+        )
+            .into_response();
+    };
+    let Some(meta_raft) = state.meta_raft() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "meta raft is not configured for this server",
+        )
+            .into_response();
+    };
+
+    match meta_raft
+        .register_node(
+            MetaNodeRegistration::new(node_id, client_url.clone(), cluster_url.clone()),
+            state.unix_time_ms(),
+        )
+        .await
+    {
+        Ok(ControlResponse::Ok) => (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            format!("{{\"node_id\":{node_id},\"registered\":true}}"),
+        )
+            .into_response(),
+        Ok(ControlResponse::Rejected { reason }) => {
+            (StatusCode::BAD_REQUEST, reason).into_response()
+        }
+        Ok(response) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("unexpected meta raft response: {response}"),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("register node in meta raft: {err}"),
+        )
+            .into_response(),
+    }
 }
 
 pub(crate) async fn flush_cold_stream(

@@ -4685,6 +4685,96 @@ fn test_router() -> Router {
     router(spawn_default_runtime(2, 8).expect("runtime"))
 }
 
+async fn single_node_meta_handle_for_test(cluster_name: &str) -> ursula_raft::MetaRaftHandle {
+    let config = Arc::new(
+        openraft::Config {
+            cluster_name: cluster_name.to_owned(),
+            heartbeat_interval: 10,
+            election_timeout_min: 30,
+            election_timeout_max: 60,
+            ..Default::default()
+        }
+        .validate()
+        .expect("valid raft config"),
+    );
+    ursula_raft::MetaRaftHandle::new_single_node_with_log_store(
+        1,
+        BasicNode::new("meta-local"),
+        config,
+        ursula_raft::MetaRaftLogStore::shared(),
+    )
+    .await
+    .expect("create single-node meta raft handle")
+}
+
+#[tokio::test]
+async fn admin_register_node_writes_to_meta_group() {
+    let now_ms = Arc::new(AtomicU64::new(1_234));
+    let meta = single_node_meta_handle_for_test("ursula-admin-register-node-test").await;
+    let state = HttpState::new(spawn_default_runtime(1, 1).expect("runtime"))
+        .with_meta_raft_handle(meta.clone())
+        .with_wall_clock(TestWallClock {
+            now_ms: Arc::clone(&now_ms),
+        });
+    let client = client_router_from_state(state);
+
+    let response = client
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/__ursula/admin/nodes/4/register?client_url=http://node4:4491/&cluster_url=http://node4:4492/")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body = std::str::from_utf8(&body).expect("register response utf8");
+    assert!(body.contains("\"node_id\":4"), "{body}");
+    assert!(body.contains("\"registered\":true"), "{body}");
+
+    let node = meta
+        .read_state(|state| state.nodes.get(&4).cloned())
+        .await
+        .expect("read meta state")
+        .expect("node registered");
+    assert_eq!(node.client_url, "http://node4:4491");
+    assert_eq!(node.cluster_url, "http://node4:4492");
+    assert_eq!(node.updated_at_ms, 1_234);
+
+    meta.shutdown().await.expect("shutdown meta raft");
+}
+
+#[tokio::test]
+async fn admin_register_node_requires_meta_group() {
+    let client = client_router_from_state(HttpState::new(
+        spawn_default_runtime(1, 1).expect("runtime"),
+    ));
+
+    let response = client
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/__ursula/admin/nodes/4/register?client_url=http://node4:4491&cluster_url=http://node4:4492")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body = std::str::from_utf8(&body).expect("register response utf8");
+    assert!(
+        body.contains("meta raft is not configured for this server"),
+        "{body}"
+    );
+}
+
 #[tokio::test]
 async fn client_router_does_not_serve_cluster_plane_via_grpc_service() {
     // The gRPC path `/ursula.raft.v1.RaftInternal/Append` has the same shape

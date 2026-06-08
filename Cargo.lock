@@ -3586,6 +3586,7 @@ dependencies = [
  "tonic 0.12.3",
  "tower 0.5.3",
  "tracing",
+ "ursula-control",
  "ursula-observability",
  "ursula-raft",
  "ursula-runtime",
