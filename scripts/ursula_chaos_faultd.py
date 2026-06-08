@@ -6,11 +6,15 @@ S3 traffic (and vice versa). Each `apply` call replaces all previously
 applied state.
 
 Fault payload schema:
-  kind            One of "netem" | "partition" | "s3_unavailable" | "clear"
+  kind            One of "netem" | "partition" | "s3_unavailable" | "process" | "clear"
   scope           Used by "netem": "cluster" | "all" (default "all")
   delay_ms/jitter_ms/loss_percent  netem parameters
-  peer_hosts      partition: list of remote IPs to drop both directions
+  reorder_percent/duplicate_percent/corrupt_percent  extra netem parameters
+  peer_hosts      partition: list of remote IPs to drop
+  direction       partition: "both" | "inbound" | "outbound" (default "both")
   cluster_subnets netem scope=cluster: list of CIDRs to selectively delay
+  action          process: "kill" | "freeze" | "thaw"
+  units           process: systemd units to target (default ursula-chaos.service)
 """
 
 from __future__ import annotations
@@ -26,6 +30,14 @@ from typing import Any
 S3_SNI_PATTERNS = [
     "s3.amazonaws.com",
     "s3.us-east-1.amazonaws.com",
+]
+
+# Units a "process" fault may kill/freeze, and that clear() must always thaw.
+# Like the S3 SNI patterns above, this is a stateless fallback: a frozen cgroup
+# survives a faultd restart in the kernel, so clear() thaws these even when the
+# process never tracked what it froze.
+DEFAULT_PROCESS_UNITS = [
+    "ursula-chaos.service",
 ]
 
 
@@ -68,8 +80,10 @@ class FaultState:
         self.dev = default_dev() if dev == "auto" else dev
         self.tc = command_path("tc")
         self.iptables = command_path("iptables")
+        self.systemctl = command_path("systemctl")
         self.peer_hosts: list[str] = []
         self.s3_patterns: list[str] = []
+        self.frozen_units: list[str] = []
         self.has_root_qdisc = False
         self.has_classful_qdisc = False
         # Stale iptables/tc rules from a prior chaos run survive faultd restart
@@ -85,6 +99,7 @@ class FaultState:
         *,
         peer_hosts: list[str] | None = None,
         s3_patterns: list[str] | None = None,
+        units: list[str] | None = None,
     ) -> None:
         # Stateless: always attempt to remove the root qdisc. A daemon restart
         # or a concurrent ThreadingHTTPServer request can lose has_*_qdisc,
@@ -111,12 +126,22 @@ class FaultState:
                        "-j", "DROP"]).returncode == 0:
                 pass
         self.s3_patterns = []
+        # Stateless thaw: a frozen cgroup (systemctl freeze) lives in the kernel
+        # and survives a faultd restart, exactly like the netem/iptables rules
+        # above. A frozen ursula is a node that looks "up" (systemd reports the
+        # unit active) but is wedged forever, so unconditionally thaw every known
+        # unit even when self.frozen_units was lost. `thaw` on a running unit is
+        # a harmless no-op.
+        for unit in unique([*self.frozen_units, *DEFAULT_PROCESS_UNITS, *(units or [])]):
+            run([self.systemctl, "thaw", unit])
+        self.frozen_units = []
 
     def status(
         self,
         *,
         peer_hosts: list[str] | None = None,
         s3_patterns: list[str] | None = None,
+        units: list[str] | None = None,
     ) -> dict[str, Any]:
         qdisc = run([self.tc, "qdisc", "show", "dev", self.dev])
         qdisc_lines = qdisc.stdout.splitlines() if qdisc.returncode == 0 else []
@@ -140,16 +165,29 @@ class FaultState:
                     "-j", "DROP"]).returncode == 0:
                 s3_rules.append(pattern)
 
+        frozen_units: list[str] = []
+        for unit in unique([*self.frozen_units, *DEFAULT_PROCESS_UNITS, *(units or [])]):
+            res = run([self.systemctl, "show", unit, "-p", "FreezerState"])
+            if res.returncode == 0 and "FreezerState=frozen" in res.stdout:
+                frozen_units.append(unit)
+
         qdisc_error = ""
         if qdisc.returncode != 0:
             qdisc_error = qdisc.stderr.strip() or qdisc.stdout.strip()
-        clean = not active_qdisc and not partition_rules and not s3_rules and not qdisc_error
+        clean = (
+            not active_qdisc
+            and not partition_rules
+            and not s3_rules
+            and not frozen_units
+            and not qdisc_error
+        )
         return {
             "clean": clean,
             "dev": self.dev,
             "active_qdisc": active_qdisc,
             "partition_rules": partition_rules,
             "s3_rules": s3_rules,
+            "frozen_units": frozen_units,
             "qdisc_error": qdisc_error,
         }
 
@@ -165,24 +203,43 @@ class FaultState:
             return self._apply_partition(payload)
         if kind == "s3_unavailable":
             return self._apply_s3_unavailable(payload)
+        if kind == "process":
+            return self._apply_process(payload)
         raise ValueError(f"unsupported fault kind: {kind}")
 
     def _apply_netem(self, payload: dict[str, Any]) -> dict[str, Any]:
         delay_ms = max(0, int(payload.get("delay_ms", 0)))
         jitter_ms = max(0, int(payload.get("jitter_ms", 0)))
         loss_percent = max(0.0, min(100.0, float(payload.get("loss_percent", 0))))
+        reorder_percent = max(0.0, min(100.0, float(payload.get("reorder_percent", 0))))
+        duplicate_percent = max(0.0, min(100.0, float(payload.get("duplicate_percent", 0))))
+        corrupt_percent = max(0.0, min(100.0, float(payload.get("corrupt_percent", 0))))
         scope = payload.get("scope", "all")
+
+        # netem only reorders packets that sit in a delay queue, so a reorder
+        # fault needs some delay to be meaningful — inject a small one if the
+        # caller asked for reorder without specifying a delay.
+        if reorder_percent > 0 and delay_ms == 0:
+            delay_ms = 10
 
         netem_args = ["netem"]
         if delay_ms > 0:
             netem_args.extend(["delay", f"{delay_ms}ms"])
             if jitter_ms > 0:
                 netem_args.append(f"{jitter_ms}ms")
-                # Bound reordering so chaos models real network latency rather
-                # than producing TCP HOL stalls from packet reorder.
+                # Bound the delay correlation so chaos models real network
+                # latency rather than producing TCP HOL stalls.
                 netem_args.extend(["25%"])
         if loss_percent > 0:
             netem_args.extend(["loss", f"{loss_percent}%"])
+        if duplicate_percent > 0:
+            netem_args.extend(["duplicate", f"{duplicate_percent}%"])
+        if corrupt_percent > 0:
+            netem_args.extend(["corrupt", f"{corrupt_percent}%"])
+        # reorder must follow delay in netem's argument order; the trailing 50%
+        # is the reorder correlation.
+        if reorder_percent > 0:
+            netem_args.extend(["reorder", f"{reorder_percent}%", "50%"])
 
         if scope == "cluster":
             cluster_subnets = [str(c) for c in payload.get("cluster_subnets", []) if c]
@@ -211,11 +268,22 @@ class FaultState:
 
     def _apply_partition(self, payload: dict[str, Any]) -> dict[str, Any]:
         hosts = [str(host) for host in payload.get("peer_hosts", []) if host]
+        direction = payload.get("direction", "both")
+        if direction not in ("both", "inbound", "outbound"):
+            raise ValueError(f"unsupported partition direction: {direction}")
         for host in hosts:
-            run([self.iptables, "-A", "INPUT", "-s", host, "-j", "DROP"], check=True)
-            run([self.iptables, "-A", "OUTPUT", "-d", host, "-j", "DROP"], check=True)
+            # inbound drops traffic FROM the peer (this node stops hearing it);
+            # outbound drops traffic TO the peer. A one-way drop creates the
+            # asymmetric link that wedges Raft — heartbeats land but replies
+            # don't, or a leader can send yet never receive acks — which is far
+            # nastier than a clean bidirectional cut. clear() removes both
+            # directions per host, so a one-way rule is still fully cleaned up.
+            if direction in ("both", "inbound"):
+                run([self.iptables, "-A", "INPUT", "-s", host, "-j", "DROP"], check=True)
+            if direction in ("both", "outbound"):
+                run([self.iptables, "-A", "OUTPUT", "-d", host, "-j", "DROP"], check=True)
         self.peer_hosts = hosts
-        return {"ok": True, "kind": "partition", "peer_hosts": hosts}
+        return {"ok": True, "kind": "partition", "direction": direction, "peer_hosts": hosts}
 
     def _apply_s3_unavailable(self, payload: dict[str, Any]) -> dict[str, Any]:
         patterns = [str(p) for p in payload.get("patterns", S3_SNI_PATTERNS) if p]
@@ -225,6 +293,35 @@ class FaultState:
                 check=True)
         self.s3_patterns = patterns
         return {"ok": True, "kind": "s3_unavailable", "patterns": patterns}
+
+    def _apply_process(self, payload: dict[str, Any]) -> dict[str, Any]:
+        action = payload.get("action", "kill")
+        units = [str(unit) for unit in payload.get("units", DEFAULT_PROCESS_UNITS) if unit]
+        if not units:
+            raise ValueError("process fault requires at least one unit")
+        if action == "kill":
+            # SIGKILL the unit's processes; systemd Restart= brings ursula back,
+            # so this models a sudden crash, not a graceful stop. On a
+            # --raft-memory node it is a full amnesiac restart that must
+            # re-catch-up from the S3 snapshot plus peer logs.
+            for unit in units:
+                self._must_run([self.systemctl, "kill", "-s", "SIGKILL", unit])
+            return {"ok": True, "kind": "process", "action": "kill", "units": units}
+        if action == "freeze":
+            # cgroup freezer: the process stops being scheduled but its TCP
+            # sockets stay open, so peers keep the connection alive and only
+            # notice via heartbeat timeout — the grey-failure path, distinct
+            # from a kill's prompt connection reset.
+            for unit in units:
+                self._must_run([self.systemctl, "freeze", unit])
+            self.frozen_units = units
+            return {"ok": True, "kind": "process", "action": "freeze", "units": units}
+        if action == "thaw":
+            for unit in units:
+                run([self.systemctl, "thaw", unit])
+            self.frozen_units = []
+            return {"ok": True, "kind": "process", "action": "thaw", "units": units}
+        raise ValueError(f"unsupported process action: {action}")
 
     def _must_run(self, argv: list[str]) -> None:
         result = run(argv)
@@ -244,8 +341,9 @@ class Handler(BaseHTTPRequestHandler):
                 payload = self.read_json_body()
                 peer_hosts = [str(host) for host in payload.get("peer_hosts", []) if host]
                 s3_patterns = [str(pattern) for pattern in payload.get("s3_patterns", []) if pattern]
-                self.state.clear(peer_hosts=peer_hosts, s3_patterns=s3_patterns)
-                status = self.state.status(peer_hosts=peer_hosts, s3_patterns=s3_patterns)
+                units = [str(unit) for unit in payload.get("units", []) if unit]
+                self.state.clear(peer_hosts=peer_hosts, s3_patterns=s3_patterns, units=units)
+                status = self.state.status(peer_hosts=peer_hosts, s3_patterns=s3_patterns, units=units)
                 self.write_json(200 if status["clean"] else 500, {"ok": status["clean"], **status})
                 return
             if self.path == "/apply":
