@@ -10,6 +10,7 @@ members = [
     "crates/ursula-ctl",
     "crates/ursula-sim",
     "crates/ursula-observability",
+    "crates/ursula-gateway",
 ]
 resolver = "3"
 

@@ -1,0 +1,21 @@
+{{- if .Values.server.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ursula.fullname" . }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+  {{- with .Values.server.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.server.service.type }}
+  ports:
+    - name: client
+      port: {{ .Values.server.service.port }}
+      targetPort: client
+      protocol: TCP
+  selector:
+    {{- include "ursula.selectorLabels" . | nindent 4 }}
+{{- end }}

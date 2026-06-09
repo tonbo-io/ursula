@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ursula.headlessServiceName" . }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+  {{- with .Values.server.headlessService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: client
+      port: {{ .Values.server.ports.client }}
+      targetPort: client
+      protocol: TCP
+  selector:
+    {{- include "ursula.selectorLabels" . | nindent 4 }}

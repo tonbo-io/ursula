@@ -1,0 +1,46 @@
+Ursula has been installed as a static-membership Raft cluster.
+
+Release: {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+Replicas: {{ .Values.server.replicaCount }}
+Raft groups: {{ .Values.raft.groupCount }}
+
+Internal server Service:
+  {{ include "ursula.fullname" . }}.{{ .Release.Namespace }}.svc.{{ .Values.global.clusterDomain }}:{{ .Values.server.service.port }}
+{{- if .Values.gateway.enabled }}
+
+Gateway entrypoint Service:
+  {{ include "ursula.gatewayFullname" . }}.{{ .Release.Namespace }}.svc.{{ .Values.global.clusterDomain }}:{{ .Values.gateway.service.port }}
+{{- end }}
+
+Port-forward locally:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ursula.fullname" . }} {{ .Values.server.service.port }}:{{ .Values.server.service.port }}
+{{- if .Values.gateway.enabled }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ursula.gatewayFullname" . }} {{ .Values.gateway.service.port }}:{{ .Values.gateway.service.port }}
+{{- end }}
+
+{{ if .Values.tests.enabled }}
+Verify cluster readiness:
+  helm test {{ .Release.Name }} -n {{ .Release.Namespace }}
+{{ else }}
+Cluster readiness test:
+  Helm test rendering is disabled by tests.enabled=false.
+{{ end }}
+
+Important bootstrap step:
+  raft.initMembershipPerGroup is currently {{ .Values.raft.initMembershipPerGroup }}.
+{{- if .Values.raft.initMembershipPerGroup }}
+  For a fresh cluster this should be true only for the first successful bootstrap.
+  After helm test passes, or after your equivalent readiness check succeeds,
+  update your values and run:
+    helm upgrade {{ .Release.Name }} <chart-ref-or-path> -n {{ .Release.Namespace }} --reuse-values --set raft.initMembershipPerGroup=false
+  If you do not use --reuse-values, repeat image overrides or use a values file.
+{{- else }}
+  Keep this value false for normal restarts and upgrades. The future Ursula
+  operator will own this transition automatically.
+{{- end }}
+
+Static membership warning:
+  server.replicaCount controls the initial voter set for a fresh cluster. Changing it
+  on an initialized cluster is not safe Raft voter reconfiguration. Use the
+  future Ursula operator for safe learner add, voter promotion, and voter removal.
