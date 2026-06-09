@@ -724,8 +724,10 @@ fn plan_next_cold_flush_selects_deterministic_eligible_stream() {
     ));
 
     let candidate = machine
-        .plan_next_cold_flush(4, 4)
+        .plan_next_cold_flush_batch(4, 4, 1)
         .expect("plan next cold flush")
+        .into_iter()
+        .next()
         .expect("candidate");
     assert_eq!(candidate.stream_id, stream("a-cold"));
     assert_eq!(candidate.payload, b"aaaa");
@@ -752,26 +754,29 @@ fn plan_next_cold_flush_drains_distributed_group_hot_bytes() {
         ));
     }
 
-    assert!(
+    assert_eq!(
         machine
-            .plan_next_cold_flush(4, 4)
+            .plan_next_cold_flush_batch(4, 4, 1)
             .expect("plan next cold flush")
-            .is_some()
+            .len(),
+        1
     );
-    let candidate = machine
-        .plan_next_cold_flush(5, 4)
+    let candidates = machine
+        .plan_next_cold_flush_batch(5, 4, 1)
         .expect("plan next cold flush");
-    assert!(candidate.is_none());
+    assert!(candidates.is_empty());
     let candidate = machine
-        .plan_next_cold_flush(4, 4)
+        .plan_next_cold_flush_batch(4, 4, 1)
         .expect("plan next cold flush")
+        .into_iter()
+        .next()
         .expect("candidate");
     assert_eq!(candidate.stream_id, stream("a-cold"));
     assert_eq!(candidate.payload, b"aa");
 }
 
 #[test]
-fn plan_next_cold_flush_batch_advances_on_preview_state() {
+fn plan_next_cold_flush_batch_advances() {
     let mut machine = StreamStateMachine::new();
     create_bucket(&mut machine);
     create_stream(&mut machine, "batched-cold");
@@ -811,6 +816,7 @@ fn plan_next_cold_flush_batch_advances_on_preview_state() {
             b"d".as_slice()
         ]
     );
+    assert_eq!(machine.hot_start_offset(&stream("batched-cold")), 0);
     assert_eq!(machine.hot_payload_len(&stream("batched-cold")), Ok(4));
     assert!(machine.cold_chunks(&stream("batched-cold")).is_empty());
 }
@@ -949,8 +955,10 @@ fn plan_next_cold_flush_skips_soft_deleted_streams() {
     ));
 
     let candidate = machine
-        .plan_next_cold_flush(4, 4)
+        .plan_next_cold_flush_batch(4, 4, 1)
         .expect("plan next cold flush")
+        .into_iter()
+        .next()
         .expect("candidate");
     assert_eq!(candidate.stream_id, stream("b-live"));
     assert_eq!(candidate.payload, b"live");

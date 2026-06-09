@@ -2297,7 +2297,8 @@ impl GroupEngine for InMemoryGroupEngine {
     ) -> GroupPlanNextColdFlushFuture<'a> {
         Box::pin(async move {
             self.state_machine
-                .plan_next_cold_flush(request.min_hot_bytes, request.max_flush_bytes)
+                .plan_next_cold_flush_batch(request.min_hot_bytes, request.max_flush_bytes, 1)
+                .map(|candidates| candidates.into_iter().next())
                 .map_err(stream_response_error)
         })
     }
