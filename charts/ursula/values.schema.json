@@ -1,0 +1,835 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "coldStorage": {
+            "properties": {
+              "enabled": { "const": true }
+            },
+            "required": ["enabled"]
+          }
+        },
+        "required": ["coldStorage"]
+      },
+      "then": {
+        "properties": {
+          "s3": {
+            "properties": {
+              "bucket": { "minLength": 1 }
+            },
+            "required": ["bucket"]
+          }
+        },
+        "required": ["s3"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "snapshotStore": {
+            "properties": {
+              "backend": { "const": "s3" }
+            },
+            "required": ["backend"]
+          }
+        },
+        "required": ["snapshotStore"]
+      },
+      "then": {
+        "properties": {
+          "s3": {
+            "properties": {
+              "bucket": { "minLength": 1 }
+            },
+            "required": ["bucket"]
+          }
+        },
+        "required": ["s3"]
+      }
+    }
+  ],
+  "properties": {
+    "global": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Shared chart defaults used by server, gateway, and test pods.",
+      "properties": {
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Global image settings shared by components when component-level overrides are empty.",
+          "properties": {
+            "repository": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Image repository."
+            },
+            "tag": {
+              "type": "string",
+              "description": "Image tag. Empty uses Chart appVersion."
+            },
+            "pullPolicy": {
+              "type": "string",
+              "enum": ["Always", "IfNotPresent", "Never"],
+              "description": "Image pull policy."
+            }
+          },
+          "required": ["repository", "tag", "pullPolicy"]
+        },
+        "imagePullSecrets": {
+          "type": "array",
+          "description": "Image pull secret references rendered on server, gateway, and test pods.",
+          "items": { "type": "object" }
+        },
+        "clusterDomain": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$",
+          "description": "Kubernetes cluster DNS domain used for generated peer FQDNs and gateway upstreams."
+        }
+      },
+      "required": ["image", "imagePullSecrets", "clusterDomain"]
+    },
+    "nameOverride": {
+      "type": "string",
+      "maxLength": 63,
+      "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+      "description": "Override the chart name portion of generated resource names."
+    },
+    "fullnameOverride": {
+      "type": "string",
+      "maxLength": 61,
+      "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+      "description": "Override the full generated release name."
+    },
+    "serviceAccount": {
+      "type": "object",
+      "description": "ServiceAccount identity for server, gateway, and test pods.",
+      "properties": {
+        "create": {
+          "type": "boolean",
+          "description": "Create a dedicated ServiceAccount."
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 63,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+          "description": "ServiceAccount name override."
+        },
+        "annotations": {
+          "type": "object",
+          "description": "ServiceAccount annotations.",
+          "additionalProperties": { "type": "string" }
+        },
+        "automountServiceAccountToken": {
+          "type": "boolean",
+          "description": "Whether to mount Kubernetes API tokens into pods."
+        }
+      }
+    },
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Ursula server StatefulSet, Services, and runtime settings.",
+      "properties": {
+        "replicaCount": {
+          "type": "integer",
+          "enum": [1, 3, 5],
+          "description": "Fresh-cluster Ursula voter pod count. Supported values are 1, 3, and 5."
+        },
+        "podManagementPolicy": {
+          "type": "string",
+          "enum": ["OrderedReady", "Parallel"],
+          "description": "StatefulSet pod management policy."
+        },
+        "ports": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "client": { "type": "integer", "minimum": 1, "maximum": 65535 }
+          },
+          "required": ["client"]
+        },
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "annotations": { "type": "object", "additionalProperties": { "type": "string" } }
+          },
+          "required": ["enabled", "type", "port", "annotations"]
+        },
+        "headlessService": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "annotations": { "type": "object", "additionalProperties": { "type": "string" } }
+          },
+          "required": ["annotations"]
+        },
+        "podAnnotations": { "type": "object", "additionalProperties": { "type": "string" } },
+        "podLabels": { "type": "object", "additionalProperties": { "type": "string" } },
+        "rustLog": { "type": "string" },
+        "coreCount": { "type": "integer", "minimum": 1 },
+        "extraArgs": { "type": "array", "items": { "type": "string" } },
+        "extraEnv": { "type": "array", "items": { "type": "object" } },
+        "extraEnvFrom": { "type": "array", "items": { "type": "object" } },
+        "resources": { "type": "object" },
+        "podSecurityContext": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Pod-level securityContext for Ursula server pods."
+        },
+        "securityContext": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Container-level securityContext for the Ursula server container."
+        },
+        "podDisruptionBudget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "maxUnavailable": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["enabled", "maxUnavailable"]
+        },
+        "scheduling": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "nodeSelector": { "type": "object", "additionalProperties": { "type": "string" } },
+            "tolerations": { "type": "array", "items": { "type": "object" } },
+            "affinity": { "type": "object" },
+            "topologySpreadConstraints": { "type": "array", "items": { "type": "object" } }
+          },
+          "required": ["nodeSelector", "tolerations", "affinity", "topologySpreadConstraints"]
+        }
+      },
+      "required": [
+        "replicaCount",
+        "podManagementPolicy",
+        "ports",
+        "service",
+        "headlessService",
+        "podAnnotations",
+        "podLabels",
+        "rustLog",
+        "coreCount",
+        "extraArgs",
+        "extraEnv",
+        "extraEnvFrom",
+        "resources",
+        "podSecurityContext",
+        "securityContext",
+        "podDisruptionBudget",
+        "scheduling"
+      ]
+    },
+    "gateway": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Stateless Ursula gateway proxy settings.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable the gateway Deployment and Service."
+        },
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of gateway replicas."
+        },
+        "image": {
+          "type": "object",
+          "description": "Gateway image settings. Empty fields inherit the global image settings.",
+          "properties": {
+            "repository": {
+              "type": "string",
+              "description": "Gateway image repository. Empty inherits global.image.repository."
+            },
+            "tag": {
+              "type": "string",
+              "description": "Gateway image tag. Empty inherits global.image.tag or appVersion."
+            },
+            "pullPolicy": {
+              "type": "string",
+              "enum": ["", "Always", "IfNotPresent", "Never"],
+              "description": "Gateway image pull policy. Empty inherits global.image.pullPolicy."
+            }
+          }
+        },
+        "ports": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "http": { "type": "integer", "minimum": 1, "maximum": 65535 }
+          },
+          "required": ["http"]
+        },
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Gateway Service settings.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["ClusterIP", "NodePort", "LoadBalancer"],
+              "description": "Gateway Service type."
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535,
+              "description": "Gateway Service port."
+            },
+            "annotations": {
+              "type": "object",
+              "description": "Gateway Service annotations.",
+              "additionalProperties": { "type": "string" }
+            }
+          },
+          "required": ["type", "port", "annotations"]
+        },
+        "ingress": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Optional Ingress resource for the gateway Service.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Render an Ingress resource."
+            },
+            "className": {
+              "type": "string",
+              "description": "Optional IngressClass name."
+            },
+            "annotations": {
+              "type": "object",
+              "description": "Ingress annotations.",
+              "additionalProperties": { "type": "string" }
+            },
+            "labels": {
+              "type": "object",
+              "description": "Extra labels applied only to the Ingress resource.",
+              "additionalProperties": { "type": "string" }
+            },
+            "hosts": {
+              "type": "array",
+              "description": "Ingress rule hosts. Required when gateway.ingress.enabled=true.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "host": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Fully-qualified host name."
+                  },
+                  "paths": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "HTTP paths routed to the Service.",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "path": {
+                          "type": "string",
+                          "minLength": 1,
+                          "pattern": "^/",
+                          "description": "URL path beginning with /."
+                        },
+                        "pathType": {
+                          "type": "string",
+                          "enum": ["Prefix", "Exact", "ImplementationSpecific"],
+                          "description": "Kubernetes Ingress path type."
+                        }
+                      },
+                      "required": ["path", "pathType"]
+                    }
+                  }
+                },
+                "required": ["host", "paths"]
+              }
+            },
+            "tls": {
+              "type": "array",
+              "description": "TLS entries rendered into spec.tls.",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "secretName": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Existing Kubernetes TLS Secret name."
+                  },
+                  "hosts": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "Hosts covered by the TLS Secret.",
+                    "items": { "type": "string", "minLength": 1 }
+                  }
+                },
+                "required": ["secretName", "hosts"]
+              }
+            }
+          },
+          "required": ["enabled", "className", "annotations", "labels", "hosts", "tls"]
+        },
+        "upstreams": {
+          "type": "array",
+          "description": "Manual upstream URLs. When empty, upstreams are auto-generated from Ursula headless Service pod DNS.",
+          "items": { "type": "string" }
+        },
+        "podAnnotations": {
+          "type": "object",
+          "description": "Extra annotations applied to gateway pods.",
+          "additionalProperties": { "type": "string" }
+        },
+        "podLabels": {
+          "type": "object",
+          "description": "Extra labels applied to gateway pods.",
+          "additionalProperties": { "type": "string" }
+        },
+        "rustLog": {
+          "type": "string",
+          "description": "Rust tracing filter passed through RUST_LOG."
+        },
+        "connectTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "TCP connect timeout per upstream attempt in seconds."
+        },
+        "responseHeaderTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Timeout for upstream response headers in seconds."
+        },
+        "maxRequestBodyBytes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum request body bytes buffered for leader-redirect replay."
+        },
+        "gracefulShutdownTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum graceful shutdown drain time after SIGTERM, in seconds."
+        },
+        "extraArgs": {
+          "type": "array",
+          "description": "Extra CLI args appended after generated gateway args.",
+          "items": { "type": "string" }
+        },
+        "extraEnv": {
+          "type": "array",
+          "description": "Extra environment variables for the gateway.",
+          "items": { "type": "object" }
+        },
+        "extraEnvFrom": {
+          "type": "array",
+          "description": "Extra envFrom blocks for the gateway.",
+          "items": { "type": "object" }
+        },
+        "resources": {
+          "type": "object",
+          "description": "Container resource requests and limits for the gateway."
+        },
+        "podSecurityContext": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Pod-level securityContext for gateway pods."
+        },
+        "securityContext": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Container-level securityContext for the gateway."
+        },
+        "probes": {
+          "type": "object",
+          "description": "Kubernetes probe settings for the gateway.",
+          "properties": {
+            "startup": {
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "description": "Enable startupProbe for the gateway."
+                },
+                "failureThreshold": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Startup probe failure threshold."
+                },
+                "periodSeconds": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Startup probe period."
+                }
+              }
+            },
+            "readiness": {
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "description": "Enable readinessProbe for the gateway."
+                },
+                "periodSeconds": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Readiness probe period."
+                },
+                "timeoutSeconds": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Readiness probe timeout."
+                }
+              }
+            },
+            "liveness": {
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "description": "Enable livenessProbe for the gateway."
+                },
+                "periodSeconds": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Liveness probe period."
+                },
+                "timeoutSeconds": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "description": "Liveness probe timeout."
+                }
+              }
+            }
+          }
+        },
+        "podDisruptionBudget": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "PodDisruptionBudget settings for the gateway.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable PDB for the gateway."
+            },
+            "maxUnavailable": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Maximum voluntary disruptions for gateway replicas."
+            }
+          },
+          "required": ["enabled", "maxUnavailable"]
+        },
+        "autoscaling": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "HorizontalPodAutoscaler settings for the gateway.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Enable HPA for the gateway."
+            },
+            "minReplicas": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Minimum number of gateway replicas."
+            },
+            "maxReplicas": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum number of gateway replicas."
+            },
+            "targetCPUUtilizationPercentage": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "maximum": 100,
+              "description": "Target CPU utilization percentage for HPA."
+            },
+            "targetMemoryUtilizationPercentage": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "maximum": 100,
+              "description": "Target memory utilization percentage for HPA."
+            },
+            "behavior": {
+              "type": "object",
+              "description": "HPA scaling behavior."
+            }
+          }
+        },
+        "scheduling": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "nodeSelector": { "type": "object", "additionalProperties": { "type": "string" } },
+            "tolerations": { "type": "array", "items": { "type": "object" } },
+            "affinity": { "type": "object" },
+            "topologySpreadConstraints": { "type": "array", "items": { "type": "object" } }
+          },
+          "required": ["nodeSelector", "tolerations", "affinity", "topologySpreadConstraints"]
+        },
+        "initContainers": {
+          "type": "array",
+          "description": "Init containers to run before the gateway container.",
+          "items": { "type": "object" }
+        }
+      },
+      "required": [
+        "enabled",
+        "replicaCount",
+        "image",
+        "ports",
+        "service",
+        "ingress",
+        "upstreams",
+        "podAnnotations",
+        "podLabels",
+        "rustLog",
+        "connectTimeoutSeconds",
+        "responseHeaderTimeoutSeconds",
+        "maxRequestBodyBytes",
+        "gracefulShutdownTimeoutSeconds",
+        "extraArgs",
+        "extraEnv",
+        "extraEnvFrom",
+        "resources",
+        "podSecurityContext",
+        "securityContext",
+        "probes",
+        "podDisruptionBudget",
+        "autoscaling",
+        "scheduling",
+        "initContainers"
+      ]
+    },
+    "raft": {
+      "type": "object",
+      "description": "Static Raft cluster settings.",
+      "properties": {
+        "groupCount": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of Raft groups."
+        },
+        "initMembershipPerGroup": {
+          "type": "boolean",
+          "description": "One-time fresh-cluster membership bootstrap flag."
+        },
+        "storageMode": {
+          "type": "string",
+          "enum": ["logDir", "memory"],
+          "description": "Raft storage mode."
+        },
+        "logDir": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Raft log directory for logDir mode."
+        },
+        "maxUncommittedBytesPerGroup": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Optional raft uncommitted byte cap per group."
+        }
+      }
+    },
+    "persistence": {
+      "type": "object",
+      "description": "Per-pod PVC settings for durable Raft logs.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable PVCs."
+        },
+        "storageClassName": {
+          "type": "string",
+          "description": "StorageClass name. Empty uses default."
+        },
+        "accessModes": {
+          "type": "array",
+          "minItems": 1,
+          "description": "PVC access modes.",
+          "items": { "type": "string" }
+        },
+        "size": {
+          "type": "string",
+          "minLength": 1,
+          "description": "PVC size."
+        },
+        "annotations": {
+          "type": "object",
+          "description": "PVC annotations.",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "s3": {
+      "type": "object",
+      "description": "Shared S3-compatible object storage settings.",
+      "properties": {
+        "bucket": {
+          "type": "string",
+          "description": "Shared S3 bucket. Required when coldStorage.enabled=true or snapshotStore.backend=s3."
+        },
+        "region": {
+          "type": "string",
+          "description": "S3 region."
+        },
+        "endpoint": {
+          "type": "string",
+          "description": "Optional S3-compatible endpoint."
+        },
+        "prefix": {
+          "type": "string",
+          "description": "Shared object prefix for Ursula objects."
+        },
+        "credentials": {
+          "type": "object",
+          "description": "Shared S3 credential settings.",
+          "properties": {
+            "accessKeyId": {
+              "type": "string",
+              "description": "Inline S3 access key."
+            },
+            "secretAccessKey": {
+              "type": "string",
+              "description": "Inline S3 secret key."
+            },
+            "sessionToken": {
+              "type": "string",
+              "description": "Optional inline S3 session token."
+            },
+            "existingSecret": {
+              "type": "string",
+              "description": "Existing Secret containing credentials. When set, inline credentials are not allowed."
+            }
+          }
+        }
+      }
+    },
+    "coldStorage": {
+      "type": "object",
+      "description": "Shared cold storage settings.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable cold storage runtime env vars."
+        },
+        "backend": {
+          "type": "string",
+          "enum": ["s3"],
+          "description": "Cold backend."
+        },
+        "prefix": {
+          "type": "string",
+          "description": "Cold object prefix below s3.prefix."
+        },
+        "flush": {
+          "type": "object",
+          "description": "Background cold flush settings.",
+          "properties": {
+            "intervalMs": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Background cold flush interval in milliseconds."
+            },
+            "minHotBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Skip flush below this hot byte threshold per group."
+            },
+            "maxBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum bytes flushed per group per tick."
+            },
+            "maxConcurrency": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Maximum concurrent cold writes."
+            },
+            "maxHotBytesPerGroup": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Backpressure ceiling for hot bytes per group."
+            }
+          }
+        }
+      }
+    },
+    "snapshotStore": {
+      "type": "object",
+      "description": "OpenRaft snapshot store settings.",
+      "properties": {
+        "backend": {
+          "type": "string",
+          "enum": ["inline", "s3"],
+          "description": "Snapshot backend."
+        },
+        "prefix": {
+          "type": "string",
+          "description": "Snapshot object prefix below s3.prefix."
+        }
+      }
+    },
+    "tests": {
+      "type": "object",
+      "description": "Helm test settings.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Render Helm test Pod."
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Timeout for ursulactl wait-ready."
+        },
+        "image": {
+          "type": "object",
+          "description": "Optional test image override.",
+          "properties": {
+            "repository": {
+              "type": "string",
+              "description": "Optional test image repository."
+            },
+            "tag": {
+              "type": "string",
+              "description": "Optional test image tag."
+            },
+            "pullPolicy": {
+              "type": "string",
+              "enum": ["", "Always", "IfNotPresent", "Never"],
+              "description": "Optional test image pull policy."
+            }
+          }
+        }
+      }
+    }
+  },
+  "required": [
+    "global",
+    "nameOverride",
+    "fullnameOverride",
+    "serviceAccount",
+    "server",
+    "gateway",
+    "raft",
+    "persistence",
+    "s3",
+    "coldStorage",
+    "snapshotStore",
+    "tests"
+  ]
+}

@@ -1,0 +1,76 @@
+{{- include "ursula.validateEntrypointConfig" . -}}
+{{- $fullname := include "ursula.fullname" . -}}
+{{- $headless := include "ursula.headlessServiceName" . -}}
+{{- $namespace := .Release.Namespace -}}
+{{- $clusterDomain := .Values.global.clusterDomain | toString -}}
+{{- $clientPort := .Values.server.ports.client | int -}}
+{{- $replicaCount := .Values.server.replicaCount | int -}}
+{{- $peers := list -}}
+{{- $nodes := list -}}
+{{- range $i := until $replicaCount -}}
+{{- $podName := printf "%s-%d" $fullname $i -}}
+{{- $host := printf "%s.%s.%s.svc.%s" $podName $headless $namespace $clusterDomain -}}
+{{- $clientUrl := printf "http://%s:%d" $host $clientPort -}}
+{{- $nodeId := add1 $i -}}
+{{- $peers = append $peers (dict "node_id" $nodeId "url" $clientUrl) -}}
+{{- $nodes = append $nodes (dict "id" $nodeId "http_url" $clientUrl "host" $host "name" $podName) -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ursula.fullname" . }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+data:
+  ursula-entrypoint.sh: |
+    #!/bin/sh
+    set -eu
+
+    replica_count={{ $replicaCount }}
+
+    hostname="${HOSTNAME:-$(hostname)}"
+    ordinal="${hostname##*-}"
+    case "${ordinal}" in
+      ''|*[!0-9]*)
+        echo "cannot derive StatefulSet ordinal from HOSTNAME=${hostname}" >&2
+        exit 1
+        ;;
+    esac
+
+    node_id=$((ordinal + 1))
+    if [ "${node_id}" -gt "${replica_count}" ]; then
+      echo "derived node_id=${node_id} exceeds replica_count=${replica_count}" >&2
+      exit 1
+    fi
+
+    config_dir="/etc/ursula/generated"
+    config_path="${config_dir}/cluster.json"
+    mkdir -p "${config_dir}"
+
+    cat > "${config_path}" <<EOF
+    {
+      "node_id": ${node_id},
+      "init_membership_per_group": {{ .Values.raft.initMembershipPerGroup }},
+      "peers": {{ $peers | toJson }}
+    }
+    EOF
+
+{{- if .Values.raft.storageMode | eq "memory" }}
+    exec /usr/local/bin/ursula \
+      --listen {{ printf "0.0.0.0:%d" $clientPort | quote }} \
+      --core-count {{ .Values.server.coreCount | quote }} \
+      --raft-group-count {{ .Values.raft.groupCount | quote }} \
+      --raft-memory \
+      --raft-cluster-config "${config_path}" \
+      "$@"
+{{- else }}
+    exec /usr/local/bin/ursula \
+      --listen {{ printf "0.0.0.0:%d" $clientPort | quote }} \
+      --core-count {{ .Values.server.coreCount | quote }} \
+      --raft-group-count {{ .Values.raft.groupCount | quote }} \
+      --raft-log-dir {{ .Values.raft.logDir | quote }} \
+      --raft-cluster-config "${config_path}" \
+      "$@"
+{{- end }}
+  cluster-manifest.json: |
+{{ dict "nodes" $nodes | toPrettyJson | indent 4 }}

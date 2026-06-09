@@ -1,0 +1,12 @@
+apiVersion: v2
+name: ursula
+description: Ursula durable-stream server for static-membership Raft clusters
+type: application
+version: 0.1.0
+appVersion: "0.1.3"
+kubeVersion: ">=1.24.0-0"
+home: https://ursula.tonbo.io
+sources:
+  - https://github.com/tonbo-io/ursula
+maintainers:
+  - name: The Ursula contributors

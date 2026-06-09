@@ -1,0 +1,19 @@
+{{- $replicas := int .Values.server.replicaCount -}}
+{{- $maxUnavailable := int .Values.server.podDisruptionBudget.maxUnavailable -}}
+{{- $maxSafeUnavailable := sub (div (add $replicas 1) 2) 1 -}}
+{{- if and .Values.server.podDisruptionBudget.enabled (gt $replicas 1) -}}
+{{- if gt $maxUnavailable $maxSafeUnavailable -}}
+{{- fail (printf "server.podDisruptionBudget.maxUnavailable=%d is unsafe for server.replicaCount=%d; must be <= %d to preserve Raft quorum" $maxUnavailable $replicas $maxSafeUnavailable) -}}
+{{- end -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "ursula.fullname" . }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ $maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "ursula.selectorLabels" . | nindent 6 }}
+{{- end }}
