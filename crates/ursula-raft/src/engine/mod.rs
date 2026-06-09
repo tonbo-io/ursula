@@ -9,6 +9,7 @@ use std::time::Duration;
 pub use factory::ColdRaftGroupEngineFactory;
 pub use factory::DurableRaftGroupEngineFactory;
 pub use factory::DurableRaftLogStoreFactory;
+pub use factory::RaftEngineConfig;
 pub use factory::RaftGroupEngineFactory;
 pub use factory::RegisteredRaftGroupEngineFactory;
 pub use factory::StaticGrpcRaftGroupEngineFactory;

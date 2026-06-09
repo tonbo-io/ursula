@@ -623,9 +623,13 @@
           "minimum": 1,
           "description": "Number of Raft groups."
         },
-        "initMembershipPerGroup": {
+        "initMembership": {
           "type": "boolean",
           "description": "One-time fresh-cluster membership bootstrap flag."
+        },
+        "initMembershipPerGroup": {
+          "type": "boolean",
+          "description": "One-time fresh-cluster per-group membership bootstrap flag."
         },
         "storageMode": {
           "type": "string",

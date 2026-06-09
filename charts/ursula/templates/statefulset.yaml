@@ -78,47 +78,6 @@ spec:
           env:
             - name: RUST_LOG
               value: {{ .Values.server.rustLog | quote }}
-            {{- if .Values.raft.maxUncommittedBytesPerGroup }}
-            - name: URSULA_RAFT_MAX_UNCOMMITTED_BYTES_PER_GROUP
-              value: {{ .Values.raft.maxUncommittedBytesPerGroup | int64 | quote }}
-            {{- end }}
-            {{- if .Values.coldStorage.enabled }}
-            - name: URSULA_COLD_BACKEND
-              value: {{ .Values.coldStorage.backend | quote }}
-            {{- if $coldRoot }}
-            - name: URSULA_COLD_ROOT
-              value: {{ $coldRoot | quote }}
-            {{- end }}
-            - name: URSULA_COLD_S3_BUCKET
-              value: {{ $s3Bucket | quote }}
-            {{- if $s3Region }}
-            - name: URSULA_COLD_S3_REGION
-              value: {{ $s3Region | quote }}
-            {{- end }}
-            {{- if $s3Endpoint }}
-            - name: URSULA_COLD_S3_ENDPOINT
-              value: {{ $s3Endpoint | quote }}
-            {{- end }}
-            {{- if $renderColdFlushIntervalMs }}
-            - name: URSULA_COLD_FLUSH_INTERVAL_MS
-              value: {{ $coldFlushIntervalMs | quote }}
-            {{- end }}
-            {{- if $renderColdFlushMinHotBytes }}
-            - name: URSULA_COLD_FLUSH_MIN_HOT_BYTES
-              value: {{ $coldFlushMinHotBytes | quote }}
-            {{- end }}
-            {{- if $renderColdFlushMaxBytes }}
-            - name: URSULA_COLD_FLUSH_MAX_BYTES
-              value: {{ $coldFlushMaxBytes | quote }}
-            {{- end }}
-            {{- if $renderColdFlushMaxConcurrency }}
-            - name: URSULA_COLD_FLUSH_MAX_CONCURRENCY
-              value: {{ $coldFlushMaxConcurrency | quote }}
-            {{- end }}
-            {{- if $renderColdMaxHotBytesPerGroup }}
-            - name: URSULA_COLD_MAX_HOT_BYTES_PER_GROUP
-              value: {{ $coldMaxHotBytesPerGroup | quote }}
-            {{- end }}
             {{- if $hasS3Credentials }}
             - name: URSULA_COLD_S3_ACCESS_KEY_ID
               valueFrom:
@@ -137,47 +96,7 @@ spec:
                   key: "sessionToken"
                   optional: true
             {{- end }}
-            {{- end }}
-            {{- if .Values.snapshotStore.backend | eq "s3" }}
-            - name: URSULA_SNAPSHOT_BACKEND
-              value: {{ .Values.snapshotStore.backend | quote }}
-            - name: URSULA_SNAPSHOT_S3_BUCKET
-              value: {{ $s3Bucket | quote }}
-            {{- if $s3Region }}
-            - name: URSULA_SNAPSHOT_S3_REGION
-              value: {{ $s3Region | quote }}
-            {{- end }}
-            {{- if $snapshotRoot }}
-            - name: URSULA_SNAPSHOT_S3_ROOT
-              value: {{ $snapshotRoot | quote }}
-            {{- end }}
-            {{- if $snapshotPrefix }}
-            - name: URSULA_SNAPSHOT_S3_PREFIX
-              value: {{ $snapshotPrefix | quote }}
-            {{- end }}
-            {{- if $s3Endpoint }}
-            - name: URSULA_SNAPSHOT_S3_ENDPOINT
-              value: {{ $s3Endpoint | quote }}
-            {{- end }}
-            {{- if $hasS3Credentials }}
-            - name: URSULA_SNAPSHOT_S3_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $s3CredentialSecret | quote }}
-                  key: "accessKeyId"
-            - name: URSULA_SNAPSHOT_S3_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $s3CredentialSecret | quote }}
-                  key: "secretAccessKey"
-            - name: URSULA_SNAPSHOT_S3_SESSION_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ $s3CredentialSecret | quote }}
-                  key: "sessionToken"
-                  optional: true
-            {{- end }}
-            {{- end }}
+
             {{- with .Values.server.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

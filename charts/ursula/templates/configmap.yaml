@@ -15,6 +15,18 @@
 {{- $peers = append $peers (dict "node_id" $nodeId "url" $clientUrl) -}}
 {{- $nodes = append $nodes (dict "id" $nodeId "http_url" $clientUrl "host" $host "name" $podName) -}}
 {{- end -}}
+{{- $s3Bucket := .Values.s3.bucket | toString -}}
+{{- $s3Region := .Values.s3.region | toString -}}
+{{- $s3Endpoint := .Values.s3.endpoint | toString -}}
+{{- $s3Prefix := .Values.s3.prefix | toString -}}
+{{- $coldRoot := include "ursula.joinPath" (list $s3Prefix .Values.coldStorage.prefix) -}}
+{{- $snapshotPrefix := .Values.snapshotStore.prefix | toString | trimAll "/" -}}
+{{- $hasS3Credentials := include "ursula.hasS3Credentials" . -}}
+{{- $coldFlushIntervalMs := .Values.coldStorage.flush.intervalMs | int64 -}}
+{{- $coldFlushMinHotBytes := .Values.coldStorage.flush.minHotBytes | int64 -}}
+{{- $coldFlushMaxBytes := .Values.coldStorage.flush.maxBytes | int64 -}}
+{{- $coldFlushMaxConcurrency := .Values.coldStorage.flush.maxConcurrency | int64 -}}
+{{- $coldMaxHotBytesPerGroup := .Values.coldStorage.flush.maxHotBytesPerGroup | int64 -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -44,33 +56,91 @@ data:
     fi
 
     config_dir="/etc/ursula/generated"
-    config_path="${config_dir}/cluster.json"
+    config_path="${config_dir}/ursula.toml"
     mkdir -p "${config_dir}"
 
-    cat > "${config_path}" <<EOF
-    {
-      "node_id": ${node_id},
-      "init_membership_per_group": {{ .Values.raft.initMembershipPerGroup }},
-      "peers": {{ $peers | toJson }}
+    # Restrict generated config permissions: it may contain S3 credentials.
+    old_umask=$(umask)
+    umask 077
+
+    toml_string() {
+      printf '%s' "$1" | tr -d '\n\r' | sed 's/\\/\\\\/g; s/"/\\"/g'
     }
+
+    cat > "${config_path}" <<EOF
+    [server]
+    listen = "0.0.0.0:{{ $clientPort }}"
+
+    [runtime]
+    core_count = {{ .Values.server.coreCount }}
+
+    [raft]
+    group_count = {{ .Values.raft.groupCount }}
+    init_membership = {{ .Values.raft.initMembership }}
+    init_membership_per_group = {{ .Values.raft.initMembershipPerGroup }}
+{{- range $peers }}
+    [[raft.peers]]
+    node_id = {{ .node_id }}
+    url = {{ .url | quote }}
+{{- end }}
+
+    [raft.wal]
+{{- if .Values.raft.storageMode | eq "memory" }}
+    backend = "memory"
+{{- else }}
+    backend = "disk"
+    path = {{ .Values.raft.logDir | quote }}
+{{- end }}
+
+    [storage.cold]
+{{- if .Values.coldStorage.enabled }}
+    backend = {{ .Values.coldStorage.backend | quote }}
+{{- if $coldRoot }}
+    root = {{ $coldRoot | quote }}
+{{- end }}
+    flush_interval = "{{ $coldFlushIntervalMs }}ms"
+    flush_size = "{{ $coldFlushMaxBytes }}"
+    flush_min_hot_size = "{{ $coldFlushMinHotBytes }}"
+    flush_max_size = "{{ $coldFlushMaxBytes }}"
+    flush_max_concurrency = {{ $coldFlushMaxConcurrency }}
+    max_hot_size_per_group = "{{ $coldMaxHotBytesPerGroup }}"
+{{- else }}
+    backend = "none"
+{{- end }}
+{{- if or .Values.coldStorage.enabled (eq .Values.snapshotStore.backend "s3") }}
+
+    [storage.cold.s3]
+    bucket = {{ $s3Bucket | quote }}
+{{- if $s3Region }}
+    region = {{ $s3Region | quote }}
+{{- end }}
+{{- if $s3Endpoint }}
+    endpoint = {{ $s3Endpoint | quote }}
+{{- end }}
+{{- if $hasS3Credentials }}
+    access_key_id = "$(toml_string "${URSULA_COLD_S3_ACCESS_KEY_ID:-}")"
+    secret_access_key = "$(toml_string "${URSULA_COLD_S3_SECRET_ACCESS_KEY:-}")"
+    session_token = "$(toml_string "${URSULA_COLD_S3_SESSION_TOKEN:-}")"
+{{- end }}
+{{- end }}
+
+    [storage.snapshot]
+{{- if .Values.snapshotStore.backend | eq "s3" }}
+    backend = "s3"
+    s3_prefix = {{ .Values.snapshotStore.prefix | quote }}
+{{- else }}
+    backend = "inline"
+{{- end }}
+{{- if .Values.raft.maxUncommittedBytesPerGroup }}
+
+    [raft]
+    max_uncommitted_size_per_group = "{{ .Values.raft.maxUncommittedBytesPerGroup }}"
+{{- end }}
     EOF
 
-{{- if .Values.raft.storageMode | eq "memory" }}
-    exec /usr/local/bin/ursula \
-      --listen {{ printf "0.0.0.0:%d" $clientPort | quote }} \
-      --core-count {{ .Values.server.coreCount | quote }} \
-      --raft-group-count {{ .Values.raft.groupCount | quote }} \
-      --raft-memory \
-      --raft-cluster-config "${config_path}" \
-      "$@"
-{{- else }}
-    exec /usr/local/bin/ursula \
-      --listen {{ printf "0.0.0.0:%d" $clientPort | quote }} \
-      --core-count {{ .Values.server.coreCount | quote }} \
-      --raft-group-count {{ .Values.raft.groupCount | quote }} \
-      --raft-log-dir {{ .Values.raft.logDir | quote }} \
-      --raft-cluster-config "${config_path}" \
-      "$@"
-{{- end }}
+    chmod 600 "${config_path}"
+    umask "${old_umask}"
+
+    exec /usr/local/bin/ursula --config "${config_path}" --node-id "${node_id}" "$@"
   cluster-manifest.json: |
 {{ dict "nodes" $nodes | toPrettyJson | indent 4 }}

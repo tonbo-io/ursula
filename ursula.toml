@@ -1,0 +1,283 @@
+# Ursula server configuration file
+#
+# This is the primary configuration format for Ursula.  Every setting that
+# used to be controlled by environment variables or CLI flags now lives here.
+#
+# Quick start:
+#   cargo run --bin ursula -- --config ./ursula.toml
+#
+# The binary also searches for a default config in the following order:
+#   ./ursula.toml  →  ./ursula.json  →  ./ursula.yaml  →  /etc/ursula/ursula.toml  →  …
+#
+# Config loading order (later wins):
+#   1. Built-in defaults
+#   2. Preset (--preset tiny|small|standard|large)
+#   3. This config file
+#   4. CLI overrides (--node-id)
+#
+# ------------------------------------------------------------------------------
+# [server]  — HTTP server binding and admission controls
+# ------------------------------------------------------------------------------
+[server]
+# Public HTTP client API bind address.  Client-plane routes (append, read,
+# admin) are served here.
+listen = "127.0.0.1:4437"
+
+# Optional separate bind for the cluster / Raft gRPC plane.  When set,
+# client traffic and inter-node Raft traffic are isolated on two sockets.
+# cluster_listen = "10.0.0.1:4438"
+
+# Process-wide cap on accepted write body bytes held by the HTTP layer.
+# A request must reserve its body bytes before axum drains the body into
+# Bytes, and the reservation lives until the response is produced.  This
+# turns memory pressure into backpressure at the HTTP edge.
+# Use a human-readable size: "64MiB", "1GiB", etc.  Omit to disable the limit.
+# http_inflight_body_size = "256MiB"   # default: 256 MiB
+
+# ------------------------------------------------------------------------------
+# [runtime]  — Per-core runtime sizing and admission controls
+# ------------------------------------------------------------------------------
+[runtime]
+# Number of CPU cores / tokio worker threads to use.  Each core owns a
+# deterministic subset of Raft groups (sharding by hash).
+# Defaults to the machine's available parallelism when omitted.
+core_count = 4
+
+# Soft RSS cap.  When the process RSS exceeds this value, new writes are
+# rejected with HTTP 503.  Omit to disable the monitor.
+# node_memory_abort_cap_size = "8GiB"
+
+# Minimum payload size that triggers external cold-store staging instead
+# of inline hot-ring storage.  Payloads below this size are kept in memory.
+# Omit to use the default (1 MiB).
+# external_payload_min_size = "1MiB"
+
+# Max live-read waiters per core.  When the limit is reached, new live
+# read requests are rejected with HTTP 503.  Omit to disable the limit.
+# live_read_max_waiters_per_core = 65536
+
+# ------------------------------------------------------------------------------
+# [raft]  — Raft consensus and static-cluster networking
+# ------------------------------------------------------------------------------
+[raft]
+# Unique node ID within the static gRPC Raft cluster.  Must be present in
+# raft.peers and must be non-zero.  Can also be supplied via --node-id CLI.
+node_id = 1
+
+# Number of Raft groups (shards).  Each stream hashes to exactly one group.
+# More groups = finer-grained parallelism but slightly more memory overhead.
+group_count = 16
+
+# Per-group cap on raft-submitted-but-not-yet-applied payload bytes.
+# Catches raft replication lag before in-memory queues grow unbounded.
+# Use a human-readable size.  Omit to disable the admission.
+# max_uncommitted_size_per_group = "64MiB"
+
+# Bootstrap the initial Raft membership once on startup.  Only needed for
+# the very first cluster formation; set to false after the first run.
+init_membership = false
+
+# Bootstrap per-group Raft membership on startup.  When true, each group
+# initializes its own membership independently (useful for heterogeneous
+# clusters where different groups have different voter sets).
+init_membership_per_group = false
+
+# How long a restarting node waits to observe an already-established leader
+# before deciding the group is truly new and bootstrapping it.  Must exceed
+# the election window.
+# rejoin_probe = "6s"
+
+# Timeout for probing static peers during bootstrap before logging a warning.
+# Continues retrying indefinitely.
+# bootstrap_peer_probe = "60s"
+
+# Interval between static-peer reachability probes during bootstrap.
+# bootstrap_peer_probe_interval = "250ms"
+
+# gRPC connect timeout when probing static peers.
+# bootstrap_peer_connect = "500ms"
+
+# OpenRaft's install_snapshot_timeout covers the whole FullSnapshot RPC.
+# The receiver downloads and installs the referenced object before replying,
+# so this must be comfortably above the S3 per-attempt timeout plus retries.
+# install_snapshot_timeout = "120s"
+
+# Directory for memory-bootstrap marker files.  When set, each group writes
+# a marker after successful membership initialization so that restart skips
+# re-initialization.
+# memory_bootstrap_marker_dir = "/tmp/ursula-raft-memory-bootstrap"
+
+# Consecutive gRPC RPC failures before forcing a transport reconnect.
+# grpc_reconnect_after_failures = 8
+
+# Max concurrent snapshot installs across all groups on this node.
+# snapshot_install_max_concurrency = 1
+
+# ------------------------------------------------------------------------------
+# [raft.wal]  — Raft write-ahead log persistence
+# ------------------------------------------------------------------------------
+[raft.wal]
+# WAL persistence backend: "memory" | "disk"
+#   memory  — volatile in-memory log (fastest, data lost on restart)
+#   disk    — durable on-disk log files (requires `path`)
+backend = "memory"
+
+# Directory for on-disk WAL files.  Required when backend is "disk".
+# Ursula appends a "raft-log" subdirectory automatically.
+# path = "/data/ursula"
+
+# ------------------------------------------------------------------------------
+# [raft.peers]  — Static gRPC Raft peers (repeatable table)
+# ------------------------------------------------------------------------------
+# Uncomment and repeat for every node in the cluster.
+# [[raft.peers]]
+# node_id = 1
+# url = "http://10.0.0.1:4437"
+# [[raft.peers]]
+# node_id = 2
+# url = "http://10.0.0.2:4437"
+# [[raft.peers]]
+# node_id = 3
+# url = "http://10.0.0.3:4437"
+
+# ------------------------------------------------------------------------------
+# [raft.groups]  — Per-group voter assignments (repeatable table, optional)
+# ------------------------------------------------------------------------------
+# When omitted, every Raft group uses all peers as voters (homogeneous
+# cluster).  When supplied, every group in 0..group_count must have an
+# entry and each entry's voters must be a non-empty subset of peers.
+#
+# [[raft.groups]]
+# raft_group_id = 0
+# voters = [1, 2, 3]
+# [[raft.groups]]
+# raft_group_id = 1
+# voters = [2, 3, 4]
+
+# ------------------------------------------------------------------------------
+# [storage.cold]  — Cold-tier (object store) flush, GC, and cache
+# ------------------------------------------------------------------------------
+[storage.cold]
+# Cold-storage backend: "none" | "memory" | "s3"
+#   none    — cold tier disabled (all data stays in memory)
+#   memory  — in-memory object store (testing / development)
+#   s3      — S3-compatible object store (requires [storage.cold.s3])
+backend = "none"
+
+# Root prefix for cold-storage objects (e.g. S3 prefix or local dir).
+# root = "ursula-cold"
+
+# Interval between periodic cold-flush passes.
+# flush_interval = "1s"
+
+# Target number of hot bytes to flush per group per pass.
+# flush_size = "8MiB"
+
+# Minimum hot bytes a group must have before it is eligible for flush.
+# Falls back to flush_size when unset.
+# flush_min_hot_size = "8MiB"
+
+# Upper bound on bytes flushed per group per pass.
+# Falls back to flush_size when unset.
+# flush_max_size = "8MiB"
+
+# Max groups flushed concurrently.
+# flush_max_concurrency = 4
+
+# Per-group hot-size cap.  When a group's hot bytes exceed this, new writes
+# are rejected with HTTP 503.  Omit to disable the admission.
+# max_hot_size_per_group = "64MiB"
+
+# Interval between periodic cold-gc passes.
+# gc_interval = "5s"
+
+# Max GC entries to process per group per pass.
+# gc_max_entries = 256
+
+# ------------------------------------------------------------------------------
+# [storage.cold.cache]  — Optional cold-read cache
+# ------------------------------------------------------------------------------
+# When cold backend is not "none" and this section is omitted, a default
+# cache is still enabled automatically.  Uncomment to customize.
+# [storage.cold.cache]
+# max_size = "256MiB"
+# block_size = "1MiB"
+# readahead_blocks = 4
+
+# ------------------------------------------------------------------------------
+# [storage.cold.s3]  — S3 connection and credentials
+# ------------------------------------------------------------------------------
+# Required when storage.cold.backend = "s3".
+# [storage.cold.s3]
+# bucket = "my-ursula-bucket"
+# region = "us-east-1"
+# endpoint = "http://localhost:9000"   # for MinIO, etc.
+# access_key_id = "AKIA..."
+# secret_access_key = "..."
+# session_token = "..."                # optional
+# timeout = "10s"
+# max_retries = 3
+# probe_timeout = "2s"
+# unhealthy_ticks = 1
+# heal_ticks = 2
+
+# ------------------------------------------------------------------------------
+# [storage.snapshot]  — Raft snapshot store
+# ------------------------------------------------------------------------------
+[storage.snapshot]
+# Snapshot store backend: "inline" | "local" | "s3"
+#   inline  — snapshot metadata kept in memory (default, no external store)
+#   local   — snapshots written to local filesystem (requires local_root)
+#   s3      — snapshots written to S3 (shares [storage.cold.s3] credentials)
+backend = "inline"
+
+# Interval between manual snapshot drives.  When an external store is
+# configured (local or s3) and this is omitted, it defaults to 60s so
+# snapshots are built automatically.  Set to "0s" to disable the driver.
+# drive_interval = "60s"
+
+# Max concurrent group cold-flushes during a snapshot drive pass.
+# drive_flush_concurrency = 4
+
+# Root directory for local snapshot store.  Required when backend = "local".
+# local_root = "/data/ursula/snapshots"
+
+# S3 object key prefix for snapshot blobs.  Only used when backend = "s3".
+# s3_prefix = "snapshots"
+
+# ------------------------------------------------------------------------------
+# [governance]  — Background governance task tuning (optional)
+# ------------------------------------------------------------------------------
+# All sub-sections are optional; sensible defaults apply when omitted.
+
+# [governance.leadership_balance]
+# interval      = "5s"      # balancer tick interval
+# max_per_tick  = 4         # max leader handoffs per tick
+# peer_timeout  = "500ms"   # peer shed-query timeout
+
+# [governance.cluster_probe]
+# interval        = "500ms"  # probe tick interval
+# probe_size      = "64KiB"  # probe payload size
+# timeout         = "200ms"  # per-probe timeout
+# unhealthy_ticks = 2        # failed ticks before marking unhealthy
+# heal_ticks      = 6        # healthy ticks before clearing unhealthy
+
+# [governance.commit_stall]
+# interval   = "1s"  # watchdog tick interval
+# threshold  = "3s"  # stall duration before leader transfer
+
+# [governance.cold_health]
+# interval             = "1s"      # health-gate tick interval
+# unhealthy_ticks      = 3         # ticks before shedding leadership
+# heal_ticks           = 6         # ticks before re-allowing leadership
+# hot_size_high        = "64MiB"   # per-group hot bytes high watermark (default: 7 MiB)
+# hot_size_low         = "32MiB"   # per-group hot bytes low watermark (default: 4 MiB)
+# errors_per_tick_high = 1         # error threshold per tick
+
+# ------------------------------------------------------------------------------
+# [observability]  — Telemetry and debugging
+# ------------------------------------------------------------------------------
+[observability]
+# Enable tokio-console integration (requires building with tokio_unstable).
+# Can also be enabled by setting URSULA_TOKIO_CONSOLE=1.
+tokio_console = false

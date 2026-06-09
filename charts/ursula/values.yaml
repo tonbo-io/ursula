@@ -98,6 +98,8 @@ raft:
   # Number of Raft groups. Defaults to a lighter quickstart than production docs.
   groupCount: 64
   # Fresh-cluster bootstrap flag. Set to false after the first successful ready.
+  initMembership: false
+  # Fresh-cluster per-group bootstrap flag. Set to false after the first successful ready.
   initMembershipPerGroup: true
   # Storage mode: logDir for durable Raft logs, memory for ephemeral tests.
   storageMode: logDir

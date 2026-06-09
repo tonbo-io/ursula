@@ -1,6 +1,8 @@
+use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use ursula_config::ColdBackend;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdStore;
 use ursula_runtime::CreateStreamRequest;
@@ -20,9 +22,28 @@ async fn s3_cold_path_flushes_reads_and_cleans_up_object() {
         return;
     }
 
-    let cold_store = ColdStore::from_env()
-        .unwrap_or_else(|err| panic!("cold store creation failed: {err}"))
-        .unwrap_or_else(|| panic!("cold store not configured; set URSULA_COLD_BACKEND"));
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after unix epoch")
+        .as_nanos();
+    let cold_cfg = ursula_runtime::ColdConfig {
+        backend: ColdBackend::S3,
+        root: Some(format!("ursula-runtime-s3-cold-{suffix}")),
+        s3: Some(ursula_config::S3Config {
+            bucket: std::env::var("URSULA_COLD_S3_BUCKET").ok(),
+            region: std::env::var("URSULA_COLD_S3_REGION").ok(),
+            endpoint: std::env::var("URSULA_COLD_S3_ENDPOINT").ok(),
+            access_key_id: std::env::var("URSULA_COLD_S3_ACCESS_KEY_ID").ok(),
+            secret_access_key: std::env::var("URSULA_COLD_S3_SECRET_ACCESS_KEY").ok(),
+            session_token: std::env::var("URSULA_COLD_S3_SESSION_TOKEN").ok(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let cold_store = Arc::new(
+        ColdStore::try_new(&cold_cfg)
+            .unwrap_or_else(|err| panic!("cold store creation failed: {err}")),
+    );
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
         RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(8 * 1024 * 1024)),
         InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
