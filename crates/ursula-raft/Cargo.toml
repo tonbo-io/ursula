@@ -21,6 +21,7 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync
 tonic = { workspace = true, features = ["transport"] }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
+ursula-control = { workspace = true }
 ursula-runtime = { workspace = true }
 ursula-proto = { workspace = true }
 ursula-shard = { workspace = true }

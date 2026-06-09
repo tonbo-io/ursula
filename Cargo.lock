@@ -3586,6 +3586,7 @@ dependencies = [
  "tonic 0.12.3",
  "tower 0.5.3",
  "tracing",
+ "ursula-control",
  "ursula-observability",
  "ursula-raft",
  "ursula-runtime",
@@ -3609,6 +3610,14 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "ursula-observability",
+]
+
+[[package]]
+name = "ursula-control"
+version = "0.1.3"
+dependencies = [
+ "serde",
+ "ursula-shard",
 ]
 
 [[package]]
@@ -3690,6 +3699,7 @@ dependencies = [
  "tonic-build",
  "tracing",
  "tracing-opentelemetry",
+ "ursula-control",
  "ursula-proto",
  "ursula-runtime",
  "ursula-shard",

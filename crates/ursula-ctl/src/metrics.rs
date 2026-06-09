@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -7,6 +9,8 @@ use anyhow::anyhow;
 use anyhow::bail;
 use reqwest::Client;
 use serde::Deserialize;
+use serde::Serialize;
+use url::Url;
 
 use crate::provider::NodeInfo;
 
@@ -168,6 +172,372 @@ impl MetricsClient {
             ))
         }
     }
+
+    pub async fn register_node(
+        &self,
+        admin_url: &Url,
+        node_id: u64,
+        client_url: &str,
+        cluster_url: &str,
+    ) -> Result<RegisterNodeResponse> {
+        let path = register_node_path(node_id, client_url, cluster_url);
+        let url = admin_url
+            .join(&path)
+            .with_context(|| format!("compose node-register url at {admin_url}"))?;
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str::<RegisterNodeResponse>(&body)
+                .with_context(|| format!("decode node-register response: {body}"))
+        } else {
+            Err(anyhow!(
+                "node-register at {admin_url} for node {node_id} returned {status}: {body}"
+            ))
+        }
+    }
+
+    pub async fn group_placement(
+        &self,
+        admin_url: &Url,
+        raft_group_id: u64,
+    ) -> Result<GroupPlacementResponse> {
+        let path = group_placement_path(raft_group_id);
+        let url = admin_url
+            .join(&path)
+            .with_context(|| format!("compose group-placement url at {admin_url}"))?;
+        let resp = self
+            .client
+            .get(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str::<GroupPlacementResponse>(&body)
+                .with_context(|| format!("decode group-placement response: {body}"))
+        } else {
+            Err(anyhow!(
+                "group-placement at {admin_url} for group {raft_group_id} returned {status}: {body}"
+            ))
+        }
+    }
+
+    pub async fn begin_migration(
+        &self,
+        admin_url: &Url,
+        raft_group_id: u64,
+        target_voters: &BTreeSet<u64>,
+        retain_removed: bool,
+    ) -> Result<BeginMigrationResponse> {
+        let path = begin_migration_path(raft_group_id, target_voters, retain_removed);
+        let url = admin_url
+            .join(&path)
+            .with_context(|| format!("compose begin-migration url at {admin_url}"))?;
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str::<BeginMigrationResponse>(&body)
+                .with_context(|| format!("decode begin-migration response: {body}"))
+        } else {
+            Err(anyhow!(
+                "begin-migration at {admin_url} for group {raft_group_id} returned {status}: {body}"
+            ))
+        }
+    }
+
+    pub async fn commit_placement(
+        &self,
+        admin_url: &Url,
+        raft_group_id: u64,
+        voters: &BTreeSet<u64>,
+        learners: &BTreeSet<u64>,
+        draining: &BTreeSet<u64>,
+    ) -> Result<CommitPlacementResponse> {
+        let path = commit_placement_path(raft_group_id, voters, learners, draining);
+        let url = admin_url
+            .join(&path)
+            .with_context(|| format!("compose commit-placement url at {admin_url}"))?;
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str::<CommitPlacementResponse>(&body)
+                .with_context(|| format!("decode commit-placement response: {body}"))
+        } else {
+            Err(anyhow!(
+                "commit-placement at {admin_url} for group {raft_group_id} returned {status}: {body}"
+            ))
+        }
+    }
+
+    pub async fn finish_migration(
+        &self,
+        admin_url: &Url,
+        migration_id: u64,
+        success: bool,
+    ) -> Result<FinishMigrationResponse> {
+        let path = finish_migration_path(migration_id, success);
+        let url = admin_url
+            .join(&path)
+            .with_context(|| format!("compose finish-migration url at {admin_url}"))?;
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str::<FinishMigrationResponse>(&body)
+                .with_context(|| format!("decode finish-migration response: {body}"))
+        } else {
+            Err(anyhow!(
+                "finish-migration at {admin_url} for migration {migration_id} returned {status}: {body}"
+            ))
+        }
+    }
+
+    pub async fn prepare_local_engine(
+        &self,
+        admin_url: &Url,
+        raft_group_id: u64,
+    ) -> Result<PrepareLocalEngineResponse> {
+        let path = prepare_local_engine_path(raft_group_id);
+        let url = admin_url
+            .join(&path)
+            .with_context(|| format!("compose prepare-local-engine url at {admin_url}"))?;
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str::<PrepareLocalEngineResponse>(&body)
+                .with_context(|| format!("decode prepare-local-engine response: {body}"))
+        } else {
+            Err(anyhow!(
+                "prepare-local-engine at {admin_url} for group {raft_group_id} returned {status}: {body}"
+            ))
+        }
+    }
+
+    pub async fn add_learner(
+        &self,
+        leader_url: &Url,
+        raft_group_id: u64,
+        node_id: u64,
+        cluster_url: &str,
+    ) -> Result<AddLearnerResponse> {
+        let path = add_learner_path(raft_group_id, node_id, cluster_url);
+        let url = leader_url
+            .join(&path)
+            .with_context(|| format!("compose add-learner url at {leader_url}"))?;
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str::<AddLearnerResponse>(&body)
+                .with_context(|| format!("decode add-learner response: {body}"))
+        } else {
+            Err(anyhow!(
+                "add-learner at {leader_url} for group {raft_group_id} node {node_id} returned {status}: {body}"
+            ))
+        }
+    }
+
+    pub async fn change_membership(
+        &self,
+        leader_url: &Url,
+        raft_group_id: u64,
+        voters: &BTreeSet<u64>,
+    ) -> Result<ChangeMembershipResponse> {
+        let path = change_membership_path(raft_group_id, voters);
+        let url = leader_url
+            .join(&path)
+            .with_context(|| format!("compose change-membership url at {leader_url}"))?;
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            serde_json::from_str::<ChangeMembershipResponse>(&body)
+                .with_context(|| format!("decode change-membership response: {body}"))
+        } else {
+            Err(anyhow!(
+                "change-membership at {leader_url} for group {raft_group_id} returned {status}: {body}"
+            ))
+        }
+    }
+}
+
+fn register_node_path(node_id: u64, client_url: &str, cluster_url: &str) -> String {
+    format!(
+        "/__ursula/admin/nodes/{node_id}/register?client_url={client_url}&cluster_url={cluster_url}"
+    )
+}
+
+fn group_placement_path(raft_group_id: u64) -> String {
+    format!("/__ursula/admin/groups/{raft_group_id}/placement")
+}
+
+fn begin_migration_path(
+    raft_group_id: u64,
+    target_voters: &BTreeSet<u64>,
+    retain_removed: bool,
+) -> String {
+    let target_voters = target_voters
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "/__ursula/admin/groups/{raft_group_id}/migrations?target_voters={target_voters}&retain_removed={retain_removed}"
+    )
+}
+
+fn commit_placement_path(
+    raft_group_id: u64,
+    voters: &BTreeSet<u64>,
+    learners: &BTreeSet<u64>,
+    draining: &BTreeSet<u64>,
+) -> String {
+    let voters = voters
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let learners = learners
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let draining = draining
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "/__ursula/admin/groups/{raft_group_id}/placement/commit?voters={voters}&learners={learners}&draining={draining}"
+    )
+}
+
+fn finish_migration_path(migration_id: u64, success: bool) -> String {
+    format!("/__ursula/admin/migrations/{migration_id}/finish?success={success}")
+}
+
+fn prepare_local_engine_path(raft_group_id: u64) -> String {
+    format!("/__ursula/admin/groups/{raft_group_id}/local-engine")
+}
+
+fn add_learner_path(raft_group_id: u64, node_id: u64, cluster_url: &str) -> String {
+    format!("/__ursula/raft/{raft_group_id}/learners/{node_id}?addr={cluster_url}")
+}
+
+fn change_membership_path(raft_group_id: u64, voters: &BTreeSet<u64>) -> String {
+    let voters = voters
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("/__ursula/raft/{raft_group_id}/membership?voters={voters}")
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegisterNodeResponse {
+    pub node_id: u64,
+    pub registered: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GroupPlacementResponse {
+    pub raft_group_id: u64,
+    pub voters: BTreeSet<u64>,
+    pub learners: BTreeSet<u64>,
+    pub draining: BTreeSet<u64>,
+    pub epoch: u64,
+    pub nodes: BTreeMap<u64, PlacementNodeResponse>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PlacementNodeResponse {
+    pub node_id: u64,
+    pub client_url: String,
+    pub cluster_url: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BeginMigrationResponse {
+    pub raft_group_id: u64,
+    pub migration_id: u64,
+    pub started: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CommitPlacementResponse {
+    pub raft_group_id: u64,
+    pub committed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FinishMigrationResponse {
+    pub migration_id: u64,
+    pub success: bool,
+    pub finished: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrepareLocalEngineResponse {
+    pub raft_group_id: u64,
+    pub core_id: u64,
+    pub prepared: bool,
+    pub already_allowed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddLearnerResponse {
+    pub raft_group_id: u64,
+    pub node_id: u64,
+    pub log_index: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChangeMembershipResponse {
+    pub raft_group_id: u64,
+    pub voter_ids: Vec<u64>,
+    pub log_index: u64,
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -304,5 +674,79 @@ impl ClusterSnapshot {
             }
         }
         map
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_register_path_preserves_raw_urls_for_server_query_parser() {
+        assert_eq!(
+            register_node_path(5, "http://node5:4491", "http://node5:4492"),
+            "/__ursula/admin/nodes/5/register?client_url=http://node5:4491&cluster_url=http://node5:4492"
+        );
+    }
+
+    #[test]
+    fn group_placement_path_builds_admin_projection_path() {
+        assert_eq!(
+            group_placement_path(7),
+            "/__ursula/admin/groups/7/placement"
+        );
+    }
+
+    #[test]
+    fn begin_migration_path_builds_admin_query() {
+        assert_eq!(
+            begin_migration_path(2, &BTreeSet::from([2, 3, 4]), true),
+            "/__ursula/admin/groups/2/migrations?target_voters=2,3,4&retain_removed=true"
+        );
+    }
+
+    #[test]
+    fn commit_placement_path_builds_admin_query() {
+        assert_eq!(
+            commit_placement_path(
+                2,
+                &BTreeSet::from([2, 3, 4]),
+                &BTreeSet::from([1]),
+                &BTreeSet::from([1]),
+            ),
+            "/__ursula/admin/groups/2/placement/commit?voters=2,3,4&learners=1&draining=1"
+        );
+    }
+
+    #[test]
+    fn finish_migration_path_builds_admin_query() {
+        assert_eq!(
+            finish_migration_path(7, true),
+            "/__ursula/admin/migrations/7/finish?success=true"
+        );
+    }
+
+    #[test]
+    fn prepare_local_engine_path_builds_admin_path() {
+        assert_eq!(
+            prepare_local_engine_path(2),
+            "/__ursula/admin/groups/2/local-engine"
+        );
+    }
+
+    #[test]
+    fn add_learner_path_preserves_raw_addr_for_server_query_parser() {
+        assert_eq!(
+            add_learner_path(2, 4, "http://node4:4492"),
+            "/__ursula/raft/2/learners/4?addr=http://node4:4492"
+        );
+    }
+
+    #[test]
+    fn change_membership_path_builds_voter_query() {
+        assert_eq!(
+            change_membership_path(2, &BTreeSet::from([2, 3, 4])),
+            "/__ursula/raft/2/membership?voters=2,3,4"
+        );
     }
 }

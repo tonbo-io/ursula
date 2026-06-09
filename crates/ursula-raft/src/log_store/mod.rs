@@ -10,11 +10,14 @@ pub use file::RaftGroupFileLogStore;
 pub(crate) use file::elapsed_ns;
 #[cfg(test)]
 pub(crate) use file::read_protobuf_frames;
+pub use memory::MemoryRaftLogStore;
+pub use memory::MetaRaftLogStore;
 pub use memory::RaftGroupLogStore;
 use openraft::BasicNode;
 use openraft::Entry;
 use openraft::EntryPayload;
 use openraft::Membership;
+use openraft::RaftTypeConfig;
 use openraft::StoredMembership;
 use openraft::alias::EntryOf;
 use openraft::alias::LogIdOf;
@@ -37,12 +40,18 @@ use crate::types::UrsulaVoteRequest;
 use crate::types::UrsulaVoteResponse;
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct RaftGroupLogStoreInner {
-    last_purged_log_id: Option<LogIdOf<UrsulaRaftTypeConfig>>,
-    committed: Option<LogIdOf<UrsulaRaftTypeConfig>>,
-    entries: BTreeMap<u64, EntryOf<UrsulaRaftTypeConfig>>,
-    vote: Option<VoteOf<UrsulaRaftTypeConfig>>,
+pub(crate) struct MemoryRaftLogStoreInner<C>
+where
+    C: RaftTypeConfig,
+    C::Entry: Clone,
+{
+    last_purged_log_id: Option<LogIdOf<C>>,
+    committed: Option<LogIdOf<C>>,
+    entries: BTreeMap<u64, EntryOf<C>>,
+    vote: Option<VoteOf<C>>,
 }
+
+pub(crate) type RaftGroupLogStoreInner = MemoryRaftLogStoreInner<UrsulaRaftTypeConfig>;
 
 pub(crate) type RaftGroupLogRecord = raft_internal_proto::RaftGroupLogRecordV1;
 pub(crate) type CoreJournalRecord = raft_internal_proto::CoreJournalRecordV1;
@@ -513,12 +522,14 @@ pub(crate) fn purge_record(log_id: LogIdOf<UrsulaRaftTypeConfig>) -> RaftGroupLo
     }
 }
 
-pub(crate) fn ensure_consecutive_entries(
-    entries: &[EntryOf<UrsulaRaftTypeConfig>],
-) -> Result<(), io::Error> {
+pub(crate) fn ensure_consecutive_entries<C>(entries: &[EntryOf<C>]) -> Result<(), io::Error>
+where
+    C: RaftTypeConfig,
+    C::Entry: Clone,
+{
     for pair in entries.windows(2) {
-        let current = pair[0].log_id.index;
-        let next = pair[1].log_id.index;
+        let current = pair[0].log_id().index;
+        let next = pair[1].log_id().index;
         if next != current + 1 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -529,10 +540,14 @@ pub(crate) fn ensure_consecutive_entries(
     Ok(())
 }
 
-pub(crate) fn ensure_log_append_boundary(
-    inner: &RaftGroupLogStoreInner,
-    entries: &[EntryOf<UrsulaRaftTypeConfig>],
-) -> Result<(), io::Error> {
+pub(crate) fn ensure_log_append_boundary<C>(
+    inner: &MemoryRaftLogStoreInner<C>,
+    entries: &[EntryOf<C>],
+) -> Result<(), io::Error>
+where
+    C: RaftTypeConfig,
+    C::Entry: Clone,
+{
     let Some(first_entry) = entries.first() else {
         return Ok(());
     };
@@ -540,7 +555,7 @@ pub(crate) fn ensure_log_append_boundary(
         return Ok(());
     };
 
-    let first_append_index = first_entry.log_id.index;
+    let first_append_index = first_entry.log_id().index;
     if first_append_index > last_existing_index + 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -551,9 +566,13 @@ pub(crate) fn ensure_log_append_boundary(
     Ok(())
 }
 
-pub(crate) fn ensure_consecutive_log(
-    entries: &BTreeMap<u64, EntryOf<UrsulaRaftTypeConfig>>,
-) -> Result<(), io::Error> {
+pub(crate) fn ensure_consecutive_log<C>(
+    entries: &BTreeMap<u64, EntryOf<C>>,
+) -> Result<(), io::Error>
+where
+    C: RaftTypeConfig,
+    C::Entry: Clone,
+{
     let mut previous = None;
     for index in entries.keys().copied() {
         if let Some(previous) = previous

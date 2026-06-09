@@ -2,13 +2,13 @@
 title: Operations
 ---
 
-The first tool to reach for is [`ursulactl`](/docs/cli). It covers the raft-aware verbs operators run most often — rolling restart, status, readiness gate. This page covers everything **around** it: the metrics shape ursulactl reads, the admin endpoints it (and your custom tooling) can call, the SSH-side lifecycle that still lives in Python, and the operational policies ursulactl does not encode (backups, log levels, S3 cleanup).
+The first tool to reach for is [`ursulactl`](/docs/cli). It covers the raft-aware verbs operators run most often — rolling restart, status, readiness gate, and manual group migration. This page covers everything **around** it: the metrics shape ursulactl reads, the admin endpoints it (and your custom tooling) can call, the SSH-side lifecycle that still lives in Python, and the operational policies ursulactl does not encode (backups, log levels, S3 cleanup).
 
 ## Tooling map
 
 | Surface | When to reach for it |
 |---------|---------------------|
-| [`ursulactl`](/docs/cli) | Day-2 cluster ops over HTTP: restart, status, wait-ready. |
+| [`ursulactl`](/docs/cli) | Day-2 cluster ops over HTTP: restart, status, wait-ready, one-group-at-a-time migration. |
 | `scripts/ursula_ec2.py` | SSH/IAM/EC2 lifecycle: push binaries, write systemd units, S3 cleanup, drive the benchmark client. |
 | `/__ursula/metrics` and the `/__ursula/raft/...` admin endpoints | Custom tooling. ursulactl uses these underneath; the surface is small and stable enough to script directly. |
 
@@ -27,6 +27,21 @@ The JSON snapshot covers per-core mailbox depth, append/read counters, latency h
 These are the primitives `ursulactl` and any custom operator tooling builds on. Each call is local to one node; to act on every group, loop over the IDs in metrics.
 
 ```bash
+# Register a new data-capable node in the meta group
+curl -X POST 'http://127.0.0.1:4437/__ursula/admin/nodes/4/register?client_url=http://node4:4437&cluster_url=http://node4:4437'
+
+# Start the single active migration intent for one data group
+curl -X POST 'http://127.0.0.1:4437/__ursula/admin/groups/2/migrations?target_voters=2,3,4&retain_removed=true'
+
+# Allow and warm the target node's local engine before adding it as learner
+curl -X POST http://node4:4437/__ursula/admin/groups/2/local-engine
+
+# Commit the final placement after the data-group membership change
+curl -X POST 'http://127.0.0.1:4437/__ursula/admin/groups/2/placement/commit?voters=2,3,4&learners=1&draining=1'
+
+# Release the migration lock
+curl -X POST 'http://127.0.0.1:4437/__ursula/admin/migrations/1/finish?success=true'
+
 # Force a cold flush for one stream (skip the timer)
 curl -X POST http://127.0.0.1:4437/__ursula/flush-cold/demo/hello
 
@@ -37,13 +52,16 @@ curl -X POST http://127.0.0.1:4437/__ursula/raft/42/snapshot
 curl -X POST http://127.0.0.1:4437/__ursula/raft/42/purge
 
 # Add a learner (non-voting replica) to one group
-curl -X POST http://127.0.0.1:4437/__ursula/raft/42/learners/4
+curl -X POST 'http://127.0.0.1:4437/__ursula/raft/42/learners/4?addr=http://node4:4437'
+
+# Change a group's full voter set
+curl -X POST 'http://127.0.0.1:4437/__ursula/raft/42/membership?voters=2,3,4'
 
 # Hand leadership of one group to another voter (used by `ursulactl restart`)
 curl -X POST http://127.0.0.1:4437/__ursula/raft/42/leader/transfer/2
 ```
 
-The leader-transfer endpoint refuses with `409 Conflict` if the receiving node isn't the current leader and `400 Bad Request` if the target isn't a voter — this is why `ursulactl` is the safer way to chain these calls: it consults metrics first.
+The leader-transfer endpoint refuses with `409 Conflict` if the receiving node isn't the current leader and `400 Bad Request` if the target isn't a voter — this is why `ursulactl` is the safer way to chain these calls: it consults metrics first. Manual group migration is intentionally serialized by the meta group; finish the active migration before beginning the next group.
 
 ## SSH-side lifecycle
 
