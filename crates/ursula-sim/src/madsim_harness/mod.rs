@@ -54,6 +54,7 @@ use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::DeleteSnapshotRequest;
 use ursula_runtime::DeleteStreamRequest;
 use ursula_runtime::FlushColdRequest;
+use ursula_runtime::GetStreamAttrsRequest;
 use ursula_runtime::GroupAppendBatchFuture;
 use ursula_runtime::GroupAppendFuture;
 use ursula_runtime::GroupBootstrapStreamFuture;
@@ -69,6 +70,7 @@ use ursula_runtime::GroupEngineFactory;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::GroupFlushColdFuture;
 use ursula_runtime::GroupForkRefFuture;
+use ursula_runtime::GroupGetStreamAttrsFuture;
 use ursula_runtime::GroupHeadStreamFuture;
 use ursula_runtime::GroupInstallSnapshotFuture;
 use ursula_runtime::GroupPlanColdFlushFuture;
@@ -83,6 +85,7 @@ use ursula_runtime::GroupShutdownFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
+use ursula_runtime::GroupUpdateStreamAttrsFuture;
 use ursula_runtime::GroupWriteBatchFuture;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::HeadStreamRequest;
@@ -97,6 +100,7 @@ use ursula_runtime::RuntimeConfig;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::RuntimeThreading;
 use ursula_runtime::ShardRuntime;
+use ursula_runtime::UpdateStreamAttrsRequest;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
@@ -1138,6 +1142,16 @@ impl GroupEngine for MadsimScopedGroupEngine {
         }))
     }
 
+    fn get_stream_attrs<'a>(
+        &'a mut self,
+        request: GetStreamAttrsRequest,
+        placement: ShardPlacement,
+    ) -> GroupGetStreamAttrsFuture<'a> {
+        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
+            self.inner.get_stream_attrs(request, placement).await
+        }))
+    }
+
     fn read_stream<'a>(
         &'a mut self,
         request: ReadStreamRequest,
@@ -1218,6 +1232,16 @@ impl GroupEngine for MadsimScopedGroupEngine {
             self.inner
                 .touch_stream_access(stream_id, now_ms, renew_ttl, placement)
                 .await
+        }))
+    }
+
+    fn update_stream_attrs<'a>(
+        &'a mut self,
+        request: UpdateStreamAttrsRequest,
+        placement: ShardPlacement,
+    ) -> GroupUpdateStreamAttrsFuture<'a> {
+        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
+            self.inner.update_stream_attrs(request, placement).await
         }))
     }
 

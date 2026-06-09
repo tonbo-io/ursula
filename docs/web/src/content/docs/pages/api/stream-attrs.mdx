@@ -1,0 +1,108 @@
+---
+title: Stream attributes
+api: "GET /{bucket}/{stream}/attrs, PUT /{bucket}/{stream}/attrs"
+---
+
+Stream attributes are mutable, application-owned JSON metadata stored beside a stream. They are not part of the append-only byte stream and do not affect offsets, reads, snapshots, bootstrap, content type, or closed state.
+
+The protocol details are defined in the [extensions spec](/docs/specs/extensions#5-stream-attributes).
+
+<ParamField path="bucket" type="string" required>
+ Bucket ID.
+</ParamField>
+
+<ParamField path="stream" type="string" required>
+ Stream ID within the bucket.
+</ParamField>
+
+## Attribute object
+
+```json
+{
+  "title": "Support session",
+  "metadata": {
+    "purpose": "customer-support",
+    "environment_id": "env_019e2590d33f711fabf42f2857cecd8a",
+    "agent": {
+      "id": "agent_019e390add9f7bac9b6cc806db46fcbd",
+      "version": 2
+    }
+  }
+}
+```
+
+Top-level fields are optional:
+
+| Field | Type | Description |
+| ---------- | ------ | ----------------------------------- |
+| `title` | string | Application-defined display title. |
+| `metadata` | object | Arbitrary application metadata. |
+
+Ursula does not define top-level fields for application concepts such as agents or environments. Store that data inside `metadata` when needed.
+
+Unknown top-level fields are ignored and not stored. Place any additional fields inside `metadata`.
+
+The encoded attribute object is limited to 16 KiB. Larger documents are rejected with `400 Bad Request`.
+
+## Read attributes
+
+```http
+GET /{bucket}/{stream}/attrs
+```
+
+| Status | Meaning |
+| ------ | ------------------------------------------ |
+| `200` | Attributes returned as `application/json`. |
+| `404` | Stream not found or expired. |
+| `410` | Stream is gone. |
+
+When no attributes are set, the response body is `{}`.
+
+## Replace attributes
+
+```http
+PUT /{bucket}/{stream}/attrs
+Content-Type: application/json
+
+{"title":"Renamed session","metadata":{"purpose":"debugging"}}
+```
+
+`PUT` replaces the complete attribute object. It does not merge with the previous value. Submitting `{}` clears attributes.
+
+| Status | Meaning |
+| ------ | ------------------------------------------------------------- |
+| `204` | Attributes replaced, cleared, or already equal to the request. |
+| `400` | Missing `Content-Type`, non-JSON content type, invalid JSON, or attributes over the 16 KiB limit. |
+| `404` | Stream not found or expired. |
+| `410` | Stream is gone. |
+
+Attributes can be updated after a stream is closed. Stream closure only prevents further appends.
+
+## Create with attributes
+
+You can set initial attributes on stream creation with the `Stream-Attrs` header:
+
+```bash
+curl -X PUT http://127.0.0.1:4437/demo/session-1 \
+  -H 'Stream-Attrs: {"title":"Support session","metadata":{"purpose":"customer-support"}}'
+```
+
+If the stream already exists, the submitted attributes must match the stored attributes for the create request to return `200 OK`. A mismatch returns `409 Conflict`.
+
+<RequestExample>
+```bash Read attributes
+curl http://127.0.0.1:4437/demo/session-1/attrs
+```
+
+```bash Replace attributes
+curl -X PUT http://127.0.0.1:4437/demo/session-1/attrs \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"title":"Renamed session","metadata":{"purpose":"debugging"}}'
+```
+
+```bash Clear attributes
+curl -X PUT http://127.0.0.1:4437/demo/session-1/attrs \
+  -H 'Content-Type: application/json' \
+  --data-binary '{}'
+```
+</RequestExample>

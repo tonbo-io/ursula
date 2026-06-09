@@ -99,6 +99,7 @@ fn setup_machine(scenario: &AppendScenario) -> StreamStateMachine {
                 stream_expires_at_ms: None,
                 forked_from: None,
                 fork_offset: None,
+                attrs: None,
                 now_ms: 0,
             }),
             StreamResponse::Created { .. }

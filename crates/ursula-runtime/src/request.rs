@@ -8,6 +8,7 @@ use ursula_shard::ShardPlacement;
 use ursula_stream::ColdChunkRef;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::ProducerRequest;
+use ursula_stream::StreamAttrs;
 use ursula_stream::StreamIntegritySnapshot;
 use ursula_stream::StreamReadPlan;
 use ursula_stream::StreamReadSegment;
@@ -33,6 +34,7 @@ pub struct CreateStreamRequest {
     pub stream_expires_at_ms: Option<u64>,
     pub forked_from: Option<BucketStreamId>,
     pub fork_offset: Option<u64>,
+    pub attrs: Option<StreamAttrs>,
     pub now_ms: u64,
 }
 
@@ -48,6 +50,7 @@ pub struct CreateStreamExternalRequest {
     pub stream_expires_at_ms: Option<u64>,
     pub forked_from: Option<BucketStreamId>,
     pub fork_offset: Option<u64>,
+    pub attrs: Option<StreamAttrs>,
     pub now_ms: u64,
 }
 
@@ -67,6 +70,7 @@ impl CreateStreamExternalRequest {
             stream_expires_at_ms: request.stream_expires_at_ms,
             forked_from: request.forked_from,
             fork_offset: request.fork_offset,
+            attrs: request.attrs,
             now_ms: request.now_ms,
         }
     }
@@ -86,6 +90,7 @@ impl CreateStreamRequest {
             stream_expires_at_ms: None,
             forked_from: None,
             fork_offset: None,
+            attrs: None,
             now_ms: 0,
         }
     }
@@ -117,6 +122,32 @@ pub struct HeadStreamResponse {
     pub stream_expires_at_ms: Option<u64>,
     pub snapshot_offset: Option<u64>,
     pub integrity: StreamIntegritySnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GetStreamAttrsRequest {
+    pub stream_id: BucketStreamId,
+    pub now_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetStreamAttrsResponse {
+    pub placement: ShardPlacement,
+    pub attrs: Option<StreamAttrs>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateStreamAttrsRequest {
+    pub stream_id: BucketStreamId,
+    pub attrs: Option<StreamAttrs>,
+    pub now_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateStreamAttrsResponse {
+    pub placement: ShardPlacement,
+    pub changed: bool,
+    pub group_commit_index: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

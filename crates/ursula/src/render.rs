@@ -97,7 +97,8 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         | StreamErrorCode::InvalidRetention
         | StreamErrorCode::InvalidFork
         | StreamErrorCode::InvalidColdFlush
-        | StreamErrorCode::InvalidSnapshot => StatusCode::BAD_REQUEST,
+        | StreamErrorCode::InvalidSnapshot
+        | StreamErrorCode::InvalidStreamAttrs => StatusCode::BAD_REQUEST,
     }
 }
 

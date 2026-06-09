@@ -13,6 +13,7 @@ use openraft::error::ReplicationClosed;
 use openraft::network::RPCOption;
 use openraft::raft::SnapshotResponse;
 use openraft::rt::WatchReceiver;
+use serde_json::json;
 use tower::ServiceExt;
 use ursula_raft::StaticGrpcRaftGroupEngineFactory;
 use ursula_raft::StaticGrpcRaftMembershipConfig;
@@ -510,6 +511,299 @@ async fn create_append_read_and_head_match_perf_compare_subset() {
             .get(HEADER_STREAM_INTEGRITY_LIVE_SETSUM)
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn stream_attrs_can_be_updated_and_read_over_http() {
+    let app = test_router();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-http")
+                .header(CONTENT_TYPE, "text/plain")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let attrs = json!({
+        "title": "Support session",
+        "metadata": {
+            "agent": { "id": "agent-1", "version": 2 },
+            "purpose": "customer-support"
+        }
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-http/attrs")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(attrs.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/benchcmp/attrs-http/attrs")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let actual: serde_json::Value = serde_json::from_slice(&body).expect("attrs json");
+    assert_eq!(actual, attrs);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-http/attrs")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/benchcmp/attrs-http/attrs")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let actual: serde_json::Value = serde_json::from_slice(&body).expect("attrs json");
+    assert_eq!(actual, json!({}));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-http")
+                .header(CONTENT_TYPE, "text/plain")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn stream_attrs_can_be_set_when_creating_stream_over_http() {
+    let app = test_router();
+    let attrs = json!({
+        "title": "Created session",
+        "metadata": {
+            "agent": { "id": "agent-create", "version": 2 },
+            "purpose": "create-time"
+        }
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-create-http")
+                .header(CONTENT_TYPE, "text/plain")
+                .header("stream-attrs", attrs.to_string())
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/benchcmp/attrs-create-http/attrs")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let actual: serde_json::Value = serde_json::from_slice(&body).expect("attrs json");
+    assert_eq!(actual, attrs);
+}
+
+#[tokio::test]
+async fn stream_attrs_endpoints_return_not_found_for_missing_stream() {
+    let app = test_router();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/benchcmp/attrs-missing/attrs")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-missing/attrs")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"title":"missing"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn stream_attrs_endpoints_return_gone_for_soft_deleted_stream() {
+    let app = test_router();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-soft-deleted")
+                .header(CONTENT_TYPE, "text/plain")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // Forking keeps a reference on the parent so deleting it soft-deletes.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-soft-deleted-child")
+                .header(HEADER_STREAM_FORKED_FROM, "benchcmp/attrs-soft-deleted")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/benchcmp/attrs-soft-deleted")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/benchcmp/attrs-soft-deleted/attrs")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::GONE);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-soft-deleted/attrs")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"title":"gone"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::GONE);
+}
+
+#[tokio::test]
+async fn create_stream_rejects_invalid_stream_attrs_header() {
+    let app = test_router();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-bad-header")
+                .header(CONTENT_TYPE, "text/plain")
+                .header("stream-attrs", "{not json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-bad-header/attrs")
+                .header(CONTENT_TYPE, "application/json5")
+                .body(Body::from(r#"{"title":"json5"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
