@@ -291,30 +291,53 @@ impl HotBuffer {
         });
     }
 
-    fn plan_cold_flush(
+    fn plan_cold_flush_from(
         &self,
+        from_offset: u64,
         min_hot_bytes: usize,
         max_flush_bytes: usize,
     ) -> Option<(u64, u64, Vec<u8>)> {
-        let first = self.chunks.front()?;
         let mut payload = Vec::new();
-        let mut end_offset = first.start_offset;
         for chunk in &self.chunks {
-            if chunk.start_offset != end_offset || payload.len() >= max_flush_bytes {
+            if chunk.end_offset <= from_offset {
+                continue;
+            }
+            if chunk.start_offset
+                > from_offset + u64::try_from(payload.len()).expect("payload len fits u64")
+            {
                 break;
             }
+            if payload.len() >= max_flush_bytes {
+                break;
+            }
+            let skip = if chunk.start_offset < from_offset {
+                usize::try_from(from_offset - chunk.start_offset).expect("skip fits usize")
+            } else {
+                0
+            };
             let remaining = max_flush_bytes - payload.len();
-            let take = chunk.bytes.len().min(remaining);
-            payload.extend_from_slice(&chunk.bytes[..take]);
-            end_offset = end_offset.saturating_add(u64::try_from(take).expect("take fits u64"));
-            if take < chunk.bytes.len() {
+            let take = (chunk.bytes.len() - skip).min(remaining);
+            payload.extend_from_slice(&chunk.bytes[skip..skip + take]);
+            if take < chunk.bytes.len() - skip {
                 break;
             }
         }
         if payload.len() < min_hot_bytes {
             return None;
         }
-        Some((first.start_offset, end_offset, payload))
+        let end_offset = from_offset + u64::try_from(payload.len()).expect("payload len fits u64");
+        Some((from_offset, end_offset, payload))
+    }
+
+    fn remaining_len_from(&self, from_offset: u64) -> usize {
+        self.chunks
+            .iter()
+            .filter(|chunk| chunk.end_offset > from_offset)
+            .map(|chunk| {
+                let start = chunk.start_offset.max(from_offset);
+                usize::try_from(chunk.end_offset - start).expect("remaining len fits usize")
+            })
+            .sum()
     }
 
     fn read_segments(&self, offset: u64, next_offset: u64) -> Vec<(u64, StreamReadSegment)> {
@@ -625,6 +648,17 @@ impl StreamStateMachine {
         min_hot_bytes: usize,
         max_flush_bytes: usize,
     ) -> Result<Option<ColdFlushCandidate>, StreamResponse> {
+        let start_offset = self.hot_start_offset(stream_id);
+        self.plan_cold_flush_with_start(stream_id, start_offset, min_hot_bytes, max_flush_bytes)
+    }
+
+    fn plan_cold_flush_with_start(
+        &self,
+        stream_id: &BucketStreamId,
+        start_offset: u64,
+        min_hot_bytes: usize,
+        max_flush_bytes: usize,
+    ) -> Result<Option<ColdFlushCandidate>, StreamResponse> {
         if max_flush_bytes == 0 {
             return Ok(None);
         }
@@ -644,7 +678,7 @@ impl StreamStateMachine {
             return Ok(None);
         };
         let Some((start_offset, end_offset, payload)) =
-            hot_buffer.plan_cold_flush(min_hot_bytes, max_flush_bytes)
+            hot_buffer.plan_cold_flush_from(start_offset, min_hot_bytes, max_flush_bytes)
         else {
             return Ok(None);
         };
@@ -656,10 +690,12 @@ impl StreamStateMachine {
         }))
     }
 
-    pub fn plan_next_cold_flush(
+    fn plan_next_cold_flush_from_start(
         &self,
+        mut start_fn: impl FnMut(&BucketStreamId) -> u64,
         min_hot_bytes: usize,
         max_flush_bytes: usize,
+        group_hot_bytes: u64,
     ) -> Result<Option<ColdFlushCandidate>, StreamResponse> {
         if max_flush_bytes == 0 {
             return Ok(None);
@@ -667,7 +703,9 @@ impl StreamStateMachine {
         let mut stream_ids = self.streams.keys().cloned().collect::<Vec<_>>();
         stream_ids.sort_by(compare_stream_ids);
         for stream_id in &stream_ids {
-            match self.plan_cold_flush(stream_id, min_hot_bytes, max_flush_bytes) {
+            let start = start_fn(stream_id);
+            match self.plan_cold_flush_with_start(stream_id, start, min_hot_bytes, max_flush_bytes)
+            {
                 Ok(Some(candidate)) => return Ok(Some(candidate)),
                 Ok(None) => {}
                 Err(StreamResponse::Error {
@@ -678,12 +716,12 @@ impl StreamStateMachine {
             }
         }
         let group_min_hot_bytes = u64::try_from(min_hot_bytes).unwrap_or(u64::MAX);
-        let group_hot_bytes = self.total_hot_payload_bytes();
         if group_hot_bytes < group_min_hot_bytes {
             return Ok(None);
         }
         for stream_id in stream_ids {
-            match self.plan_cold_flush(&stream_id, 1, max_flush_bytes) {
+            let start = start_fn(&stream_id);
+            match self.plan_cold_flush_with_start(&stream_id, start, 1, max_flush_bytes) {
                 Ok(Some(candidate)) => return Ok(Some(candidate)),
                 Ok(None) => {}
                 Err(StreamResponse::Error {
@@ -705,29 +743,34 @@ impl StreamStateMachine {
         if max_candidates == 0 || max_flush_bytes == 0 {
             return Ok(Vec::new());
         }
-        let mut preview = self.clone();
+        let mut planned_flush_offsets: HashMap<BucketStreamId, u64> = HashMap::new();
         let mut candidates = Vec::with_capacity(max_candidates);
         while candidates.len() < max_candidates {
-            let Some(candidate) = preview.plan_next_cold_flush(min_hot_bytes, max_flush_bytes)?
-            else {
+            let start_for = |stream_id: &BucketStreamId| -> u64 {
+                planned_flush_offsets
+                    .get(stream_id)
+                    .copied()
+                    .unwrap_or_else(|| self.hot_start_offset(stream_id))
+            };
+            let group_hot_bytes: u64 = self
+                .hot_buffers
+                .iter()
+                .map(|(stream_id, buffer)| {
+                    let start = start_for(stream_id);
+                    u64::try_from(buffer.remaining_len_from(start)).expect("len fits u64")
+                })
+                .sum();
+            let candidate = self.plan_next_cold_flush_from_start(
+                start_for,
+                min_hot_bytes,
+                max_flush_bytes,
+                group_hot_bytes,
+            )?;
+            let Some(candidate) = candidate else {
                 break;
             };
-            let chunk = ColdChunkRef {
-                start_offset: candidate.start_offset,
-                end_offset: candidate.end_offset,
-                s3_path: "planned-cold-flush-batch".to_owned(),
-                object_size: u64::try_from(candidate.payload.len()).expect("payload len fits u64"),
-            };
-            match preview.flush_cold(candidate.stream_id.clone(), chunk) {
-                StreamResponse::ColdFlushed { .. } => candidates.push(candidate),
-                StreamResponse::Error { .. } => break,
-                other => {
-                    return Err(StreamResponse::error(
-                        StreamErrorCode::InvalidColdFlush,
-                        format!("unexpected cold flush planning response: {other:?}"),
-                    ));
-                }
-            }
+            planned_flush_offsets.insert(candidate.stream_id.clone(), candidate.end_offset);
+            candidates.push(candidate);
         }
         Ok(candidates)
     }
