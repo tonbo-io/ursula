@@ -60,10 +60,13 @@ message GroupReadRequestV1 {
   oneof read {
     HeadStreamReadV1 head = 7;
     ReadStreamReadV1 read_stream = 8;
+    GetStreamAttrsReadV1 get_stream_attrs = 9;
   }
 }
 
 message HeadStreamReadV1 {}
+
+message GetStreamAttrsReadV1 {}
 
 message ReadStreamReadV1 {
   uint64 offset = 1;
@@ -246,6 +249,13 @@ message ReadStreamResponsePayloadV1 {
   bytes payload = 7;
   bool up_to_date = 8;
   bool closed = 9;
+}
+
+message GetStreamAttrsResponsePayloadV1 {
+  uint32 core_id = 1;
+  uint32 shard_id = 2;
+  uint32 raft_group_id = 3;
+  optional bytes attrs_json = 4;
 }
 
 service RaftInternal {

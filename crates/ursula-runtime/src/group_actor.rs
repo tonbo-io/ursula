@@ -40,6 +40,8 @@ use crate::request::DeleteStreamResponse;
 use crate::request::FlushColdRequest;
 use crate::request::FlushColdResponse;
 use crate::request::ForkRefResponse;
+use crate::request::GetStreamAttrsRequest;
+use crate::request::GetStreamAttrsResponse;
 use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
 use crate::request::PlanColdFlushRequest;
@@ -50,6 +52,8 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
+use crate::request::UpdateStreamAttrsRequest;
+use crate::request::UpdateStreamAttrsResponse;
 use crate::rt::sync::Semaphore;
 use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
@@ -125,6 +129,10 @@ pub(crate) enum GroupCommand {
         request: HeadStreamRequest,
         response_tx: oneshot::Sender<Result<HeadStreamResponse, RuntimeError>>,
     },
+    GetStreamAttrs {
+        request: GetStreamAttrsRequest,
+        response_tx: oneshot::Sender<Result<GetStreamAttrsResponse, RuntimeError>>,
+    },
     ReadStream {
         request: ReadStreamRequest,
         response_tx: oneshot::Sender<Result<ReadStreamResponse, RuntimeError>>,
@@ -160,6 +168,10 @@ pub(crate) enum GroupCommand {
     CloseStream {
         request: CloseStreamRequest,
         response_tx: oneshot::Sender<Result<CloseStreamResponse, RuntimeError>>,
+    },
+    UpdateStreamAttrs {
+        request: UpdateStreamAttrsRequest,
+        response_tx: oneshot::Sender<Result<UpdateStreamAttrsResponse, RuntimeError>>,
     },
     AddForkRef {
         stream_id: BucketStreamId,
@@ -238,6 +250,9 @@ impl GroupCommand {
             Self::HeadStream { response_tx, .. } => {
                 let _ = response_tx.send(Err(err));
             }
+            Self::GetStreamAttrs { response_tx, .. } => {
+                let _ = response_tx.send(Err(err));
+            }
             Self::ReadStream { response_tx, .. } | Self::WaitRead { response_tx, .. } => {
                 let _ = response_tx.send(Err(err));
             }
@@ -258,6 +273,9 @@ impl GroupCommand {
                 let _ = response_tx.send(Err(err));
             }
             Self::CloseStream { response_tx, .. } => {
+                let _ = response_tx.send(Err(err));
+            }
+            Self::UpdateStreamAttrs { response_tx, .. } => {
                 let _ = response_tx.send(Err(err));
             }
             Self::AddForkRef { response_tx, .. } | Self::ReleaseForkRef { response_tx, .. } => {
@@ -390,6 +408,19 @@ impl GroupActor {
                 .await;
                 let _ = response_tx.send(response);
             }
+            GroupCommand::GetStreamAttrs {
+                request,
+                response_tx,
+            } => {
+                let response = CoreWorker::get_stream_attrs(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    request,
+                    self.placement,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
             GroupCommand::ReadStream {
                 request,
                 response_tx,
@@ -508,6 +539,19 @@ impl GroupActor {
                     self.metrics.clone(),
                     self.read_materialization.clone(),
                     &mut self.read_watchers,
+                    request,
+                    self.placement,
+                )
+                .await;
+                let _ = response_tx.send(response);
+            }
+            GroupCommand::UpdateStreamAttrs {
+                request,
+                response_tx,
+            } => {
+                let response = CoreWorker::update_stream_attrs(
+                    &mut self.engine,
+                    self.metrics.clone(),
                     request,
                     self.placement,
                 )

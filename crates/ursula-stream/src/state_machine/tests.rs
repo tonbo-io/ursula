@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use proptest::collection::vec;
 use proptest::prelude::*;
+use serde_json::json;
 
 use super::*;
 use crate::integrity::StreamIntegritySnapshot;
@@ -34,6 +35,7 @@ fn create_stream(machine: &mut StreamStateMachine, id: &str) {
             stream_expires_at_ms: None,
             forked_from: None,
             fork_offset: None,
+            attrs: None,
             now_ms: 0,
         }),
         StreamResponse::Created {
@@ -42,6 +44,20 @@ fn create_stream(machine: &mut StreamStateMachine, id: &str) {
             closed: false,
         }
     );
+}
+
+fn attrs(title: &str, purpose: &str) -> StreamAttrs {
+    let metadata = json!({
+        "agent": { "id": "agent-1", "version": 2 },
+        "purpose": purpose
+    })
+    .as_object()
+    .expect("metadata object")
+    .clone();
+    StreamAttrs {
+        title: Some(title.to_owned()),
+        metadata,
+    }
 }
 
 fn producer(id: &str, epoch: u64, seq: u64) -> ProducerRequest {
@@ -64,6 +80,186 @@ fn empty_integrity() -> StreamIntegritySnapshot {
         evicted_records: 0,
         total_records: 0,
     }
+}
+
+#[test]
+fn create_stream_stores_stream_attrs_separately() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    let attrs = attrs("Support session", "customer-support");
+
+    assert_eq!(
+        machine.apply(StreamCommand::CreateStream {
+            stream_id: stream("attrs"),
+            content_type: "application/octet-stream".to_owned(),
+            initial_payload: Vec::new(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            forked_from: None,
+            fork_offset: None,
+            attrs: Some(attrs.clone()),
+            now_ms: 0,
+        }),
+        StreamResponse::Created {
+            stream_id: stream("attrs"),
+            next_offset: 0,
+            closed: false,
+        }
+    );
+
+    assert_eq!(machine.stream_attrs(&stream("attrs")), Some(&attrs));
+    assert!(machine.head(&stream("attrs")).is_some());
+}
+
+#[test]
+fn update_stream_attrs_replaces_existing_attrs() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    create_stream(&mut machine, "attrs");
+    let first = attrs("Support session", "customer-support");
+    let second = attrs("Escalated session", "incident-review");
+
+    assert_eq!(
+        machine.apply(StreamCommand::UpdateStreamAttrs {
+            stream_id: stream("attrs"),
+            attrs: Some(first.clone()),
+            now_ms: 0,
+        }),
+        StreamResponse::AttrsUpdated { changed: true }
+    );
+    assert_eq!(machine.stream_attrs(&stream("attrs")), Some(&first));
+
+    assert_eq!(
+        machine.apply(StreamCommand::UpdateStreamAttrs {
+            stream_id: stream("attrs"),
+            attrs: Some(second.clone()),
+            now_ms: 0,
+        }),
+        StreamResponse::AttrsUpdated { changed: true }
+    );
+
+    assert_eq!(machine.stream_attrs(&stream("attrs")), Some(&second));
+}
+
+#[test]
+fn update_stream_attrs_is_allowed_after_stream_is_closed() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    create_stream(&mut machine, "attrs-closed");
+    let attrs = attrs("Closed session", "post-close-metadata");
+
+    assert_eq!(
+        machine.apply(StreamCommand::Close {
+            stream_id: stream("attrs-closed"),
+            stream_seq: None,
+            producer: None,
+            now_ms: 0,
+        }),
+        StreamResponse::Closed {
+            next_offset: 0,
+            deduplicated: false,
+            producer: None,
+        }
+    );
+    assert_eq!(
+        machine.apply(StreamCommand::UpdateStreamAttrs {
+            stream_id: stream("attrs-closed"),
+            attrs: Some(attrs.clone()),
+            now_ms: 0,
+        }),
+        StreamResponse::AttrsUpdated { changed: true }
+    );
+
+    assert_eq!(machine.stream_attrs(&stream("attrs-closed")), Some(&attrs));
+}
+
+fn oversized_attrs() -> StreamAttrs {
+    let mut attrs = attrs("Oversized", "size-cap");
+    attrs.metadata.insert(
+        "blob".to_owned(),
+        serde_json::Value::String("x".repeat(MAX_STREAM_ATTRS_BYTES + 1)),
+    );
+    attrs
+}
+
+#[test]
+fn create_stream_rejects_oversized_attrs() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateStream {
+            stream_id: stream("attrs-too-big"),
+            content_type: "application/octet-stream".to_owned(),
+            initial_payload: Vec::new(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            forked_from: None,
+            fork_offset: None,
+            attrs: Some(oversized_attrs()),
+            now_ms: 0,
+        }),
+        StreamResponse::Error {
+            code: StreamErrorCode::InvalidStreamAttrs,
+            ..
+        }
+    ));
+    assert!(machine.head(&stream("attrs-too-big")).is_none());
+}
+
+#[test]
+fn update_stream_attrs_rejects_oversized_attrs() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    create_stream(&mut machine, "attrs-cap");
+
+    assert!(matches!(
+        machine.apply(StreamCommand::UpdateStreamAttrs {
+            stream_id: stream("attrs-cap"),
+            attrs: Some(oversized_attrs()),
+            now_ms: 0,
+        }),
+        StreamResponse::Error {
+            code: StreamErrorCode::InvalidStreamAttrs,
+            ..
+        }
+    ));
+    assert_eq!(machine.stream_attrs(&stream("attrs-cap")), None);
+}
+
+#[test]
+fn stream_command_decodes_pre_attrs_wal_records() {
+    let command = StreamCommand::CreateStream {
+        stream_id: stream("legacy-wal"),
+        content_type: "application/octet-stream".to_owned(),
+        initial_payload: b"abc".to_vec(),
+        close_after: false,
+        stream_seq: None,
+        producer: None,
+        stream_ttl_seconds: None,
+        stream_expires_at_ms: None,
+        forked_from: None,
+        fork_offset: None,
+        attrs: None,
+        now_ms: 7,
+    };
+    let mut value = serde_json::to_value(&command).expect("encode command");
+    let fields = value
+        .get_mut("CreateStream")
+        .expect("create stream variant")
+        .as_object_mut()
+        .expect("variant object");
+    assert!(fields.remove("attrs").is_some());
+
+    let decoded: StreamCommand =
+        serde_json::from_value(value).expect("decode pre-attrs WAL record");
+    assert_eq!(decoded, command);
 }
 
 #[test]
@@ -91,6 +287,7 @@ fn stream_create_requires_existing_bucket_and_valid_ids() {
             stream_expires_at_ms: None,
             forked_from: None,
             fork_offset: None,
+            attrs: None,
             now_ms: 0,
         }),
         StreamResponse::Error {
@@ -112,6 +309,7 @@ fn stream_create_requires_existing_bucket_and_valid_ids() {
             stream_expires_at_ms: None,
             forked_from: None,
             fork_offset: None,
+            attrs: None,
             now_ms: 0,
         }),
         StreamResponse::Error {
@@ -139,6 +337,7 @@ fn create_stream_is_idempotent_only_when_metadata_matches() {
             stream_expires_at_ms: None,
             forked_from: None,
             fork_offset: None,
+            attrs: None,
             now_ms: 0,
         }),
         StreamResponse::AlreadyExists {
@@ -162,6 +361,82 @@ fn create_stream_is_idempotent_only_when_metadata_matches() {
             stream_expires_at_ms: None,
             forked_from: None,
             fork_offset: None,
+            attrs: None,
+            now_ms: 0,
+        }),
+        StreamResponse::Error {
+            code: StreamErrorCode::StreamAlreadyExistsConflict,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn create_stream_is_idempotent_only_when_attrs_match() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    let first = attrs("Support session", "customer-support");
+    let second = attrs("Escalated session", "incident-review");
+
+    assert_eq!(
+        machine.apply(StreamCommand::CreateStream {
+            stream_id: stream("attrs-idempotent"),
+            content_type: "application/octet-stream".to_owned(),
+            initial_payload: Vec::new(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            forked_from: None,
+            fork_offset: None,
+            attrs: Some(first.clone()),
+            now_ms: 0,
+        }),
+        StreamResponse::Created {
+            stream_id: stream("attrs-idempotent"),
+            next_offset: 0,
+            closed: false,
+        }
+    );
+
+    assert_eq!(
+        machine.apply(StreamCommand::CreateStream {
+            stream_id: stream("attrs-idempotent"),
+            content_type: "application/octet-stream".to_owned(),
+            initial_payload: Vec::new(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            forked_from: None,
+            fork_offset: None,
+            attrs: Some(first),
+            now_ms: 0,
+        }),
+        StreamResponse::AlreadyExists {
+            next_offset: 0,
+            closed: false,
+            content_type: "application/octet-stream".to_owned(),
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+        }
+    );
+
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateStream {
+            stream_id: stream("attrs-idempotent"),
+            content_type: "application/octet-stream".to_owned(),
+            initial_payload: Vec::new(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            forked_from: None,
+            fork_offset: None,
+            attrs: Some(second),
             now_ms: 0,
         }),
         StreamResponse::Error {
@@ -564,6 +839,7 @@ fn expired_stream_with_cold_chunks_enqueues_cold_gc() {
         stream_expires_at_ms: Some(1_000),
         forked_from: None,
         fork_offset: None,
+        attrs: None,
         now_ms: 0,
     });
     flush_one_cold_chunk(&mut machine, "ttl");
@@ -1047,6 +1323,7 @@ fn hot_start_offset_advances_to_tail_after_full_cold_flush() {
 fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
     let mut machine = StreamStateMachine::new();
     create_bucket(&mut machine);
+    let attrs = attrs("Snapshot session", "snapshot-restore");
     assert_eq!(
         machine.apply(StreamCommand::CreateStream {
             stream_id: stream("snap-open"),
@@ -1059,6 +1336,7 @@ fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
             stream_expires_at_ms: None,
             forked_from: None,
             fork_offset: None,
+            attrs: Some(attrs.clone()),
             now_ms: 0,
         }),
         StreamResponse::Created {
@@ -1095,6 +1373,7 @@ fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
             stream_expires_at_ms: None,
             forked_from: None,
             fork_offset: None,
+            attrs: None,
             now_ms: 0,
         }),
         StreamResponse::Created {
@@ -1123,6 +1402,7 @@ fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
     assert_eq!(metadata.last_stream_seq.as_deref(), Some("0002"));
     assert_eq!(metadata.stream_ttl_seconds, Some(60));
     assert_eq!(metadata.stream_expires_at_ms, None);
+    assert_eq!(restored.stream_attrs(&stream("snap-open")), Some(&attrs));
 
     assert!(matches!(
         restored.apply(StreamCommand::Append {
@@ -1202,6 +1482,7 @@ fn snapshot_order_is_deterministic() {
                 stream_expires_at_ms: None,
                 forked_from: None,
                 fork_offset: None,
+                attrs: None,
                 now_ms: 0,
             }),
             StreamResponse::Created { .. }
@@ -1258,6 +1539,7 @@ fn snapshot_restore_rejects_invalid_entries() {
                     fork_offset: None,
                     fork_ref_count: 0,
                 },
+                attrs: None,
                 hot_start_offset: 0,
                 payload: Vec::new(),
                 hot_segments: Vec::new(),
@@ -1294,6 +1576,7 @@ fn snapshot_restore_rejects_invalid_entries() {
                     fork_offset: None,
                     fork_ref_count: 0,
                 },
+                attrs: None,
                 hot_start_offset: 0,
                 payload: b"x".to_vec(),
                 hot_segments: Vec::new(),
@@ -1330,6 +1613,7 @@ fn snapshot_restore_rejects_invalid_entries() {
                     fork_offset: None,
                     fork_ref_count: 0,
                 },
+                attrs: None,
                 hot_start_offset: 0,
                 payload: Vec::new(),
                 hot_segments: Vec::new(),
@@ -1749,6 +2033,7 @@ fn stream_ttl_uses_sliding_access_window() {
             stream_expires_at_ms: None,
             forked_from: None,
             fork_offset: None,
+            attrs: None,
             now_ms: 1_000,
         }),
         StreamResponse::Created {
@@ -1841,6 +2126,7 @@ fn stream_expires_at_is_absolute_and_recreate_after_expiry() {
             stream_expires_at_ms: Some(2_000),
             forked_from: None,
             fork_offset: None,
+            attrs: None,
             now_ms: 1_000,
         }),
         StreamResponse::Created { .. }
@@ -1888,6 +2174,7 @@ fn stream_expires_at_is_absolute_and_recreate_after_expiry() {
             stream_expires_at_ms: None,
             forked_from: None,
             fork_offset: None,
+            attrs: None,
             now_ms: 2_001,
         }),
         StreamResponse::Created {
@@ -2310,6 +2597,7 @@ proptest! {
                 stream_expires_at_ms: None,
                 forked_from: None,
                 fork_offset: None,
+                attrs: None,
                 now_ms: 0,
             }),
             StreamResponse::Created {
@@ -2639,6 +2927,7 @@ proptest! {
                 stream_expires_at_ms: None,
                 forked_from: None,
                 fork_offset: None,
+                attrs: None,
                 now_ms: start_ms,
             });
         prop_assert!(

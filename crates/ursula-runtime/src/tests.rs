@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
+use serde_json::json;
 use tokio::sync::Notify;
 use tokio::sync::Semaphore;
 use tokio::sync::oneshot;
@@ -17,6 +18,7 @@ use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::ObjectPayloadRef;
+use ursula_stream::StreamAttrs;
 use ursula_stream::StreamReadSegment;
 use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamStateMachine;
@@ -84,6 +86,37 @@ fn empty_integrity() -> StreamIntegritySnapshot {
         evicted_records: 0,
         total_records: 0,
     }
+}
+
+fn stream_attrs(title: &str, purpose: &str) -> StreamAttrs {
+    StreamAttrs {
+        title: Some(title.to_owned()),
+        metadata: json!({
+            "agent": { "id": "agent-1", "version": 2 },
+            "purpose": purpose
+        })
+        .as_object()
+        .expect("metadata object")
+        .clone(),
+    }
+}
+
+#[test]
+fn group_write_command_decodes_pre_attrs_wal_records() {
+    let mut request = CreateStreamRequest::new(
+        BucketStreamId::new("benchcmp", "legacy-wal"),
+        "application/octet-stream",
+    );
+    request.now_ms = 7;
+    let command = GroupWriteCommand::from(request);
+
+    let mut value = serde_json::to_value(&command).expect("encode command");
+    let fields = value.as_object_mut().expect("command object");
+    assert!(fields.remove("attrs").is_some());
+
+    let decoded: GroupWriteCommand =
+        serde_json::from_value(value).expect("decode pre-attrs WAL record");
+    assert_eq!(decoded, command);
 }
 
 #[test]
@@ -260,6 +293,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
                 stream_expires_at_ms: None,
                 forked_from: None,
                 fork_offset: None,
+                attrs: None,
                 now_ms: 0,
             },
             placement,
@@ -365,6 +399,7 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
                 stream_expires_at_ms: None,
                 forked_from: None,
                 fork_offset: None,
+                attrs: None,
                 now_ms: 0,
             },
             placement,
@@ -537,6 +572,7 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
             stream_expires_at_ms: None,
             forked_from: None,
             fork_offset: None,
+            attrs: None,
             now_ms: 0,
         })
         .await
@@ -1313,7 +1349,16 @@ async fn install_group_snapshot_restores_group_state_and_append_counts() {
     let source = runtime(2, 8);
     let stream = BucketStreamId::new("benchcmp", "install-snapshot");
     let placement = source.locate(&stream);
+    let attrs = stream_attrs("Snapshot session", "snapshot-install");
     create_stream(&source, &stream).await;
+    source
+        .update_stream_attrs(UpdateStreamAttrsRequest {
+            stream_id: stream.clone(),
+            attrs: Some(attrs.clone()),
+            now_ms: 0,
+        })
+        .await
+        .expect("update attrs before snapshot");
     source
         .append(AppendRequest::from_bytes(stream.clone(), b"ab".to_vec()))
         .await
@@ -1327,7 +1372,8 @@ async fn install_group_snapshot_restores_group_state_and_append_counts() {
         .snapshot_group(placement.raft_group_id)
         .await
         .expect("snapshot group");
-    assert_eq!(snapshot.group_commit_index, 3);
+    assert_eq!(snapshot.group_commit_index, 4);
+    let snapshot_commit_index = snapshot.group_commit_index;
     assert_eq!(snapshot.stream_append_counts, vec![StreamAppendCount {
         stream_id: stream.clone(),
         append_count: 2,
@@ -1351,6 +1397,14 @@ async fn install_group_snapshot_restores_group_state_and_append_counts() {
     assert_eq!(read.placement, placement);
     assert_eq!(read.payload, b"abcd");
     assert_eq!(read.next_offset, 4);
+    let restored_attrs = target
+        .get_stream_attrs(GetStreamAttrsRequest {
+            stream_id: stream.clone(),
+            now_ms: 0,
+        })
+        .await
+        .expect("get restored attrs");
+    assert_eq!(restored_attrs.attrs, Some(attrs));
 
     let appended = target
         .append(AppendRequest::from_bytes(stream, b"ef".to_vec()))
@@ -1359,7 +1413,7 @@ async fn install_group_snapshot_restores_group_state_and_append_counts() {
     assert_eq!(appended.start_offset, 4);
     assert_eq!(appended.next_offset, 6);
     assert_eq!(appended.stream_append_count, 3);
-    assert_eq!(appended.group_commit_index, 4);
+    assert_eq!(appended.group_commit_index, snapshot_commit_index + 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1687,6 +1741,33 @@ async fn create_stream_is_routed_and_idempotent_for_matching_metadata() {
     assert_eq!(existing.next_offset, 0);
     assert!(!existing.closed);
     assert!(existing.already_exists);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_updates_and_reads_stream_attrs_on_owner_group() {
+    let runtime = runtime(2, 8);
+    let stream = BucketStreamId::new("benchcmp", "stream-attrs");
+    create_stream(&runtime, &stream).await;
+    let attrs = stream_attrs("Support session", "customer-support");
+
+    let updated = runtime
+        .update_stream_attrs(UpdateStreamAttrsRequest {
+            stream_id: stream.clone(),
+            attrs: Some(attrs.clone()),
+            now_ms: 0,
+        })
+        .await
+        .expect("update stream attrs");
+    assert!(updated.changed);
+
+    let read = runtime
+        .get_stream_attrs(GetStreamAttrsRequest {
+            stream_id: stream,
+            now_ms: 0,
+        })
+        .await
+        .expect("get stream attrs");
+    assert_eq!(read.attrs, Some(attrs));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3785,6 +3866,80 @@ async fn wal_group_engine_persists_installed_snapshot() {
         .expect("append after recovered snapshot");
     assert_eq!(appended.start_offset, 16);
     assert_eq!(appended.stream_append_count, 2);
+
+    drop(recovered);
+    std::fs::remove_dir_all(&wal_root).expect("remove WAL root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wal_group_engine_recovers_stream_attrs_after_restart() {
+    let wal_root = std::env::temp_dir().join(format!(
+        "ursula-wal-attrs-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&wal_root);
+    let config = RuntimeConfig {
+        core_count: 2,
+        raft_group_count: 8,
+        mailbox_capacity: 128,
+        threading: RuntimeThreading::HostedTokio,
+        cold_max_hot_bytes_per_group: None,
+        raft_max_uncommitted_bytes_per_group: None,
+        live_read_max_waiters_per_core: Some(65_536),
+    };
+    let created_stream = BucketStreamId::new("benchcmp", "wal-created-attrs");
+    let updated_stream = BucketStreamId::new("benchcmp", "wal-updated-attrs");
+    let created_attrs = stream_attrs("Created attrs", "create-replay");
+    let updated_attrs = stream_attrs("Updated attrs", "update-replay");
+
+    {
+        let runtime = ShardRuntime::spawn_with_engine_factory(
+            config.clone(),
+            WalGroupEngineFactory::new(&wal_root),
+        )
+        .expect("spawn WAL runtime");
+        let mut create_request =
+            CreateStreamRequest::new(created_stream.clone(), DEFAULT_CONTENT_TYPE);
+        create_request.attrs = Some(created_attrs.clone());
+        runtime
+            .create_stream(create_request)
+            .await
+            .expect("create stream with attrs");
+
+        create_stream(&runtime, &updated_stream).await;
+        runtime
+            .update_stream_attrs(UpdateStreamAttrsRequest {
+                stream_id: updated_stream.clone(),
+                attrs: Some(updated_attrs.clone()),
+                now_ms: 0,
+            })
+            .await
+            .expect("update stream attrs");
+    }
+
+    let recovered =
+        ShardRuntime::spawn_with_engine_factory(config, WalGroupEngineFactory::new(&wal_root))
+            .expect("spawn recovered runtime");
+    let recovered_created = recovered
+        .get_stream_attrs(GetStreamAttrsRequest {
+            stream_id: created_stream,
+            now_ms: 0,
+        })
+        .await
+        .expect("get attrs from replayed create");
+    assert_eq!(recovered_created.attrs, Some(created_attrs));
+    let recovered_updated = recovered
+        .get_stream_attrs(GetStreamAttrsRequest {
+            stream_id: updated_stream,
+            now_ms: 0,
+        })
+        .await
+        .expect("get attrs from replayed update");
+    assert_eq!(recovered_updated.attrs, Some(updated_attrs));
 
     drop(recovered);
     std::fs::remove_dir_all(&wal_root).expect("remove WAL root");

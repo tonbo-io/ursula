@@ -24,6 +24,7 @@ Bucket-level `GET` (metadata), `DELETE`, and `GET /{bucket}/streams` (list) are 
 | `POST` | `/{bucket}/{stream}/append-batch` | Batched append. See [extensions spec](/docs/specs/extensions#append-batch) |
 | `GET` | `/{bucket}/{stream}` | [Read (catch-up, long-poll, SSE)](/docs/api/read) |
 | `HEAD` | `/{bucket}/{stream}` | [Get stream metadata](/docs/api/head-stream) |
+| `GET` / `PUT` | `/{bucket}/{stream}/attrs` | [Read or replace stream attributes](/docs/api/stream-attrs) |
 | `DELETE` | `/{bucket}/{stream}` | [Delete a stream](/docs/api/delete-stream) |
 
 ## Bootstrap and snapshots

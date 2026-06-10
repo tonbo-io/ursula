@@ -36,6 +36,7 @@ use super::GroupEngineFactory;
 use super::GroupEngineMetrics;
 use super::GroupFlushColdFuture;
 use super::GroupForkRefFuture;
+use super::GroupGetStreamAttrsFuture;
 use super::GroupHeadStreamFuture;
 use super::GroupInstallSnapshotFuture;
 use super::GroupPlanColdFlushFuture;
@@ -48,6 +49,7 @@ use super::GroupReadStreamFuture;
 use super::GroupReadStreamPartsFuture;
 use super::GroupSnapshotFuture;
 use super::GroupTouchStreamAccessFuture;
+use super::GroupUpdateStreamAttrsFuture;
 use super::GroupWriteResponse;
 use crate::cold_index::ColdIndexPageCache;
 use crate::cold_index::ColdStoreColdIndexPageStore;
@@ -79,6 +81,8 @@ use crate::request::DeleteStreamResponse;
 use crate::request::FlushColdRequest;
 use crate::request::FlushColdResponse;
 use crate::request::ForkRefResponse;
+use crate::request::GetStreamAttrsRequest;
+use crate::request::GetStreamAttrsResponse;
 use crate::request::GroupReadStreamParts;
 use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
@@ -91,6 +95,8 @@ use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::StreamAppendCount;
 use crate::request::TouchStreamAccessResponse;
+use crate::request::UpdateStreamAttrsRequest;
+use crate::request::UpdateStreamAttrsResponse;
 
 pub(crate) struct AppendPayloadInput<'a> {
     stream_id: BucketStreamId,
@@ -149,6 +155,7 @@ impl InMemoryGroupEngine {
                 stream_expires_at_ms,
                 forked_from,
                 fork_offset,
+                attrs,
                 now_ms,
             } => {
                 ensure_bucket_exists(&mut self.state_machine, &stream_id)?;
@@ -163,6 +170,7 @@ impl InMemoryGroupEngine {
                     stream_expires_at_ms,
                     forked_from,
                     fork_offset,
+                    attrs,
                     now_ms,
                 });
                 match response {
@@ -218,6 +226,7 @@ impl InMemoryGroupEngine {
                 stream_expires_at_ms,
                 forked_from,
                 fork_offset,
+                attrs,
                 now_ms,
             } => {
                 ensure_bucket_exists(&mut self.state_machine, &stream_id)?;
@@ -232,6 +241,7 @@ impl InMemoryGroupEngine {
                     stream_expires_at_ms,
                     forked_from,
                     fork_offset,
+                    attrs,
                     now_ms,
                 });
                 match response {
@@ -521,6 +531,45 @@ impl InMemoryGroupEngine {
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected touch stream access response: {other:?}"
+                    ))),
+                }
+            }
+            GroupWriteCommand::UpdateStreamAttrs {
+                stream_id,
+                attrs,
+                now_ms,
+            } => {
+                let response = self.state_machine.apply(StreamCommand::UpdateStreamAttrs {
+                    stream_id,
+                    attrs,
+                    now_ms,
+                });
+                match response {
+                    StreamResponse::AttrsUpdated { changed } => {
+                        if changed {
+                            self.commit_index += 1;
+                        }
+                        Ok(GroupWriteResponse::UpdateStreamAttrs(
+                            UpdateStreamAttrsResponse {
+                                placement,
+                                changed,
+                                group_commit_index: self.commit_index,
+                            },
+                        ))
+                    }
+                    StreamResponse::Error {
+                        code,
+                        message,
+                        next_offset,
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
+                        code,
+                        message,
+                        next_offset,
+                        context,
+                    )),
+                    other => Err(GroupEngineError::new(format!(
+                        "unexpected update stream attrs response: {other:?}"
                     ))),
                 }
             }
@@ -1029,6 +1078,7 @@ impl InMemoryGroupEngine {
                 stream_expires_at_ms,
                 forked_from,
                 fork_offset,
+                attrs,
                 now_ms,
             } => {
                 ensure_bucket_exists(&mut self.state_machine, &stream_id)?;
@@ -1043,6 +1093,7 @@ impl InMemoryGroupEngine {
                     stream_expires_at_ms,
                     forked_from,
                     fork_offset,
+                    attrs,
                     now_ms,
                 });
                 match response {
@@ -1078,6 +1129,7 @@ impl InMemoryGroupEngine {
                 stream_expires_at_ms,
                 forked_from,
                 fork_offset,
+                attrs,
                 now_ms,
             } => {
                 ensure_bucket_exists(&mut self.state_machine, &stream_id)?;
@@ -1092,6 +1144,7 @@ impl InMemoryGroupEngine {
                     stream_expires_at_ms,
                     forked_from,
                     fork_offset,
+                    attrs,
                     now_ms,
                 });
                 match response {
@@ -1308,6 +1361,39 @@ impl InMemoryGroupEngine {
                     )),
                     other => Err(GroupEngineError::new(format!(
                         "unexpected replay touch stream access response: {other:?}"
+                    ))),
+                }
+            }
+            StreamCommand::UpdateStreamAttrs {
+                stream_id,
+                attrs,
+                now_ms,
+            } => {
+                let response = self.state_machine.apply(StreamCommand::UpdateStreamAttrs {
+                    stream_id,
+                    attrs,
+                    now_ms,
+                });
+                match response {
+                    StreamResponse::AttrsUpdated { changed } => {
+                        if changed {
+                            self.commit_index += 1;
+                        }
+                        Ok(())
+                    }
+                    StreamResponse::Error {
+                        code,
+                        message,
+                        next_offset,
+                        context,
+                    } => Err(GroupEngineError::stream_with_context(
+                        code,
+                        message,
+                        next_offset,
+                        context,
+                    )),
+                    other => Err(GroupEngineError::new(format!(
+                        "unexpected replay update stream attrs response: {other:?}"
                     ))),
                 }
             }
@@ -1592,6 +1678,27 @@ impl InMemoryGroupEngine {
                 .state_machine
                 .integrity_snapshot(&request.stream_id)
                 .map_err(stream_response_error)?,
+        })
+    }
+
+    pub fn get_stream_attrs_after_access(
+        &mut self,
+        request: &GetStreamAttrsRequest,
+        placement: ShardPlacement,
+    ) -> Result<GetStreamAttrsResponse, GroupEngineError> {
+        if self
+            .state_machine
+            .head_at(&request.stream_id, request.now_ms)
+            .is_none()
+        {
+            return Err(GroupEngineError::stream(
+                StreamErrorCode::StreamNotFound,
+                format!("stream '{}' does not exist", request.stream_id),
+            ));
+        }
+        Ok(GetStreamAttrsResponse {
+            placement,
+            attrs: self.state_machine.stream_attrs(&request.stream_id).cloned(),
         })
     }
 
@@ -2067,6 +2174,32 @@ impl GroupEngine for InMemoryGroupEngine {
         Box::pin(async move {
             self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
             self.head_stream_after_access(&request, placement)
+        })
+    }
+
+    fn get_stream_attrs<'a>(
+        &'a mut self,
+        request: GetStreamAttrsRequest,
+        placement: ShardPlacement,
+    ) -> GroupGetStreamAttrsFuture<'a> {
+        Box::pin(async move {
+            self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
+            self.get_stream_attrs_after_access(&request, placement)
+        })
+    }
+
+    fn update_stream_attrs<'a>(
+        &'a mut self,
+        request: UpdateStreamAttrsRequest,
+        placement: ShardPlacement,
+    ) -> GroupUpdateStreamAttrsFuture<'a> {
+        Box::pin(async move {
+            match self.apply_committed_write(GroupWriteCommand::from(request), placement)? {
+                GroupWriteResponse::UpdateStreamAttrs(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected update stream attrs write response: {other:?}"
+                ))),
+            }
         })
     }
 
