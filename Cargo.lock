@@ -3744,6 +3744,7 @@ dependencies = [
 name = "ursula-stream"
 version = "0.1.4"
 dependencies = [
+ "criterion",
  "proptest",
  "serde",
  "serde_json",
