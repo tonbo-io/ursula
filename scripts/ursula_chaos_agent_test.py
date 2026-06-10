@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import threading
 import unittest
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -9,6 +10,9 @@ from ursula_chaos_agent import (
     NODE_SERVICE_UNIT,
     ChaosAgent,
     Node,
+    ProducerState,
+    Setsum,
+    WorkloadStream,
     _published_started_at,
 )
 
@@ -184,6 +188,74 @@ class ChaosAgentStateTest(unittest.TestCase):
         )
         self.assertEqual(agent.effective_recovery_slo_secs("cluster_netem_delay"), 120)
         self.assertEqual(agent.effective_recovery_slo_secs(None), 120)
+
+    def test_parse_producer_seq_conflict(self) -> None:
+        parsed = ChaosAgent.parse_producer_seq_conflict(
+            b"core 1 raft group 3 operation failed: "
+            b"ProducerSeqConflict: producer 'chaos-agent-021' expected sequence 2908, received 2938"
+        )
+
+        self.assertEqual(parsed, ("chaos-agent-021", 2908, 2938))
+        self.assertIsNone(ChaosAgent.parse_producer_seq_conflict(b"ProducerEpochStale"))
+
+    def test_recover_producer_seq_conflict_resyncs_stream_and_bumps_epoch(self) -> None:
+        agent = object.__new__(ChaosAgent)
+        agent.nodes = [
+            Node("n1", "i-1", "http://n1:4491"),
+            Node("n2", "i-2", "http://n2:4491"),
+        ]
+        agent.state_lock = threading.Lock()
+        agent.events = deque()
+        agent.event = lambda level, message: agent.events.append((level, message))
+        producer = ProducerState("chaos-agent-001", epoch=3)
+        stream = WorkloadStream("run-test-0001", next_offset=99)
+        other_stream = WorkloadStream("run-test-0002", next_offset=7)
+        agent.streams = [stream, other_stream]
+        for workload_stream in agent.streams:
+            workload_stream.producer_seqs[producer.producer_id] = 42
+            workload_stream.producer_epochs[producer.producer_id] = producer.epoch
+            workload_stream.pending_producer_appends[
+                f"{producer.producer_id}\0{producer.epoch}\0{42}"
+            ] = b"pending"
+        server_setsum = Setsum()
+        server_setsum.insert_vectored([b"server"])
+        zero_setsum = Setsum().hexdigest()
+        calls: list[str] = []
+
+        def request(method, url, **kwargs):
+            calls.append(url)
+            if url.startswith("http://n1"):
+                return 200, b"", {
+                    "stream-next-offset": "80",
+                    "stream-integrity-total-records": "8",
+                    "stream-integrity-total-setsum": zero_setsum,
+                }
+            return 200, b"", {
+                "stream-next-offset": "120",
+                "stream-integrity-total-records": "12",
+                "stream-integrity-total-setsum": server_setsum.hexdigest(),
+            }
+
+        agent.request = request
+
+        self.assertTrue(
+            agent.recover_producer_seq_conflict(
+                stream,
+                producer,
+                expected_seq=40,
+                received_seq=42,
+            )
+        )
+
+        self.assertEqual(calls, ["http://n1:4491/chaos/run-test-0001", "http://n2:4491/chaos/run-test-0001"])
+        self.assertEqual(stream.next_offset, 120)
+        self.assertEqual(stream.expected_live_setsum.hexdigest(), server_setsum.hexdigest())
+        self.assertEqual(producer.epoch, 4)
+        for workload_stream in agent.streams:
+            self.assertEqual(workload_stream.producer_seqs[producer.producer_id], 0)
+            self.assertEqual(workload_stream.producer_epochs[producer.producer_id], 4)
+            self.assertEqual(workload_stream.pending_producer_appends, {})
+        self.assertEqual(agent.events[-1][0], "warn")
 
 
 if __name__ == "__main__":
