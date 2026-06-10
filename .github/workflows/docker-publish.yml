@@ -5,22 +5,12 @@ on:
     paths:
       - .dockerignore
       - .github/workflows/docker-publish.yml
-      - Cargo.lock
-      - Cargo.toml
       - Dockerfile
-      - crates/**
   push:
     branches:
       - main
     tags:
       - "v*.*.*"
-    paths:
-      - .dockerignore
-      - .github/workflows/docker-publish.yml
-      - Cargo.lock
-      - Cargo.toml
-      - Dockerfile
-      - crates/**
   workflow_dispatch:
 
 permissions:
