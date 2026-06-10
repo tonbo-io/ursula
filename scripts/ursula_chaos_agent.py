@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import random
+import re
 import subprocess
 import sys
 import threading
@@ -112,6 +113,9 @@ CLUSTER_IPS_BY_NAME = {
     "ursula-chaos-node-2": "172.31.31.150",
     "ursula-chaos-node-3": "172.31.47.237",
 }
+PRODUCER_SEQ_CONFLICT_RE = re.compile(
+    r"ProducerSeqConflict: producer '([^']+)' expected sequence (\d+), received (\d+)"
+)
 # systemd unit running the ursula node process on each node, targeted by the
 # process kill/freeze faults (faultd runs `systemctl` against it).
 NODE_SERVICE_UNIT = "ursula-chaos.service"
@@ -620,6 +624,90 @@ class ChaosAgent:
                 payload,
             )
 
+    @staticmethod
+    def parse_producer_seq_conflict(body: bytes) -> tuple[str, int, int] | None:
+        body_preview = body[:240].decode("utf-8", errors="replace")
+        match = PRODUCER_SEQ_CONFLICT_RE.search(body_preview)
+        if match is None:
+            return None
+        return match.group(1), int(match.group(2)), int(match.group(3))
+
+    def resync_stream_from_server(self, stream: WorkloadStream) -> bool:
+        samples: list[tuple[int, int, str]] = []
+        last_error: str | None = None
+        for node in self.nodes:
+            try:
+                status, _, headers = self.request("HEAD", f"{node.base_url}/{BUCKET}/{stream.name}")
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"{node.name} head failed: {exc}"
+                continue
+            if status != 200:
+                last_error = f"{node.name} head status={status}"
+                continue
+            next_offset = parse_int(headers.get("stream-next-offset"))
+            total_records = parse_int(headers.get("stream-integrity-total-records")) or 0
+            total_setsum = headers.get("stream-integrity-total-setsum")
+            if next_offset is None or total_setsum is None:
+                last_error = f"{node.name} head missing stream-next-offset or total setsum"
+                continue
+            samples.append((total_records, next_offset, total_setsum))
+        if not samples:
+            self.event(
+                "warn",
+                f"producer conflict resync skipped for {stream.name}: "
+                f"{last_error or 'no server integrity sample'}",
+            )
+            return False
+        total_records, next_offset, total_setsum = max(samples, key=lambda sample: (sample[0], sample[1]))
+        try:
+            expected_setsum = Setsum()
+            expected_setsum.load_hex(total_setsum)
+        except ValueError as exc:
+            self.event(
+                "warn",
+                f"producer conflict resync skipped for {stream.name}: invalid server setsum {exc}",
+            )
+            return False
+        with self.state_lock:
+            stream.next_offset = next_offset
+            stream.expected_live_setsum = expected_setsum
+            stream.pending_producer_appends.clear()
+            stream.verified_offsets = min(stream.verified_offsets, next_offset)
+        return True
+
+    def recover_producer_seq_conflict(
+        self,
+        stream: WorkloadStream,
+        producer: ProducerState,
+        *,
+        expected_seq: int,
+        received_seq: int,
+    ) -> bool:
+        if not self.resync_stream_from_server(stream):
+            return False
+        with self.state_lock:
+            old_epoch = producer.epoch
+            producer.epoch += 1
+            producer.seq = 0
+            for workload_stream in self.streams:
+                workload_stream.producer_seqs[producer.producer_id] = 0
+                workload_stream.producer_epochs[producer.producer_id] = producer.epoch
+                prefix = f"{producer.producer_id}\0"
+                stale_keys = [
+                    key for key in workload_stream.pending_producer_appends
+                    if key.startswith(prefix)
+                ]
+                for key in stale_keys:
+                    workload_stream.pending_producer_appends.pop(key, None)
+            new_epoch = producer.epoch
+        self.event(
+            "warn",
+            f"recovered producer sequence conflict for {producer.producer_id} on {stream.name}: "
+            f"server expected {expected_seq}, agent sent {received_seq}; "
+            f"bumped epoch {old_epoch}->{new_epoch}",
+        )
+        return True
+
     def request(
         self,
         method: str,
@@ -752,6 +840,7 @@ class ChaosAgent:
         saw_cold_backpressure = False
         saw_hard_error = False
         saw_transient_failure = False
+        producer_seq_conflict: tuple[int, int] | None = None
         retry_deadline = time.monotonic() + APPEND_TRANSIENT_RETRY_SECS
         while True:
             retryable_sweep = False
@@ -777,6 +866,13 @@ class ChaosAgent:
                 if status not in {200, 204}:
                     body_preview = body[:160].decode("utf-8", errors="replace").strip()
                     last_error = f"{node.name}: status={status} body={body_preview!r}"
+                    conflict = self.parse_producer_seq_conflict(body)
+                    if (
+                        status == 409
+                        and conflict is not None
+                        and conflict[0] == producer_id
+                    ):
+                        producer_seq_conflict = (conflict[1], conflict[2])
                     if status == 503 and "ColdBackpressure" in body_preview:
                         saw_cold_backpressure = True
                     elif self.is_transient_append_failure(status, body, headers):
@@ -867,6 +963,22 @@ class ChaosAgent:
         # commit, so the append is resolved (not unknown) and is recorded as a
         # shed rather than a workload error.
         is_pure_shed = saw_cold_backpressure and not saw_hard_error and not saw_transient_failure
+        if producer_seq_conflict is not None:
+            expected_seq, received_seq = producer_seq_conflict
+            if self.recover_producer_seq_conflict(
+                stream,
+                producer,
+                expected_seq=expected_seq,
+                received_seq=received_seq,
+            ):
+                with self.state_lock:
+                    if lane_id is None:
+                        self.global_unresolved_append = False
+                    else:
+                        lane = lane_id % self.append_workers
+                        self.lane_unresolved_appends[lane] = False
+                        self.lane_attempts[lane] += 1
+                return False
         with self.state_lock:
             if is_pure_shed:
                 self.append_shed += 1
