@@ -1,5 +1,7 @@
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Map;
+use serde_json::Value;
 use ursula_proto::ColdChunkRefV1;
 use ursula_proto::ExternalPayloadRefV1;
 use ursula_proto::ProducerRequestV1;
@@ -28,6 +30,25 @@ pub struct StreamMetadata {
     pub forked_from: Option<BucketStreamId>,
     pub fork_offset: Option<u64>,
     pub fork_ref_count: u64,
+}
+
+/// Maximum encoded JSON size of a stream attribute object. Attrs travel in
+/// every raft log entry, WAL record, and snapshot entry that carries them, so
+/// the limit keeps replicated state small.
+pub const MAX_STREAM_ATTRS_BYTES: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamAttrs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    pub metadata: Map<String, Value>,
+}
+
+impl StreamAttrs {
+    pub fn is_empty(&self) -> bool {
+        self.title.is_none() && self.metadata.is_empty()
+    }
 }
 
 pub type ProducerRequest = ProducerRequestV1;

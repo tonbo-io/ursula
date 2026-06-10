@@ -12,6 +12,7 @@ autobenches = false
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 setsum = { workspace = true }
 ursula-shard = { workspace = true }
 ursula-proto = { workspace = true }
@@ -19,7 +20,6 @@ ursula-proto = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
-serde_json = { workspace = true }
 
 [[bench]]
 name = "plan_next_cold_flush"

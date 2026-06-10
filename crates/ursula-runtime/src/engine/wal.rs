@@ -30,6 +30,7 @@ use super::GroupEngineFactory;
 use super::GroupEngineMetrics;
 use super::GroupFlushColdFuture;
 use super::GroupForkRefFuture;
+use super::GroupGetStreamAttrsFuture;
 use super::GroupHeadStreamFuture;
 use super::GroupInstallSnapshotFuture;
 use super::GroupPlanColdFlushFuture;
@@ -40,6 +41,7 @@ use super::GroupReadSnapshotFuture;
 use super::GroupReadStreamFuture;
 use super::GroupSnapshotFuture;
 use super::GroupTouchStreamAccessFuture;
+use super::GroupUpdateStreamAttrsFuture;
 use super::GroupWriteResponse;
 use super::in_memory::InMemoryGroupEngine;
 use crate::cold_store::ColdStoreHandle;
@@ -55,6 +57,7 @@ use crate::request::CreateStreamRequest;
 use crate::request::DeleteSnapshotRequest;
 use crate::request::DeleteStreamRequest;
 use crate::request::FlushColdRequest;
+use crate::request::GetStreamAttrsRequest;
 use crate::request::HeadStreamRequest;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
@@ -63,6 +66,7 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadStreamRequest;
 use crate::request::StreamAppendCount;
 use crate::request::TouchStreamAccessResponse;
+use crate::request::UpdateStreamAttrsRequest;
 use crate::rt::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -357,6 +361,18 @@ impl GroupEngine for WalGroupEngine {
         })
     }
 
+    fn get_stream_attrs<'a>(
+        &'a mut self,
+        request: GetStreamAttrsRequest,
+        placement: ShardPlacement,
+    ) -> GroupGetStreamAttrsFuture<'a> {
+        Box::pin(async move {
+            self.ensure_ready()?;
+            self.commit_access_if_needed(&request.stream_id, request.now_ms, false, placement)?;
+            self.inner.get_stream_attrs(request, placement).await
+        })
+    }
+
     fn read_stream<'a>(
         &'a mut self,
         request: ReadStreamRequest,
@@ -453,6 +469,31 @@ impl GroupEngine for WalGroupEngine {
                 }
             };
             if response.changed || response.expired {
+                self.append_record(&command)?;
+            }
+            self.inner = preview;
+            Ok(response)
+        })
+    }
+
+    fn update_stream_attrs<'a>(
+        &'a mut self,
+        request: UpdateStreamAttrsRequest,
+        placement: ShardPlacement,
+    ) -> GroupUpdateStreamAttrsFuture<'a> {
+        Box::pin(async move {
+            self.ensure_ready()?;
+            let command = GroupWriteCommand::from(request);
+            let mut preview = self.inner.clone();
+            let response = match preview.apply_committed_write(command.clone(), placement)? {
+                GroupWriteResponse::UpdateStreamAttrs(response) => response,
+                other => {
+                    return Err(GroupEngineError::new(format!(
+                        "unexpected update stream attrs write response: {other:?}"
+                    )));
+                }
+            };
+            if response.changed {
                 self.append_record(&command)?;
             }
             self.inner = preview;

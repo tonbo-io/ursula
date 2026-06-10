@@ -61,6 +61,8 @@ use crate::request::DeleteStreamResponse;
 use crate::request::FlushColdRequest;
 use crate::request::FlushColdResponse;
 use crate::request::ForkRefResponse;
+use crate::request::GetStreamAttrsRequest;
+use crate::request::GetStreamAttrsResponse;
 use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
 use crate::request::PlanColdFlushRequest;
@@ -71,6 +73,8 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
+use crate::request::UpdateStreamAttrsRequest;
+use crate::request::UpdateStreamAttrsResponse;
 use crate::rt::sync::Semaphore;
 use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
@@ -398,6 +402,44 @@ impl ShardRuntime {
         self.send_core_command(
             mailbox,
             CoreCommand::HeadStream {
+                request,
+                placement,
+                response_tx,
+            },
+            response_rx,
+        )
+        .await
+    }
+
+    pub async fn get_stream_attrs(
+        &self,
+        request: GetStreamAttrsRequest,
+    ) -> Result<GetStreamAttrsResponse, RuntimeError> {
+        let placement = self.shard_map.locate(&request.stream_id);
+        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send_core_command(
+            mailbox,
+            CoreCommand::GetStreamAttrs {
+                request,
+                placement,
+                response_tx,
+            },
+            response_rx,
+        )
+        .await
+    }
+
+    pub async fn update_stream_attrs(
+        &self,
+        request: UpdateStreamAttrsRequest,
+    ) -> Result<UpdateStreamAttrsResponse, RuntimeError> {
+        let placement = self.shard_map.locate(&request.stream_id);
+        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send_core_command(
+            mailbox,
+            CoreCommand::UpdateStreamAttrs {
                 request,
                 placement,
                 response_tx,

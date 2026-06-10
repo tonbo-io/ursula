@@ -87,6 +87,7 @@ use ursula_runtime::DeleteSnapshotRequest;
 use ursula_runtime::DeleteStreamRequest;
 use ursula_runtime::ErrorStatus;
 use ursula_runtime::ExternalPayloadRef;
+use ursula_runtime::GetStreamAttrsRequest;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::ProducerRequest;
@@ -95,6 +96,8 @@ use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
+use ursula_runtime::StreamAttrs;
+use ursula_runtime::UpdateStreamAttrsRequest;
 use ursula_runtime::new_external_payload_path;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
@@ -152,6 +155,7 @@ const HEADER_STREAM_COLD_HOT_START_OFFSET: &str = "stream-cold-hot-start-offset"
 const HEADER_STREAM_NEXT_OFFSET: &str = "stream-next-offset";
 const HEADER_STREAM_SNAPSHOT_OFFSET: &str = "stream-snapshot-offset";
 const HEADER_STREAM_SSE_DATA_ENCODING: &str = "stream-sse-data-encoding";
+const HEADER_STREAM_ATTRS: &str = "stream-attrs";
 const HEADER_STREAM_SEQ: &str = "stream-seq";
 const HEADER_STREAM_TTL: &str = "stream-ttl";
 const HEADER_STREAM_UP_TO_DATE: &str = "stream-up-to-date";
@@ -739,6 +743,10 @@ pub fn client_router_from_state(state: HttpState) -> Router {
                 .delete(delete_snapshot),
         )
         .route("/{bucket}/{stream}/bootstrap", get(bootstrap_stream))
+        .route(
+            "/{bucket}/{stream}/attrs",
+            put(update_stream_attrs).get(get_stream_attrs),
+        )
         .route(
             "/{bucket}/{stream}",
             put(create_stream)
@@ -1542,6 +1550,10 @@ pub(crate) async fn create_stream_by_id(
         Ok(lifetime) => lifetime,
         Err(response) => return *response,
     };
+    let attrs = match stream_attrs(&request_headers) {
+        Ok(attrs) => attrs,
+        Err(response) => return *response,
+    };
     let mut request = CreateStreamRequest::new(stream_id.clone(), content_type.clone());
     request.content_type_explicit = content_type_explicit;
     request.now_ms = state.unix_time_ms();
@@ -1556,6 +1568,7 @@ pub(crate) async fn create_stream_by_id(
     request.stream_expires_at_ms = stream_expires_at_ms;
     request.forked_from = forked_from;
     request.fork_offset = fork_offset;
+    request.attrs = attrs;
     let producer = match producer_request(&request_headers) {
         Ok(producer) => producer,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
@@ -1849,6 +1862,97 @@ pub(crate) async fn delete_stream_by_id(
             (StatusCode::NO_CONTENT, headers).into_response()
         }
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
+    }
+}
+
+pub(crate) async fn update_stream_attrs(
+    State(state): State<HttpState>,
+    OriginalUri(uri): OriginalUri,
+    Path((bucket, stream)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !has_content_type(&headers) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "stream attrs update must include content type",
+        )
+            .into_response();
+    }
+    let content_type = request_content_type(&headers);
+    if !render::is_json_content_type(&content_type) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "stream attrs update body must be application/json",
+        )
+            .into_response();
+    }
+    let attrs = match serde_json::from_slice::<StreamAttrs>(&body) {
+        Ok(attrs) => attrs,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid stream attrs JSON: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let stream_id = BucketStreamId::new(bucket, stream);
+    match state
+        .runtime
+        .update_stream_attrs(UpdateStreamAttrsRequest {
+            stream_id,
+            attrs: Some(attrs),
+            now_ms: state.unix_time_ms(),
+        })
+        .await
+    {
+        Ok(_) => {
+            let mut headers = HeaderMap::new();
+            insert_default_response_headers(&mut headers);
+            (StatusCode::NO_CONTENT, headers).into_response()
+        }
+        Err(err) => {
+            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
+        }
+    }
+}
+
+pub(crate) async fn get_stream_attrs(
+    State(state): State<HttpState>,
+    OriginalUri(uri): OriginalUri,
+    Path((bucket, stream)): Path<(String, String)>,
+) -> Response {
+    let stream_id = BucketStreamId::new(bucket, stream);
+    match state
+        .runtime
+        .get_stream_attrs(GetStreamAttrsRequest {
+            stream_id,
+            now_ms: state.unix_time_ms(),
+        })
+        .await
+    {
+        Ok(response) => {
+            let attrs = response.attrs.unwrap_or_default();
+            let body = match serde_json::to_vec(&attrs) {
+                Ok(body) => body,
+                Err(err) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("render stream attrs JSON: {err}"),
+                    )
+                        .into_response();
+                }
+            };
+            let mut headers = HeaderMap::new();
+            insert_default_response_headers(&mut headers);
+            insert_content_type(&mut headers, "application/json");
+            insert_cache_control(&mut headers, "no-store");
+            (StatusCode::OK, headers, body).into_response()
+        }
+        Err(err) => {
+            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
+        }
     }
 }
 
@@ -2539,6 +2643,23 @@ pub(crate) fn stream_fork_offset(headers: &HeaderMap) -> Result<Option<u64>, Box
     normalized.parse::<u64>().map(Some).map_err(|_| {
         Box::new((StatusCode::BAD_REQUEST, "invalid stream-fork-offset").into_response())
     })
+}
+
+pub(crate) fn stream_attrs(headers: &HeaderMap) -> Result<Option<StreamAttrs>, BoxResponse> {
+    let Some(raw) = header_value(headers, HEADER_STREAM_ATTRS) else {
+        return Ok(None);
+    };
+    serde_json::from_str::<StreamAttrs>(raw)
+        .map(Some)
+        .map_err(|err| {
+            Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid stream-attrs JSON: {err}"),
+                )
+                    .into_response(),
+            )
+        })
 }
 
 pub(crate) fn has_content_type(headers: &HeaderMap) -> bool {

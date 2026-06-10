@@ -39,6 +39,8 @@ use crate::request::DeleteStreamResponse;
 use crate::request::FlushColdRequest;
 use crate::request::FlushColdResponse;
 use crate::request::ForkRefResponse;
+use crate::request::GetStreamAttrsRequest;
+use crate::request::GetStreamAttrsResponse;
 use crate::request::GroupReadStreamParts;
 use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
@@ -51,6 +53,8 @@ use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
 use crate::request::TouchStreamAccessResponse;
+use crate::request::UpdateStreamAttrsRequest;
+use crate::request::UpdateStreamAttrsResponse;
 
 pub type GroupAppendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AppendResponse, GroupEngineError>> + Send + 'a>>;
@@ -70,6 +74,8 @@ pub type GroupCreateStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CreateStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupHeadStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<HeadStreamResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupGetStreamAttrsFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<GetStreamAttrsResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupReadStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ReadStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupReadStreamPartsFuture<'a> =
@@ -86,6 +92,8 @@ pub type GroupBootstrapStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<BootstrapStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupTouchStreamAccessFuture<'a> =
     Pin<Box<dyn Future<Output = Result<TouchStreamAccessResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupUpdateStreamAttrsFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<UpdateStreamAttrsResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupCloseStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CloseStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupDeleteStreamFuture<'a> =
@@ -129,6 +137,7 @@ pub enum GroupWriteResponse {
     AppendBatch(GroupAppendBatchResponse),
     PublishSnapshot(PublishSnapshotResponse),
     TouchStreamAccess(TouchStreamAccessResponse),
+    UpdateStreamAttrs(UpdateStreamAttrsResponse),
     AddForkRef(ForkRefResponse),
     ReleaseForkRef(ForkRefResponse),
     FlushCold(FlushColdResponse),
@@ -167,6 +176,19 @@ pub trait GroupEngine: Send + 'static {
         request: HeadStreamRequest,
         placement: ShardPlacement,
     ) -> GroupHeadStreamFuture<'a>;
+
+    fn get_stream_attrs<'a>(
+        &'a mut self,
+        request: GetStreamAttrsRequest,
+        _placement: ShardPlacement,
+    ) -> GroupGetStreamAttrsFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "stream attrs read is not supported for stream '{}'",
+                request.stream_id
+            )))
+        })
+    }
 
     fn read_stream<'a>(
         &'a mut self,
@@ -251,6 +273,19 @@ pub trait GroupEngine: Send + 'static {
         renew_ttl: bool,
         placement: ShardPlacement,
     ) -> GroupTouchStreamAccessFuture<'a>;
+
+    fn update_stream_attrs<'a>(
+        &'a mut self,
+        request: UpdateStreamAttrsRequest,
+        _placement: ShardPlacement,
+    ) -> GroupUpdateStreamAttrsFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "stream attrs update is not supported for stream '{}'",
+                request.stream_id
+            )))
+        })
+    }
 
     fn add_fork_ref<'a>(
         &'a mut self,
@@ -463,6 +498,7 @@ pub trait GroupEngine: Send + 'static {
                         stream_expires_at_ms,
                         forked_from,
                         fork_offset,
+                        attrs,
                         now_ms,
                     } => self
                         .create_stream(
@@ -478,6 +514,7 @@ pub trait GroupEngine: Send + 'static {
                                 stream_expires_at_ms,
                                 forked_from,
                                 fork_offset,
+                                attrs,
                                 now_ms,
                             },
                             placement,
@@ -495,6 +532,7 @@ pub trait GroupEngine: Send + 'static {
                         stream_expires_at_ms,
                         forked_from,
                         fork_offset,
+                        attrs,
                         now_ms,
                     } => self
                         .create_stream_external(
@@ -509,6 +547,7 @@ pub trait GroupEngine: Send + 'static {
                                 stream_expires_at_ms,
                                 forked_from,
                                 fork_offset,
+                                attrs,
                                 now_ms,
                             },
                             placement,
@@ -607,6 +646,21 @@ pub trait GroupEngine: Send + 'static {
                         .touch_stream_access(stream_id, now_ms, renew_ttl, placement)
                         .await
                         .map(GroupWriteResponse::TouchStreamAccess),
+                    GroupWriteCommand::UpdateStreamAttrs {
+                        stream_id,
+                        attrs,
+                        now_ms,
+                    } => self
+                        .update_stream_attrs(
+                            UpdateStreamAttrsRequest {
+                                stream_id,
+                                attrs,
+                                now_ms,
+                            },
+                            placement,
+                        )
+                        .await
+                        .map(GroupWriteResponse::UpdateStreamAttrs),
                     GroupWriteCommand::AddForkRef { stream_id, now_ms } => self
                         .add_fork_ref(stream_id, now_ms, placement)
                         .await

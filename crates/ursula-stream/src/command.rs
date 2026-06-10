@@ -5,6 +5,7 @@ use ursula_shard::BucketStreamId;
 use crate::model::ColdChunkRef;
 use crate::model::ExternalPayloadRef;
 use crate::model::ProducerRequest;
+use crate::model::StreamAttrs;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamCommand {
@@ -25,6 +26,9 @@ pub enum StreamCommand {
         stream_expires_at_ms: Option<u64>,
         forked_from: Option<BucketStreamId>,
         fork_offset: Option<u64>,
+        // `default` keeps pre-attrs WAL records decodable.
+        #[serde(default)]
+        attrs: Option<StreamAttrs>,
         now_ms: u64,
     },
     CreateExternal {
@@ -38,6 +42,9 @@ pub enum StreamCommand {
         stream_expires_at_ms: Option<u64>,
         forked_from: Option<BucketStreamId>,
         fork_offset: Option<u64>,
+        // `default` keeps pre-attrs WAL records decodable.
+        #[serde(default)]
+        attrs: Option<StreamAttrs>,
         now_ms: u64,
     },
     Append {
@@ -76,6 +83,11 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
         now_ms: u64,
         renew_ttl: bool,
+    },
+    UpdateStreamAttrs {
+        stream_id: BucketStreamId,
+        attrs: Option<StreamAttrs>,
+        now_ms: u64,
     },
     AddForkRef {
         stream_id: BucketStreamId,

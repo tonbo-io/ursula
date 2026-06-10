@@ -10,7 +10,7 @@ title: "Durable Streams Extensions"
 
 ## Abstract
 
-This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, and multipart bootstrap delivery. It also documents Ursula-specific append batching as an implementation extension for high-throughput small-event writes.
+This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, multipart bootstrap delivery, mutable stream attributes, and Ursula-specific append batching for high-throughput small-event writes.
 
 The snapshot and bootstrap design in sections 2 and 3 was proposed by [Loro](https://loro.dev/); Ursula adopts that design.
 
@@ -26,8 +26,9 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 2. [Snapshots](#2-snapshots)
 3. [Bootstrap](#3-bootstrap)
 4. [Append Batch](#4-append-batch)
-5. [Ordinary SSE Compatibility](#5-ordinary-sse-compatibility)
-6. [URL Encoding](#6-url-encoding)
+5. [Stream Attributes](#5-stream-attributes)
+6. [Ordinary SSE Compatibility](#6-ordinary-sse-compatibility)
+7. [URL Encoding](#7-url-encoding)
 
 ---
 
@@ -397,7 +398,93 @@ All standard stream read APIs remain unchanged. Data appended through Append Bat
 
 ---
 
-## 5. Ordinary SSE Compatibility
+## 5. Stream Attributes
+
+Stream Attributes are an Ursula-specific metadata extension for mutable, application-owned stream attributes. They are separate from the base protocol's stream metadata returned by `HEAD {stream_url}`.
+
+Attributes are not part of the append-only byte stream. Updating attributes MUST NOT change stream offsets, `ETag`, content type, closed state, snapshots, bootstrap payloads, or ordinary read results.
+
+### 5.1. Attribute Object
+
+The attribute document is a JSON object with the following optional fields:
+
+```json
+{
+  "title": "Support session",
+  "metadata": {
+    "purpose": "customer-support",
+    "environment_id": "env_019e2590d33f711fabf42f2857cecd8a",
+    "agent": {
+      "id": "agent_019e390add9f7bac9b6cc806db46fcbd",
+      "version": 2
+    }
+  }
+}
+```
+
+Fields:
+
+- `title`: Optional string. Interpreted by the application.
+- `metadata`: Optional JSON object for arbitrary application metadata.
+
+Ursula does not define first-class semantics for application concepts such as agents or environments. If an application wants to associate such information with a stream, it SHOULD store that information inside `metadata`.
+
+Unknown top-level fields are ignored: servers MUST accept attribute objects containing unrecognized top-level fields and MUST NOT store them. Clients that need additional fields MUST place them inside `metadata`.
+
+The encoded attribute object MUST NOT exceed 16 KiB. Servers MUST reject larger attribute documents with `400 Bad Request`. Attributes are replicated with stream state, so the limit keeps log entries and snapshots small.
+
+An empty attribute object (`{}`) is equivalent to no attributes.
+
+### 5.2. Create Stream With Attributes
+
+Attributes MAY be supplied when creating a stream:
+
+```http
+PUT {stream_url}
+Stream-Attrs: {"title":"Support session","metadata":{"purpose":"customer-support"}}
+```
+
+`Stream-Attrs` is an optional request header whose value is the JSON attribute object.
+
+When a stream already exists, the create request is idempotent only if the existing stream attributes match the supplied attributes after empty-object normalization. A mismatch MUST return `409 Conflict`, the same as other create-configuration mismatches.
+
+### 5.3. Read Attributes
+
+```http
+GET {stream_url}/attrs
+```
+
+**Response:**
+
+- `200 OK`: Returns the current attribute object as `application/json`.
+- `404 Not Found`: The stream does not exist or has expired.
+- `410 Gone`: The stream was soft-deleted.
+
+When no attributes are set, the response body is `{}`.
+
+### 5.4. Replace Attributes
+
+```http
+PUT {stream_url}/attrs
+Content-Type: application/json
+
+{"title":"Renamed session","metadata":{"purpose":"debugging"}}
+```
+
+The request body replaces the complete attribute object. Partial merge semantics are not defined by this extension.
+
+**Response Codes:**
+
+- `204 No Content`: Attributes were replaced, or the submitted object already matched the stored attributes.
+- `400 Bad Request`: The request is missing `Content-Type`, the content type is not `application/json`, the body is not a valid attribute JSON object, or the attribute object exceeds the size limit.
+- `404 Not Found`: The stream does not exist or has expired.
+- `410 Gone`: The stream was soft-deleted.
+
+Submitting `{}` clears the stream attributes. Attributes MAY be updated after a stream is closed because stream closure only forbids further appends.
+
+---
+
+## 6. Ordinary SSE Compatibility
 
 Ordinary SSE behavior, including binary stream handling, is defined by `docs/specs/durable-stream.md`.
 
@@ -406,6 +493,6 @@ Ordinary SSE behavior, including binary stream handling, is defined by `docs/spe
 
 ---
 
-## 6. URL Encoding
+## 7. URL Encoding
 
 `snapshot_offset` values originate from `Stream-Next-Offset` and MAY contain characters requiring URL encoding. Clients and servers MUST apply standard URL encoding/decoding when using offset values in path segments.

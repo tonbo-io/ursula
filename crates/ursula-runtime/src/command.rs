@@ -8,6 +8,7 @@ use ursula_shard::ShardPlacement;
 use ursula_stream::ColdChunkRef;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::ProducerRequest;
+use ursula_stream::StreamAttrs;
 use ursula_stream::StreamSnapshot;
 
 use crate::request::AppendBatchRequest;
@@ -20,6 +21,7 @@ use crate::request::DeleteStreamRequest;
 use crate::request::FlushColdRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::StreamAppendCount;
+use crate::request::UpdateStreamAttrsRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GroupSnapshot {
@@ -43,6 +45,9 @@ pub enum GroupWriteCommand {
         stream_expires_at_ms: Option<u64>,
         forked_from: Option<BucketStreamId>,
         fork_offset: Option<u64>,
+        // `default` keeps pre-attrs WAL records decodable.
+        #[serde(default)]
+        attrs: Option<StreamAttrs>,
         now_ms: u64,
     },
     CreateExternal {
@@ -56,6 +61,9 @@ pub enum GroupWriteCommand {
         stream_expires_at_ms: Option<u64>,
         forked_from: Option<BucketStreamId>,
         fork_offset: Option<u64>,
+        // `default` keeps pre-attrs WAL records decodable.
+        #[serde(default)]
+        attrs: Option<StreamAttrs>,
         now_ms: u64,
     },
     Append {
@@ -94,6 +102,11 @@ pub enum GroupWriteCommand {
         stream_id: BucketStreamId,
         now_ms: u64,
         renew_ttl: bool,
+    },
+    UpdateStreamAttrs {
+        stream_id: BucketStreamId,
+        attrs: Option<StreamAttrs>,
+        now_ms: u64,
     },
     AddForkRef {
         stream_id: BucketStreamId,
@@ -136,6 +149,7 @@ impl From<CreateStreamRequest> for GroupWriteCommand {
             stream_expires_at_ms: request.stream_expires_at_ms,
             forked_from: request.forked_from,
             fork_offset: request.fork_offset,
+            attrs: request.attrs,
             now_ms: request.now_ms,
         }
     }
@@ -154,6 +168,7 @@ impl From<&CreateStreamRequest> for GroupWriteCommand {
             stream_expires_at_ms: request.stream_expires_at_ms,
             forked_from: request.forked_from.clone(),
             fork_offset: request.fork_offset,
+            attrs: request.attrs.clone(),
             now_ms: request.now_ms,
         }
     }
@@ -172,6 +187,7 @@ impl From<CreateStreamExternalRequest> for GroupWriteCommand {
             stream_expires_at_ms: request.stream_expires_at_ms,
             forked_from: request.forked_from,
             fork_offset: request.fork_offset,
+            attrs: request.attrs,
             now_ms: request.now_ms,
         }
     }
@@ -190,6 +206,27 @@ impl From<&CreateStreamExternalRequest> for GroupWriteCommand {
             stream_expires_at_ms: request.stream_expires_at_ms,
             forked_from: request.forked_from.clone(),
             fork_offset: request.fork_offset,
+            attrs: request.attrs.clone(),
+            now_ms: request.now_ms,
+        }
+    }
+}
+
+impl From<UpdateStreamAttrsRequest> for GroupWriteCommand {
+    fn from(request: UpdateStreamAttrsRequest) -> Self {
+        Self::UpdateStreamAttrs {
+            stream_id: request.stream_id,
+            attrs: request.attrs,
+            now_ms: request.now_ms,
+        }
+    }
+}
+
+impl From<&UpdateStreamAttrsRequest> for GroupWriteCommand {
+    fn from(request: &UpdateStreamAttrsRequest) -> Self {
+        Self::UpdateStreamAttrs {
+            stream_id: request.stream_id.clone(),
+            attrs: request.attrs.clone(),
             now_ms: request.now_ms,
         }
     }
@@ -411,6 +448,9 @@ impl fmt::Display for GroupWriteCommand {
                 ..
             } => {
                 write!(f, "touch_stream_access:{stream_id}:renew_ttl={renew_ttl}")
+            }
+            Self::UpdateStreamAttrs { stream_id, .. } => {
+                write!(f, "update_stream_attrs:{stream_id}")
             }
             Self::AddForkRef { stream_id, .. } => {
                 write!(f, "add_fork_ref:{stream_id}")

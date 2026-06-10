@@ -29,6 +29,7 @@ use ursula_proto as raft_app_proto;
 use ursula_runtime::ColdIndexPageCache;
 use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::ColdStoreHandle;
+use ursula_runtime::GetStreamAttrsRequest;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::HeadStreamRequest;
@@ -37,6 +38,7 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 
 use crate::codec::encode_group_write_result;
+use crate::codec::get_stream_attrs_response_to_proto;
 use crate::codec::group_engine_error_to_proto;
 use crate::codec::group_write_command_from_proto;
 use crate::codec::head_stream_response_to_proto;
@@ -366,6 +368,19 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     .map(|response| raft_internal_proto::GroupReadResponseV1 {
                         ok: true,
                         payload: head_stream_response_to_proto(response).encode_to_vec(),
+                    }),
+                raft_internal_proto::group_read_request_v1::Read::GetStreamAttrs(_) => engine
+                    .get_stream_attrs(
+                        GetStreamAttrsRequest {
+                            stream_id,
+                            now_ms: request.now_ms,
+                        },
+                        placement,
+                    )
+                    .await
+                    .map(|response| raft_internal_proto::GroupReadResponseV1 {
+                        ok: true,
+                        payload: get_stream_attrs_response_to_proto(response).encode_to_vec(),
                     }),
                 raft_internal_proto::group_read_request_v1::Read::ReadStream(read) => {
                     let max_len = usize::try_from(read.max_len).map_err(|_| {
