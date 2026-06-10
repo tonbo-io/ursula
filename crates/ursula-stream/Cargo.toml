@@ -8,6 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
 description = "Durable Streams state machine for Ursula: bucket and stream commands, events, and offset bookkeeping."
+autobenches = false
 
 [dependencies]
 serde = { workspace = true }
@@ -16,8 +17,17 @@ ursula-shard = { workspace = true }
 ursula-proto = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 proptest = { workspace = true }
 serde_json = { workspace = true }
+
+[[bench]]
+name = "plan_next_cold_flush"
+harness = false
+
+[[bench]]
+name = "plan_next_cold_flush_alloc"
+harness = false
 
 [lints.clippy]
 wildcard_imports = "deny"
