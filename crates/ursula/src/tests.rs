@@ -1447,7 +1447,7 @@ async fn append_batch_producer_headers_deduplicate_retries() {
 }
 
 #[tokio::test]
-async fn json_mode_normalizes_appends_and_projects_reads() {
+async fn json_mode_normalizes_appends_and_reads_ndjson() {
     let app = test_router();
 
     let response = app
@@ -1490,10 +1490,14 @@ async fn json_mode_normalizes_appends_and_projects_reads() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/x-ndjson"
+    );
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
-    assert_eq!(&body[..], br#"[[1,2,3]]"#);
+    assert_eq!(&body[..], b"[1,2,3]\n");
 
     let response = app
         .oneshot(
@@ -1507,6 +1511,63 @@ async fn json_mode_normalizes_appends_and_projects_reads() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn json_mode_reads_ndjson_bytes_without_message_boundary_projection() {
+    let app = test_router();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/stream/json-window")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/stream/json-window")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"[{"message":"alpha"},{"message":"beta"}]"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/stream/json-window?offset=-1&max_bytes=5")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/x-ndjson"
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_NEXT_OFFSET).unwrap(),
+        "00000000000000000005"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(&body[..], b"{\"mes");
 }
 
 #[tokio::test]
@@ -1556,10 +1617,14 @@ async fn fork_creation_copies_source_prefix_and_inherits_content_type() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).expect("content type"),
+        "application/x-ndjson"
+    );
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
-    assert_eq!(&body[..], br#"[{"from":"source"}]"#);
+    assert_eq!(&body[..], b"{\"from\":\"source\"}\n");
 }
 
 #[test]
@@ -1971,6 +2036,13 @@ async fn sse_live_tail_delivers_appended_text_and_closed_control() {
         response.headers().get(CONTENT_TYPE).unwrap(),
         "text/event-stream"
     );
+    assert_eq!(
+        response
+            .headers()
+            .get("stream-data-content-type")
+            .expect("stream data content type"),
+        "text/plain"
+    );
 
     let body_task = tokio::spawn(async move {
         to_bytes(response.into_body(), usize::MAX)
@@ -2023,6 +2095,140 @@ async fn sse_live_tail_delivers_appended_text_and_closed_control() {
     assert!(body.contains("\"sse_data_events\":1"));
     assert!(body.contains("\"sse_control_events\":1"));
     assert!(body.contains("\"sse_error_events\":0"));
+}
+
+#[tokio::test]
+async fn sse_exposes_ndjson_data_content_type_for_json_streams() {
+    let app = test_router();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/sse-json")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/benchcmp/sse-json")
+                .header(CONTENT_TYPE, "application/json")
+                .header(HEADER_STREAM_CLOSED, "true")
+                .body(Body::from(r#"{"event":"done"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/benchcmp/sse-json?offset=-1&live=sse")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("stream-data-content-type")
+            .expect("stream data content type"),
+        "application/x-ndjson"
+    );
+    assert!(
+        response
+            .headers()
+            .get(HEADER_STREAM_SSE_DATA_ENCODING)
+            .is_none()
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("sse body");
+    let body = std::str::from_utf8(&body).expect("utf8 sse body");
+    assert!(body.contains("event: data"));
+    assert!(body.contains("data:{\"event\":\"done\"}"));
+    assert!(body.contains("data:{\"event\":\"done\"}\ndata:\n\n"));
+    assert!(body.contains("\"streamClosed\":true"));
+}
+
+#[tokio::test]
+async fn sse_json_max_bytes_does_not_split_utf8_codepoints() {
+    let app = test_router();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/sse-json-utf8")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/benchcmp/sse-json-utf8")
+                .header(CONTENT_TYPE, "application/json")
+                .header(HEADER_STREAM_CLOSED, "true")
+                .body(Body::from(r#"{"m":"\u00e9"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/benchcmp/sse-json-utf8?offset=-1&live=sse&max_bytes=7")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("stream-data-content-type")
+            .expect("stream data content type"),
+        "application/x-ndjson"
+    );
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("sse body");
+    let body = std::str::from_utf8(&body).expect("utf8 sse body");
+    assert!(!body.contains('\u{fffd}'), "{body}");
+    assert!(body.contains("\"streamNextOffset\":\"00000000000000000006\""));
+    assert!(body.contains("data:{\"m\":\""));
+    assert!(body.contains("data:\u{00e9}\"}"));
+    assert!(body.contains("\"streamClosed\":true"));
 }
 
 #[tokio::test]
