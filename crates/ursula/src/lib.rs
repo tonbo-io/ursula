@@ -105,6 +105,8 @@ use ursula_shard::RaftGroupId;
 use crate::bootstrap::env_usize;
 use crate::bootstrap::reenable_elections_if_campaign_allowed;
 use crate::render::bootstrap_response;
+use crate::render::clamp_sse_text_read;
+use crate::render::http_read_content_type;
 use crate::render::insert_cache_control;
 use crate::render::insert_content_type;
 use crate::render::insert_cursor;
@@ -152,6 +154,7 @@ const HEADER_STREAM_INTEGRITY_LIVE_START_OFFSET: &str = "stream-integrity-live-s
 const HEADER_STREAM_INTEGRITY_TOTAL_RECORDS: &str = "stream-integrity-total-records";
 const HEADER_STREAM_INTEGRITY_TOTAL_SETSUM: &str = "stream-integrity-total-setsum";
 const HEADER_STREAM_COLD_HOT_START_OFFSET: &str = "stream-cold-hot-start-offset";
+const HEADER_STREAM_DATA_CONTENT_TYPE: &str = "stream-data-content-type";
 const HEADER_STREAM_NEXT_OFFSET: &str = "stream-next-offset";
 const HEADER_STREAM_SNAPSHOT_OFFSET: &str = "stream-snapshot-offset";
 const HEADER_STREAM_SSE_DATA_ENCODING: &str = "stream-sse-data-encoding";
@@ -2472,13 +2475,18 @@ pub(crate) async fn sse_stream(
         .http_metrics
         .sse_streams_opened
         .fetch_add(1, Ordering::Relaxed);
+    let sse_max_len = if encode_base64 {
+        max_len.max(1)
+    } else {
+        max_len.max(4)
+    };
     let sse_state = SseState {
         runtime: state.runtime,
         http_metrics: state.http_metrics,
         wall_clock: state.wall_clock,
         stream_id,
         offset,
-        max_len: max_len.max(1),
+        max_len: sse_max_len,
         encode_base64,
         cursor: query.get("cursor").cloned(),
         initial_read: true,
@@ -2504,7 +2512,7 @@ pub(crate) async fn sse_stream(
         } else {
             state.runtime.wait_read_stream(read_request).await
         };
-        let read = match read {
+        let mut read = match read {
             Ok(read) => read,
             Err(err) => {
                 state
@@ -2515,6 +2523,7 @@ pub(crate) async fn sse_stream(
                 return Some((Ok::<Bytes, Infallible>(Bytes::from(event)), None));
             }
         };
+        clamp_sse_text_read(&mut read, state.encode_base64);
 
         state.offset = read.next_offset;
         let done = read.closed && read.up_to_date;
@@ -2536,6 +2545,11 @@ pub(crate) async fn sse_stream(
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     insert_content_type(&mut headers, "text/event-stream");
+    insert_header_str(
+        &mut headers,
+        HEADER_STREAM_DATA_CONTENT_TYPE,
+        http_read_content_type(&head.content_type),
+    );
     insert_cache_control(&mut headers, "no-cache");
     if encode_base64 {
         insert_static(&mut headers, HEADER_STREAM_SSE_DATA_ENCODING, "base64");
