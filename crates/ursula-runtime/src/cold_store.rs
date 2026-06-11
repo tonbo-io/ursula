@@ -249,7 +249,7 @@ impl ColdStore {
 
     /// Build a [`ColdStore`] from an explicit [`ColdConfig`].
     ///
-    /// The bootstrap layer reads environment variables and assembles the config;
+    /// The bootstrap layer assembles the typed config before calling this method;
     /// this method is purely functional — it does not touch `std::env`.
     ///
     /// Returns `Err` when the backend is [`ColdBackend::None`];
@@ -266,9 +266,8 @@ impl ColdStore {
             ColdBackend::Memory => Self::memory()?,
             ColdBackend::S3 => Self::s3_from_config(config)?,
         };
-        if let Some(cache) = &config.cache
-            && cache.max_size.as_bytes() > 0
-        {
+        let cache = config.cache.clone().unwrap_or_default();
+        if cache.max_size.as_bytes() > 0 {
             let cache_params = ColdReadCacheParams {
                 max_bytes: cache.max_size.as_bytes() as usize,
                 block_bytes: cache.block_size.as_bytes() as usize,
@@ -1212,6 +1211,66 @@ mod tests {
     use super::ColdStore;
     use crate::ColdConfig;
     use crate::ColdReadCacheParams;
+
+    fn read_cache_params(store: &ColdStore) -> ColdReadCacheParams {
+        store
+            .read_cache
+            .as_ref()
+            .map(|cache| cache.config)
+            .expect("read cache")
+    }
+
+    #[test]
+    fn try_new_omitted_cache_installs_default_cache() {
+        let config = ColdConfig {
+            backend: ColdBackend::Memory,
+            cache: None,
+            ..Default::default()
+        };
+
+        let store = ColdStore::try_new(&config).expect("memory cold store");
+        let cache = read_cache_params(&store);
+
+        assert_eq!(cache.max_bytes, 256 * 1024 * 1024);
+        assert_eq!(cache.block_bytes, 1024 * 1024);
+        assert_eq!(cache.max_readahead_blocks, 4);
+    }
+
+    #[test]
+    fn try_new_zero_cache_disables_cache() {
+        let config = ColdConfig {
+            backend: ColdBackend::Memory,
+            cache: Some(ursula_config::ColdCacheConfig {
+                max_size: ursula_config::HumanSize::bytes(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let store = ColdStore::try_new(&config).expect("memory cold store");
+
+        assert!(store.read_cache.is_none());
+    }
+
+    #[test]
+    fn try_new_custom_cache_installs_cache() {
+        let config = ColdConfig {
+            backend: ColdBackend::Memory,
+            cache: Some(ursula_config::ColdCacheConfig {
+                max_size: ursula_config::HumanSize::mib(7),
+                block_size: ursula_config::HumanSize::kib(512),
+                readahead_blocks: 3,
+            }),
+            ..Default::default()
+        };
+
+        let store = ColdStore::try_new(&config).expect("memory cold store");
+        let cache = read_cache_params(&store);
+
+        assert_eq!(cache.max_bytes, 7 * 1024 * 1024);
+        assert_eq!(cache.block_bytes, 512 * 1024);
+        assert_eq!(cache.max_readahead_blocks, 3);
+    }
 
     #[test]
     fn lru_queue_stays_bounded_under_repeated_hits() {

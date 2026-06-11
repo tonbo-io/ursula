@@ -1,8 +1,7 @@
-//! Process-level orchestration: env-driven `ShardRuntime` constructors and
+//! Process-level orchestration: typed-config `ShardRuntime` constructors and
 //! raft-related background workers.
 //!
 //! This module is responsible for:
-//! - reading process environment variables,
 //! - validating configuration,
 //! - constructing the [`ShardRuntime`]
 //! - spawning raft-related background workers.

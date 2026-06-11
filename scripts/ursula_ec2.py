@@ -250,6 +250,8 @@ class Ec2Ops:
             cfg["root"] = env["URSULA_COLD_ROOT"]
         if "URSULA_COLD_FLUSH_INTERVAL_MS" in env:
             cfg["flush_interval"] = f'{env["URSULA_COLD_FLUSH_INTERVAL_MS"]}ms'
+        if "URSULA_COLD_FLUSH_BYTES" in env:
+            cfg["flush_size"] = env["URSULA_COLD_FLUSH_BYTES"]
         if "URSULA_COLD_FLUSH_MIN_HOT_BYTES" in env:
             cfg["flush_min_hot_size"] = env["URSULA_COLD_FLUSH_MIN_HOT_BYTES"]
         if "URSULA_COLD_FLUSH_MAX_BYTES" in env:
@@ -260,7 +262,9 @@ class Ec2Ops:
             cfg["max_hot_size_per_group"] = env["URSULA_COLD_MAX_HOT_BYTES_PER_GROUP"]
         if "URSULA_COLD_GC_INTERVAL_MS" in env:
             cfg["gc_interval"] = f'{env["URSULA_COLD_GC_INTERVAL_MS"]}ms'
-        if "URSULA_COLD_GC_MAX_ENTRIES" in env:
+        if "URSULA_COLD_GC_MAX_ENTRIES_PER_GROUP" in env:
+            cfg["gc_max_entries"] = int(env["URSULA_COLD_GC_MAX_ENTRIES_PER_GROUP"])
+        elif "URSULA_COLD_GC_MAX_ENTRIES" in env:
             cfg["gc_max_entries"] = int(env["URSULA_COLD_GC_MAX_ENTRIES"])
 
         s3_cfg: dict[str, Any] = {}
@@ -278,6 +282,12 @@ class Ec2Ops:
             s3_cfg["timeout"] = f'{env["URSULA_S3_TIMEOUT_MS"]}ms'
         if "URSULA_S3_MAX_RETRIES" in env:
             s3_cfg["max_retries"] = int(env["URSULA_S3_MAX_RETRIES"])
+        if "URSULA_S3_PROBE_TIMEOUT_MS" in env:
+            s3_cfg["probe_timeout"] = f'{env["URSULA_S3_PROBE_TIMEOUT_MS"]}ms'
+        if "URSULA_S3_PROBE_UNHEALTHY_TICKS" in env:
+            s3_cfg["unhealthy_ticks"] = int(env["URSULA_S3_PROBE_UNHEALTHY_TICKS"])
+        if "URSULA_S3_PROBE_HEAL_TICKS" in env:
+            s3_cfg["heal_ticks"] = int(env["URSULA_S3_PROBE_HEAL_TICKS"])
         if s3_cfg:
             cfg["s3"] = s3_cfg
 
@@ -299,12 +309,14 @@ class Ec2Ops:
         "URSULA_COLD_BACKEND",
         "URSULA_COLD_ROOT",
         "URSULA_COLD_FLUSH_INTERVAL_MS",
+        "URSULA_COLD_FLUSH_BYTES",
         "URSULA_COLD_FLUSH_MIN_HOT_BYTES",
         "URSULA_COLD_FLUSH_MAX_BYTES",
         "URSULA_COLD_FLUSH_MAX_CONCURRENCY",
         "URSULA_COLD_MAX_HOT_BYTES_PER_GROUP",
         "URSULA_COLD_GC_INTERVAL_MS",
         "URSULA_COLD_GC_MAX_ENTRIES",
+        "URSULA_COLD_GC_MAX_ENTRIES_PER_GROUP",
         "URSULA_COLD_S3_BUCKET",
         "URSULA_COLD_S3_REGION",
         "URSULA_COLD_S3_ENDPOINT",
@@ -313,6 +325,9 @@ class Ec2Ops:
         "URSULA_COLD_S3_SESSION_TOKEN",
         "URSULA_S3_TIMEOUT_MS",
         "URSULA_S3_MAX_RETRIES",
+        "URSULA_S3_PROBE_TIMEOUT_MS",
+        "URSULA_S3_PROBE_UNHEALTHY_TICKS",
+        "URSULA_S3_PROBE_HEAL_TICKS",
         "URSULA_COLD_CACHE_BYTES",
         "URSULA_COLD_CACHE_BLOCK_BYTES",
         "URSULA_COLD_CACHE_READAHEAD_BLOCKS",
@@ -326,7 +341,34 @@ class Ec2Ops:
     def _warn_unmapped_cold_env(self) -> None:
         for key in self.config.cold_env:
             if key not in self._KNOWN_COLD_ENV_KEYS:
-                print(f"warn: cold_env key {key} is not mapped to config", file=sys.stderr)
+                print(
+                    f"warn: cold_env key {key} is not mapped to config; passing through as environment",
+                    file=sys.stderr,
+                )
+
+    def environment_passthrough(self) -> dict[str, str]:
+        return {
+            key: value
+            for key, value in self.config.cold_env.items()
+            if key not in self._KNOWN_COLD_ENV_KEYS
+        }
+
+    def _environment_prefix(self) -> str:
+        return "".join(
+            f"{shlex.quote(key)}={shlex.quote(value)} "
+            for key, value in sorted(self.environment_passthrough().items())
+        )
+
+    @staticmethod
+    def _systemd_env_value(key: str, value: str) -> str:
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{key}={escaped}"'
+
+    def systemd_environment_lines(self) -> str:
+        return "".join(
+            f"Environment={self._systemd_env_value(key, value)}\n"
+            for key, value in sorted(self.environment_passthrough().items())
+        )
 
     def generate_config(self, node: Node) -> str:
         self._warn_unmapped_cold_env()
@@ -397,7 +439,8 @@ class Ec2Ops:
                 f"cat > {shlex.quote(self.remote_config(node))} <<'EOF'",
                 self.generate_config(node),
                 "EOF",
-                " ".join(shlex.quote(arg) for arg in self.node_command(node))
+                self._environment_prefix()
+                + " ".join(shlex.quote(arg) for arg in self.node_command(node))
                 + f" > {shlex.quote(self.remote_log(node))} 2>&1 & echo $! > {shlex.quote(self.remote_pid(node))}",
             ]
         )
@@ -412,10 +455,9 @@ class Ec2Ops:
             str(node.id),
         ]
 
-    def install_service(self, node: Node, restart: bool = True) -> None:
+    def systemd_unit(self, node: Node, restart_policy: str) -> str:
         exec_start = " ".join(shlex.quote(arg) for arg in self.node_command(node))
-        restart_policy = "on-failure" if self.config.raft_memory else "always"
-        unit = f"""[Unit]
+        return f"""[Unit]
 Description=Ursula chaos node {node.id}
 After=network-online.target
 Wants=network-online.target
@@ -429,10 +471,14 @@ Restart={restart_policy}
 RestartSec=3
 LimitNOFILE=1048576
 LimitCORE=0
-
+{self.systemd_environment_lines()}
 [Install]
 WantedBy=multi-user.target
 """
+
+    def install_service(self, node: Node, restart: bool = True) -> None:
+        restart_policy = "on-failure" if self.config.raft_memory else "always"
+        unit = self.systemd_unit(node, restart_policy)
         command = "\n".join(
             [
                 "set -euo pipefail",

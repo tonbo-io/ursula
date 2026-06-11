@@ -20,13 +20,17 @@
 {{- $s3Endpoint := .Values.s3.endpoint | toString -}}
 {{- $s3Prefix := .Values.s3.prefix | toString -}}
 {{- $coldRoot := include "ursula.joinPath" (list $s3Prefix .Values.coldStorage.prefix) -}}
-{{- $snapshotPrefix := .Values.snapshotStore.prefix | toString | trimAll "/" -}}
 {{- $hasS3Credentials := include "ursula.hasS3Credentials" . -}}
 {{- $coldFlushIntervalMs := .Values.coldStorage.flush.intervalMs | int64 -}}
 {{- $coldFlushMinHotBytes := .Values.coldStorage.flush.minHotBytes | int64 -}}
 {{- $coldFlushMaxBytes := .Values.coldStorage.flush.maxBytes | int64 -}}
 {{- $coldFlushMaxConcurrency := .Values.coldStorage.flush.maxConcurrency | int64 -}}
 {{- $coldMaxHotBytesPerGroup := .Values.coldStorage.flush.maxHotBytesPerGroup | int64 -}}
+{{- $coldCache := .Values.coldStorage.cache | default dict -}}
+{{- $coldCacheMaxSizeBytes := $coldCache.maxSizeBytes -}}
+{{- $coldCacheBlockSizeBytes := $coldCache.blockSizeBytes -}}
+{{- $coldCacheReadaheadBlocks := $coldCache.readaheadBlocks -}}
+{{- $snapshotDriveIntervalMs := .Values.snapshotStore.driveIntervalMs -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -78,6 +82,9 @@ data:
     group_count = {{ .Values.raft.groupCount }}
     init_membership = {{ .Values.raft.initMembership }}
     init_membership_per_group = {{ .Values.raft.initMembershipPerGroup }}
+{{- if not (eq .Values.raft.maxUncommittedBytesPerGroup nil) }}
+    max_uncommitted_size_per_group = "{{ .Values.raft.maxUncommittedBytesPerGroup }}"
+{{- end }}
 {{- range $peers }}
     [[raft.peers]]
     node_id = {{ .node_id }}
@@ -104,6 +111,19 @@ data:
     flush_max_size = "{{ $coldFlushMaxBytes }}"
     flush_max_concurrency = {{ $coldFlushMaxConcurrency }}
     max_hot_size_per_group = "{{ $coldMaxHotBytesPerGroup }}"
+{{- if or (not (eq $coldCacheMaxSizeBytes nil)) (not (eq $coldCacheBlockSizeBytes nil)) (not (eq $coldCacheReadaheadBlocks nil)) }}
+
+    [storage.cold.cache]
+{{- if not (eq $coldCacheMaxSizeBytes nil) }}
+    max_size = "{{ $coldCacheMaxSizeBytes }}"
+{{- end }}
+{{- if not (eq $coldCacheBlockSizeBytes nil) }}
+    block_size = "{{ $coldCacheBlockSizeBytes }}"
+{{- end }}
+{{- if not (eq $coldCacheReadaheadBlocks nil) }}
+    readahead_blocks = {{ $coldCacheReadaheadBlocks }}
+{{- end }}
+{{- end }}
 {{- else }}
     backend = "none"
 {{- end }}
@@ -131,10 +151,8 @@ data:
 {{- else }}
     backend = "inline"
 {{- end }}
-{{- if .Values.raft.maxUncommittedBytesPerGroup }}
-
-    [raft]
-    max_uncommitted_size_per_group = "{{ .Values.raft.maxUncommittedBytesPerGroup }}"
+{{- if not (eq $snapshotDriveIntervalMs nil) }}
+    drive_interval = "{{ $snapshotDriveIntervalMs }}ms"
 {{- end }}
     EOF
 

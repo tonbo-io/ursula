@@ -22,6 +22,17 @@ pub enum Preset {
 #[error("unknown preset '{0}'")]
 pub struct PresetParseError(String);
 
+impl std::fmt::Display for Preset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Preset::Default => write!(f, "default"),
+            Preset::Tiny => write!(f, "tiny"),
+            Preset::Small => write!(f, "small"),
+            Preset::Standard => write!(f, "standard"),
+            Preset::Large => write!(f, "large"),
+        }
+    }
+}
 impl std::str::FromStr for Preset {
     type Err = PresetParseError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {

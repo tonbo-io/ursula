@@ -61,7 +61,7 @@ server:
   coreCount: 4
   # Extra CLI args appended after the generated Ursula args.
   extraArgs: []
-  # Extra environment variables for Ursula.
+  # Extra container environment entries for Ursula.
   extraEnv: []
   # Extra envFrom blocks for Ursula.
   extraEnvFrom: []
@@ -125,11 +125,13 @@ s3:
   # Shared S3-compatible bucket for Ursula object storage.
   # Required when coldStorage.enabled=true or snapshotStore.backend=s3.
   bucket: ""
-  # S3 region. Renders the corresponding runtime env var only when non-empty.
+  # S3 region. Rendered as storage.cold.s3.region in the generated config when non-empty.
   region: ""
   # Optional S3-compatible endpoint, such as TOS or MinIO.
   endpoint: ""
-  # Shared object prefix. Cold chunks and snapshots are stored below this prefix.
+  # Shared object prefix used with coldStorage.prefix to build storage.cold.root
+  # when cold storage is enabled. Snapshot keys also use the resolved cold root
+  # when present, so they are not always directly below this prefix.
   prefix: ""
   credentials:
     # Inline S3 access key. When set with secretAccessKey, the chart renders a Secret.
@@ -143,29 +145,32 @@ s3:
     existingSecret: ""
 
 coldStorage:
-  # Enable shared cold storage runtime env vars. Multi-node production clusters should use S3.
+  # Enable shared cold storage config. Multi-node production clusters should use S3.
   enabled: false
   # Cold backend. The chart currently renders S3 settings when enabled.
   backend: s3
   # Cold object prefix below s3.prefix.
   prefix: cold
   flush:
-    # Background cold flush interval in milliseconds. Renders only when changed from Ursula's runtime default.
     intervalMs: 1000
-    # Skip flush below this hot byte threshold per group. Renders only when changed from Ursula's runtime default.
     minHotBytes: 8388608
-    # Maximum bytes flushed per group per tick. Renders only when changed from Ursula's runtime default.
     maxBytes: 8388608
-    # Maximum concurrent cold writes. Renders only when changed from Ursula's runtime default.
     maxConcurrency: 4
-    # Backpressure ceiling for hot bytes per group. Renders only when changed from Ursula's runtime default.
     maxHotBytesPerGroup: 67108864
+  cache:
+    # Optional cold-read cache override. Leave all fields null/omitted to let Ursula install its default cache.
+    maxSizeBytes: null
+    blockSizeBytes: null
+    readaheadBlocks: null
 
 snapshotStore:
-  # Snapshot backend: inline or s3. The inline default is not rendered as an env var.
+  # Snapshot backend: inline or s3. Rendered explicitly as storage.snapshot.backend.
   backend: inline
-  # Snapshot object prefix below s3.prefix.
+  # Snapshot object suffix rendered as storage.snapshot.s3_prefix; resolved against
+  # storage.cold.root when present, otherwise against the S3 bucket root for S3 snapshots.
   prefix: snapshots
+  # Optional manual snapshot driver interval in milliseconds. Leave null for runtime default semantics.
+  driveIntervalMs: null
 
 gateway:
   # Enable the gateway Deployment and Service. The gateway is the default
@@ -229,7 +234,7 @@ gateway:
   gracefulShutdownTimeoutSeconds: 3600
   # Extra CLI args appended after the generated gateway args.
   extraArgs: []
-  # Extra environment variables for the gateway.
+  # Extra container environment entries for the gateway.
   extraEnv: []
   # Extra envFrom blocks for the gateway.
   extraEnvFrom: []

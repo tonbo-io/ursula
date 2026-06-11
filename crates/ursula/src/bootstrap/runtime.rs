@@ -54,15 +54,14 @@ pub fn spawn_runtime(
             message: err.to_string(),
         })?;
     let mut engine_config = RaftEngineConfig::from(&config.raft);
+    let configured_snapshot_drive_interval_ms = config
+        .storage
+        .snapshot
+        .drive_interval
+        .as_ref()
+        .map(|interval| interval.as_duration().as_millis() as usize);
     let snapshot_drive_interval_ms = snapshot::resolve_snapshot_drive_interval_ms(
-        Some(
-            config
-                .storage
-                .snapshot
-                .drive_interval
-                .as_duration()
-                .as_millis() as usize,
-        ),
+        configured_snapshot_drive_interval_ms,
         snapshot_store.is_some(),
     );
     engine_config.snapshot_drive_interval_ms = snapshot_drive_interval_ms as u64;

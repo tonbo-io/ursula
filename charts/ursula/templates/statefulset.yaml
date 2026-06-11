@@ -3,25 +3,8 @@
 {{- fail (printf "server.podLabels must not set reserved selector label %q" $label) -}}
 {{- end -}}
 {{- end -}}
-{{- $s3Bucket := .Values.s3.bucket | toString -}}
-{{- $s3Region := .Values.s3.region | toString -}}
-{{- $s3Endpoint := .Values.s3.endpoint | toString -}}
-{{- $s3Prefix := .Values.s3.prefix | toString -}}
-{{- $coldRoot := include "ursula.joinPath" (list $s3Prefix .Values.coldStorage.prefix) -}}
-{{- $snapshotRoot := include "ursula.joinPath" (list $s3Prefix) -}}
-{{- $snapshotPrefix := .Values.snapshotStore.prefix | toString | trimAll "/" -}}
 {{- $s3CredentialSecret := include "ursula.s3SecretName" . -}}
 {{- $hasS3Credentials := include "ursula.hasS3Credentials" . -}}
-{{- $coldFlushIntervalMs := .Values.coldStorage.flush.intervalMs | int64 -}}
-{{- $coldFlushMinHotBytes := .Values.coldStorage.flush.minHotBytes | int64 -}}
-{{- $coldFlushMaxBytes := .Values.coldStorage.flush.maxBytes | int64 -}}
-{{- $coldFlushMaxConcurrency := .Values.coldStorage.flush.maxConcurrency | int64 -}}
-{{- $coldMaxHotBytesPerGroup := .Values.coldStorage.flush.maxHotBytesPerGroup | int64 -}}
-{{- $renderColdFlushIntervalMs := $coldFlushIntervalMs | toString | ne "1000" -}}
-{{- $renderColdFlushMinHotBytes := $coldFlushMinHotBytes | toString | ne "8388608" -}}
-{{- $renderColdFlushMaxBytes := $coldFlushMaxBytes | toString | ne "8388608" -}}
-{{- $renderColdFlushMaxConcurrency := $coldFlushMaxConcurrency | toString | ne "4" -}}
-{{- $renderColdMaxHotBytesPerGroup := $coldMaxHotBytesPerGroup | toString | ne "67108864" -}}
 {{- $replicaCount := .Values.server.replicaCount | int -}}
 apiVersion: apps/v1
 kind: StatefulSet

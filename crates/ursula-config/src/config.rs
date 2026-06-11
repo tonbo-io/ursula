@@ -367,7 +367,7 @@ impl Default for S3Config {
 }
 
 /// Cold-read cache sizing.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ColdCacheConfig {
     /// Max cache size in bytes.
@@ -397,12 +397,14 @@ pub struct RaftSnapshotConfig {
     /// Root directory for local snapshot storage.
     /// Required when `backend` is `Local`.
     pub local_root: Option<PathBuf>,
-    /// S3 prefix for snapshot objects. Used when `backend` is `S3` or
-    /// `Inline` with S3 cold storage.
+    /// S3 prefix for snapshot objects. Used only when `backend` is `S3`.
     pub s3_prefix: Option<String>,
-    /// Interval for the manual snapshot driver. When zero, snapshots are
-    /// driver-disabled and openraft's default auto-policy applies.
-    pub drive_interval: HumanDuration,
+    /// Interval for the manual snapshot driver.
+    ///
+    /// When omitted, inline snapshot stores keep the manual driver disabled and
+    /// external snapshot stores use a 60s manual-driver default. Explicit `0s`
+    /// disables the manual driver and keeps openraft's default auto-policy.
+    pub drive_interval: Option<HumanDuration>,
     /// Max concurrent snapshot flushes.
     pub drive_flush_concurrency: usize,
 }
@@ -413,7 +415,7 @@ impl Default for RaftSnapshotConfig {
             backend: RaftSnapshotBackend::Inline,
             local_root: None,
             s3_prefix: None,
-            drive_interval: HumanDuration::milli(0),
+            drive_interval: None,
             drive_flush_concurrency: 4,
         }
     }

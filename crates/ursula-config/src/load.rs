@@ -81,10 +81,9 @@ fn parse_raw(raw: &str, format: ConfigFormat) -> Result<toml::Table, ConfigError
 
 /// Load config from an optional file path with optional preset and node_id override.
 ///
-/// `node_id` is intentionally **not** part of the config file — it is a node
-/// identity that must be supplied by the runtime environment (CLI flag,
-/// hostname derivation, etc.).  If `node_id` is `Some`, it overrides any
-/// value that may have been present in the file.
+/// `node_id` may be set in the config file as `raft.node_id`; the CLI
+/// `--node-id` flag intentionally overrides it for per-node identity or
+/// deployment-derived identities such as StatefulSet ordinals.
 ///
 /// When `path` is `None`, the config is built entirely from the preset (if any)
 /// plus `UrsulaConfig` defaults.  This allows `--preset tiny` to work without

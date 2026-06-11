@@ -5,48 +5,43 @@ sidebarTitle: Configure S3
 
 Ursula keeps recent data in an in-memory hot ring on every replica and flushes older segments and snapshot blobs to a cold backend. Multi-node clusters should use S3 or an S3-compatible object store so every replica can read chunks flushed by any leader.
 
-Configuration is entirely environment-variable based. There is no config file.
+Cold storage is configured in the Ursula config file. Helm and EC2 scripts generate this file from their deployment inputs.
 
 ## S3 backend
 
-```bash
-export URSULA_COLD_BACKEND=s3
-export URSULA_COLD_S3_BUCKET=my-ursula-bucket
-export URSULA_COLD_S3_REGION=us-east-1
-export URSULA_COLD_ROOT=ursula-prod-20260518   # optional prefix
+```toml
+[storage.cold]
+backend = "s3"
+root = "ursula-prod-20260518"
+
+[storage.cold.s3]
+bucket = "my-ursula-bucket"
+region = "us-east-1"
+# endpoint = "http://127.0.0.1:9000"
+# access_key_id = "AKIA..."
+# secret_access_key = "..."
+# session_token = "..."
 ```
 
-Standard AWS credential discovery applies - Ursula reads credentials via the AWS SDK chain (instance profile, env vars, profile, etc.). Explicit credentials can be supplied via:
-
-```bash
-export URSULA_COLD_S3_ACCESS_KEY_ID=AKIA...
-export URSULA_COLD_S3_SECRET_ACCESS_KEY=...
-export URSULA_COLD_S3_SESSION_TOKEN=...   # optional, for STS
-```
-
-For S3-compatible stores (MinIO, R2, etc.):
-
-```bash
-export URSULA_COLD_S3_ENDPOINT=http://127.0.0.1:9000
-```
+Standard AWS credential discovery still applies - when `access_key_id` and `secret_access_key` are omitted, Ursula reads credentials via the AWS SDK chain (instance profile, environment, profile, etc.). Set `endpoint` for S3-compatible stores such as MinIO, R2, or TOS.
 
 ## Flush tuning
 
 The cold-flush worker runs in the background and decides when to move hot segments to the cold backend. Defaults are conservative. Tune them under load.
 
-| Variable | Default | Meaning |
-| -------- | ------- | ------- |
-| `URSULA_COLD_FLUSH_INTERVAL_MS` | `1000` | Background tick interval |
-| `URSULA_COLD_FLUSH_BYTES` | `8 MiB` | Target bytes flushed per group per tick |
-| `URSULA_COLD_FLUSH_MAX_CONCURRENCY` | `4` | Parallel cold writes in flight |
-| `URSULA_COLD_MAX_HOT_BYTES_PER_GROUP` | `64 MiB` | Backpressure ceiling: appends to a group above this size return `503` until cold flush catches up |
+| Config key | Default | Meaning |
+| ---------- | ------- | ------- |
+| `storage.cold.flush_interval` | `1s` | Background tick interval |
+| `storage.cold.flush_size` | `8MiB` | Target bytes flushed per group per tick |
+| `storage.cold.flush_max_concurrency` | `4` | Parallel cold writes in flight |
+| `storage.cold.max_hot_size_per_group` | `64MiB` | Backpressure ceiling |
 
 A typical benchmark profile drops the interval to `200ms`, raises concurrency to `32`, and bumps the per-group ceiling.
 
-Advanced deployments can still split the flush threshold and batch size with `URSULA_COLD_FLUSH_MIN_HOT_BYTES` and `URSULA_COLD_FLUSH_MAX_BYTES`, but the single `URSULA_COLD_FLUSH_BYTES` knob is the normal path.
+Advanced deployments can still split the flush threshold and batch size with `storage.cold.flush_min_hot_size` and `storage.cold.flush_max_size`, but the single `storage.cold.flush_size` knob is the normal path.
 
 ## Operating notes
 
-- The `URSULA_COLD_ROOT` prefix is appended to every cold key. Use a date-stamped value (`ursula-prod-20260518T000000Z`) when running benchmarks so you can clean up afterwards without touching production data.
+- The `storage.cold.root` prefix is appended to every cold key. Use a date-stamped value (`ursula-prod-20260518T000000Z`) when running benchmarks so you can clean up afterwards without touching production data.
 - `scripts/ursula_ec2.py --config cluster.json cleanup-s3 --root <prefix>` deletes a single root prefix from the bucket configured in the manifest. There is no built-in retention policy beyond Ursula's snapshot GC.
 - Cold reads can be served by any replica that has applied the stream metadata referencing the cold chunks. All replicas must point at the same shared bucket so follower reads and post-leadership-change reads can fetch the same objects on demand.

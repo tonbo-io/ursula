@@ -199,6 +199,92 @@ backend = "s3"
             Some("my-bucket".into())
         );
     }
+
+    #[test]
+    fn snapshot_drive_interval_is_optional_and_zero_is_explicit_disable() {
+        use crate::human::HumanDuration;
+
+        let omitted: UrsulaConfig = toml::from_str(
+            r#"
+[storage.snapshot]
+backend = "s3"
+"#,
+        )
+        .expect("omitted drive_interval parses");
+        assert_eq!(omitted.storage.snapshot.drive_interval, None);
+
+        let disabled: UrsulaConfig = toml::from_str(
+            r#"
+[storage.snapshot]
+backend = "s3"
+drive_interval = "0s"
+"#,
+        )
+        .expect("explicit zero drive_interval parses");
+        assert_eq!(
+            disabled.storage.snapshot.drive_interval,
+            Some(HumanDuration::milli(0))
+        );
+
+        let explicit: UrsulaConfig = toml::from_str(
+            r#"
+[storage.snapshot]
+backend = "s3"
+drive_interval = "45s"
+"#,
+        )
+        .expect("explicit non-zero drive_interval parses");
+        assert_eq!(
+            explicit.storage.snapshot.drive_interval,
+            Some(HumanDuration::sec(45))
+        );
+    }
+
+    #[test]
+    fn cold_cache_config_has_omitted_zero_and_custom_states() {
+        use crate::human::HumanSize;
+
+        let omitted: UrsulaConfig = toml::from_str(
+            r#"
+[storage.cold]
+backend = "memory"
+"#,
+        )
+        .expect("omitted cache parses");
+        assert_eq!(omitted.storage.cold.cache, None);
+
+        let disabled: UrsulaConfig = toml::from_str(
+            r#"
+[storage.cold]
+backend = "memory"
+
+[storage.cold.cache]
+max_size = "0B"
+"#,
+        )
+        .expect("zero cache parses");
+        assert_eq!(
+            disabled.storage.cold.cache.unwrap().max_size,
+            HumanSize::bytes(0)
+        );
+
+        let custom: UrsulaConfig = toml::from_str(
+            r#"
+[storage.cold]
+backend = "memory"
+
+[storage.cold.cache]
+max_size = "12MiB"
+block_size = "2MiB"
+readahead_blocks = 7
+"#,
+        )
+        .expect("custom cache parses");
+        let cache = custom.storage.cold.cache.unwrap();
+        assert_eq!(cache.max_size, HumanSize::mib(12));
+        assert_eq!(cache.block_size, HumanSize::mib(2));
+        assert_eq!(cache.readahead_blocks, 7);
+    }
 }
 
 #[cfg(test)]

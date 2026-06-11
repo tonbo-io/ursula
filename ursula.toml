@@ -7,11 +7,11 @@
 #   cargo run --bin ursula -- --config ./ursula.toml
 #
 # The binary also searches for a default config in the following order:
-#   ./ursula.toml  →  ./ursula.json  →  ./ursula.yaml  →  /etc/ursula/ursula.toml  →  …
+#   ./ursula.toml  →  ./ursula.json  →  ./ursula.yaml  →  ./ursula.yml  →  /etc/ursula/ursula.toml  →  /etc/ursula/ursula.json  →  /etc/ursula/ursula.yaml  →  /etc/ursula/ursula.yml  →  …
 #
 # Config loading order (later wins):
 #   1. Built-in defaults
-#   2. Preset (--preset tiny|small|standard|large)
+#   2. Preset (--preset default|dev|tiny|small|standard|large)
 #   3. This config file
 #   4. CLI overrides (--node-id)
 #
@@ -19,19 +19,24 @@
 # [server]  — HTTP server binding and admission controls
 # ------------------------------------------------------------------------------
 [server]
-# Public HTTP client API bind address.  Client-plane routes (append, read,
-# admin) are served here.
+# Public HTTP client API bind address. Client-plane routes (append, read,
+# admin) are served here. When cluster_listen is unset, Raft/cluster routes
+# are also served on this socket.
 listen = "127.0.0.1:4437"
 
-# Optional separate bind for the cluster / Raft gRPC plane.  When set,
-# client traffic and inter-node Raft traffic are isolated on two sockets.
+# Optional separate bind for the cluster / Raft gRPC plane. When set,
+# server.listen serves client/API routes and this address serves Raft/cluster
+# routes. Peer URLs must point to server.listen when cluster_listen is unset,
+# or to server.cluster_listen when it is set. The same peer URL is also used
+# for HTTP leader redirects, so clients and gateways must be able to reach it.
 # cluster_listen = "10.0.0.1:4438"
 
 # Process-wide cap on accepted write body bytes held by the HTTP layer.
 # A request must reserve its body bytes before axum drains the body into
 # Bytes, and the reservation lives until the response is produced.  This
 # turns memory pressure into backpressure at the HTTP edge.
-# Use a human-readable size: "64MiB", "1GiB", etc.  Omit to disable the limit.
+# Use a human-readable size: "64MiB", "1GiB", etc. Omit to inherit the
+# built-in or preset default; the built-in default is 256MiB.
 # http_inflight_body_size = "256MiB"   # default: 256 MiB
 
 # ------------------------------------------------------------------------------
@@ -53,7 +58,9 @@ core_count = 4
 # external_payload_min_size = "1MiB"
 
 # Max live-read waiters per core.  When the limit is reached, new live
-# read requests are rejected with HTTP 503.  Omit to disable the limit.
+# read requests are rejected with HTTP 503. Omit to inherit the built-in
+# or preset default; the built-in default is 65536. Set explicitly to 0
+# to disable the limit.
 # live_read_max_waiters_per_core = 65536
 
 # ------------------------------------------------------------------------------
@@ -185,7 +192,8 @@ backend = "none"
 # flush_max_concurrency = 4
 
 # Per-group hot-size cap.  When a group's hot bytes exceed this, new writes
-# are rejected with HTTP 503.  Omit to disable the admission.
+# are rejected with HTTP 503.  Omit to inherit default/preset behavior; set
+# explicitly to "0" to disable the admission.
 # max_hot_size_per_group = "64MiB"
 
 # Interval between periodic cold-gc passes.
@@ -242,7 +250,9 @@ backend = "inline"
 # Root directory for local snapshot store.  Required when backend = "local".
 # local_root = "/data/ursula/snapshots"
 
-# S3 object key prefix for snapshot blobs.  Only used when backend = "s3".
+# S3 object key suffix for snapshot blobs. Resolved against storage.cold.root
+# when present; if storage.cold.root is absent, keys are relative to the S3
+# bucket root plus this prefix. Only used when backend = "s3".
 # s3_prefix = "snapshots"
 
 # ------------------------------------------------------------------------------

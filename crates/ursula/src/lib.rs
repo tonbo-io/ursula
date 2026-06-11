@@ -1,10 +1,10 @@
 //! Ursula HTTP server: axum router, request handlers, response rendering,
-//! plus the env-driven `ShardRuntime` constructors used by the `ursula` binary.
+//! plus the typed-config bootstrap constructors used by the `ursula` binary.
 //!
 //! Module map:
 //!
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
-//! - [`bootstrap`]: env-driven `spawn_*_runtime` constructors and cold-flush worker.
+//! - [`bootstrap`]: typed-config `spawn_*_runtime` constructors and cold-flush worker.
 
 mod bootstrap;
 mod otel_metrics;
@@ -374,9 +374,11 @@ struct HttpMetricsSnapshot {
 
 /// Resolves the current leader of a raft group to a client-reachable base URL
 /// so a write/read that lands on a non-leader can be answered with a 307
-/// redirect. `peers` maps raft node id to that node's listen address; gRPC and
-/// the client API share one listener, so a single address per peer is both the
-/// replication endpoint and the redirect target.
+/// redirect. `peers` maps raft node id to that node's configured peer URL:
+/// `server.listen` when `server.cluster_listen` is unset, or the separate
+/// `server.cluster_listen` address when it is set. Peer URLs are also used as
+/// HTTP leader-redirect targets, so clients and gateways must be able to reach
+/// them too.
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
     peers: Arc<BTreeMap<u64, String>>,
@@ -693,9 +695,9 @@ pub fn router_with_http_state(state: HttpState) -> Router {
 }
 
 /// Cluster-plane routes: inter-node gRPC carrying Raft RPCs, snapshot
-/// transfer, and HTTP-write forwarding to the leader. In a dual-listener
-/// deployment these bind to the private (VPC) interface so chaos applied to
-/// the public face never disrupts consensus.
+/// transfer, and leader-read checks. In a dual-listener deployment these bind
+/// to the private (VPC) interface so chaos applied to the public face never
+/// disrupts consensus.
 pub fn cluster_router_from_state(state: HttpState) -> Router {
     let raft_registry = state.raft_registry.clone().unwrap_or_default();
     Router::new()
@@ -2878,9 +2880,10 @@ pub(crate) async fn runtime_error_or_leader_redirect_async(
     let Some(router) = state.client_write_router() else {
         return runtime_error_response(err);
     };
-    // gRPC and the client API share one listener, so the leader's address is
-    // a valid redirect target for reads and writes alike. 307 preserves the
-    // method and body, so a forwarded POST/PUT re-runs as a write on the
+    // Peer URLs are the configured client-reachable leader addresses
+    // (`server.listen` when shared, or `server.cluster_listen` when split), so
+    // they are valid redirect targets for reads and writes alike. 307 preserves
+    // the method and body, so a redirected POST/PUT re-runs as a write on the
     // leader. Writes go through the leader's raft client_write exactly as a
     // local write would; redirecting only moves the leader hop to the client.
     if let Some(redirect) = router.redirect_response(&err, request_target) {

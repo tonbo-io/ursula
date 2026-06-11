@@ -21,13 +21,14 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[derive(Parser, Debug)]
 #[command(version, about = "Ursula durable-stream server")]
 struct Cli {
-    /// Path to the TOML configuration file.
+    /// Path to the TOML, JSON, or YAML configuration file.
     #[arg(short, long)]
     config: Option<PathBuf>,
 
-    /// Resource preset (tiny, small, standard, large).
+    /// Resource preset (default, tiny, small, standard, large).
     #[arg(long)]
-    preset: Option<String>,
+    #[clap(value_enum)]
+    preset: Option<Preset>,
 
     /// Raft node identity.  Must be unique per node in a cluster.
     #[arg(long)]
@@ -48,11 +49,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let config_path = cli.config.or_else(find_default_config);
 
-    let mut preset = cli
-        .preset
-        .as_deref()
-        .map(|s| s.parse::<Preset>())
-        .transpose()?;
+    let mut preset = cli.preset;
 
     // When no config file and no explicit preset are given, fall back to the
     // default single-node development preset (memory WAL, node-id = 1).
@@ -84,7 +81,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config_path
             .as_deref()
             .map_or_else(|| "(none)".into(), |p| p.display().to_string()),
-        cli.preset.as_deref().unwrap_or("default")
+        preset.unwrap_or(Preset::Default)
     );
 
     let state = init_state(&config, preset).await?;
