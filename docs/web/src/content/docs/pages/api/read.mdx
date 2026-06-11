@@ -27,8 +27,8 @@ api: "GET /{bucket}/{stream}"
  Live mode: `sse` for Server-Sent Events, `long-poll` for long-polling. Omit for catch-up read.
 </ParamField>
 
-<ParamField query="max-bytes" type="number">
- Maximum bytes to return in a single response (catch-up and long-poll only).
+<ParamField query="max_bytes" type="number">
+ Maximum bytes to read in one response or SSE data batch. For UTF-8 SSE data, Ursula may shorten the emitted batch so `Stream-Next-Offset` lands on a valid text boundary.
 </ParamField>
 
 ## Read modes
@@ -69,11 +69,13 @@ api: "GET /{bucket}/{stream}"
 
 Response headers include `Stream-Next-Offset`, `Stream-Cursor`, `ETag`, `Stream-Up-To-Date`, `Stream-Closed`, and `Content-Type`.
 
+Streams written with `Content-Type: application/json` are returned as newline-delimited JSON with response `Content-Type: application/x-ndjson`. `max_bytes` applies to the encoded byte stream, so a response can end mid-line. Resume from `Stream-Next-Offset` and buffer any incomplete trailing line before parsing. `HEAD` reports the configured stream content type; read responses report the wire representation.
+
 ## SSE event format
 
 In SSE mode, the server sends:
 
-- **Data events** (`event: data`): stream payload in the `data` field. For binary streams, data is base64-encoded (controlled by the `Stream-Sse-Data-Encoding` header).
+- **Data events** (`event: data`): stream payload in the `data` field. The response `Stream-Data-Content-Type` header identifies the data payload type (`application/x-ndjson` for JSON streams, the original content type for other streams). SSE `data:` lines are transport lines, not guaranteed message boundaries; JSON clients should buffer until newline before parsing records. For binary streams, data is base64-encoded (controlled by the `Stream-Sse-Data-Encoding` header).
 - **Control events** (`event: control`): JSON metadata including the current offset and stream state.
 - **Heartbeat comments**: periodic `:` lines to keep the connection alive through proxies.
 

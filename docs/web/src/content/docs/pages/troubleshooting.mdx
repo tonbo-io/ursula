@@ -106,9 +106,9 @@ More committed data exists past this response. Page forward with `Stream-Next-Of
 
 A proxy or load balancer is closing idle TCP. Raise its idle timeout or enable TCP keepalive on the proxy-to-Ursula leg. Ursula doesn't emit SSE keepalive comments.
 
-### SSE on a binary stream returns base64 JSON
+### SSE on a binary stream returns base64 text
 
-Expected. SSE wire format is text-only, so binary streams are wrapped in JSON and the `Stream-Sse-Data-Encoding: base64` header signals it. See [binary SSE](/docs/concepts/binary-sse).
+Expected. SSE wire format is text-only, so binary stream data events carry raw base64 text and the `Stream-Sse-Data-Encoding: base64` header signals it. See [binary SSE](/docs/concepts/binary-sse).
 
 ### Reads stall for hundreds of ms for cold offsets
 

@@ -47,6 +47,8 @@ use crate::HEADER_STREAM_UP_TO_DATE;
 use crate::HEADER_X_CONTENT_TYPE_OPTIONS;
 use crate::HttpMetricsSnapshot;
 
+const JSON_READ_CONTENT_TYPE: &str = "application/x-ndjson";
+
 pub(crate) fn runtime_error_status(err: &RuntimeError) -> StatusCode {
     match err {
         RuntimeError::EmptyAppend
@@ -711,13 +713,9 @@ pub(crate) fn read_response(
     request_headers: &HeaderMap,
     request_cursor: Option<&str>,
 ) -> Response {
-    let payload = match project_http_read_payload(&response.content_type, &response.payload) {
-        Ok(payload) => payload,
-        Err(message) => return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response(),
-    };
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
-    insert_content_type(&mut headers, &response.content_type);
+    insert_content_type(&mut headers, http_read_content_type(&response.content_type));
     insert_offset(&mut headers, response.next_offset);
     let etag = read_etag(&response);
     if let Ok(value) = HeaderValue::from_str(&etag) {
@@ -742,7 +740,7 @@ pub(crate) fn read_response(
             response_cursor(response.next_offset, request_cursor),
         );
     }
-    (StatusCode::OK, headers, payload).into_response()
+    (StatusCode::OK, headers, response.payload).into_response()
 }
 
 pub(crate) fn snapshot_response(response: ReadSnapshotResponse) -> Response {
@@ -832,19 +830,14 @@ pub(crate) fn push_multipart_part(
 pub(crate) fn offset_now_response(response: ReadStreamResponse) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
-    insert_content_type(&mut headers, &response.content_type);
+    insert_content_type(&mut headers, http_read_content_type(&response.content_type));
     insert_offset(&mut headers, response.next_offset);
     insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
     insert_cache_control(&mut headers, "no-store");
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
     }
-    let body = if is_json_content_type(&response.content_type) {
-        Bytes::from_static(b"[]")
-    } else {
-        Bytes::new()
-    };
-    (StatusCode::OK, headers, body).into_response()
+    (StatusCode::OK, headers, Bytes::new()).into_response()
 }
 
 pub(crate) fn long_poll_no_content_response(
@@ -873,6 +866,14 @@ pub(crate) fn is_json_content_type(content_type: &str) -> bool {
         .unwrap_or(content_type)
         .trim()
         .eq_ignore_ascii_case("application/json")
+}
+
+pub(crate) fn http_read_content_type(content_type: &str) -> &str {
+    if is_json_content_type(content_type) {
+        JSON_READ_CONTENT_TYPE
+    } else {
+        content_type
+    }
 }
 
 pub(crate) fn normalize_http_write_payload(
@@ -905,37 +906,33 @@ pub(crate) fn normalize_http_write_payload(
     Ok(Bytes::from(out))
 }
 
-pub(crate) fn project_http_read_payload(
-    content_type: &str,
-    payload: &[u8],
-) -> Result<Vec<u8>, String> {
-    if !is_json_content_type(content_type) {
-        return Ok(payload.to_vec());
+pub(crate) fn clamp_sse_text_read(read: &mut ReadStreamResponse, encode_base64: bool) {
+    if encode_base64 || read.payload.is_empty() {
+        return;
     }
 
-    let mut out = Vec::with_capacity(payload.len().saturating_add(2));
-    out.push(b'[');
-    let mut first = true;
-    let mut idx = 0usize;
-    while idx < payload.len() {
-        let Some(rel_end) = payload[idx..].iter().position(|byte| *byte == b'\n') else {
-            return Err(format!("invalid JSON payload boundary at byte {idx}"));
-        };
-        let line_end = idx + rel_end;
-        let line = &payload[idx..line_end];
-        if !line.is_empty() {
-            serde_json::from_slice::<serde_json::Value>(line)
-                .map_err(|err| format!("invalid stored JSON message at byte {idx}: {err}"))?;
-            if !first {
-                out.push(b',');
-            }
-            out.extend_from_slice(line);
-            first = false;
-        }
-        idx = line_end + 1;
+    let len = sse_text_payload_len(&read.content_type, &read.payload);
+    if len == 0 || len == read.payload.len() {
+        return;
     }
-    out.push(b']');
-    Ok(out)
+
+    read.payload.truncate(len);
+    read.next_offset = read.offset + u64::try_from(len).expect("payload len fits u64");
+    read.up_to_date = false;
+}
+
+fn sse_text_payload_len(content_type: &str, payload: &[u8]) -> usize {
+    if is_json_content_type(content_type)
+        && !payload.ends_with(b"\n")
+        && let Some(newline) = payload.iter().rposition(|byte| *byte == b'\n')
+    {
+        return newline + 1;
+    }
+
+    match std::str::from_utf8(payload) {
+        Ok(_) => payload.len(),
+        Err(err) => err.valid_up_to(),
+    }
 }
 
 pub(crate) fn render_sse_read(
@@ -949,11 +946,6 @@ pub(crate) fn render_sse_read(
         body.push_str("event: data\n");
         let payload = if encode_base64 {
             BASE64_STANDARD.encode(&read.payload)
-        } else if is_json_content_type(&read.content_type) {
-            match project_http_read_payload(&read.content_type, &read.payload) {
-                Ok(payload) => String::from_utf8_lossy(&payload).into_owned(),
-                Err(message) => message,
-            }
         } else {
             String::from_utf8_lossy(&read.payload).into_owned()
         };

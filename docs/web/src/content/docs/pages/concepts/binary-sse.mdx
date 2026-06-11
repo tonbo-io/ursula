@@ -3,23 +3,30 @@ title: Binary SSE
 sidebarTitle: Binary SSE
 ---
 
-The SSE wire format is text-only: every `data:` field must be valid UTF-8. For streams with text-shaped content types (`text/*`, `application/json`), SSE works out of the box: each event's `data` field carries the bytes verbatim.
+The SSE wire format is text-only: every `data:` field must be valid UTF-8. Ursula therefore advertises the decoded data payload type with `Stream-Data-Content-Type` on every SSE read.
 
-For other content types (`application/octet-stream`, custom binary), Ursula wraps each event in a JSON envelope and base64-encodes the payload:
+For `text/*` streams, data events carry UTF-8 text directly.
 
-```json
-{
-  "encoding": "base64",
-  "contentType": "application/octet-stream",
-  "payload": "aGVsbG8="
-}
+For `application/json` streams, data events carry newline-delimited JSON and the response includes `Stream-Data-Content-Type: application/x-ndjson`. SSE `data:` lines are transport framing, not JSON record boundaries, so clients should buffer until newline before parsing records.
+
+For other content types (`application/octet-stream`, custom binary), Ursula base64-encodes the data event payload as raw text. It is not wrapped in a JSON envelope:
+
+```text
+event: data
+data: AQIDBAUG
+data: BwgJCg==
+
+event: control
+data: {"streamNextOffset":"123456_789","streamCursor":"abc"}
 ```
 
-The choice is automatic, determined by the stream's content type. There is no client opt-in. What you get is what the stream's content type implied. The response advertises the choice with the `Stream-Sse-Data-Encoding` header: `base64` for wrapped streams, absent for raw.
+The choice is automatic, determined by the stream's content type. There is no client opt-in. What you get is what the stream's content type implied. The response advertises base64 data with `Stream-Sse-Data-Encoding: base64`; when that header is absent, the `data` event payload is already UTF-8 text with the type identified by `Stream-Data-Content-Type`.
 
 ## Decoding
 
-For wrapped streams, decode each event as JSON, then base64-decode `payload`. For raw streams, the `data` field is already the payload (UTF-8 text or JSON).
+For binary streams, concatenate the `data:` lines for an `event: data`, remove line breaks inserted by SSE framing, then base64-decode the resulting text. Interpret the decoded bytes according to `Stream-Data-Content-Type`.
+
+For text and JSON streams, the `data` field is already the payload text. JSON streams use newline-delimited JSON (`application/x-ndjson`), so buffer until newline before parsing.
 
 Browser `EventSource` works for both modes. Only the `data` handler differs.
 
