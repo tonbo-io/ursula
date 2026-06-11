@@ -89,6 +89,6 @@ es.addEventListener("data", (e) => console.log(e.data));
 ## Notes for client implementers
 
 - After every read and append, the server returns `Stream-Next-Offset`. Track it. Use it as the `offset` query parameter on the next read. Don't construct offsets manually. They're opaque.
-- For binary streams over SSE, `data` events arrive as a JSON envelope (`{ encoding, contentType, payload }`) with a base64 payload. See [Binary SSE](/docs/concepts/binary-sse).
+- For binary streams over SSE, `data` events carry raw base64 text and the response includes `Stream-Sse-Data-Encoding: base64`. Decode the data event first, then interpret the bytes using `Stream-Data-Content-Type`. See [Binary SSE](/docs/concepts/binary-sse).
 - For exactly-once writes, send `Producer-Id`, `Producer-Epoch`, `Producer-Seq` headers and retry on network errors. The server deduplicates. See [Exactly-once writes](/docs/concepts/exactly-once-writes).
 - For conditional writes, use `Stream-Seq` with a monotonically increasing token. (`If-Match` is part of the Durable Streams Protocol but is not yet implemented in Ursula.) See [Conditional writes](/docs/concepts/conditional-writes).
