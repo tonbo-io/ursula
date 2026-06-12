@@ -74,7 +74,7 @@ struct SnapshotInstallCoordinatorInner {
 
 impl Default for SnapshotInstallCoordinator {
     fn default() -> Self {
-        Self::new(snapshot_install_max_concurrency_from_env())
+        Self::new(1)
     }
 }
 
@@ -143,14 +143,6 @@ impl SnapshotInstallCoordinator {
     fn available_permits(&self) -> usize {
         self.inner.semaphore.available_permits()
     }
-}
-
-fn snapshot_install_max_concurrency_from_env() -> usize {
-    std::env::var("URSULA_RAFT_SNAPSHOT_INSTALL_MAX_CONCURRENCY")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1)
 }
 
 #[derive(Debug, Clone)]

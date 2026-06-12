@@ -623,9 +623,13 @@
           "minimum": 1,
           "description": "Number of Raft groups."
         },
-        "initMembershipPerGroup": {
+        "initMembership": {
           "type": "boolean",
           "description": "One-time fresh-cluster membership bootstrap flag."
+        },
+        "initMembershipPerGroup": {
+          "type": "boolean",
+          "description": "One-time fresh-cluster per-group membership bootstrap flag."
         },
         "storageMode": {
           "type": "string",
@@ -639,8 +643,8 @@
         },
         "maxUncommittedBytesPerGroup": {
           "type": ["integer", "null"],
-          "minimum": 1,
-          "description": "Optional raft uncommitted byte cap per group."
+          "minimum": 0,
+          "description": "Optional raft uncommitted byte cap per group; 0 disables the cap."
         }
       }
     },
@@ -692,7 +696,7 @@
         },
         "prefix": {
           "type": "string",
-          "description": "Shared object prefix for Ursula objects."
+          "description": "Shared object prefix used with coldStorage.prefix to build storage.cold.root when coldStorage.enabled=true; not rendered into a cold root when cold storage is disabled."
         },
         "credentials": {
           "type": "object",
@@ -724,7 +728,7 @@
       "properties": {
         "enabled": {
           "type": "boolean",
-          "description": "Enable cold storage runtime env vars."
+          "description": "Enable cold storage in the generated Ursula config."
         },
         "backend": {
           "type": "string",
@@ -761,8 +765,29 @@
             },
             "maxHotBytesPerGroup": {
               "type": "integer",
+              "minimum": 0,
+              "description": "Backpressure ceiling for hot bytes per group; 0 disables the cap."
+            }
+          }
+        },
+        "cache": {
+          "type": ["object", "null"],
+          "description": "Optional cold-read cache override. Omitted values use Ursula runtime defaults.",
+          "properties": {
+            "maxSizeBytes": {
+              "type": ["integer", "null"],
+              "minimum": 0,
+              "description": "Maximum cold-read cache bytes; 0 disables the cache."
+            },
+            "blockSizeBytes": {
+              "type": ["integer", "null"],
               "minimum": 1,
-              "description": "Backpressure ceiling for hot bytes per group."
+              "description": "Cold-read cache block size in bytes."
+            },
+            "readaheadBlocks": {
+              "type": ["integer", "null"],
+              "minimum": 0,
+              "description": "Number of cache blocks to read ahead."
             }
           }
         }
@@ -779,7 +804,12 @@
         },
         "prefix": {
           "type": "string",
-          "description": "Snapshot object prefix below s3.prefix."
+          "description": "Snapshot object suffix rendered as storage.snapshot.s3_prefix; resolved against storage.cold.root when present, otherwise against the S3 bucket root for S3 snapshots."
+        },
+        "driveIntervalMs": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Manual snapshot driver interval in milliseconds; 0 disables the manual driver."
         }
       }
     },

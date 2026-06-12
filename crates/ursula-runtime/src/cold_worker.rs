@@ -2,24 +2,25 @@
 //!
 //! Started by the bootstrap layer after the runtime is constructed.
 
-use std::time::Duration;
-
 use crate::PlanGroupColdFlushRequest;
 use crate::ShardRuntime;
-use crate::cold_config::ColdWorkerConfig;
 
 /// Start the periodic cold-flush worker if the configured interval is non-zero.
-pub fn spawn_cold_flush_worker_if_configured(runtime: &ShardRuntime, config: &ColdWorkerConfig) {
-    if config.flush_interval_ms == 0 {
+pub fn spawn_cold_flush_worker_if_configured(
+    runtime: &ShardRuntime,
+    config: &ursula_config::ColdConfig,
+) {
+    let interval = config.flush_interval.as_duration();
+    if interval.is_zero() {
         return;
     }
-    let interval_ms = config.flush_interval_ms;
-    let min_hot_bytes = config.flush_min_hot_bytes;
-    let max_flush_bytes = config.flush_max_bytes;
+    let min_hot_bytes = usize::try_from(config.flush_min_hot_size().as_bytes())
+        .expect("config validation ensures flush sizes fit usize");
+    let max_flush_bytes = usize::try_from(config.flush_max_size().as_bytes())
+        .expect("config validation ensures flush sizes fit usize");
     let max_concurrency = config.flush_max_concurrency.max(1);
     let runtime = runtime.clone();
     tokio::spawn(async move {
-        let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX));
         loop {
             if let Err(err) = runtime
                 .flush_cold_all_groups_once_bounded(
@@ -39,15 +40,17 @@ pub fn spawn_cold_flush_worker_if_configured(runtime: &ShardRuntime, config: &Co
 }
 
 /// Start the periodic cold-gc worker if the configured interval is non-zero.
-pub fn spawn_cold_gc_worker_if_configured(runtime: &ShardRuntime, config: &ColdWorkerConfig) {
-    if config.gc_interval_ms == 0 {
+pub fn spawn_cold_gc_worker_if_configured(
+    runtime: &ShardRuntime,
+    config: &ursula_config::ColdConfig,
+) {
+    let interval = config.gc_interval.as_duration();
+    if interval.is_zero() {
         return;
     }
-    let interval_ms = config.gc_interval_ms;
     let max_entries = config.gc_max_entries.max(1);
     let runtime = runtime.clone();
     tokio::spawn(async move {
-        let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX));
         loop {
             if let Err(err) = runtime.run_cold_gc_all_groups_once(max_entries).await {
                 tracing::error!("cold gc worker error: {err}");

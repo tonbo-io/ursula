@@ -1,10 +1,10 @@
 //! Ursula HTTP server: axum router, request handlers, response rendering,
-//! plus the env-driven `ShardRuntime` constructors used by the `ursula` binary.
+//! plus the typed-config bootstrap constructors used by the `ursula` binary.
 //!
 //! Module map:
 //!
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
-//! - [`bootstrap`]: env-driven `spawn_*_runtime` constructors and cold-flush worker.
+//! - [`bootstrap`]: typed-config `spawn_*_runtime` constructors and cold-flush worker.
 
 mod bootstrap;
 mod otel_metrics;
@@ -102,7 +102,6 @@ use ursula_runtime::new_external_payload_path;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 
-use crate::bootstrap::env_usize;
 use crate::bootstrap::reenable_elections_if_campaign_allowed;
 use crate::render::bootstrap_response;
 use crate::render::insert_cache_control;
@@ -205,8 +204,9 @@ pub struct HttpState {
     client_write_router: Option<ClientWriteLeaderRouter>,
     http_metrics: Arc<HttpMetrics>,
     wall_clock: Arc<dyn WallClock>,
-    node_memory: NodeMemoryMonitor,
+    pub node_memory: NodeMemoryMonitor,
     leadership_shed: LeadershipShedFlag,
+    external_payload_min_bytes: usize,
 }
 
 impl HttpState {
@@ -224,8 +224,9 @@ impl HttpState {
             client_write_router: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
-            node_memory: NodeMemoryMonitor::from_env(),
+            node_memory: NodeMemoryMonitor::default(),
             leadership_shed: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            external_payload_min_bytes: 1024 * 1024,
         }
     }
 
@@ -240,8 +241,9 @@ impl HttpState {
             client_write_router: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
-            node_memory: NodeMemoryMonitor::from_env(),
+            node_memory: NodeMemoryMonitor::default(),
             leadership_shed,
+            external_payload_min_bytes: 1024 * 1024,
         }
     }
 
@@ -277,8 +279,9 @@ impl HttpState {
             )),
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
-            node_memory: NodeMemoryMonitor::from_env(),
+            node_memory: NodeMemoryMonitor::default(),
             leadership_shed,
+            external_payload_min_bytes: 1024 * 1024,
         }
     }
 
@@ -302,6 +305,23 @@ impl HttpState {
 
     pub fn with_wall_clock_handle(mut self, wall_clock: Arc<dyn WallClock>) -> Self {
         self.wall_clock = wall_clock;
+        self
+    }
+
+    pub fn with_external_payload_min_bytes(mut self, min_bytes: usize) -> Self {
+        self.external_payload_min_bytes = min_bytes;
+        self
+    }
+
+    /// Apply runtime-level config (memory monitor, payload threshold) derived
+    /// from the typed configuration.  Replaces the hard-coded defaults set by
+    /// the constructors.
+    pub fn with_runtime_config(mut self, config: &ursula_config::RuntimeConfig) -> Self {
+        self.node_memory = NodeMemoryMonitor::new(config);
+        if let Some(min_size) = &config.external_payload_min_size {
+            self.external_payload_min_bytes = usize::try_from(min_size.as_bytes())
+                .expect("config validation ensures payload size fits usize");
+        }
         self
     }
 
@@ -354,9 +374,11 @@ struct HttpMetricsSnapshot {
 
 /// Resolves the current leader of a raft group to a client-reachable base URL
 /// so a write/read that lands on a non-leader can be answered with a 307
-/// redirect. `peers` maps raft node id to that node's listen address; gRPC and
-/// the client API share one listener, so a single address per peer is both the
-/// replication endpoint and the redirect target.
+/// redirect. `peers` maps raft node id to that node's configured peer URL:
+/// `server.listen` when `server.cluster_listen` is unset, or the separate
+/// `server.cluster_listen` address when it is set. Peer URLs are also used as
+/// HTTP leader-redirect targets, so clients and gateways must be able to reach
+/// them too.
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
     peers: Arc<BTreeMap<u64, String>>,
@@ -450,10 +472,22 @@ impl std::fmt::Debug for NodeMemoryMonitor {
     }
 }
 
+impl Default for NodeMemoryMonitor {
+    fn default() -> Self {
+        Self {
+            abort_cap_bytes: None,
+            last_rss_bytes: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
 impl NodeMemoryMonitor {
-    pub fn from_env() -> Self {
+    pub fn new(cfg: &ursula_config::RuntimeConfig) -> Self {
         let monitor = Self {
-            abort_cap_bytes: env_u64_optional("URSULA_NODE_MEMORY_ABORT_CAP_BYTES"),
+            abort_cap_bytes: cfg
+                .node_memory_abort_cap_size
+                .as_ref()
+                .map(|s| s.as_bytes()),
             last_rss_bytes: Arc::new(AtomicU64::new(0)),
         };
         monitor.spawn_rss_sampler();
@@ -521,14 +555,7 @@ fn read_proc_self_status_vm_rss_bytes() -> Option<u64> {
     None
 }
 
-fn env_u64_optional(name: &str) -> Option<u64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-}
-
 #[derive(Clone)]
-
 struct HttpRaftGrpcService {
     raft: RaftGrpcService,
 }
@@ -608,14 +635,22 @@ fn raft_grpc_service(
 }
 
 pub fn router(runtime: ShardRuntime) -> Router {
-    router_from_state(HttpState::new(runtime))
+    let state = HttpState::new(runtime);
+    cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
+    ))
 }
 
 pub fn router_with_raft_registry(
     runtime: ShardRuntime,
     raft_registry: RaftGroupHandleRegistry,
 ) -> Router {
-    router_from_state(HttpState::with_raft_registry(runtime, raft_registry))
+    let state = HttpState::with_raft_registry(runtime, raft_registry);
+    cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
+    ))
 }
 
 pub fn router_with_static_raft_cluster(
@@ -623,10 +658,10 @@ pub fn router_with_static_raft_cluster(
     raft_registry: RaftGroupHandleRegistry,
     peers: impl IntoIterator<Item = (u64, String)>,
 ) -> Router {
-    router_from_state(HttpState::with_static_raft_cluster(
-        runtime,
-        raft_registry,
-        peers,
+    let state = HttpState::with_static_raft_cluster(runtime, raft_registry, peers);
+    cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
     ))
 }
 
@@ -637,23 +672,32 @@ pub fn router_with_static_raft_cluster_topology(
     peers: impl IntoIterator<Item = (u64, String)>,
     per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
 ) -> Router {
-    router_from_state(HttpState::with_static_raft_cluster_topology(
+    let state = HttpState::with_static_raft_cluster_topology(
         runtime,
         raft_registry,
         Some(node_id),
         peers,
         per_group_voters,
+    );
+    cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
     ))
 }
 
+/// Convenience wrapper that merges both client and cluster planes into a
+/// single router.  Used by in-process tests and the madsim harness.
 pub fn router_with_http_state(state: HttpState) -> Router {
-    router_from_state(state)
+    cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
+    ))
 }
 
 /// Cluster-plane routes: inter-node gRPC carrying Raft RPCs, snapshot
-/// transfer, and HTTP-write forwarding to the leader. In a dual-listener
-/// deployment these bind to the private (VPC) interface so chaos applied to
-/// the public face never disrupts consensus.
+/// transfer, and leader-read checks. In a dual-listener deployment these bind
+/// to the private (VPC) interface so chaos applied to the public face never
+/// disrupts consensus.
 pub fn cluster_router_from_state(state: HttpState) -> Router {
     let raft_registry = state.raft_registry.clone().unwrap_or_default();
     Router::new()
@@ -686,103 +730,39 @@ pub fn cluster_router_from_state(state: HttpState) -> Router {
         .with_state(state)
 }
 
-/// Client-plane routes: HTTP append/read/admin endpoints used by external
-/// callers (producers, readers, operators). In a dual-listener deployment
-/// these bind to the public interface; failure injection against the public
-/// face only affects this plane.
-pub fn client_router_from_state(state: HttpState) -> Router {
-    Router::new()
-        .route("/__ursula/metrics", get(metrics))
-        .route(CLUSTER_PROBE_PATH, post(cluster_probe))
-        .route(
-            "/__ursula/flush-cold/{bucket}/{stream}",
-            post(flush_cold_stream),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/snapshot",
-            post(trigger_raft_snapshot),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/purge",
-            post(trigger_raft_purge),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/membership",
-            post(change_raft_membership),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/learners/{node_id}",
-            post(add_raft_learner),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/nodes/{node_id}/allow-next-revert",
-            post(allow_raft_node_next_revert),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/leader/transfer/{node_id}",
-            post(transfer_raft_leader),
-        )
-        .route(
-            "/__ursula/leadership-shed/maintenance",
-            post(mark_maintenance_drain).delete(clear_maintenance_drain),
-        )
-        .route(
-            "/v1/stream/{*path}",
-            put(create_stream_v1)
-                .post(append_stream_v1)
-                .get(read_stream_v1)
-                .delete(delete_stream_v1)
-                .head(head_stream_v1),
-        )
-        .route("/{bucket}", put(create_bucket))
-        .route("/{bucket}/{stream}/snapshot", get(read_latest_snapshot))
-        .route(
-            "/{bucket}/{stream}/snapshot/{snapshot_offset}",
-            put(publish_snapshot)
-                .get(read_snapshot)
-                .delete(delete_snapshot),
-        )
-        .route("/{bucket}/{stream}/bootstrap", get(bootstrap_stream))
-        .route(
-            "/{bucket}/{stream}/attrs",
-            put(update_stream_attrs).get(get_stream_attrs),
-        )
-        .route(
-            "/{bucket}/{stream}",
-            put(create_stream)
-                .post(append_stream)
-                .get(read_stream)
-                .delete(delete_stream)
-                .head(head_stream),
-        )
-        .route("/{bucket}/{stream}/append-batch", post(append_batch))
-        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
-        .layer(middleware::from_fn_with_state(
-            IngressAdmission::from_env(),
-            ingress_admission_middleware,
-        ))
-        .with_state(state)
-}
-
 /// Client-plane ingress admission. The primary control is a process-wide
 /// in-flight write-body byte budget: a request must reserve its body bytes
 /// before axum drains the body into `Bytes`, and the reservation lives until
 /// the response is produced. This is the layer that turns memory pressure into
 /// backpressure at the HTTP edge.
 ///
-/// `URSULA_HTTP_INFLIGHT_BODY_BYTES` overrides the default budget.
+/// Configurable via `ServerConfig.http_inflight_body_size`.
 #[derive(Clone)]
-struct IngressAdmission {
+pub struct IngressAdmission {
     body_bytes: Arc<tokio::sync::Semaphore>,
 }
 
+impl Default for IngressAdmission {
+    fn default() -> Self {
+        Self {
+            body_bytes: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_HTTP_INFLIGHT_BODY_BYTES,
+            )),
+        }
+    }
+}
+
 impl IngressAdmission {
-    fn from_env() -> Self {
-        let body_budget = env_u64_optional("URSULA_HTTP_INFLIGHT_BODY_BYTES")
-            .and_then(|n| usize::try_from(n).ok())
-            .unwrap_or(DEFAULT_HTTP_INFLIGHT_BODY_BYTES);
+    pub fn new(cfg: &ursula_config::ServerConfig) -> Self {
+        let body_budget = cfg.http_inflight_body_size.as_bytes() as usize;
         Self {
             body_bytes: Arc::new(tokio::sync::Semaphore::new(body_budget)),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self {
+            body_bytes: Arc::new(tokio::sync::Semaphore::new(usize::MAX)),
         }
     }
 }
@@ -918,11 +898,78 @@ fn bool_json(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
 
-/// Single-listener router that serves both planes from one bind. Kept for
-/// in-process tests and backward-compatible deployments that don't separate
-/// the public and cluster network paths.
-fn router_from_state(state: HttpState) -> Router {
-    cluster_router_from_state(state.clone()).merge(client_router_from_state(state))
+pub fn client_router_with_admission(state: HttpState, admission: IngressAdmission) -> Router {
+    Router::new()
+        .route("/__ursula/metrics", get(metrics))
+        .route(CLUSTER_PROBE_PATH, post(cluster_probe))
+        .route(
+            "/__ursula/flush-cold/{bucket}/{stream}",
+            post(flush_cold_stream),
+        )
+        .route(
+            "/__ursula/raft/{raft_group_id}/snapshot",
+            post(trigger_raft_snapshot),
+        )
+        .route(
+            "/__ursula/raft/{raft_group_id}/purge",
+            post(trigger_raft_purge),
+        )
+        .route(
+            "/__ursula/raft/{raft_group_id}/membership",
+            post(change_raft_membership),
+        )
+        .route(
+            "/__ursula/raft/{raft_group_id}/learners/{node_id}",
+            post(add_raft_learner),
+        )
+        .route(
+            "/__ursula/raft/{raft_group_id}/nodes/{node_id}/allow-next-revert",
+            post(allow_raft_node_next_revert),
+        )
+        .route(
+            "/__ursula/raft/{raft_group_id}/leader/transfer/{node_id}",
+            post(transfer_raft_leader),
+        )
+        .route(
+            "/__ursula/leadership-shed/maintenance",
+            post(mark_maintenance_drain).delete(clear_maintenance_drain),
+        )
+        .route(
+            "/v1/stream/{*path}",
+            put(create_stream_v1)
+                .post(append_stream_v1)
+                .get(read_stream_v1)
+                .delete(delete_stream_v1)
+                .head(head_stream_v1),
+        )
+        .route("/{bucket}", put(create_bucket))
+        .route("/{bucket}/{stream}/snapshot", get(read_latest_snapshot))
+        .route(
+            "/{bucket}/{stream}/snapshot/{snapshot_offset}",
+            put(publish_snapshot)
+                .get(read_snapshot)
+                .delete(delete_snapshot),
+        )
+        .route("/{bucket}/{stream}/bootstrap", get(bootstrap_stream))
+        .route(
+            "/{bucket}/{stream}/attrs",
+            put(update_stream_attrs).get(get_stream_attrs),
+        )
+        .route(
+            "/{bucket}/{stream}",
+            put(create_stream)
+                .post(append_stream)
+                .get(read_stream)
+                .delete(delete_stream)
+                .head(head_stream),
+        )
+        .route("/{bucket}/{stream}/append-batch", post(append_batch))
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            admission,
+            ingress_admission_middleware,
+        ))
+        .with_state(state)
 }
 
 pub(crate) fn should_externalize_payload(
@@ -933,7 +980,7 @@ pub(crate) fn should_externalize_payload(
     allowed
         && payload_len > 0
         && state.runtime.has_cold_store()
-        && payload_len >= env_usize("URSULA_EXTERNAL_PAYLOAD_MIN_BYTES", 1024 * 1024)
+        && payload_len >= state.external_payload_min_bytes
 }
 
 pub(crate) async fn stage_external_payload(
@@ -944,7 +991,7 @@ pub(crate) async fn stage_external_payload(
     let Some(cold_store) = state.runtime.cold_store() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "URSULA_COLD_BACKEND must be configured before externalizing payloads",
+            "cold backend must be configured before externalizing payloads",
         )
             .into_response());
     };
@@ -2833,9 +2880,10 @@ pub(crate) async fn runtime_error_or_leader_redirect_async(
     let Some(router) = state.client_write_router() else {
         return runtime_error_response(err);
     };
-    // gRPC and the client API share one listener, so the leader's address is
-    // a valid redirect target for reads and writes alike. 307 preserves the
-    // method and body, so a forwarded POST/PUT re-runs as a write on the
+    // Peer URLs are the configured client-reachable leader addresses
+    // (`server.listen` when shared, or `server.cluster_listen` when split), so
+    // they are valid redirect targets for reads and writes alike. 307 preserves
+    // the method and body, so a redirected POST/PUT re-runs as a write on the
     // leader. Writes go through the leader's raft client_write exactly as a
     // local write would; redirecting only moves the leader hop to the client.
     if let Some(redirect) = router.redirect_response(&err, request_target) {

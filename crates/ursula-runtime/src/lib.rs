@@ -17,14 +17,13 @@
 //! - [`metrics`]: runtime metrics shared across cores; lock-free counters.
 
 mod admission;
-pub mod cold_config;
 pub mod cold_index;
 mod cold_store;
 pub mod cold_worker;
 mod command;
 mod core_worker;
 mod engine;
-pub(crate) mod env;
+
 mod error;
 mod group_actor;
 mod metrics;
@@ -35,10 +34,6 @@ mod snapshot_store;
 mod trace;
 
 pub use admission::RaftUncommittedAdmission;
-pub use cold_config::ColdCacheConfig;
-pub use cold_config::ColdConfig;
-pub use cold_config::ColdStorageConfig;
-pub use cold_config::ColdWorkerConfig;
 pub use cold_index::ColdIndexPage;
 pub use cold_index::ColdIndexPageCache;
 pub use cold_index::ColdIndexPageKey;
@@ -48,6 +43,7 @@ pub use cold_index::InMemoryColdIndexPageStore;
 pub use cold_index::cold_index_prefix;
 pub use cold_index::write_cold_chunk_index_pages;
 pub use cold_index::write_external_segment_index_pages;
+pub use cold_store::ColdReadCacheParams;
 pub use cold_store::ColdStore;
 pub use cold_store::ColdStoreEvent;
 pub use cold_store::ColdStoreFault;
@@ -164,7 +160,8 @@ pub use snapshot_store::SnapshotStore;
 pub use snapshot_store::SnapshotStoreError;
 pub use snapshot_store::SnapshotStoreFuture;
 pub use snapshot_store::default_snapshot_store;
-pub use snapshot_store::snapshot_store_from_env;
+pub use snapshot_store::snapshot_store_from_config;
+pub use ursula_config::config::ColdConfig;
 pub use ursula_stream::ColdChunkRef;
 pub use ursula_stream::ColdFlushCandidate;
 pub use ursula_stream::ColdGcEntry;
