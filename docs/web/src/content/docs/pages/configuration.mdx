@@ -2,143 +2,170 @@
 title: Configuration
 ---
 
-Ursula is configured via CLI flags and environment variables. There is no TOML or YAML configuration file today.
+Ursula is configured by a config file, an optional resource preset, and a small set of CLI overrides.
 
-```
-defaults < environment variables < CLI flags
+```text
+built-in defaults < preset defaults < config file < CLI overrides
 ```
 
-## CLI flags
+The normal startup command is:
+
+```bash
+ursula --config /etc/ursula/ursula.toml --node-id 1
+```
+
+For local development without a config file, `ursula --preset default` starts a single-node in-memory runtime.
+
+## CLI overrides
 
 | Flag | Default | Notes |
 | ---- | ------- | ----- |
-| `--listen ADDR` | `127.0.0.1:4437` | TCP bind address for the HTTP + gRPC-Raft listener |
-| `--core-count N` | `available_parallelism` | Worker threads (each pinned to its mailbox event loop) |
-| `--raft-group-count N` | `core_count × 16` | Total Raft groups. Higher = better stream-to-group hash spread |
-| `--profile PROFILE` | `URSULA_PROFILE` or `default` | Startup template: `default`, `dev`, `tiny`, `small`, `standard`, or `large` |
-| `--storage-backend BACKEND` | profile-selected | `memory` or `disk` |
-| `--disk-path DIR` | none | Selects disk storage when `--storage-backend` is omitted; Ursula stores Raft logs under `DIR/raft-log` |
-| `--raft-node-id ID` | none | Required for static gRPC cluster mode |
-| `--raft-peer ID=URL` | none | Static peer list (repeatable: one per node, including self) |
-| `--raft-cluster-config FILE` | none | JSON file equivalent to `--raft-node-id` + `--raft-peer` lines |
-| `--raft-init-membership` | off | One-time cluster-wide membership bootstrap (first start only) |
-| `--raft-init-membership-per-group` | off | Same, but bootstrap each Raft group independently |
+| `--config FILE` | searches `./ursula.toml`, `./ursula.json`, `./ursula.yaml`, `./ursula.yml`, `/etc/ursula/ursula.toml`, `/etc/ursula/ursula.json`, `/etc/ursula/ursula.yaml`, `/etc/ursula/ursula.yml`, then user config paths | TOML, JSON, or YAML config file |
+| `--preset PRESET` | `default` when no config file is found; otherwise none | Resource preset: `default`, `dev`, `tiny`, `small`, `standard`, or `large` |
+| `--node-id ID` | config file or preset | Overrides `raft.node_id`; Helm derives this from the StatefulSet ordinal |
 
-`memory` uses an in-memory Raft log. `disk` uses the durable OpenRaft log store and works for both single-node and static gRPC cluster runs. When `--storage-backend` is omitted, `--disk-path DIR` selects disk storage automatically.
+CLI `--node-id` intentionally overrides any `raft.node_id` value in the config file so the same file can be mounted on every node.
 
-### Legacy storage aliases
+## Config file overview
 
-These compatibility aliases are hidden from CLI help and will be removed in a future 0.1.x cleanup:
+| Config key | Default | Purpose |
+| ---------- | ------- | ------- |
+| `server.listen` | `127.0.0.1:4437` | Client/API listener. When `server.cluster_listen` is unset, this also serves Raft/cluster routes and peer URLs should point here |
+| `server.cluster_listen` | none | Optional separate Raft/cluster listener. When set, `server.listen` is client/API-only and peer URLs must point here |
+| `runtime.core_count` | `available_parallelism` | Worker threads, each pinned to its mailbox event loop |
+| `raft.group_count` | `core_count × 16` | Total Raft groups. Higher values improve stream-to-group hash spread |
+| `raft.wal.backend` | `memory` | `memory` or `disk` |
+| `raft.wal.path` | none | Required for `raft.wal.backend = "disk"`; Ursula stores Raft logs under `PATH/raft-log` |
+| `raft.peers` | empty | Static gRPC peer list. Each `url` is also used for HTTP leader redirects, so clients/gateway must be able to reach it unless future separate redirect URL config exists |
+| `raft.init_membership_per_group` | `false` | One-time per-group membership bootstrap for a fresh cluster |
 
-| Legacy input | Replacement |
-| ------------ | ----------- |
-| `--raft-memory` | `--storage-backend memory` |
-| `--raft-log-dir DIR` | `--storage-backend disk --disk-path DIR` |
-| `--storage-dir DIR` | `--disk-path DIR` |
-| `--storage-backend raft-log` | `--storage-backend disk` |
+Without `server.cluster_listen`, set each `[[raft.peers]].url` to the node's `server.listen` address. With `server.cluster_listen`, set each `[[raft.peers]].url` to the node's cluster listener address and port. The same peer URL is currently also used for HTTP leader redirects, so that address must be reachable by clients or the gateway as well as other Ursula peers unless separate redirect URL configuration is added later.
 
-`--wal-dir DIR` is also still accepted for the old standalone diagnostic WAL runtime, but it is not a supported production storage path. Use `--storage-backend disk --disk-path DIR` for durable storage.
+## Static cluster config
 
-## Resource profiles
+Configure static Raft peers in the same TOML file on every host. Set a different `raft.node_id` on each host, or keep `raft.node_id` in the file and override it with `--node-id`.
 
-`--profile` and `URSULA_PROFILE` expand to a startup template. They set resource-budget env defaults and, when no storage backend is explicit, choose the storage shape: `default`/`dev` keep the lightweight non-Raft default runtime; `tiny`, `small`, `standard`, and `large` default to Raft memory. Supplying `--disk-path DIR` upgrades any profile to disk storage under `DIR/raft-log`. Explicit storage flags still win, and CLI admission flags such as `--http-inflight-body-bytes` still win over profile defaults.
+```toml
+[raft]
+node_id = 1
+group_count = 64
+init_membership_per_group = true
 
-| Profile | Intended use | Main defaults |
-| ------- | ------------ | ------------- |
-| `default`, `dev` | Local development and backwards-compatible startup | Non-Raft default runtime; does not inject resource-budget env vars |
-| `tiny` | Memory-bound tests or very small nodes | Raft memory by default; 64 MiB cold cache, 4 MiB cold flushes, 2 cold writes, 8 MiB hot/admission Raft caps, 64 MiB HTTP in-flight body budget |
-| `small` | Small nodes or cost-sensitive tests | Raft memory by default; 64 MiB cold cache, 4 MiB cold flushes, 2 cold writes, 16 MiB hot/admission Raft caps, 64 MiB HTTP in-flight body budget |
-| `standard` | Production baseline | Raft memory by default; 256 MiB cold cache, 8 MiB cold flushes, 4 cold writes, 64 MiB hot/admission Raft caps, 256 MiB HTTP in-flight body budget |
-| `large` | Larger nodes with more cache and write headroom | Raft memory by default; 512 MiB cold cache, 16 MiB cold flushes, 8 cold writes, 128 MiB hot/admission Raft caps, 512 MiB HTTP in-flight body budget |
+[raft.wal]
+backend = "disk"
+path = "/var/lib/ursula"
 
-Chaos deployments should use `--profile tiny` plus deployment-level env overrides such as `URSULA_NODE_MEMORY_ABORT_CAP_BYTES`; chaos-only safety limits are not part of the server profile list.
+[[raft.peers]]
+node_id = 1
+url = "http://10.0.0.1:4437"
 
-## Cluster config file
+[[raft.peers]]
+node_id = 2
+url = "http://10.0.0.2:4437"
 
-The `--raft-cluster-config FILE` JSON shape:
-
-```json
-{
-  "node_id": 1,
-  "init_membership_per_group": true,
-  "peers": [
-    {"node_id": 1, "url": "http://10.0.0.1:4437"},
-    {"node_id": 2, "url": "http://10.0.0.2:4437"},
-    {"node_id": 3, "url": "http://10.0.0.3:4437"}
-  ]
-}
+[[raft.peers]]
+node_id = 3
+url = "http://10.0.0.3:4437"
 ```
 
-Same file on every host. Only `node_id` at the top level changes.
+## Resource presets
 
-## Cold storage environment variables
+`--preset` supplies a base configuration before the config file is merged. `default`/`dev` keep the lightweight single-node development runtime; `tiny`, `small`, `standard`, and `large` size the Raft runtime and cold-storage knobs for progressively larger nodes. Config-file values override preset values.
 
-Cold backend is selected entirely via `URSULA_COLD_*` env vars. See [Configure S3](/docs/configure-s3) for the full reference. Minimum set:
+| Preset | Intended use | Main defaults |
+| ------ | ------------ | ------------- |
+| `default`, `dev` | Local development | Single-node in-memory runtime |
+| `tiny` | Memory-bound tests or very small nodes | 64 groups, 64 MiB cold cache, 4 MiB cold flushes, 2 cold writes, 8 MiB hot/admission caps, 64 MiB HTTP in-flight body budget |
+| `small` | Small nodes or cost-sensitive tests | 128 groups, 64 MiB cold cache, 4 MiB cold flushes, 2 cold writes, 16 MiB hot/admission caps, 64 MiB HTTP in-flight body budget |
+| `standard` | Production baseline | 256 groups, 256 MiB cold cache, 8 MiB cold flushes, 4 cold writes, 64 MiB hot/admission caps, 256 MiB HTTP in-flight body budget |
+| `large` | Larger nodes with more cache and write headroom | 512 groups, 512 MiB cold cache, 16 MiB cold flushes, 8 cold writes, 128 MiB hot/admission caps, 512 MiB HTTP in-flight body budget |
 
-| Variable | Required when | Notes |
-| -------- | ------------- | ----- |
-| `URSULA_COLD_BACKEND` | optional | `s3` or `memory`. Default: no cold backend configured. Use `memory` only for local tests. |
-| `URSULA_COLD_S3_BUCKET` | `BACKEND=s3` | Bucket name. |
-| `URSULA_COLD_S3_REGION` | `BACKEND=s3` | AWS region. |
-| `URSULA_COLD_S3_ENDPOINT` | optional | Set for S3-compatible stores. |
-| `URSULA_COLD_S3_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY`, `_SESSION_TOKEN` | optional | Explicit credentials. Omit to use the AWS SDK credential chain. |
-| `URSULA_COLD_ROOT` | optional | Prefix for all cold and snapshot keys. Defaults to unprefixed. |
+## Config-file cold storage and tuning
 
-## Flush and admission tuning
+Cold storage is configured under `[storage.cold]` and `[storage.cold.s3]` in the config file. The deployment tools (Helm and `scripts/ursula_ec2.py`) map their deployment-specific inputs into these canonical keys.
 
-| Variable | Default | Purpose |
-| -------- | ------- | ------- |
-| `URSULA_COLD_FLUSH_INTERVAL_MS` | `1000` | Background flush worker tick interval |
-| `URSULA_COLD_FLUSH_BYTES` | `8 MiB` | Target bytes flushed per group per tick |
-| `URSULA_COLD_FLUSH_MAX_CONCURRENCY` | `4` | Parallel cold writes |
-| `URSULA_COLD_MAX_HOT_BYTES_PER_GROUP` | `64 MiB` | Per-group hot ceiling - appends return `503` (cold backpressure) above this |
-| `URSULA_LIVE_READ_MAX_WAITERS_PER_CORE` | `65536` | Hard cap on SSE waiters held per core |
-
-`URSULA_COLD_FLUSH_MIN_HOT_BYTES` and `URSULA_COLD_FLUSH_MAX_BYTES` are still accepted as advanced overrides, but most deployments should use `URSULA_COLD_FLUSH_BYTES`.
-
-## Diagnostic
-
-| Variable | Purpose |
-| -------- | ------- |
-| `URSULA_TOKIO_CONSOLE` | When set, initializes the Tokio console subscriber if the binary was built with `--features tokio-console` and `RUSTFLAGS="--cfg tokio_unstable"`; otherwise logs a warning |
-| `RUST_LOG` | Standard tracing subscriber filter `ursula=info,ursula_runtime=info,ursula_raft=info` is a reasonable baseline |
+| Config key | Default | Purpose |
+| ---------- | ------- | ------- |
+| `storage.cold.backend` | `none` | `none`, `memory`, or `s3`. |
+| `storage.cold.s3.bucket` | none | Required when `backend = "s3"`. |
+| `storage.cold.flush_interval` | `1s` | Background flush worker interval. |
+| `storage.cold.flush_size` | `8MiB` | Target bytes flushed per group per pass. |
+| `storage.cold.flush_max_concurrency` | `4` | Parallel cold writes. |
+| `storage.cold.max_hot_size_per_group` | `64MiB` | Per-group hot ceiling; explicit `0` disables the cap, and omitted inherits default/preset behavior. |
+| `runtime.live_read_max_waiters_per_core` | `65536` | SSE waiter cap per core; `0` disables the limit. |
+| `observability.tokio_console` | `false` | Enables Tokio console when the binary is built with the feature. |
 
 ## Minimal examples
 
 In-memory single node:
 
 ```bash
-ursula \
-  --listen 127.0.0.1:4437 \
-  --core-count 4 \
-  --raft-group-count 64 \
-  --storage-backend memory
+ursula --preset default
 ```
 
 Disk-backed single node:
 
-```bash
-ursula \
-  --listen 127.0.0.1:4437 \
-  --core-count 4 \
-  --raft-group-count 64 \
-  --storage-backend disk \
-  --disk-path ./data
+```toml
+[server]
+listen = "127.0.0.1:4437"
+
+[runtime]
+core_count = 4
+
+[raft]
+node_id = 1
+group_count = 64
+
+[raft.wal]
+backend = "disk"
+path = "./data"
 ```
 
-Three-node durable cluster (same command on each host, `node_id` from the cluster config):
+```bash
+ursula --config ./ursula.toml
+```
+
+Three-node durable cluster (same file on each host, override `raft.node_id` per host):
+
+```toml
+[server]
+listen = "0.0.0.0:4437"
+
+[runtime]
+core_count = 16
+
+[raft]
+node_id = 1
+group_count = 256
+init_membership_per_group = true
+
+[raft.wal]
+backend = "disk"
+path = "/var/lib/ursula"
+
+[storage.cold]
+backend = "s3"
+root = "ursula-prod-20260518"
+
+[storage.cold.s3]
+bucket = "my-ursula-bucket"
+region = "us-east-1"
+
+[[raft.peers]]
+node_id = 1
+url = "http://10.0.0.1:4437"
+
+[[raft.peers]]
+node_id = 2
+url = "http://10.0.0.2:4437"
+
+[[raft.peers]]
+node_id = 3
+url = "http://10.0.0.3:4437"
+```
 
 ```bash
-URSULA_COLD_BACKEND=s3 \
-URSULA_COLD_S3_BUCKET=my-ursula-bucket \
-URSULA_COLD_S3_REGION=us-east-1 \
-ursula \
-  --listen 0.0.0.0:4437 \
-  --core-count 16 \
-  --raft-group-count 256 \
-  --storage-backend disk \
-  --disk-path /var/lib/ursula \
-  --raft-cluster-config /etc/ursula/cluster.json
+ursula --config /etc/ursula/ursula.toml --node-id 1
 ```
 
 See [Deploy a cluster](/docs/deploy-cluster) for the full walk-through and [Configure S3](/docs/configure-s3) for cold-tier specifics.

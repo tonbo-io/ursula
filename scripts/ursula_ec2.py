@@ -61,6 +61,7 @@ class ClusterConfig:
     binary: str
     pid_prefix: str
     log_prefix: str
+    config_prefix: str
     core_count: int
     raft_group_count: int
     raft_memory: bool
@@ -120,6 +121,7 @@ def load_config(path: Path) -> ClusterConfig:
         binary=raw.get("binary", "/tmp/ursula"),
         pid_prefix=raw.get("pid_prefix", "/tmp/ursula"),
         log_prefix=raw.get("log_prefix", "/tmp/ursula"),
+        config_prefix=raw.get("config_prefix", raw.get("pid_prefix", "/tmp/ursula")),
         core_count=int(raw.get("core_count", 16)),
         raft_group_count=int(raw.get("raft_group_count", 64)),
         raft_memory=bool(raw.get("raft_memory", True)),
@@ -225,6 +227,190 @@ class Ec2Ops:
     def remote_log(self, node: Node) -> str:
         return f"{self.config.log_prefix}-{node.id}.log"
 
+    def remote_config(self, node: Node) -> str:
+        return f"{self.config.config_prefix}-{node.id}.json"
+
+    def _raft_wal_config(self, node: Node) -> dict[str, Any]:
+        if self.config.raft_memory:
+            return {"backend": "memory"}
+        if self.config.raft_log_prefix:
+            return {
+                "backend": "disk",
+                "path": f"{self.config.raft_log_prefix}-{node.id}",
+            }
+        return {"backend": "memory"}
+
+    def _cold_storage_config(self, env: dict[str, str]) -> dict[str, Any]:
+        backend = env.get("URSULA_COLD_BACKEND", "none")
+        cfg: dict[str, Any] = {"backend": backend}
+        if backend == "none":
+            return cfg
+
+        if "URSULA_COLD_ROOT" in env:
+            cfg["root"] = env["URSULA_COLD_ROOT"]
+        if "URSULA_COLD_FLUSH_INTERVAL_MS" in env:
+            cfg["flush_interval"] = f'{env["URSULA_COLD_FLUSH_INTERVAL_MS"]}ms'
+        if "URSULA_COLD_FLUSH_BYTES" in env:
+            cfg["flush_size"] = env["URSULA_COLD_FLUSH_BYTES"]
+        if "URSULA_COLD_FLUSH_MIN_HOT_BYTES" in env:
+            cfg["flush_min_hot_size"] = env["URSULA_COLD_FLUSH_MIN_HOT_BYTES"]
+        if "URSULA_COLD_FLUSH_MAX_BYTES" in env:
+            cfg["flush_max_size"] = env["URSULA_COLD_FLUSH_MAX_BYTES"]
+        if "URSULA_COLD_FLUSH_MAX_CONCURRENCY" in env:
+            cfg["flush_max_concurrency"] = int(env["URSULA_COLD_FLUSH_MAX_CONCURRENCY"])
+        if "URSULA_COLD_MAX_HOT_BYTES_PER_GROUP" in env:
+            cfg["max_hot_size_per_group"] = env["URSULA_COLD_MAX_HOT_BYTES_PER_GROUP"]
+        if "URSULA_COLD_GC_INTERVAL_MS" in env:
+            cfg["gc_interval"] = f'{env["URSULA_COLD_GC_INTERVAL_MS"]}ms'
+        if "URSULA_COLD_GC_MAX_ENTRIES_PER_GROUP" in env:
+            cfg["gc_max_entries"] = int(env["URSULA_COLD_GC_MAX_ENTRIES_PER_GROUP"])
+        elif "URSULA_COLD_GC_MAX_ENTRIES" in env:
+            cfg["gc_max_entries"] = int(env["URSULA_COLD_GC_MAX_ENTRIES"])
+
+        s3_cfg: dict[str, Any] = {}
+        for env_key, toml_key in [
+            ("URSULA_COLD_S3_BUCKET", "bucket"),
+            ("URSULA_COLD_S3_REGION", "region"),
+            ("URSULA_COLD_S3_ENDPOINT", "endpoint"),
+            ("URSULA_COLD_S3_ACCESS_KEY_ID", "access_key_id"),
+            ("URSULA_COLD_S3_SECRET_ACCESS_KEY", "secret_access_key"),
+            ("URSULA_COLD_S3_SESSION_TOKEN", "session_token"),
+        ]:
+            if env_key in env:
+                s3_cfg[toml_key] = env[env_key]
+        if "URSULA_S3_TIMEOUT_MS" in env:
+            s3_cfg["timeout"] = f'{env["URSULA_S3_TIMEOUT_MS"]}ms'
+        if "URSULA_S3_MAX_RETRIES" in env:
+            s3_cfg["max_retries"] = int(env["URSULA_S3_MAX_RETRIES"])
+        if "URSULA_S3_PROBE_TIMEOUT_MS" in env:
+            s3_cfg["probe_timeout"] = f'{env["URSULA_S3_PROBE_TIMEOUT_MS"]}ms'
+        if "URSULA_S3_PROBE_UNHEALTHY_TICKS" in env:
+            s3_cfg["unhealthy_ticks"] = int(env["URSULA_S3_PROBE_UNHEALTHY_TICKS"])
+        if "URSULA_S3_PROBE_HEAL_TICKS" in env:
+            s3_cfg["heal_ticks"] = int(env["URSULA_S3_PROBE_HEAL_TICKS"])
+        if s3_cfg:
+            cfg["s3"] = s3_cfg
+
+        cache_cfg: dict[str, Any] = {}
+        if "URSULA_COLD_CACHE_BYTES" in env:
+            cache_cfg["max_size"] = env["URSULA_COLD_CACHE_BYTES"]
+        if "URSULA_COLD_CACHE_BLOCK_BYTES" in env:
+            cache_cfg["block_size"] = env["URSULA_COLD_CACHE_BLOCK_BYTES"]
+        if "URSULA_COLD_CACHE_READAHEAD_BLOCKS" in env:
+            cache_cfg["readahead_blocks"] = int(env["URSULA_COLD_CACHE_READAHEAD_BLOCKS"])
+        if cache_cfg:
+            cfg["cache"] = cache_cfg
+        return cfg
+
+    _SNAPSHOT_BACKEND_ENV = "URSULA_SNAPSHOT_BACKEND"
+    _SNAPSHOT_PREFIX_ENV = "URSULA_SNAPSHOT_S3_PREFIX"
+    _SNAPSHOT_DRIVE_INTERVAL_ENV = "URSULA_SNAPSHOT_DRIVE_INTERVAL_MS"
+    _KNOWN_COLD_ENV_KEYS = {
+        "URSULA_COLD_BACKEND",
+        "URSULA_COLD_ROOT",
+        "URSULA_COLD_FLUSH_INTERVAL_MS",
+        "URSULA_COLD_FLUSH_BYTES",
+        "URSULA_COLD_FLUSH_MIN_HOT_BYTES",
+        "URSULA_COLD_FLUSH_MAX_BYTES",
+        "URSULA_COLD_FLUSH_MAX_CONCURRENCY",
+        "URSULA_COLD_MAX_HOT_BYTES_PER_GROUP",
+        "URSULA_COLD_GC_INTERVAL_MS",
+        "URSULA_COLD_GC_MAX_ENTRIES",
+        "URSULA_COLD_GC_MAX_ENTRIES_PER_GROUP",
+        "URSULA_COLD_S3_BUCKET",
+        "URSULA_COLD_S3_REGION",
+        "URSULA_COLD_S3_ENDPOINT",
+        "URSULA_COLD_S3_ACCESS_KEY_ID",
+        "URSULA_COLD_S3_SECRET_ACCESS_KEY",
+        "URSULA_COLD_S3_SESSION_TOKEN",
+        "URSULA_S3_TIMEOUT_MS",
+        "URSULA_S3_MAX_RETRIES",
+        "URSULA_S3_PROBE_TIMEOUT_MS",
+        "URSULA_S3_PROBE_UNHEALTHY_TICKS",
+        "URSULA_S3_PROBE_HEAL_TICKS",
+        "URSULA_COLD_CACHE_BYTES",
+        "URSULA_COLD_CACHE_BLOCK_BYTES",
+        "URSULA_COLD_CACHE_READAHEAD_BLOCKS",
+        _SNAPSHOT_BACKEND_ENV,
+        _SNAPSHOT_PREFIX_ENV,
+        _SNAPSHOT_DRIVE_INTERVAL_ENV,
+        "URSULA_NODE_MEMORY_ABORT_CAP_BYTES",
+        "URSULA_RAFT_MEMORY_BOOTSTRAP_MARKER_DIR",
+    }
+
+    def _warn_unmapped_cold_env(self) -> None:
+        for key in self.config.cold_env:
+            if key not in self._KNOWN_COLD_ENV_KEYS:
+                print(
+                    f"warn: cold_env key {key} is not mapped to config; passing through as environment",
+                    file=sys.stderr,
+                )
+
+    def environment_passthrough(self) -> dict[str, str]:
+        return {
+            key: value
+            for key, value in self.config.cold_env.items()
+            if key not in self._KNOWN_COLD_ENV_KEYS
+        }
+
+    def _environment_prefix(self) -> str:
+        return "".join(
+            f"{shlex.quote(key)}={shlex.quote(value)} "
+            for key, value in sorted(self.environment_passthrough().items())
+        )
+
+    @staticmethod
+    def _systemd_env_value(key: str, value: str) -> str:
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{key}={escaped}"'
+
+    def systemd_environment_lines(self) -> str:
+        return "".join(
+            f"Environment={self._systemd_env_value(key, value)}\n"
+            for key, value in sorted(self.environment_passthrough().items())
+        )
+
+    def generate_config(self, node: Node) -> str:
+        self._warn_unmapped_cold_env()
+        cold_env = self.config.cold_env
+        runtime: dict[str, Any] = {"core_count": self.config.core_count}
+        if self.config.raft_memory:
+            runtime["node_memory_abort_cap_size"] = cold_env.get(
+                "URSULA_NODE_MEMORY_ABORT_CAP_BYTES", DEFAULT_RAFT_MEMORY_ABORT_CAP_BYTES
+            )
+
+        raft: dict[str, Any] = {
+            "group_count": self.config.raft_group_count,
+            "init_membership_per_group": self.config.init_membership_per_group,
+            "peers": [
+                {"node_id": peer.id, "url": f"http://{peer.private_ip}:{self.config.port}"}
+                for peer in self.config.nodes
+            ],
+            "wal": self._raft_wal_config(node),
+        }
+        if self.config.raft_memory:
+            raft["memory_bootstrap_marker_dir"] = cold_env.get(
+                "URSULA_RAFT_MEMORY_BOOTSTRAP_MARKER_DIR", "/tmp/ursula-raft-memory-bootstrap"
+            )
+
+        snapshot_backend = cold_env.get(self._SNAPSHOT_BACKEND_ENV, "inline")
+        snapshot: dict[str, Any] = {"backend": snapshot_backend}
+        if snapshot_backend == "s3":
+            snapshot["s3_prefix"] = cold_env.get(self._SNAPSHOT_PREFIX_ENV, "snapshots")
+        if self._SNAPSHOT_DRIVE_INTERVAL_ENV in cold_env:
+            snapshot["drive_interval"] = f'{cold_env[self._SNAPSHOT_DRIVE_INTERVAL_ENV]}ms'
+
+        cfg = {
+            "server": {"listen": f"0.0.0.0:{self.config.port}"},
+            "runtime": runtime,
+            "raft": raft,
+            "storage": {
+                "cold": self._cold_storage_config(cold_env),
+                "snapshot": snapshot,
+            },
+        }
+        return json.dumps(cfg, indent=2)
+
     def stop_node(self, node: Node) -> None:
         pid = shlex.quote(self.remote_pid(node))
         command = (
@@ -237,23 +423,7 @@ class Ec2Ops:
         )
         self.ssh(node, command, check=False)
 
-    def node_env(self) -> dict[str, str]:
-        env = dict(self.config.cold_env)
-        if self.config.raft_memory:
-            env.setdefault(
-                "URSULA_RAFT_MEMORY_BOOTSTRAP_MARKER_DIR",
-                "/tmp/ursula-raft-memory-bootstrap",
-            )
-            env.setdefault(
-                "URSULA_NODE_MEMORY_ABORT_CAP_BYTES",
-                DEFAULT_RAFT_MEMORY_ABORT_CAP_BYTES,
-            )
-        return env
-
     def start_node(self, node: Node) -> None:
-        env_lines = "\n".join(
-            f"export {key}={shlex.quote(value)}" for key, value in sorted(self.node_env().items())
-        )
         command = "\n".join(
             [
                 "set -euo pipefail",
@@ -266,47 +436,28 @@ class Ec2Ops:
                 f"kill $(cat {shlex.quote(self.remote_pid(node))}) 2>/dev/null || true; "
                 f"rm -f {shlex.quote(self.remote_pid(node))}; "
                 "fi",
-                env_lines,
-                " ".join(shlex.quote(arg) for arg in self.node_command(node))
+                f"cat > {shlex.quote(self.remote_config(node))} <<'EOF'",
+                self.generate_config(node),
+                "EOF",
+                self._environment_prefix()
+                + " ".join(shlex.quote(arg) for arg in self.node_command(node))
                 + f" > {shlex.quote(self.remote_log(node))} 2>&1 & echo $! > {shlex.quote(self.remote_pid(node))}",
             ]
         )
         self.ssh(node, command)
 
     def node_command(self, node: Node) -> list[str]:
-        args = [
+        return [
             self.config.binary,
-            "--listen",
-            f"0.0.0.0:{self.config.port}",
-            "--core-count",
-            str(self.config.core_count),
-            "--raft-group-count",
-            str(self.config.raft_group_count),
-            "--raft-node-id",
+            "--config",
+            self.remote_config(node),
+            "--node-id",
             str(node.id),
-            *self.all_peer_flags(),
         ]
-        if self.config.raft_memory:
-            args += ["--storage-backend", "memory"]
-        elif self.config.raft_log_prefix:
-            args += [
-                "--storage-backend",
-                "disk",
-                "--disk-path",
-                f"{self.config.raft_log_prefix}-{node.id}",
-            ]
-        if self.config.init_membership_per_group:
-            args.append("--raft-init-membership-per-group")
-        return args
 
-    def install_service(self, node: Node, restart: bool = True) -> None:
-        env_lines = "\n".join(
-            f"Environment={key}={value}"
-            for key, value in sorted(self.node_env().items())
-        )
+    def systemd_unit(self, node: Node, restart_policy: str) -> str:
         exec_start = " ".join(shlex.quote(arg) for arg in self.node_command(node))
-        restart_policy = "on-failure" if self.config.raft_memory else "always"
-        unit = f"""[Unit]
+        return f"""[Unit]
 Description=Ursula chaos node {node.id}
 After=network-online.target
 Wants=network-online.target
@@ -315,21 +466,27 @@ Wants=network-online.target
 Type=simple
 User={self.config.ssh_user}
 WorkingDirectory=/tmp
-{env_lines}
 ExecStart={exec_start}
 Restart={restart_policy}
 RestartSec=3
 LimitNOFILE=1048576
 LimitCORE=0
-
+{self.systemd_environment_lines()}
 [Install]
 WantedBy=multi-user.target
 """
+
+    def install_service(self, node: Node, restart: bool = True) -> None:
+        restart_policy = "on-failure" if self.config.raft_memory else "always"
+        unit = self.systemd_unit(node, restart_policy)
         command = "\n".join(
             [
                 "set -euo pipefail",
                 f"test -x {shlex.quote(self.config.binary)}",
                 *self.raft_log_dir_setup_commands(node),
+                f"cat > {shlex.quote(self.remote_config(node))} <<'EOF'",
+                self.generate_config(node),
+                "EOF",
                 "sudo tee /etc/systemd/system/ursula-chaos.service >/dev/null <<'EOF'",
                 unit,
                 "EOF",

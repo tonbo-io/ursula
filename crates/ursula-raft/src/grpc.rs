@@ -460,11 +460,20 @@ pub(crate) fn validate_grpc_metadata(protocol_version: u32) -> Result<(), GrpcRp
 #[derive(Debug, Clone)]
 pub struct GrpcRaftNetworkFactory {
     raft_group_id: RaftGroupId,
+    reconnect_threshold: u32,
 }
 
 impl GrpcRaftNetworkFactory {
     pub fn new(raft_group_id: RaftGroupId) -> Self {
-        Self { raft_group_id }
+        Self {
+            raft_group_id,
+            reconnect_threshold: 8,
+        }
+    }
+
+    pub fn with_reconnect_threshold(mut self, threshold: u32) -> Self {
+        self.reconnect_threshold = threshold;
+        self
     }
 }
 
@@ -472,7 +481,12 @@ impl RaftNetworkFactory<UrsulaRaftTypeConfig> for GrpcRaftNetworkFactory {
     type Network = GrpcRaftNetwork;
 
     async fn new_client(&mut self, target: u64, node: &BasicNode) -> Self::Network {
-        GrpcRaftNetwork::new(self.raft_group_id, target, node.addr.clone())
+        GrpcRaftNetwork::with_threshold(
+            self.raft_group_id,
+            target,
+            node.addr.clone(),
+            self.reconnect_threshold,
+        )
     }
 }
 
@@ -505,16 +519,17 @@ impl Debug for GrpcRaftNetwork {
 
 impl GrpcRaftNetwork {
     pub fn new(raft_group_id: RaftGroupId, target: u64, address: impl Into<String>) -> Self {
+        Self::with_threshold(raft_group_id, target, address, 8)
+    }
+
+    pub fn with_threshold(
+        raft_group_id: RaftGroupId,
+        target: u64,
+        address: impl Into<String>,
+        reconnect_threshold: u32,
+    ) -> Self {
         let endpoint = normalize_grpc_endpoint(address.into());
         let client = build_client(&endpoint);
-        // 8 consecutive failures × ~150ms heartbeat ≈ 1.2s of stuck stream
-        // before we forcibly rebuild — long enough that a single transient
-        // timeout doesn't churn channels, short enough that a real wedge
-        // self-heals before openraft's leadership lease expires.
-        let reconnect_threshold = std::env::var("URSULA_RAFT_GRPC_RECONNECT_AFTER_FAILURES")
-            .ok()
-            .and_then(|raw| raw.parse::<u32>().ok())
-            .unwrap_or(8);
         Self {
             raft_group_id,
             target,

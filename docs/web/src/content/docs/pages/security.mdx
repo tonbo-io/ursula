@@ -11,7 +11,7 @@ The current `v0.x` security model is deliberately narrow. Ursula is built to slo
 ## What Ursula does
 
 - **Quorum-acknowledged writes.** An append is acknowledged only after a majority of voters has replicated it.
-- **Per-group backpressure.** When a group's hot ring exceeds `URSULA_COLD_MAX_HOT_BYTES_PER_GROUP`, appends to that group return `503` with `Retry-After` until cold flush catches up. Per-group, not global or per-client.
+- **Per-group backpressure.** When a group's hot ring exceeds `storage.cold.max_hot_size_per_group`, appends to that group return `503` with `Retry-After` until cold flush catches up. Per-group, not global or per-client.
 - **Stream-level isolation.** Streams hash to disjoint Raft groups and disjoint owner cores. A hot stream on one group cannot starve writes on a different group on a different core.
 
 ## What Ursula does not do
@@ -19,7 +19,7 @@ The current `v0.x` security model is deliberately narrow. Ursula is built to slo
 Handle the following outside Ursula:
 
 - **TLS / HTTPS.** The public listener serves plain HTTP. No built-in `rustls`.
-- **Inter-node encryption.** Peer gRPC (Raft heartbeats, append-entries, snapshots, forwarded writes) runs over h2c. Peers must share a private network.
+- **Inter-node encryption.** Peer gRPC (Raft heartbeats, append-entries, snapshots, and leader-read checks) runs over h2c. Peers must share a private network. Non-leader HTTP writes return a `307` redirect to the current group leader rather than being forwarded over gRPC.
 - **API authentication.** No bearer-token, API-key, mTLS, or signed-request validation on the public API. Any caller with network reach can create buckets, append, read, delete.
 - **Authorization / multi-tenancy.** No per-user, per-bucket, or per-scope ACLs. Enforce isolation upstream.
 - **Admin endpoint isolation.** `/__ursula/metrics`, `/__ursula/flush-cold/*`, `/__ursula/raft/*`, and the public stream endpoints share the same listener with no auth gate.
@@ -52,12 +52,12 @@ CORS is permissive (`Access-Control-Allow-Origin: *`). Restrict at the proxy for
 
 ### Checklist
 
-- **Bind to the private interface.** `--listen 10.0.0.X:4437` or a security group / firewall so the listener is unreachable from public networks.
+- **Bind to the private interface.** Set `server.listen = "10.0.0.X:4437"` or use a security group / firewall so the listener is unreachable from public networks.
 - **Terminate TLS at the proxy.** Ursula stays plain HTTP on the internal side.
 - **Authenticate at the proxy.** Validate the caller (OAuth2, mTLS, signed requests) and reject unauthenticated traffic before it reaches Ursula.
 - **Block admin paths from public traffic.** Deny `/__ursula/*` from the public listener; allow it only on an internal or ops network.
-- **Use IAM roles for S3.** Omit the static `URSULA_COLD_S3_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` and let the AWS SDK credential chain discover credentials.
-- **Encrypt data volumes.** Apply full-disk encryption to `--disk-path`.
+- **Use IAM roles for S3.** Omit static `storage.cold.s3.access_key_id` / `storage.cold.s3.secret_access_key` values and let the AWS SDK credential chain discover credentials.
+- **Encrypt data volumes.** Apply full-disk encryption to `raft.wal.path`.
 - **Keep peer traffic private.** Never route gRPC peer traffic across the public internet.
 
 ## Reporting vulnerabilities

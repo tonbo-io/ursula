@@ -2,35 +2,60 @@
 title: Run locally
 ---
 
-Ursula's HTTP server is the `ursula` binary. It takes its configuration from CLI flags and a small set of environment variables - there is no config file yet.
+Ursula's HTTP server is the `ursula` binary. It reads a config file, an optional preset, and a small set of CLI overrides.
 
 ## Default (in-process, non-replicated)
 
-With no storage flag, Ursula runs an in-process non-replicated default runtime (no Raft at all). Nothing is persisted. Best for state-machine smoke tests and first-impression testing:
+With no config file, the `default` preset runs an in-process non-replicated runtime (no Raft at all). Nothing is persisted. Best for state-machine smoke tests and first-impression testing:
 
 ```bash
-cargo run --bin ursula
+cargo run --bin ursula -- --preset default
 ```
 
-It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses the in-memory engine.
+It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses the in-memory engine. `--preset default` selects the default preset but does not disable config-file discovery: from the repository root, `cargo run --bin ursula -- --preset default` still loads `./ursula.toml` when present. For a true no-file smoke test, run from a directory with no Ursula config file or temporarily move/rename `./ursula.toml` first.
 
 ## In-memory Raft
 
 OpenRaft with an in-memory log. Fast iteration, no persistence, but the runtime exercises the real Raft path:
 
+```toml
+[server]
+listen = "127.0.0.1:4437"
+
+[raft]
+node_id = 1
+group_count = 16
+
+[raft.wal]
+backend = "memory"
+```
+
 ```bash
-cargo run --bin ursula -- --storage-backend memory
+ursula --config ./ursula.toml
 ```
 
 ## Disk-backed single node
 
 Persistent local storage. Streams survive a restart:
 
-```bash
-cargo run --bin ursula -- --storage-backend disk --disk-path ./data
+```toml
+[server]
+listen = "127.0.0.1:4437"
+
+[raft]
+node_id = 1
+group_count = 16
+
+[raft.wal]
+backend = "disk"
+path = "./data"
 ```
 
-The `--disk-path` directory will contain a `raft-log/` subdirectory with protobuf-framed Raft log records per group plus a shared `journal.bin` per core. Removing the directory wipes state cleanly.
+```bash
+ursula --config ./ursula.toml
+```
+
+The `raft.wal.path` directory will contain a `raft-log/` subdirectory with protobuf-framed Raft log records per group plus a shared `journal.bin` per core. Removing the directory wipes state cleanly.
 
 ## Smoke test
 
@@ -51,30 +76,20 @@ Inspect runtime metrics (placement, mailbox depth, per-core counters):
 curl http://127.0.0.1:4437/__ursula/metrics | jq .
 ```
 
-## Flags
+## CLI overrides
 
 | Flag | Default | Notes |
 | ---- | ------- | ----- |
-| `--listen ADDR` | `127.0.0.1:4437` | TCP bind address |
-| `--core-count N` | `available_parallelism` | Worker threads (each pinned to its mailbox event loop) |
-| `--raft-group-count N` | `core_count × 16` | Total Raft groups. Higher = better stream-to-group hash spread |
-| `--storage-backend BACKEND` | default runtime | `memory` or `disk` |
-| `--disk-path DIR` | none | Required for `disk`; Raft logs live under `DIR/raft-log` |
-| `--raft-node-id ID` | none | Required for static gRPC cluster mode |
-| `--raft-peer ID=URL` | none (repeatable) | Static peer list for the cluster |
-| `--raft-cluster-config FILE` | none | JSON file equivalent of `--raft-node-id` + `--raft-peer` |
-| `--raft-init-membership[-per-group]` | off | One-time membership bootstrap |
+| `--config FILE` | searches default config paths | TOML, JSON, or YAML config file |
+| `--preset PRESET` | `default` when no config file is found | `default`, `dev`, `tiny`, `small`, `standard`, or `large` |
+| `--node-id ID` | config file or preset | Overrides `raft.node_id` |
 
-`--storage-backend disk` uses the durable OpenRaft log store. Static gRPC clusters use the same `disk` backend or `memory` for volatile tests.
+## Common config keys
 
-## Environment variables
-
-A small set of knobs are read at startup:
-
-- `URSULA_LIVE_READ_MAX_WAITERS_PER_CORE` (default `65536`) - SSE waiter cap per core
-- `URSULA_COLD_MAX_HOT_BYTES_PER_GROUP` (default 64 MiB) - when a group's hot ring exceeds this, cold flush kicks in
-- `URSULA_COLD_BACKEND` (`memory` or `s3`), `URSULA_COLD_S3_*`, `URSULA_COLD_ROOT`, `URSULA_COLD_FLUSH_*` - cold-storage configuration. See [configure S3](/docs/configure-s3)
-- `URSULA_TOKIO_CONSOLE` - when set, initializes the Tokio console subscriber (requires building with `--features tokio-console` and `RUSTFLAGS="--cfg tokio_unstable"`)
+- `runtime.live_read_max_waiters_per_core` (default `65536`) - SSE waiter cap per core
+- `storage.cold.max_hot_size_per_group` (default `64MiB`) - when a group's hot bytes exceed this cap, new writes are rejected with HTTP `503`
+- `storage.cold.backend`, `storage.cold.root`, `[storage.cold.s3]`, and `storage.cold.flush_*` - cold-storage configuration. See [configure S3](/docs/configure-s3)
+- `observability.tokio_console` - enables the Tokio console subscriber when the binary is built with the feature
 
 ## Next
 

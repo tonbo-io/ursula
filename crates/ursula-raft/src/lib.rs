@@ -36,6 +36,7 @@ mod types;
 pub use engine::ColdRaftGroupEngineFactory;
 pub use engine::DurableRaftGroupEngineFactory;
 pub use engine::DurableRaftLogStoreFactory;
+pub use engine::RaftEngineConfig;
 pub use engine::RaftGroupEngine;
 pub use engine::RaftGroupEngineFactory;
 pub use engine::RegisteredRaftGroupEngineFactory;

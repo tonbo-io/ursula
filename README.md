@@ -29,10 +29,10 @@ Full design intent: [Why Ursula](https://ursula.tonbo.io/docs/why-ursula) · [Ho
 Run a single in-memory node (no persistence, good for kicking the tires):
 
 ```bash
-cargo run --bin ursula
+cargo run --bin ursula -- --preset default
 ```
 
-It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses an in-memory engine. Override with `--listen`, `--core-count`, `--raft-group-count`, or pick a persistent backend with `--wal-dir` / `--raft-log-dir`.
+It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses an in-memory engine. Use `--config` to load a TOML/JSON/YAML config file, or `--preset` to choose a built-in resource preset.
 
 Create a bucket and stream, append bytes, read them back:
 
@@ -99,7 +99,7 @@ Three or five Ursula processes act as one durable-streams server. A stream hashe
 
 - **Per-group node-to-node Raft.**
 
-  Every node hosts replicas for the same configured groups, and those replicas exchange gRPC Raft RPCs while non-leader HTTP writes forward to the current group leader.
+  Every node hosts replicas for the same configured groups, and those replicas exchange gRPC Raft RPCs while non-leader HTTP writes receive a `307` redirect to the current group leader.
 
 - **Hot ring on the write path.**
 

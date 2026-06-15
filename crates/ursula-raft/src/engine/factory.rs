@@ -31,82 +31,55 @@ use crate::registry::RaftGroupHandleRegistry;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::types::UrsulaRaftTypeConfig;
 
-const RAFT_INSTALL_SNAPSHOT_TIMEOUT_DEFAULT_MS: u64 = 120_000;
-/// How long a restarting bootstrap node waits to observe an already-established
-/// (or freshly re-elected) leader before deciding the group is truly new and
-/// bootstrapping it. Must exceed the election window so peers that lost this
-/// node as their leader have time to elect a replacement. Tunable via
-/// `URSULA_RAFT_REJOIN_PROBE_MS`.
-fn rejoin_leader_probe_timeout() -> Duration {
-    let ms = std::env::var("URSULA_RAFT_REJOIN_PROBE_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .filter(|ms| *ms > 0)
-        .unwrap_or(6000);
-    Duration::from_millis(ms)
-}
-
-fn bootstrap_peer_probe_timeout() -> Duration {
-    Duration::from_millis(parse_positive_millis_env(
-        "URSULA_RAFT_BOOTSTRAP_PEER_PROBE_MS",
-        60_000,
-    ))
-}
-
-fn bootstrap_peer_probe_interval() -> Duration {
-    Duration::from_millis(parse_positive_millis_env(
-        "URSULA_RAFT_BOOTSTRAP_PEER_PROBE_INTERVAL_MS",
-        250,
-    ))
-}
-
-fn bootstrap_peer_connect_timeout() -> Duration {
-    Duration::from_millis(parse_positive_millis_env(
-        "URSULA_RAFT_BOOTSTRAP_PEER_CONNECT_MS",
-        500,
-    ))
-}
-
-/// OpenRaft's `install_snapshot_timeout` covers the whole FullSnapshot RPC.
-/// Ursula sends only a snapshot pointer in that RPC, but the receiver downloads
-/// and installs the referenced object before replying, so this timeout must be
-/// comfortably above the S3 per-attempt timeout plus retries. Tunable via
-/// `URSULA_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS`.
-fn raft_install_snapshot_timeout_ms() -> u64 {
-    parse_positive_millis_env(
-        "URSULA_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS",
-        RAFT_INSTALL_SNAPSHOT_TIMEOUT_DEFAULT_MS,
-    )
-}
-
-fn parse_positive_millis_env(name: &str, default_ms: u64) -> u64 {
-    let raw = std::env::var(name).ok();
-    parse_positive_millis(raw.as_deref(), default_ms)
-}
-
+#[cfg(test)]
 fn parse_positive_millis(raw: Option<&str>, default_ms: u64) -> u64 {
     raw.and_then(|raw| raw.parse::<u64>().ok())
         .filter(|ms| *ms > 0)
         .unwrap_or(default_ms)
 }
 
-/// Whether the manual snapshot driver is configured. When it is, snapshots are
-/// fully driver-driven and gated on S3 health, so openraft must not run its own
-/// size-based snapshot policy: an auto-triggered `build_snapshot` during a local
-/// S3 outage returns a `StorageError`, which openraft treats as fatal and kills
-/// the raft group. Without the driver, openraft's default policy still applies.
-fn snapshot_driver_configured() -> bool {
-    std::env::var("URSULA_SNAPSHOT_DRIVE_INTERVAL_MS")
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-        .is_some_and(|ms| ms > 0)
+#[derive(Debug, Clone)]
+pub struct RaftEngineConfig {
+    pub rejoin_probe: Duration,
+    pub bootstrap_peer_probe: Duration,
+    pub bootstrap_peer_probe_interval: Duration,
+    pub bootstrap_peer_connect: Duration,
+    pub install_snapshot_timeout_ms: u64,
+    pub snapshot_drive_interval_ms: u64,
+    pub memory_bootstrap_marker_dir: Option<PathBuf>,
+    pub grpc_reconnect_after_failures: u32,
 }
 
-fn raft_memory_bootstrap_marker_dir() -> Option<PathBuf> {
-    std::env::var("URSULA_RAFT_MEMORY_BOOTSTRAP_MARKER_DIR")
-        .ok()
-        .filter(|raw| !raw.trim().is_empty())
-        .map(PathBuf::from)
+impl Default for RaftEngineConfig {
+    fn default() -> Self {
+        Self {
+            rejoin_probe: Duration::from_millis(6_000),
+            bootstrap_peer_probe: Duration::from_millis(60_000),
+            bootstrap_peer_probe_interval: Duration::from_millis(250),
+            bootstrap_peer_connect: Duration::from_millis(500),
+            install_snapshot_timeout_ms: 120_000,
+            snapshot_drive_interval_ms: 0,
+            memory_bootstrap_marker_dir: None,
+            grpc_reconnect_after_failures: 8,
+        }
+    }
+}
+
+impl From<&ursula_config::RaftConfig> for RaftEngineConfig {
+    fn from(cfg: &ursula_config::RaftConfig) -> Self {
+        Self {
+            rejoin_probe: cfg.rejoin_probe.as_duration(),
+            bootstrap_peer_probe: cfg.bootstrap_peer_probe.as_duration(),
+            bootstrap_peer_probe_interval: cfg.bootstrap_peer_probe_interval.as_duration(),
+            bootstrap_peer_connect: cfg.bootstrap_peer_connect.as_duration(),
+            install_snapshot_timeout_ms: cfg.install_snapshot_timeout.as_duration().as_millis()
+                as u64,
+            snapshot_drive_interval_ms: 0, // set by caller from RaftSnapshotConfig
+            memory_bootstrap_marker_dir: cfg.memory_bootstrap_marker_dir.clone(),
+            grpc_reconnect_after_failures: u32::try_from(cfg.grpc_reconnect_after_failures)
+                .expect("config validation ensures grpc_reconnect_after_failures fits u32"),
+        }
+    }
 }
 
 fn quorum_size(voter_count: usize) -> usize {
@@ -124,11 +97,12 @@ async fn wait_for_static_peer_quorum(
     node_id: u64,
     raft_group_id: RaftGroupId,
     nodes: &BTreeMap<u64, BasicNode>,
+    engine_config: &RaftEngineConfig,
 ) {
     let quorum = quorum_size(nodes.len());
-    let mut next_warning = Instant::now() + bootstrap_peer_probe_timeout();
-    let interval = bootstrap_peer_probe_interval();
-    let connect_timeout = bootstrap_peer_connect_timeout();
+    let mut next_warning = Instant::now() + engine_config.bootstrap_peer_probe;
+    let interval = engine_config.bootstrap_peer_probe_interval;
+    let connect_timeout = engine_config.bootstrap_peer_connect;
 
     loop {
         let mut reachable = usize::from(nodes.contains_key(&node_id));
@@ -151,7 +125,7 @@ async fn wait_for_static_peer_quorum(
                 raft_group_id.0,
                 nodes.len()
             );
-            next_warning = Instant::now() + bootstrap_peer_probe_timeout();
+            next_warning = Instant::now() + engine_config.bootstrap_peer_probe;
         }
 
         tokio::time::sleep(interval).await;
@@ -164,9 +138,10 @@ fn spawn_deferred_membership_initialization(
     raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
     nodes: BTreeMap<u64, BasicNode>,
     marker_path: Option<PathBuf>,
+    engine_config: RaftEngineConfig,
 ) {
     tokio::spawn(async move {
-        wait_for_static_peer_quorum(node_id, raft_group_id, &nodes).await;
+        wait_for_static_peer_quorum(node_id, raft_group_id, &nodes, &engine_config).await;
 
         match raft.is_initialized().await {
             Ok(true) => return,
@@ -434,6 +409,7 @@ pub struct StaticGrpcRaftGroupEngineFactory {
     cold_store: Option<ColdStoreHandle>,
     log_stores: Option<DurableRaftLogStoreFactory>,
     snapshot_store: Option<SharedSnapshotStore>,
+    engine_config: RaftEngineConfig,
 }
 
 impl StaticGrpcRaftGroupEngineFactory {
@@ -453,6 +429,7 @@ impl StaticGrpcRaftGroupEngineFactory {
             cold_store: None,
             log_stores: None,
             snapshot_store: None,
+            engine_config: RaftEngineConfig::default(),
         }
     }
 
@@ -486,15 +463,25 @@ impl StaticGrpcRaftGroupEngineFactory {
         self
     }
 
+    pub fn with_engine_config(mut self, config: RaftEngineConfig) -> Self {
+        self.engine_config = config;
+        self
+    }
+
     fn uses_memory_log_store(&self) -> bool {
         self.log_stores.is_none()
     }
 
     fn raft_memory_bootstrap_marker_path(&self, raft_group_id: RaftGroupId) -> Option<PathBuf> {
-        Some(raft_memory_bootstrap_marker_dir()?.join(format!(
-            "node-{}-group-{}.bootstrapped",
-            self.node_id, raft_group_id.0
-        )))
+        Some(
+            self.engine_config
+                .memory_bootstrap_marker_dir
+                .clone()?
+                .join(format!(
+                    "node-{}-group-{}.bootstrapped",
+                    self.node_id, raft_group_id.0
+                )),
+        )
     }
 
     fn raft_memory_bootstrap_seen(&self, raft_group_id: RaftGroupId) -> bool {
@@ -639,7 +626,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 heartbeat_interval: 250,
                 election_timeout_min: 1500,
                 election_timeout_max: 3000,
-                install_snapshot_timeout: raft_install_snapshot_timeout_ms(),
+                install_snapshot_timeout: self.engine_config.install_snapshot_timeout_ms,
                 ..Default::default()
             };
             // With the manual snapshot driver, snapshots are driver-driven and
@@ -647,7 +634,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             // because a build_snapshot failure during an S3 outage is fatal to
             // the group (it kills the raft core, so leadership can no longer be
             // yielded and only a process restart recovers it).
-            if snapshot_driver_configured() {
+            if self.engine_config.snapshot_drive_interval_ms > 0 {
                 raft_config.snapshot_policy = SnapshotPolicy::Never;
             }
             let config =
@@ -659,7 +646,8 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     placement,
                     self.node_id,
                     config,
-                    GrpcRaftNetworkFactory::new(placement.raft_group_id),
+                    GrpcRaftNetworkFactory::new(placement.raft_group_id)
+                        .with_reconnect_threshold(self.engine_config.grpc_reconnect_after_failures),
                     log_stores.open(placement, metrics.clone())?,
                     Some(metrics),
                     self.cold_store.clone(),
@@ -672,7 +660,8 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     placement,
                     self.node_id,
                     config,
-                    GrpcRaftNetworkFactory::new(placement.raft_group_id),
+                    GrpcRaftNetworkFactory::new(placement.raft_group_id)
+                        .with_reconnect_threshold(self.engine_config.grpc_reconnect_after_failures),
                     RaftGroupLogStore::shared(),
                     Some(metrics),
                     self.cold_store.clone(),
@@ -692,7 +681,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 let recovery_possible = self.snapshot_store.is_some() && !bootstrapped;
                 let rejoin_existing_cluster = recovery_possible
                     && engine
-                        .observe_any_leader(rejoin_leader_probe_timeout())
+                        .observe_any_leader(self.engine_config.rejoin_probe)
                         .await;
                 if rejoin_existing_cluster {
                     self.mark_raft_memory_bootstrap_seen(placement.raft_group_id)?;
@@ -709,6 +698,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                         engine.raft_handle(),
                         self.peer_nodes_for_group(placement.raft_group_id)?,
                         self.raft_memory_bootstrap_marker_path(placement.raft_group_id),
+                        self.engine_config.clone(),
                     );
                 }
             }
@@ -798,12 +788,14 @@ mod tests {
     #[test]
     fn raft_memory_bootstrap_marker_blocks_reinitialize() {
         let dir = unique_test_dir("memory-bootstrap-marker");
-        let previous = std::env::var_os("URSULA_RAFT_MEMORY_BOOTSTRAP_MARKER_DIR");
-        unsafe {
-            std::env::set_var("URSULA_RAFT_MEMORY_BOOTSTRAP_MARKER_DIR", &dir);
-        }
 
-        let memory_factory = factory_for_node(1).with_per_group_membership_initializers(true);
+        let engine_config = RaftEngineConfig {
+            memory_bootstrap_marker_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        let memory_factory = factory_for_node(1)
+            .with_per_group_membership_initializers(true)
+            .with_engine_config(engine_config.clone());
         assert!(memory_factory.uses_memory_log_store());
         assert!(!memory_factory.raft_memory_bootstrap_seen(RaftGroupId(0)));
         memory_factory
@@ -811,19 +803,12 @@ mod tests {
             .expect("write marker");
         assert!(memory_factory.raft_memory_bootstrap_seen(RaftGroupId(0)));
 
-        let durable_factory = factory_for_node(1).with_raft_log_dir(dir.join("raft-log"));
+        let durable_factory = factory_for_node(1)
+            .with_raft_log_dir(dir.join("raft-log"))
+            .with_engine_config(engine_config.clone());
         assert!(!durable_factory.uses_memory_log_store());
         assert!(!durable_factory.raft_memory_bootstrap_seen(RaftGroupId(0)));
 
-        if let Some(previous) = previous {
-            unsafe {
-                std::env::set_var("URSULA_RAFT_MEMORY_BOOTSTRAP_MARKER_DIR", previous);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("URSULA_RAFT_MEMORY_BOOTSTRAP_MARKER_DIR");
-            }
-        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

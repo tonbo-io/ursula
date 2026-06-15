@@ -21,6 +21,10 @@ const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 3600;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    run().await
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
     let args = Args::parse();

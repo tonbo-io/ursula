@@ -59,7 +59,28 @@ COPY --from=builder /usr/local/bin/ursula /usr/local/bin/ursula
 COPY --from=builder /usr/local/bin/ursulactl /usr/local/bin/ursulactl
 COPY --from=builder /usr/local/bin/ursulagw /usr/local/bin/ursulagw
 
+# Add default config (node_id is supplied at runtime via --node-id)
+COPY <<EOF /etc/ursula/ursula.toml
+[server]
+listen = "0.0.0.0:4437"
+
+[runtime]
+core_count = 16
+
+[raft]
+group_count = 256
+
+[raft.wal]
+backend = "memory"
+
+[storage.cold]
+backend = "none"
+
+[storage.snapshot]
+backend = "inline"
+EOF
+
 EXPOSE 4437
 
 ENTRYPOINT ["/usr/local/bin/ursula"]
-CMD ["--listen", "0.0.0.0:4437", "--raft-memory"]
+CMD ["--config", "/etc/ursula/ursula.toml", "--node-id", "1"]

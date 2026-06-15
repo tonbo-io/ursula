@@ -9,7 +9,7 @@ the hot read/write path pays nothing.
 
 ## Enabling OTLP export
 
-Set the standard OpenTelemetry environment variables before starting `ursula`:
+Set the standard OpenTelemetry OTLP exporter settings before starting `ursula`:
 
 ```bash
 # Send traces and metrics to a collector (Tempo, Jaeger, the OTel Collector, …).
@@ -18,7 +18,12 @@ export OTEL_EXPORTER_OTLP_ENDPOINT="http://otel-collector:4318"
 # Optional: head-sampling ratio for new root traces (0.0–1.0, default 1.0).
 export OTEL_TRACES_SAMPLER_ARG="0.1"
 
-ursula --listen 0.0.0.0:8080 # …
+cat > /tmp/ursula-otel.toml <<'TOML'
+[server]
+listen = "0.0.0.0:8080"
+TOML
+
+ursula --preset default --config /tmp/ursula-otel.toml
 ```
 
 The exporter uses OTLP over HTTP/protobuf (port `4318`), reusing the server's

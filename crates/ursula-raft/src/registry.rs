@@ -796,7 +796,7 @@ impl Default for RaftGroupHandleRegistry {
             groups: Arc::new(Mutex::new(BTreeMap::new())),
             leadership_shed: Arc::new(AtomicU8::new(0)),
             snapshot_store: Arc::new(Mutex::new(default_snapshot_store())),
-            snapshot_install: SnapshotInstallCoordinator::default(),
+            snapshot_install: SnapshotInstallCoordinator::new(1),
         }
     }
 }
@@ -858,6 +858,11 @@ impl RaftGroupHandleRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn with_snapshot_install_max_concurrency(mut self, max_concurrency: usize) -> Self {
+        self.snapshot_install = SnapshotInstallCoordinator::new(max_concurrency);
+        self
     }
 
     pub fn set_snapshot_store(&self, snapshot_store: Option<SharedSnapshotStore>) {

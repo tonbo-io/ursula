@@ -127,28 +127,12 @@ impl RuntimeConfig {
         self
     }
 
-    /// Parse runtime configuration from the process environment.
-    pub fn from_env(core_count: usize, raft_group_count: usize) -> Self {
-        use crate::env::env_optional_usize;
-        use crate::env::env_usize;
-
-        fn non_zero(value: usize) -> Option<u64> {
-            if value == 0 {
-                None
-            } else {
-                Some(u64::try_from(value).unwrap_or(u64::MAX))
-            }
-        }
-
-        let mut config = Self::new(core_count, raft_group_count);
-        config.live_read_max_waiters_per_core =
-            non_zero(env_usize("URSULA_LIVE_READ_MAX_WAITERS_PER_CORE", 65_536));
-        config.raft_max_uncommitted_bytes_per_group =
-            env_optional_usize("URSULA_RAFT_MAX_UNCOMMITTED_BYTES_PER_GROUP").and_then(non_zero);
-        config.cold_max_hot_bytes_per_group = non_zero(env_usize(
-            "URSULA_COLD_MAX_HOT_BYTES_PER_GROUP",
-            64 * 1024 * 1024,
-        ));
+    /// Build runtime configuration from a typed `ursula_config::RuntimeConfig`.
+    pub fn from_ursula_config(cfg: &ursula_config::RuntimeConfig, raft_group_count: usize) -> Self {
+        let mut config = Self::new(cfg.core_count, raft_group_count);
+        config.live_read_max_waiters_per_core = cfg
+            .live_read_max_waiters_per_core
+            .and_then(|n| if n == 0 { None } else { Some(n as u64) });
         config
     }
 }
@@ -834,8 +818,7 @@ impl ShardRuntime {
     ) -> Result<FlushColdResponse, RuntimeError> {
         let Some(cold_store) = self.cold_store.as_ref() else {
             return Err(RuntimeError::ColdStoreConfig {
-                message: "URSULA_COLD_BACKEND must be configured before flushing cold chunks"
-                    .to_owned(),
+                message: "cold backend must be configured before flushing cold chunks".to_owned(),
             });
         };
         let path = new_cold_chunk_path(

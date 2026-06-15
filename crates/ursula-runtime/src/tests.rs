@@ -24,7 +24,7 @@ use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamStateMachine;
 
 use super::*;
-use crate::cold_config::ColdCacheConfig;
+use crate::ColdReadCacheParams;
 use crate::cold_store::DEFAULT_CONTENT_TYPE;
 use crate::core_worker::CoreWorker;
 use crate::core_worker::ReadWatcher;
@@ -750,7 +750,7 @@ async fn cold_store_reads_only_requested_range() {
 async fn cold_store_prefetches_sequential_stream_blocks() {
     let cold_store = ColdStore::memory()
         .expect("memory cold store")
-        .with_read_cache(ColdCacheConfig {
+        .with_read_cache(ColdReadCacheParams {
             max_bytes: 32,
             block_bytes: 4,
             max_readahead_blocks: 2,

@@ -20,14 +20,12 @@ use opendal::Operator;
 use opendal::Scheme;
 use opendal::layers::RetryLayer;
 use opendal::layers::TimeoutLayer;
+use ursula_config::config::ColdBackend;
 use ursula_shard::BucketStreamId;
 use ursula_stream::ColdChunkRef;
 use ursula_stream::ObjectPayloadRef;
 
-use crate::cold_config::ColdCacheConfig;
-use crate::cold_config::ColdConfig;
-use crate::cold_config::ColdStorageBackend;
-use crate::cold_config::ColdStorageConfig;
+use crate::ColdConfig;
 
 pub(crate) const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 // Keep this global atomic isolated from unrelated statics. This does not remove
@@ -251,75 +249,88 @@ impl ColdStore {
 
     /// Build a [`ColdStore`] from an explicit [`ColdConfig`].
     ///
-    /// The bootstrap layer reads environment variables and assembles the config;
+    /// The bootstrap layer assembles the typed config before calling this method;
     /// this method is purely functional — it does not touch `std::env`.
-    pub fn from_config(config: &ColdConfig) -> io::Result<Option<ColdStoreHandle>> {
-        let mut store = match config.storage.backend {
-            ColdStorageBackend::None => return Ok(None),
-            ColdStorageBackend::Memory => Self::memory()?,
-            ColdStorageBackend::S3 => Self::s3_from_config(&config.storage)?,
-        };
-        if let Some(cache_config) = config.cache {
-            store = store.with_read_cache(cache_config);
-        }
-        Ok(Some(Arc::new(store)))
-    }
-
-    /// Convenience constructor that reads the process environment.
     ///
-    /// Delegates to [`from_config`](Self::from_config) after assembling a
-    /// [`ColdConfig`] from `URSULA_COLD_*` env vars.
-    pub fn from_env() -> io::Result<Option<ColdStoreHandle>> {
-        Self::from_config(&ColdConfig::from_env()?)
+    /// Returns `Err` when the backend is [`ColdBackend::None`];
+    /// the caller should skip construction when cold storage is disabled.
+    pub fn try_new(config: &ColdConfig) -> io::Result<Self> {
+        let mut store = match config.backend {
+            ColdBackend::None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "ColdStore::try_new called with backend=none; \
+                     the caller should skip construction when cold storage is disabled",
+                ));
+            }
+            ColdBackend::Memory => Self::memory()?,
+            ColdBackend::S3 => Self::s3_from_config(config)?,
+        };
+        let cache = config.cache.clone().unwrap_or_default();
+        if cache.max_size.as_bytes() > 0 {
+            let cache_params = ColdReadCacheParams {
+                max_bytes: cache.max_size.as_bytes() as usize,
+                block_bytes: cache.block_size.as_bytes() as usize,
+                max_readahead_blocks: cache.readahead_blocks,
+            };
+            store = store.with_read_cache(cache_params);
+        }
+        Ok(store)
     }
 
-    fn s3_from_config(config: &ColdStorageConfig) -> io::Result<Self> {
-        let bucket = config.s3_bucket.as_deref().ok_or_else(|| {
+    fn s3_from_config(config: &ColdConfig) -> io::Result<Self> {
+        let s3 = config.s3.as_ref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "URSULA_COLD_S3_BUCKET is required when URSULA_COLD_BACKEND=s3",
+                "s3 configuration is required when cold backend is s3",
+            )
+        })?;
+        let bucket = s3.bucket.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "s3 bucket is required when cold backend is s3",
             )
         })?;
         if bucket.trim().is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "URSULA_COLD_S3_BUCKET must not be empty",
+                "s3 bucket must not be empty",
             ));
         }
 
         let mut builder = opendal::services::S3::default().bucket(bucket);
         let mut configured_root = None;
-        if let Some(root) = config.s3_root.as_deref()
+        if let Some(root) = config.root.as_deref()
             && !root.trim().is_empty()
         {
             builder = builder.root(root);
             configured_root = Some(root.to_owned());
         }
         let mut configured_region = None;
-        if let Some(region) = config.s3_region.as_deref()
+        if let Some(region) = s3.region.as_deref()
             && !region.trim().is_empty()
         {
             builder = builder.region(region);
             configured_region = Some(region.to_owned());
         }
         let mut configured_endpoint = None;
-        if let Some(endpoint) = config.s3_endpoint.as_deref()
+        if let Some(endpoint) = s3.endpoint.as_deref()
             && !endpoint.trim().is_empty()
         {
             builder = builder.endpoint(endpoint);
             configured_endpoint = Some(endpoint.to_owned());
         }
-        if let Some(access_key_id) = config.s3_access_key_id.as_deref()
+        if let Some(access_key_id) = s3.access_key_id.as_deref()
             && !access_key_id.trim().is_empty()
         {
             builder = builder.access_key_id(access_key_id);
         }
-        if let Some(secret_access_key) = config.s3_secret_access_key.as_deref()
+        if let Some(secret_access_key) = s3.secret_access_key.as_deref()
             && !secret_access_key.trim().is_empty()
         {
             builder = builder.secret_access_key(secret_access_key);
         }
-        if let Some(session_token) = config.s3_session_token.as_deref()
+        if let Some(session_token) = s3.session_token.as_deref()
             && !session_token.trim().is_empty()
         {
             builder = builder.session_token(session_token);
@@ -330,8 +341,8 @@ impl ColdStore {
                 Operator::new(builder)
                     .map_err(|err| io::Error::other(err.to_string()))?
                     .finish(),
-                config.s3_timeout,
-                config.s3_max_retries,
+                s3.timeout.as_duration(),
+                s3.max_retries,
             ),
             ColdStoreInfo {
                 backend: "s3",
@@ -358,7 +369,7 @@ impl ColdStore {
         &self.info
     }
 
-    pub fn with_read_cache(mut self, config: ColdCacheConfig) -> Self {
+    pub fn with_read_cache(mut self, config: ColdReadCacheParams) -> Self {
         self.read_cache = Some(Arc::new(ColdReadCache::new(config)));
         self
     }
@@ -932,9 +943,20 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Runtime parameters for the optional cold-read cache.
+///
+/// Kept separate from the serde [`ursula_config::ColdCacheConfig`] because
+/// `ColdReadCache` accesses these fields on the hot path.
+#[derive(Debug, Clone, Copy)]
+pub struct ColdReadCacheParams {
+    pub max_bytes: usize,
+    pub block_bytes: usize,
+    pub max_readahead_blocks: usize,
+}
+
 #[derive(Debug)]
 struct ColdReadCache {
-    config: ColdCacheConfig,
+    config: ColdReadCacheParams,
     inner: Mutex<ColdReadCacheInner>,
 }
 
@@ -966,10 +988,10 @@ struct StreamReadState {
 }
 
 impl ColdReadCache {
-    fn new(config: ColdCacheConfig) -> Self {
+    fn new(config: ColdReadCacheParams) -> Self {
         let block_bytes = config.block_bytes.max(1);
         Self {
-            config: ColdCacheConfig {
+            config: ColdReadCacheParams {
                 max_bytes: config.max_bytes,
                 block_bytes,
                 max_readahead_blocks: config.max_readahead_blocks,
@@ -1183,13 +1205,72 @@ pub fn reset_cold_chunk_sequence_for_sim() {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use ursula_config::config::ColdBackend;
 
     use super::ColdReadCache;
     use super::ColdStore;
-    use crate::cold_config::ColdCacheConfig as ColdReadCacheConfig;
-    use crate::cold_config::ColdConfig;
-    use crate::cold_config::ColdStorageBackend;
-    use crate::cold_config::ColdStorageConfig;
+    use crate::ColdConfig;
+    use crate::ColdReadCacheParams;
+
+    fn read_cache_params(store: &ColdStore) -> ColdReadCacheParams {
+        store
+            .read_cache
+            .as_ref()
+            .map(|cache| cache.config)
+            .expect("read cache")
+    }
+
+    #[test]
+    fn try_new_omitted_cache_installs_default_cache() {
+        let config = ColdConfig {
+            backend: ColdBackend::Memory,
+            cache: None,
+            ..Default::default()
+        };
+
+        let store = ColdStore::try_new(&config).expect("memory cold store");
+        let cache = read_cache_params(&store);
+
+        assert_eq!(cache.max_bytes, 256 * 1024 * 1024);
+        assert_eq!(cache.block_bytes, 1024 * 1024);
+        assert_eq!(cache.max_readahead_blocks, 4);
+    }
+
+    #[test]
+    fn try_new_zero_cache_disables_cache() {
+        let config = ColdConfig {
+            backend: ColdBackend::Memory,
+            cache: Some(ursula_config::ColdCacheConfig {
+                max_size: ursula_config::HumanSize::bytes(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let store = ColdStore::try_new(&config).expect("memory cold store");
+
+        assert!(store.read_cache.is_none());
+    }
+
+    #[test]
+    fn try_new_custom_cache_installs_cache() {
+        let config = ColdConfig {
+            backend: ColdBackend::Memory,
+            cache: Some(ursula_config::ColdCacheConfig {
+                max_size: ursula_config::HumanSize::mib(7),
+                block_size: ursula_config::HumanSize::kib(512),
+                readahead_blocks: 3,
+            }),
+            ..Default::default()
+        };
+
+        let store = ColdStore::try_new(&config).expect("memory cold store");
+        let cache = read_cache_params(&store);
+
+        assert_eq!(cache.max_bytes, 7 * 1024 * 1024);
+        assert_eq!(cache.block_bytes, 512 * 1024);
+        assert_eq!(cache.max_readahead_blocks, 3);
+    }
 
     #[test]
     fn lru_queue_stays_bounded_under_repeated_hits() {
@@ -1197,7 +1278,7 @@ mod tests {
         // is no eviction pressure and the recency deque is the only thing that
         // could grow. Before compaction it grew by one entry per hit (~40k here);
         // it must stay bounded to the live set instead.
-        let cache = ColdReadCache::new(ColdReadCacheConfig {
+        let cache = ColdReadCache::new(ColdReadCacheParams {
             max_bytes: 4 * 1024,
             block_bytes: 1024,
             max_readahead_blocks: 0,
@@ -1223,14 +1304,10 @@ mod tests {
     #[test]
     fn s3_without_bucket_fails() {
         let config = ColdConfig {
-            storage: ColdStorageConfig {
-                backend: ColdStorageBackend::S3,
-                ..Default::default()
-            },
-            cache: None,
-            worker: Default::default(),
+            backend: ColdBackend::S3,
+            ..Default::default()
         };
-        let err = ColdStore::from_config(&config).expect_err("s3 without bucket should fail");
+        let err = ColdStore::try_new(&config).expect_err("s3 without bucket should fail");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

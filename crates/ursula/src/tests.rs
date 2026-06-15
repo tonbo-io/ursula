@@ -31,6 +31,13 @@ use ursula_shard::RaftGroupId;
 
 use super::*;
 
+fn test_config(core_count: usize, group_count: usize) -> ursula_config::UrsulaConfig {
+    let mut config = ursula_config::UrsulaConfig::default();
+    config.runtime.core_count = core_count;
+    config.raft.group_count = group_count;
+    config
+}
+
 #[derive(Clone)]
 struct TestWallClock {
     now_ms: Arc<AtomicU64>,
@@ -2040,7 +2047,7 @@ async fn wal_runtime_recovers_http_stream_after_restart() {
     {
         let app = router(
             spawn_runtime(
-                2,
+                &test_config(2, 8),
                 Persistence::Wal {
                     wal_dir: wal_root.clone(),
                 },
@@ -2105,7 +2112,7 @@ async fn wal_runtime_recovers_http_stream_after_restart() {
 
     let app = router(
         spawn_runtime(
-            2,
+            &test_config(2, 8),
             Persistence::Wal {
                 wal_dir: wal_root.clone(),
             },
@@ -2149,7 +2156,7 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
 
     let app = router(
         spawn_runtime(
-            1,
+            &test_config(1, 1),
             Persistence::Raft {
                 log_dir: Some(raft_root.clone()),
             },
@@ -2252,7 +2259,7 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
     let _ = std::fs::remove_dir_all(&raft_root);
 
     let spawned = spawn_runtime(
-        1,
+        &test_config(1, 1),
         Persistence::Raft {
             log_dir: Some(raft_root.as_path().into()),
         },
@@ -2380,7 +2387,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
 
     {
         let spawned = spawn_runtime(
-            1,
+            &test_config(1, 1),
             Persistence::Raft {
                 log_dir: Some(raft_root.as_path().into()),
             },
@@ -2440,7 +2447,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
 
     {
         let spawned = spawn_runtime(
-            1,
+            &test_config(1, 1),
             Persistence::Raft {
                 log_dir: Some(raft_root.as_path().into()),
             },
@@ -2487,7 +2494,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
 async fn raft_memory_runtime_serves_http_subset_without_wal_metrics() {
     let app = router(
         spawn_runtime(
-            1,
+            &test_config(1, 1),
             Persistence::Raft { log_dir: None },
             Topology::SingleNode {
                 raft_group_count: 1,
@@ -5047,9 +5054,13 @@ async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
 
 fn test_router() -> Router {
     router(
-        spawn_runtime(2, Persistence::InMemory, Topology::SingleNode {
-            raft_group_count: 8,
-        })
+        spawn_runtime(
+            &test_config(2, 8),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 8,
+            },
+        )
         .expect("runtime")
         .runtime,
     )
@@ -5067,13 +5078,17 @@ async fn client_router_does_not_serve_cluster_plane_via_grpc_service() {
     // a tonic-style response (200/415/501) while the client router stays in
     // HTTP append's error space (4xx, never 200).
     let state = HttpState::new(
-        spawn_runtime(1, Persistence::InMemory, Topology::SingleNode {
-            raft_group_count: 1,
-        })
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
         .expect("runtime")
         .runtime,
     );
-    let client = client_router_from_state(state.clone());
+    let client = client_router_with_admission(state.clone(), IngressAdmission::default());
     let response = client
         .oneshot(
             Request::builder()
@@ -5103,9 +5118,13 @@ async fn client_router_does_not_serve_cluster_plane_via_grpc_service() {
 #[tokio::test]
 async fn cluster_router_does_not_expose_client_plane_routes() {
     let state = HttpState::new(
-        spawn_runtime(1, Persistence::InMemory, Topology::SingleNode {
-            raft_group_count: 1,
-        })
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
         .expect("runtime")
         .runtime,
     );
@@ -5134,9 +5153,13 @@ async fn cluster_router_reports_leadership_shed_policy() {
     let registry = RaftGroupHandleRegistry::default();
     registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::ColdHealth);
     let state = HttpState::with_raft_registry(
-        spawn_runtime(1, Persistence::InMemory, Topology::SingleNode {
-            raft_group_count: 1,
-        })
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
         .expect("runtime")
         .runtime,
         registry,
@@ -5170,14 +5193,21 @@ async fn cluster_router_reports_leadership_shed_policy() {
 async fn maintenance_drain_endpoint_marks_and_clears_leadership_shed() {
     let registry = RaftGroupHandleRegistry::default();
     let state = HttpState::with_raft_registry(
-        spawn_runtime(1, Persistence::InMemory, Topology::SingleNode {
-            raft_group_count: 1,
-        })
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
         .expect("runtime")
         .runtime,
         registry,
     );
-    let router = router_with_http_state(state);
+    let router = cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
+    ));
 
     let response = router
         .clone()
@@ -5224,13 +5254,20 @@ async fn merged_router_serves_both_planes() {
     // The single-listener router (backwards compat / in-process tests) must
     // still answer both client and cluster routes from one bind.
     let state = HttpState::new(
-        spawn_runtime(1, Persistence::InMemory, Topology::SingleNode {
-            raft_group_count: 1,
-        })
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
         .expect("runtime")
         .runtime,
     );
-    let merged = router_with_http_state(state);
+    let merged = cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
+    ));
     let merged_for_cluster = merged.clone();
 
     // Client-plane: HEAD on an unknown stream returns 404 (route mounted).
@@ -5269,16 +5306,23 @@ async fn merged_router_serves_both_planes() {
 async fn http_state_wall_clock_drives_protocol_now_ms() {
     let now_ms = Arc::new(AtomicU64::new(1_000));
     let state = HttpState::new(
-        spawn_runtime(1, Persistence::InMemory, Topology::SingleNode {
-            raft_group_count: 1,
-        })
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
         .expect("runtime")
         .runtime,
     )
     .with_wall_clock(TestWallClock {
         now_ms: Arc::clone(&now_ms),
     });
-    let app = router_with_http_state(state);
+    let app = cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
+    ));
 
     let response = app
         .clone()
@@ -5630,9 +5674,14 @@ mod snapshot_driver {
     fn snapshot_driver_default_interval_follows_external_store() {
         assert_eq!(resolve_snapshot_drive_interval_ms(None, false), 0);
         assert_eq!(resolve_snapshot_drive_interval_ms(None, true), 60_000);
+        assert_eq!(resolve_snapshot_drive_interval_ms(Some(0), false), 0);
         assert_eq!(resolve_snapshot_drive_interval_ms(Some(0), true), 0);
         assert_eq!(
             resolve_snapshot_drive_interval_ms(Some(15_000), false),
+            15_000
+        );
+        assert_eq!(
+            resolve_snapshot_drive_interval_ms(Some(15_000), true),
             15_000
         );
     }
@@ -6058,11 +6107,14 @@ mod cluster_egress {
         ]);
         let registry = RaftGroupHandleRegistry::default();
 
-        crate::bootstrap::spawn_cluster_egress_gate_if_configured(
+        crate::bootstrap::spawn_egress_gate(
             &registry,
             1,
             &peers,
             per_group_voters,
+            &ursula_config::UrsulaConfig::default()
+                .governance
+                .cluster_probe,
         );
         tokio::time::sleep(Duration::from_millis(2_500)).await;
 
