@@ -17,6 +17,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }
+ursula-config = { workspace = true }
 ursula-shard = { workspace = true }
 ursula-stream = { workspace = true }
 

@@ -13,14 +13,15 @@ Ursula ships **two binaries** you will use side by side:
 
 Required:
 
-- Rust stable and Cargo
+- the pinned Rust nightly toolchain from `rust-toolchain.toml` and Cargo
 - a C compiler (for transitive native crates)
 - `pkg-config`
 
-On macOS:
+On macOS, install rustup so Cargo selects the pinned nightly from `rust-toolchain.toml`:
 
 ```bash
-brew install rust pkg-config
+brew install rustup pkg-config
+rustup-init -y
 ```
 
 On Debian or Ubuntu:
@@ -58,10 +59,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 ./target/release/ursulactl --help
 ```
 
-Both should print supported CLI flags. Then run a short smoke server (defaults to `127.0.0.1:4437`, in-memory engine, core count from your CPU):
+Both should print supported CLI flags. From the repository root, `./target/release/ursula --preset default` still performs config-file discovery and will load `./ursula.toml` when present. Use that command when you want the bundled `./ursula.toml` with the default preset; for a true no-file smoke test, run from a directory with no Ursula config file or temporarily move/rename `./ursula.toml` first.
 
 ```bash
-./target/release/ursula &
+./target/release/ursula --preset default &
 ```
 
 For a single local node, `ursulactl` needs a one-node manifest to talk to:
