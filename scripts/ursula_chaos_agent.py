@@ -683,8 +683,21 @@ class ChaosAgent:
         expected_seq: int,
         received_seq: int,
     ) -> bool:
-        if not self.resync_stream_from_server(stream):
-            return False
+        prefix = f"{producer.producer_id}\0"
+        with self.state_lock:
+            affected_streams = [stream]
+            affected_streams.extend(
+                workload_stream
+                for workload_stream in self.streams
+                if workload_stream is not stream
+                and any(
+                    key.startswith(prefix)
+                    for key in workload_stream.pending_producer_appends
+                )
+            )
+        for workload_stream in affected_streams:
+            if not self.resync_stream_from_server(workload_stream):
+                return False
         with self.state_lock:
             old_epoch = producer.epoch
             producer.epoch += 1
@@ -692,7 +705,6 @@ class ChaosAgent:
             for workload_stream in self.streams:
                 workload_stream.producer_seqs[producer.producer_id] = 0
                 workload_stream.producer_epochs[producer.producer_id] = producer.epoch
-                prefix = f"{producer.producer_id}\0"
                 stale_keys = [
                     key for key in workload_stream.pending_producer_appends
                     if key.startswith(prefix)

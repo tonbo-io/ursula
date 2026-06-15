@@ -247,9 +247,16 @@ class ChaosAgentStateTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual(calls, ["http://n1:4491/chaos/run-test-0001", "http://n2:4491/chaos/run-test-0001"])
+        self.assertEqual(calls, [
+            "http://n1:4491/chaos/run-test-0001",
+            "http://n2:4491/chaos/run-test-0001",
+            "http://n1:4491/chaos/run-test-0002",
+            "http://n2:4491/chaos/run-test-0002",
+        ])
         self.assertEqual(stream.next_offset, 120)
         self.assertEqual(stream.expected_live_setsum.hexdigest(), server_setsum.hexdigest())
+        self.assertEqual(other_stream.next_offset, 120)
+        self.assertEqual(other_stream.expected_live_setsum.hexdigest(), server_setsum.hexdigest())
         self.assertEqual(producer.epoch, 4)
         for workload_stream in agent.streams:
             self.assertEqual(workload_stream.producer_seqs[producer.producer_id], 0)
