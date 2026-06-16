@@ -1231,6 +1231,8 @@ mod tests {
             location: SnapshotLocation::S3 {
                 key: format!("{snapshot_id}.snap"),
                 size_bytes: 1,
+                stored_size_bytes: Some(1),
+                compression: ursula_runtime::SnapshotCompression::None,
             },
         };
         TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
