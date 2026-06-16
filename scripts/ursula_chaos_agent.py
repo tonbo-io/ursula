@@ -608,21 +608,20 @@ class ChaosAgent:
         previous_next_offset: int,
         end_offset: int,
         payload: bytes,
-    ) -> None:
+    ) -> bool:
         if not payload or end_offset <= previous_next_offset:
-            return
+            return True
         payload_len = len(payload)
         span = end_offset - previous_next_offset
-        if span % payload_len != 0:
-            self.record_expected_append(stream, end_offset - payload_len, end_offset, payload)
-            return
-        for record_start_offset in range(previous_next_offset, end_offset, payload_len):
-            self.record_expected_append(
-                stream,
-                record_start_offset,
-                record_start_offset + payload_len,
-                payload,
-            )
+        if span != payload_len:
+            return False
+        self.record_expected_append(
+            stream,
+            previous_next_offset,
+            end_offset,
+            payload,
+        )
+        return True
 
     @staticmethod
     def parse_producer_seq_conflict(body: bytes) -> tuple[str, int, int] | None:
@@ -908,29 +907,33 @@ class ChaosAgent:
                     ) from exc
                 end_offset = next_offset_value
                 committed_new_record = status == 200
+                needs_resync = False
+                resync_reason = ""
                 with self.state_lock:
                     pending_payload = stream.pending_producer_appends.pop(pending_key, None)
                     if committed_new_record:
                         previous_next_offset = stream.next_offset
                         stream.next_offset = max(stream.next_offset, end_offset)
-                        self.record_expected_append_span(
+                        needs_resync = not self.record_expected_append_span(
                             stream,
                             previous_next_offset,
                             end_offset,
                             payload,
                         )
+                        resync_reason = "new append response"
                     elif pending_payload is not None:
                         # 204 is a producer dedup acknowledgement. If the original
                         # append timed out but committed, account the original
                         # payload once the dedup response proves it.
                         previous_next_offset = stream.next_offset
                         stream.next_offset = max(stream.next_offset, end_offset)
-                        self.record_expected_append_span(
+                        needs_resync = not self.record_expected_append_span(
                             stream,
                             previous_next_offset,
                             end_offset,
                             pending_payload,
                         )
+                        resync_reason = "dedup response with pending payload"
                     else:
                         previous_next_offset = stream.next_offset
                         stream.next_offset = max(stream.next_offset, end_offset)
@@ -939,12 +942,13 @@ class ChaosAgent:
                             # agent sees for this producer seq. The payload is
                             # deterministic for the seq, so account it when the
                             # response advances our stream view.
-                            self.record_expected_append_span(
+                            needs_resync = not self.record_expected_append_span(
                                 stream,
                                 previous_next_offset,
                                 end_offset,
                                 payload,
                             )
+                            resync_reason = "dedup response without pending payload"
                     producer.last_seq = producer_seq
                     producer.last_stream = stream.name
                     producer.last_append_ordinal = producer_seq
@@ -962,6 +966,14 @@ class ChaosAgent:
                         self.lane_attempts[lane] += 1
                         self.lane_unresolved_appends[lane] = False
                     self.append_success += 1
+                if needs_resync:
+                    span = max(0, end_offset - previous_next_offset)
+                    self.event(
+                        "warn",
+                        f"resyncing expected setsum for {stream_name}: "
+                        f"ambiguous {resync_reason} span={span} payload_len={len(payload)}",
+                    )
+                    self.resync_stream_from_server(stream)
                 return True
             if (
                 not retryable_sweep
@@ -1275,8 +1287,24 @@ class ChaosAgent:
                 f"producer append probe failed: status={status} next_offset={next_offset}",
             )
             return
+        needs_resync = False
         with self.state_lock:
+            previous_next_offset = stream.next_offset
             stream.next_offset = max(stream.next_offset, next_offset)
+            needs_resync = not self.record_expected_append_span(
+                stream,
+                previous_next_offset,
+                next_offset,
+                payload,
+            )
+        if needs_resync:
+            span = max(0, next_offset - previous_next_offset)
+            self.event(
+                "warn",
+                f"resyncing expected setsum for {stream.name}: "
+                f"ambiguous producer probe span={span} payload_len={len(payload)}",
+            )
+            self.resync_stream_from_server(stream)
 
         status, _, headers = self.request(
             "POST",
@@ -1291,8 +1319,24 @@ class ChaosAgent:
         )
         duplicate_next = parse_int(response_header(headers, "Stream-Next-Offset"))
         if status == 200 and duplicate_next is not None and duplicate_next > next_offset:
+            needs_resync = False
             with self.state_lock:
+                previous_next_offset = stream.next_offset
                 stream.next_offset = max(stream.next_offset, duplicate_next)
+                needs_resync = not self.record_expected_append_span(
+                    stream,
+                    previous_next_offset,
+                    duplicate_next,
+                    payload,
+                )
+            if needs_resync:
+                span = max(0, duplicate_next - previous_next_offset)
+                self.event(
+                    "warn",
+                    f"resyncing expected setsum for {stream.name}: "
+                    f"ambiguous producer duplicate span={span} payload_len={len(payload)}",
+                )
+                self.resync_stream_from_server(stream)
             self.record_producer_probe_skipped(
                 f"producer duplicate_seq probe skipped (state lost): "
                 f"status={status} next_offset={duplicate_next} expected={next_offset}"
