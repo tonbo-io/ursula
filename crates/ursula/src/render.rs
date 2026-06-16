@@ -19,8 +19,9 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::DateTime;
 use chrono::SecondsFormat;
 use chrono::Utc;
+use serde_json::Value;
+use serde_json::json;
 use ursula_raft::RaftGroupMetricsSnapshot;
-use ursula_raft::RaftLogProgressSnapshot;
 use ursula_runtime::AppendResponse;
 use ursula_runtime::BootstrapStreamResponse;
 use ursula_runtime::ColdStoreInfo;
@@ -104,22 +105,22 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
     }
 }
 
-pub(crate) fn insert_offset(headers: &mut HeaderMap, next_offset: u64) {
-    if let Ok(value) = HeaderValue::from_str(&format!("{next_offset:020}")) {
-        headers.insert(HEADER_STREAM_NEXT_OFFSET, value);
+pub(crate) fn insert_padded_offset(headers: &mut HeaderMap, name: &'static str, value: u64) {
+    if let Ok(value) = HeaderValue::from_str(&format!("{value:020}")) {
+        headers.insert(name, value);
     }
+}
+
+pub(crate) fn insert_offset(headers: &mut HeaderMap, next_offset: u64) {
+    insert_padded_offset(headers, HEADER_STREAM_NEXT_OFFSET, next_offset);
 }
 
 pub(crate) fn insert_snapshot_offset(headers: &mut HeaderMap, snapshot_offset: u64) {
-    if let Ok(value) = HeaderValue::from_str(&format!("{snapshot_offset:020}")) {
-        headers.insert(HEADER_STREAM_SNAPSHOT_OFFSET, value);
-    }
+    insert_padded_offset(headers, HEADER_STREAM_SNAPSHOT_OFFSET, snapshot_offset);
 }
 
 pub(crate) fn insert_cursor(headers: &mut HeaderMap, cursor: u64) {
-    if let Ok(value) = HeaderValue::from_str(&format!("{cursor:020}")) {
-        headers.insert(HEADER_STREAM_CURSOR, value);
-    }
+    insert_padded_offset(headers, HEADER_STREAM_CURSOR, cursor);
 }
 
 pub(crate) fn response_cursor(next_offset: u64, request_cursor: Option<&str>) -> u64 {
@@ -283,36 +284,17 @@ pub(crate) fn parse_append_batch(body: &Bytes) -> Result<Vec<Bytes>, String> {
 }
 
 pub(crate) fn render_batch_results(results: &[Result<AppendResponse, RuntimeError>]) -> String {
-    const OK_ACK: &str = "{\"status\":204}";
-    if results.iter().all(Result::is_ok) {
-        let mut body = String::with_capacity(2 + results.len().saturating_mul(OK_ACK.len() + 1));
-        body.push('[');
-        for index in 0..results.len() {
-            if index > 0 {
-                body.push(',');
-            }
-            body.push_str(OK_ACK);
-        }
-        body.push(']');
-        return body;
-    }
-
-    let mut body = String::with_capacity(2 + results.len().saturating_mul(OK_ACK.len() + 1));
-    body.push('[');
-    for (index, result) in results.iter().enumerate() {
-        if index > 0 {
-            body.push(',');
-        }
-        let status = match result {
-            Ok(_) => StatusCode::NO_CONTENT.as_u16(),
-            Err(err) => runtime_error_status(err).as_u16(),
-        };
-        body.push_str("{\"status\":");
-        body.push_str(&status.to_string());
-        body.push('}');
-    }
-    body.push(']');
-    body
+    let acks = results
+        .iter()
+        .map(|result| {
+            let status = match result {
+                Ok(_) => StatusCode::NO_CONTENT.as_u16(),
+                Err(err) => runtime_error_status(err).as_u16(),
+            };
+            json!({ "status": status })
+        })
+        .collect::<Vec<Value>>();
+    Value::Array(acks).to_string()
 }
 
 pub(crate) fn render_metrics(
@@ -321,370 +303,94 @@ pub(crate) fn render_metrics(
     http: HttpMetricsSnapshot,
     raft_groups: &[RaftGroupMetricsSnapshot],
     cold_store: Option<&ColdStoreInfo>,
-) -> String {
-    let active_cores = active_count(&snapshot.per_core_appends);
-    let active_groups = active_count(&snapshot.per_group_appends);
-    let mut body = String::from("{");
-    body.push_str("\"accepted_appends\":");
-    body.push_str(&snapshot.accepted_appends.to_string());
-    body.push_str(",\"active_cores\":");
-    body.push_str(&active_cores.to_string());
-    body.push_str(",\"active_groups\":");
-    body.push_str(&active_groups.to_string());
-    body.push_str(",\"per_core_appends\":");
-    body.push_str(&render_u64_array(&snapshot.per_core_appends));
-    body.push_str(",\"per_group_appends\":");
-    body.push_str(&render_u64_array(&snapshot.per_group_appends));
-    body.push_str(",\"applied_mutations\":");
-    body.push_str(&snapshot.applied_mutations.to_string());
-    body.push_str(",\"per_core_applied_mutations\":");
-    body.push_str(&render_u64_array(&snapshot.per_core_applied_mutations));
-    body.push_str(",\"per_group_applied_mutations\":");
-    body.push_str(&render_u64_array(&snapshot.per_group_applied_mutations));
-    body.push_str(",\"mutation_apply_ns\":");
-    body.push_str(&snapshot.mutation_apply_ns.to_string());
-    body.push_str(",\"per_core_mutation_apply_ns\":");
-    body.push_str(&render_u64_array(&snapshot.per_core_mutation_apply_ns));
-    body.push_str(",\"per_group_mutation_apply_ns\":");
-    body.push_str(&render_u64_array(&snapshot.per_group_mutation_apply_ns));
-    body.push_str(",\"group_lock_wait_ns\":");
-    body.push_str(&snapshot.group_lock_wait_ns.to_string());
-    body.push_str(",\"per_core_group_lock_wait_ns\":");
-    body.push_str(&render_u64_array(&snapshot.per_core_group_lock_wait_ns));
-    body.push_str(",\"per_group_group_lock_wait_ns\":");
-    body.push_str(&render_u64_array(&snapshot.per_group_group_lock_wait_ns));
-    body.push_str(",\"group_engine_exec_ns\":");
-    body.push_str(&snapshot.group_engine_exec_ns.to_string());
-    body.push_str(",\"per_core_group_engine_exec_ns\":");
-    body.push_str(&render_u64_array(&snapshot.per_core_group_engine_exec_ns));
-    body.push_str(",\"per_group_group_engine_exec_ns\":");
-    body.push_str(&render_u64_array(&snapshot.per_group_group_engine_exec_ns));
-    body.push_str(",\"group_mailbox_depth\":");
-    body.push_str(&snapshot.group_mailbox_depth.to_string());
-    body.push_str(",\"per_group_group_mailbox_depth\":");
-    body.push_str(&render_u64_array(&snapshot.per_group_group_mailbox_depth));
-    body.push_str(",\"group_mailbox_max_depth\":");
-    body.push_str(&snapshot.group_mailbox_max_depth.to_string());
-    body.push_str(",\"per_group_group_mailbox_max_depth\":");
-    body.push_str(&render_u64_array(
-        &snapshot.per_group_group_mailbox_max_depth,
-    ));
-    body.push_str(",\"group_mailbox_full_events\":");
-    body.push_str(&snapshot.group_mailbox_full_events.to_string());
-    body.push_str(",\"per_group_group_mailbox_full_events\":");
-    body.push_str(&render_u64_array(
-        &snapshot.per_group_group_mailbox_full_events,
-    ));
-    body.push_str(",\"raft_write_many_batches\":");
-    body.push_str(&snapshot.raft_write_many_batches.to_string());
-    body.push_str(",\"per_core_raft_write_many_batches\":");
-    body.push_str(&render_u64_array(
-        &snapshot.per_core_raft_write_many_batches,
-    ));
-    body.push_str(",\"per_group_raft_write_many_batches\":");
-    body.push_str(&render_u64_array(
-        &snapshot.per_group_raft_write_many_batches,
-    ));
-    body.push_str(",\"raft_write_many_commands\":");
-    body.push_str(&snapshot.raft_write_many_commands.to_string());
-    body.push_str(",\"per_core_raft_write_many_commands\":");
-    body.push_str(&render_u64_array(
-        &snapshot.per_core_raft_write_many_commands,
-    ));
-    body.push_str(",\"per_group_raft_write_many_commands\":");
-    body.push_str(&render_u64_array(
-        &snapshot.per_group_raft_write_many_commands,
-    ));
-    body.push_str(",\"raft_write_many_logical_commands\":");
-    body.push_str(&snapshot.raft_write_many_logical_commands.to_string());
-    body.push_str(",\"per_core_raft_write_many_logical_commands\":");
-    body.push_str(&render_u64_array(
-        &snapshot.per_core_raft_write_many_logical_commands,
-    ));
-    body.push_str(",\"per_group_raft_write_many_logical_commands\":");
-    body.push_str(&render_u64_array(
-        &snapshot.per_group_raft_write_many_logical_commands,
-    ));
-    body.push_str(",\"raft_write_many_responses\":");
-    body.push_str(&snapshot.raft_write_many_responses.to_string());
-    body.push_str(",\"per_core_raft_write_many_responses\":");
-    body.push_str(&render_u64_array(
-        &snapshot.per_core_raft_write_many_responses,
-    ));
-    body.push_str(",\"per_group_raft_write_many_responses\":");
-    body.push_str(&render_u64_array(
-        &snapshot.per_group_raft_write_many_responses,
-    ));
-    body.push_str(",\"raft_write_many_submit_ns\":");
-    body.push_str(&snapshot.raft_write_many_submit_ns.to_string());
-    body.push_str(",\"per_core_raft_write_many_submit_ns\":");
-    body.push_str(&render_u64_array(
-        &snapshot.per_core_raft_write_many_submit_ns,
-    ));
-    body.push_str(",\"per_group_raft_write_many_submit_ns\":");
-    body.push_str(&render_u64_array(
-        &snapshot.per_group_raft_write_many_submit_ns,
-    ));
-    body.push_str(",\"raft_write_many_response_ns\":");
-    body.push_str(&snapshot.raft_write_many_response_ns.to_string());
-    body.push_str(",\"per_core_raft_write_many_response_ns\":");
-    body.push_str(&render_u64_array(
-        &snapshot.per_core_raft_write_many_response_ns,
-    ));
-    body.push_str(",\"per_group_raft_write_many_response_ns\":");
-    body.push_str(&render_u64_array(
-        &snapshot.per_group_raft_write_many_response_ns,
-    ));
-    body.push_str(",\"raft_apply_entries\":");
-    body.push_str(&snapshot.raft_apply_entries.to_string());
-    body.push_str(",\"per_core_raft_apply_entries\":");
-    body.push_str(&render_u64_array(&snapshot.per_core_raft_apply_entries));
-    body.push_str(",\"per_group_raft_apply_entries\":");
-    body.push_str(&render_u64_array(&snapshot.per_group_raft_apply_entries));
-    body.push_str(",\"raft_apply_ns\":");
-    body.push_str(&snapshot.raft_apply_ns.to_string());
-    body.push_str(",\"per_core_raft_apply_ns\":");
-    body.push_str(&render_u64_array(&snapshot.per_core_raft_apply_ns));
-    body.push_str(",\"per_group_raft_apply_ns\":");
-    body.push_str(&render_u64_array(&snapshot.per_group_raft_apply_ns));
-    body.push_str(",\"live_read_waiters\":");
-    body.push_str(&snapshot.live_read_waiters.to_string());
-    body.push_str(",\"per_core_live_read_waiters\":");
-    body.push_str(&render_u64_array(&snapshot.per_core_live_read_waiters));
-    body.push_str(",\"live_read_backpressure_events\":");
-    body.push_str(&snapshot.live_read_backpressure_events.to_string());
-    body.push_str(",\"per_core_live_read_backpressure_events\":");
-    body.push_str(&render_u64_array(
-        &snapshot.per_core_live_read_backpressure_events,
-    ));
-    body.push_str(",\"sse_streams_opened\":");
-    body.push_str(&http.sse_streams_opened.to_string());
-    body.push_str(",\"sse_read_iterations\":");
-    body.push_str(&http.sse_read_iterations.to_string());
-    body.push_str(",\"sse_data_events\":");
-    body.push_str(&http.sse_data_events.to_string());
-    body.push_str(",\"sse_control_events\":");
-    body.push_str(&http.sse_control_events.to_string());
-    body.push_str(",\"sse_error_events\":");
-    body.push_str(&http.sse_error_events.to_string());
-    body.push_str(",\"routed_requests\":");
-    body.push_str(&snapshot.routed_requests.to_string());
-    body.push_str(",\"per_core_routed_requests\":");
-    body.push_str(&render_u64_array(&snapshot.per_core_routed_requests));
-    body.push_str(",\"mailbox_send_wait_ns\":");
-    body.push_str(&snapshot.mailbox_send_wait_ns.to_string());
-    body.push_str(",\"per_core_mailbox_send_wait_ns\":");
-    body.push_str(&render_u64_array(&snapshot.per_core_mailbox_send_wait_ns));
-    body.push_str(",\"mailbox_full_events\":");
-    body.push_str(&snapshot.mailbox_full_events.to_string());
-    body.push_str(",\"per_core_mailbox_full_events\":");
-    body.push_str(&render_u64_array(&snapshot.per_core_mailbox_full_events));
-    body.push_str(",\"wal_batches\":");
-    body.push_str(&snapshot.wal_batches.to_string());
-    body.push_str(",\"per_core_wal_batches\":");
-    body.push_str(&render_u64_array(&snapshot.per_core_wal_batches));
-    body.push_str(",\"per_group_wal_batches\":");
-    body.push_str(&render_u64_array(&snapshot.per_group_wal_batches));
-    body.push_str(",\"wal_records\":");
-    body.push_str(&snapshot.wal_records.to_string());
-    body.push_str(",\"per_core_wal_records\":");
-    body.push_str(&render_u64_array(&snapshot.per_core_wal_records));
-    body.push_str(",\"per_group_wal_records\":");
-    body.push_str(&render_u64_array(&snapshot.per_group_wal_records));
-    body.push_str(",\"wal_write_ns\":");
-    body.push_str(&snapshot.wal_write_ns.to_string());
-    body.push_str(",\"per_core_wal_write_ns\":");
-    body.push_str(&render_u64_array(&snapshot.per_core_wal_write_ns));
-    body.push_str(",\"per_group_wal_write_ns\":");
-    body.push_str(&render_u64_array(&snapshot.per_group_wal_write_ns));
-    body.push_str(",\"wal_sync_ns\":");
-    body.push_str(&snapshot.wal_sync_ns.to_string());
-    body.push_str(",\"per_core_wal_sync_ns\":");
-    body.push_str(&render_u64_array(&snapshot.per_core_wal_sync_ns));
-    body.push_str(",\"per_group_wal_sync_ns\":");
-    body.push_str(&render_u64_array(&snapshot.per_group_wal_sync_ns));
-    body.push_str(",\"cold_flush_uploads\":");
-    body.push_str(&snapshot.cold_flush_uploads.to_string());
-    body.push_str(",\"cold_flush_upload_bytes\":");
-    body.push_str(&snapshot.cold_flush_upload_bytes.to_string());
-    body.push_str(",\"cold_flush_upload_ns\":");
-    body.push_str(&snapshot.cold_flush_upload_ns.to_string());
-    body.push_str(",\"cold_flush_publishes\":");
-    body.push_str(&snapshot.cold_flush_publishes.to_string());
-    body.push_str(",\"cold_flush_publish_bytes\":");
-    body.push_str(&snapshot.cold_flush_publish_bytes.to_string());
-    body.push_str(",\"cold_flush_publish_ns\":");
-    body.push_str(&snapshot.cold_flush_publish_ns.to_string());
-    body.push_str(",\"cold_orphan_cleanup_attempts\":");
-    body.push_str(&snapshot.cold_orphan_cleanup_attempts.to_string());
-    body.push_str(",\"cold_orphan_cleanup_errors\":");
-    body.push_str(&snapshot.cold_orphan_cleanup_errors.to_string());
-    body.push_str(",\"cold_orphan_bytes\":");
-    body.push_str(&snapshot.cold_orphan_bytes.to_string());
-    body.push_str(",\"cold_gc_reclaimed\":");
-    body.push_str(&snapshot.cold_gc_reclaimed.to_string());
-    body.push_str(",\"cold_gc_errors\":");
-    body.push_str(&snapshot.cold_gc_errors.to_string());
-    body.push_str(",\"cold_flush_write_errors\":");
-    body.push_str(&snapshot.cold_flush_write_errors.to_string());
-    body.push_str(",\"cold_hot_bytes\":");
-    body.push_str(&snapshot.cold_hot_bytes.to_string());
-    body.push_str(",\"per_group_cold_hot_bytes\":");
-    body.push_str(&render_u64_array(&snapshot.per_group_cold_hot_bytes));
-    body.push_str(",\"cold_hot_group_bytes_max\":");
-    body.push_str(&snapshot.cold_hot_group_bytes_max.to_string());
-    body.push_str(",\"per_group_cold_hot_bytes_max\":");
-    body.push_str(&render_u64_array(&snapshot.per_group_cold_hot_bytes_max));
-    body.push_str(",\"cold_hot_stream_bytes_max\":");
-    body.push_str(&snapshot.cold_hot_stream_bytes_max.to_string());
-    body.push_str(",\"cold_backpressure_events\":");
-    body.push_str(&snapshot.cold_backpressure_events.to_string());
-    body.push_str(",\"per_core_cold_backpressure_events\":");
-    body.push_str(&render_u64_array(
-        &snapshot.per_core_cold_backpressure_events,
-    ));
-    body.push_str(",\"per_group_cold_backpressure_events\":");
-    body.push_str(&render_u64_array(
-        &snapshot.per_group_cold_backpressure_events,
-    ));
-    body.push_str(",\"cold_backpressure_bytes\":");
-    body.push_str(&snapshot.cold_backpressure_bytes.to_string());
-    body.push_str(",\"cold_store\":");
-    body.push_str(&render_cold_store_info(cold_store));
-    body.push_str(",\"mailbox_depths\":");
-    body.push_str(&render_usize_array(&mailbox.depths));
-    body.push_str(",\"mailbox_capacities\":");
-    body.push_str(&render_usize_array(&mailbox.capacities));
-    body.push_str(",\"raft_group_count\":");
-    body.push_str(&raft_groups.len().to_string());
-    body.push_str(",\"raft_groups\":");
-    body.push_str(&render_raft_group_metrics_array(raft_groups));
-    body.push('}');
-    body
-}
+) -> Value {
+    // The bulk of the metrics object is the runtime + HTTP snapshots flattened
+    // in verbatim (their field names are the wire keys, kept in sync by the
+    // compiler). Only the derived/aggregate fields are spelled out here.
+    #[derive(serde::Serialize)]
+    struct MetricsView<'a> {
+        #[serde(flatten)]
+        runtime: &'a RuntimeMetricsSnapshot,
+        active_cores: usize,
+        active_groups: usize,
+        #[serde(flatten)]
+        http: &'a HttpMetricsSnapshot,
+        mailbox_depths: &'a [usize],
+        mailbox_capacities: &'a [usize],
+        cold_store: Value,
+        raft_group_count: usize,
+        raft_groups: Value,
+    }
 
-pub(crate) fn render_cold_store_info(value: Option<&ColdStoreInfo>) -> String {
-    let Some(value) = value else {
-        return "{\"backend\":\"none\",\"root\":null,\"bucket\":null,\"region\":null,\"endpoint\":null}".to_owned();
+    let active_cores = snapshot
+        .per_core_appends
+        .iter()
+        .filter(|appends| **appends > 0)
+        .count();
+    let active_groups = snapshot
+        .per_group_appends
+        .iter()
+        .filter(|appends| **appends > 0)
+        .count();
+
+    let view = MetricsView {
+        runtime: &snapshot,
+        active_cores,
+        active_groups,
+        http: &http,
+        mailbox_depths: &mailbox.depths,
+        mailbox_capacities: &mailbox.capacities,
+        cold_store: render_cold_store_info(cold_store),
+        raft_group_count: raft_groups.len(),
+        raft_groups: render_raft_group_metrics_array(raft_groups),
     };
-    let mut body = String::from("{\"backend\":");
-    push_json_string(&mut body, value.backend);
-    body.push_str(",\"root\":");
-    push_optional_json_string(&mut body, value.root.as_deref());
-    body.push_str(",\"bucket\":");
-    push_optional_json_string(&mut body, value.bucket.as_deref());
-    body.push_str(",\"region\":");
-    push_optional_json_string(&mut body, value.region.as_deref());
-    body.push_str(",\"endpoint\":");
-    push_optional_json_string(&mut body, value.endpoint.as_deref());
-    body.push('}');
-    body
+    serde_json::to_value(&view).unwrap_or(Value::Null)
 }
 
-pub(crate) fn active_count(values: &[u64]) -> usize {
-    values.iter().filter(|value| **value > 0).count()
+pub(crate) fn render_cold_store_info(value: Option<&ColdStoreInfo>) -> Value {
+    let Some(value) = value else {
+        return json!({
+            "backend": "none",
+            "root": null,
+            "bucket": null,
+            "region": null,
+            "endpoint": null,
+        });
+    };
+    json!({
+        "backend": value.backend,
+        "root": value.root,
+        "bucket": value.bucket,
+        "region": value.region,
+        "endpoint": value.endpoint,
+    })
 }
 
-pub(crate) fn render_u64_array(values: &[u64]) -> String {
-    let mut body = String::from("[");
-    for (index, value) in values.iter().enumerate() {
-        if index > 0 {
-            body.push(',');
-        }
-        body.push_str(&value.to_string());
-    }
-    body.push(']');
-    body
-}
-
-pub(crate) fn render_usize_array(values: &[usize]) -> String {
-    let mut body = String::from("[");
-    for (index, value) in values.iter().enumerate() {
-        if index > 0 {
-            body.push(',');
-        }
-        body.push_str(&value.to_string());
-    }
-    body.push(']');
-    body
-}
-
-pub(crate) fn render_raft_group_metrics_array(values: &[RaftGroupMetricsSnapshot]) -> String {
-    let mut body = String::from("[");
-    for (index, value) in values.iter().enumerate() {
-        if index > 0 {
-            body.push(',');
-        }
-        body.push('{');
-        body.push_str("\"raft_group_id\":");
-        body.push_str(&value.raft_group_id.to_string());
-        body.push_str(",\"node_id\":");
-        body.push_str(&value.node_id.to_string());
-        body.push_str(",\"current_term\":");
-        body.push_str(&value.current_term.to_string());
-        body.push_str(",\"current_leader\":");
-        push_optional_u64(&mut body, value.current_leader);
-        body.push_str(",\"last_log_index\":");
-        push_optional_u64(&mut body, value.last_log_index);
-        push_optional_log_progress(&mut body, "committed", value.committed);
-        push_optional_log_progress(&mut body, "last_applied", value.last_applied);
-        push_optional_log_progress(&mut body, "snapshot", value.snapshot);
-        push_optional_log_progress(&mut body, "purged", value.purged);
-        body.push_str(",\"voter_ids\":");
-        body.push_str(&render_u64_array(&value.voter_ids));
-        body.push_str(",\"learner_ids\":");
-        body.push_str(&render_u64_array(&value.learner_ids));
-        body.push('}');
-    }
-    body.push(']');
-    body
-}
-
-pub(crate) fn push_optional_log_progress(
-    body: &mut String,
-    name: &str,
-    progress: Option<RaftLogProgressSnapshot>,
-) {
-    body.push_str(",\"");
-    body.push_str(name);
-    body.push_str("_term\":");
-    push_optional_u64(body, progress.map(|value| value.term));
-    body.push_str(",\"");
-    body.push_str(name);
-    body.push_str("_index\":");
-    push_optional_u64(body, progress.map(|value| value.index));
-}
-
-pub(crate) fn push_optional_u64(body: &mut String, value: Option<u64>) {
-    match value {
-        Some(value) => body.push_str(&value.to_string()),
-        None => body.push_str("null"),
-    }
-}
-
-pub(crate) fn push_optional_json_string(body: &mut String, value: Option<&str>) {
-    match value {
-        Some(value) => push_json_string(body, value),
-        None => body.push_str("null"),
-    }
-}
-
-pub(crate) fn push_json_string(body: &mut String, value: &str) {
-    body.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => body.push_str("\\\""),
-            '\\' => body.push_str("\\\\"),
-            '\n' => body.push_str("\\n"),
-            '\r' => body.push_str("\\r"),
-            '\t' => body.push_str("\\t"),
-            ch if ch.is_control() => {
-                body.push_str(&format!("\\u{:04x}", u32::from(ch)));
-            }
-            ch => body.push(ch),
-        }
-    }
-    body.push('"');
+pub(crate) fn render_raft_group_metrics_array(values: &[RaftGroupMetricsSnapshot]) -> Value {
+    Value::Array(
+        values
+            .iter()
+            .map(|value| {
+                json!({
+                    "raft_group_id": value.raft_group_id,
+                    "node_id": value.node_id,
+                    "current_term": value.current_term,
+                    "current_leader": value.current_leader,
+                    "last_log_index": value.last_log_index,
+                    "committed_term": value.committed.map(|progress| progress.term),
+                    "committed_index": value.committed.map(|progress| progress.index),
+                    "last_applied_term": value.last_applied.map(|progress| progress.term),
+                    "last_applied_index": value.last_applied.map(|progress| progress.index),
+                    "snapshot_term": value.snapshot.map(|progress| progress.term),
+                    "snapshot_index": value.snapshot.map(|progress| progress.index),
+                    "purged_term": value.purged.map(|progress| progress.term),
+                    "purged_index": value.purged.map(|progress| progress.index),
+                    "voter_ids": value.voter_ids,
+                    "learner_ids": value.learner_ids,
+                })
+            })
+            .collect(),
+    )
 }
 
 pub(crate) fn should_base64_encode_sse_data(content_type: &str) -> bool {

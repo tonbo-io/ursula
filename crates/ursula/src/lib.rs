@@ -71,6 +71,7 @@ use ursula_raft::RAFT_GRPC_GROUP_WRITE_PATH;
 use ursula_raft::RAFT_GRPC_MAX_MESSAGE_BYTES;
 use ursula_raft::RAFT_GRPC_TRANSFER_LEADER_PATH;
 use ursula_raft::RAFT_GRPC_VOTE_PATH;
+use ursula_raft::RaftGroupHandle;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGrpcService;
 use ursula_raft::raft_internal_proto;
@@ -126,7 +127,6 @@ use crate::render::long_poll_no_content_response;
 use crate::render::normalize_http_write_payload;
 use crate::render::offset_now_response;
 use crate::render::parse_append_batch;
-use crate::render::push_json_string;
 use crate::render::read_response;
 use crate::render::render_batch_results;
 use crate::render::render_metrics;
@@ -366,7 +366,7 @@ impl HttpMetrics {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 struct HttpMetricsSnapshot {
     sse_streams_opened: u64,
     sse_read_iterations: u64,
@@ -528,11 +528,16 @@ impl NodeMemoryMonitor {
                             .unwrap_or_default();
                         let now_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis())
+                            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
                             .unwrap_or(0);
-                        let breadcrumb = format!(
-                            "{{\"event\":\"memory_abort_cap_exit\",\"ts_ms\":{now_ms},\"host\":\"{host}\",\"rss_bytes\":{rss},\"abort_cap_bytes\":{cap}}}",
-                        );
+                        let breadcrumb = serde_json::json!({
+                            "event": "memory_abort_cap_exit",
+                            "ts_ms": now_ms,
+                            "host": host,
+                            "rss_bytes": rss,
+                            "abort_cap_bytes": cap,
+                        })
+                        .to_string();
                         tracing::error!("{breadcrumb}");
                         use std::io::Write as _;
                         let _ = std::io::stderr().flush();
@@ -834,9 +839,16 @@ fn retry_after_json(error: &'static str) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         headers,
-        format!("{{\"error\":\"{error}\"}}"),
+        serde_json::json!({ "error": error }).to_string(),
     )
         .into_response()
+}
+
+/// Builds a `200`-style JSON response with the `application/json` content type.
+/// Centralizes the content-type wiring so handlers returning a JSON body share
+/// one consistent style.
+fn json_response(status: StatusCode, body: String) -> Response {
+    (status, [(CONTENT_TYPE, "application/json")], body).into_response()
 }
 
 /// Path of the cluster egress-health probe (M2). Peers POST a payload here over
@@ -856,20 +868,15 @@ async fn leadership_shed_status(State(state): State<HttpState>) -> Response {
         .raft_registry()
         .map(RaftGroupHandleRegistry::leadership_shed_state)
         .unwrap_or_default();
-    let mut body = String::from("{\"bits\":");
-    body.push_str(&shed_state.bits().to_string());
-    body.push_str(",\"state\":");
-    push_json_string(&mut body, &shed_state.to_string());
-    body.push_str(",\"should_accept_transfer\":");
-    body.push_str(bool_json(shed_state.should_accept_transfer()));
-    body.push_str(",\"should_campaign\":");
-    body.push_str(bool_json(shed_state.should_campaign()));
-    body.push_str(",\"should_shed_current_leaders\":");
-    body.push_str(bool_json(shed_state.should_shed_current_leaders()));
-    body.push('}');
-    let mut headers = HeaderMap::new();
-    insert_content_type(&mut headers, "application/json");
-    (StatusCode::OK, headers, body).into_response()
+    let body = serde_json::json!({
+        "bits": shed_state.bits(),
+        "state": shed_state.to_string(),
+        "should_accept_transfer": shed_state.should_accept_transfer(),
+        "should_campaign": shed_state.should_campaign(),
+        "should_shed_current_leaders": shed_state.should_shed_current_leaders(),
+    })
+    .to_string();
+    json_response(StatusCode::OK, body)
 }
 
 async fn mark_maintenance_drain(State(state): State<HttpState>) -> Response {
@@ -895,10 +902,6 @@ async fn clear_maintenance_drain(State(state): State<HttpState>) -> Response {
     registry.clear_leadership_shed(LeadershipShedReason::MaintenanceDrain);
     reenable_elections_if_campaign_allowed(registry, "maintenance-drain cleared");
     leadership_shed_status(State(state)).await
-}
-
-fn bool_json(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
 }
 
 pub fn client_router_with_admission(state: HttpState, admission: IngressAdmission) -> Router {
@@ -1077,8 +1080,6 @@ pub(crate) async fn create_bucket(Path(_bucket): Path<String>) -> Response {
 }
 
 pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
-    let mut headers = HeaderMap::new();
-    insert_content_type(&mut headers, "application/json");
     let raft_groups = state
         .raft_registry()
         .map(RaftGroupHandleRegistry::metrics_snapshot)
@@ -1095,15 +1096,14 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
     // status-publishing pipeline survives SSM exec failures).
     let rss = state.node_memory.last_rss_bytes();
     let cap = state.node_memory.abort_cap_bytes().unwrap_or_default();
-    if body.ends_with('}') {
-        body.truncate(body.len() - 1);
-        body.push_str(",\"process_rss_bytes\":");
-        body.push_str(&rss.to_string());
-        body.push_str(",\"node_memory_abort_cap_bytes\":");
-        body.push_str(&cap.to_string());
-        body.push('}');
+    if let Some(object) = body.as_object_mut() {
+        object.insert("process_rss_bytes".to_owned(), serde_json::json!(rss));
+        object.insert(
+            "node_memory_abort_cap_bytes".to_owned(),
+            serde_json::json!(cap),
+        );
     }
-    (StatusCode::OK, headers, body).into_response()
+    json_response(StatusCode::OK, body.to_string())
 }
 
 pub(crate) async fn flush_cold_stream(
@@ -1134,19 +1134,14 @@ pub(crate) async fn flush_cold_stream(
         })
         .await
     {
-        Ok(Some(response)) => {
-            let mut headers = HeaderMap::new();
-            insert_content_type(&mut headers, "application/json");
-            (
-                StatusCode::OK,
-                headers,
-                format!(
-                    "{{\"hot_start_offset\":{},\"group_commit_index\":{}}}",
-                    response.hot_start_offset, response.group_commit_index
-                ),
-            )
-                .into_response()
-        }
+        Ok(Some(response)) => json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "hot_start_offset": response.hot_start_offset,
+                "group_commit_index": response.group_commit_index,
+            })
+            .to_string(),
+        ),
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => {
             runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
@@ -1158,18 +1153,9 @@ pub(crate) async fn trigger_raft_snapshot(
     State(state): State<HttpState>,
     Path(raft_group_id): Path<u64>,
 ) -> Response {
-    let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
-    };
-    let Some(raft) = registry.get(raft_group_id) else {
-        return (StatusCode::NOT_FOUND, "raft group is not registered").into_response();
+    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
     };
     let snapshot_log_id = raft.metrics().borrow_watched().last_applied;
     if let Err(err) = raft.trigger().snapshot().await {
@@ -1201,16 +1187,14 @@ pub(crate) async fn trigger_raft_snapshot(
     }
 
     let metrics = raft.metrics().borrow_watched().clone();
-    (
+    json_response(
         StatusCode::OK,
-        [("content-type", "application/json")],
-        format!(
-            "{{\"raft_group_id\":{},\"snapshot_index\":{}}}",
-            raft_group_id.0,
-            optional_u64_json(metrics.snapshot.map(|log_id| log_id.index))
-        ),
+        serde_json::json!({
+            "raft_group_id": raft_group_id.0,
+            "snapshot_index": metrics.snapshot.map(|log_id| log_id.index),
+        })
+        .to_string(),
     )
-        .into_response()
 }
 
 pub(crate) async fn trigger_raft_purge(
@@ -1228,18 +1212,9 @@ pub(crate) async fn trigger_raft_purge(
     else {
         return (StatusCode::BAD_REQUEST, "upto query parameter is required").into_response();
     };
-    let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
-    };
-    let Some(raft) = registry.get(raft_group_id) else {
-        return (StatusCode::NOT_FOUND, "raft group is not registered").into_response();
+    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
     };
     if let Err(err) = raft.trigger().purge_log(upto).await {
         return (
@@ -1263,16 +1238,14 @@ pub(crate) async fn trigger_raft_purge(
             .into_response();
     }
     let metrics = raft.metrics().borrow_watched().clone();
-    (
+    json_response(
         StatusCode::OK,
-        [("content-type", "application/json")],
-        format!(
-            "{{\"raft_group_id\":{},\"purged_index\":{}}}",
-            raft_group_id.0,
-            optional_u64_json(metrics.purged.map(|log_id| log_id.index))
-        ),
+        serde_json::json!({
+            "raft_group_id": raft_group_id.0,
+            "purged_index": metrics.purged.map(|log_id| log_id.index),
+        })
+        .to_string(),
     )
-        .into_response()
 }
 
 pub(crate) async fn add_raft_learner(
@@ -1287,34 +1260,23 @@ pub(crate) async fn add_raft_learner(
     let Some(address) = query.get("addr").filter(|value| !value.trim().is_empty()) else {
         return (StatusCode::BAD_REQUEST, "addr query parameter is required").into_response();
     };
-    let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
-    };
-    let Some(raft) = registry.get(raft_group_id) else {
-        return (StatusCode::NOT_FOUND, "raft group is not registered").into_response();
+    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
     };
     match raft
         .add_learner(node_id, BasicNode::new(address.clone()), true)
         .await
     {
-        Ok(response) => (
+        Ok(response) => json_response(
             StatusCode::OK,
-            [("content-type", "application/json")],
-            format!(
-                "{{\"raft_group_id\":{},\"node_id\":{},\"log_index\":{}}}",
-                raft_group_id.0,
-                node_id,
-                response.log_id.index()
-            ),
-        )
-            .into_response(),
+            serde_json::json!({
+                "raft_group_id": raft_group_id.0,
+                "node_id": node_id,
+                "log_index": response.log_id.index(),
+            })
+            .to_string(),
+        ),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("add raft learner: {err}"),
@@ -1343,49 +1305,35 @@ pub(crate) async fn change_raft_membership(
         Ok(voters) => voters,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
-    let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
-    };
-    let Some(raft) = registry.get(raft_group_id) else {
-        return (StatusCode::NOT_FOUND, "raft group is not registered").into_response();
+    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
     };
     let metrics = raft.metrics().borrow_watched().clone();
     if metrics.current_leader != Some(metrics.id) {
-        return (
+        return json_response(
             StatusCode::CONFLICT,
-            [("content-type", "application/json")],
-            format!(
-                "{{\"raft_group_id\":{},\"current_leader\":{},\"changed\":false,\"reason\":\"not leader\"}}",
-                raft_group_id.0,
-                optional_u64_json(metrics.current_leader)
-            ),
-        )
-            .into_response();
+            serde_json::json!({
+                "raft_group_id": raft_group_id.0,
+                "current_leader": metrics.current_leader,
+                "changed": false,
+                "reason": "not leader",
+            })
+            .to_string(),
+        );
     }
 
     match raft.change_membership(voters.clone(), false).await {
-        Ok(response) => (
+        Ok(response) => json_response(
             StatusCode::OK,
-            [("content-type", "application/json")],
-            format!(
-                "{{\"raft_group_id\":{},\"voter_ids\":[{}],\"log_index\":{},\"changed\":true}}",
-                raft_group_id.0,
-                voters
-                    .iter()
-                    .map(u64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
-                response.log_id.index()
-            ),
-        )
-            .into_response(),
+            serde_json::json!({
+                "raft_group_id": raft_group_id.0,
+                "voter_ids": voters,
+                "log_index": response.log_id.index(),
+                "changed": true,
+            })
+            .to_string(),
+        ),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("change raft membership: {err}"),
@@ -1416,29 +1364,20 @@ pub(crate) async fn allow_raft_node_next_revert(
     State(state): State<HttpState>,
     Path((raft_group_id, node_id)): Path<(u64, u64)>,
 ) -> Response {
-    let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
-    };
-    let Some(raft) = registry.get(raft_group_id) else {
-        return (StatusCode::NOT_FOUND, "raft group is not registered").into_response();
+    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
     };
     match raft.trigger().allow_next_revert(&node_id, true).await {
-        Ok(Ok(())) => (
+        Ok(Ok(())) => json_response(
             StatusCode::OK,
-            [("content-type", "application/json")],
-            format!(
-                "{{\"raft_group_id\":{},\"node_id\":{},\"allow_next_revert\":true}}",
-                raft_group_id.0, node_id
-            ),
-        )
-            .into_response(),
+            serde_json::json!({
+                "raft_group_id": raft_group_id.0,
+                "node_id": node_id,
+                "allow_next_revert": true,
+            })
+            .to_string(),
+        ),
         Ok(Err(err)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("allow raft node next revert: {err}"),
@@ -1456,33 +1395,24 @@ pub(crate) async fn transfer_raft_leader(
     State(state): State<HttpState>,
     Path((raft_group_id, node_id)): Path<(u64, u64)>,
 ) -> Response {
-    let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
-    };
-    let Some(raft) = registry.get(raft_group_id) else {
-        return (StatusCode::NOT_FOUND, "raft group is not registered").into_response();
+    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
     };
     let metrics_before = raft.metrics().borrow_watched().clone();
     let current_leader = metrics_before.current_leader;
     let self_id = metrics_before.id;
     if current_leader != Some(self_id) {
-        return (
+        return json_response(
             StatusCode::CONFLICT,
-            [("content-type", "application/json")],
-            format!(
-                "{{\"raft_group_id\":{},\"current_leader\":{},\"transferred\":false,\"reason\":\"not leader\"}}",
-                raft_group_id.0,
-                optional_u64_json(current_leader)
-            ),
-        )
-            .into_response();
+            serde_json::json!({
+                "raft_group_id": raft_group_id.0,
+                "current_leader": current_leader,
+                "transferred": false,
+                "reason": "not leader",
+            })
+            .to_string(),
+        );
     }
     if node_id == self_id {
         return (
@@ -1509,25 +1439,50 @@ pub(crate) async fn transfer_raft_leader(
         )
             .into_response();
     }
-    (
+    json_response(
         StatusCode::OK,
-        [("content-type", "application/json")],
-        format!(
-            "{{\"raft_group_id\":{},\"from\":{},\"to\":{},\"transferred\":true}}",
-            raft_group_id.0, self_id, node_id
-        ),
+        serde_json::json!({
+            "raft_group_id": raft_group_id.0,
+            "from": self_id,
+            "to": node_id,
+            "transferred": true,
+        })
+        .to_string(),
     )
-        .into_response()
 }
 
 pub(crate) fn parse_raft_group_id(raw: u64) -> Result<RaftGroupId, std::num::TryFromIntError> {
     u32::try_from(raw).map(RaftGroupId)
 }
 
-pub(crate) fn optional_u64_json(value: Option<u64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "null".to_owned())
+/// Resolves the raft registry, parses the group id, and looks up the live group
+/// handle — the preamble shared by every raft admin endpoint. Returns the
+/// appropriate error response (`400`/`404`) when any step fails, so handlers can
+/// `?`-style early-return and focus on their actual operation.
+fn resolve_raft_group(
+    state: &HttpState,
+    raft_group_id: u64,
+) -> Result<(RaftGroupId, RaftGroupHandle), Box<Response>> {
+    let Some(registry) = state.raft_registry() else {
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                "raft registry is not configured for this server",
+            )
+                .into_response(),
+        ));
+    };
+    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
+        return Err(Box::new(
+            (StatusCode::BAD_REQUEST, "invalid raft group id").into_response(),
+        ));
+    };
+    let Some(raft) = registry.get(raft_group_id) else {
+        return Err(Box::new(
+            (StatusCode::NOT_FOUND, "raft group is not registered").into_response(),
+        ));
+    };
+    Ok((raft_group_id, raft))
 }
 
 pub(crate) async fn create_stream(
