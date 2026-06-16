@@ -81,6 +81,7 @@ ursula-shard = { path = "crates/ursula-shard", version = "0.1.5" }
 ursula-stream = { path = "crates/ursula-stream", version = "0.1.5" }
 ursula-observability = { path = "crates/ursula-observability", version = "0.1.5" }
 yaml_serde = "0.10"
+zstd = "0.13"
 
 [workspace.lints.rust]
 unknown_lints = "deny"
