@@ -105,8 +105,16 @@ impl SnapshotInstallCoordinator {
             SnapshotLocation::Local { path, size_bytes } => {
                 format!("{snapshot_id}:local:{}:{size_bytes}", path.display())
             }
-            SnapshotLocation::S3 { key, size_bytes } => {
-                format!("{snapshot_id}:s3:{key}:{size_bytes}")
+            SnapshotLocation::S3 {
+                key,
+                size_bytes,
+                stored_size_bytes,
+                compression,
+            } => {
+                format!(
+                    "{snapshot_id}:s3:{key}:{size_bytes}:{}:{compression:?}",
+                    stored_size_bytes.unwrap_or(*size_bytes)
+                )
             }
         }
     }

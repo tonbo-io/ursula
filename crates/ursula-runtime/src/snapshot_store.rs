@@ -57,7 +57,26 @@ pub enum SnapshotLocation {
     /// Bytes live on the local filesystem at `path` (dev / single-host).
     Local { path: PathBuf, size_bytes: u64 },
     /// Bytes live in an object storage backend at `key` (S3-compatible).
-    S3 { key: String, size_bytes: u64 },
+    S3 {
+        key: String,
+        /// Logical snapshot size after decompression.
+        size_bytes: u64,
+        /// Physical object size in S3. Legacy pointers omit this and use
+        /// `size_bytes` as both logical and physical size.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stored_size_bytes: Option<u64>,
+        /// Compression applied to the S3 object body.
+        #[serde(default)]
+        compression: SnapshotCompression,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotCompression {
+    #[default]
+    None,
+    Zstd,
 }
 
 impl SnapshotLocation {
@@ -66,6 +85,25 @@ impl SnapshotLocation {
             Self::Inline { bytes } => bytes.len() as u64,
             Self::Local { size_bytes, .. } => *size_bytes,
             Self::S3 { size_bytes, .. } => *size_bytes,
+        }
+    }
+
+    pub fn stored_size_hint(&self) -> u64 {
+        match self {
+            Self::Inline { bytes } => bytes.len() as u64,
+            Self::Local { size_bytes, .. } => *size_bytes,
+            Self::S3 {
+                size_bytes,
+                stored_size_bytes,
+                ..
+            } => stored_size_bytes.unwrap_or(*size_bytes),
+        }
+    }
+
+    pub fn compression(&self) -> SnapshotCompression {
+        match self {
+            Self::S3 { compression, .. } => *compression,
+            Self::Inline { .. } | Self::Local { .. } => SnapshotCompression::None,
         }
     }
 }
@@ -244,12 +282,15 @@ mod s3 {
     use opendal::Operator;
     use opendal::Scheme;
 
+    use super::SnapshotCompression;
     use super::SnapshotKey;
     use super::SnapshotLocation;
     use super::SnapshotStore;
     use super::SnapshotStoreError;
     use super::SnapshotStoreFuture;
     use super::unique_snapshot_leaf;
+
+    const S3_SNAPSHOT_ZSTD_LEVEL: i32 = 3;
 
     /// Bytes live in an opendal-managed S3 bucket under `{prefix}/group-{gid}/`.
     pub struct S3SnapshotStore {
@@ -279,6 +320,18 @@ mod s3 {
             let operator = Operator::via_iter(Scheme::Memory, [])
                 .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
             Ok(Self::new(operator, prefix))
+        }
+
+        #[cfg(test)]
+        pub(crate) async fn write_raw_for_tests(
+            &self,
+            key: &str,
+            bytes: Vec<u8>,
+        ) -> Result<(), SnapshotStoreError> {
+            self.operator
+                .write(key, bytes)
+                .await
+                .map_err(|err| SnapshotStoreError::Backend(err.to_string()))
         }
 
         /// Build an S3 snapshot store from a [`ColdConfig`].
@@ -370,13 +423,20 @@ mod s3 {
             Box::pin(async move {
                 let object_key = self.object_key(&key);
                 let size_bytes = bytes.len() as u64;
+                let stored_bytes =
+                    zstd::bulk::compress(&bytes, S3_SNAPSHOT_ZSTD_LEVEL).map_err(|err| {
+                        SnapshotStoreError::Backend(format!("compress s3 snapshot: {err}"))
+                    })?;
+                let stored_size_bytes = stored_bytes.len() as u64;
                 self.operator
-                    .write(&object_key, bytes)
+                    .write(&object_key, stored_bytes)
                     .await
                     .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
                 Ok(SnapshotLocation::S3 {
                     key: object_key,
                     size_bytes,
+                    stored_size_bytes: Some(stored_size_bytes),
+                    compression: SnapshotCompression::Zstd,
                 })
             })
         }
@@ -386,7 +446,10 @@ mod s3 {
             location: &'a SnapshotLocation,
         ) -> SnapshotStoreFuture<'a, Vec<u8>> {
             Box::pin(async move {
-                let SnapshotLocation::S3 { key, size_bytes } = location else {
+                let SnapshotLocation::S3 {
+                    key, size_bytes, ..
+                } = location
+                else {
                     return Err(SnapshotStoreError::Backend(format!(
                         "s3 snapshot store cannot download {location:?}"
                     )));
@@ -398,10 +461,34 @@ mod s3 {
                         SnapshotStoreError::Backend(err.to_string())
                     }
                 })?;
-                let bytes = buf.to_vec();
+                let stored_bytes = buf.to_vec();
+                let expected_stored_size = location.stored_size_hint();
+                if stored_bytes.len() as u64 != expected_stored_size {
+                    return Err(SnapshotStoreError::Integrity(format!(
+                        "s3 snapshot {key} stored size {} != expected {}",
+                        stored_bytes.len(),
+                        expected_stored_size
+                    )));
+                }
+                let bytes = match location.compression() {
+                    SnapshotCompression::None => stored_bytes,
+                    SnapshotCompression::Zstd => zstd::bulk::decompress(
+                        &stored_bytes,
+                        usize::try_from(*size_bytes).map_err(|_| {
+                            SnapshotStoreError::Integrity(format!(
+                                "s3 snapshot {key} logical size {size_bytes} does not fit usize"
+                            ))
+                        })?,
+                    )
+                    .map_err(|err| {
+                        SnapshotStoreError::Integrity(format!(
+                            "decompress s3 snapshot {key}: {err}"
+                        ))
+                    })?,
+                };
                 if bytes.len() as u64 != *size_bytes {
                     return Err(SnapshotStoreError::Integrity(format!(
-                        "s3 snapshot {key} size {} != expected {}",
+                        "s3 snapshot {key} logical size {} != expected {}",
                         bytes.len(),
                         size_bytes
                     )));
@@ -465,7 +552,7 @@ mod s3 {
             location: &'a SnapshotLocation,
         ) -> SnapshotStoreFuture<'a, ()> {
             Box::pin(async move {
-                let SnapshotLocation::S3 { key, size_bytes } = location else {
+                let SnapshotLocation::S3 { key, .. } = location else {
                     return Ok(());
                 };
                 let meta = self.operator.stat(key).await.map_err(|err| {
@@ -478,9 +565,10 @@ mod s3 {
                     }
                 })?;
                 let actual = meta.content_length();
-                if actual != *size_bytes {
+                let expected = location.stored_size_hint();
+                if actual != expected {
                     return Err(SnapshotStoreError::Integrity(format!(
-                        "s3 snapshot {key} size mismatch post-upload: stat={actual} expected={size_bytes}"
+                        "s3 snapshot {key} stored size mismatch post-upload: stat={actual} expected={expected}"
                     )));
                 }
                 Ok(())
@@ -835,19 +923,25 @@ mod tests {
     async fn s3_memory_roundtrip() {
         let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
         let key = test_key(3, "group-3-T5-N2-9876");
-        let loc = store
-            .upload(key, b"raw snapshot bytes".to_vec())
-            .await
-            .unwrap();
+        let payload = b"raw snapshot bytes".repeat(64);
+        let loc = store.upload(key, payload.clone()).await.unwrap();
         match &loc {
-            SnapshotLocation::S3 { key, size_bytes } => {
+            SnapshotLocation::S3 {
+                key,
+                size_bytes,
+                stored_size_bytes,
+                compression,
+            } => {
                 assert!(key.starts_with("snapshots/group-3/"));
-                assert_eq!(*size_bytes, b"raw snapshot bytes".len() as u64);
+                assert_eq!(*size_bytes, payload.len() as u64);
+                assert_eq!(*compression, SnapshotCompression::Zstd);
+                assert!(stored_size_bytes.is_some());
+                assert!(stored_size_bytes.unwrap() < *size_bytes);
             }
             other => panic!("expected S3 location, got {other:?}"),
         }
         let bytes = store.download(&loc).await.unwrap();
-        assert_eq!(bytes, b"raw snapshot bytes");
+        assert_eq!(bytes, payload);
         store.delete(&loc).await.unwrap();
         assert!(matches!(
             store.download(&loc).await,
@@ -855,6 +949,28 @@ mod tests {
         ));
         // Second delete is a no-op.
         store.delete(&loc).await.unwrap();
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_download_accepts_legacy_uncompressed_pointer() {
+        let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
+        let key = test_key(5, "group-5-T1-N1-10");
+        let loc = store.upload(key, b"legacy body".to_vec()).await.unwrap();
+        let SnapshotLocation::S3 { key, .. } = loc else {
+            panic!("expected s3 location")
+        };
+        store
+            .write_raw_for_tests(&key, b"legacy body".to_vec())
+            .await
+            .unwrap();
+        let legacy = SnapshotLocation::S3 {
+            key,
+            size_bytes: b"legacy body".len() as u64,
+            stored_size_bytes: None,
+            compression: SnapshotCompression::None,
+        };
+        assert_eq!(store.download(&legacy).await.unwrap(), b"legacy body");
     }
 
     #[cfg(not(madsim))]

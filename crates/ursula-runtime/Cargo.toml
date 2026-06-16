@@ -20,6 +20,7 @@ tracing = { workspace = true }
 ursula-config = { workspace = true }
 ursula-shard = { workspace = true }
 ursula-stream = { workspace = true }
+zstd = { workspace = true }
 
 [target.'cfg(madsim)'.dependencies]
 sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
