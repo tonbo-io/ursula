@@ -45,8 +45,8 @@ opendal = "0.51"
 opentelemetry = "0.30"
 opentelemetry_sdk = { version = "0.30", features = ["metrics"] }
 opentelemetry-otlp = { version = "0.30", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"] }
-openraft = { version = "0.10.0-alpha.20", default-features = false, features = ["tokio-rt", "type-alias", "serde"] }
-openraft-rt = "0.10.0-alpha.20"
+openraft = { version = "0.10.0-alpha.21", default-features = false, features = ["tokio-rt", "type-alias"] }
+openraft-rt = "0.10.0-alpha.21"
 pin-project-lite = "0.2"
 prost = "0.13"
 prost-build = "0.13"
@@ -81,12 +81,7 @@ ursula-shard = { path = "crates/ursula-shard", version = "0.1.5" }
 ursula-stream = { path = "crates/ursula-stream", version = "0.1.5" }
 ursula-observability = { path = "crates/ursula-observability", version = "0.1.5" }
 yaml_serde = "0.10"
-
-[patch.crates-io]
-openraft = { git = "https://github.com/databendlabs/openraft.git", rev = "13df5b32288b7937a293759264712b5a144987ac" }
-openraft-macros = { git = "https://github.com/databendlabs/openraft.git", rev = "13df5b32288b7937a293759264712b5a144987ac" }
-openraft-rt = { git = "https://github.com/databendlabs/openraft.git", rev = "13df5b32288b7937a293759264712b5a144987ac" }
-openraft-rt-tokio = { git = "https://github.com/databendlabs/openraft.git", rev = "13df5b32288b7937a293759264712b5a144987ac" }
+zstd = "0.13"
 
 [workspace.lints.rust]
 unknown_lints = "deny"
