@@ -782,6 +782,12 @@ impl fmt::Display for LeadershipShedState {
     }
 }
 
+/// Owned handle to a single Raft group's [`Raft`] instance, as stored in the
+/// [`RaftGroupHandleRegistry`]. Spelled out as a type alias so callers (e.g. the
+/// HTTP admin handlers) can name it without repeating the full type-config
+/// generics.
+pub type RaftGroupHandle = Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>;
+
 #[derive(Debug, Clone)]
 pub struct RaftGroupHandleRegistry {
     groups: Arc<Mutex<BTreeMap<u32, Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>>>>,
@@ -831,10 +837,7 @@ impl RaftGroupHandleRegistry {
             .insert(placement.raft_group_id.0, raft);
     }
 
-    pub fn get(
-        &self,
-        raft_group_id: RaftGroupId,
-    ) -> Option<Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>> {
+    pub fn get(&self, raft_group_id: RaftGroupId) -> Option<RaftGroupHandle> {
         self.groups
             .lock()
             .expect("raft group handle registry mutex")

@@ -67,6 +67,7 @@ pub use registry::InProcessRaftRpcKind;
 pub use registry::LeadershipShedFlag;
 pub use registry::LeadershipShedReason;
 pub use registry::LeadershipShedState;
+pub use registry::RaftGroupHandle;
 pub use registry::RaftGroupHandleRegistry;
 pub use registry::SingleNodeRaftNetwork;
 pub use registry::SingleNodeRaftNetworkFactory;
