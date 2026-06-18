@@ -264,6 +264,52 @@ class ChaosAgentStateTest(unittest.TestCase):
             self.assertEqual(workload_stream.pending_producer_appends, {})
         self.assertEqual(agent.events[-1][0], "warn")
 
+    def test_pending_integrity_resync_blocks_verifier_until_resynced(self) -> None:
+        agent = object.__new__(ChaosAgent)
+        agent.nodes = [Node("n1", "i-1", "http://n1:4491")]
+        agent.state_lock = threading.Lock()
+        agent.events = deque()
+        agent.event = lambda level, message: agent.events.append((level, message))
+        agent.global_unresolved_append = False
+        agent.lane_unresolved_appends = []
+        stream = WorkloadStream("run-test-0001", next_offset=40)
+        stream.needs_integrity_resync = True
+        agent.streams = [stream]
+        agent.producer_probe_stream = WorkloadStream("run-test-producer-probe")
+        server_setsum = Setsum()
+        server_setsum.insert_vectored([b"server"])
+        responses = [
+            (0, b"timeout", {}),
+            (
+                200,
+                b"",
+                {
+                    "stream-next-offset": "80",
+                    "stream-integrity-total-records": "8",
+                    "stream-integrity-total-setsum": server_setsum.hexdigest(),
+                },
+            ),
+        ]
+
+        def request(method, url, **kwargs):
+            return responses.pop(0)
+
+        agent.request = request
+
+        self.assertTrue(agent.has_unknown_appends_locked())
+
+        agent.retry_pending_integrity_resyncs()
+
+        self.assertTrue(stream.needs_integrity_resync)
+        self.assertTrue(agent.has_unknown_appends_locked())
+
+        agent.retry_pending_integrity_resyncs()
+
+        self.assertFalse(stream.needs_integrity_resync)
+        self.assertFalse(agent.has_unknown_appends_locked())
+        self.assertEqual(stream.next_offset, 80)
+        self.assertEqual(stream.expected_live_setsum.hexdigest(), server_setsum.hexdigest())
+
 
 if __name__ == "__main__":
     unittest.main()
