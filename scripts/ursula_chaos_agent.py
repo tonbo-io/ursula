@@ -365,6 +365,7 @@ class WorkloadStream:
     name: str
     next_offset: int = 0
     verified_offsets: int = 0
+    needs_integrity_resync: bool = False
     expected_live_setsum: Setsum | None = None
     producer_epochs: dict[str, int] | None = None
     producer_seqs: dict[str, int] | None = None
@@ -670,6 +671,7 @@ class ChaosAgent:
         with self.state_lock:
             stream.next_offset = next_offset
             stream.expected_live_setsum = expected_setsum
+            stream.needs_integrity_resync = False
             stream.pending_producer_appends.clear()
             stream.verified_offsets = min(stream.verified_offsets, next_offset)
         return True
@@ -973,7 +975,9 @@ class ChaosAgent:
                         f"resyncing expected setsum for {stream_name}: "
                         f"ambiguous {resync_reason} span={span} payload_len={len(payload)}",
                     )
-                    self.resync_stream_from_server(stream)
+                    if not self.resync_stream_from_server(stream):
+                        with self.state_lock:
+                            stream.needs_integrity_resync = True
                 return True
             if (
                 not retryable_sweep
@@ -1127,6 +1131,7 @@ class ChaosAgent:
     def verify_integrity(self) -> None:
         if self.workload_probes_paused():
             return
+        self.retry_pending_integrity_resyncs()
         with self.state_lock:
             has_unknown_appends = self.has_unknown_appends_locked()
         if has_unknown_appends:
@@ -1304,7 +1309,9 @@ class ChaosAgent:
                 f"resyncing expected setsum for {stream.name}: "
                 f"ambiguous producer probe span={span} payload_len={len(payload)}",
             )
-            self.resync_stream_from_server(stream)
+            if not self.resync_stream_from_server(stream):
+                with self.state_lock:
+                    stream.needs_integrity_resync = True
 
         status, _, headers = self.request(
             "POST",
@@ -1336,7 +1343,9 @@ class ChaosAgent:
                     f"resyncing expected setsum for {stream.name}: "
                     f"ambiguous producer duplicate span={span} payload_len={len(payload)}",
                 )
-                self.resync_stream_from_server(stream)
+                if not self.resync_stream_from_server(stream):
+                    with self.state_lock:
+                        stream.needs_integrity_resync = True
             self.record_producer_probe_skipped(
                 f"producer duplicate_seq probe skipped (state lost): "
                 f"status={status} next_offset={duplicate_next} expected={next_offset}"
@@ -1387,7 +1396,19 @@ class ChaosAgent:
             self.global_unresolved_append
             or any(self.lane_unresolved_appends)
             or any(stream.pending_producer_appends for stream in self.streams)
+            or any(stream.needs_integrity_resync for stream in self.streams)
+            or self.producer_probe_stream.needs_integrity_resync
         )
+
+    def retry_pending_integrity_resyncs(self) -> None:
+        with self.state_lock:
+            streams = [
+                stream
+                for stream in [*self.streams, self.producer_probe_stream]
+                if stream.needs_integrity_resync
+            ]
+        for stream in streams:
+            self.resync_stream_from_server(stream)
 
     def verify_server_integrity(self, stream: WorkloadStream) -> str:
         with self.state_lock:
