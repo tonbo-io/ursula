@@ -505,7 +505,7 @@ function eventLevelClass(level: string) {
   }
 }
 
-type BandState = "met" | "missed" | "active";
+type BandState = "recovered" | "missed" | "active";
 type InjectionBand = {
   id: number;
   scenario: string | null;
@@ -515,8 +515,8 @@ type InjectionBand = {
 };
 
 function injectionBandState(injection: ChaosInjection): BandState {
-  if (injection.slo_met === true) return "met";
   if (injection.slo_met === false) return "missed";
+  if (injection.recovered_at || injection.status === "recovered") return "recovered";
   return "active";
 }
 
@@ -1369,6 +1369,7 @@ function StatusPage() {
                         {inj.scenario.replace(/_/g, " ")}
                       </span>
                     ) : null}
+                    <span className="activity-band-chip-state">{state}</span>
                   </button>
                 );
               })}

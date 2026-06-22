@@ -837,7 +837,7 @@ button {
   transition: opacity 120ms ease;
 }
 
-.activity-band-met {
+.activity-band-recovered {
   fill: rgba(184, 187, 38, 0.10);
 }
 
@@ -938,7 +938,7 @@ button {
   color: var(--text-muted);
 }
 
-.activity-band-chip-met {
+.activity-band-chip-recovered {
   border-bottom-color: rgba(184, 187, 38, 0.55);
 }
 
@@ -950,6 +950,11 @@ button {
 .activity-band-chip-active {
   border-bottom-color: rgba(250, 189, 47, 0.65);
   color: #fabd2f;
+}
+
+.activity-band-chip-state {
+  color: var(--text-muted);
+  font-size: 11px;
 }
 
 .activity-band-chip-selected {
