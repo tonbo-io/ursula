@@ -96,6 +96,21 @@ type ChaosInjection = {
   }>;
 };
 
+const ACTIVE_INJECTION_STATUSES = new Set([
+  "stopping",
+  "injected",
+  "stopped",
+  "starting",
+  "clear_failed",
+  "repairing",
+  "repair_clear_failed",
+]);
+
+function isActiveInjection(injection: ChaosInjection): boolean {
+  if (injection.recovered_at) return false;
+  return ACTIVE_INJECTION_STATUSES.has(injection.status ?? "");
+}
+
 type ChaosCoverage = {
   scenario_count?: number;
   configured_count?: number;
@@ -1033,7 +1048,7 @@ function StatusPage() {
     [allInjections, selectedInjectionId],
   );
   const activeInjection = useMemo(
-    () => allInjections.find((inj) => inj.status && inj.status !== "recovered") ?? null,
+    () => allInjections.find(isActiveInjection) ?? null,
     [allInjections],
   );
   const defaultDetailInjection =
