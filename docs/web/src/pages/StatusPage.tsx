@@ -105,6 +105,7 @@ const ACTIVE_INJECTION_STATUSES = new Set([
   "repairing",
   "repair_clear_failed",
 ]);
+const ACTIVITY_WINDOW_MS = 30 * 60 * 1000;
 
 function isActiveInjection(injection: ChaosInjection): boolean {
   if (injection.recovered_at) return false;
@@ -1019,7 +1020,15 @@ function StatusPage() {
     () => bucketHistory(status?.history ?? [], HEALTH_BUCKET_MS, HEALTH_BUCKET_COUNT, now),
     [status, now],
   );
-  const rateSamples = useMemo(() => appendRateSamples(status?.history ?? []).slice(-80), [status]);
+  const rateSamples = useMemo(() => {
+    const samples = appendRateSamples(status?.history ?? []);
+    const cutoff = now - ACTIVITY_WINDOW_MS;
+    const recent = samples.filter((sample) => {
+      const time = new Date(sample.time).getTime();
+      return Number.isFinite(time) && time >= cutoff;
+    });
+    return (recent.length >= 2 ? recent : samples).slice(-80);
+  }, [status, now]);
   const currentAppendRate = useMemo(() => {
     const delta = status?.health?.append_success_delta;
     if (typeof delta !== "number") return null;
