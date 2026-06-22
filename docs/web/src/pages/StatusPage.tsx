@@ -1051,8 +1051,7 @@ function StatusPage() {
     () => allInjections.find(isActiveInjection) ?? null,
     [allInjections],
   );
-  const defaultDetailInjection =
-    selectedInjection ?? activeInjection ?? windowInjections[windowInjections.length - 1] ?? null;
+  const defaultDetailInjection = selectedInjection ?? activeInjection;
   const integrityMark = useMemo(() => {
     const checked = status?.integrity.checked_at;
     if (!checked) return null;
