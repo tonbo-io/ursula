@@ -289,6 +289,7 @@ impl StaticGrpcTestNode {
 struct StaticGrpcTestNodeStorage {
     raft_log_dir: Option<PathBuf>,
     cold_store: Option<ColdStoreHandle>,
+    engine_config: Option<ursula_raft::RaftEngineConfig>,
     per_group_initializers: bool,
     per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
 }
@@ -332,6 +333,7 @@ async fn spawn_static_grpc_test_node_with_log_dir(
         StaticGrpcTestNodeStorage {
             raft_log_dir,
             cold_store: None,
+            engine_config: None,
             per_group_initializers: false,
             per_group_voters: BTreeMap::new(),
         },
@@ -357,6 +359,7 @@ async fn spawn_static_grpc_test_node_with_per_group_initializers(
         StaticGrpcTestNodeStorage {
             raft_log_dir: None,
             cold_store: None,
+            engine_config: None,
             per_group_initializers: true,
             per_group_voters: BTreeMap::new(),
         },
@@ -385,6 +388,9 @@ async fn spawn_static_grpc_test_node_with_storage(
     factory = factory.with_per_group_membership_initializers(storage.per_group_initializers);
     factory = factory.with_per_group_voters(storage.per_group_voters.clone());
     factory = factory.with_cold_store(storage.cold_store.clone());
+    if let Some(engine_config) = storage.engine_config {
+        factory = factory.with_engine_config(engine_config);
+    }
     if let Some(raft_log_dir) = storage.raft_log_dir {
         factory = factory.with_raft_log_dir(raft_log_dir);
     }
@@ -2914,7 +2920,7 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
             .expect("warm node groups");
     }
 
-    for raw_group_id in 0..6 {
+    for raw_group_id in 0u32..6 {
         let expected_leader = u64::from(raw_group_id % 3) + 1;
         let raft_group_id = RaftGroupId(raw_group_id);
         for node in &nodes {
@@ -2965,6 +2971,7 @@ async fn static_grpc_per_group_voters_create_distinct_initial_memberships() {
                 StaticGrpcTestNodeStorage {
                     raft_log_dir: None,
                     cold_store: None,
+                    engine_config: None,
                     per_group_initializers: true,
                     per_group_voters: group_voters.clone(),
                 },
@@ -3056,6 +3063,7 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
                 StaticGrpcTestNodeStorage {
                     raft_log_dir: None,
                     cold_store: None,
+                    engine_config: None,
                     per_group_initializers: true,
                     per_group_voters: group_voters.clone(),
                 },
@@ -3469,7 +3477,7 @@ async fn static_grpc_memory_node_rejoins_all_groups_after_allowed_log_revert() {
         .expect("warm leader groups timed out")
         .expect("warm leader groups");
 
-    for raw_group_id in 0..6 {
+    for raw_group_id in 0u32..6 {
         let expected_leader = u64::from(raw_group_id % 3) + 1;
         for node in &nodes {
             let raft = node
@@ -3692,6 +3700,148 @@ async fn static_grpc_memory_node_rejoins_all_groups_after_allowed_log_revert() {
 
     nodes.push(restarted);
     for node in nodes {
+        node.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn static_grpc_memory_restart_with_bootstrap_marker_reinitializes_group() {
+    let marker_dir = tempfile::tempdir().expect("marker dir");
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    let mut addrs = Vec::new();
+    for node_id in 1..=3u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        peers.push((node_id, format!("http://{addr}")));
+        addrs.push(addr);
+        listeners.push(listener);
+    }
+
+    let engine_config = ursula_raft::RaftEngineConfig {
+        memory_bootstrap_marker_dir: Some(marker_dir.path().to_path_buf()),
+        rejoin_probe: Duration::from_millis(100),
+        bootstrap_peer_probe: Duration::from_millis(100),
+        bootstrap_peer_probe_interval: Duration::from_millis(20),
+        bootstrap_peer_connect: Duration::from_millis(20),
+        ..Default::default()
+    };
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        nodes.push(
+            spawn_static_grpc_test_node_with_storage(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                true,
+                6,
+                StaticGrpcTestNodeStorage {
+                    raft_log_dir: None,
+                    cold_store: None,
+                    engine_config: Some(engine_config.clone()),
+                    per_group_initializers: true,
+                    per_group_voters: BTreeMap::new(),
+                },
+            )
+            .await,
+        );
+    }
+
+    for node in &nodes {
+        tokio::time::timeout(Duration::from_secs(10), node.runtime.warm_all_groups())
+            .await
+            .expect("initial warm_all_groups timed out")
+            .expect("initial warm_all_groups");
+    }
+    let group_0_marker = marker_dir.path().join("node-1-group-0.bootstrapped");
+    for _ in 0..50 {
+        if group_0_marker.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        group_0_marker.exists(),
+        "bootstrap wrote marker {}",
+        group_0_marker.display()
+    );
+    for node in nodes {
+        node.shutdown().await;
+    }
+
+    let mut restarted_nodes = Vec::new();
+    for (index, addr) in addrs.iter().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("rebind listener");
+        restarted_nodes.push(
+            spawn_static_grpc_test_node_with_storage(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                true,
+                6,
+                StaticGrpcTestNodeStorage {
+                    raft_log_dir: None,
+                    cold_store: None,
+                    engine_config: Some(engine_config.clone()),
+                    per_group_initializers: true,
+                    per_group_voters: BTreeMap::new(),
+                },
+            )
+            .await,
+        );
+    }
+    for (index, node) in restarted_nodes.iter().enumerate() {
+        tokio::time::timeout(Duration::from_secs(10), node.runtime.warm_all_groups())
+            .await
+            .unwrap_or_else(|_| panic!("restart warm_all_groups timed out for node {index}"))
+            .expect("restart warm_all_groups");
+    }
+
+    let group_0 = restarted_nodes[0]
+        .registry
+        .get(RaftGroupId(0))
+        .expect("registered group 0");
+    group_0
+        .wait(Some(Duration::from_secs(10)))
+        .current_leader(
+            1,
+            "marker-backed full memory restart should reinitialize group 0",
+        )
+        .await
+        .expect("wait for group 0 leadership after restart");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build reqwest client");
+    let stream_id = (0..10_000)
+        .map(|candidate| BucketStreamId::new("benchcmp", format!("stale-marker-{candidate}")))
+        .find(|stream_id| {
+            restarted_nodes[0].runtime.locate(stream_id).raft_group_id == RaftGroupId(0)
+        })
+        .expect("found stream for group 0");
+    let create = client
+        .put(format!("{}/{}", peers[0].1, stream_id))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body("after-restart")
+        .send()
+        .await
+        .expect("send create through reinitialized group");
+    assert_eq!(
+        create.status(),
+        StatusCode::CREATED,
+        "reinitialized group should be externally writable"
+    );
+
+    for node in restarted_nodes {
         node.shutdown().await;
     }
 }
@@ -4165,6 +4315,7 @@ async fn static_grpc_raft_durable_cold_flush_replicates_manifest() {
                 StaticGrpcTestNodeStorage {
                     raft_log_dir: Some(node_root),
                     cold_store: Some(cold_store.clone()),
+                    engine_config: None,
                     per_group_initializers: false,
                     per_group_voters: BTreeMap::new(),
                 },

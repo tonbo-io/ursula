@@ -17,7 +17,10 @@ use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
+use crossbeam_utils::CachePadded;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -31,11 +34,14 @@ pub struct SnapshotKey {
     pub snapshot_id: String,
 }
 
-impl SnapshotKey {
-    /// Canonical leaf filename for filesystem / object key derivation.
-    pub fn filename(&self) -> String {
-        format!("{}.snap", self.snapshot_id)
-    }
+fn unique_snapshot_leaf(snapshot_id: &str) -> String {
+    static COUNTER: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+    let nonce_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let nonce_seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{snapshot_id}-{nonce_nanos:032}-{nonce_seq:020}.snap")
 }
 
 /// Where a snapshot blob lives. Carried in [`SnapshotPointer`] over openraft.
@@ -157,6 +163,20 @@ pub trait SnapshotStore: Send + Sync + Debug {
     /// Best-effort delete; missing is not an error.
     fn delete<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()>;
 
+    /// Best-effort prune of retired snapshots for one Raft group. Backends
+    /// with an external namespace should derive retired objects by listing the
+    /// group's snapshot prefix and keep the published `current` object plus
+    /// `retain_latest` older objects. Inline snapshots have no external
+    /// lifecycle, so the default is a no-op.
+    fn prune_retired<'a>(
+        &'a self,
+        _raft_group_id: u32,
+        _current: &'a SnapshotLocation,
+        _retain_latest: usize,
+    ) -> SnapshotStoreFuture<'a, ()> {
+        Box::pin(async move { Ok(()) })
+    }
+
     /// Lightweight liveness probe for the backend, used by the snapshot driver
     /// to detect local S3 loss WITHOUT triggering a `build_snapshot` (whose
     /// failure openraft treats as fatal). The default is "always healthy":
@@ -229,6 +249,7 @@ mod s3 {
     use super::SnapshotStore;
     use super::SnapshotStoreError;
     use super::SnapshotStoreFuture;
+    use super::unique_snapshot_leaf;
 
     /// Bytes live in an opendal-managed S3 bucket under `{prefix}/group-{gid}/`.
     pub struct S3SnapshotStore {
@@ -327,23 +348,16 @@ mod s3 {
         /// S3 key unique per upload attempt without changing the openraft-visible
         /// snapshot_id.
         fn object_key(&self, key: &SnapshotKey) -> String {
-            use std::sync::atomic::AtomicU64;
-            use std::sync::atomic::Ordering;
-
-            use crossbeam_utils::CachePadded;
-            // Keep the nonce counter isolated from unrelated statics. Snapshot
-            // uploads are low frequency, so this is a defensive false-sharing
-            // guard rather than a fix for contention on the counter itself.
-            static COUNTER: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
-            let nonce_nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let nonce_seq = COUNTER.fetch_add(1, Ordering::Relaxed);
             format!(
-                "{}/group-{}/{}-{nonce_nanos:032}-{nonce_seq:020}.snap",
-                self.prefix, key.raft_group_id, key.snapshot_id,
+                "{}/group-{}/{}",
+                self.prefix,
+                key.raft_group_id,
+                unique_snapshot_leaf(&key.snapshot_id),
             )
+        }
+
+        fn group_prefix(&self, raft_group_id: u32) -> String {
+            format!("{}/group-{raft_group_id}/", self.prefix)
         }
     }
 
@@ -406,6 +420,43 @@ mod s3 {
                     Err(err) if matches!(err.kind(), opendal::ErrorKind::NotFound) => Ok(()),
                     Err(err) => Err(SnapshotStoreError::Backend(err.to_string())),
                 }
+            })
+        }
+
+        fn prune_retired<'a>(
+            &'a self,
+            raft_group_id: u32,
+            current: &'a SnapshotLocation,
+            retain_latest: usize,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            Box::pin(async move {
+                let SnapshotLocation::S3 {
+                    key: current_key, ..
+                } = current
+                else {
+                    return Ok(());
+                };
+                let prefix = self.group_prefix(raft_group_id);
+                let mut keys = self
+                    .operator
+                    .list(&prefix)
+                    .await
+                    .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?
+                    .into_iter()
+                    .filter(|entry| entry.metadata().is_file())
+                    .map(|entry| entry.path().to_owned())
+                    .filter(|key| key.ends_with(".snap") && key != current_key)
+                    .collect::<Vec<_>>();
+                keys.sort();
+                let delete_count = keys.len().saturating_sub(retain_latest);
+                for key in keys.into_iter().take(delete_count) {
+                    match self.operator.delete(&key).await {
+                        Ok(()) => {}
+                        Err(err) if matches!(err.kind(), opendal::ErrorKind::NotFound) => {}
+                        Err(err) => return Err(SnapshotStoreError::Backend(err.to_string())),
+                    }
+                }
+                Ok(())
             })
         }
 
@@ -504,6 +555,7 @@ mod local {
     use super::SnapshotStore;
     use super::SnapshotStoreError;
     use super::SnapshotStoreFuture;
+    use super::unique_snapshot_leaf;
 
     /// Bytes live on the local filesystem under a root directory.
     #[derive(Debug, Clone)]
@@ -519,7 +571,11 @@ mod local {
         fn path_for(&self, key: SnapshotKey) -> PathBuf {
             self.root
                 .join(format!("group-{}", key.raft_group_id))
-                .join(key.filename())
+                .join(unique_snapshot_leaf(&key.snapshot_id))
+        }
+
+        fn group_dir(&self, raft_group_id: u32) -> PathBuf {
+            self.root.join(format!("group-{raft_group_id}"))
         }
     }
 
@@ -582,6 +638,52 @@ mod local {
                     Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
                     Err(err) => Err(SnapshotStoreError::Io(err)),
                 }
+            })
+        }
+
+        fn prune_retired<'a>(
+            &'a self,
+            raft_group_id: u32,
+            current: &'a SnapshotLocation,
+            retain_latest: usize,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            Box::pin(async move {
+                let SnapshotLocation::Local {
+                    path: current_path, ..
+                } = current
+                else {
+                    return Ok(());
+                };
+                let dir = self.group_dir(raft_group_id);
+                let mut read_dir = match tokio::fs::read_dir(&dir).await {
+                    Ok(read_dir) => read_dir,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Err(err) => return Err(SnapshotStoreError::Io(err)),
+                };
+                let mut paths = Vec::new();
+                while let Some(entry) = read_dir
+                    .next_entry()
+                    .await
+                    .map_err(SnapshotStoreError::Io)?
+                {
+                    let path = entry.path();
+                    if path == *current_path {
+                        continue;
+                    }
+                    if path.extension().and_then(|ext| ext.to_str()) == Some("snap") {
+                        paths.push(path);
+                    }
+                }
+                paths.sort();
+                let delete_count = paths.len().saturating_sub(retain_latest);
+                for path in paths.into_iter().take(delete_count) {
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(SnapshotStoreError::Io(err)),
+                    }
+                }
+                Ok(())
             })
         }
     }
@@ -674,6 +776,58 @@ mod tests {
         assert!(matches!(again, Err(SnapshotStoreError::NotFound(_))));
         // Second delete is a no-op.
         store.delete(&loc).await.unwrap();
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn local_two_uploads_with_same_snapshot_id_get_different_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalSnapshotStore::new(dir.path());
+        let key1 = test_key(4, "group-4-T18-N3-264150");
+        let key2 = test_key(4, "group-4-T18-N3-264150");
+        let loc1 = store.upload(key1, b"body1".to_vec()).await.unwrap();
+        let loc2 = store.upload(key2, b"body2".to_vec()).await.unwrap();
+        let (path1, path2) = match (&loc1, &loc2) {
+            (
+                SnapshotLocation::Local { path: path1, .. },
+                SnapshotLocation::Local { path: path2, .. },
+            ) => (path1.clone(), path2.clone()),
+            _ => panic!("expected local locations"),
+        };
+        assert_ne!(
+            path1, path2,
+            "same snapshot_id must yield distinct local paths"
+        );
+        assert_eq!(store.download(&loc1).await.unwrap(), b"body1");
+        assert_eq!(store.download(&loc2).await.unwrap(), b"body2");
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn local_prune_retired_keeps_current_and_latest_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalSnapshotStore::new(dir.path());
+        let loc1 = store
+            .upload(test_key(7, "group-7-T1-N1-1"), b"one".to_vec())
+            .await
+            .unwrap();
+        let loc2 = store
+            .upload(test_key(7, "group-7-T1-N1-2"), b"two".to_vec())
+            .await
+            .unwrap();
+        let loc3 = store
+            .upload(test_key(7, "group-7-T1-N1-3"), b"three".to_vec())
+            .await
+            .unwrap();
+
+        store.prune_retired(7, &loc3, 1).await.unwrap();
+
+        assert!(matches!(
+            store.download(&loc1).await,
+            Err(SnapshotStoreError::NotFound(_))
+        ));
+        assert_eq!(store.download(&loc2).await.unwrap(), b"two");
+        assert_eq!(store.download(&loc3).await.unwrap(), b"three");
     }
 
     #[cfg(not(madsim))]
