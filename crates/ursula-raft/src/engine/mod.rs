@@ -9,6 +9,7 @@ use std::time::Duration;
 pub use factory::ColdRaftGroupEngineFactory;
 pub use factory::DurableRaftGroupEngineFactory;
 pub use factory::DurableRaftLogStoreFactory;
+pub use factory::RaftEngineConfig;
 pub use factory::RaftGroupEngineFactory;
 pub use factory::RegisteredRaftGroupEngineFactory;
 pub use factory::StaticGrpcRaftGroupEngineFactory;
@@ -33,6 +34,7 @@ use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::DeleteSnapshotRequest;
 use ursula_runtime::DeleteStreamRequest;
 use ursula_runtime::FlushColdRequest;
+use ursula_runtime::GetStreamAttrsRequest;
 use ursula_runtime::GroupAckColdGcFuture;
 use ursula_runtime::GroupAppendBatchFuture;
 use ursula_runtime::GroupAppendFuture;
@@ -47,6 +49,7 @@ use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::GroupFlushColdFuture;
 use ursula_runtime::GroupForkRefFuture;
+use ursula_runtime::GroupGetStreamAttrsFuture;
 use ursula_runtime::GroupHeadStreamFuture;
 use ursula_runtime::GroupInstallSnapshotFuture;
 use ursula_runtime::GroupPlanColdFlushFuture;
@@ -61,6 +64,7 @@ use ursula_runtime::GroupReadStreamPartsFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
+use ursula_runtime::GroupUpdateStreamAttrsFuture;
 use ursula_runtime::GroupWriteBatchFuture;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
@@ -73,6 +77,7 @@ use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::StreamErrorCode;
 use ursula_runtime::TouchStreamAccessResponse;
+use ursula_runtime::UpdateStreamAttrsRequest;
 use ursula_runtime::default_snapshot_store;
 use ursula_runtime::write_cold_chunk_index_pages;
 use ursula_runtime::write_external_segment_index_pages;
@@ -80,6 +85,7 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 
 use crate::codec::group_write_result_from_raft_response;
+use crate::forward::forward_get_stream_attrs_to_leader;
 use crate::forward::forward_head_stream_to_leader;
 use crate::forward::forward_read_stream_to_leader;
 use crate::forward::group_engine_client_write_error;
@@ -656,6 +662,32 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
+    fn get_stream_attrs<'a>(
+        &'a mut self,
+        request: GetStreamAttrsRequest,
+        placement: ShardPlacement,
+    ) -> GroupGetStreamAttrsFuture<'a> {
+        Box::pin(async move {
+            if !self.raft.is_leader()
+                && let Some(leader_node) = self.current_leader_node().await
+            {
+                return forward_get_stream_attrs_to_leader(placement, &leader_node, request).await;
+            }
+            self.require_local_leader_for_read("get_stream_attrs")
+                .await?;
+            self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
+                .await?;
+            self.with_state_machine(move |state_machine| {
+                Box::pin(async move {
+                    state_machine
+                        .engine
+                        .get_stream_attrs_after_access(&request, placement)
+                })
+            })
+            .await?
+        })
+    }
+
     fn read_stream<'a>(
         &'a mut self,
         request: ReadStreamRequest,
@@ -825,6 +857,30 @@ impl GroupEngine for RaftGroupEngine {
                 GroupWriteResponse::TouchStreamAccess(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
                     "unexpected touch stream access write response: {other:?}"
+                ))),
+            }
+        })
+    }
+
+    fn update_stream_attrs<'a>(
+        &'a mut self,
+        request: UpdateStreamAttrsRequest,
+        _placement: ShardPlacement,
+    ) -> GroupUpdateStreamAttrsFuture<'a> {
+        Box::pin(async move {
+            let command = GroupWriteCommand::from(request.clone());
+            if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
+                return match response {
+                    GroupWriteResponse::UpdateStreamAttrs(response) => Ok(response),
+                    other => Err(GroupEngineError::new(format!(
+                        "unexpected update stream attrs write response: {other:?}"
+                    ))),
+                };
+            }
+            match self.write(GroupWriteCommand::from(request)).await? {
+                GroupWriteResponse::UpdateStreamAttrs(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected update stream attrs write response: {other:?}"
                 ))),
             }
         })

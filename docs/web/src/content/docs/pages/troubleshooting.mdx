@@ -25,33 +25,27 @@ Ursula does **not** expose `/healthz`, `/readyz`, Prometheus `/metrics`, or `/cl
 
 ## Startup failures
 
-### `--storage-backend memory does not accept --disk-path`
+### `raft.wal.path is required when WAL backend is 'disk'`
 
-`--disk-path` selects disk storage when `--storage-backend` is omitted. Do not pass it with `--storage-backend memory`.
+Set `raft.wal.path` when `raft.wal.backend = "disk"`. Use `raft.wal.backend = "memory"` for volatile tests.
 
-### `static gRPC Raft does not support legacy --wal-dir`
+### `raft.node_id must be non-zero`
 
-The hidden legacy `--wal-dir` flag selects the standalone WAL runtime. Cluster mode needs `--storage-backend disk --disk-path DIR` or `--storage-backend memory`.
+Static Raft mode requires a unique `raft.node_id` in the config file or a `--node-id` override.
 
-Legacy storage flags are compatibility-only and will be removed in a future 0.1.x cleanup.
+### `raft.peers` must include this node id
 
-### `static gRPC Raft requires --raft-node-id` / `--raft-peer ID=URL`
+The local `raft.node_id` must appear in `[[raft.peers]]`. The peer list always includes self.
 
-Any of `--raft-node-id`, `--raft-peer`, `--raft-init-membership`, or `--raft-cluster-config` flips Ursula to static gRPC mode and requires the full peer list plus local node ID. Use `--raft-cluster-config FILE` to avoid repeating peer lines on every host.
+### `storage.cold.s3.bucket is required when cold backend is 's3'`
 
-### `--raft-peer must include this node id N`
-
-The local `--raft-node-id` must appear in the peer list. The peer list always includes self.
-
-### `URSULA_COLD_S3_BUCKET is required when URSULA_COLD_BACKEND=s3`
-
-Leave `URSULA_COLD_BACKEND` unset if you don't want cold storage.
+Set `storage.cold.s3.bucket`, or set `storage.cold.backend = "none"` if you don't want cold storage.
 
 ### Port already in use
 
-`--listen` is taken. Public HTTP and inter-node gRPC share the same port.
+`server.listen` is taken. Public HTTP and inter-node gRPC share the same port unless `server.cluster_listen` is configured separately.
 
-### I/O error on `--disk-path`
+### I/O error on `raft.wal.path`
 
 The directory must be writable. No lock file to clear, Ursula trusts the directory.
 
@@ -61,21 +55,21 @@ The directory must be writable. No lock file to clear, Ursula trusts the directo
 
 `/__ursula/metrics` on each node should show non-zero `leader_id` and a stable `current_term`. If groups stay leaderless:
 
-- First start must include `--raft-init-membership-per-group` (or `--raft-init-membership`) on every voting node.
+- First start must include `raft.init_membership_per_group = true` (or `raft.init_membership = true`) on every voting node.
 - Every peer URL must be reachable from every node.
-- All peers must use the same storage mode. Mismatch causes silent join failures.
+- All peers must use the same `raft.wal.backend` mode. Mismatch causes silent join failures.
 
 ### Replacing or restarting a node leaves it leaderless
 
-Restart with the **same** `--raft-node-id` and `--raft-cluster-config`. A fresh storage directory means rehydrating from peers, which can be slow on cold-storage-only history.
+Restart with the **same** `raft.node_id` and peer list. A fresh `raft.wal.path` means rehydrating from peers, which can be slow on cold-storage-only history.
 
 ## Write path
 
 ### `503` with `Retry-After` on append
 
-Cold-write backpressure for that group. Either the hot ring exceeds `URSULA_COLD_MAX_HOT_BYTES_PER_GROUP` (cold flush isn't keeping up), or the cold backend is slow or erroring out.
+Cold-write backpressure for that group. Either the hot ring exceeds `storage.cold.max_hot_size_per_group` (cold flush isn't keeping up), or the cold backend is slow or erroring out.
 
-Raise the per-group ceiling, lower `URSULA_COLD_FLUSH_INTERVAL_MS`, raise `URSULA_COLD_FLUSH_MAX_CONCURRENCY`, or fix the cold backend.
+Raise the per-group ceiling, lower `storage.cold.flush_interval`, raise `storage.cold.flush_max_concurrency`, or fix the cold backend.
 
 ### `409 Conflict` with `producer-expected-seq` / `producer-received-seq`
 
@@ -112,9 +106,9 @@ More committed data exists past this response. Page forward with `Stream-Next-Of
 
 A proxy or load balancer is closing idle TCP. Raise its idle timeout or enable TCP keepalive on the proxy-to-Ursula leg. Ursula doesn't emit SSE keepalive comments.
 
-### SSE on a binary stream returns base64 JSON
+### SSE on a binary stream returns base64 text
 
-Expected. SSE wire format is text-only, so binary streams are wrapped in JSON and the `Stream-Sse-Data-Encoding: base64` header signals it. See [binary SSE](/docs/concepts/binary-sse).
+Expected. SSE wire format is text-only, so binary stream data events carry raw base64 text and the `Stream-Sse-Data-Encoding: base64` header signals it. See [binary SSE](/docs/concepts/binary-sse).
 
 ### Reads stall for hundreds of ms for cold offsets
 
@@ -134,7 +128,7 @@ Either an election is in progress or quorum is lost for that group. Only streams
 State-machine apply runs on the follower's owner core. If CPU is pinned, `last_applied` trails. Check:
 
 - Per-core mailbox depth (sustained queueing means saturation).
-- Disk pressure if `--storage-backend disk` (fsync latency).
+- Disk pressure if `raft.wal.backend = "disk"` (fsync latency).
 - A pathological hot stream forcing constant cold flushes (`hot_bytes_total` per group).
 
 ### Manually trigger a snapshot
@@ -150,18 +144,17 @@ Purge only after the snapshot replicates. Otherwise a slow follower may need log
 
 ### Writes succeed but data never reaches S3
 
-- `URSULA_COLD_BACKEND` not set, or set to `memory` when you expected `s3`.
+- `storage.cold.backend` is `none`, or set to `memory` when you expected `s3`.
 - IAM permissions missing. Required: `s3:GetObject`, `s3:PutObject`, `s3:ListBucket`, `s3:DeleteObject`.
-- `URSULA_COLD_S3_ENDPOINT` unreachable.
+- `storage.cold.s3.endpoint` unreachable.
 - Cold flush worker stalled (`cold_backpressure_events_total` climbing).
 
-If hot bytes grow unbounded, you'll eventually hit `URSULA_COLD_MAX_HOT_BYTES_PER_GROUP` and writes start returning `503`. Fix the backend before that.
+If hot bytes grow unbounded, you'll eventually hit `storage.cold.max_hot_size_per_group` and writes start returning `503`. Fix the backend before that.
 
 ## Still stuck?
 
 Open a [GitHub issue](https://github.com/tonbo-io/ursula/issues) with:
 
 - `/__ursula/metrics` from every node (with timestamps)
-- CLI flags per node
-- `URSULA_*` env vars (redact credentials)
+- Config file and CLI overrides per node (redact credentials)
 - Last ~200 log lines at `RUST_LOG=ursula_runtime=debug,ursula_raft=debug,ursula=info`

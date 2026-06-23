@@ -607,11 +607,11 @@ GET {stream-url}?offset=<offset>&live=sse
 
 Where `{stream-url}` is the URL of the stream. Returns data as a Server-Sent Events (SSE) stream.
 
-SSE mode supports all content types. For streams with `content-type: text/*` or `application/json`, data events carry UTF-8 text directly. For streams with any other `content-type` (binary streams), servers **MUST** automatically base64-encode data events and include the response header `stream-sse-data-encoding: base64`.
+SSE mode supports all content types. Servers **MUST** include `stream-data-content-type` to identify the decoded `event: data` payload type. For `application/json` streams, this value is `application/x-ndjson`. For all other streams, this value is the stream's configured content type. For streams with `content-type: text/*` or `application/json`, data events carry UTF-8 text directly. For streams with any other `content-type` (binary streams), servers **MUST** automatically base64-encode data events and include the response header `stream-sse-data-encoding: base64`.
 
 SSE responses **MUST** use `Content-Type: text/event-stream` in the HTTP response headers.
 
-When the stream's configured `content-type` is neither `text/*` nor `application/json`, servers **MUST** include the HTTP response header `stream-sse-data-encoding: base64`. Clients **MUST** check for this header and decode data events accordingly.
+Clients **MUST** check `stream-sse-data-encoding` before interpreting `event: data`. If it is `base64`, clients decode the event data first, then interpret the decoded bytes according to `stream-data-content-type`. For `application/x-ndjson` SSE payloads, `data:` lines are transport lines, not record boundaries; clients MUST buffer until newline before parsing records.
 
 #### Query Parameters
 
@@ -620,6 +620,9 @@ When the stream's configured `content-type` is neither `text/*` nor `application
 
 - `live=sse` (required)
  - Indicates SSE streaming mode.
+
+- `max_bytes` (optional)
+ - Maximum bytes to read in one data batch before SSE framing. For non-base64 UTF-8 data, servers **MUST NOT** emit invalid UTF-8; if a read window ends inside a code point, servers shorten the emitted payload and set `streamNextOffset` to the actual emitted byte position. For `application/x-ndjson` SSE payloads, servers **SHOULD** prefer ending at the last complete newline-delimited record when one is available, but **MAY** emit a partial record to make progress.
 
 #### Response Codes
 
@@ -636,13 +639,15 @@ Data is emitted in [Server-Sent Events format](https://developer.mozilla.org/en-
 
 - `data`: Emitted for each batch of data
  - Each line prefixed with `data:`
+ - The decoded data payload type is identified by the response header `stream-data-content-type`.
+ - `data:` lines are transport framing and are not guaranteed to align with application message boundaries.
  - For binary streams (where `stream-sse-data-encoding: base64` is present), the `data` event payload represents bytes encoded using standard base64 per [RFC 4648](https://www.rfc-editor.org/rfc/rfc4648) (alphabet: A-Z, a-z, 0-9, +, /).
  - Servers **MAY** split the base64 text across multiple `data:` lines within the same SSE `data` event.
  - Clients **MUST** concatenate the `data:` lines for the event (per SSE rules) and **MUST** remove all `\n` and `\r` characters inserted between lines before base64-decoding.
  - The resulting string (after removing `\n` and `\r`) **MUST** be valid base64 text with length that is a multiple of 4 (or empty).
  - If a `data` event's byte payload length is 0, the base64 text **MUST** be the empty string.
  - Base64 encoding affects only `event: data` payloads. `event: control` events remain JSON as specified and are not encoded.
- - When the stream content type is `application/json`, implementations **MAY** batch multiple logical messages into a single SSE `data` event by streaming a JSON array across multiple `data:` lines, as in the example below.
+ - When the stream content type is `application/json`, implementations **MAY** batch multiple logical messages into a single SSE `data` event by streaming newline-delimited JSON across multiple `data:` lines, as in the example below.
 - `control`: Emitted after every data event
  - **MUST** include `streamNextOffset`. See Section 8.1.
  - **MUST** include `streamCursor` when the stream is open. Servers **MAY** omit `streamCursor` when `streamClosed` is true (cursor is unnecessary when no reconnection is expected).
@@ -654,10 +659,8 @@ Data is emitted in [Server-Sent Events format](https://developer.mozilla.org/en-
 
 ```
 event: data
-data: [
-data: {"k":"v"},
-data: {"k":"w"},
-data: ]
+data: {"k":"v"}
+data: {"k":"w"}
 
 event: control
 data: {"streamNextOffset":"123456_789","streamCursor":"abc"}
@@ -667,9 +670,7 @@ data: {"streamNextOffset":"123456_789","streamCursor":"abc"}
 
 ```
 event: data
-data: [
 data: {"k":"final"}
-data: ]
 
 event: control
 data: {"streamNextOffset":"123456_999","streamClosed":true}
@@ -728,9 +729,7 @@ Offsets are opaque tokens that identify positions within a stream. They have the
 - **`now` (Current Tail Position)**: The special offset value `now` allows clients to skip all existing data and begin reading from the current tail position. This is useful for applications that only care about future data (e.g., presence tracking, live monitoring, late joiners to a conversation). The behavior varies by read mode:
 
  **Catch-up mode** (`offset=now` without `live` parameter):
- - Servers **MUST** return `200 OK` with an empty response body appropriate to the stream's content type:
- - For `application/json` streams: the body **MUST** be `[]` (empty JSON array), consistent with Section 7.1
- - For all other content types: the body **MUST** be 0 bytes (empty)
+ - Servers **MUST** return `200 OK` with an empty response body.
  - Servers **MUST** include a `Stream-Next-Offset` header set to the current tail position
  - Servers **MUST** include `Stream-Up-To-Date: true` header
  - Servers **SHOULD** return `Cache-Control: no-store` to prevent caching of the tail offset
@@ -754,7 +753,7 @@ Offsets are opaque tokens that identify positions within a stream. They have the
  - Regardless of the `live` parameter, servers **MUST** return immediately with the closure signal
  - The response **MUST** include `Stream-Closed: true` and `Stream-Up-To-Date: true` headers
  - The `Stream-Next-Offset` header **MUST** be set to the stream's final (tail) offset
- - For catch-up mode: `200 OK` with empty body (or empty JSON array for JSON streams)
+ - For catch-up mode: `200 OK` with empty body
  - For long-poll mode: `204 No Content` (no waiting, immediate return)
  - For SSE mode: The first (and only) control event includes `streamClosed: true` and `upToDate: true`, then the connection closes
  - This ensures clients using `offset=now` can immediately discover that a stream has no future data
@@ -787,7 +786,7 @@ Streams created with `Content-Type: application/json` have special semantics for
 
 #### Message Boundaries
 
-For `application/json` streams, servers **MUST** preserve message boundaries. Each POST request stores messages as a distinct unit, and GET responses **MUST** return data as a JSON array containing all messages from the requested offset range.
+For `application/json` streams, servers **MUST** preserve message boundaries by storing each normalized message as one newline-delimited JSON record. `HEAD` responses report the configured stream content type (`application/json`). GET responses **MUST** return those records as newline-delimited JSON with `Content-Type: application/x-ndjson`, because that is the read representation.
 
 #### Array Flattening for Batch Operations
 
@@ -814,16 +813,17 @@ Servers **MUST** validate that appended data is valid JSON. If validation fails,
 
 #### Response Format
 
-GET responses for `application/json` streams **MUST** return `Content-Type: application/json` with a body containing a JSON array of all messages in the requested range:
+GET responses for `application/json` streams **MUST** return `Content-Type: application/x-ndjson` with a body containing newline-delimited JSON messages from the requested offset range. `max_bytes` applies to the encoded byte stream and MAY end a response mid-record; clients MUST resume from `Stream-Next-Offset` and buffer incomplete trailing records before parsing.
 
 ```http
 HTTP/1.1 200 OK
-Content-Type: application/json
+Content-Type: application/x-ndjson
 
-[{"event":"created"},{"event":"updated"}]
+{"event":"created"}
+{"event":"updated"}
 ```
 
-If no messages exist in the range, servers **MUST** return an empty JSON array `[]`.
+If no messages exist in the range, servers **MUST** return an empty body.
 
 ## 8. Caching and Collapsing
 

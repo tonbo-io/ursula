@@ -24,6 +24,7 @@ tracing-opentelemetry = { workspace = true }
 ursula-control = { workspace = true }
 ursula-runtime = { workspace = true }
 ursula-proto = { workspace = true }
+ursula-config = { workspace = true }
 ursula-shard = { workspace = true }
 
 [build-dependencies]

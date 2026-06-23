@@ -96,6 +96,22 @@ type ChaosInjection = {
   }>;
 };
 
+const ACTIVE_INJECTION_STATUSES = new Set([
+  "stopping",
+  "injected",
+  "stopped",
+  "starting",
+  "clear_failed",
+  "repairing",
+  "repair_clear_failed",
+]);
+const ACTIVITY_WINDOW_MS = 30 * 60 * 1000;
+
+function isActiveInjection(injection: ChaosInjection): boolean {
+  if (injection.recovered_at) return false;
+  return ACTIVE_INJECTION_STATUSES.has(injection.status ?? "");
+}
+
 type ChaosCoverage = {
   scenario_count?: number;
   configured_count?: number;
@@ -490,7 +506,7 @@ function eventLevelClass(level: string) {
   }
 }
 
-type BandState = "met" | "missed" | "active";
+type BandState = "recovered" | "missed" | "active";
 type InjectionBand = {
   id: number;
   scenario: string | null;
@@ -500,8 +516,8 @@ type InjectionBand = {
 };
 
 function injectionBandState(injection: ChaosInjection): BandState {
-  if (injection.slo_met === true) return "met";
   if (injection.slo_met === false) return "missed";
+  if (injection.recovered_at || injection.status === "recovered") return "recovered";
   return "active";
 }
 
@@ -1004,7 +1020,15 @@ function StatusPage() {
     () => bucketHistory(status?.history ?? [], HEALTH_BUCKET_MS, HEALTH_BUCKET_COUNT, now),
     [status, now],
   );
-  const rateSamples = useMemo(() => appendRateSamples(status?.history ?? []).slice(-80), [status]);
+  const rateSamples = useMemo(() => {
+    const samples = appendRateSamples(status?.history ?? []);
+    const cutoff = now - ACTIVITY_WINDOW_MS;
+    const recent = samples.filter((sample) => {
+      const time = new Date(sample.time).getTime();
+      return Number.isFinite(time) && time >= cutoff;
+    });
+    return (recent.length >= 2 ? recent : samples).slice(-80);
+  }, [status, now]);
   const currentAppendRate = useMemo(() => {
     const delta = status?.health?.append_success_delta;
     if (typeof delta !== "number") return null;
@@ -1033,11 +1057,10 @@ function StatusPage() {
     [allInjections, selectedInjectionId],
   );
   const activeInjection = useMemo(
-    () => allInjections.find((inj) => inj.status && inj.status !== "recovered") ?? null,
+    () => allInjections.find(isActiveInjection) ?? null,
     [allInjections],
   );
-  const defaultDetailInjection =
-    selectedInjection ?? activeInjection ?? windowInjections[windowInjections.length - 1] ?? null;
+  const defaultDetailInjection = selectedInjection ?? activeInjection;
   const integrityMark = useMemo(() => {
     const checked = status?.integrity.checked_at;
     if (!checked) return null;
@@ -1355,6 +1378,7 @@ function StatusPage() {
                         {inj.scenario.replace(/_/g, " ")}
                       </span>
                     ) : null}
+                    <span className="activity-band-chip-state">{state}</span>
                   </button>
                 );
               })}

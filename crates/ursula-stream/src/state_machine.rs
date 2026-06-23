@@ -15,11 +15,13 @@ use crate::model::ColdGcEntry;
 use crate::model::ColdGcTarget;
 use crate::model::ExternalPayloadRef;
 use crate::model::HotPayloadSegment;
+use crate::model::MAX_STREAM_ATTRS_BYTES;
 use crate::model::ObjectPayloadRef;
 use crate::model::ProducerAppendRecord;
 use crate::model::ProducerRequest;
 use crate::model::ProducerSnapshot;
 use crate::model::ProducerState;
+use crate::model::StreamAttrs;
 use crate::model::StreamBatchAppend;
 use crate::model::StreamBatchAppendItem;
 use crate::model::StreamBootstrapPlan;
@@ -45,6 +47,7 @@ use crate::validate::validate_stream_id;
 pub struct StreamStateMachine {
     buckets: HashSet<String>,
     streams: HashMap<BucketStreamId, StreamMetadata>,
+    stream_attrs: HashMap<BucketStreamId, StreamAttrs>,
     hot_buffers: HashMap<BucketStreamId, HotBuffer>,
     cold_index: InMemoryColdIndex,
     message_records: HashMap<BucketStreamId, Vec<StreamMessageRecord>>,
@@ -291,30 +294,53 @@ impl HotBuffer {
         });
     }
 
-    fn plan_cold_flush(
+    fn plan_cold_flush_from(
         &self,
+        from_offset: u64,
         min_hot_bytes: usize,
         max_flush_bytes: usize,
     ) -> Option<(u64, u64, Vec<u8>)> {
-        let first = self.chunks.front()?;
         let mut payload = Vec::new();
-        let mut end_offset = first.start_offset;
         for chunk in &self.chunks {
-            if chunk.start_offset != end_offset || payload.len() >= max_flush_bytes {
+            if chunk.end_offset <= from_offset {
+                continue;
+            }
+            if chunk.start_offset
+                > from_offset + u64::try_from(payload.len()).expect("payload len fits u64")
+            {
                 break;
             }
+            if payload.len() >= max_flush_bytes {
+                break;
+            }
+            let skip = if chunk.start_offset < from_offset {
+                usize::try_from(from_offset - chunk.start_offset).expect("skip fits usize")
+            } else {
+                0
+            };
             let remaining = max_flush_bytes - payload.len();
-            let take = chunk.bytes.len().min(remaining);
-            payload.extend_from_slice(&chunk.bytes[..take]);
-            end_offset = end_offset.saturating_add(u64::try_from(take).expect("take fits u64"));
-            if take < chunk.bytes.len() {
+            let take = (chunk.bytes.len() - skip).min(remaining);
+            payload.extend_from_slice(&chunk.bytes[skip..skip + take]);
+            if take < chunk.bytes.len() - skip {
                 break;
             }
         }
         if payload.len() < min_hot_bytes {
             return None;
         }
-        Some((first.start_offset, end_offset, payload))
+        let end_offset = from_offset + u64::try_from(payload.len()).expect("payload len fits u64");
+        Some((from_offset, end_offset, payload))
+    }
+
+    fn remaining_len_from(&self, from_offset: u64) -> usize {
+        self.chunks
+            .iter()
+            .filter(|chunk| chunk.end_offset > from_offset)
+            .map(|chunk| {
+                let start = chunk.start_offset.max(from_offset);
+                usize::try_from(chunk.end_offset - start).expect("remaining len fits usize")
+            })
+            .sum()
     }
 
     fn read_segments(&self, offset: u64, next_offset: u64) -> Vec<(u64, StreamReadSegment)> {
@@ -399,6 +425,7 @@ impl StreamStateMachine {
                 stream_expires_at_ms,
                 forked_from,
                 fork_offset,
+                attrs,
                 now_ms,
             } => self.create_stream(CreateStreamInput {
                 stream_id,
@@ -411,6 +438,7 @@ impl StreamStateMachine {
                 stream_expires_at_ms,
                 forked_from,
                 fork_offset,
+                attrs,
                 now_ms,
             }),
             StreamCommand::CreateExternal {
@@ -424,6 +452,7 @@ impl StreamStateMachine {
                 stream_expires_at_ms,
                 forked_from,
                 fork_offset,
+                attrs,
                 now_ms,
             } => self.create_external_stream(CreateExternalStreamInput {
                 stream_id,
@@ -436,6 +465,7 @@ impl StreamStateMachine {
                 stream_expires_at_ms,
                 forked_from,
                 fork_offset,
+                attrs,
                 now_ms,
             }),
             StreamCommand::Append {
@@ -515,6 +545,11 @@ impl StreamStateMachine {
                 now_ms,
                 renew_ttl,
             } => self.touch_stream_access(&stream_id, now_ms, renew_ttl),
+            StreamCommand::UpdateStreamAttrs {
+                stream_id,
+                attrs,
+                now_ms,
+            } => self.update_stream_attrs(&stream_id, attrs, now_ms),
             StreamCommand::AddForkRef { stream_id, now_ms } => {
                 self.add_fork_ref(&stream_id, now_ms)
             }
@@ -533,6 +568,10 @@ impl StreamStateMachine {
 
     pub fn head(&self, stream_id: &BucketStreamId) -> Option<&StreamMetadata> {
         self.streams.get(stream_id)
+    }
+
+    pub fn stream_attrs(&self, stream_id: &BucketStreamId) -> Option<&StreamAttrs> {
+        self.stream_attrs.get(stream_id)
     }
 
     pub fn head_at(&mut self, stream_id: &BucketStreamId, now_ms: u64) -> Option<&StreamMetadata> {
@@ -625,6 +664,17 @@ impl StreamStateMachine {
         min_hot_bytes: usize,
         max_flush_bytes: usize,
     ) -> Result<Option<ColdFlushCandidate>, StreamResponse> {
+        let start_offset = self.hot_start_offset(stream_id);
+        self.plan_cold_flush_with_start(stream_id, start_offset, min_hot_bytes, max_flush_bytes)
+    }
+
+    fn plan_cold_flush_with_start(
+        &self,
+        stream_id: &BucketStreamId,
+        start_offset: u64,
+        min_hot_bytes: usize,
+        max_flush_bytes: usize,
+    ) -> Result<Option<ColdFlushCandidate>, StreamResponse> {
         if max_flush_bytes == 0 {
             return Ok(None);
         }
@@ -644,7 +694,7 @@ impl StreamStateMachine {
             return Ok(None);
         };
         let Some((start_offset, end_offset, payload)) =
-            hot_buffer.plan_cold_flush(min_hot_bytes, max_flush_bytes)
+            hot_buffer.plan_cold_flush_from(start_offset, min_hot_bytes, max_flush_bytes)
         else {
             return Ok(None);
         };
@@ -656,10 +706,12 @@ impl StreamStateMachine {
         }))
     }
 
-    pub fn plan_next_cold_flush(
+    fn plan_next_cold_flush_from_start(
         &self,
+        mut start_fn: impl FnMut(&BucketStreamId) -> u64,
         min_hot_bytes: usize,
         max_flush_bytes: usize,
+        group_hot_bytes: u64,
     ) -> Result<Option<ColdFlushCandidate>, StreamResponse> {
         if max_flush_bytes == 0 {
             return Ok(None);
@@ -667,7 +719,9 @@ impl StreamStateMachine {
         let mut stream_ids = self.streams.keys().cloned().collect::<Vec<_>>();
         stream_ids.sort_by(compare_stream_ids);
         for stream_id in &stream_ids {
-            match self.plan_cold_flush(stream_id, min_hot_bytes, max_flush_bytes) {
+            let start = start_fn(stream_id);
+            match self.plan_cold_flush_with_start(stream_id, start, min_hot_bytes, max_flush_bytes)
+            {
                 Ok(Some(candidate)) => return Ok(Some(candidate)),
                 Ok(None) => {}
                 Err(StreamResponse::Error {
@@ -678,12 +732,12 @@ impl StreamStateMachine {
             }
         }
         let group_min_hot_bytes = u64::try_from(min_hot_bytes).unwrap_or(u64::MAX);
-        let group_hot_bytes = self.total_hot_payload_bytes();
         if group_hot_bytes < group_min_hot_bytes {
             return Ok(None);
         }
         for stream_id in stream_ids {
-            match self.plan_cold_flush(&stream_id, 1, max_flush_bytes) {
+            let start = start_fn(&stream_id);
+            match self.plan_cold_flush_with_start(&stream_id, start, 1, max_flush_bytes) {
                 Ok(Some(candidate)) => return Ok(Some(candidate)),
                 Ok(None) => {}
                 Err(StreamResponse::Error {
@@ -705,29 +759,34 @@ impl StreamStateMachine {
         if max_candidates == 0 || max_flush_bytes == 0 {
             return Ok(Vec::new());
         }
-        let mut preview = self.clone();
+        let mut planned_flush_offsets: HashMap<BucketStreamId, u64> = HashMap::new();
         let mut candidates = Vec::with_capacity(max_candidates);
         while candidates.len() < max_candidates {
-            let Some(candidate) = preview.plan_next_cold_flush(min_hot_bytes, max_flush_bytes)?
-            else {
+            let start_for = |stream_id: &BucketStreamId| -> u64 {
+                planned_flush_offsets
+                    .get(stream_id)
+                    .copied()
+                    .unwrap_or_else(|| self.hot_start_offset(stream_id))
+            };
+            let group_hot_bytes: u64 = self
+                .hot_buffers
+                .iter()
+                .map(|(stream_id, buffer)| {
+                    let start = start_for(stream_id);
+                    u64::try_from(buffer.remaining_len_from(start)).expect("len fits u64")
+                })
+                .sum();
+            let candidate = self.plan_next_cold_flush_from_start(
+                start_for,
+                min_hot_bytes,
+                max_flush_bytes,
+                group_hot_bytes,
+            )?;
+            let Some(candidate) = candidate else {
                 break;
             };
-            let chunk = ColdChunkRef {
-                start_offset: candidate.start_offset,
-                end_offset: candidate.end_offset,
-                s3_path: "planned-cold-flush-batch".to_owned(),
-                object_size: u64::try_from(candidate.payload.len()).expect("payload len fits u64"),
-            };
-            match preview.flush_cold(candidate.stream_id.clone(), chunk) {
-                StreamResponse::ColdFlushed { .. } => candidates.push(candidate),
-                StreamResponse::Error { .. } => break,
-                other => {
-                    return Err(StreamResponse::error(
-                        StreamErrorCode::InvalidColdFlush,
-                        format!("unexpected cold flush planning response: {other:?}"),
-                    ));
-                }
-            }
+            planned_flush_offsets.insert(candidate.stream_id.clone(), candidate.end_offset);
+            candidates.push(candidate);
         }
         Ok(candidates)
     }
@@ -786,6 +845,7 @@ impl StreamStateMachine {
                 let producer_states = self.producer_snapshot(&stream_id);
                 StreamSnapshotEntry {
                     metadata,
+                    attrs: self.stream_attrs.get(&stream_id).cloned(),
                     hot_start_offset: self.hot_start_offset(&stream_id),
                     payload,
                     hot_segments: hot_buffer.hot_segments(),
@@ -894,6 +954,9 @@ impl StreamStateMachine {
                 .is_some()
             {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
+            }
+            if let Some(attrs) = normalize_stream_attrs(entry.attrs) {
+                machine.stream_attrs.insert(stream_id.clone(), attrs);
             }
             let producer_states = restore_producer_states(&stream_id, entry.producer_states)?;
             machine.hot_buffers.insert(
@@ -1407,7 +1470,11 @@ impl StreamStateMachine {
     }
 
     fn create_stream(&mut self, input: CreateStreamInput) -> StreamResponse {
+        let attrs = normalize_stream_attrs(input.attrs.clone());
         if let Err(response) = self.validate_stream_scope(&input.stream_id) {
+            return response;
+        }
+        if let Err(response) = validate_stream_attrs(attrs.as_ref()) {
             return response;
         }
         if let Err(response) =
@@ -1457,6 +1524,7 @@ impl StreamStateMachine {
                 && existing.stream_expires_at_ms == input.stream_expires_at_ms
                 && existing.forked_from == input.forked_from
                 && existing.fork_offset == input.fork_offset
+                && self.stream_attrs.get(&input.stream_id) == attrs.as_ref()
             {
                 return StreamResponse::AlreadyExists {
                     next_offset: existing.tail_offset,
@@ -1491,6 +1559,9 @@ impl StreamStateMachine {
             fork_ref_count: 0,
         };
         self.streams.insert(input.stream_id.clone(), metadata);
+        if let Some(attrs) = attrs {
+            self.stream_attrs.insert(input.stream_id.clone(), attrs);
+        }
         self.hot_buffers.insert(
             input.stream_id.clone(),
             HotBuffer::from_payload(0, input.initial_payload),
@@ -1538,10 +1609,14 @@ impl StreamStateMachine {
     }
 
     fn create_external_stream(&mut self, input: CreateExternalStreamInput) -> StreamResponse {
+        let attrs = normalize_stream_attrs(input.attrs.clone());
         if let Err(response) = validate_external_payload_ref(&input.initial_payload) {
             return response;
         }
         if let Err(response) = self.validate_stream_scope(&input.stream_id) {
+            return response;
+        }
+        if let Err(response) = validate_stream_attrs(attrs.as_ref()) {
             return response;
         }
         if let Err(response) =
@@ -1591,6 +1666,7 @@ impl StreamStateMachine {
                 && existing.stream_expires_at_ms == input.stream_expires_at_ms
                 && existing.forked_from == input.forked_from
                 && existing.fork_offset == input.fork_offset
+                && self.stream_attrs.get(&input.stream_id) == attrs.as_ref()
             {
                 return StreamResponse::AlreadyExists {
                     next_offset: existing.tail_offset,
@@ -1625,6 +1701,9 @@ impl StreamStateMachine {
             fork_ref_count: 0,
         };
         self.streams.insert(input.stream_id.clone(), metadata);
+        if let Some(attrs) = attrs {
+            self.stream_attrs.insert(input.stream_id.clone(), attrs);
+        }
         self.hot_buffers
             .insert(input.stream_id.clone(), HotBuffer::default());
         let object = ObjectPayloadRef {
@@ -2217,6 +2296,48 @@ impl StreamStateMachine {
         }
     }
 
+    fn update_stream_attrs(
+        &mut self,
+        stream_id: &BucketStreamId,
+        attrs: Option<StreamAttrs>,
+        now_ms: u64,
+    ) -> StreamResponse {
+        if let Err(response) = self.validate_stream_scope(stream_id) {
+            return response;
+        }
+        if self.expire_stream_if_due(stream_id, now_ms) {
+            return StreamResponse::error(
+                StreamErrorCode::StreamNotFound,
+                format!("stream '{stream_id}' does not exist"),
+            );
+        }
+        let Some(stream) = self.streams.get(stream_id) else {
+            return StreamResponse::error(
+                StreamErrorCode::StreamNotFound,
+                format!("stream '{stream_id}' does not exist"),
+            );
+        };
+        if is_soft_deleted(stream) {
+            return StreamResponse::error(
+                StreamErrorCode::StreamGone,
+                format!("stream '{stream_id}' is gone"),
+            );
+        }
+        let attrs = normalize_stream_attrs(attrs);
+        if let Err(response) = validate_stream_attrs(attrs.as_ref()) {
+            return response;
+        }
+        if self.stream_attrs.get(stream_id) == attrs.as_ref() {
+            return StreamResponse::AttrsUpdated { changed: false };
+        }
+        if let Some(attrs) = attrs {
+            self.stream_attrs.insert(stream_id.clone(), attrs);
+        } else {
+            self.stream_attrs.remove(stream_id);
+        }
+        StreamResponse::AttrsUpdated { changed: true }
+    }
+
     fn release_fork_ref(&mut self, stream_id: &BucketStreamId) -> StreamResponse {
         if let Err(response) = self.validate_stream_scope(stream_id) {
             return response;
@@ -2310,6 +2431,7 @@ impl StreamStateMachine {
 
     fn remove_stream_state(&mut self, stream_id: &BucketStreamId) -> bool {
         if self.streams.remove(stream_id).is_some() {
+            self.stream_attrs.remove(stream_id);
             self.hot_buffers.remove(stream_id);
             let had_cold = self.cold_index_mut().remove_stream(stream_id);
             self.message_records.remove(stream_id);
@@ -2604,6 +2726,7 @@ struct CreateStreamInput {
     stream_expires_at_ms: Option<u64>,
     forked_from: Option<BucketStreamId>,
     fork_offset: Option<u64>,
+    attrs: Option<StreamAttrs>,
     now_ms: u64,
 }
 
@@ -2619,6 +2742,7 @@ struct CreateExternalStreamInput {
     stream_expires_at_ms: Option<u64>,
     forked_from: Option<BucketStreamId>,
     fork_offset: Option<u64>,
+    attrs: Option<StreamAttrs>,
     now_ms: u64,
 }
 
@@ -2650,6 +2774,33 @@ fn status_from_closed(closed: bool) -> StreamStatus {
 
 fn is_soft_deleted(stream: &StreamMetadata) -> bool {
     stream.status == StreamStatus::SoftDeleted
+}
+
+fn normalize_stream_attrs(attrs: Option<StreamAttrs>) -> Option<StreamAttrs> {
+    attrs.filter(|attrs| !attrs.is_empty())
+}
+
+fn validate_stream_attrs(attrs: Option<&StreamAttrs>) -> Result<(), StreamResponse> {
+    let Some(attrs) = attrs else {
+        return Ok(());
+    };
+    let encoded_len = serde_json::to_vec(attrs)
+        .map_err(|err| {
+            StreamResponse::error(
+                StreamErrorCode::InvalidStreamAttrs,
+                format!("encode stream attrs JSON: {err}"),
+            )
+        })?
+        .len();
+    if encoded_len > MAX_STREAM_ATTRS_BYTES {
+        return Err(StreamResponse::error(
+            StreamErrorCode::InvalidStreamAttrs,
+            format!(
+                "stream attrs JSON is {encoded_len} bytes; limit is {MAX_STREAM_ATTRS_BYTES} bytes"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_retention(

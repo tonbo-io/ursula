@@ -5,16 +5,29 @@ sidebarTitle: Quick Start
 
 > For now, Ursula builds from Rust source. Pre-built release binaries are on the way.
 
-Start a local node from the workspace root. The default is in-memory (no on-disk state, good for kicking the tires):
+Start a local node from the workspace root. The default preset is in-memory (no on-disk state, good for kicking the tires):
 
 ```bash
-cargo run --bin ursula
+cargo run --bin ursula -- --preset default
 ```
 
-It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses the in-memory engine. For local disk-backed persistence instead, point `--disk-path` at an empty directory:
+It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses the in-memory engine. For local disk-backed persistence instead, create a small config file:
 
 ```bash
-cargo run --bin ursula -- --storage-backend disk --disk-path ./data
+cat > ./ursula.toml <<'TOML'
+[server]
+listen = "127.0.0.1:4437"
+
+[raft]
+node_id = 1
+group_count = 16
+
+[raft.wal]
+backend = "disk"
+path = "./data"
+TOML
+
+cargo run --bin ursula -- --config ./ursula.toml
 ```
 
 Then drive the HTTP API with `curl` in another terminal.
@@ -63,7 +76,7 @@ Open a second terminal:
 curl -N 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
 ```
 
-`-N` keeps `curl` from line-buffering the SSE stream. Append more data from the first terminal and you'll see it arrive immediately as `event: data` lines. Binary streams are delivered as a JSON envelope with a base64-encoded payload (`Stream-Sse-Data-Encoding: base64`). See [binary SSE](/docs/concepts/binary-sse) for details.
+`-N` keeps `curl` from line-buffering the SSE stream. Append more data from the first terminal and you'll see it arrive immediately as `event: data` lines. Binary streams are delivered as raw base64 text in `event: data` payloads (`Stream-Sse-Data-Encoding: base64`). See [binary SSE](/docs/concepts/binary-sse) for details.
 
 ## Inspect runtime state
 
@@ -88,7 +101,7 @@ The raw endpoint is also what `ursulactl` consumes; reach for it when you want t
 ## Next steps
 
 - [ursulactl](/docs/cli): the operator CLI you'll use once a cluster is up
-- [Run locally](/docs/run-locally): flags, environment variables, and durability modes
+- [Run locally](/docs/run-locally): config files, presets, and durability modes
 - [Deploy a cluster](/docs/deploy-cluster): static gRPC Raft cluster shape
 - [Configure S3](/docs/configure-s3): shared cold storage for clusters
 - [API overview](/docs/api/overview): the HTTP surface Ursula currently exposes

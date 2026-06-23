@@ -1,0 +1,172 @@
+{{- range $label := list "app.kubernetes.io/name" "app.kubernetes.io/instance" -}}
+{{- if hasKey $.Values.server.podLabels $label -}}
+{{- fail (printf "server.podLabels must not set reserved selector label %q" $label) -}}
+{{- end -}}
+{{- end -}}
+{{- $s3CredentialSecret := include "ursula.s3SecretName" . -}}
+{{- $hasS3Credentials := include "ursula.hasS3Credentials" . -}}
+{{- $replicaCount := .Values.server.replicaCount | int -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "ursula.fullname" . }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "ursula.headlessServiceName" . }}
+  replicas: {{ $replicaCount }}
+  podManagementPolicy: {{ .Values.server.podManagementPolicy }}
+  selector:
+    matchLabels:
+      {{- include "ursula.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ursula.selectorLabels" . | nindent 8 }}
+        {{- with .Values.server.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.server.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "ursula.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      enableServiceLinks: false
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ursula
+          image: {{ include "ursula.image" . | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - /opt/ursula/entrypoint/ursula-entrypoint.sh
+          {{- with .Values.server.extraArgs }}
+          args:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: client
+              containerPort: {{ .Values.server.ports.client }}
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.server.rustLog | quote }}
+            {{- if $hasS3Credentials }}
+            - name: URSULA_COLD_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s3CredentialSecret | quote }}
+                  key: "accessKeyId"
+            - name: URSULA_COLD_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s3CredentialSecret | quote }}
+                  key: "secretAccessKey"
+            - name: URSULA_COLD_S3_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s3CredentialSecret | quote }}
+                  key: "sessionToken"
+                  optional: true
+            {{- end }}
+
+            {{- with .Values.server.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.server.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.server.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.server.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: entrypoint
+              mountPath: /opt/ursula/entrypoint
+              readOnly: true
+            - name: generated-config
+              mountPath: /etc/ursula/generated
+            - name: tmp
+              mountPath: /tmp
+            - name: raft-data
+              mountPath: {{ .Values.raft.logDir }}
+      volumes:
+        - name: entrypoint
+          configMap:
+            name: {{ include "ursula.fullname" . }}
+            defaultMode: 0555
+        - name: generated-config
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        {{- if not .Values.persistence.enabled }}
+        - name: raft-data
+          emptyDir: {}
+        {{- end }}
+      {{- with .Values.server.scheduling.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.server.scheduling.affinity }}
+      affinity:
+        {{- toYaml .Values.server.scheduling.affinity | nindent 8 }}
+      {{- else if gt $replicaCount 1 }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "ursula.selectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- with .Values.server.scheduling.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.server.scheduling.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml .Values.server.scheduling.topologySpreadConstraints | nindent 8 }}
+      {{- else if gt $replicaCount 1 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "ursula.selectorLabels" . | nindent 14 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: raft-data
+        {{- with .Values.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+  {{- end }}

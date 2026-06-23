@@ -57,11 +57,12 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   "api/append": { group: "API Reference", order: 4 },
   "api/read": { group: "API Reference", order: 5 },
   "api/head-stream": { group: "API Reference", order: 6 },
-  "api/publish-snapshot": { group: "API Reference", order: 7 },
-  "api/read-snapshot": { group: "API Reference", order: 8 },
-  "api/bootstrap": { group: "API Reference", order: 9 },
-  "api/delete-stream": { group: "API Reference", order: 10 },
-  "api/v1-compatibility": { group: "API Reference", order: 11 },
+  "api/stream-attrs": { group: "API Reference", order: 7 },
+  "api/publish-snapshot": { group: "API Reference", order: 8 },
+  "api/read-snapshot": { group: "API Reference", order: 9 },
+  "api/bootstrap": { group: "API Reference", order: 10 },
+  "api/delete-stream": { group: "API Reference", order: 11 },
+  "api/v1-compatibility": { group: "API Reference", order: 12 },
 
   // Install & Deploy - get the binaries, get the cluster running.
   install: { group: "Install & Deploy", order: 1 },
@@ -69,7 +70,8 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   configuration: { group: "Install & Deploy", order: 3 },
   "configure-s3": { group: "Install & Deploy", order: 4 },
   "deploy-cluster": { group: "Install & Deploy", order: 5 },
-  security: { group: "Install & Deploy", order: 6 },
+  "deploy-kubernetes": { group: "Install & Deploy", order: 6 },
+  security: { group: "Install & Deploy", order: 7 },
 
   // Operate - day-2 entrypoints. `ursulactl` is the first one to reach for.
   cli: { group: "Operate", order: 1, title: "ursulactl" },

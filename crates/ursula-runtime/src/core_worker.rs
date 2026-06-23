@@ -49,6 +49,8 @@ use crate::request::DeleteStreamResponse;
 use crate::request::FlushColdRequest;
 use crate::request::FlushColdResponse;
 use crate::request::ForkRefResponse;
+use crate::request::GetStreamAttrsRequest;
+use crate::request::GetStreamAttrsResponse;
 use crate::request::GroupReadStreamParts;
 use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
@@ -60,6 +62,8 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
+use crate::request::UpdateStreamAttrsRequest;
+use crate::request::UpdateStreamAttrsResponse;
 use crate::rt::sync::Semaphore;
 use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
@@ -97,6 +101,11 @@ pub(crate) enum CoreCommand {
         request: HeadStreamRequest,
         placement: ShardPlacement,
         response_tx: oneshot::Sender<Result<HeadStreamResponse, RuntimeError>>,
+    },
+    GetStreamAttrs {
+        request: GetStreamAttrsRequest,
+        placement: ShardPlacement,
+        response_tx: oneshot::Sender<Result<GetStreamAttrsResponse, RuntimeError>>,
     },
     ReadStream {
         request: ReadStreamRequest,
@@ -142,6 +151,11 @@ pub(crate) enum CoreCommand {
         request: CloseStreamRequest,
         placement: ShardPlacement,
         response_tx: oneshot::Sender<Result<CloseStreamResponse, RuntimeError>>,
+    },
+    UpdateStreamAttrs {
+        request: UpdateStreamAttrsRequest,
+        placement: ShardPlacement,
+        response_tx: oneshot::Sender<Result<UpdateStreamAttrsResponse, RuntimeError>>,
     },
     AddForkRef {
         stream_id: BucketStreamId,
@@ -372,6 +386,18 @@ impl CoreWorker {
                 })
                 .await;
             }
+            CoreCommand::GetStreamAttrs {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::GetStreamAttrs {
+                    request,
+                    response_tx,
+                })
+                .await;
+            }
             CoreCommand::ReadStream {
                 request,
                 placement,
@@ -475,6 +501,18 @@ impl CoreWorker {
             } => {
                 debug_assert_eq!(placement.core_id, self.core_id);
                 self.send_group_command(placement, GroupCommand::CloseStream {
+                    request,
+                    response_tx,
+                })
+                .await;
+            }
+            CoreCommand::UpdateStreamAttrs {
+                request,
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                self.send_group_command(placement, GroupCommand::UpdateStreamAttrs {
                     request,
                     response_tx,
                 })
@@ -1410,6 +1448,51 @@ impl CoreWorker {
             elapsed_ns(exec_started_at),
         );
         response
+    }
+
+    pub(crate) async fn get_stream_attrs(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        request: GetStreamAttrsRequest,
+        placement: ShardPlacement,
+    ) -> Result<GetStreamAttrsResponse, RuntimeError> {
+        let exec_started_at = Instant::now();
+        let response = group
+            .get_stream_attrs(request, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err));
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(exec_started_at),
+        );
+        response
+    }
+
+    pub(crate) async fn update_stream_attrs(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        request: UpdateStreamAttrsRequest,
+        placement: ShardPlacement,
+    ) -> Result<UpdateStreamAttrsResponse, RuntimeError> {
+        let started_at = Instant::now();
+        let response = group
+            .update_stream_attrs(request, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err))?;
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(started_at),
+        );
+        if response.changed {
+            metrics.record_applied_mutation(
+                placement.core_id,
+                placement.raft_group_id,
+                elapsed_ns(started_at),
+            );
+        }
+        Ok(response)
     }
 
     pub(crate) async fn snapshot_group(

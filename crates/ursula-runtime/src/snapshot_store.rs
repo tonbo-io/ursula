@@ -17,7 +17,10 @@ use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
+use crossbeam_utils::CachePadded;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -31,11 +34,14 @@ pub struct SnapshotKey {
     pub snapshot_id: String,
 }
 
-impl SnapshotKey {
-    /// Canonical leaf filename for filesystem / object key derivation.
-    pub fn filename(&self) -> String {
-        format!("{}.snap", self.snapshot_id)
-    }
+fn unique_snapshot_leaf(snapshot_id: &str) -> String {
+    static COUNTER: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
+    let nonce_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let nonce_seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{snapshot_id}-{nonce_nanos:032}-{nonce_seq:020}.snap")
 }
 
 /// Where a snapshot blob lives. Carried in [`SnapshotPointer`] over openraft.
@@ -157,6 +163,20 @@ pub trait SnapshotStore: Send + Sync + Debug {
     /// Best-effort delete; missing is not an error.
     fn delete<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()>;
 
+    /// Best-effort prune of retired snapshots for one Raft group. Backends
+    /// with an external namespace should derive retired objects by listing the
+    /// group's snapshot prefix and keep the published `current` object plus
+    /// `retain_latest` older objects. Inline snapshots have no external
+    /// lifecycle, so the default is a no-op.
+    fn prune_retired<'a>(
+        &'a self,
+        _raft_group_id: u32,
+        _current: &'a SnapshotLocation,
+        _retain_latest: usize,
+    ) -> SnapshotStoreFuture<'a, ()> {
+        Box::pin(async move { Ok(()) })
+    }
+
     /// Lightweight liveness probe for the backend, used by the snapshot driver
     /// to detect local S3 loss WITHOUT triggering a `build_snapshot` (whose
     /// failure openraft treats as fatal). The default is "always healthy":
@@ -229,6 +249,7 @@ mod s3 {
     use super::SnapshotStore;
     use super::SnapshotStoreError;
     use super::SnapshotStoreFuture;
+    use super::unique_snapshot_leaf;
 
     /// Bytes live in an opendal-managed S3 bucket under `{prefix}/group-{gid}/`.
     pub struct S3SnapshotStore {
@@ -260,60 +281,62 @@ mod s3 {
             Ok(Self::new(operator, prefix))
         }
 
-        /// Build an S3 operator from the cold-store `URSULA_COLD_S3_*` env.
-        /// Snapshot blobs share the cold bucket/credentials and use
-        /// `URSULA_SNAPSHOT_S3_PREFIX` (defaults to `snapshots`) for separation.
-        pub fn s3_from_env() -> Result<Self, SnapshotStoreError> {
-            let bucket = std::env::var("URSULA_COLD_S3_BUCKET").map_err(|_| {
-                SnapshotStoreError::Backend(
-                    "URSULA_COLD_S3_BUCKET is required for snapshot s3 backend".into(),
-                )
+        /// Build an S3 snapshot store from a [`ColdConfig`].
+        /// Snapshot blobs share the cold bucket/credentials and use `prefix`
+        /// (defaults to `snapshots`) for separation.
+        pub fn try_new(
+            config: &crate::ColdConfig,
+            prefix: impl Into<String>,
+        ) -> Result<Self, SnapshotStoreError> {
+            let s3 = config.s3.as_ref().ok_or_else(|| {
+                SnapshotStoreError::Backend("S3 config is required for snapshot s3 backend".into())
+            })?;
+            let bucket = s3.bucket.as_deref().ok_or_else(|| {
+                SnapshotStoreError::Backend("S3 bucket is required for snapshot s3 backend".into())
             })?;
             if bucket.trim().is_empty() {
                 return Err(SnapshotStoreError::Backend(
                     "snapshot s3 bucket must not be empty".into(),
                 ));
             }
-            let mut builder = opendal::services::S3::default().bucket(&bucket);
-            // Root pins all blobs into a snapshot-only sub-tree of the bucket,
-            // letting the cold store reuse the same bucket with different keys.
-            if let Ok(root) = std::env::var("URSULA_COLD_ROOT")
+            let mut builder = opendal::services::S3::default().bucket(bucket);
+            if let Some(root) = config.root.as_deref()
                 && !root.trim().is_empty()
             {
-                builder = builder.root(&root);
+                builder = builder.root(root);
             }
-            if let Ok(region) = std::env::var("URSULA_COLD_S3_REGION")
+            if let Some(region) = s3.region.as_deref()
                 && !region.trim().is_empty()
             {
-                builder = builder.region(&region);
+                builder = builder.region(region);
             }
-            if let Ok(endpoint) = std::env::var("URSULA_COLD_S3_ENDPOINT")
+            if let Some(endpoint) = s3.endpoint.as_deref()
                 && !endpoint.trim().is_empty()
             {
-                builder = builder.endpoint(&endpoint);
+                builder = builder.endpoint(endpoint);
             }
-            if let Ok(access) = std::env::var("URSULA_COLD_S3_ACCESS_KEY_ID")
+            if let Some(access) = s3.access_key_id.as_deref()
                 && !access.trim().is_empty()
             {
-                builder = builder.access_key_id(&access);
+                builder = builder.access_key_id(access);
             }
-            if let Ok(secret) = std::env::var("URSULA_COLD_S3_SECRET_ACCESS_KEY")
+            if let Some(secret) = s3.secret_access_key.as_deref()
                 && !secret.trim().is_empty()
             {
-                builder = builder.secret_access_key(&secret);
+                builder = builder.secret_access_key(secret);
             }
-            if let Ok(token) = std::env::var("URSULA_COLD_S3_SESSION_TOKEN")
+            if let Some(token) = s3.session_token.as_deref()
                 && !token.trim().is_empty()
             {
-                builder = builder.session_token(&token);
+                builder = builder.session_token(token);
             }
             let operator = crate::cold_store::with_s3_resilience(
                 Operator::new(builder)
                     .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?
                     .finish(),
+                s3.timeout.as_duration(),
+                s3.max_retries,
             );
-            let prefix = std::env::var("URSULA_SNAPSHOT_S3_PREFIX")
-                .unwrap_or_else(|_| "snapshots".to_owned());
             Ok(Self::new(operator, prefix))
         }
 
@@ -325,18 +348,16 @@ mod s3 {
         /// S3 key unique per upload attempt without changing the openraft-visible
         /// snapshot_id.
         fn object_key(&self, key: &SnapshotKey) -> String {
-            use std::sync::atomic::AtomicU64;
-            use std::sync::atomic::Ordering;
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let nonce_nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let nonce_seq = COUNTER.fetch_add(1, Ordering::Relaxed);
             format!(
-                "{}/group-{}/{}-{nonce_nanos:032}-{nonce_seq:020}.snap",
-                self.prefix, key.raft_group_id, key.snapshot_id,
+                "{}/group-{}/{}",
+                self.prefix,
+                key.raft_group_id,
+                unique_snapshot_leaf(&key.snapshot_id),
             )
+        }
+
+        fn group_prefix(&self, raft_group_id: u32) -> String {
+            format!("{}/group-{raft_group_id}/", self.prefix)
         }
     }
 
@@ -402,6 +423,43 @@ mod s3 {
             })
         }
 
+        fn prune_retired<'a>(
+            &'a self,
+            raft_group_id: u32,
+            current: &'a SnapshotLocation,
+            retain_latest: usize,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            Box::pin(async move {
+                let SnapshotLocation::S3 {
+                    key: current_key, ..
+                } = current
+                else {
+                    return Ok(());
+                };
+                let prefix = self.group_prefix(raft_group_id);
+                let mut keys = self
+                    .operator
+                    .list(&prefix)
+                    .await
+                    .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?
+                    .into_iter()
+                    .filter(|entry| entry.metadata().is_file())
+                    .map(|entry| entry.path().to_owned())
+                    .filter(|key| key.ends_with(".snap") && key != current_key)
+                    .collect::<Vec<_>>();
+                keys.sort();
+                let delete_count = keys.len().saturating_sub(retain_latest);
+                for key in keys.into_iter().take(delete_count) {
+                    match self.operator.delete(&key).await {
+                        Ok(()) => {}
+                        Err(err) if matches!(err.kind(), opendal::ErrorKind::NotFound) => {}
+                        Err(err) => return Err(SnapshotStoreError::Backend(err.to_string())),
+                    }
+                }
+                Ok(())
+            })
+        }
+
         fn verify_uploaded<'a>(
             &'a self,
             location: &'a SnapshotLocation,
@@ -449,41 +507,41 @@ mod s3 {
 #[cfg(not(madsim))]
 pub use s3::S3SnapshotStore;
 
-/// Pick a snapshot store from env. Returns `None` when the backend is
-/// "inline" (the default) so callers can fall back to [`default_snapshot_store`]
-/// without instantiating anything.
-///
-/// Recognized values for `URSULA_SNAPSHOT_BACKEND`: `inline`, `local`, `s3`.
-/// Under `madsim`, only `inline` is recognized; the others have no I/O.
-pub fn snapshot_store_from_env() -> Result<Option<SharedSnapshotStore>, SnapshotStoreError> {
-    let backend = std::env::var("URSULA_SNAPSHOT_BACKEND")
-        .unwrap_or_else(|_| "inline".to_owned())
-        .to_ascii_lowercase();
-    match backend.as_str() {
-        "inline" | "default" | "" => Ok(None),
+/// Pick a snapshot store from a typed `ursula_config::RaftSnapshotConfig`. Returns `None`
+/// when the backend is "inline" (the default) so callers can fall back to
+/// [`default_snapshot_store`] without instantiating anything.
+pub fn snapshot_store_from_config(
+    cfg: &ursula_config::RaftSnapshotConfig,
+    cold_cfg: &crate::ColdConfig,
+) -> Result<Option<SharedSnapshotStore>, SnapshotStoreError> {
+    let _ = cold_cfg;
+    match cfg.backend {
+        ursula_config::RaftSnapshotBackend::Inline => Ok(None),
         #[cfg(not(madsim))]
-        "local" => {
-            let root = std::env::var("URSULA_SNAPSHOT_LOCAL_ROOT").map_err(|_| {
-                SnapshotStoreError::Backend(
-                    "URSULA_SNAPSHOT_LOCAL_ROOT is required for snapshot local backend".into(),
-                )
+        ursula_config::RaftSnapshotBackend::Local => {
+            let root = cfg.local_root.as_ref().ok_or_else(|| {
+                SnapshotStoreError::Backend("snapshot local_root required for local backend".into())
             })?;
-            if root.trim().is_empty() {
+            let root_str = root.to_string_lossy();
+            if root_str.trim().is_empty() {
                 return Err(SnapshotStoreError::Backend(
-                    "URSULA_SNAPSHOT_LOCAL_ROOT must not be empty".into(),
+                    "snapshot local_root must not be empty".into(),
                 ));
             }
             Ok(Some(Arc::new(LocalSnapshotStore::new(root))))
         }
         #[cfg(not(madsim))]
-        "s3" => Ok(Some(Arc::new(S3SnapshotStore::s3_from_env()?))),
+        ursula_config::RaftSnapshotBackend::S3 => {
+            let prefix = cfg.s3_prefix.as_deref().unwrap_or("snapshots");
+            Ok(Some(Arc::new(S3SnapshotStore::try_new(cold_cfg, prefix)?)))
+        }
         #[cfg(madsim)]
-        "local" | "s3" => Err(SnapshotStoreError::Backend(format!(
-            "URSULA_SNAPSHOT_BACKEND '{backend}' has no I/O under madsim; use 'inline'"
-        ))),
-        other => Err(SnapshotStoreError::Backend(format!(
-            "unsupported URSULA_SNAPSHOT_BACKEND '{other}' (expected inline | local | s3)"
-        ))),
+        ursula_config::RaftSnapshotBackend::Local | ursula_config::RaftSnapshotBackend::S3 => {
+            Err(SnapshotStoreError::Backend(format!(
+                "snapshot backend {:?} has no I/O under madsim; use 'inline'",
+                cfg.backend
+            )))
+        }
     }
 }
 
@@ -497,6 +555,7 @@ mod local {
     use super::SnapshotStore;
     use super::SnapshotStoreError;
     use super::SnapshotStoreFuture;
+    use super::unique_snapshot_leaf;
 
     /// Bytes live on the local filesystem under a root directory.
     #[derive(Debug, Clone)]
@@ -512,7 +571,11 @@ mod local {
         fn path_for(&self, key: SnapshotKey) -> PathBuf {
             self.root
                 .join(format!("group-{}", key.raft_group_id))
-                .join(key.filename())
+                .join(unique_snapshot_leaf(&key.snapshot_id))
+        }
+
+        fn group_dir(&self, raft_group_id: u32) -> PathBuf {
+            self.root.join(format!("group-{raft_group_id}"))
         }
     }
 
@@ -575,6 +638,52 @@ mod local {
                     Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
                     Err(err) => Err(SnapshotStoreError::Io(err)),
                 }
+            })
+        }
+
+        fn prune_retired<'a>(
+            &'a self,
+            raft_group_id: u32,
+            current: &'a SnapshotLocation,
+            retain_latest: usize,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            Box::pin(async move {
+                let SnapshotLocation::Local {
+                    path: current_path, ..
+                } = current
+                else {
+                    return Ok(());
+                };
+                let dir = self.group_dir(raft_group_id);
+                let mut read_dir = match tokio::fs::read_dir(&dir).await {
+                    Ok(read_dir) => read_dir,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Err(err) => return Err(SnapshotStoreError::Io(err)),
+                };
+                let mut paths = Vec::new();
+                while let Some(entry) = read_dir
+                    .next_entry()
+                    .await
+                    .map_err(SnapshotStoreError::Io)?
+                {
+                    let path = entry.path();
+                    if path == *current_path {
+                        continue;
+                    }
+                    if path.extension().and_then(|ext| ext.to_str()) == Some("snap") {
+                        paths.push(path);
+                    }
+                }
+                paths.sort();
+                let delete_count = paths.len().saturating_sub(retain_latest);
+                for path in paths.into_iter().take(delete_count) {
+                    match tokio::fs::remove_file(&path).await {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(SnapshotStoreError::Io(err)),
+                    }
+                }
+                Ok(())
             })
         }
     }
@@ -671,6 +780,58 @@ mod tests {
 
     #[cfg(not(madsim))]
     #[tokio::test]
+    async fn local_two_uploads_with_same_snapshot_id_get_different_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalSnapshotStore::new(dir.path());
+        let key1 = test_key(4, "group-4-T18-N3-264150");
+        let key2 = test_key(4, "group-4-T18-N3-264150");
+        let loc1 = store.upload(key1, b"body1".to_vec()).await.unwrap();
+        let loc2 = store.upload(key2, b"body2".to_vec()).await.unwrap();
+        let (path1, path2) = match (&loc1, &loc2) {
+            (
+                SnapshotLocation::Local { path: path1, .. },
+                SnapshotLocation::Local { path: path2, .. },
+            ) => (path1.clone(), path2.clone()),
+            _ => panic!("expected local locations"),
+        };
+        assert_ne!(
+            path1, path2,
+            "same snapshot_id must yield distinct local paths"
+        );
+        assert_eq!(store.download(&loc1).await.unwrap(), b"body1");
+        assert_eq!(store.download(&loc2).await.unwrap(), b"body2");
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn local_prune_retired_keeps_current_and_latest_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalSnapshotStore::new(dir.path());
+        let loc1 = store
+            .upload(test_key(7, "group-7-T1-N1-1"), b"one".to_vec())
+            .await
+            .unwrap();
+        let loc2 = store
+            .upload(test_key(7, "group-7-T1-N1-2"), b"two".to_vec())
+            .await
+            .unwrap();
+        let loc3 = store
+            .upload(test_key(7, "group-7-T1-N1-3"), b"three".to_vec())
+            .await
+            .unwrap();
+
+        store.prune_retired(7, &loc3, 1).await.unwrap();
+
+        assert!(matches!(
+            store.download(&loc1).await,
+            Err(SnapshotStoreError::NotFound(_))
+        ));
+        assert_eq!(store.download(&loc2).await.unwrap(), b"two");
+        assert_eq!(store.download(&loc3).await.unwrap(), b"three");
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
     async fn s3_memory_roundtrip() {
         let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
         let key = test_key(3, "group-3-T5-N2-9876");
@@ -744,30 +905,6 @@ mod tests {
             matches!(err, SnapshotStoreError::NotFound(_)),
             "expected NotFound after delete, got {err:?}"
         );
-    }
-
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn snapshot_store_from_env_inline_default() {
-        // No env set → inline default.
-        // Sanity check: clear any backend var that might leak from the host env.
-        // SAFETY: tests run single-threaded for env, and the value is restored
-        // below. The harness is expected to be single-threaded for env-based
-        // tests anyway.
-        let prev = std::env::var("URSULA_SNAPSHOT_BACKEND").ok();
-        // SAFETY: removing/setting env vars in a test guarded by single env
-        // mutation per test; the workspace test harness is multi-threaded but
-        // this test only inspects the absence path.
-        unsafe {
-            std::env::remove_var("URSULA_SNAPSHOT_BACKEND");
-        }
-        let result = snapshot_store_from_env().unwrap();
-        assert!(result.is_none());
-        if let Some(prev) = prev {
-            unsafe {
-                std::env::set_var("URSULA_SNAPSHOT_BACKEND", prev);
-            }
-        }
     }
 
     #[cfg(not(madsim))]

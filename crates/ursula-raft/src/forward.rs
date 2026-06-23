@@ -9,6 +9,8 @@ use prost::Message;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 use ursula_proto as raft_app_proto;
+use ursula_runtime::GetStreamAttrsRequest;
+use ursula_runtime::GetStreamAttrsResponse;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::GroupWriteCommand;
@@ -20,6 +22,7 @@ use ursula_runtime::ReadStreamResponse;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 
+use crate::codec::get_stream_attrs_response_from_proto;
 use crate::codec::group_engine_error_from_proto;
 use crate::codec::group_write_result_from_raft_response;
 use crate::codec::head_stream_response_from_proto;
@@ -101,6 +104,42 @@ pub(crate) async fn forward_read_stream_to_leader(
     } else {
         let err = raft_app_proto::GroupEngineErrorV1::decode(response.payload.as_slice())
             .map_err(|err| GroupEngineError::new(format!("decode forwarded read error: {err}")))?;
+        Err(group_engine_error_from_proto(err)?)
+    }
+}
+
+#[tracing::instrument(
+    name = "raft.forward_get_attrs",
+    skip_all,
+    fields(group = placement.raft_group_id.0, bucket = %request.stream_id.bucket_id, stream = %request.stream_id.stream_id),
+)]
+pub(crate) async fn forward_get_stream_attrs_to_leader(
+    placement: ShardPlacement,
+    leader_node: &BasicNode,
+    request: GetStreamAttrsRequest,
+) -> Result<GetStreamAttrsResponse, GroupEngineError> {
+    let response = forward_group_read_to_leader(
+        placement,
+        leader_node,
+        request.stream_id,
+        request.now_ms,
+        raft_internal_proto::group_read_request_v1::Read::GetStreamAttrs(
+            raft_internal_proto::GetStreamAttrsReadV1 {},
+        ),
+    )
+    .await?;
+    if response.ok {
+        let response = raft_internal_proto::GetStreamAttrsResponsePayloadV1::decode(
+            response.payload.as_slice(),
+        )
+        .map_err(|err| {
+            GroupEngineError::new(format!("decode forwarded get stream attrs response: {err}"))
+        })?;
+        get_stream_attrs_response_from_proto(response)
+    } else {
+        let err = raft_app_proto::GroupEngineErrorV1::decode(response.payload.as_slice()).map_err(
+            |err| GroupEngineError::new(format!("decode forwarded get stream attrs error: {err}")),
+        )?;
         Err(group_engine_error_from_proto(err)?)
     }
 }

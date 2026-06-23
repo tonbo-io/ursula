@@ -13,6 +13,7 @@ import argparse
 import hashlib
 import json
 import random
+import re
 import subprocess
 import sys
 import threading
@@ -62,7 +63,26 @@ IMPAIRMENT_SCENARIOS = {
     "cluster_netem_loss",
     "cluster_partition",
     "s3_unavailable",
+    # Process faults recover via systemd auto-restart (kill) or faultd thaw
+    # (freeze) — both driven by the clear_impairment recovery path, which clears
+    # every node and waits for the cluster to go ready again without needing an
+    # EC2 instance-state change. They must NOT use the stop/start state machine,
+    # which waits for instance_state to flip to "stopped" (it never does here:
+    # the instance stays running, only the ursula process restarts).
+    "process_kill",
+    "process_freeze",
+    "oneway_partition",
+    "netem_reorder",
+    "netem_duplicate",
 }
+# process_kill restarts a --raft-memory node, which must rebuild every raft group
+# from the S3 snapshot + peer logs (millions of entries) before it rejoins quorum
+# — minutes, not the seconds an impairment /clear takes. Reusing the normal
+# recovery SLO flags every node-crash recovery as slo_missed and trips
+# repair_failed even though the node recovers fine (observed on #526), so
+# catch-up scenarios get a much longer SLO.
+CATCH_UP_SCENARIOS = {"process_kill"}
+CATCH_UP_RECOVERY_SLO_SECS = 900
 # The public storage-backend=memory chaos run should keep a surviving quorum. Dropping
 # two nodes in a three-node cluster tests data-loss behavior rather than
 # recovery, especially when the leader is among the stopped nodes.
@@ -93,6 +113,12 @@ CLUSTER_IPS_BY_NAME = {
     "ursula-chaos-node-2": "172.31.31.150",
     "ursula-chaos-node-3": "172.31.47.237",
 }
+PRODUCER_SEQ_CONFLICT_RE = re.compile(
+    r"ProducerSeqConflict: producer '([^']+)' expected sequence (\d+), received (\d+)"
+)
+# systemd unit running the ursula node process on each node, targeted by the
+# process kill/freeze faults (faultd runs `systemctl` against it).
+NODE_SERVICE_UNIT = "ursula-chaos.service"
 SETSUM_PRIMES = [
     4294967291,
     4294967279,
@@ -339,6 +365,7 @@ class WorkloadStream:
     name: str
     next_offset: int = 0
     verified_offsets: int = 0
+    needs_integrity_resync: bool = False
     expected_live_setsum: Setsum | None = None
     producer_epochs: dict[str, int] | None = None
     producer_seqs: dict[str, int] | None = None
@@ -582,21 +609,117 @@ class ChaosAgent:
         previous_next_offset: int,
         end_offset: int,
         payload: bytes,
-    ) -> None:
+    ) -> bool:
         if not payload or end_offset <= previous_next_offset:
-            return
+            return True
         payload_len = len(payload)
         span = end_offset - previous_next_offset
-        if span % payload_len != 0:
-            self.record_expected_append(stream, end_offset - payload_len, end_offset, payload)
-            return
-        for record_start_offset in range(previous_next_offset, end_offset, payload_len):
-            self.record_expected_append(
-                stream,
-                record_start_offset,
-                record_start_offset + payload_len,
-                payload,
+        if span != payload_len:
+            return False
+        self.record_expected_append(
+            stream,
+            previous_next_offset,
+            end_offset,
+            payload,
+        )
+        return True
+
+    @staticmethod
+    def parse_producer_seq_conflict(body: bytes) -> tuple[str, int, int] | None:
+        body_preview = body[:240].decode("utf-8", errors="replace")
+        match = PRODUCER_SEQ_CONFLICT_RE.search(body_preview)
+        if match is None:
+            return None
+        return match.group(1), int(match.group(2)), int(match.group(3))
+
+    def resync_stream_from_server(self, stream: WorkloadStream) -> bool:
+        samples: list[tuple[int, int, str]] = []
+        last_error: str | None = None
+        for node in self.nodes:
+            try:
+                status, _, headers = self.request("HEAD", f"{node.base_url}/{BUCKET}/{stream.name}")
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"{node.name} head failed: {exc}"
+                continue
+            if status != 200:
+                last_error = f"{node.name} head status={status}"
+                continue
+            next_offset = parse_int(headers.get("stream-next-offset"))
+            total_records = parse_int(headers.get("stream-integrity-total-records")) or 0
+            total_setsum = headers.get("stream-integrity-total-setsum")
+            if next_offset is None or total_setsum is None:
+                last_error = f"{node.name} head missing stream-next-offset or total setsum"
+                continue
+            samples.append((total_records, next_offset, total_setsum))
+        if not samples:
+            self.event(
+                "warn",
+                f"producer conflict resync skipped for {stream.name}: "
+                f"{last_error or 'no server integrity sample'}",
             )
+            return False
+        total_records, next_offset, total_setsum = max(samples, key=lambda sample: (sample[0], sample[1]))
+        try:
+            expected_setsum = Setsum()
+            expected_setsum.load_hex(total_setsum)
+        except ValueError as exc:
+            self.event(
+                "warn",
+                f"producer conflict resync skipped for {stream.name}: invalid server setsum {exc}",
+            )
+            return False
+        with self.state_lock:
+            stream.next_offset = next_offset
+            stream.expected_live_setsum = expected_setsum
+            stream.needs_integrity_resync = False
+            stream.pending_producer_appends.clear()
+            stream.verified_offsets = min(stream.verified_offsets, next_offset)
+        return True
+
+    def recover_producer_seq_conflict(
+        self,
+        stream: WorkloadStream,
+        producer: ProducerState,
+        *,
+        expected_seq: int,
+        received_seq: int,
+    ) -> bool:
+        prefix = f"{producer.producer_id}\0"
+        with self.state_lock:
+            affected_streams = [stream]
+            affected_streams.extend(
+                workload_stream
+                for workload_stream in self.streams
+                if workload_stream is not stream
+                and any(
+                    key.startswith(prefix)
+                    for key in workload_stream.pending_producer_appends
+                )
+            )
+        for workload_stream in affected_streams:
+            if not self.resync_stream_from_server(workload_stream):
+                return False
+        with self.state_lock:
+            old_epoch = producer.epoch
+            producer.epoch += 1
+            producer.seq = 0
+            for workload_stream in self.streams:
+                workload_stream.producer_seqs[producer.producer_id] = 0
+                workload_stream.producer_epochs[producer.producer_id] = producer.epoch
+                stale_keys = [
+                    key for key in workload_stream.pending_producer_appends
+                    if key.startswith(prefix)
+                ]
+                for key in stale_keys:
+                    workload_stream.pending_producer_appends.pop(key, None)
+            new_epoch = producer.epoch
+        self.event(
+            "warn",
+            f"recovered producer sequence conflict for {producer.producer_id} on {stream.name}: "
+            f"server expected {expected_seq}, agent sent {received_seq}; "
+            f"bumped epoch {old_epoch}->{new_epoch}",
+        )
+        return True
 
     def request(
         self,
@@ -730,6 +853,7 @@ class ChaosAgent:
         saw_cold_backpressure = False
         saw_hard_error = False
         saw_transient_failure = False
+        producer_seq_conflict: tuple[int, int] | None = None
         retry_deadline = time.monotonic() + APPEND_TRANSIENT_RETRY_SECS
         while True:
             retryable_sweep = False
@@ -755,6 +879,13 @@ class ChaosAgent:
                 if status not in {200, 204}:
                     body_preview = body[:160].decode("utf-8", errors="replace").strip()
                     last_error = f"{node.name}: status={status} body={body_preview!r}"
+                    conflict = self.parse_producer_seq_conflict(body)
+                    if (
+                        status == 409
+                        and conflict is not None
+                        and conflict[0] == producer_id
+                    ):
+                        producer_seq_conflict = (conflict[1], conflict[2])
                     if status == 503 and "ColdBackpressure" in body_preview:
                         saw_cold_backpressure = True
                     elif self.is_transient_append_failure(status, body, headers):
@@ -778,29 +909,33 @@ class ChaosAgent:
                     ) from exc
                 end_offset = next_offset_value
                 committed_new_record = status == 200
+                needs_resync = False
+                resync_reason = ""
                 with self.state_lock:
                     pending_payload = stream.pending_producer_appends.pop(pending_key, None)
                     if committed_new_record:
                         previous_next_offset = stream.next_offset
                         stream.next_offset = max(stream.next_offset, end_offset)
-                        self.record_expected_append_span(
+                        needs_resync = not self.record_expected_append_span(
                             stream,
                             previous_next_offset,
                             end_offset,
                             payload,
                         )
+                        resync_reason = "new append response"
                     elif pending_payload is not None:
                         # 204 is a producer dedup acknowledgement. If the original
                         # append timed out but committed, account the original
                         # payload once the dedup response proves it.
                         previous_next_offset = stream.next_offset
                         stream.next_offset = max(stream.next_offset, end_offset)
-                        self.record_expected_append_span(
+                        needs_resync = not self.record_expected_append_span(
                             stream,
                             previous_next_offset,
                             end_offset,
                             pending_payload,
                         )
+                        resync_reason = "dedup response with pending payload"
                     else:
                         previous_next_offset = stream.next_offset
                         stream.next_offset = max(stream.next_offset, end_offset)
@@ -809,12 +944,13 @@ class ChaosAgent:
                             # agent sees for this producer seq. The payload is
                             # deterministic for the seq, so account it when the
                             # response advances our stream view.
-                            self.record_expected_append_span(
+                            needs_resync = not self.record_expected_append_span(
                                 stream,
                                 previous_next_offset,
                                 end_offset,
                                 payload,
                             )
+                            resync_reason = "dedup response without pending payload"
                     producer.last_seq = producer_seq
                     producer.last_stream = stream.name
                     producer.last_append_ordinal = producer_seq
@@ -832,6 +968,16 @@ class ChaosAgent:
                         self.lane_attempts[lane] += 1
                         self.lane_unresolved_appends[lane] = False
                     self.append_success += 1
+                if needs_resync:
+                    span = max(0, end_offset - previous_next_offset)
+                    self.event(
+                        "warn",
+                        f"resyncing expected setsum for {stream_name}: "
+                        f"ambiguous {resync_reason} span={span} payload_len={len(payload)}",
+                    )
+                    if not self.resync_stream_from_server(stream):
+                        with self.state_lock:
+                            stream.needs_integrity_resync = True
                 return True
             if (
                 not retryable_sweep
@@ -845,6 +991,22 @@ class ChaosAgent:
         # commit, so the append is resolved (not unknown) and is recorded as a
         # shed rather than a workload error.
         is_pure_shed = saw_cold_backpressure and not saw_hard_error and not saw_transient_failure
+        if producer_seq_conflict is not None:
+            expected_seq, received_seq = producer_seq_conflict
+            if self.recover_producer_seq_conflict(
+                stream,
+                producer,
+                expected_seq=expected_seq,
+                received_seq=received_seq,
+            ):
+                with self.state_lock:
+                    if lane_id is None:
+                        self.global_unresolved_append = False
+                    else:
+                        lane = lane_id % self.append_workers
+                        self.lane_unresolved_appends[lane] = False
+                        self.lane_attempts[lane] += 1
+                return False
         with self.state_lock:
             if is_pure_shed:
                 self.append_shed += 1
@@ -969,6 +1131,7 @@ class ChaosAgent:
     def verify_integrity(self) -> None:
         if self.workload_probes_paused():
             return
+        self.retry_pending_integrity_resyncs()
         with self.state_lock:
             has_unknown_appends = self.has_unknown_appends_locked()
         if has_unknown_appends:
@@ -1129,8 +1292,26 @@ class ChaosAgent:
                 f"producer append probe failed: status={status} next_offset={next_offset}",
             )
             return
+        needs_resync = False
         with self.state_lock:
+            previous_next_offset = stream.next_offset
             stream.next_offset = max(stream.next_offset, next_offset)
+            needs_resync = not self.record_expected_append_span(
+                stream,
+                previous_next_offset,
+                next_offset,
+                payload,
+            )
+        if needs_resync:
+            span = max(0, next_offset - previous_next_offset)
+            self.event(
+                "warn",
+                f"resyncing expected setsum for {stream.name}: "
+                f"ambiguous producer probe span={span} payload_len={len(payload)}",
+            )
+            if not self.resync_stream_from_server(stream):
+                with self.state_lock:
+                    stream.needs_integrity_resync = True
 
         status, _, headers = self.request(
             "POST",
@@ -1145,8 +1326,26 @@ class ChaosAgent:
         )
         duplicate_next = parse_int(response_header(headers, "Stream-Next-Offset"))
         if status == 200 and duplicate_next is not None and duplicate_next > next_offset:
+            needs_resync = False
             with self.state_lock:
+                previous_next_offset = stream.next_offset
                 stream.next_offset = max(stream.next_offset, duplicate_next)
+                needs_resync = not self.record_expected_append_span(
+                    stream,
+                    previous_next_offset,
+                    duplicate_next,
+                    payload,
+                )
+            if needs_resync:
+                span = max(0, duplicate_next - previous_next_offset)
+                self.event(
+                    "warn",
+                    f"resyncing expected setsum for {stream.name}: "
+                    f"ambiguous producer duplicate span={span} payload_len={len(payload)}",
+                )
+                if not self.resync_stream_from_server(stream):
+                    with self.state_lock:
+                        stream.needs_integrity_resync = True
             self.record_producer_probe_skipped(
                 f"producer duplicate_seq probe skipped (state lost): "
                 f"status={status} next_offset={duplicate_next} expected={next_offset}"
@@ -1197,7 +1396,19 @@ class ChaosAgent:
             self.global_unresolved_append
             or any(self.lane_unresolved_appends)
             or any(stream.pending_producer_appends for stream in self.streams)
+            or any(stream.needs_integrity_resync for stream in self.streams)
+            or self.producer_probe_stream.needs_integrity_resync
         )
+
+    def retry_pending_integrity_resyncs(self) -> None:
+        with self.state_lock:
+            streams = [
+                stream
+                for stream in [*self.streams, self.producer_probe_stream]
+                if stream.needs_integrity_resync
+            ]
+        for stream in streams:
+            self.resync_stream_from_server(stream)
 
     def verify_server_integrity(self, stream: WorkloadStream) -> str:
         with self.state_lock:
@@ -2012,6 +2223,69 @@ class ChaosAgent:
                 ) and applied
             self.mark_current_injection_apply_result(applied)
             return
+        if scenario == "process_kill":
+            applied = True
+            for node in targets:
+                applied = self.apply_node_impairment(
+                    node, {"kind": "process", "action": "kill", "units": [NODE_SERVICE_UNIT]}
+                ) and applied
+            self.mark_current_injection_apply_result(applied)
+            return
+        if scenario == "process_freeze":
+            applied = True
+            for node in targets:
+                applied = self.apply_node_impairment(
+                    node, {"kind": "process", "action": "freeze", "units": [NODE_SERVICE_UNIT]}
+                ) and applied
+            self.mark_current_injection_apply_result(applied)
+            return
+        if scenario == "oneway_partition":
+            peer_cluster_ips = [
+                CLUSTER_IPS_BY_NAME[node.name]
+                for node in self.nodes
+                if node not in targets and node.name in CLUSTER_IPS_BY_NAME
+            ]
+            if not peer_cluster_ips:
+                self.event("warn", "oneway_partition: no cluster IPs known for peers; skipping")
+                self.mark_current_injection_apply_result(False)
+                return
+            applied = True
+            for node in targets:
+                applied = self.apply_node_impairment(
+                    node,
+                    {"kind": "partition", "direction": "inbound", "peer_hosts": peer_cluster_ips},
+                ) and applied
+            self.mark_current_injection_apply_result(applied)
+            return
+        if scenario == "netem_reorder":
+            applied = True
+            for node in targets:
+                applied = self.apply_node_impairment(
+                    node,
+                    {
+                        "kind": "netem",
+                        "scope": "cluster",
+                        "delay_ms": 50,
+                        "reorder_percent": 25,
+                        "cluster_subnets": CLUSTER_SUBNETS,
+                    },
+                ) and applied
+            self.mark_current_injection_apply_result(applied)
+            return
+        if scenario == "netem_duplicate":
+            applied = True
+            for node in targets:
+                applied = self.apply_node_impairment(
+                    node,
+                    {
+                        "kind": "netem",
+                        "scope": "cluster",
+                        "duplicate_percent": 1,
+                        "cluster_subnets": CLUSTER_SUBNETS,
+                    },
+                ) and applied
+            self.mark_current_injection_apply_result(applied)
+            return
         self.event("warn", f"unknown fault scenario {scenario}; falling back to clean stop")
         run(["aws", "ec2", "stop-instances", "--instance-ids", *[node.instance_id for node in targets]], check=False)
 
@@ -2045,7 +2319,11 @@ class ChaosAgent:
             )
             if host
         ]
-        return {"kind": "clear", "peer_hosts": list(dict.fromkeys(peer_hosts))}
+        return {
+            "kind": "clear",
+            "peer_hosts": list(dict.fromkeys(peer_hosts)),
+            "units": [NODE_SERVICE_UNIT],
+        }
 
     def clear_node_impairment(self, node: Node) -> bool:
         payload = self.faultd_clear_payload()
@@ -2388,6 +2666,46 @@ class ChaosAgent:
                 reasons.append(f"{cold_backpressure_event_delta} cold write backpressure events since last publish")
         return not reasons, reasons
 
+    @staticmethod
+    def _overall_status(
+        *,
+        integrity_status: str,
+        running_nodes: int,
+        metrics_ok: int,
+        fully_healthy: bool,
+        has_active_fault: bool,
+        serving_on_quorum: bool,
+        workload_started: bool,
+    ) -> str:
+        # partial_outage means the majority is up but the data plane is NOT
+        # serving (writes stalled). It must NOT be driven by full_raft_nodes,
+        # which sags on every fault injection while the quorum keeps committing
+        # writes — see serving_on_quorum in build_status.
+        if integrity_status != "operational" or running_nodes < 2 or metrics_ok < 2:
+            return "major_outage"
+        if fully_healthy and not has_active_fault:
+            return "operational"
+        if serving_on_quorum:
+            return "degraded_performance"
+        if running_nodes >= 2 and not workload_started:
+            # Startup grace: the agent's own workload hasn't begun yet (no
+            # successful append this run), so append_success_delta is 0 and would
+            # otherwise read as a write stall. With the majority up and metrics
+            # healthy that's the agent ramping up, not a cluster outage —
+            # without this, every agent restart (e.g. a deploy) stamps false
+            # partial_outage hours into the history.
+            return "operational"
+        if running_nodes >= 2:
+            return "partial_outage"
+        return "major_outage"
+
+    def effective_recovery_slo_secs(self, scenario: str | None) -> int:
+        # Node-crash (catch-up) scenarios rebuild raft-memory state from S3 + peer
+        # logs and need far longer than an impairment /clear; see CATCH_UP_SCENARIOS.
+        if scenario in CATCH_UP_SCENARIOS:
+            return max(self.recovery_slo_secs, CATCH_UP_RECOVERY_SLO_SECS)
+        return self.recovery_slo_secs
+
     def build_status(self) -> dict[str, Any]:
         self.reconcile_active_fault_from_injection(utc_now())
         nodes = [self.sample_node(node) for node in self.nodes]
@@ -2478,6 +2796,16 @@ class ChaosAgent:
             reasons.append(self.last_integrity_error or "integrity check failed")
 
         quorum_healthy = running_nodes >= 2 and metrics_ok >= 2 and full_raft_nodes >= 2
+        # overall status keys off whether the data plane is actually serving on a
+        # majority, NOT off full_raft_nodes. That metric sags to 0/3-1/3 on every
+        # fault injection (a node catching up or briefly unreachable makes the
+        # agent's whole-cluster raft-view sample read low) even while the 2/3
+        # quorum commits writes fine — gating partial_outage on it turned every
+        # injection into a false outage across whole hours. partial_outage now
+        # means the majority is up but writes are NOT progressing (a real serving
+        # failure); full_raft_nodes still gates the stricter `fully_healthy`
+        # (operational) check above.
+        serving_on_quorum = running_nodes >= 2 and metrics_ok >= 2 and workload_progressing
         fully_healthy = (
             running_nodes == expected_nodes
             and metrics_ok == expected_nodes
@@ -2506,16 +2834,15 @@ class ChaosAgent:
             and workload_progressing
             and integrity_status == "operational"
         )
-        if integrity_status != "operational" or running_nodes < 2 or metrics_ok < 2:
-            overall = "major_outage"
-        elif fully_healthy and self.active_fault is None:
-            overall = "operational"
-        elif quorum_healthy and workload_progressing:
-            overall = "degraded_performance"
-        elif running_nodes >= 2:
-            overall = "partial_outage"
-        else:
-            overall = "major_outage"
+        overall = self._overall_status(
+            integrity_status=integrity_status,
+            running_nodes=running_nodes,
+            metrics_ok=metrics_ok,
+            fully_healthy=fully_healthy,
+            has_active_fault=self.active_fault is not None,
+            serving_on_quorum=serving_on_quorum,
+            workload_started=self.append_success > 0,
+        )
         active_fault = self.active_fault_label()
         published_at = utc_now()
         status_interval_secs = self.status_every
@@ -2569,11 +2896,12 @@ class ChaosAgent:
                     }
                 )
             start_requested_at = parse_iso(injection.get("start_requested_at"))
+            effective_slo = self.effective_recovery_slo_secs(injection.get("scenario"))
             if (
                 start_requested_at is not None
                 and injection.get("recovered_at") is None
                 and injection.get("slo_missed_at") is None
-                and (utc_now() - start_requested_at).total_seconds() > self.recovery_slo_secs
+                and (utc_now() - start_requested_at).total_seconds() > effective_slo
             ):
                 expected_revert_detection = injection.get("expected_result") == "revert_detection"
                 injection["status"] = "detected" if expected_revert_detection else "slo_missed"
@@ -2586,7 +2914,7 @@ class ChaosAgent:
                         "message": (
                             "revert protection detected; node did not recover without allow-next-revert"
                             if expected_revert_detection
-                            else f"recovery exceeded {self.recovery_slo_secs}s SLO"
+                            else f"recovery exceeded {effective_slo}s SLO"
                         ),
                     }
                 )
@@ -2605,7 +2933,7 @@ class ChaosAgent:
                 injection["slo_met"] = (
                     injection.get("slo_missed_at") is None
                     and recovery_ms is not None
-                    and recovery_ms <= self.recovery_slo_secs * 1000
+                    and recovery_ms <= effective_slo * 1000
                 )
                 injection["timeline"].append(
                     {

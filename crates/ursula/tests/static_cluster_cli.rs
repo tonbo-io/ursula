@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -18,6 +19,7 @@ struct ChildGuard {
     child: Child,
     label: String,
     stderr_path: PathBuf,
+    config_path: Option<PathBuf>,
 }
 
 impl Drop for ChildGuard {
@@ -26,6 +28,9 @@ impl Drop for ChildGuard {
         let _ = self.child.wait();
         if !std::thread::panicking() {
             let _ = std::fs::remove_file(&self.stderr_path);
+            if let Some(config) = &self.config_path {
+                let _ = std::fs::remove_file(config);
+            }
         }
     }
 }
@@ -107,12 +112,12 @@ async fn cli_static_grpc_raft_log_dir_recovers_after_restart() {
     ));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create temp root");
-    let config_path = root.join("cluster.json");
+    let config_path = root.join("cluster.toml");
     let log_dir = root.join("raft-log");
 
-    write_single_node_cluster_config(&config_path, &base_url, true);
+    write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, true, &log_dir);
     {
-        let mut child = spawn_node_with_cluster_config(binary, port, 1, &config_path, &log_dir);
+        let mut child = spawn_node_with_cluster_config(binary, &config_path);
         let client = reqwest::Client::new();
         wait_until_ready(&client, &base_url, std::slice::from_mut(&mut child)).await;
         put_until_created(&client, &format!("{base_url}/benchcmp/cli-durable-restart")).await;
@@ -124,7 +129,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_after_restart() {
         .await;
     }
 
-    let journal_path = log_dir.join("core-0").join("journal.bin");
+    let journal_path = log_dir.join("raft-log").join("core-0").join("journal.bin");
     assert!(journal_path.exists(), "core journal should exist");
     assert!(
         std::fs::metadata(&journal_path)
@@ -134,9 +139,9 @@ async fn cli_static_grpc_raft_log_dir_recovers_after_restart() {
         "core journal should contain records"
     );
 
-    write_single_node_cluster_config(&config_path, &base_url, false);
+    write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, false, &log_dir);
     {
-        let mut child = spawn_node_with_cluster_config(binary, port, 1, &config_path, &log_dir);
+        let mut child = spawn_node_with_cluster_config(binary, &config_path);
         let client = reqwest::Client::new();
         wait_until_ready(&client, &base_url, std::slice::from_mut(&mut child)).await;
         let payload = read_until_replicated(
@@ -180,16 +185,25 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
     std::fs::create_dir_all(&root).expect("create temp root");
 
     let mut configs = Vec::new();
-    for (node_id, _) in &peers {
-        let config_path = root.join(format!("node-{node_id}.json"));
-        write_cluster_config(&config_path, *node_id, &peers, *node_id == 1);
+    for (index, (node_id, _)) in peers.iter().enumerate() {
+        let config_path = root.join(format!("node-{node_id}.toml"));
+        let log_dir = root.join(format!("node-{node_id}-log"));
+        write_cluster_config(
+            &config_path,
+            ports[index],
+            *node_id,
+            4,
+            &peers,
+            *node_id == 1,
+            &log_dir,
+        );
         configs.push(config_path);
     }
 
     let mut children = vec![
-        spawn_node_with_cluster_config(binary, ports[1], 4, &configs[1], &root.join("node-2-log")),
-        spawn_node_with_cluster_config(binary, ports[2], 4, &configs[2], &root.join("node-3-log")),
-        spawn_node_with_cluster_config(binary, ports[0], 4, &configs[0], &root.join("node-1-log")),
+        spawn_node_with_cluster_config(binary, &configs[1]),
+        spawn_node_with_cluster_config(binary, &configs[2]),
+        spawn_node_with_cluster_config(binary, &configs[0]),
     ];
 
     let client = reqwest::Client::new();
@@ -227,6 +241,7 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
     for node_id in 1..=3 {
         let journal_path = root
             .join(format!("node-{node_id}-log"))
+            .join("raft-log")
             .join("core-0")
             .join("journal.bin");
         let mut last_len = 0u64;
@@ -287,28 +302,40 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create temp root");
 
-    let node1_config = root.join("node-1.json");
-    let node2_config = root.join("node-2.json");
-    let node3_config = root.join("node-3.json");
-    write_cluster_config(&node1_config, 1, &initial_peers, true);
-    write_cluster_config(&node2_config, 2, &initial_peers, false);
-    write_cluster_config(&node3_config, 3, &peers, false);
+    let node1_config = root.join("node-1.toml");
+    let node2_config = root.join("node-2.toml");
+    let node3_config = root.join("node-3.toml");
+    write_cluster_config(
+        &node1_config,
+        ports[0],
+        1,
+        1,
+        &initial_peers,
+        true,
+        &root.join("node-1-log"),
+    );
+    write_cluster_config(
+        &node2_config,
+        ports[1],
+        2,
+        1,
+        &initial_peers,
+        false,
+        &root.join("node-2-log"),
+    );
+    write_cluster_config(
+        &node3_config,
+        ports[2],
+        3,
+        1,
+        &peers,
+        false,
+        &root.join("node-3-log"),
+    );
 
     let mut children = vec![
-        spawn_node_with_cluster_config(
-            binary,
-            ports[1],
-            1,
-            &node2_config,
-            &root.join("node-2-log"),
-        ),
-        spawn_node_with_cluster_config(
-            binary,
-            ports[0],
-            1,
-            &node1_config,
-            &root.join("node-1-log"),
-        ),
+        spawn_node_with_cluster_config(binary, &node2_config),
+        spawn_node_with_cluster_config(binary, &node1_config),
     ];
 
     let client = reqwest::Client::new();
@@ -359,13 +386,7 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
         .expect("trigger leader purge");
     assert_eq!(purge.status(), reqwest::StatusCode::OK);
 
-    children.push(spawn_node_with_cluster_config(
-        binary,
-        ports[2],
-        1,
-        &node3_config,
-        &root.join("node-3-log"),
-    ));
+    children.push(spawn_node_with_cluster_config(binary, &node3_config));
     wait_until_ready(&client, &peers[2].1, &mut children).await;
 
     let add_learner = client
@@ -424,12 +445,6 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
         .expect("system time after unix epoch")
         .as_nanos();
     let cold_root = format!("ursula-cli-s3-cold-restart/{suffix}");
-    let cold_store =
-        ColdStore::s3_from_env_with_root(Some(&cold_root)).expect("S3 cold store from env");
-    cold_store
-        .remove_all("")
-        .await
-        .expect("clear S3 cold test root before run");
 
     let ports = [free_port(), free_port(), free_port()];
     let peers: Vec<(u64, String)> = ports
@@ -450,38 +465,40 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
     std::fs::create_dir_all(&root).expect("create temp root");
 
     let mut configs = Vec::new();
-    for (node_id, _) in &peers {
-        let config_path = root.join(format!("node-{node_id}.json"));
-        write_cluster_config(&config_path, *node_id, &peers, *node_id == 1);
+    for (index, (node_id, _)) in peers.iter().enumerate() {
+        let config_path = root.join(format!("node-{node_id}.toml"));
+        let log_dir = root.join(format!("node-{node_id}-log"));
+        write_node_toml(
+            &config_path,
+            ports[index],
+            *node_id,
+            1,
+            &peers,
+            *node_id == 1,
+            "disk",
+            Some(&log_dir),
+            "s3",
+            Some(&cold_root),
+        );
         configs.push(config_path);
     }
 
+    let config = ursula_config::load_config(Some(&configs[0]), None, None)
+        .unwrap_or_else(|err| panic!("load config for cold store: {err}"));
+    let cold_store = Arc::new(
+        ColdStore::try_new(&config.storage.cold)
+            .unwrap_or_else(|err| panic!("cold store creation failed: {err}")),
+    );
+    cold_store
+        .remove_all("")
+        .await
+        .expect("clear S3 cold test root before run");
+
     {
         let mut children = vec![
-            spawn_node_with_cluster_config_and_cold_s3(
-                binary,
-                ports[1],
-                1,
-                &configs[1],
-                &root.join("node-2-log"),
-                &cold_root,
-            ),
-            spawn_node_with_cluster_config_and_cold_s3(
-                binary,
-                ports[2],
-                1,
-                &configs[2],
-                &root.join("node-3-log"),
-                &cold_root,
-            ),
-            spawn_node_with_cluster_config_and_cold_s3(
-                binary,
-                ports[0],
-                1,
-                &configs[0],
-                &root.join("node-1-log"),
-                &cold_root,
-            ),
+            spawn_node_with_cluster_config_and_cold_s3(binary, &configs[1]),
+            spawn_node_with_cluster_config_and_cold_s3(binary, &configs[2]),
+            spawn_node_with_cluster_config_and_cold_s3(binary, &configs[0]),
         ];
 
         let client = reqwest::Client::new();
@@ -518,41 +535,27 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
         drop(children);
     }
 
-    for (node_id, _) in &peers {
-        write_cluster_config(
-            &configs[usize::try_from(*node_id - 1).expect("node index fits usize")],
+    for (index, (node_id, _)) in peers.iter().enumerate() {
+        let log_dir = root.join(format!("node-{node_id}-log"));
+        write_node_toml(
+            &configs[index],
+            ports[index],
             *node_id,
+            1,
             &peers,
             false,
+            "disk",
+            Some(&log_dir),
+            "s3",
+            Some(&cold_root),
         );
     }
 
     {
         let mut children = vec![
-            spawn_node_with_cluster_config_and_cold_s3(
-                binary,
-                ports[1],
-                1,
-                &configs[1],
-                &root.join("node-2-log"),
-                &cold_root,
-            ),
-            spawn_node_with_cluster_config_and_cold_s3(
-                binary,
-                ports[2],
-                1,
-                &configs[2],
-                &root.join("node-3-log"),
-                &cold_root,
-            ),
-            spawn_node_with_cluster_config_and_cold_s3(
-                binary,
-                ports[0],
-                1,
-                &configs[0],
-                &root.join("node-1-log"),
-                &cold_root,
-            ),
+            spawn_node_with_cluster_config_and_cold_s3(binary, &configs[1]),
+            spawn_node_with_cluster_config_and_cold_s3(binary, &configs[2]),
+            spawn_node_with_cluster_config_and_cold_s3(binary, &configs[0]),
         ];
         let client = reqwest::Client::new();
         for (_, base_url) in &peers {
@@ -604,6 +607,114 @@ fn free_port() -> u16 {
     panic!("failed to reserve a unique local port");
 }
 
+fn write_node_toml(
+    path: &Path,
+    port: u16,
+    node_id: u64,
+    raft_group_count: usize,
+    peers: &[(u64, String)],
+    init_membership: bool,
+    wal_backend: &str,
+    wal_path: Option<&Path>,
+    cold_backend: &str,
+    cold_root: Option<&str>,
+) {
+    use std::fmt::Write;
+
+    let mut config = String::new();
+
+    writeln!(
+        config,
+        r#"[server]
+listen = "127.0.0.1:{port}"
+"#
+    )
+    .unwrap();
+
+    writeln!(
+        config,
+        r#"[runtime]
+core_count = 1
+"#
+    )
+    .unwrap();
+
+    writeln!(
+        config,
+        r#"[raft]
+node_id = {node_id}
+group_count = {raft_group_count}
+init_membership = {init_membership}
+init_membership_per_group = false
+"#
+    )
+    .unwrap();
+
+    writeln!(
+        config,
+        r#"[raft.wal]
+backend = "{wal_backend}""#
+    )
+    .unwrap();
+    if let Some(p) = wal_path {
+        writeln!(config, r#"path = "{}""#, p.display()).unwrap();
+    }
+    config.push('\n');
+
+    for (peer_id, peer_url) in peers {
+        writeln!(
+            config,
+            r#"[[raft.peers]]
+node_id = {peer_id}
+url = "{peer_url}"
+"#
+        )
+        .unwrap();
+    }
+
+    writeln!(
+        config,
+        r#"[storage.cold]
+backend = "{cold_backend}"
+flush_interval = "1s"
+gc_interval = "1s"
+"#
+    )
+    .unwrap();
+
+    if let Some(root) = cold_root {
+        writeln!(config, r#"root = "{root}""#).unwrap();
+    }
+
+    if cold_backend == "s3" {
+        writeln!(
+            config,
+            r#"
+[storage.cold.s3]"#
+        )
+        .unwrap();
+        for name in [
+            "URSULA_COLD_S3_BUCKET",
+            "URSULA_COLD_S3_REGION",
+            "URSULA_COLD_S3_ENDPOINT",
+            "URSULA_COLD_S3_ACCESS_KEY_ID",
+            "URSULA_COLD_S3_SECRET_ACCESS_KEY",
+            "URSULA_COLD_S3_SESSION_TOKEN",
+        ] {
+            if let Ok(value) = std::env::var(name) {
+                let key = name
+                    .strip_prefix("URSULA_COLD_S3_")
+                    .unwrap_or(name)
+                    .to_ascii_lowercase();
+                let escaped = toml::Value::String(value).to_string();
+                writeln!(config, "{key} = {escaped}").unwrap();
+            }
+        }
+    }
+
+    std::fs::write(path, config).expect("write node toml config");
+}
+
 fn spawn_node(
     binary: &str,
     node_id: u64,
@@ -611,84 +722,42 @@ fn spawn_node(
     peers: &[(u64, String)],
     init_membership: bool,
 ) -> ChildGuard {
+    let config_path = std::env::temp_dir().join(format!(
+        "ursula-node-{node_id}-{port}-{}.toml",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_nanos()
+    ));
+    write_node_toml(
+        &config_path,
+        port,
+        node_id,
+        4,
+        peers,
+        init_membership,
+        "memory",
+        None,
+        "memory",
+        None,
+    );
     let mut command = Command::new(binary);
-    command
-        .arg("--listen")
-        .arg(format!("127.0.0.1:{port}"))
-        .arg("--core-count")
-        .arg("1")
-        .arg("--raft-group-count")
-        .arg("4")
-        .arg("--raft-memory")
-        .arg("--raft-node-id")
-        .arg(node_id.to_string())
-        .env("URSULA_COLD_BACKEND", "memory")
-        .env("URSULA_COLD_FLUSH_INTERVAL_MS", "0");
-    for (peer_id, peer_url) in peers {
-        command
-            .arg("--raft-peer")
-            .arg(format!("{peer_id}={peer_url}"));
-    }
-    if init_membership {
-        command.arg("--raft-init-membership");
-    }
-    spawn_child(command, format!("memory-node-{node_id}-{port}"))
+    command.arg("--config").arg(&config_path);
+    let mut guard = spawn_child(command, format!("memory-node-{node_id}-{port}"));
+    guard.config_path = Some(config_path);
+    guard
 }
 
-fn spawn_node_with_cluster_config(
-    binary: &str,
-    port: u16,
-    raft_group_count: usize,
-    config_path: &Path,
-    log_dir: &Path,
-) -> ChildGuard {
+fn spawn_node_with_cluster_config(binary: &str, config_path: &Path) -> ChildGuard {
     let mut command = Command::new(binary);
-    command
-        .arg("--listen")
-        .arg(format!("127.0.0.1:{port}"))
-        .arg("--core-count")
-        .arg("1")
-        .arg("--raft-group-count")
-        .arg(raft_group_count.to_string())
-        .arg("--raft-log-dir")
-        .arg(log_dir)
-        .arg("--raft-cluster-config")
-        .arg(config_path)
-        .env("URSULA_COLD_BACKEND", "memory")
-        .env("URSULA_COLD_FLUSH_INTERVAL_MS", "0");
-    spawn_child(command, child_label("durable-node", port, config_path))
+    command.arg("--config").arg(config_path);
+    spawn_child(command, child_label("durable-node", config_path))
 }
 
-fn spawn_node_with_cluster_config_and_cold_s3(
-    binary: &str,
-    port: u16,
-    raft_group_count: usize,
-    config_path: &Path,
-    log_dir: &Path,
-    cold_root: &str,
-) -> ChildGuard {
+fn spawn_node_with_cluster_config_and_cold_s3(binary: &str, config_path: &Path) -> ChildGuard {
     let mut command = Command::new(binary);
-    command
-        .arg("--listen")
-        .arg(format!("127.0.0.1:{port}"))
-        .arg("--core-count")
-        .arg("1")
-        .arg("--raft-group-count")
-        .arg(raft_group_count.to_string())
-        .arg("--raft-log-dir")
-        .arg(log_dir)
-        .arg("--raft-cluster-config")
-        .arg(config_path)
-        .env("URSULA_COLD_BACKEND", "s3")
-        .env("URSULA_COLD_ROOT", cold_root)
-        .env("URSULA_COLD_FLUSH_INTERVAL_MS", "0");
+    command.arg("--config").arg(config_path);
     for name in [
-        "URSULA_COLD_S3_BUCKET",
-        "URSULA_COLD_S3_REGION",
-        "URSULA_COLD_S3_ENDPOINT",
-        "URSULA_COLD_S3_ACCESS_KEY_ID",
-        "URSULA_COLD_S3_SECRET_ACCESS_KEY",
-        "URSULA_COLD_S3_SESSION_TOKEN",
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
@@ -699,15 +768,15 @@ fn spawn_node_with_cluster_config_and_cold_s3(
             command.env(name, value);
         }
     }
-    spawn_child(command, child_label("s3-node", port, config_path))
+    spawn_child(command, child_label("s3-node", config_path))
 }
 
-fn child_label(prefix: &str, port: u16, config_path: &Path) -> String {
+fn child_label(prefix: &str, config_path: &Path) -> String {
     let config_name = config_path
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("node");
-    format!("{prefix}-{config_name}-{port}")
+    format!("{prefix}-{config_name}")
 }
 
 fn spawn_child(mut command: Command, label: String) -> ChildGuard {
@@ -729,6 +798,7 @@ fn spawn_child(mut command: Command, label: String) -> ChildGuard {
         child,
         label,
         stderr_path,
+        config_path: None,
     }
 }
 
@@ -803,25 +873,47 @@ fn exited_child_report(children: &mut [ChildGuard]) -> Option<String> {
     None
 }
 
-fn write_single_node_cluster_config(path: &Path, base_url: &str, init_membership: bool) {
-    write_cluster_config(path, 1, &[(1, base_url.to_owned())], init_membership);
+fn write_single_node_cluster_config(
+    path: &Path,
+    port: u16,
+    node_id: u64,
+    raft_group_count: usize,
+    base_url: &str,
+    init_membership: bool,
+    log_dir: &Path,
+) {
+    write_cluster_config(
+        path,
+        port,
+        node_id,
+        raft_group_count,
+        &[(node_id, base_url.to_owned())],
+        init_membership,
+        log_dir,
+    );
 }
 
-fn write_cluster_config(path: &Path, node_id: u64, peers: &[(u64, String)], init_membership: bool) {
-    let peers = peers
-        .iter()
-        .map(|(node_id, url)| serde_json::json!({"node_id": node_id, "url": url}))
-        .collect::<Vec<_>>();
-    let body = serde_json::json!({
-        "node_id": node_id,
-        "init_membership": init_membership,
-        "peers": peers
-    });
-    std::fs::write(
+fn write_cluster_config(
+    path: &Path,
+    port: u16,
+    node_id: u64,
+    raft_group_count: usize,
+    peers: &[(u64, String)],
+    init_membership: bool,
+    log_dir: &Path,
+) {
+    write_node_toml(
         path,
-        serde_json::to_vec_pretty(&body).expect("encode cluster config"),
-    )
-    .expect("write cluster config");
+        port,
+        node_id,
+        raft_group_count,
+        peers,
+        init_membership,
+        "disk",
+        Some(log_dir),
+        "memory",
+        None,
+    );
 }
 
 async fn wait_until_ready(client: &reqwest::Client, base_url: &str, children: &mut [ChildGuard]) {

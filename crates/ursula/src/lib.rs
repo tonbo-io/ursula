@@ -1,10 +1,10 @@
 //! Ursula HTTP server: axum router, request handlers, response rendering,
-//! plus the env-driven `ShardRuntime` constructors used by the `ursula` binary.
+//! plus the typed-config bootstrap constructors used by the `ursula` binary.
 //!
 //! Module map:
 //!
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
-//! - [`bootstrap`]: env-driven `spawn_*_runtime` constructors and cold-flush worker.
+//! - [`bootstrap`]: typed-config `spawn_*_runtime` constructors and cold-flush worker.
 
 mod bootstrap;
 mod otel_metrics;
@@ -54,19 +54,10 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
 use axum::routing::put;
-pub use bootstrap::StaticGrpcRaftMembershipConfig;
-pub use bootstrap::spawn_cold_flush_worker_if_configured;
-pub use bootstrap::spawn_cold_gc_worker_if_configured;
-pub use bootstrap::spawn_default_runtime;
-pub use bootstrap::spawn_raft_memory_runtime;
-pub use bootstrap::spawn_raft_runtime;
-pub use bootstrap::spawn_static_grpc_raft_memory_runtime;
-pub use bootstrap::spawn_static_grpc_raft_memory_runtime_with_membership_config;
-pub use bootstrap::spawn_static_grpc_raft_memory_runtime_with_per_group_initializers;
-pub use bootstrap::spawn_static_grpc_raft_runtime;
-pub use bootstrap::spawn_static_grpc_raft_runtime_with_membership_config;
-pub use bootstrap::spawn_static_grpc_raft_runtime_with_per_group_initializers;
-pub use bootstrap::spawn_wal_runtime;
+pub use bootstrap::Persistence;
+pub use bootstrap::SpawnedRuntime;
+pub use bootstrap::Topology;
+pub use bootstrap::spawn_runtime;
 use chrono::DateTime;
 use futures_util::stream;
 use openraft::BasicNode;
@@ -83,6 +74,7 @@ use ursula_raft::RAFT_GRPC_GROUP_WRITE_PATH;
 use ursula_raft::RAFT_GRPC_MAX_MESSAGE_BYTES;
 use ursula_raft::RAFT_GRPC_TRANSFER_LEADER_PATH;
 use ursula_raft::RAFT_GRPC_VOTE_PATH;
+use ursula_raft::RaftGroupHandle;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGrpcService;
 use ursula_raft::raft_internal_proto;
@@ -99,6 +91,7 @@ use ursula_runtime::DeleteSnapshotRequest;
 use ursula_runtime::DeleteStreamRequest;
 use ursula_runtime::ErrorStatus;
 use ursula_runtime::ExternalPayloadRef;
+use ursula_runtime::GetStreamAttrsRequest;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::ProducerRequest;
@@ -107,13 +100,16 @@ use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
+use ursula_runtime::StreamAttrs;
+use ursula_runtime::UpdateStreamAttrsRequest;
 use ursula_runtime::new_external_payload_path;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 
-use crate::bootstrap::env_usize;
 use crate::bootstrap::reenable_elections_if_campaign_allowed;
 use crate::render::bootstrap_response;
+use crate::render::clamp_sse_text_read;
+use crate::render::http_read_content_type;
 use crate::render::insert_cache_control;
 use crate::render::insert_content_type;
 use crate::render::insert_cursor;
@@ -134,7 +130,6 @@ use crate::render::long_poll_no_content_response;
 use crate::render::normalize_http_write_payload;
 use crate::render::offset_now_response;
 use crate::render::parse_append_batch;
-use crate::render::push_json_string;
 use crate::render::read_response;
 use crate::render::render_batch_results;
 use crate::render::render_metrics;
@@ -161,9 +156,11 @@ const HEADER_STREAM_INTEGRITY_LIVE_START_OFFSET: &str = "stream-integrity-live-s
 const HEADER_STREAM_INTEGRITY_TOTAL_RECORDS: &str = "stream-integrity-total-records";
 const HEADER_STREAM_INTEGRITY_TOTAL_SETSUM: &str = "stream-integrity-total-setsum";
 const HEADER_STREAM_COLD_HOT_START_OFFSET: &str = "stream-cold-hot-start-offset";
+const HEADER_STREAM_DATA_CONTENT_TYPE: &str = "stream-data-content-type";
 const HEADER_STREAM_NEXT_OFFSET: &str = "stream-next-offset";
 const HEADER_STREAM_SNAPSHOT_OFFSET: &str = "stream-snapshot-offset";
 const HEADER_STREAM_SSE_DATA_ENCODING: &str = "stream-sse-data-encoding";
+const HEADER_STREAM_ATTRS: &str = "stream-attrs";
 const HEADER_STREAM_SEQ: &str = "stream-seq";
 const HEADER_STREAM_TTL: &str = "stream-ttl";
 const HEADER_STREAM_UP_TO_DATE: &str = "stream-up-to-date";
@@ -214,8 +211,9 @@ pub struct HttpState {
     client_write_router: Option<ClientWriteLeaderRouter>,
     http_metrics: Arc<HttpMetrics>,
     wall_clock: Arc<dyn WallClock>,
-    node_memory: NodeMemoryMonitor,
+    pub node_memory: NodeMemoryMonitor,
     leadership_shed: LeadershipShedFlag,
+    external_payload_min_bytes: usize,
 }
 
 impl HttpState {
@@ -234,8 +232,9 @@ impl HttpState {
             client_write_router: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
-            node_memory: NodeMemoryMonitor::from_env(),
+            node_memory: NodeMemoryMonitor::default(),
             leadership_shed: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            external_payload_min_bytes: 1024 * 1024,
         }
     }
 
@@ -251,8 +250,9 @@ impl HttpState {
             client_write_router: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
-            node_memory: NodeMemoryMonitor::from_env(),
+            node_memory: NodeMemoryMonitor::default(),
             leadership_shed,
+            external_payload_min_bytes: 1024 * 1024,
         }
     }
 
@@ -289,8 +289,9 @@ impl HttpState {
             )),
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
-            node_memory: NodeMemoryMonitor::from_env(),
+            node_memory: NodeMemoryMonitor::default(),
             leadership_shed,
+            external_payload_min_bytes: 1024 * 1024,
         }
     }
 
@@ -319,6 +320,23 @@ impl HttpState {
 
     pub fn with_wall_clock_handle(mut self, wall_clock: Arc<dyn WallClock>) -> Self {
         self.wall_clock = wall_clock;
+        self
+    }
+
+    pub fn with_external_payload_min_bytes(mut self, min_bytes: usize) -> Self {
+        self.external_payload_min_bytes = min_bytes;
+        self
+    }
+
+    /// Apply runtime-level config (memory monitor, payload threshold) derived
+    /// from the typed configuration.  Replaces the hard-coded defaults set by
+    /// the constructors.
+    pub fn with_runtime_config(mut self, config: &ursula_config::RuntimeConfig) -> Self {
+        self.node_memory = NodeMemoryMonitor::new(config);
+        if let Some(min_size) = &config.external_payload_min_size {
+            self.external_payload_min_bytes = usize::try_from(min_size.as_bytes())
+                .expect("config validation ensures payload size fits usize");
+        }
         self
     }
 
@@ -364,7 +382,7 @@ impl HttpMetrics {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 struct HttpMetricsSnapshot {
     sse_streams_opened: u64,
     sse_read_iterations: u64,
@@ -375,9 +393,11 @@ struct HttpMetricsSnapshot {
 
 /// Resolves the current leader of a raft group to a client-reachable base URL
 /// so a write/read that lands on a non-leader can be answered with a 307
-/// redirect. `peers` maps raft node id to that node's listen address; gRPC and
-/// the client API share one listener, so a single address per peer is both the
-/// replication endpoint and the redirect target.
+/// redirect. `peers` maps raft node id to that node's configured peer URL:
+/// `server.listen` when `server.cluster_listen` is unset, or the separate
+/// `server.cluster_listen` address when it is set. Peer URLs are also used as
+/// HTTP leader-redirect targets, so clients and gateways must be able to reach
+/// them too.
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
     peers: Arc<BTreeMap<u64, String>>,
@@ -471,10 +491,22 @@ impl std::fmt::Debug for NodeMemoryMonitor {
     }
 }
 
+impl Default for NodeMemoryMonitor {
+    fn default() -> Self {
+        Self {
+            abort_cap_bytes: None,
+            last_rss_bytes: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
 impl NodeMemoryMonitor {
-    pub fn from_env() -> Self {
+    pub fn new(cfg: &ursula_config::RuntimeConfig) -> Self {
         let monitor = Self {
-            abort_cap_bytes: env_u64_optional("URSULA_NODE_MEMORY_ABORT_CAP_BYTES"),
+            abort_cap_bytes: cfg
+                .node_memory_abort_cap_size
+                .as_ref()
+                .map(|s| s.as_bytes()),
             last_rss_bytes: Arc::new(AtomicU64::new(0)),
         };
         monitor.spawn_rss_sampler();
@@ -512,11 +544,16 @@ impl NodeMemoryMonitor {
                             .unwrap_or_default();
                         let now_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis())
+                            .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
                             .unwrap_or(0);
-                        let breadcrumb = format!(
-                            "{{\"event\":\"memory_abort_cap_exit\",\"ts_ms\":{now_ms},\"host\":\"{host}\",\"rss_bytes\":{rss},\"abort_cap_bytes\":{cap}}}",
-                        );
+                        let breadcrumb = serde_json::json!({
+                            "event": "memory_abort_cap_exit",
+                            "ts_ms": now_ms,
+                            "host": host,
+                            "rss_bytes": rss,
+                            "abort_cap_bytes": cap,
+                        })
+                        .to_string();
                         tracing::error!("{breadcrumb}");
                         use std::io::Write as _;
                         let _ = std::io::stderr().flush();
@@ -542,14 +579,7 @@ fn read_proc_self_status_vm_rss_bytes() -> Option<u64> {
     None
 }
 
-fn env_u64_optional(name: &str) -> Option<u64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-}
-
 #[derive(Clone)]
-
 struct HttpRaftGrpcService {
     raft: RaftGrpcService,
 }
@@ -629,14 +659,22 @@ fn raft_grpc_service(
 }
 
 pub fn router(runtime: ShardRuntime) -> Router {
-    router_from_state(HttpState::new(runtime))
+    let state = HttpState::new(runtime);
+    cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
+    ))
 }
 
 pub fn router_with_raft_registry(
     runtime: ShardRuntime,
     raft_registry: RaftGroupHandleRegistry,
 ) -> Router {
-    router_from_state(HttpState::with_raft_registry(runtime, raft_registry))
+    let state = HttpState::with_raft_registry(runtime, raft_registry);
+    cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
+    ))
 }
 
 pub fn router_with_static_raft_cluster(
@@ -644,10 +682,10 @@ pub fn router_with_static_raft_cluster(
     raft_registry: RaftGroupHandleRegistry,
     peers: impl IntoIterator<Item = (u64, String)>,
 ) -> Router {
-    router_from_state(HttpState::with_static_raft_cluster(
-        runtime,
-        raft_registry,
-        peers,
+    let state = HttpState::with_static_raft_cluster(runtime, raft_registry, peers);
+    cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
     ))
 }
 
@@ -658,23 +696,32 @@ pub fn router_with_static_raft_cluster_topology(
     peers: impl IntoIterator<Item = (u64, String)>,
     per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
 ) -> Router {
-    router_from_state(HttpState::with_static_raft_cluster_topology(
+    let state = HttpState::with_static_raft_cluster_topology(
         runtime,
         raft_registry,
         Some(node_id),
         peers,
         per_group_voters,
+    );
+    cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
     ))
 }
 
+/// Convenience wrapper that merges both client and cluster planes into a
+/// single router.  Used by in-process tests and the madsim harness.
 pub fn router_with_http_state(state: HttpState) -> Router {
-    router_from_state(state)
+    cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
+    ))
 }
 
 /// Cluster-plane routes: inter-node gRPC carrying Raft RPCs, snapshot
-/// transfer, and HTTP-write forwarding to the leader. In a dual-listener
-/// deployment these bind to the private (VPC) interface so chaos applied to
-/// the public face never disrupts consensus.
+/// transfer, and leader-read checks. In a dual-listener deployment these bind
+/// to the private (VPC) interface so chaos applied to the public face never
+/// disrupts consensus.
 pub fn cluster_router_from_state(state: HttpState) -> Router {
     let raft_registry = state.raft_registry.clone().unwrap_or_default();
     Router::new()
@@ -712,6 +759,176 @@ pub fn cluster_router_from_state(state: HttpState) -> Router {
 /// these bind to the public interface; failure injection against the public
 /// face only affects this plane.
 pub fn client_router_from_state(state: HttpState) -> Router {
+    client_router_with_admission(state, IngressAdmission::default())
+}
+
+/// Client-plane ingress admission. The primary control is a process-wide
+/// in-flight write-body byte budget: a request must reserve its body bytes
+/// before axum drains the body into `Bytes`, and the reservation lives until
+/// the response is produced. This is the layer that turns memory pressure into
+/// backpressure at the HTTP edge.
+///
+/// Configurable via `ServerConfig.http_inflight_body_size`.
+#[derive(Clone)]
+pub struct IngressAdmission {
+    body_bytes: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for IngressAdmission {
+    fn default() -> Self {
+        Self {
+            body_bytes: Arc::new(tokio::sync::Semaphore::new(
+                DEFAULT_HTTP_INFLIGHT_BODY_BYTES,
+            )),
+        }
+    }
+}
+
+impl IngressAdmission {
+    pub fn new(cfg: &ursula_config::ServerConfig) -> Self {
+        let body_budget = cfg.http_inflight_body_size.as_bytes() as usize;
+        Self {
+            body_bytes: Arc::new(tokio::sync::Semaphore::new(body_budget)),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self {
+            body_bytes: Arc::new(tokio::sync::Semaphore::new(usize::MAX)),
+        }
+    }
+}
+
+async fn ingress_admission_middleware(
+    State(admission): State<IngressAdmission>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if request.uri().path() == CLUSTER_PROBE_PATH {
+        return next.run(request).await;
+    }
+    let Some(body_bytes) = request_write_body_bytes(&request) else {
+        return next.run(request).await;
+    };
+    if body_bytes > u64::try_from(MAX_HTTP_BODY_BYTES).expect("max body bytes fits u64") {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large").into_response();
+    }
+
+    let _body_permits = if body_bytes > 0 {
+        let Ok(permits) = u32::try_from(body_bytes) else {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large").into_response();
+        };
+        match admission.body_bytes.clone().try_acquire_many_owned(permits) {
+            Ok(permit) => Some(permit),
+            Err(_) => return retry_after_json("IngressBodyBytesLimitReached"),
+        }
+    } else {
+        None
+    };
+
+    next.run(request).await
+}
+
+fn request_write_body_bytes(request: &Request<Body>) -> Option<u64> {
+    if !is_write_method(request.method()) {
+        return None;
+    }
+    if let Some(content_length) = request.headers().get(CONTENT_LENGTH)
+        && let Ok(content_length) = content_length.to_str()
+        && let Ok(parsed) = content_length.parse::<u64>()
+    {
+        return Some(parsed);
+    }
+    let size_hint = request.body().size_hint();
+    size_hint.exact().or_else(|| size_hint.upper()).or(Some(
+        u64::try_from(MAX_HTTP_BODY_BYTES).expect("max body bytes fits u64"),
+    ))
+}
+
+fn is_write_method(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    )
+}
+
+fn retry_after_json(error: &'static str) -> Response {
+    let mut headers = HeaderMap::new();
+    insert_default_response_headers(&mut headers);
+    headers.insert(
+        axum::http::header::RETRY_AFTER,
+        HeaderValue::from_static("1"),
+    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        headers,
+        serde_json::json!({ "error": error }).to_string(),
+    )
+        .into_response()
+}
+
+/// Builds a `200`-style JSON response with the `application/json` content type.
+/// Centralizes the content-type wiring so handlers returning a JSON body share
+/// one consistent style.
+fn json_response(status: StatusCode, body: String) -> Response {
+    (status, [(CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+/// Path of the cluster egress-health probe (M2). Peers POST a payload here over
+/// the cluster plane; the round-trip time exposes loss/delay on the sender's
+/// egress, which a small heartbeat-sized request would mask.
+pub(crate) const CLUSTER_PROBE_PATH: &str = "/__ursula/cluster-probe";
+pub(crate) const LEADERSHIP_SHED_PATH: &str = "/__ursula/leadership-shed";
+
+/// Probe target: drain the body (so the sender's full egress traverses the
+/// cluster plane) and answer 200. Bypasses ingress admission.
+async fn cluster_probe(_body: Bytes) -> StatusCode {
+    StatusCode::OK
+}
+
+async fn leadership_shed_status(State(state): State<HttpState>) -> Response {
+    let shed_state = state
+        .raft_registry()
+        .map(RaftGroupHandleRegistry::leadership_shed_state)
+        .unwrap_or_default();
+    let body = serde_json::json!({
+        "bits": shed_state.bits(),
+        "state": shed_state.to_string(),
+        "should_accept_transfer": shed_state.should_accept_transfer(),
+        "should_campaign": shed_state.should_campaign(),
+        "should_shed_current_leaders": shed_state.should_shed_current_leaders(),
+    })
+    .to_string();
+    json_response(StatusCode::OK, body)
+}
+
+async fn mark_maintenance_drain(State(state): State<HttpState>) -> Response {
+    let Some(registry) = state.raft_registry() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "raft registry is not configured for this server",
+        )
+            .into_response();
+    };
+    registry.mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
+    leadership_shed_status(State(state)).await
+}
+
+async fn clear_maintenance_drain(State(state): State<HttpState>) -> Response {
+    let Some(registry) = state.raft_registry() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "raft registry is not configured for this server",
+        )
+            .into_response();
+    };
+    registry.clear_leadership_shed(LeadershipShedReason::MaintenanceDrain);
+    reenable_elections_if_campaign_allowed(registry, "maintenance-drain cleared");
+    leadership_shed_status(State(state)).await
+}
+
+pub fn client_router_with_admission(state: HttpState, admission: IngressAdmission) -> Router {
     Router::new()
         .route("/__ursula/metrics", get(metrics))
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
@@ -789,6 +1006,10 @@ pub fn client_router_from_state(state: HttpState) -> Router {
         )
         .route("/{bucket}/{stream}/bootstrap", get(bootstrap_stream))
         .route(
+            "/{bucket}/{stream}/attrs",
+            put(update_stream_attrs).get(get_stream_attrs),
+        )
+        .route(
             "/{bucket}/{stream}",
             put(create_stream)
                 .post(append_stream)
@@ -799,171 +1020,10 @@ pub fn client_router_from_state(state: HttpState) -> Router {
         .route("/{bucket}/{stream}/append-batch", post(append_batch))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
-            IngressAdmission::from_env(),
+            admission,
             ingress_admission_middleware,
         ))
         .with_state(state)
-}
-
-/// Client-plane ingress admission. The primary control is a process-wide
-/// in-flight write-body byte budget: a request must reserve its body bytes
-/// before axum drains the body into `Bytes`, and the reservation lives until
-/// the response is produced. This is the layer that turns memory pressure into
-/// backpressure at the HTTP edge.
-///
-/// `URSULA_HTTP_INFLIGHT_BODY_BYTES` overrides the default budget.
-#[derive(Clone)]
-struct IngressAdmission {
-    body_bytes: Arc<tokio::sync::Semaphore>,
-}
-
-impl IngressAdmission {
-    fn from_env() -> Self {
-        let body_budget = env_u64_optional("URSULA_HTTP_INFLIGHT_BODY_BYTES")
-            .and_then(|n| usize::try_from(n).ok())
-            .unwrap_or(DEFAULT_HTTP_INFLIGHT_BODY_BYTES);
-        Self {
-            body_bytes: Arc::new(tokio::sync::Semaphore::new(body_budget)),
-        }
-    }
-}
-
-async fn ingress_admission_middleware(
-    State(admission): State<IngressAdmission>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
-    if request.uri().path() == CLUSTER_PROBE_PATH {
-        return next.run(request).await;
-    }
-    let Some(body_bytes) = request_write_body_bytes(&request) else {
-        return next.run(request).await;
-    };
-    if body_bytes > u64::try_from(MAX_HTTP_BODY_BYTES).expect("max body bytes fits u64") {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large").into_response();
-    }
-
-    let _body_permits = if body_bytes > 0 {
-        let Ok(permits) = u32::try_from(body_bytes) else {
-            return (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large").into_response();
-        };
-        match admission.body_bytes.clone().try_acquire_many_owned(permits) {
-            Ok(permit) => Some(permit),
-            Err(_) => return retry_after_json("IngressBodyBytesLimitReached"),
-        }
-    } else {
-        None
-    };
-
-    next.run(request).await
-}
-
-fn request_write_body_bytes(request: &Request<Body>) -> Option<u64> {
-    if !is_write_method(request.method()) {
-        return None;
-    }
-    if let Some(content_length) = request.headers().get(CONTENT_LENGTH)
-        && let Ok(content_length) = content_length.to_str()
-        && let Ok(parsed) = content_length.parse::<u64>()
-    {
-        return Some(parsed);
-    }
-    let size_hint = request.body().size_hint();
-    size_hint.exact().or_else(|| size_hint.upper()).or(Some(
-        u64::try_from(MAX_HTTP_BODY_BYTES).expect("max body bytes fits u64"),
-    ))
-}
-
-fn is_write_method(method: &Method) -> bool {
-    matches!(
-        *method,
-        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-    )
-}
-
-fn retry_after_json(error: &'static str) -> Response {
-    let mut headers = HeaderMap::new();
-    insert_default_response_headers(&mut headers);
-    headers.insert(
-        axum::http::header::RETRY_AFTER,
-        HeaderValue::from_static("1"),
-    );
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        headers,
-        format!("{{\"error\":\"{error}\"}}"),
-    )
-        .into_response()
-}
-
-/// Path of the cluster egress-health probe (M2). Peers POST a payload here over
-/// the cluster plane; the round-trip time exposes loss/delay on the sender's
-/// egress, which a small heartbeat-sized request would mask.
-pub(crate) const CLUSTER_PROBE_PATH: &str = "/__ursula/cluster-probe";
-pub(crate) const LEADERSHIP_SHED_PATH: &str = "/__ursula/leadership-shed";
-
-/// Probe target: drain the body (so the sender's full egress traverses the
-/// cluster plane) and answer 200. Bypasses ingress admission.
-async fn cluster_probe(_body: Bytes) -> StatusCode {
-    StatusCode::OK
-}
-
-async fn leadership_shed_status(State(state): State<HttpState>) -> Response {
-    let shed_state = state
-        .raft_registry()
-        .map(RaftGroupHandleRegistry::leadership_shed_state)
-        .unwrap_or_default();
-    let mut body = String::from("{\"bits\":");
-    body.push_str(&shed_state.bits().to_string());
-    body.push_str(",\"state\":");
-    push_json_string(&mut body, &shed_state.to_string());
-    body.push_str(",\"should_accept_transfer\":");
-    body.push_str(bool_json(shed_state.should_accept_transfer()));
-    body.push_str(",\"should_campaign\":");
-    body.push_str(bool_json(shed_state.should_campaign()));
-    body.push_str(",\"should_shed_current_leaders\":");
-    body.push_str(bool_json(shed_state.should_shed_current_leaders()));
-    body.push('}');
-    let mut headers = HeaderMap::new();
-    insert_content_type(&mut headers, "application/json");
-    (StatusCode::OK, headers, body).into_response()
-}
-
-async fn mark_maintenance_drain(State(state): State<HttpState>) -> Response {
-    let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
-    registry.mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
-    leadership_shed_status(State(state)).await
-}
-
-async fn clear_maintenance_drain(State(state): State<HttpState>) -> Response {
-    let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
-    registry.clear_leadership_shed(LeadershipShedReason::MaintenanceDrain);
-    reenable_elections_if_campaign_allowed(registry, "maintenance-drain cleared");
-    leadership_shed_status(State(state)).await
-}
-
-fn bool_json(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
-}
-
-/// Single-listener router that serves both planes from one bind. Kept for
-/// in-process tests and backward-compatible deployments that don't separate
-/// the public and cluster network paths.
-fn router_from_state(state: HttpState) -> Router {
-    cluster_router_from_state(state.clone()).merge(client_router_from_state(state))
 }
 
 pub(crate) fn should_externalize_payload(
@@ -974,7 +1034,7 @@ pub(crate) fn should_externalize_payload(
     allowed
         && payload_len > 0
         && state.runtime.has_cold_store()
-        && payload_len >= env_usize("URSULA_EXTERNAL_PAYLOAD_MIN_BYTES", 1024 * 1024)
+        && payload_len >= state.external_payload_min_bytes
 }
 
 pub(crate) async fn stage_external_payload(
@@ -985,7 +1045,7 @@ pub(crate) async fn stage_external_payload(
     let Some(cold_store) = state.runtime.cold_store() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "URSULA_COLD_BACKEND must be configured before externalizing payloads",
+            "cold backend must be configured before externalizing payloads",
         )
             .into_response());
     };
@@ -1068,8 +1128,6 @@ pub(crate) async fn create_bucket(Path(_bucket): Path<String>) -> Response {
 }
 
 pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
-    let mut headers = HeaderMap::new();
-    insert_content_type(&mut headers, "application/json");
     let raft_groups = state
         .raft_registry()
         .map(RaftGroupHandleRegistry::metrics_snapshot)
@@ -1086,15 +1144,14 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
     // status-publishing pipeline survives SSM exec failures).
     let rss = state.node_memory.last_rss_bytes();
     let cap = state.node_memory.abort_cap_bytes().unwrap_or_default();
-    if body.ends_with('}') {
-        body.truncate(body.len() - 1);
-        body.push_str(",\"process_rss_bytes\":");
-        body.push_str(&rss.to_string());
-        body.push_str(",\"node_memory_abort_cap_bytes\":");
-        body.push_str(&cap.to_string());
-        body.push('}');
+    if let Some(object) = body.as_object_mut() {
+        object.insert("process_rss_bytes".to_owned(), serde_json::json!(rss));
+        object.insert(
+            "node_memory_abort_cap_bytes".to_owned(),
+            serde_json::json!(cap),
+        );
     }
-    (StatusCode::OK, headers, body).into_response()
+    json_response(StatusCode::OK, body.to_string())
 }
 
 pub(crate) async fn register_admin_node(
@@ -1463,19 +1520,14 @@ pub(crate) async fn flush_cold_stream(
         })
         .await
     {
-        Ok(Some(response)) => {
-            let mut headers = HeaderMap::new();
-            insert_content_type(&mut headers, "application/json");
-            (
-                StatusCode::OK,
-                headers,
-                format!(
-                    "{{\"hot_start_offset\":{},\"group_commit_index\":{}}}",
-                    response.hot_start_offset, response.group_commit_index
-                ),
-            )
-                .into_response()
-        }
+        Ok(Some(response)) => json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "hot_start_offset": response.hot_start_offset,
+                "group_commit_index": response.group_commit_index,
+            })
+            .to_string(),
+        ),
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
         Err(err) => {
             runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
@@ -1487,18 +1539,9 @@ pub(crate) async fn trigger_raft_snapshot(
     State(state): State<HttpState>,
     Path(raft_group_id): Path<u64>,
 ) -> Response {
-    let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
-    };
-    let Some(raft) = registry.get(raft_group_id) else {
-        return (StatusCode::NOT_FOUND, "raft group is not registered").into_response();
+    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
     };
     let snapshot_log_id = raft.metrics().borrow_watched().last_applied;
     if let Err(err) = raft.trigger().snapshot().await {
@@ -1530,16 +1573,14 @@ pub(crate) async fn trigger_raft_snapshot(
     }
 
     let metrics = raft.metrics().borrow_watched().clone();
-    (
+    json_response(
         StatusCode::OK,
-        [("content-type", "application/json")],
-        format!(
-            "{{\"raft_group_id\":{},\"snapshot_index\":{}}}",
-            raft_group_id.0,
-            optional_u64_json(metrics.snapshot.map(|log_id| log_id.index))
-        ),
+        serde_json::json!({
+            "raft_group_id": raft_group_id.0,
+            "snapshot_index": metrics.snapshot.map(|log_id| log_id.index),
+        })
+        .to_string(),
     )
-        .into_response()
 }
 
 pub(crate) async fn trigger_raft_purge(
@@ -1557,18 +1598,9 @@ pub(crate) async fn trigger_raft_purge(
     else {
         return (StatusCode::BAD_REQUEST, "upto query parameter is required").into_response();
     };
-    let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
-    };
-    let Some(raft) = registry.get(raft_group_id) else {
-        return (StatusCode::NOT_FOUND, "raft group is not registered").into_response();
+    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
     };
     if let Err(err) = raft.trigger().purge_log(upto).await {
         return (
@@ -1592,16 +1624,14 @@ pub(crate) async fn trigger_raft_purge(
             .into_response();
     }
     let metrics = raft.metrics().borrow_watched().clone();
-    (
+    json_response(
         StatusCode::OK,
-        [("content-type", "application/json")],
-        format!(
-            "{{\"raft_group_id\":{},\"purged_index\":{}}}",
-            raft_group_id.0,
-            optional_u64_json(metrics.purged.map(|log_id| log_id.index))
-        ),
+        serde_json::json!({
+            "raft_group_id": raft_group_id.0,
+            "purged_index": metrics.purged.map(|log_id| log_id.index),
+        })
+        .to_string(),
     )
-        .into_response()
 }
 
 pub(crate) async fn add_raft_learner(
@@ -1616,34 +1646,23 @@ pub(crate) async fn add_raft_learner(
     let Some(address) = query.get("addr").filter(|value| !value.trim().is_empty()) else {
         return (StatusCode::BAD_REQUEST, "addr query parameter is required").into_response();
     };
-    let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
-    };
-    let Some(raft) = registry.get(raft_group_id) else {
-        return (StatusCode::NOT_FOUND, "raft group is not registered").into_response();
+    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
     };
     match raft
         .add_learner(node_id, BasicNode::new(address.clone()), true)
         .await
     {
-        Ok(response) => (
+        Ok(response) => json_response(
             StatusCode::OK,
-            [("content-type", "application/json")],
-            format!(
-                "{{\"raft_group_id\":{},\"node_id\":{},\"log_index\":{}}}",
-                raft_group_id.0,
-                node_id,
-                response.log_id.index()
-            ),
-        )
-            .into_response(),
+            serde_json::json!({
+                "raft_group_id": raft_group_id.0,
+                "node_id": node_id,
+                "log_index": response.log_id.index(),
+            })
+            .to_string(),
+        ),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("add raft learner: {err}"),
@@ -1672,49 +1691,35 @@ pub(crate) async fn change_raft_membership(
         Ok(voters) => voters,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
-    let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
-    };
-    let Some(raft) = registry.get(raft_group_id) else {
-        return (StatusCode::NOT_FOUND, "raft group is not registered").into_response();
+    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
     };
     let metrics = raft.metrics().borrow_watched().clone();
     if metrics.current_leader != Some(metrics.id) {
-        return (
+        return json_response(
             StatusCode::CONFLICT,
-            [("content-type", "application/json")],
-            format!(
-                "{{\"raft_group_id\":{},\"current_leader\":{},\"changed\":false,\"reason\":\"not leader\"}}",
-                raft_group_id.0,
-                optional_u64_json(metrics.current_leader)
-            ),
-        )
-            .into_response();
+            serde_json::json!({
+                "raft_group_id": raft_group_id.0,
+                "current_leader": metrics.current_leader,
+                "changed": false,
+                "reason": "not leader",
+            })
+            .to_string(),
+        );
     }
 
     match raft.change_membership(voters.clone(), false).await {
-        Ok(response) => (
+        Ok(response) => json_response(
             StatusCode::OK,
-            [("content-type", "application/json")],
-            format!(
-                "{{\"raft_group_id\":{},\"voter_ids\":[{}],\"log_index\":{},\"changed\":true}}",
-                raft_group_id.0,
-                voters
-                    .iter()
-                    .map(u64::to_string)
-                    .collect::<Vec<_>>()
-                    .join(","),
-                response.log_id.index()
-            ),
-        )
-            .into_response(),
+            serde_json::json!({
+                "raft_group_id": raft_group_id.0,
+                "voter_ids": voters,
+                "log_index": response.log_id.index(),
+                "changed": true,
+            })
+            .to_string(),
+        ),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("change raft membership: {err}"),
@@ -1767,29 +1772,20 @@ pub(crate) async fn allow_raft_node_next_revert(
     State(state): State<HttpState>,
     Path((raft_group_id, node_id)): Path<(u64, u64)>,
 ) -> Response {
-    let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
-    };
-    let Some(raft) = registry.get(raft_group_id) else {
-        return (StatusCode::NOT_FOUND, "raft group is not registered").into_response();
+    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
     };
     match raft.trigger().allow_next_revert(&node_id, true).await {
-        Ok(Ok(())) => (
+        Ok(Ok(())) => json_response(
             StatusCode::OK,
-            [("content-type", "application/json")],
-            format!(
-                "{{\"raft_group_id\":{},\"node_id\":{},\"allow_next_revert\":true}}",
-                raft_group_id.0, node_id
-            ),
-        )
-            .into_response(),
+            serde_json::json!({
+                "raft_group_id": raft_group_id.0,
+                "node_id": node_id,
+                "allow_next_revert": true,
+            })
+            .to_string(),
+        ),
         Ok(Err(err)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("allow raft node next revert: {err}"),
@@ -1807,33 +1803,24 @@ pub(crate) async fn transfer_raft_leader(
     State(state): State<HttpState>,
     Path((raft_group_id, node_id)): Path<(u64, u64)>,
 ) -> Response {
-    let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
-    };
-    let Some(raft) = registry.get(raft_group_id) else {
-        return (StatusCode::NOT_FOUND, "raft group is not registered").into_response();
+    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
+        Ok(resolved) => resolved,
+        Err(response) => return *response,
     };
     let metrics_before = raft.metrics().borrow_watched().clone();
     let current_leader = metrics_before.current_leader;
     let self_id = metrics_before.id;
     if current_leader != Some(self_id) {
-        return (
+        return json_response(
             StatusCode::CONFLICT,
-            [("content-type", "application/json")],
-            format!(
-                "{{\"raft_group_id\":{},\"current_leader\":{},\"transferred\":false,\"reason\":\"not leader\"}}",
-                raft_group_id.0,
-                optional_u64_json(current_leader)
-            ),
-        )
-            .into_response();
+            serde_json::json!({
+                "raft_group_id": raft_group_id.0,
+                "current_leader": current_leader,
+                "transferred": false,
+                "reason": "not leader",
+            })
+            .to_string(),
+        );
     }
     if node_id == self_id {
         return (
@@ -1860,25 +1847,50 @@ pub(crate) async fn transfer_raft_leader(
         )
             .into_response();
     }
-    (
+    json_response(
         StatusCode::OK,
-        [("content-type", "application/json")],
-        format!(
-            "{{\"raft_group_id\":{},\"from\":{},\"to\":{},\"transferred\":true}}",
-            raft_group_id.0, self_id, node_id
-        ),
+        serde_json::json!({
+            "raft_group_id": raft_group_id.0,
+            "from": self_id,
+            "to": node_id,
+            "transferred": true,
+        })
+        .to_string(),
     )
-        .into_response()
 }
 
 pub(crate) fn parse_raft_group_id(raw: u64) -> Result<RaftGroupId, std::num::TryFromIntError> {
     u32::try_from(raw).map(RaftGroupId)
 }
 
-pub(crate) fn optional_u64_json(value: Option<u64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "null".to_owned())
+/// Resolves the raft registry, parses the group id, and looks up the live group
+/// handle — the preamble shared by every raft admin endpoint. Returns the
+/// appropriate error response (`400`/`404`) when any step fails, so handlers can
+/// `?`-style early-return and focus on their actual operation.
+fn resolve_raft_group(
+    state: &HttpState,
+    raft_group_id: u64,
+) -> Result<(RaftGroupId, RaftGroupHandle), Box<Response>> {
+    let Some(registry) = state.raft_registry() else {
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                "raft registry is not configured for this server",
+            )
+                .into_response(),
+        ));
+    };
+    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
+        return Err(Box::new(
+            (StatusCode::BAD_REQUEST, "invalid raft group id").into_response(),
+        ));
+    };
+    let Some(raft) = registry.get(raft_group_id) else {
+        return Err(Box::new(
+            (StatusCode::NOT_FOUND, "raft group is not registered").into_response(),
+        ));
+    };
+    Ok((raft_group_id, raft))
 }
 
 pub(crate) async fn create_stream(
@@ -1951,6 +1963,10 @@ pub(crate) async fn create_stream_by_id(
         Ok(lifetime) => lifetime,
         Err(response) => return *response,
     };
+    let attrs = match stream_attrs(&request_headers) {
+        Ok(attrs) => attrs,
+        Err(response) => return *response,
+    };
     let mut request = CreateStreamRequest::new(stream_id.clone(), content_type.clone());
     request.content_type_explicit = content_type_explicit;
     request.now_ms = state.unix_time_ms();
@@ -1965,6 +1981,7 @@ pub(crate) async fn create_stream_by_id(
     request.stream_expires_at_ms = stream_expires_at_ms;
     request.forked_from = forked_from;
     request.fork_offset = fork_offset;
+    request.attrs = attrs;
     let producer = match producer_request(&request_headers) {
         Ok(producer) => producer,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
@@ -2258,6 +2275,97 @@ pub(crate) async fn delete_stream_by_id(
             (StatusCode::NO_CONTENT, headers).into_response()
         }
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
+    }
+}
+
+pub(crate) async fn update_stream_attrs(
+    State(state): State<HttpState>,
+    OriginalUri(uri): OriginalUri,
+    Path((bucket, stream)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !has_content_type(&headers) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "stream attrs update must include content type",
+        )
+            .into_response();
+    }
+    let content_type = request_content_type(&headers);
+    if !render::is_json_content_type(&content_type) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "stream attrs update body must be application/json",
+        )
+            .into_response();
+    }
+    let attrs = match serde_json::from_slice::<StreamAttrs>(&body) {
+        Ok(attrs) => attrs,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid stream attrs JSON: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let stream_id = BucketStreamId::new(bucket, stream);
+    match state
+        .runtime
+        .update_stream_attrs(UpdateStreamAttrsRequest {
+            stream_id,
+            attrs: Some(attrs),
+            now_ms: state.unix_time_ms(),
+        })
+        .await
+    {
+        Ok(_) => {
+            let mut headers = HeaderMap::new();
+            insert_default_response_headers(&mut headers);
+            (StatusCode::NO_CONTENT, headers).into_response()
+        }
+        Err(err) => {
+            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
+        }
+    }
+}
+
+pub(crate) async fn get_stream_attrs(
+    State(state): State<HttpState>,
+    OriginalUri(uri): OriginalUri,
+    Path((bucket, stream)): Path<(String, String)>,
+) -> Response {
+    let stream_id = BucketStreamId::new(bucket, stream);
+    match state
+        .runtime
+        .get_stream_attrs(GetStreamAttrsRequest {
+            stream_id,
+            now_ms: state.unix_time_ms(),
+        })
+        .await
+    {
+        Ok(response) => {
+            let attrs = response.attrs.unwrap_or_default();
+            let body = match serde_json::to_vec(&attrs) {
+                Ok(body) => body,
+                Err(err) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("render stream attrs JSON: {err}"),
+                    )
+                        .into_response();
+                }
+            };
+            let mut headers = HeaderMap::new();
+            insert_default_response_headers(&mut headers);
+            insert_content_type(&mut headers, "application/json");
+            insert_cache_control(&mut headers, "no-store");
+            (StatusCode::OK, headers, body).into_response()
+        }
+        Err(err) => {
+            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
+        }
     }
 }
 
@@ -2777,13 +2885,18 @@ pub(crate) async fn sse_stream(
         .http_metrics
         .sse_streams_opened
         .fetch_add(1, Ordering::Relaxed);
+    let sse_max_len = if encode_base64 {
+        max_len.max(1)
+    } else {
+        max_len.max(4)
+    };
     let sse_state = SseState {
         runtime: state.runtime,
         http_metrics: state.http_metrics,
         wall_clock: state.wall_clock,
         stream_id,
         offset,
-        max_len: max_len.max(1),
+        max_len: sse_max_len,
         encode_base64,
         cursor: query.get("cursor").cloned(),
         initial_read: true,
@@ -2809,7 +2922,7 @@ pub(crate) async fn sse_stream(
         } else {
             state.runtime.wait_read_stream(read_request).await
         };
-        let read = match read {
+        let mut read = match read {
             Ok(read) => read,
             Err(err) => {
                 state
@@ -2820,6 +2933,7 @@ pub(crate) async fn sse_stream(
                 return Some((Ok::<Bytes, Infallible>(Bytes::from(event)), None));
             }
         };
+        clamp_sse_text_read(&mut read, state.encode_base64);
 
         state.offset = read.next_offset;
         let done = read.closed && read.up_to_date;
@@ -2841,6 +2955,11 @@ pub(crate) async fn sse_stream(
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     insert_content_type(&mut headers, "text/event-stream");
+    insert_header_str(
+        &mut headers,
+        HEADER_STREAM_DATA_CONTENT_TYPE,
+        http_read_content_type(&head.content_type),
+    );
     insert_cache_control(&mut headers, "no-cache");
     if encode_base64 {
         insert_static(&mut headers, HEADER_STREAM_SSE_DATA_ENCODING, "base64");
@@ -2948,6 +3067,23 @@ pub(crate) fn stream_fork_offset(headers: &HeaderMap) -> Result<Option<u64>, Box
     normalized.parse::<u64>().map(Some).map_err(|_| {
         Box::new((StatusCode::BAD_REQUEST, "invalid stream-fork-offset").into_response())
     })
+}
+
+pub(crate) fn stream_attrs(headers: &HeaderMap) -> Result<Option<StreamAttrs>, BoxResponse> {
+    let Some(raw) = header_value(headers, HEADER_STREAM_ATTRS) else {
+        return Ok(None);
+    };
+    serde_json::from_str::<StreamAttrs>(raw)
+        .map(Some)
+        .map_err(|err| {
+            Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid stream-attrs JSON: {err}"),
+                )
+                    .into_response(),
+            )
+        })
 }
 
 pub(crate) fn has_content_type(headers: &HeaderMap) -> bool {
@@ -3121,9 +3257,10 @@ pub(crate) async fn runtime_error_or_leader_redirect_async(
     let Some(router) = state.client_write_router() else {
         return runtime_error_response(err);
     };
-    // gRPC and the client API share one listener, so the leader's address is
-    // a valid redirect target for reads and writes alike. 307 preserves the
-    // method and body, so a forwarded POST/PUT re-runs as a write on the
+    // Peer URLs are the configured client-reachable leader addresses
+    // (`server.listen` when shared, or `server.cluster_listen` when split), so
+    // they are valid redirect targets for reads and writes alike. 307 preserves
+    // the method and body, so a redirected POST/PUT re-runs as a write on the
     // leader. Writes go through the leader's raft client_write exactly as a
     // local write would; redirecting only moves the leader hop to the client.
     if let Some(redirect) = router.redirect_response(&err, request_target) {

@@ -1,0 +1,299 @@
+global:
+  image:
+    # Image repository. The image must contain `ursula`, `ursulactl`, and `ursulagw`.
+    repository: ghcr.io/tonbo-io/ursula
+    # Image tag. Defaults to the chart appVersion when left empty.
+    tag: ""
+    # Kubernetes image pull policy.
+    pullPolicy: IfNotPresent
+  # Optional image pull secrets, rendered as `imagePullSecrets`.
+  imagePullSecrets: []
+  # Kubernetes cluster DNS domain used for generated peer FQDNs and gateway upstreams.
+  clusterDomain: cluster.local
+
+# Override the chart name portion of generated resource names.
+# Must be a lowercase DNS-1123 label when set.
+nameOverride: ""
+# Override the full generated release name.
+# Must be a lowercase DNS-1123 label when set, with room for generated suffixes.
+fullnameOverride: ""
+
+serviceAccount:
+  # Create a dedicated ServiceAccount for Ursula server, gateway, and test pods.
+  create: true
+  # Use this ServiceAccount name when create=false, or override the generated name.
+  # Must be a lowercase DNS-1123 label when set.
+  name: ""
+  # ServiceAccount annotations, commonly used for cloud workload identity.
+  annotations: {}
+  # Keep Kubernetes API tokens out of pods by default.
+  automountServiceAccountToken: false
+
+server:
+  # Number of Ursula pods to start for a fresh static-membership cluster.
+  # Supported fresh-install values are 1, 3, and 5. Changing this value on an
+  # initialized cluster does not perform safe Raft voter reconfiguration.
+  replicaCount: 3
+  # StatefulSet pod management policy. Parallel avoids readiness-gated bootstrap serialization.
+  podManagementPolicy: Parallel
+  ports:
+    # Ursula HTTP/admin client-plane process port.
+    client: 4437
+  service:
+    # Render the internal client/admin Service.
+    enabled: true
+    # Client/admin Service type.
+    type: ClusterIP
+    # Client/admin Service port.
+    port: 4437
+    # Client/admin Service annotations.
+    annotations: {}
+  headlessService:
+    # Headless peer Service annotations.
+    annotations: {}
+  # Extra annotations applied to Ursula server pods.
+  podAnnotations: {}
+  # Extra labels applied to Ursula server pods.
+  podLabels: {}
+  # Rust tracing filter passed through RUST_LOG.
+  rustLog: "ursula=info,ursula_runtime=info,ursula_raft=info"
+  # Number of Ursula runtime cores. Tune based on CPU requests/limits.
+  coreCount: 4
+  # Extra CLI args appended after the generated Ursula args.
+  extraArgs: []
+  # Extra container environment entries for Ursula.
+  extraEnv: []
+  # Extra envFrom blocks for Ursula.
+  extraEnvFrom: []
+  # Container resource requests and limits.
+  resources: {}
+  podSecurityContext:
+    # Pod-level securityContext for Ursula server pods.
+    fsGroup: 10001
+    fsGroupChangePolicy: OnRootMismatch
+  securityContext:
+    # Container-level securityContext for the Ursula server container.
+    runAsUser: 10001
+    runAsGroup: 10001
+    runAsNonRoot: true
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+  podDisruptionBudget:
+    # Enable quorum-friendly PDB for multi-node clusters.
+    enabled: true
+    # Maximum voluntary disruptions for replicaCount > 1.
+    maxUnavailable: 1
+  scheduling:
+    nodeSelector: {}
+    tolerations: []
+    # Empty uses the chart's default soft hostname anti-affinity for multi-pod clusters.
+    affinity: {}
+    # Empty uses the chart's default zone spread constraint for multi-pod clusters.
+    topologySpreadConstraints: []
+
+raft:
+  # Number of Raft groups. Defaults to a lighter quickstart than production docs.
+  groupCount: 64
+  # Fresh-cluster bootstrap flag. Set to false after the first successful ready.
+  initMembership: false
+  # Fresh-cluster per-group bootstrap flag. Set to false after the first successful ready.
+  initMembershipPerGroup: true
+  # Storage mode: logDir for durable Raft logs, memory for ephemeral tests.
+  storageMode: logDir
+  # Raft log directory used when storageMode=logDir.
+  logDir: /var/lib/ursula/raft
+  # Optional cap for uncommitted payload bytes per group.
+  maxUncommittedBytesPerGroup: null
+
+persistence:
+  # Enable per-pod PVCs for durable Raft log storage.
+  enabled: true
+  # StorageClass name. Empty string uses the cluster default.
+  storageClassName: ""
+  # PVC access modes.
+  accessModes:
+    - ReadWriteOnce
+  # PVC size for each Ursula pod.
+  size: 20Gi
+  # PVC annotations.
+  annotations: {}
+
+s3:
+  # Shared S3-compatible bucket for Ursula object storage.
+  # Required when coldStorage.enabled=true or snapshotStore.backend=s3.
+  bucket: ""
+  # S3 region. Rendered as storage.cold.s3.region in the generated config when non-empty.
+  region: ""
+  # Optional S3-compatible endpoint, such as TOS or MinIO.
+  endpoint: ""
+  # Shared object prefix used with coldStorage.prefix to build storage.cold.root
+  # when cold storage is enabled. Snapshot keys also use the resolved cold root
+  # when present, so they are not always directly below this prefix.
+  prefix: ""
+  credentials:
+    # Inline S3 access key. When set with secretAccessKey, the chart renders a Secret.
+    accessKeyId: ""
+    # Inline S3 secret key. When set with accessKeyId, the chart renders a Secret.
+    secretAccessKey: ""
+    # Optional inline S3 session token.
+    sessionToken: ""
+    # Existing Secret containing accessKeyId, secretAccessKey, and optional sessionToken.
+    # When set, inline credentials are not allowed.
+    existingSecret: ""
+
+coldStorage:
+  # Enable shared cold storage config. Multi-node production clusters should use S3.
+  enabled: false
+  # Cold backend. The chart currently renders S3 settings when enabled.
+  backend: s3
+  # Cold object prefix below s3.prefix.
+  prefix: cold
+  flush:
+    intervalMs: 1000
+    minHotBytes: 8388608
+    maxBytes: 8388608
+    maxConcurrency: 4
+    maxHotBytesPerGroup: 67108864
+  cache:
+    # Optional cold-read cache override. Leave all fields null/omitted to let Ursula install its default cache.
+    maxSizeBytes: null
+    blockSizeBytes: null
+    readaheadBlocks: null
+
+snapshotStore:
+  # Snapshot backend: inline or s3. Rendered explicitly as storage.snapshot.backend.
+  backend: inline
+  # Snapshot object suffix rendered as storage.snapshot.s3_prefix; resolved against
+  # storage.cold.root when present, otherwise against the S3 bucket root for S3 snapshots.
+  prefix: snapshots
+  # Optional manual snapshot driver interval in milliseconds. Leave null for runtime default semantics.
+  driveIntervalMs: null
+
+gateway:
+  # Enable the gateway Deployment and Service. The gateway is the default
+  # external entrypoint; Ingress belongs under gateway.
+  enabled: true
+  # Number of gateway replicas.
+  replicaCount: 2
+
+  image:
+    # Gateway image repository. Defaults to global.image.repository when empty.
+    repository: ""
+    # Gateway image tag. Defaults to global.image.tag / appVersion when empty.
+    tag: ""
+    # Gateway image pull policy. Defaults to global.image.pullPolicy when empty.
+    pullPolicy: ""
+
+  ports:
+    # Gateway HTTP process listen port.
+    http: 4437
+
+  service:
+    # Gateway Service type.
+    type: ClusterIP
+    # Gateway Service port.
+    port: 4437
+    # Gateway Service annotations.
+    annotations: {}
+
+  ingress:
+    # Render an Ingress resource for the gateway Service.
+    enabled: false
+    # Optional IngressClass name. Prefer this over the legacy
+    # kubernetes.io/ingress.class annotation.
+    className: ""
+    # Ingress annotations, commonly used for controller-specific settings.
+    annotations: {}
+    # Extra labels applied only to the Ingress resource.
+    labels: {}
+    # Host rules rendered into spec.rules.
+    hosts: []
+    # TLS configuration rendered into spec.tls. Referenced Secrets must already exist.
+    tls: []
+
+  # Manual upstream URLs. When empty, the chart auto-generates upstreams from
+  # Ursula server pod DNS through the headless Service.
+  upstreams: []
+
+  # Extra annotations applied to gateway pods.
+  podAnnotations: {}
+  # Extra labels applied to gateway pods.
+  podLabels: {}
+  # Rust tracing filter passed through RUST_LOG.
+  rustLog: "ursula_gateway=info"
+  # TCP connect timeout per upstream attempt in seconds.
+  connectTimeoutSeconds: 5
+  # Timeout for upstream response headers in seconds.
+  responseHeaderTimeoutSeconds: 30
+  # Maximum request body bytes the gateway buffers for leader-redirect replay.
+  maxRequestBodyBytes: 33554432
+  # Maximum graceful shutdown drain time after SIGTERM, in seconds.
+  gracefulShutdownTimeoutSeconds: 3600
+  # Extra CLI args appended after the generated gateway args.
+  extraArgs: []
+  # Extra container environment entries for the gateway.
+  extraEnv: []
+  # Extra envFrom blocks for the gateway.
+  extraEnvFrom: []
+  # Container resource requests and limits for the gateway.
+  resources: {}
+  podSecurityContext:
+    fsGroup: 10001
+    fsGroupChangePolicy: OnRootMismatch
+  securityContext:
+    runAsUser: 10001
+    runAsGroup: 10001
+    runAsNonRoot: true
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+  probes:
+    startup:
+      enabled: true
+      failureThreshold: 30
+      periodSeconds: 2
+    readiness:
+      enabled: true
+      periodSeconds: 5
+      timeoutSeconds: 2
+    liveness:
+      enabled: true
+      periodSeconds: 10
+      timeoutSeconds: 2
+  podDisruptionBudget:
+    # Enable a PodDisruptionBudget for the gateway.
+    enabled: false
+    maxUnavailable: 1
+  autoscaling:
+    # Enable HorizontalPodAutoscaler for the gateway.
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 80
+    targetMemoryUtilizationPercentage: null
+    behavior: {}
+  scheduling:
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    topologySpreadConstraints: []
+  # Init containers to run before the gateway container.
+  initContainers: []
+
+tests:
+  # Render Helm test Pod.
+  enabled: true
+  # Timeout for ursulactl wait-ready.
+  timeoutSeconds: 120
+  image:
+    # Optional test image repository. Empty inherits global.image.repository.
+    repository: ""
+    # Optional test image tag. Empty inherits global.image.tag / appVersion.
+    tag: ""
+    # Optional test image pull policy. Empty inherits global.image.pullPolicy.
+    pullPolicy: ""

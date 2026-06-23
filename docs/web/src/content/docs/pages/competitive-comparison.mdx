@@ -2,56 +2,57 @@
 title: Comparisons
 ---
 
-Ursula's niche: distributed Durable Streams over HTTP, one timeline per application resource, served from a thread-per-core multi-Raft cluster. The frame that drove the design: every other server we evaluated forces you to give up one of four things this primitive deserves to keep: open-source self-hosting, low write latency, plain S3 economics, or quorum-replicated durability. Each section below maps a competitor against that four-way frame.
+Ursula is for streams that diverse clients reach over the public internet with plain HTTP. One durable timeline per resource, and many small streams rather than a few big ones.
 
-## Object storage (S3 directly)
+Most streaming systems are built for a different shape. They assume an SDK client inside your network and a few high-throughput topics. That assumption decides most of the comparison below, so start there.
 
-S3 is excellent for durable immutable blobs. As an append interface it isn't: every append is a new object, conditional writes are optimistic and retry-storm under contention, and live readers must poll.
+## Start with the access model
 
-Ursula uses S3 for the cold tier and snapshots, never the write path. Appends commit at Raft quorum in an in-memory hot ring; a background flush carries older segments to S3. The hot/cold boundary is invisible: one `GET` serves both.
+Two questions decide whether Ursula fits.
 
-## Durable Streams reference server (Electric)
+**Where do clients run, and how do they connect?** Ursula serves plain HTTP and SSE. A browser, a mobile app, a serverless function, or a third party can read, write, and tail a stream over the public internet with no SDK. Broker-style systems expect a client library inside the same network.
 
-The reference server implements the same protocol and is designed to embed and run as a single process. HA requires building another layer on top.
+**What is one stream?** In Ursula one stream maps to one resource: a document, a session, a task, an agent run. You address it by URL and keep thousands of them. Broker-style systems multiplex many resources into a few topics and partitions, and you rebuild per-resource state downstream.
 
-Ursula provides that layer natively (per-group Raft, quorum replication, transparent leader forwarding, snapshot publication, cold offload), at the cost of running a multi-node cluster. Both speak the same protocol, so clients are interchangeable.
-
-## S2 / S2 Lite
-
-S2 is an object-storage-backed stream API. Strong acknowledged durability comes from writing through S3 Express One Zone. Self-hosted S2 Lite is a single serving process; the managed product uses its own API.
-
-| | Ursula | S2 |
-| --- | --- | --- |
-| Protocol | Durable Streams HTTP | Custom |
-| Write path | Raft quorum in replicated hot ring, no S3 | S3 Express |
-| Cold tier | S3 Standard | S3 Express (~7× per-GB) |
-| Shape | Raft cluster | Single-process self-host (Lite) |
+If your clients are in-network services and your data is a few high-throughput pipelines, Ursula is the wrong shape. If your clients are on the open internet and your data is many small per-resource timelines, the rest follows.
 
 ## Kafka / Redpanda
 
-Kafka and Redpanda target high-throughput pipelines: topics, partitions, consumer groups. Redpanda shares one idea with Ursula: **thread-per-core**, with each core owning its partitions.
+Kafka and Redpanda are built for high-throughput pipelines. Topics, partitions, consumer groups, and SDK clients inside the cluster network. They are mature and fast at that job.
 
-Differences:
+They are not built for public-internet HTTP access or for thousands of small, independently addressable streams. There is no plain-HTTP read, write, and tail for an arbitrary client, and the unit of work is the topic, not the resource. Pick Kafka or Redpanda for a few high-throughput topics with in-network consumers. Pick Ursula for many small streams with open-internet clients.
 
-- **Primitive.** Topic + partition + consumer group vs. one independently-addressable durable stream per resource. Ursula is built for thousands of small streams, not a few high-throughput pipelines.
-- **Protocol.** Kafka wire protocol with partition-aware clients vs. plain HTTP + SSE.
-- **Group placement.** Redpanda strictly owns one Raft group per core (Seastar reactor). Ursula co-schedules many small groups on one `tokio::current_thread` runtime per core, trading a bit of within-core isolation for the flexibility of group count ≫ core count.
-- **Maturity.** Kafka and Redpanda have years of production hardening; Ursula is `v0.x` with intentionally minimal operations.
+## S2 / S2 Lite
 
-## etcd / single-Raft KV
+S2 is an object-storage-backed stream API and the closest alternative to Ursula. Acknowledged writes go through S3 Express One Zone, and the cold tier stays on Express-class storage. Self-hosted S2 Lite is a single serving process. The managed product uses its own API, not Durable Streams.
 
-etcd is strongly-consistent KV over a single Raft log: exemplary at small consistent state, but capped at one leader's serialization throughput.
+S3 Express looks fine on its own. The point is that you do not need it. Ursula gets its write latency from an in-memory hot ring replicated by Raft quorum, which has nothing to do with the storage tier, and it keeps data on plain S3 Standard. In our 3-node benchmark Ursula commits appends faster than S2 Lite at every concurrency, since S2's per-append latency is bound by the S3 PUT round-trip. So S2 pays for a premium storage tier and still writes slower.
 
-Ursula's multi-Raft layout (hundreds to thousands of small groups across cores and nodes) lets aggregate throughput scale with cluster size. The cost: more groups to manage and no single-log linearizability across the namespace. Per-stream linearizability is preserved.
+| | Ursula | S2 |
+| --- | --- | --- |
+| Protocol | Durable Streams over plain HTTP and SSE, portable clients | Custom API, locked to one vendor |
+| Write latency | Single-digit to tens of ms p99 append | Hundreds of ms p99, bound by the S3 PUT |
+| Storage tier | Plain S3 Standard, commodity per-GB price | S3 Express, around 7× the per-GB storage bill |
+| Self-host | Raft cluster with quorum HA | Single process (Lite), no failover |
+
+On a workload that accumulates terabytes in the cold tier, the storage gap is the larger line on your bill, and it grows every month. Pick S2 for a managed service when you can adopt its API and pay for Express-class storage. Pick Ursula for lower-latency writes on an open protocol with a commodity S3 bill.
+
+## S3 directly
+
+S3 is great for durable immutable blobs. It is a poor append log. Every append is a new object. Conditional writes are optimistic and retry-storm under load. Live readers have to poll.
+
+Ursula uses S3 for the cold tier and snapshots, never the write path. Appends commit at Raft quorum in an in-memory hot ring, and a background flush moves older data to S3. One read serves hot and cold transparently. Use S3 directly for immutable blobs with no append or tail. Use Ursula when you need an append log with live readers.
+
+## etcd
+
+etcd is strongly consistent key-value over a single Raft log. It is excellent for small consistent state. Throughput is capped at one leader's serialization.
+
+Ursula runs many small Raft groups across cores and nodes, so throughput scales with the cluster. There is no single-log order across the whole namespace, but each stream stays linearizable. Use etcd for small consistent cluster-wide state. Use Ursula for many independent durable streams.
 
 ## When to pick which
 
-Reach for **Ursula** when the model is many small timelines (one per resource), clients are diverse HTTP callers, and you want replay + live tail + snapshot in one primitive on commodity infrastructure with S3 Standard as the cold tier.
-
-Reach for something else when:
-
-- A few high-throughput topics with consumer groups -> **Kafka / Redpanda**
-- Single-process deployment -> **Durable Streams reference server**
-- Managed service, willing to change API -> **S2**
-- Durable immutable blobs, no append/tail -> **S3 directly**
-- Small consistent KV across the whole cluster -> **etcd**
+- Many small per-resource streams, open-internet HTTP clients, replay and live tail in one primitive: **Ursula**.
+- A few high-throughput topics with consumer groups: **Kafka / Redpanda**.
+- Managed service, willing to change API: **S2**.
+- Durable immutable blobs, no append or tail: **S3 directly**.
+- Small consistent key-value across the cluster: **etcd**.

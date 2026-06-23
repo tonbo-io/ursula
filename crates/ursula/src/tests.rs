@@ -13,8 +13,10 @@ use openraft::error::ReplicationClosed;
 use openraft::network::RPCOption;
 use openraft::raft::SnapshotResponse;
 use openraft::rt::WatchReceiver;
+use serde_json::json;
 use tower::ServiceExt;
 use ursula_raft::StaticGrpcRaftGroupEngineFactory;
+use ursula_raft::StaticGrpcRaftMembershipConfig;
 use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_runtime::ColdStore;
 use ursula_runtime::ColdStoreHandle;
@@ -28,6 +30,13 @@ use ursula_runtime::StreamErrorContext;
 use ursula_shard::RaftGroupId;
 
 use super::*;
+
+fn test_config(core_count: usize, group_count: usize) -> ursula_config::UrsulaConfig {
+    let mut config = ursula_config::UrsulaConfig::default();
+    config.runtime.core_count = core_count;
+    config.raft.group_count = group_count;
+    config
+}
 
 #[derive(Clone)]
 struct TestWallClock {
@@ -234,17 +243,16 @@ fn parses_membership_voter_ids() {
 
 #[test]
 fn static_grpc_membership_config_rejects_partial_group_voters() {
-    let result = crate::bootstrap::spawn_static_grpc_raft_memory_runtime_with_membership_config(
+    let result = crate::bootstrap::Topology::static_cluster(
         1,
-        2,
-        1,
-        [
+        vec![
             (1, "http://node-1".to_owned()),
             (2, "http://node-2".to_owned()),
             (3, "http://node-3".to_owned()),
         ],
+        2,
         true,
-        crate::bootstrap::StaticGrpcRaftMembershipConfig {
+        StaticGrpcRaftMembershipConfig {
             initialize_membership_per_group: true,
             per_group_voters: BTreeMap::from([(RaftGroupId(0), BTreeSet::from([1, 2, 3]))]),
         },
@@ -281,6 +289,7 @@ impl StaticGrpcTestNode {
 struct StaticGrpcTestNodeStorage {
     raft_log_dir: Option<PathBuf>,
     cold_store: Option<ColdStoreHandle>,
+    engine_config: Option<ursula_raft::RaftEngineConfig>,
     per_group_initializers: bool,
     per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
 }
@@ -324,6 +333,7 @@ async fn spawn_static_grpc_test_node_with_log_dir(
         StaticGrpcTestNodeStorage {
             raft_log_dir,
             cold_store: None,
+            engine_config: None,
             per_group_initializers: false,
             per_group_voters: BTreeMap::new(),
         },
@@ -349,6 +359,7 @@ async fn spawn_static_grpc_test_node_with_per_group_initializers(
         StaticGrpcTestNodeStorage {
             raft_log_dir: None,
             cold_store: None,
+            engine_config: None,
             per_group_initializers: true,
             per_group_voters: BTreeMap::new(),
         },
@@ -377,6 +388,9 @@ async fn spawn_static_grpc_test_node_with_storage(
     factory = factory.with_per_group_membership_initializers(storage.per_group_initializers);
     factory = factory.with_per_group_voters(storage.per_group_voters.clone());
     factory = factory.with_cold_store(storage.cold_store.clone());
+    if let Some(engine_config) = storage.engine_config {
+        factory = factory.with_engine_config(engine_config);
+    }
     if let Some(raft_log_dir) = storage.raft_log_dir {
         factory = factory.with_raft_log_dir(raft_log_dir);
     }
@@ -510,6 +524,299 @@ async fn create_append_read_and_head_match_perf_compare_subset() {
             .get(HEADER_STREAM_INTEGRITY_LIVE_SETSUM)
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn stream_attrs_can_be_updated_and_read_over_http() {
+    let app = test_router();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-http")
+                .header(CONTENT_TYPE, "text/plain")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let attrs = json!({
+        "title": "Support session",
+        "metadata": {
+            "agent": { "id": "agent-1", "version": 2 },
+            "purpose": "customer-support"
+        }
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-http/attrs")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(attrs.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/benchcmp/attrs-http/attrs")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let actual: serde_json::Value = serde_json::from_slice(&body).expect("attrs json");
+    assert_eq!(actual, attrs);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-http/attrs")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/benchcmp/attrs-http/attrs")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let actual: serde_json::Value = serde_json::from_slice(&body).expect("attrs json");
+    assert_eq!(actual, json!({}));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-http")
+                .header(CONTENT_TYPE, "text/plain")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn stream_attrs_can_be_set_when_creating_stream_over_http() {
+    let app = test_router();
+    let attrs = json!({
+        "title": "Created session",
+        "metadata": {
+            "agent": { "id": "agent-create", "version": 2 },
+            "purpose": "create-time"
+        }
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-create-http")
+                .header(CONTENT_TYPE, "text/plain")
+                .header("stream-attrs", attrs.to_string())
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/benchcmp/attrs-create-http/attrs")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let actual: serde_json::Value = serde_json::from_slice(&body).expect("attrs json");
+    assert_eq!(actual, attrs);
+}
+
+#[tokio::test]
+async fn stream_attrs_endpoints_return_not_found_for_missing_stream() {
+    let app = test_router();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/benchcmp/attrs-missing/attrs")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-missing/attrs")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"title":"missing"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn stream_attrs_endpoints_return_gone_for_soft_deleted_stream() {
+    let app = test_router();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-soft-deleted")
+                .header(CONTENT_TYPE, "text/plain")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // Forking keeps a reference on the parent so deleting it soft-deletes.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-soft-deleted-child")
+                .header(HEADER_STREAM_FORKED_FROM, "benchcmp/attrs-soft-deleted")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/benchcmp/attrs-soft-deleted")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/benchcmp/attrs-soft-deleted/attrs")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::GONE);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-soft-deleted/attrs")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"title":"gone"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::GONE);
+}
+
+#[tokio::test]
+async fn create_stream_rejects_invalid_stream_attrs_header() {
+    let app = test_router();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-bad-header")
+                .header(CONTENT_TYPE, "text/plain")
+                .header("stream-attrs", "{not json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/attrs-bad-header/attrs")
+                .header(CONTENT_TYPE, "application/json5")
+                .body(Body::from(r#"{"title":"json5"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -1153,7 +1460,7 @@ async fn append_batch_producer_headers_deduplicate_retries() {
 }
 
 #[tokio::test]
-async fn json_mode_normalizes_appends_and_projects_reads() {
+async fn json_mode_normalizes_appends_and_reads_ndjson() {
     let app = test_router();
 
     let response = app
@@ -1196,10 +1503,14 @@ async fn json_mode_normalizes_appends_and_projects_reads() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/x-ndjson"
+    );
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
-    assert_eq!(&body[..], br#"[[1,2,3]]"#);
+    assert_eq!(&body[..], b"[1,2,3]\n");
 
     let response = app
         .oneshot(
@@ -1213,6 +1524,63 @@ async fn json_mode_normalizes_appends_and_projects_reads() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn json_mode_reads_ndjson_bytes_without_message_boundary_projection() {
+    let app = test_router();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/stream/json-window")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/stream/json-window")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"[{"message":"alpha"},{"message":"beta"}]"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/stream/json-window?offset=-1&max_bytes=5")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/x-ndjson"
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_NEXT_OFFSET).unwrap(),
+        "00000000000000000005"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(&body[..], b"{\"mes");
 }
 
 #[tokio::test]
@@ -1262,10 +1630,14 @@ async fn fork_creation_copies_source_prefix_and_inherits_content_type() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).expect("content type"),
+        "application/x-ndjson"
+    );
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
-    assert_eq!(&body[..], br#"[{"from":"source"}]"#);
+    assert_eq!(&body[..], b"{\"from\":\"source\"}\n");
 }
 
 #[test]
@@ -1677,6 +2049,13 @@ async fn sse_live_tail_delivers_appended_text_and_closed_control() {
         response.headers().get(CONTENT_TYPE).unwrap(),
         "text/event-stream"
     );
+    assert_eq!(
+        response
+            .headers()
+            .get("stream-data-content-type")
+            .expect("stream data content type"),
+        "text/plain"
+    );
 
     let body_task = tokio::spawn(async move {
         to_bytes(response.into_body(), usize::MAX)
@@ -1732,6 +2111,140 @@ async fn sse_live_tail_delivers_appended_text_and_closed_control() {
 }
 
 #[tokio::test]
+async fn sse_exposes_ndjson_data_content_type_for_json_streams() {
+    let app = test_router();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/sse-json")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/benchcmp/sse-json")
+                .header(CONTENT_TYPE, "application/json")
+                .header(HEADER_STREAM_CLOSED, "true")
+                .body(Body::from(r#"{"event":"done"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/benchcmp/sse-json?offset=-1&live=sse")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "text/event-stream"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("stream-data-content-type")
+            .expect("stream data content type"),
+        "application/x-ndjson"
+    );
+    assert!(
+        response
+            .headers()
+            .get(HEADER_STREAM_SSE_DATA_ENCODING)
+            .is_none()
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("sse body");
+    let body = std::str::from_utf8(&body).expect("utf8 sse body");
+    assert!(body.contains("event: data"));
+    assert!(body.contains("data:{\"event\":\"done\"}"));
+    assert!(body.contains("data:{\"event\":\"done\"}\ndata:\n\n"));
+    assert!(body.contains("\"streamClosed\":true"));
+}
+
+#[tokio::test]
+async fn sse_json_max_bytes_does_not_split_utf8_codepoints() {
+    let app = test_router();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/sse-json-utf8")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/benchcmp/sse-json-utf8")
+                .header(CONTENT_TYPE, "application/json")
+                .header(HEADER_STREAM_CLOSED, "true")
+                .body(Body::from(r#"{"m":"\u00e9"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/benchcmp/sse-json-utf8?offset=-1&live=sse&max_bytes=7")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("stream-data-content-type")
+            .expect("stream data content type"),
+        "application/x-ndjson"
+    );
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("sse body");
+    let body = std::str::from_utf8(&body).expect("utf8 sse body");
+    assert!(!body.contains('\u{fffd}'), "{body}");
+    assert!(body.contains("\"streamNextOffset\":\"00000000000000000006\""));
+    assert!(body.contains("data:{\"m\":\""));
+    assert!(body.contains("data:\u{00e9}\"}"));
+    assert!(body.contains("\"streamClosed\":true"));
+}
+
+#[tokio::test]
 async fn wal_runtime_recovers_http_stream_after_restart() {
     let wal_root = std::env::temp_dir().join(format!(
         "ursula-wal-test-{}-{}",
@@ -1744,7 +2257,19 @@ async fn wal_runtime_recovers_http_stream_after_restart() {
     let _ = std::fs::remove_dir_all(&wal_root);
 
     {
-        let app = router(spawn_wal_runtime(2, 8, &wal_root).expect("runtime"));
+        let app = router(
+            spawn_runtime(
+                &test_config(2, 8),
+                Persistence::Wal {
+                    wal_dir: wal_root.clone(),
+                },
+                Topology::SingleNode {
+                    raft_group_count: 8,
+                },
+            )
+            .expect("runtime")
+            .runtime,
+        );
         let response = app
             .clone()
             .oneshot(
@@ -1797,7 +2322,19 @@ async fn wal_runtime_recovers_http_stream_after_restart() {
         assert!(body.contains("\"wal_sync_ns\":"));
     }
 
-    let app = router(spawn_wal_runtime(2, 8, &wal_root).expect("recovered runtime"));
+    let app = router(
+        spawn_runtime(
+            &test_config(2, 8),
+            Persistence::Wal {
+                wal_dir: wal_root.clone(),
+            },
+            Topology::SingleNode {
+                raft_group_count: 8,
+            },
+        )
+        .expect("recovered runtime")
+        .runtime,
+    );
     let response = app
         .oneshot(
             Request::builder()
@@ -1829,7 +2366,19 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
     ));
     let _ = std::fs::remove_dir_all(&raft_root);
 
-    let app = router(spawn_raft_runtime(1, 1, &raft_root).expect("runtime"));
+    let app = router(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::Raft {
+                log_dir: Some(raft_root.clone()),
+            },
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    );
     let response = app
         .clone()
         .oneshot(
@@ -1921,15 +2470,23 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
     ));
     let _ = std::fs::remove_dir_all(&raft_root);
 
-    let (runtime, registry) = spawn_static_grpc_raft_runtime(
-        1,
-        1,
-        1,
-        [(1, "http://127.0.0.1:4477".to_owned())],
-        true,
-        &raft_root,
+    let spawned = spawn_runtime(
+        &test_config(1, 1),
+        Persistence::Raft {
+            log_dir: Some(raft_root.as_path().into()),
+        },
+        Topology::static_cluster(
+            1,
+            vec![(1, "http://127.0.0.1:4477".to_owned())],
+            1,
+            true,
+            Default::default(),
+        )
+        .expect("valid static cluster topology"),
     )
     .expect("runtime");
+    let runtime = spawned.runtime;
+    let registry = spawned.raft_registry.expect("registry");
     runtime.warm_all_groups().await.expect("warm group");
     let raft = registry
         .get(RaftGroupId(0))
@@ -2041,9 +2598,17 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
     let peers = [(1, "http://127.0.0.1:4477".to_owned())];
 
     {
-        let (runtime, registry) =
-            spawn_static_grpc_raft_runtime(1, 1, 1, peers.clone(), true, &raft_root)
-                .expect("runtime");
+        let spawned = spawn_runtime(
+            &test_config(1, 1),
+            Persistence::Raft {
+                log_dir: Some(raft_root.as_path().into()),
+            },
+            Topology::static_cluster(1, peers.to_vec(), 1, true, Default::default())
+                .expect("valid static cluster topology"),
+        )
+        .expect("runtime");
+        let runtime = spawned.runtime;
+        let registry = spawned.raft_registry.expect("registry");
         runtime.warm_all_groups().await.expect("warm group");
         let raft = registry
             .get(RaftGroupId(0))
@@ -2093,9 +2658,17 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
     );
 
     {
-        let (runtime, registry) =
-            spawn_static_grpc_raft_runtime(1, 1, 1, peers.clone(), false, &raft_root)
-                .expect("restarted runtime");
+        let spawned = spawn_runtime(
+            &test_config(1, 1),
+            Persistence::Raft {
+                log_dir: Some(raft_root.as_path().into()),
+            },
+            Topology::static_cluster(1, peers.to_vec(), 1, false, Default::default())
+                .expect("valid static cluster topology"),
+        )
+        .expect("restarted runtime");
+        let runtime = spawned.runtime;
+        let registry = spawned.raft_registry.expect("registry");
         runtime
             .warm_all_groups()
             .await
@@ -2131,7 +2704,17 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
 
 #[tokio::test]
 async fn raft_memory_runtime_serves_http_subset_without_wal_metrics() {
-    let app = router(spawn_raft_memory_runtime(1, 1).expect("runtime"));
+    let app = router(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::Raft { log_dir: None },
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    );
     let response = app
         .clone()
         .oneshot(
@@ -2337,7 +2920,7 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
             .expect("warm node groups");
     }
 
-    for raw_group_id in 0..6 {
+    for raw_group_id in 0u32..6 {
         let expected_leader = u64::from(raw_group_id % 3) + 1;
         let raft_group_id = RaftGroupId(raw_group_id);
         for node in &nodes {
@@ -2388,6 +2971,7 @@ async fn static_grpc_per_group_voters_create_distinct_initial_memberships() {
                 StaticGrpcTestNodeStorage {
                     raft_log_dir: None,
                     cold_store: None,
+                    engine_config: None,
                     per_group_initializers: true,
                     per_group_voters: group_voters.clone(),
                 },
@@ -2479,6 +3063,7 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
                 StaticGrpcTestNodeStorage {
                     raft_log_dir: None,
                     cold_store: None,
+                    engine_config: None,
                     per_group_initializers: true,
                     per_group_voters: group_voters.clone(),
                 },
@@ -2892,7 +3477,7 @@ async fn static_grpc_memory_node_rejoins_all_groups_after_allowed_log_revert() {
         .expect("warm leader groups timed out")
         .expect("warm leader groups");
 
-    for raw_group_id in 0..6 {
+    for raw_group_id in 0u32..6 {
         let expected_leader = u64::from(raw_group_id % 3) + 1;
         for node in &nodes {
             let raft = node
@@ -3115,6 +3700,148 @@ async fn static_grpc_memory_node_rejoins_all_groups_after_allowed_log_revert() {
 
     nodes.push(restarted);
     for node in nodes {
+        node.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn static_grpc_memory_restart_with_bootstrap_marker_reinitializes_group() {
+    let marker_dir = tempfile::tempdir().expect("marker dir");
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    let mut addrs = Vec::new();
+    for node_id in 1..=3u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        peers.push((node_id, format!("http://{addr}")));
+        addrs.push(addr);
+        listeners.push(listener);
+    }
+
+    let engine_config = ursula_raft::RaftEngineConfig {
+        memory_bootstrap_marker_dir: Some(marker_dir.path().to_path_buf()),
+        rejoin_probe: Duration::from_millis(100),
+        bootstrap_peer_probe: Duration::from_millis(100),
+        bootstrap_peer_probe_interval: Duration::from_millis(20),
+        bootstrap_peer_connect: Duration::from_millis(20),
+        ..Default::default()
+    };
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        nodes.push(
+            spawn_static_grpc_test_node_with_storage(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                true,
+                6,
+                StaticGrpcTestNodeStorage {
+                    raft_log_dir: None,
+                    cold_store: None,
+                    engine_config: Some(engine_config.clone()),
+                    per_group_initializers: true,
+                    per_group_voters: BTreeMap::new(),
+                },
+            )
+            .await,
+        );
+    }
+
+    for node in &nodes {
+        tokio::time::timeout(Duration::from_secs(10), node.runtime.warm_all_groups())
+            .await
+            .expect("initial warm_all_groups timed out")
+            .expect("initial warm_all_groups");
+    }
+    let group_0_marker = marker_dir.path().join("node-1-group-0.bootstrapped");
+    for _ in 0..50 {
+        if group_0_marker.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        group_0_marker.exists(),
+        "bootstrap wrote marker {}",
+        group_0_marker.display()
+    );
+    for node in nodes {
+        node.shutdown().await;
+    }
+
+    let mut restarted_nodes = Vec::new();
+    for (index, addr) in addrs.iter().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("rebind listener");
+        restarted_nodes.push(
+            spawn_static_grpc_test_node_with_storage(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                true,
+                6,
+                StaticGrpcTestNodeStorage {
+                    raft_log_dir: None,
+                    cold_store: None,
+                    engine_config: Some(engine_config.clone()),
+                    per_group_initializers: true,
+                    per_group_voters: BTreeMap::new(),
+                },
+            )
+            .await,
+        );
+    }
+    for (index, node) in restarted_nodes.iter().enumerate() {
+        tokio::time::timeout(Duration::from_secs(10), node.runtime.warm_all_groups())
+            .await
+            .unwrap_or_else(|_| panic!("restart warm_all_groups timed out for node {index}"))
+            .expect("restart warm_all_groups");
+    }
+
+    let group_0 = restarted_nodes[0]
+        .registry
+        .get(RaftGroupId(0))
+        .expect("registered group 0");
+    group_0
+        .wait(Some(Duration::from_secs(10)))
+        .current_leader(
+            1,
+            "marker-backed full memory restart should reinitialize group 0",
+        )
+        .await
+        .expect("wait for group 0 leadership after restart");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build reqwest client");
+    let stream_id = (0..10_000)
+        .map(|candidate| BucketStreamId::new("benchcmp", format!("stale-marker-{candidate}")))
+        .find(|stream_id| {
+            restarted_nodes[0].runtime.locate(stream_id).raft_group_id == RaftGroupId(0)
+        })
+        .expect("found stream for group 0");
+    let create = client
+        .put(format!("{}/{}", peers[0].1, stream_id))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body("after-restart")
+        .send()
+        .await
+        .expect("send create through reinitialized group");
+    assert_eq!(
+        create.status(),
+        StatusCode::CREATED,
+        "reinitialized group should be externally writable"
+    );
+
+    for node in restarted_nodes {
         node.shutdown().await;
     }
 }
@@ -3588,6 +4315,7 @@ async fn static_grpc_raft_durable_cold_flush_replicates_manifest() {
                 StaticGrpcTestNodeStorage {
                     raft_log_dir: Some(node_root),
                     cold_store: Some(cold_store.clone()),
+                    engine_config: None,
                     per_group_initializers: false,
                     per_group_voters: BTreeMap::new(),
                 },
@@ -4682,7 +5410,17 @@ async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
 }
 
 fn test_router() -> Router {
-    router(spawn_default_runtime(2, 8).expect("runtime"))
+    router(test_runtime(2, 8))
+}
+
+fn test_runtime(core_count: usize, raft_group_count: usize) -> ShardRuntime {
+    spawn_runtime(
+        &test_config(core_count, raft_group_count),
+        Persistence::InMemory,
+        Topology::SingleNode { raft_group_count },
+    )
+    .expect("runtime")
+    .runtime
 }
 
 async fn single_node_meta_handle_for_test(cluster_name: &str) -> ursula_raft::MetaRaftHandle {
@@ -4711,7 +5449,7 @@ async fn single_node_meta_handle_for_test(cluster_name: &str) -> ursula_raft::Me
 async fn admin_register_node_writes_to_meta_group() {
     let now_ms = Arc::new(AtomicU64::new(1_234));
     let meta = single_node_meta_handle_for_test("ursula-admin-register-node-test").await;
-    let state = HttpState::new(spawn_default_runtime(1, 1).expect("runtime"))
+    let state = HttpState::new(test_runtime(1, 1))
         .with_meta_raft_handle(meta.clone())
         .with_wall_clock(TestWallClock {
             now_ms: Arc::clone(&now_ms),
@@ -4750,9 +5488,7 @@ async fn admin_register_node_writes_to_meta_group() {
 
 #[tokio::test]
 async fn admin_register_node_requires_meta_group() {
-    let client = client_router_from_state(HttpState::new(
-        spawn_default_runtime(1, 1).expect("runtime"),
-    ));
+    let client = client_router_from_state(HttpState::new(test_runtime(1, 1)));
 
     let response = client
         .oneshot(
@@ -4797,8 +5533,7 @@ async fn admin_group_placement_reads_meta_projection() {
     .expect("seed placement");
 
     let client = client_router_from_state(
-        HttpState::new(spawn_default_runtime(1, 1).expect("runtime"))
-            .with_meta_raft_handle(meta.clone()),
+        HttpState::new(test_runtime(1, 1)).with_meta_raft_handle(meta.clone()),
     );
     let response = client
         .oneshot(
@@ -4836,9 +5571,7 @@ async fn admin_group_placement_reads_meta_projection() {
 
 #[tokio::test]
 async fn admin_group_placement_requires_meta_group() {
-    let client = client_router_from_state(HttpState::new(
-        spawn_default_runtime(1, 1).expect("runtime"),
-    ));
+    let client = client_router_from_state(HttpState::new(test_runtime(1, 1)));
 
     let response = client
         .oneshot(
@@ -4885,7 +5618,7 @@ async fn admin_begin_migration_writes_meta_migration() {
     .expect("seed placement");
 
     let client = client_router_from_state(
-        HttpState::new(spawn_default_runtime(1, 1).expect("runtime"))
+        HttpState::new(test_runtime(1, 1))
             .with_meta_raft_handle(meta.clone())
             .with_wall_clock(TestWallClock {
                 now_ms: Arc::clone(&now_ms),
@@ -4928,9 +5661,7 @@ async fn admin_begin_migration_writes_meta_migration() {
 
 #[tokio::test]
 async fn admin_begin_migration_requires_meta_group() {
-    let client = client_router_from_state(HttpState::new(
-        spawn_default_runtime(1, 1).expect("runtime"),
-    ));
+    let client = client_router_from_state(HttpState::new(test_runtime(1, 1)));
 
     let response = client
         .oneshot(
@@ -5000,9 +5731,7 @@ async fn admin_prepare_local_engine_warms_dynamically_allowed_group() {
 
 #[tokio::test]
 async fn admin_prepare_local_engine_requires_raft_registry() {
-    let client = client_router_from_state(HttpState::new(
-        spawn_default_runtime(1, 1).expect("runtime"),
-    ));
+    let client = client_router_from_state(HttpState::new(test_runtime(1, 1)));
 
     let response = client
         .oneshot(
@@ -5049,7 +5778,7 @@ async fn admin_commit_placement_writes_meta_projection() {
     .expect("seed placement");
 
     let client = client_router_from_state(
-        HttpState::new(spawn_default_runtime(1, 1).expect("runtime"))
+        HttpState::new(test_runtime(1, 1))
             .with_meta_raft_handle(meta.clone())
             .with_wall_clock(TestWallClock {
                 now_ms: Arc::clone(&now_ms),
@@ -5089,9 +5818,7 @@ async fn admin_commit_placement_writes_meta_projection() {
 
 #[tokio::test]
 async fn admin_commit_placement_requires_meta_group() {
-    let client = client_router_from_state(HttpState::new(
-        spawn_default_runtime(1, 1).expect("runtime"),
-    ));
+    let client = client_router_from_state(HttpState::new(test_runtime(1, 1)));
 
     let response = client
         .oneshot(
@@ -5141,7 +5868,7 @@ async fn admin_finish_migration_releases_meta_lock() {
         .expect("begin migration");
 
     let client = client_router_from_state(
-        HttpState::new(spawn_default_runtime(1, 1).expect("runtime"))
+        HttpState::new(test_runtime(1, 1))
             .with_meta_raft_handle(meta.clone())
             .with_wall_clock(TestWallClock {
                 now_ms: Arc::clone(&now_ms),
@@ -5186,9 +5913,7 @@ async fn admin_finish_migration_releases_meta_lock() {
 
 #[tokio::test]
 async fn admin_finish_migration_requires_meta_group() {
-    let client = client_router_from_state(HttpState::new(
-        spawn_default_runtime(1, 1).expect("runtime"),
-    ));
+    let client = client_router_from_state(HttpState::new(test_runtime(1, 1)));
 
     let response = client
         .oneshot(
@@ -5222,8 +5947,18 @@ async fn client_router_does_not_serve_cluster_plane_via_grpc_service() {
     // format produces a different status. We assert the cluster router gives
     // a tonic-style response (200/415/501) while the client router stays in
     // HTTP append's error space (4xx, never 200).
-    let state = HttpState::new(spawn_default_runtime(1, 1).expect("runtime"));
-    let client = client_router_from_state(state.clone());
+    let state = HttpState::new(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    );
+    let client = client_router_with_admission(state.clone(), IngressAdmission::default());
     let response = client
         .oneshot(
             Request::builder()
@@ -5252,7 +5987,17 @@ async fn client_router_does_not_serve_cluster_plane_via_grpc_service() {
 
 #[tokio::test]
 async fn cluster_router_does_not_expose_client_plane_routes() {
-    let state = HttpState::new(spawn_default_runtime(1, 1).expect("runtime"));
+    let state = HttpState::new(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    );
     let cluster = cluster_router_from_state(state.clone());
     // A normal client append must be 404 on the cluster router.
     let response = cluster
@@ -5277,8 +6022,18 @@ async fn cluster_router_does_not_expose_client_plane_routes() {
 async fn cluster_router_reports_leadership_shed_policy() {
     let registry = RaftGroupHandleRegistry::default();
     registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::ColdHealth);
-    let state =
-        HttpState::with_raft_registry(spawn_default_runtime(1, 1).expect("runtime"), registry);
+    let state = HttpState::with_raft_registry(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+        registry,
+    );
     let cluster = cluster_router_from_state(state);
     let response = cluster
         .oneshot(
@@ -5307,9 +6062,22 @@ async fn cluster_router_reports_leadership_shed_policy() {
 #[tokio::test]
 async fn maintenance_drain_endpoint_marks_and_clears_leadership_shed() {
     let registry = RaftGroupHandleRegistry::default();
-    let state =
-        HttpState::with_raft_registry(spawn_default_runtime(1, 1).expect("runtime"), registry);
-    let router = router_with_http_state(state);
+    let state = HttpState::with_raft_registry(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+        registry,
+    );
+    let router = cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
+    ));
 
     let response = router
         .clone()
@@ -5355,8 +6123,21 @@ async fn maintenance_drain_endpoint_marks_and_clears_leadership_shed() {
 async fn merged_router_serves_both_planes() {
     // The single-listener router (backwards compat / in-process tests) must
     // still answer both client and cluster routes from one bind.
-    let state = HttpState::new(spawn_default_runtime(1, 1).expect("runtime"));
-    let merged = router_with_http_state(state);
+    let state = HttpState::new(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    );
+    let merged = cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
+    ));
     let merged_for_cluster = merged.clone();
 
     // Client-plane: HEAD on an unknown stream returns 404 (route mounted).
@@ -5394,12 +6175,24 @@ async fn merged_router_serves_both_planes() {
 #[tokio::test]
 async fn http_state_wall_clock_drives_protocol_now_ms() {
     let now_ms = Arc::new(AtomicU64::new(1_000));
-    let state = HttpState::new(spawn_default_runtime(1, 1).expect("runtime")).with_wall_clock(
-        TestWallClock {
-            now_ms: Arc::clone(&now_ms),
-        },
-    );
-    let app = router_with_http_state(state);
+    let state = HttpState::new(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    )
+    .with_wall_clock(TestWallClock {
+        now_ms: Arc::clone(&now_ms),
+    });
+    let app = cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
+    ));
 
     let response = app
         .clone()
@@ -5751,9 +6544,14 @@ mod snapshot_driver {
     fn snapshot_driver_default_interval_follows_external_store() {
         assert_eq!(resolve_snapshot_drive_interval_ms(None, false), 0);
         assert_eq!(resolve_snapshot_drive_interval_ms(None, true), 60_000);
+        assert_eq!(resolve_snapshot_drive_interval_ms(Some(0), false), 0);
         assert_eq!(resolve_snapshot_drive_interval_ms(Some(0), true), 0);
         assert_eq!(
             resolve_snapshot_drive_interval_ms(Some(15_000), false),
+            15_000
+        );
+        assert_eq!(
+            resolve_snapshot_drive_interval_ms(Some(15_000), true),
             15_000
         );
     }
@@ -6179,11 +6977,14 @@ mod cluster_egress {
         ]);
         let registry = RaftGroupHandleRegistry::default();
 
-        crate::bootstrap::spawn_cluster_egress_gate_if_configured(
+        crate::bootstrap::spawn_egress_gate(
             &registry,
             1,
             &peers,
             per_group_voters,
+            &ursula_config::UrsulaConfig::default()
+                .governance
+                .cluster_probe,
         );
         tokio::time::sleep(Duration::from_millis(2_500)).await;
 

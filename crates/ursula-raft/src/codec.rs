@@ -7,6 +7,7 @@ use ursula_runtime::CreateStreamResponse;
 use ursula_runtime::DeleteStreamResponse;
 use ursula_runtime::FlushColdResponse;
 use ursula_runtime::ForkRefResponse;
+use ursula_runtime::GetStreamAttrsResponse;
 use ursula_runtime::GroupAppendBatchResponse;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
@@ -16,10 +17,12 @@ use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamResponse;
 use ursula_runtime::PublishSnapshotResponse;
 use ursula_runtime::ReadStreamResponse;
+use ursula_runtime::StreamAttrs;
 use ursula_runtime::StreamErrorCode;
 use ursula_runtime::StreamErrorContext;
 use ursula_runtime::StreamIntegritySnapshot;
 use ursula_runtime::TouchStreamAccessResponse;
+use ursula_runtime::UpdateStreamAttrsResponse;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
@@ -55,6 +58,7 @@ pub(crate) fn group_write_command_from_proto(
             stream_expires_at_ms: command.stream_expires_at_ms,
             forked_from: optional_stream_id_from_proto(command.forked_from)?,
             fork_offset: command.fork_offset,
+            attrs: stream_attrs_from_proto(command.attrs_json, "create_stream.attrs_json")?,
             now_ms: command.now_ms,
         }),
         Command::CreateExternal(command) => Ok(GroupWriteCommand::CreateExternal {
@@ -68,6 +72,7 @@ pub(crate) fn group_write_command_from_proto(
             stream_expires_at_ms: command.stream_expires_at_ms,
             forked_from: optional_stream_id_from_proto(command.forked_from)?,
             fork_offset: command.fork_offset,
+            attrs: stream_attrs_from_proto(command.attrs_json, "create_external.attrs_json")?,
             now_ms: command.now_ms,
         }),
         Command::Append(command) => Ok(GroupWriteCommand::Append {
@@ -110,6 +115,11 @@ pub(crate) fn group_write_command_from_proto(
             stream_id: stream_id_from_proto(command.stream_id, "touch_stream_access.stream_id")?,
             now_ms: command.now_ms,
             renew_ttl: command.renew_ttl,
+        }),
+        Command::UpdateStreamAttrs(command) => Ok(GroupWriteCommand::UpdateStreamAttrs {
+            stream_id: stream_id_from_proto(command.stream_id, "update_stream_attrs.stream_id")?,
+            attrs: stream_attrs_from_proto(command.attrs_json, "update_stream_attrs.attrs_json")?,
+            now_ms: command.now_ms,
         }),
         Command::AddForkRef(command) => Ok(GroupWriteCommand::AddForkRef {
             stream_id: stream_id_from_proto(command.stream_id, "add_fork_ref.stream_id")?,
@@ -155,6 +165,18 @@ pub(crate) fn optional_stream_id_from_proto(
     stream_id: Option<raft_app_proto::BucketStreamIdV1>,
 ) -> Result<Option<BucketStreamId>, GroupEngineError> {
     Ok(stream_id.map(Into::into))
+}
+
+fn stream_attrs_from_proto(
+    attrs_json: Option<Vec<u8>>,
+    field: &str,
+) -> Result<Option<StreamAttrs>, GroupEngineError> {
+    let Some(attrs_json) = attrs_json.filter(|bytes| !bytes.is_empty()) else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&attrs_json)
+        .map(Some)
+        .map_err(|err| GroupEngineError::new(format!("{field} contains invalid JSON: {err}")))
 }
 
 pub(crate) fn placement_from_proto(
@@ -248,6 +270,9 @@ pub(crate) fn write_applied_response_to_proto(
         GroupWriteResponse::TouchStreamAccess(response) => {
             Response::TouchStreamAccess(touch_stream_access_response_to_proto(response))
         }
+        GroupWriteResponse::UpdateStreamAttrs(response) => {
+            Response::UpdateStreamAttrs(update_stream_attrs_response_to_proto(response))
+        }
         GroupWriteResponse::AddForkRef(response) => {
             Response::AddForkRef(fork_ref_response_to_proto(response))
         }
@@ -336,6 +361,29 @@ pub(crate) fn touch_stream_access_response_to_proto(
         changed: response.changed,
         expired: response.expired,
         group_commit_index: response.group_commit_index,
+    }
+}
+
+pub(crate) fn update_stream_attrs_response_to_proto(
+    response: UpdateStreamAttrsResponse,
+) -> raft_app_proto::UpdateStreamAttrsResponseV1 {
+    raft_app_proto::UpdateStreamAttrsResponseV1 {
+        placement: Some(placement_to_proto(response.placement)),
+        changed: response.changed,
+        group_commit_index: response.group_commit_index,
+    }
+}
+
+pub(crate) fn get_stream_attrs_response_to_proto(
+    response: GetStreamAttrsResponse,
+) -> raft_internal_proto::GetStreamAttrsResponsePayloadV1 {
+    raft_internal_proto::GetStreamAttrsResponsePayloadV1 {
+        core_id: u32::from(response.placement.core_id.0),
+        shard_id: response.placement.shard_id.0,
+        raft_group_id: response.placement.raft_group_id.0,
+        attrs_json: response
+            .attrs
+            .map(|attrs| serde_json::to_vec(&attrs).expect("stream attrs serialize to JSON")),
     }
 }
 
@@ -459,6 +507,9 @@ pub(crate) fn group_write_response_from_proto(
         Response::TouchStreamAccess(response) => Ok(GroupWriteResponse::TouchStreamAccess(
             touch_stream_access_response_from_proto(response)?,
         )),
+        Response::UpdateStreamAttrs(response) => Ok(GroupWriteResponse::UpdateStreamAttrs(
+            update_stream_attrs_response_from_proto(response)?,
+        )),
         Response::AddForkRef(response) => Ok(GroupWriteResponse::AddForkRef(
             fork_ref_response_from_proto(response)?,
         )),
@@ -548,6 +599,36 @@ pub(crate) fn touch_stream_access_response_from_proto(
         changed: response.changed,
         expired: response.expired,
         group_commit_index: response.group_commit_index,
+    })
+}
+
+pub(crate) fn update_stream_attrs_response_from_proto(
+    response: raft_app_proto::UpdateStreamAttrsResponseV1,
+) -> Result<UpdateStreamAttrsResponse, GroupEngineError> {
+    Ok(UpdateStreamAttrsResponse {
+        placement: placement_from_proto(
+            response.placement,
+            "update_stream_attrs_response.placement",
+        )?,
+        changed: response.changed,
+        group_commit_index: response.group_commit_index,
+    })
+}
+
+pub(crate) fn get_stream_attrs_response_from_proto(
+    response: raft_internal_proto::GetStreamAttrsResponsePayloadV1,
+) -> Result<GetStreamAttrsResponse, GroupEngineError> {
+    Ok(GetStreamAttrsResponse {
+        placement: placement_from_parts(
+            response.core_id,
+            response.shard_id,
+            response.raft_group_id,
+            "get_stream_attrs_response",
+        )?,
+        attrs: stream_attrs_from_proto(
+            response.attrs_json,
+            "get_stream_attrs_response.attrs_json",
+        )?,
     })
 }
 
@@ -1004,6 +1085,9 @@ pub(crate) fn stream_error_code_to_proto(
         StreamErrorCode::SnapshotConflict => {
             raft_app_proto::StreamErrorCodeV1::StreamErrorCodeSnapshotConflict
         }
+        StreamErrorCode::InvalidStreamAttrs => {
+            raft_app_proto::StreamErrorCodeV1::StreamErrorCodeInvalidStreamAttrs
+        }
     }
 }
 
@@ -1079,6 +1163,9 @@ pub(crate) fn stream_error_code_from_proto(code: i32) -> Result<StreamErrorCode,
         }
         raft_app_proto::StreamErrorCodeV1::StreamErrorCodeSnapshotConflict => {
             Ok(StreamErrorCode::SnapshotConflict)
+        }
+        raft_app_proto::StreamErrorCodeV1::StreamErrorCodeInvalidStreamAttrs => {
+            Ok(StreamErrorCode::InvalidStreamAttrs)
         }
     }
 }

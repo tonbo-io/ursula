@@ -4,54 +4,77 @@ title: Deploy a cluster
 
 Production-style Ursula runs as a static-membership Raft cluster: a fixed list of nodes with stable IDs, gRPC peer-to-peer Raft traffic, and a shared S3 cold backend. The migration benchmark target is three voting nodes across availability zones.
 
+For Kubernetes, use the [Helm chart](/docs/deploy-kubernetes). It maps the same
+static-membership model onto StatefulSet pod ordinals, stable peer DNS, and
+per-pod PVCs.
+
 ## Topology
 
 Each node needs:
 
-- a stable Raft `node_id`
-- a TCP listen address (the same address every peer dials over gRPC)
-- the full peer list (including itself)
-- the same storage mode (`--storage-backend memory` or `--storage-backend disk --disk-path DIR`) on every peer
-- a one-time membership initializer on the first start (`--raft-init-membership-per-group`)
-- a shared cold backend (filesystem path for single-host smoke, S3 for production)
+- a stable Raft `raft.node_id`
+- a client/API bind address in `server.listen`
+- optional separate cluster/Raft bind address in `server.cluster_listen` when you need to isolate cluster traffic from client/API traffic
+- peer URLs in `[[raft.peers]]` that every peer can reach over gRPC (including itself)
+- the same `raft.wal.backend` mode on every peer
+- a one-time membership initializer on the first start (`raft.init_membership_per_group = true`)
+- a shared cold backend (`memory` for single-host smoke, S3 or an S3-compatible store for production)
 
-There is no separate "advertise" address. The `--listen` address must be reachable by other peers.
+Without `server.cluster_listen`, `server.listen` serves client/API and Raft/cluster routes, so each `[[raft.peers]].url` should point at that node's `server.listen` address. With `server.cluster_listen`, `server.listen` serves client/API routes and `server.cluster_listen` serves Raft/cluster routes, so each `[[raft.peers]].url` must point at that node's cluster listener address and port. The same `[[raft.peers]].url` is also used for HTTP leader redirects today, so clients and gateways must be able to reach that URL unless separate redirect URL configuration is added in the future.
 
 ## Cluster config file
 
-The `--raft-cluster-config` flag accepts a small JSON file shared across all nodes - only `node_id` differs per host:
+The Ursula config file is shared across all nodes. Only `raft.node_id` differs per host, or override it with `--node-id`.
 
-```json
-{
-  "node_id": 1,
-  "init_membership_per_group": true,
-  "peers": [
-    {"node_id": 1, "url": "http://10.0.0.1:4437"},
-    {"node_id": 2, "url": "http://10.0.0.2:4437"},
-    {"node_id": 3, "url": "http://10.0.0.3:4437"}
-  ]
-}
+```toml
+[server]
+listen = "0.0.0.0:4437"
+
+[runtime]
+core_count = 16
+
+[raft]
+node_id = 1
+group_count = 256
+init_membership_per_group = true
+
+[raft.wal]
+backend = "disk"
+path = "/var/lib/ursula"
+
+[[raft.peers]]
+node_id = 1
+url = "http://10.0.0.1:4437"
+
+[[raft.peers]]
+node_id = 2
+url = "http://10.0.0.2:4437"
+
+[[raft.peers]]
+node_id = 3
+url = "http://10.0.0.3:4437"
 ```
 
-Same file on each host, only the top-level `node_id` field changes.
+Same file on each host; change `raft.node_id` or start with `--node-id 2` / `--node-id 3`.
 
 ## Start node 1
 
 ```bash
-ursula \
-  --listen 0.0.0.0:4437 \
-  --core-count 16 \
-  --raft-group-count 256 \
-  --storage-backend disk \
-  --disk-path /var/lib/ursula \
-  --raft-cluster-config /etc/ursula/cluster.json
+ursula --config /etc/ursula/ursula.toml --node-id 1
 ```
 
-`init_membership_per_group: true` only needs to be present on the very first start of a fresh cluster. After that, Ursula remembers membership. Flip it to `false` (or remove it) for subsequent starts.
+`raft.init_membership_per_group = true` only needs to be present on the very first start of a fresh cluster. After that, Ursula remembers membership. Flip it to `false` (or remove it) for subsequent starts.
 
 ## Start nodes 2 and 3
 
-Same command, same JSON file with `node_id` adjusted to 2 and 3 respectively. Use `--storage-backend memory` instead of `--storage-backend disk --disk-path DIR` if you want a non-durable test cluster.
+Use the same config file and change the node ID:
+
+```bash
+ursula --config /etc/ursula/ursula.toml --node-id 2
+ursula --config /etc/ursula/ursula.toml --node-id 3
+```
+
+Use `raft.wal.backend = "memory"` instead of the disk settings if you want a non-durable test cluster.
 
 ## Verify with ursulactl
 
@@ -86,21 +109,24 @@ done
 
 Pick one storage backend per cluster.
 
-- `--storage-backend memory` - fast, volatile. Survives no restart
-- `--storage-backend disk --disk-path DIR` - durable OpenRaft log mode under `DIR/raft-log` (recommended for clusters)
+- `raft.wal.backend = "memory"` - fast, volatile. Survives no restart
+- `raft.wal.backend = "disk"` with `raft.wal.path = "DIR"` - durable OpenRaft log mode under `DIR/raft-log` (recommended for clusters)
 
 ## Cold storage
 
-A shared object store is recommended for any multi-node deployment because peers need to read each other's flushed chunks. Configure via environment variables on every node:
+A shared object store is recommended for any multi-node deployment because peers need to read each other's flushed chunks. Configure it in the Ursula config file on every node:
 
-```bash
-URSULA_COLD_BACKEND=s3
-URSULA_COLD_S3_BUCKET=my-ursula-bucket
-URSULA_COLD_S3_REGION=us-east-1
-URSULA_COLD_ROOT=ursula-prod-20260518
+```toml
+[storage.cold]
+backend = "s3"
+root = "ursula-prod-20260518"
+
+[storage.cold.s3]
+bucket = "my-ursula-bucket"
+region = "us-east-1"
 ```
 
-See [configure S3](/docs/configure-s3) for the full set of `URSULA_COLD_*` variables.
+See [configure S3](/docs/configure-s3) for canonical `[storage.cold]` and `[storage.cold.s3]` keys.
 
 ## Operating the cluster
 
@@ -133,4 +159,4 @@ The HTTP admin surface underneath both tools is small and stable enough to scrip
 
 - Group membership migration is manual-first: register the new node, migrate one group at a time with `ursulactl group ...`, and let the meta group serialize active migration intent. There is no automatic scheduler or balancer yet.
 - `ursulactl restart` packages the safe rolling restart loop (drain → restart-cmd → wait-ready); version-upgrade tooling that diffs binaries before restart is not yet packaged.
-- There is no zero-downtime config reload. Restart the process to pick up new flags or env vars.
+- There is no zero-downtime config reload. Restart the process to pick up config-file or CLI-override changes.

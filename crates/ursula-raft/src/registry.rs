@@ -827,6 +827,12 @@ impl fmt::Display for LeadershipShedState {
     }
 }
 
+/// Owned handle to a single Raft group's [`Raft`] instance, as stored in the
+/// [`RaftGroupHandleRegistry`]. Spelled out as a type alias so callers (e.g. the
+/// HTTP admin handlers) can name it without repeating the full type-config
+/// generics.
+pub type RaftGroupHandle = Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>;
+
 #[derive(Debug, Clone)]
 pub struct RaftGroupHandleRegistry {
     groups: Arc<Mutex<BTreeMap<u32, Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>>>>,
@@ -843,7 +849,7 @@ impl Default for RaftGroupHandleRegistry {
             dynamic_hosted_groups: Arc::new(Mutex::new(BTreeSet::new())),
             leadership_shed: Arc::new(AtomicU8::new(0)),
             snapshot_store: Arc::new(Mutex::new(default_snapshot_store())),
-            snapshot_install: SnapshotInstallCoordinator::default(),
+            snapshot_install: SnapshotInstallCoordinator::new(1),
         }
     }
 }
@@ -878,10 +884,7 @@ impl RaftGroupHandleRegistry {
             .insert(placement.raft_group_id.0, raft);
     }
 
-    pub fn get(
-        &self,
-        raft_group_id: RaftGroupId,
-    ) -> Option<Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>> {
+    pub fn get(&self, raft_group_id: RaftGroupId) -> Option<RaftGroupHandle> {
         self.groups
             .lock()
             .expect("raft group handle registry mutex")
@@ -919,6 +922,11 @@ impl RaftGroupHandleRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    pub fn with_snapshot_install_max_concurrency(mut self, max_concurrency: usize) -> Self {
+        self.snapshot_install = SnapshotInstallCoordinator::new(max_concurrency);
+        self
     }
 
     pub fn set_snapshot_store(&self, snapshot_store: Option<SharedSnapshotStore>) {

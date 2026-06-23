@@ -34,6 +34,7 @@ tonic = { workspace = true, features = ["transport"] }
 tower = { workspace = true, features = ["util", "limit", "load-shed"] }
 tracing = { workspace = true }
 ursula-control = { workspace = true }
+ursula-config = { workspace = true }
 ursula-observability = { workspace = true, features = ["otlp"] }
 ursula-raft = { workspace = true }
 ursula-runtime = { workspace = true }
@@ -43,6 +44,8 @@ ursula-shard = { workspace = true }
 madsim = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
+toml = { workspace = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)', 'cfg(tokio_unstable)'] }

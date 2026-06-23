@@ -447,7 +447,7 @@ impl RuntimeMetrics {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RuntimeMetricsSnapshot {
     pub accepted_appends: u64,
     pub per_core_appends: Vec<u64>,

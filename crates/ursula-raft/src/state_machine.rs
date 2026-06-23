@@ -74,7 +74,7 @@ struct SnapshotInstallCoordinatorInner {
 
 impl Default for SnapshotInstallCoordinator {
     fn default() -> Self {
-        Self::new(snapshot_install_max_concurrency_from_env())
+        Self::new(1)
     }
 }
 
@@ -145,14 +145,6 @@ impl SnapshotInstallCoordinator {
     }
 }
 
-fn snapshot_install_max_concurrency_from_env() -> usize {
-    std::env::var("URSULA_RAFT_SNAPSHOT_INSTALL_MAX_CONCURRENCY")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1)
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct CurrentSnapshot {
     pub(crate) meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
@@ -161,6 +153,8 @@ pub(crate) struct CurrentSnapshot {
     /// out-of-line backends (Local/S3) this is a tiny [`SnapshotPointer`].
     pointer_bytes: Vec<u8>,
 }
+
+const RETAINED_RETIRED_EXTERNAL_SNAPSHOTS: usize = 1;
 
 pub struct RaftGroupStateMachine {
     pub(crate) placement: ShardPlacement,
@@ -616,6 +610,21 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                 pointer_bytes: pointer_bytes.clone(),
             });
         }
+        if let Err(err) = self
+            .snapshot_store
+            .prune_retired(
+                self.placement.raft_group_id.0,
+                &pointer.location,
+                RETAINED_RETIRED_EXTERNAL_SNAPSHOTS,
+            )
+            .await
+        {
+            tracing::warn!(
+                snapshot_id = pointer.snapshot_id,
+                error = %err,
+                "failed to prune retired OpenRaft snapshots"
+            );
+        }
         Ok(SnapshotOf::<UrsulaRaftTypeConfig> {
             meta: self.meta.clone(),
             snapshot: Cursor::new(pointer_bytes),
@@ -665,7 +674,7 @@ mod tests {
 
     #[cfg(not(madsim))]
     #[tokio::test]
-    async fn snapshot_builder_keeps_previous_external_snapshot_objects() {
+    async fn snapshot_builder_prunes_retired_external_snapshots_from_store_listing() {
         use std::sync::Arc;
 
         use ursula_runtime::S3SnapshotStore;
@@ -704,8 +713,8 @@ mod tests {
             placement,
             snapshot: test_group_snapshot(placement, 2),
             meta: test_snapshot_meta(2),
-            current_snapshot,
-            snapshot_store,
+            current_snapshot: current_snapshot.clone(),
+            snapshot_store: snapshot_store.clone(),
         };
         let second_snapshot = second.build_snapshot().await.expect("second snapshot");
         let second_pointer = SnapshotPointer::decode(&second_snapshot.snapshot.into_inner())
@@ -725,6 +734,36 @@ mod tests {
             serde_json::from_slice(&second_bytes).expect("decode second group snapshot");
         assert_eq!(first_group.group_commit_index, 1);
         assert_eq!(second_group.group_commit_index, 2);
+
+        // Simulate a process restart: the published snapshot pointer survives
+        // in external storage, but builder-local retired state is gone.
+        let current_snapshot = Arc::new(Mutex::new(None));
+        let mut third = RaftGroupSnapshotBuilder {
+            placement,
+            snapshot: test_group_snapshot(placement, 3),
+            meta: test_snapshot_meta(3),
+            current_snapshot,
+            snapshot_store,
+        };
+        let third_snapshot = third.build_snapshot().await.expect("third snapshot");
+        let third_pointer =
+            SnapshotPointer::decode(&third_snapshot.snapshot.into_inner()).expect("third pointer");
+
+        assert!(
+            matches!(
+                raw_store.download(&first_pointer.location).await,
+                Err(ursula_runtime::SnapshotStoreError::NotFound(_))
+            ),
+            "snapshot builder should prune external snapshots by listing the group prefix"
+        );
+        raw_store
+            .download(&second_pointer.location)
+            .await
+            .expect("previous retired snapshot remains readable");
+        raw_store
+            .download(&third_pointer.location)
+            .await
+            .expect("current snapshot remains readable");
     }
 
     #[cfg(not(madsim))]
