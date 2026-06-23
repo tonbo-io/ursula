@@ -3645,7 +3645,6 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "ursula-config",
- "ursula-control",
  "ursula-observability",
  "ursula-raft",
  "ursula-runtime",
