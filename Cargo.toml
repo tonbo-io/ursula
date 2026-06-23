@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/ursula-proto",
+    "crates/ursula-control",
     "crates/ursula-config",
     "crates/ursula-runtime",
     "crates/ursula-raft",
@@ -73,6 +74,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 ursula = { path = "crates/ursula", version = "0.1.5" }
 ursula-config = { path = "crates/ursula-config", version = "0.1.5" }
+ursula-control = { path = "crates/ursula-control", version = "0.1.5" }
 ursula-ctl = { path = "crates/ursula-ctl", version = "0.1.5" }
 ursula-proto = { path = "crates/ursula-proto", version = "0.1.5" }
 ursula-raft = { path = "crates/ursula-raft", version = "0.1.5" }

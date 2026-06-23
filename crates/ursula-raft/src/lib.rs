@@ -12,6 +12,7 @@
 //!   `log_store::memory` and `log_store::file`).
 //! - [`registry`]: [`RaftGroupHandleRegistry`] and the single-node test network.
 //! - [`state_machine`]: per-group [`RaftGroupStateMachine`] and snapshot builder.
+//! - [`meta`]: meta-group OpenRaft type config and control-plane state machine.
 //! - [`engine`]: [`RaftGroupEngine`] + `GroupEngine` impl, with the engine
 //!   factories under `engine::factory`.
 //! - [`forward`]: leader-forwarding helpers used by the engine when a node is a follower.
@@ -25,6 +26,7 @@ mod engine;
 mod forward;
 mod grpc;
 mod log_store;
+mod meta;
 mod registry;
 mod rt;
 #[cfg(madsim)]
@@ -52,8 +54,17 @@ pub use grpc::RAFT_GRPC_TRANSFER_LEADER_PATH;
 pub use grpc::RAFT_GRPC_VOTE_PATH;
 pub use grpc::RaftGrpcService;
 pub use grpc::raft_grpc_service;
+pub use log_store::MemoryRaftLogStore;
+pub use log_store::MetaRaftLogStore;
 pub use log_store::RaftGroupFileLogStore;
 pub use log_store::RaftGroupLogStore;
+pub use meta::MetaNodeRegistration;
+pub use meta::MetaRaft;
+pub use meta::MetaRaftError;
+pub use meta::MetaRaftHandle;
+pub use meta::MetaRaftSnapshotBuilder;
+pub use meta::MetaRaftStateMachine;
+pub use meta::MetaRaftTypeConfig;
 pub use registry::InProcessRaftFaultAction;
 pub use registry::InProcessRaftFaultScript;
 pub use registry::InProcessRaftFaultStep;

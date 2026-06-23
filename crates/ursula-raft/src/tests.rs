@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -29,6 +30,7 @@ use openraft::storage::RaftStateMachine;
 use openraft::vote::RaftLeaderId;
 use prost::Message;
 use serde_json::json;
+use ursula_control::ControlCommand;
 use ursula_proto as raft_app_proto;
 use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendRequest;
@@ -38,6 +40,7 @@ use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::GetStreamAttrsRequest;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineError;
+use ursula_runtime::GroupEngineFactory;
 use ursula_runtime::GroupInfraError;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
@@ -64,6 +67,7 @@ use crate::registry::*;
 use crate::types::*;
 
 type CommittedLeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
+type MetaLeaderId = <MetaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
 
 #[test]
 fn group_engine_error_codec_round_trips_stream_context() {
@@ -166,6 +170,33 @@ fn normal_entry(
     command: GroupWriteCommand,
 ) -> <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::Entry {
     Entry::new(log_id(index), EntryPayload::Normal(command.into()))
+}
+
+fn meta_log_id(index: u64) -> LogId<MetaLeaderId> {
+    LogId {
+        leader_id: MetaLeaderId::new(1, 1),
+        index,
+    }
+}
+
+fn meta_entry(
+    index: u64,
+    command: ControlCommand,
+) -> <MetaRaftTypeConfig as openraft::RaftTypeConfig>::Entry {
+    <MetaRaftTypeConfig as openraft::RaftTypeConfig>::Entry::new(
+        meta_log_id(index),
+        EntryPayload::Normal(command),
+    )
+}
+
+fn register_node_command(node_id: u64) -> ControlCommand {
+    ControlCommand::RegisterNode {
+        node_id,
+        client_url: format!("http://node{node_id}:4491"),
+        cluster_url: format!("http://node{node_id}:4492"),
+        labels: BTreeMap::new(),
+        now_ms: 10,
+    }
 }
 
 fn create_stream_command(name: &str) -> GroupWriteCommand {
@@ -406,6 +437,126 @@ async fn raft_log_store_rejects_holes() {
 }
 
 #[tokio::test]
+async fn meta_raft_log_store_appends_reads_truncates_and_purges() {
+    let mut store = MetaRaftLogStore::shared();
+    store
+        .append(
+            vec![
+                meta_entry(1, register_node_command(1)),
+                meta_entry(2, register_node_command(2)),
+                meta_entry(3, register_node_command(3)),
+            ],
+            IOFlushed::noop(),
+        )
+        .await
+        .expect("append meta log entries");
+
+    let state = store.get_log_state().await.expect("log state");
+    assert_eq!(state.last_purged_log_id, None);
+    assert_eq!(state.last_log_id, Some(meta_log_id(3)));
+
+    let mut reader = store.get_log_reader().await;
+    let entries = reader
+        .try_get_log_entries(1..4)
+        .await
+        .expect("read meta entries");
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].log_id, meta_log_id(1));
+    assert_eq!(entries[2].log_id, meta_log_id(3));
+
+    store
+        .truncate_after(Some(meta_log_id(1)))
+        .await
+        .expect("truncate meta log");
+    assert_eq!(
+        store.get_log_state().await.expect("log state").last_log_id,
+        Some(meta_log_id(1))
+    );
+
+    store
+        .append(
+            vec![
+                meta_entry(2, register_node_command(4)),
+                meta_entry(3, register_node_command(5)),
+            ],
+            IOFlushed::noop(),
+        )
+        .await
+        .expect("append after truncate");
+    store.purge(meta_log_id(2)).await.expect("purge meta log");
+
+    let state = store.get_log_state().await.expect("log state after purge");
+    assert_eq!(state.last_purged_log_id, Some(meta_log_id(2)));
+    assert_eq!(state.last_log_id, Some(meta_log_id(3)));
+
+    let entries = reader
+        .try_get_log_entries(1..4)
+        .await
+        .expect("read after purge");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].log_id, meta_log_id(3));
+}
+
+#[tokio::test]
+async fn meta_raft_log_store_persists_vote_and_committed_pointer() {
+    let mut store = MetaRaftLogStore::shared();
+    let vote: VoteOf<MetaRaftTypeConfig> = openraft::Vote::new_committed(7, 1);
+
+    store.save_vote(&vote).await.expect("save vote");
+    let mut reader = store.get_log_reader().await;
+    assert_eq!(reader.read_vote().await.expect("read vote"), Some(vote));
+
+    store
+        .save_committed(Some(meta_log_id(9)))
+        .await
+        .expect("save committed");
+    assert_eq!(
+        store.read_committed().await.expect("read committed"),
+        Some(meta_log_id(9))
+    );
+}
+
+#[tokio::test]
+async fn meta_raft_log_store_rejects_holes() {
+    let mut store = MetaRaftLogStore::shared();
+    let err = store
+        .append(
+            vec![
+                meta_entry(1, register_node_command(1)),
+                meta_entry(3, register_node_command(3)),
+            ],
+            IOFlushed::noop(),
+        )
+        .await
+        .expect_err("hole should be rejected");
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+    store
+        .append(
+            vec![meta_entry(1, register_node_command(1))],
+            IOFlushed::noop(),
+        )
+        .await
+        .expect("append first entry");
+    let err = store
+        .append(
+            vec![meta_entry(3, register_node_command(3))],
+            IOFlushed::noop(),
+        )
+        .await
+        .expect_err("cross-append hole should be rejected");
+
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn public_meta_log_store_type_is_exported_from_crate_root() {
+    let _store = crate::MetaRaftLogStore::shared();
+    let _generic = crate::MemoryRaftLogStore::<crate::MetaRaftTypeConfig>::shared();
+}
+
+#[tokio::test]
 async fn raft_file_log_store_recovers_vote_committed_and_entries() {
     let path = temp_log_path("recover");
     let vote: VoteOf<UrsulaRaftTypeConfig> = openraft::Vote::new_committed(7, 1);
@@ -530,6 +681,210 @@ async fn raft_file_log_store_recovers_truncate_and_purge() {
     assert_eq!(entries[0].log_id, log_id(3));
 
     let _ = fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn single_node_meta_raft_applies_node_registration() {
+    let config = Arc::new(
+        Config {
+            cluster_name: "ursula-meta-single-node-test".to_owned(),
+            heartbeat_interval: 10,
+            election_timeout_min: 30,
+            election_timeout_max: 60,
+            ..Default::default()
+        }
+        .validate()
+        .expect("valid raft config"),
+    );
+    let mut log_store = MetaRaftLogStore::shared();
+    let handle = MetaRaftHandle::new_single_node_with_log_store(
+        1,
+        BasicNode::new("meta-local"),
+        config,
+        log_store.clone(),
+    )
+    .await
+    .expect("create single-node meta raft handle");
+
+    let registered = handle
+        .write(ControlCommand::RegisterNode {
+            node_id: 4,
+            client_url: "http://node4:4491/".to_owned(),
+            cluster_url: "http://node4:4492/".to_owned(),
+            labels: BTreeMap::from([("rack".to_owned(), "r1".to_owned())]),
+            now_ms: 10,
+        })
+        .await
+        .expect("register node through meta raft");
+    assert_eq!(registered, ursula_control::ControlResponse::Ok);
+
+    let updated = handle
+        .write(ControlCommand::SetNodeState {
+            node_id: 4,
+            state: ursula_control::NodeState::Draining,
+            now_ms: 20,
+        })
+        .await
+        .expect("update registered node through meta raft");
+    assert_eq!(updated, ursula_control::ControlResponse::Ok);
+
+    let (applied, node) = handle
+        .with_state_machine(|state_machine| {
+            Box::pin(async move {
+                let node = state_machine
+                    .state()
+                    .nodes
+                    .get(&4)
+                    .expect("node registered through raft")
+                    .clone();
+                (state_machine.applied_log_id(), node)
+            })
+        })
+        .await
+        .expect("read meta state machine");
+    assert_eq!(node.client_url, "http://node4:4491");
+    assert_eq!(node.cluster_url, "http://node4:4492");
+    assert_eq!(node.state, ursula_control::NodeState::Draining);
+    assert_eq!(node.labels.get("rack").map(String::as_str), Some("r1"));
+    assert!(applied.is_some());
+
+    let log_state = log_store.get_log_state().await.expect("meta log state");
+    assert!(log_state.last_log_id.is_some());
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown single-node meta raft handle");
+}
+
+#[tokio::test]
+async fn meta_raft_handle_registers_initial_data_nodes() {
+    let config = Arc::new(
+        Config {
+            cluster_name: "ursula-meta-initial-data-nodes-test".to_owned(),
+            heartbeat_interval: 10,
+            election_timeout_min: 30,
+            election_timeout_max: 60,
+            ..Default::default()
+        }
+        .validate()
+        .expect("valid raft config"),
+    );
+    let handle = MetaRaftHandle::new_single_node_with_log_store(
+        1,
+        BasicNode::new("meta-local"),
+        config,
+        MetaRaftLogStore::shared(),
+    )
+    .await
+    .expect("create single-node meta raft handle");
+
+    handle
+        .register_initial_data_nodes(
+            [
+                MetaNodeRegistration::new(1, "http://node1:4491/", "http://node1:4492/"),
+                MetaNodeRegistration::new(2, "http://node2:4491", "http://node2:4492"),
+                MetaNodeRegistration::new(3, "http://node3:4491", "http://node3:4492"),
+            ],
+            10,
+        )
+        .await
+        .expect("register initial data nodes");
+
+    let nodes = handle
+        .read_state(|state| state.nodes.clone())
+        .await
+        .expect("read meta state");
+    assert_eq!(nodes.len(), 3);
+    let node1 = nodes.get(&1).expect("node 1 registered");
+    assert_eq!(node1.client_url, "http://node1:4491");
+    assert_eq!(node1.cluster_url, "http://node1:4492");
+    assert_eq!(node1.state, ursula_control::NodeState::Active);
+    assert_eq!(
+        nodes.get(&2).map(|node| node.cluster_url.as_str()),
+        Some("http://node2:4492")
+    );
+    assert_eq!(
+        nodes.get(&3).map(|node| node.client_url.as_str()),
+        Some("http://node3:4491")
+    );
+
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown single-node meta raft handle");
+}
+
+#[tokio::test]
+async fn meta_raft_handle_rejects_invalid_initial_data_nodes() {
+    let config = Arc::new(
+        Config {
+            cluster_name: "ursula-meta-invalid-initial-data-nodes-test".to_owned(),
+            heartbeat_interval: 10,
+            election_timeout_min: 30,
+            election_timeout_max: 60,
+            ..Default::default()
+        }
+        .validate()
+        .expect("valid raft config"),
+    );
+    let handle = MetaRaftHandle::new_single_node_with_log_store(
+        1,
+        BasicNode::new("meta-local"),
+        config,
+        MetaRaftLogStore::shared(),
+    )
+    .await
+    .expect("create single-node meta raft handle");
+
+    let err = handle
+        .register_initial_data_nodes(
+            [
+                MetaNodeRegistration::new(1, "http://node1:4491", "http://node1:4492"),
+                MetaNodeRegistration::new(2, "  ", "http://node2:4492"),
+            ],
+            10,
+        )
+        .await
+        .expect_err("reject invalid initial data node");
+    assert!(
+        err.to_string()
+            .contains("node 2 rejected: client_url must not be empty"),
+        "unexpected error: {err}"
+    );
+
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown single-node meta raft handle");
+}
+
+#[test]
+fn dynamic_group_hosting_allows_non_voter_warmup() {
+    let registry = RaftGroupHandleRegistry::default();
+    let factory = StaticGrpcRaftGroupEngineFactory::new(
+        4,
+        [
+            (1, "node1".to_owned()),
+            (2, "node2".to_owned()),
+            (3, "node3".to_owned()),
+            (4, "node4".to_owned()),
+        ],
+        false,
+        registry.clone(),
+    )
+    .with_per_group_voters(BTreeMap::from([(
+        RaftGroupId(2),
+        BTreeSet::from([1, 2, 3]),
+    )]));
+    let placement = ShardPlacement {
+        shard_id: ShardId(0),
+        core_id: CoreId(0),
+        raft_group_id: RaftGroupId(2),
+    };
+
+    assert!(!factory.hosts_group(placement));
+    registry.allow_dynamic_group_hosting(RaftGroupId(2));
+    assert!(factory.hosts_group(placement));
 }
 
 #[tokio::test]

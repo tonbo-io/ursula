@@ -3684,6 +3684,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ursula-control"
+version = "0.1.5"
+dependencies = [
+ "serde",
+ "ursula-shard",
+]
+
+[[package]]
 name = "ursula-ctl"
 version = "0.1.5"
 dependencies = [
@@ -3763,6 +3771,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "ursula-config",
+ "ursula-control",
  "ursula-proto",
  "ursula-runtime",
  "ursula-shard",
