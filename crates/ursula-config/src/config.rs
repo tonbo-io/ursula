@@ -150,8 +150,9 @@ pub struct RaftConfig {
     /// plus retries.
     pub install_snapshot_timeout: HumanDuration,
     /// Directory for memory-bootstrap marker files. When set, each group
-    /// writes a marker after successful membership initialization so that
-    /// restart skips re-initialization.
+    /// writes a marker after successful membership initialization. On restart,
+    /// a marked memory group rejoins an observed leader or reinitializes
+    /// volatile membership if no leader exists.
     pub memory_bootstrap_marker_dir: Option<PathBuf>,
     /// Consecutive gRPC RPC failures before forcing a transport reconnect.
     pub grpc_reconnect_after_failures: usize,
