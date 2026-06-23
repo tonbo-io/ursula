@@ -438,9 +438,7 @@ impl ControlPlaneState {
             MigrationPhase::Failed
         };
         migration.updated_at_ms = now_ms;
-        if self.active_migration == Some(migration_id) {
-            self.active_migration = None;
-        }
+        self.active_migration = None;
         ControlResponse::Ok
     }
 
