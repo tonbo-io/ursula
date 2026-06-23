@@ -598,9 +598,15 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
         if self.per_group_voters.is_empty() {
             return true;
         }
-        self.per_group_voters
+        if self
+            .per_group_voters
             .get(&placement.raft_group_id)
             .is_some_and(|voters| voters.contains(&self.node_id))
+        {
+            return true;
+        }
+        self.registry
+            .dynamic_group_hosting_allowed(placement.raft_group_id)
     }
 
     fn create<'a>(

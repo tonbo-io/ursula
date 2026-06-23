@@ -1,0 +1,17 @@
+[package]
+name = "ursula-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Control-plane state for Ursula dynamic node registration, group placement, and manual group migration."
+
+[dependencies]
+serde = { workspace = true }
+ursula-shard = { workspace = true }
+
+[lints.clippy]
+wildcard_imports = "deny"

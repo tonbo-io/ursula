@@ -340,7 +340,7 @@ impl RaftLogReader<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
             .map(|(_, entry)| entry.clone())
             .collect::<Vec<_>>();
 
-        ensure_consecutive_entries(&entries)?;
+        ensure_consecutive_entries::<UrsulaRaftTypeConfig>(&entries)?;
         Ok(entries)
     }
 
@@ -422,10 +422,10 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
         let entries = entries.into_iter().collect::<Vec<_>>();
         let store = Arc::clone(self);
         spawn_log_store_blocking(move || {
-            ensure_consecutive_entries(&entries)?;
+            ensure_consecutive_entries::<UrsulaRaftTypeConfig>(&entries)?;
 
             let mut inner = store.lock_inner()?;
-            ensure_log_append_boundary(&inner, &entries)?;
+            ensure_log_append_boundary::<UrsulaRaftTypeConfig>(&inner, &entries)?;
 
             let record = append_record(entries.iter().map(StoredLogEntry::from).collect());
             if let Err(err) = store.append_record_locked(&record) {
@@ -716,11 +716,11 @@ pub(crate) fn apply_log_store_record(
                 .into_iter()
                 .map(stored_log_entry_into_entry)
                 .collect::<Result<Vec<_>, _>>()?;
-            ensure_consecutive_entries(&entries)?;
+            ensure_consecutive_entries::<UrsulaRaftTypeConfig>(&entries)?;
             for entry in entries {
                 inner.entries.insert(entry.log_id.index, entry);
             }
-            super::ensure_consecutive_log(&inner.entries)
+            super::ensure_consecutive_log::<UrsulaRaftTypeConfig>(&inner.entries)
         }
         Operation::TruncateAfter(record) => {
             let last_log_id = record
