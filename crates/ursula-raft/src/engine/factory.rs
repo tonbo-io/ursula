@@ -672,26 +672,28 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             };
             self.registry.register(placement, engine.raft_handle());
             if self.should_initialize_membership(placement.raft_group_id) {
-                // An in-memory Raft node is not crash-recoverable. After this
-                // node has once bootstrapped a group, a later empty startup is
-                // a lost-node/rejoin case, not proof that the group is new.
-                // Leave the raft uninitialized so quorum can remove/re-add it
-                // as a learner instead of minting a second empty history.
+                // An in-memory Raft node is not crash-recoverable. A later
+                // empty startup should join an existing leader when one is
+                // present, but a full volatile-cluster restart has no leader
+                // to repair from and must bootstrap membership again.
                 let bootstrapped = self.raft_memory_bootstrap_seen(placement.raft_group_id);
-                let recovery_possible = self.snapshot_store.is_some() && !bootstrapped;
+                let recovery_possible = self.snapshot_store.is_some() || bootstrapped;
                 let rejoin_existing_cluster = recovery_possible
                     && engine
                         .observe_any_leader(self.engine_config.rejoin_probe)
                         .await;
                 if rejoin_existing_cluster {
-                    self.mark_raft_memory_bootstrap_seen(placement.raft_group_id)?;
+                    if !bootstrapped {
+                        self.mark_raft_memory_bootstrap_seen(placement.raft_group_id)?;
+                    }
                 } else if bootstrapped {
                     tracing::warn!(
-                        "raft-memory: skip bootstrap for node {} group {} because this node already initialized it once; waiting for membership repair",
+                        "raft-memory: node {} group {} has a bootstrap marker but observed no existing leader; reinitializing volatile membership after static peer quorum",
                         self.node_id,
                         placement.raft_group_id.0
                     );
-                } else {
+                }
+                if !rejoin_existing_cluster {
                     spawn_deferred_membership_initialization(
                         self.node_id,
                         placement.raft_group_id,
