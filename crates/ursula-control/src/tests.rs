@@ -335,6 +335,66 @@ fn register_active_nodes(state: &mut ControlPlaneState, nodes: impl IntoIterator
 }
 
 #[test]
+fn control_plane_lifecycle_registers_migrates_commits_and_finishes_group() {
+    let mut state = ControlPlaneState::new(crate::MetaConfig::default());
+
+    register_active_nodes(&mut state, 1..=4);
+    assert_eq!(
+        state.apply(ControlCommand::SeedPlacement {
+            raft_group_id: RaftGroupId(7),
+            voters: set([1, 2, 3]),
+            now_ms: 20,
+        }),
+        ControlResponse::Ok
+    );
+
+    assert_eq!(
+        state.apply(ControlCommand::BeginMigration {
+            raft_group_id: RaftGroupId(7),
+            target_voters: set([2, 3, 4]),
+            retain_removed: true,
+            now_ms: 30,
+        }),
+        ControlResponse::MigrationStarted { migration_id: 1 }
+    );
+    let migration = state.active_migration().expect("active migration");
+    assert_eq!(migration.from_voters, set([1, 2, 3]));
+    assert_eq!(migration.target_voters, set([2, 3, 4]));
+    assert_eq!(migration.added_nodes, set([4]));
+    assert_eq!(migration.removed_voters, set([1]));
+
+    assert_eq!(
+        state.apply(ControlCommand::CommitPlacement {
+            raft_group_id: RaftGroupId(7),
+            voters: set([2, 3, 4]),
+            learners: set([1]),
+            draining: set([1]),
+            now_ms: 40,
+        }),
+        ControlResponse::Ok
+    );
+    assert_eq!(
+        state.apply(ControlCommand::FinishMigration {
+            migration_id: 1,
+            success: true,
+            now_ms: 50,
+        }),
+        ControlResponse::Ok
+    );
+
+    assert_eq!(state.active_migration, None);
+    let placement = state.placements.get(&RaftGroupId(7)).expect("placement");
+    assert_eq!(placement.voters, set([2, 3, 4]));
+    assert_eq!(placement.learners, set([1]));
+    assert_eq!(placement.draining, set([1]));
+    assert_eq!(placement.epoch, 1);
+
+    let migration = state.migrations.get(&1).expect("migration history");
+    assert_eq!(migration.phase, crate::MigrationPhase::Succeeded);
+    assert_eq!(migration.updated_at_ms, 50);
+}
+
+#[test]
 fn begin_migration_records_added_and_removed_nodes() {
     let mut state = ControlPlaneState::new(crate::MetaConfig::default());
     register_active_nodes(&mut state, 1..=5);

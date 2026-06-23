@@ -62,11 +62,8 @@ use chrono::DateTime;
 use futures_util::stream;
 use openraft::BasicNode;
 use openraft::rt::WatchReceiver;
-use ursula_control::ControlResponse;
 use ursula_raft::LeadershipShedFlag;
 use ursula_raft::LeadershipShedReason;
-use ursula_raft::MetaNodeRegistration;
-use ursula_raft::MetaRaftHandle;
 use ursula_raft::RAFT_GRPC_APPEND_PATH;
 use ursula_raft::RAFT_GRPC_FULL_SNAPSHOT_PATH;
 use ursula_raft::RAFT_GRPC_GROUP_READ_PATH;
@@ -207,7 +204,6 @@ impl WallClock for SystemWallClock {
 pub struct HttpState {
     runtime: ShardRuntime,
     raft_registry: Option<RaftGroupHandleRegistry>,
-    meta_raft: Option<MetaRaftHandle>,
     client_write_router: Option<ClientWriteLeaderRouter>,
     http_metrics: Arc<HttpMetrics>,
     wall_clock: Arc<dyn WallClock>,
@@ -228,7 +224,6 @@ impl HttpState {
         Self {
             runtime,
             raft_registry: None,
-            meta_raft: None,
             client_write_router: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
@@ -246,7 +241,6 @@ impl HttpState {
         Self {
             runtime,
             raft_registry: Some(raft_registry),
-            meta_raft: None,
             client_write_router: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
@@ -281,7 +275,6 @@ impl HttpState {
         Self {
             runtime,
             raft_registry: Some(raft_registry),
-            meta_raft: None,
             client_write_router: Some(ClientWriteLeaderRouter::with_static_topology(
                 node_id,
                 peers,
@@ -293,11 +286,6 @@ impl HttpState {
             leadership_shed,
             external_payload_min_bytes: 1024 * 1024,
         }
-    }
-
-    pub fn with_meta_raft_handle(mut self, meta_raft: MetaRaftHandle) -> Self {
-        self.meta_raft = Some(meta_raft);
-        self
     }
 
     pub fn leadership_shed_flag(&self) -> LeadershipShedFlag {
@@ -346,10 +334,6 @@ impl HttpState {
 
     pub fn raft_registry(&self) -> Option<&RaftGroupHandleRegistry> {
         self.raft_registry.as_ref()
-    }
-
-    pub fn meta_raft(&self) -> Option<&MetaRaftHandle> {
-        self.meta_raft.as_ref()
     }
 
     pub fn client_write_router(&self) -> Option<&ClientWriteLeaderRouter> {
@@ -754,14 +738,6 @@ pub fn cluster_router_from_state(state: HttpState) -> Router {
         .with_state(state)
 }
 
-/// Client-plane routes: HTTP append/read/admin endpoints used by external
-/// callers (producers, readers, operators). In a dual-listener deployment
-/// these bind to the public interface; failure injection against the public
-/// face only affects this plane.
-pub fn client_router_from_state(state: HttpState) -> Router {
-    client_router_with_admission(state, IngressAdmission::default())
-}
-
 /// Client-plane ingress admission. The primary control is a process-wide
 /// in-flight write-body byte budget: a request must reserve its body bytes
 /// before axum drains the body into `Bytes`, and the reservation lives until
@@ -932,30 +908,6 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
     Router::new()
         .route("/__ursula/metrics", get(metrics))
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
-        .route(
-            "/__ursula/admin/nodes/{node_id}/register",
-            post(register_admin_node),
-        )
-        .route(
-            "/__ursula/admin/groups/{raft_group_id}/placement",
-            get(admin_group_placement),
-        )
-        .route(
-            "/__ursula/admin/groups/{raft_group_id}/placement/commit",
-            post(admin_commit_placement),
-        )
-        .route(
-            "/__ursula/admin/groups/{raft_group_id}/migrations",
-            post(admin_begin_migration),
-        )
-        .route(
-            "/__ursula/admin/migrations/{migration_id}/finish",
-            post(admin_finish_migration),
-        )
-        .route(
-            "/__ursula/admin/groups/{raft_group_id}/local-engine",
-            post(admin_prepare_local_engine),
-        )
         .route(
             "/__ursula/flush-cold/{bucket}/{stream}",
             post(flush_cold_stream),
@@ -1152,344 +1104,6 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         );
     }
     json_response(StatusCode::OK, body.to_string())
-}
-
-pub(crate) async fn register_admin_node(
-    State(state): State<HttpState>,
-    Path(node_id): Path<u64>,
-    RawQuery(raw_query): RawQuery,
-) -> Response {
-    let query = match parse_query(raw_query.as_deref()) {
-        Ok(query) => query,
-        Err(response) => return *response,
-    };
-    let Some(client_url) = query
-        .get("client_url")
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "client_url query parameter is required",
-        )
-            .into_response();
-    };
-    let Some(cluster_url) = query
-        .get("cluster_url")
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "cluster_url query parameter is required",
-        )
-            .into_response();
-    };
-    let Some(meta_raft) = state.meta_raft() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "meta raft is not configured for this server",
-        )
-            .into_response();
-    };
-
-    match meta_raft
-        .register_node(
-            MetaNodeRegistration::new(node_id, client_url.clone(), cluster_url.clone()),
-            state.unix_time_ms(),
-        )
-        .await
-    {
-        Ok(ControlResponse::Ok) => (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            format!("{{\"node_id\":{node_id},\"registered\":true}}"),
-        )
-            .into_response(),
-        Ok(ControlResponse::Rejected { reason }) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
-        }
-        Ok(response) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unexpected meta raft response: {response}"),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("register node in meta raft: {err}"),
-        )
-            .into_response(),
-    }
-}
-
-pub(crate) async fn admin_group_placement(
-    State(state): State<HttpState>,
-    Path(raft_group_id): Path<u64>,
-) -> Response {
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
-    };
-    let Some(meta_raft) = state.meta_raft() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "meta raft is not configured for this server",
-        )
-            .into_response();
-    };
-
-    let view = match meta_raft
-        .read_state(move |meta_state| meta_state.placement_view(raft_group_id))
-        .await
-    {
-        Ok(Some(view)) => view,
-        Ok(None) => {
-            return (StatusCode::NOT_FOUND, "group placement is not registered").into_response();
-        }
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("read group placement from meta raft: {err}"),
-            )
-                .into_response();
-        }
-    };
-    match serde_json::to_string(&view) {
-        Ok(body) => (StatusCode::OK, [("content-type", "application/json")], body).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("serialize group placement: {err}"),
-        )
-            .into_response(),
-    }
-}
-
-pub(crate) async fn admin_begin_migration(
-    State(state): State<HttpState>,
-    Path(raft_group_id): Path<u64>,
-    RawQuery(raw_query): RawQuery,
-) -> Response {
-    let query = match parse_query(raw_query.as_deref()) {
-        Ok(query) => query,
-        Err(response) => return *response,
-    };
-    let Some(raw_target_voters) = query
-        .get("target_voters")
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "target_voters query parameter is required",
-        )
-            .into_response();
-    };
-    let target_voters = match parse_voter_ids(raw_target_voters) {
-        Ok(voters) => voters,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
-    let retain_removed =
-        match parse_optional_bool_query(query.get("retain_removed"), "retain_removed") {
-            Ok(retain_removed) => retain_removed,
-            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-        };
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
-    };
-    let Some(meta_raft) = state.meta_raft() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "meta raft is not configured for this server",
-        )
-            .into_response();
-    };
-
-    match meta_raft
-        .begin_migration(
-            raft_group_id,
-            target_voters,
-            retain_removed,
-            state.unix_time_ms(),
-        )
-        .await
-    {
-        Ok(ControlResponse::MigrationStarted { migration_id }) => (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            format!(
-                "{{\"raft_group_id\":{},\"migration_id\":{},\"started\":true}}",
-                raft_group_id.0, migration_id
-            ),
-        )
-            .into_response(),
-        Ok(ControlResponse::Rejected { reason }) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
-        }
-        Ok(response) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unexpected meta raft response: {response}"),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("begin migration in meta raft: {err}"),
-        )
-            .into_response(),
-    }
-}
-
-pub(crate) async fn admin_commit_placement(
-    State(state): State<HttpState>,
-    Path(raft_group_id): Path<u64>,
-    RawQuery(raw_query): RawQuery,
-) -> Response {
-    let query = match parse_query(raw_query.as_deref()) {
-        Ok(query) => query,
-        Err(response) => return *response,
-    };
-    let Some(raw_voters) = query.get("voters").filter(|value| !value.trim().is_empty()) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "voters query parameter is required",
-        )
-            .into_response();
-    };
-    let voters = match parse_voter_ids(raw_voters) {
-        Ok(voters) => voters,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
-    let learners = match parse_optional_node_ids_query(query.get("learners"), "learners") {
-        Ok(learners) => learners,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
-    let draining = match parse_optional_node_ids_query(query.get("draining"), "draining") {
-        Ok(draining) => draining,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
-    };
-    let Some(meta_raft) = state.meta_raft() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "meta raft is not configured for this server",
-        )
-            .into_response();
-    };
-
-    match meta_raft
-        .commit_placement(
-            raft_group_id,
-            voters,
-            learners,
-            draining,
-            state.unix_time_ms(),
-        )
-        .await
-    {
-        Ok(ControlResponse::Ok) => (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            format!(
-                "{{\"raft_group_id\":{},\"committed\":true}}",
-                raft_group_id.0
-            ),
-        )
-            .into_response(),
-        Ok(ControlResponse::Rejected { reason }) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
-        }
-        Ok(response) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unexpected meta raft response: {response}"),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("commit placement in meta raft: {err}"),
-        )
-            .into_response(),
-    }
-}
-
-pub(crate) async fn admin_finish_migration(
-    State(state): State<HttpState>,
-    Path(migration_id): Path<u64>,
-    RawQuery(raw_query): RawQuery,
-) -> Response {
-    let query = match parse_query(raw_query.as_deref()) {
-        Ok(query) => query,
-        Err(response) => return *response,
-    };
-    let success = match parse_optional_bool_query(query.get("success"), "success") {
-        Ok(success) => success,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
-    let Some(meta_raft) = state.meta_raft() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "meta raft is not configured for this server",
-        )
-            .into_response();
-    };
-
-    match meta_raft
-        .finish_migration(migration_id, success, state.unix_time_ms())
-        .await
-    {
-        Ok(ControlResponse::Ok) => (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            format!(
-                "{{\"migration_id\":{},\"success\":{},\"finished\":true}}",
-                migration_id, success
-            ),
-        )
-            .into_response(),
-        Ok(ControlResponse::Rejected { reason }) => {
-            (StatusCode::BAD_REQUEST, reason).into_response()
-        }
-        Ok(response) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unexpected meta raft response: {response}"),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("finish migration in meta raft: {err}"),
-        )
-            .into_response(),
-    }
-}
-
-pub(crate) async fn admin_prepare_local_engine(
-    State(state): State<HttpState>,
-    Path(raft_group_id): Path<u64>,
-) -> Response {
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
-    };
-    let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
-    };
-    let newly_allowed = registry.allow_dynamic_group_hosting(raft_group_id);
-
-    match state.runtime().warm_group(raft_group_id).await {
-        Ok(placement) => (
-            StatusCode::OK,
-            [("content-type", "application/json")],
-            format!(
-                "{{\"raft_group_id\":{},\"core_id\":{},\"prepared\":true,\"already_allowed\":{}}}",
-                placement.raft_group_id.0, placement.core_id.0, !newly_allowed
-            ),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("prepare local raft group engine: {err}"),
-        )
-            .into_response(),
-    }
 }
 
 pub(crate) async fn flush_cold_stream(
@@ -1744,28 +1358,6 @@ pub(crate) fn parse_voter_ids(raw: &str) -> Result<BTreeSet<u64>, String> {
         return Err("voters must not be empty".to_owned());
     }
     Ok(voters)
-}
-
-fn parse_optional_bool_query(raw: Option<&String>, name: &str) -> Result<bool, String> {
-    match raw.map(String::as_str) {
-        None => Ok(false),
-        Some("true") | Some("1") => Ok(true),
-        Some("false") | Some("0") => Ok(false),
-        Some(value) => Err(format!(
-            "invalid {name} query parameter '{value}': expected true or false"
-        )),
-    }
-}
-
-fn parse_optional_node_ids_query(
-    raw: Option<&String>,
-    name: &str,
-) -> Result<BTreeSet<u64>, String> {
-    match raw.map(String::as_str).map(str::trim) {
-        None | Some("") => Ok(BTreeSet::new()),
-        Some(raw) => parse_voter_ids(raw)
-            .map_err(|message| format!("invalid {name} query parameter: {message}")),
-    }
 }
 
 pub(crate) async fn allow_raft_node_next_revert(

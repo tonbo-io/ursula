@@ -33,7 +33,6 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 tonic = { workspace = true, features = ["transport"] }
 tower = { workspace = true, features = ["util", "limit", "load-shed"] }
 tracing = { workspace = true }
-ursula-control = { workspace = true }
 ursula-config = { workspace = true }
 ursula-observability = { workspace = true, features = ["otlp"] }
 ursula-raft = { workspace = true }

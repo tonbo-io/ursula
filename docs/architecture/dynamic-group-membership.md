@@ -1,8 +1,9 @@
-# Dynamic Group Membership Architecture and Operations
+# Dynamic Group Membership Design
 
-This document describes Ursula's current manual-first design for per-group
-dynamic membership. It covers both the architecture and the operator workflow
-for adding a node and migrating one data Raft group at a time.
+This document describes the target architecture for per-group dynamic
+membership and the foundation merged in the first phase. It is not an operator
+runbook yet: the public HTTP admin API, `ursulactl` workflow, bootstrap wiring,
+and durable meta log store are intentionally left for follow-up work.
 
 The design target is not "every node hosts every group". A cluster can have
 more data-capable nodes than any single data group needs:
@@ -14,65 +15,34 @@ group 3 -> [node2, node3, node4]
 group 4 -> [node1, node3, node4]
 ```
 
-The current implementation provides the control-plane state and the explicit
-operator steps for this layout. It does not yet include an automatic scheduler,
-balancer, background migration executor, or durable meta log store.
+In this phase, Ursula gains the control-plane state model and meta Raft state
+machine building blocks needed to represent that layout. It does not yet expose
+a supported operator surface for changing a production cluster's membership.
 
-## Goals
+## Phase 1 Scope
 
-- Register data-capable nodes explicitly in replicated control-plane state.
-- Track one placement projection per data Raft group.
-- Allow one in-flight group migration at a time.
-- Let one migration change one or more nodes in the same OpenRaft membership
-  operation.
-- Keep the data plane on OpenRaft's native learner and membership APIs instead
-  of inventing a second membership protocol.
-- Make every operator step inspectable and retryable through `ursulactl` and
-  the underlying HTTP admin surface.
+This phase provides:
 
-## Non-goals
+- `ursula-control`, a pure control-plane state-machine crate.
+- A placement projection model for data Raft groups.
+- Node registration state, node lifecycle state, and migration eligibility
+  validation.
+- A single active migration intent with target-voter validation.
+- Placement commit and migration finish semantics.
+- A meta Raft type config, state machine, snapshot support, and in-memory log
+  store used for development and tests.
+- Tests for the control-plane lifecycle and the meta state-machine plumbing.
 
-- No automatic scheduler decides which group should move next.
-- No automatic migration worker advances phases in the background.
-- No process supervisor starts new Ursula nodes. Operators still start daemons
-  through systemd, Kubernetes, Nomad, SSH, or another deployment layer.
-- No stream remapping is performed by this feature. A stream still maps to a
-  `RaftGroupId` through the current shard map; this feature changes which nodes
-  host that group.
-- No concurrent group migrations. The meta group serializes migration intent
-  with a single active migration lock.
+This phase deliberately does not provide:
 
-## High-level architecture
+- public HTTP admin routes for dynamic membership;
+- `ursulactl` commands for dynamic membership;
+- production bootstrap/configuration for a meta Raft group;
+- a durable on-disk meta Raft log store;
+- an automatic scheduler, balancer, or migration executor;
+- stream remapping between data group ids.
 
-Dynamic group membership is split into three layers:
-
-```text
-operator / ursulactl
-        |
-        | HTTP admin calls
-        v
-client-plane admin routes on an Ursula node
-        |
-        | meta OpenRaft writes / reads
-        v
-meta group: control-plane state
-        |
-        | operator uses state to drive explicit data-plane calls
-        v
-data groups: OpenRaft learners and voter membership
-```
-
-The meta group owns intent and placement metadata. Data groups still own their
-actual replicated stream data and their OpenRaft membership. A migration is
-complete only after both are true:
-
-1. The data group has applied the intended OpenRaft membership change.
-2. The meta group has committed the placement projection that describes that
-   final membership.
-
-## Core components
-
-### `ursula-control`
+## Control-Plane State
 
 `crates/ursula-control` is a pure state-machine crate. It has no I/O, async, or
 wall-clock reads. The meta Raft state machine applies `ControlCommand` values
@@ -88,7 +58,7 @@ The important state is:
 - `active_migration`: the single in-flight migration id, if any.
 - `next_migration_id`: monotonically assigned migration ids.
 
-The currently relevant commands are:
+The relevant commands are:
 
 - `RegisterNode`: persist a data-capable node and its URLs.
 - `SeedPlacement`: record initial data-group voters during bootstrap.
@@ -109,65 +79,7 @@ The currently relevant commands are:
 It records `from_voters`, `target_voters`, `added_nodes`, `removed_voters`,
 `retain_removed`, and learner status for newly added nodes.
 
-### Meta OpenRaft group
-
-`crates/ursula-raft/src/meta.rs` defines the OpenRaft type config and handle
-for the meta group. The meta group replicates `ControlCommand` entries and
-applies them to `ControlPlaneState`.
-
-The HTTP admin layer never mutates control-plane state directly. It calls
-`MetaRaftHandle`, which performs OpenRaft `client_write` for writes and reads
-the state machine for placement projections.
-
-Every admin endpoint that needs meta state requires the serving `HttpState` to
-have a configured `MetaRaftHandle`. If it does not, the endpoint returns:
-
-```text
-meta raft is not configured for this server
-```
-
-### Data Raft groups
-
-Each data group is an ordinary OpenRaft group that owns Durable Streams state
-for its assigned stream hash range. Dynamic membership uses OpenRaft's native
-operations:
-
-- add a prepared node as a learner;
-- wait for OpenRaft to replicate/catch up as needed;
-- change the full voter set with one membership operation.
-
-Ursula intentionally does not duplicate OpenRaft's membership protocol in the
-meta state. The meta group records operator intent and final placement; the
-data group performs the actual log membership transition.
-
-### Local engine preparation
-
-A node must be running before it can host a data group. Registering the node in
-the meta group only records metadata; it does not start the process, create
-network listeners, or initialize group-local runtime state.
-
-Before adding a new node as a learner for a group, the operator prepares that
-node's local engine:
-
-```text
-POST /__ursula/admin/groups/{raft_group_id}/local-engine
-```
-
-This allows and warms a data-group engine on the target node so the node can
-receive OpenRaft traffic for that group before it has client traffic.
-
-## Initial cluster shape
-
-The initial bootstrap nodes are both:
-
-- meta-group voters, which replicate control-plane state;
-- data-capable nodes, which can host data Raft groups.
-
-Initial data nodes are explicitly registered in the meta group, and each data
-group gets an initial placement record. After this, newly added nodes are
-registered through the same control-plane path as any other data-capable node.
-
-## Placement model
+## Placement Model
 
 A placement projection describes how a single data group should be served:
 
@@ -194,7 +106,50 @@ The sets have different meanings:
 voter or a node listed as both voter and learner. If the voter set changes, the
 placement epoch increments.
 
-## Migration lifecycle
+## Target Architecture
+
+The intended dynamic-membership system is split into three layers:
+
+```text
+operator / automation
+        |
+        | supported admin API and CLI (future phase)
+        v
+client-plane admin routes on an Ursula node (future phase)
+        |
+        | meta OpenRaft writes / reads
+        v
+meta group: control-plane state
+        |
+        | migration executor / operator coordination
+        v
+data groups: OpenRaft learners and voter membership
+```
+
+The meta group owns intent and placement metadata. Data groups still own their
+actual replicated stream data and their OpenRaft membership. A migration is
+complete only after both are true:
+
+1. The data group has applied the intended OpenRaft membership change.
+2. The meta group has committed the placement projection that describes that
+   final membership.
+
+Ursula intentionally does not duplicate OpenRaft's membership protocol in the
+meta state. The meta group records operator intent and final placement; the
+data group performs the actual log membership transition.
+
+## Meta Raft Foundation
+
+`crates/ursula-raft/src/meta.rs` defines the OpenRaft type config and handle
+for the meta group. The meta group replicates `ControlCommand` entries and
+applies them to `ControlPlaneState`.
+
+The first phase uses an in-memory meta log store. That is sufficient for unit
+tests and follow-up integration work, but it is not a persistent production
+control plane. A durable meta log store and production bootstrap/configuration
+path are required before meta state can be treated as cluster-critical state.
+
+## Migration Lifecycle
 
 A migration record is created by `BeginMigration` and completed by
 `FinishMigration`. The state model has named phases for future automation:
@@ -211,205 +166,28 @@ Succeeded
 Failed
 ```
 
-In the current manual-first implementation, the operator performs the external
-work between begin and finish. The meta group mainly provides:
+In the first phase, these phases are state-model vocabulary only. No automatic
+executor advances them, and no public operator command drives the workflow.
 
-- replicated intent;
-- single-migration serialization;
-- target voter validation;
-- final placement validation;
-- an audit trail of the migration result.
+## Follow-Up Work
 
-## Operator workflow
+Before dynamic membership is usable on a running cluster, later PRs need to:
 
-The example below adds `node4` and migrates group `2` from voters `[1,2,3]` to
-`[2,3,4]`, retaining `node1` as a draining learner.
+- add durable meta Raft storage;
+- wire meta Raft into server bootstrap and configuration;
+- seed initial node and group placement state from real cluster config;
+- expose a supported HTTP admin surface with authentication and error semantics;
+- add `ursulactl` commands over that supported surface;
+- implement or document the data-plane learner/add-voter/remove-voter workflow;
+- add end-to-end tests that start real multi-node clusters and move one group;
+- decide whether migration progression remains manual-first or gets a
+  background executor.
 
-### 1. Start the new Ursula node
-
-Start the node with the deployment system before registering it. It must have:
-
-- a stable `node_id`;
-- compatible storage and cold-store configuration;
-- reachable client and cluster URLs;
-- the same code version expected by the cluster.
-
-`ursulactl` does not start this process.
-
-### 2. Register the node in the meta group
-
-Use an admin URL on a node that has meta Raft configured:
-
-```bash
-ursulactl node register \
-  --admin-url http://node1:4437 \
-  --node-id 4 \
-  --client-url http://node4:4437 \
-  --cluster-url http://node4:4437
-```
-
-This writes `RegisterNode` to the meta group.
-
-### 3. Inspect current placement
-
-```bash
-ursulactl group placement get \
-  --admin-url http://node1:4437 \
-  --raft-group-id 2
-```
-
-The response includes voters, learners, draining nodes, epoch, and node URLs.
-Use this as the source of truth before deciding target voters.
-
-### 4. Begin migration intent
-
-```bash
-ursulactl group migration begin \
-  --admin-url http://node1:4437 \
-  --raft-group-id 2 \
-  --target-voters 2,3,4 \
-  --retain-removed
-```
-
-This acquires the single active migration lock. If another migration is active,
-the command is rejected.
-
-### 5. Prepare the target node's local engine
-
-Run this against the target node:
-
-```bash
-ursulactl group local-engine prepare \
-  --admin-url http://node4:4437 \
-  --raft-group-id 2
-```
-
-This warms runtime-owned group state on `node4` before OpenRaft sends it group
-traffic.
-
-### 6. Add the new node as learner
-
-Run this against the current data-group leader:
-
-```bash
-ursulactl group learner add \
-  --leader-url http://node2:4437 \
-  --raft-group-id 2 \
-  --node-id 4 \
-  --cluster-url http://node4:4437
-```
-
-The command calls the data group's OpenRaft learner API and returns the log
-index for the learner addition.
-
-### 7. Change the voter set
-
-OpenRaft supports changing multiple voters in one membership operation, so the
-operator commits the full target voter set:
-
-```bash
-ursulactl group membership change \
-  --leader-url http://node2:4437 \
-  --raft-group-id 2 \
-  --voters 2,3,4
-```
-
-This is the data-plane membership transition. If leadership moved after the
-previous step, use the current leader URL.
-
-### 8. Commit final placement to the meta group
-
-```bash
-ursulactl group placement commit \
-  --admin-url http://node1:4437 \
-  --raft-group-id 2 \
-  --voters 2,3,4 \
-  --learners 1 \
-  --draining 1
-```
-
-This records the final control-plane projection. `learners` and `draining` may
-be empty if no removed node should be retained.
-
-### 9. Finish the migration
-
-```bash
-ursulactl group migration finish \
-  --admin-url http://node1:4437 \
-  --migration-id 1 \
-  --success
-```
-
-Omit `--success` to finish the migration as failed and release the active lock:
-
-```bash
-ursulactl group migration finish \
-  --admin-url http://node1:4437 \
-  --migration-id 1
-```
-
-After finish, inspect placement again before starting the next group.
-
-## Underlying HTTP endpoints
-
-`ursulactl` is a thin client over these endpoints:
-
-| Operation | Endpoint |
-|-----------|----------|
-| Register node | `POST /__ursula/admin/nodes/{node_id}/register?client_url=...&cluster_url=...` |
-| Read placement | `GET /__ursula/admin/groups/{raft_group_id}/placement` |
-| Begin migration | `POST /__ursula/admin/groups/{raft_group_id}/migrations?target_voters=...&retain_removed=...` |
-| Prepare local engine | `POST /__ursula/admin/groups/{raft_group_id}/local-engine` |
-| Add learner | `POST /__ursula/raft/{raft_group_id}/learners/{node_id}?addr=...` |
-| Change voters | `POST /__ursula/raft/{raft_group_id}/membership?voters=...` |
-| Commit placement | `POST /__ursula/admin/groups/{raft_group_id}/placement/commit?voters=...&learners=...&draining=...` |
-| Finish migration | `POST /__ursula/admin/migrations/{migration_id}/finish?success=true|false` |
-
-## Failure handling
-
-The workflow is intentionally explicit. If a step fails:
-
-- Do not start another group migration until the active migration is finished.
-- Re-read placement and metrics before retrying the failed step.
-- If learner addition or membership change failed before the final meta commit,
-  either retry the data-plane step or finish the migration without `--success`.
-- If the data-plane membership changed but placement commit failed, retry
-  `group placement commit` with the actual voter/learner/draining sets before
-  finishing the migration.
-- If the target node process is missing or unreachable, start or repair the
-  process first. Registering a node never starts it.
-
-For routine restarts, prefer `ursulactl restart`; it already drains leadership
-and waits for applied-index catch-up. The migration workflow is for changing
-which nodes host a group.
-
-## Current limitations
-
-- The meta group admin handle must be configured on the node receiving meta
-  admin requests.
-- The current meta log-store implementation is in-memory. Replication through
-  OpenRaft and disk durability for meta state are separate concerns; a durable
-  meta log store is still needed before treating the meta group as a persistent
-  production control plane.
-- The meta state machine has phases for automation, but no automatic executor
-  advances them yet.
-- Only one group migration can be active at once.
-- The operator chooses group order and target voters manually.
-- There is no automatic rebalancer for the four-node/four-group layout.
-- There is no automatic eviction workflow for retained learners or draining
-  nodes beyond the lower-level control-plane command.
-- The current stream-to-group mapping remains static. This feature does not
-  split hot groups or move streams between group ids.
-
-## Implementation map
+## Implementation Map
 
 - `crates/ursula-control`: control-plane state, commands, placement views, and
   migration validation.
 - `crates/ursula-raft/src/meta.rs`: meta OpenRaft type config, state machine,
   snapshots, and `MetaRaftHandle`.
-- `crates/ursula/src/lib.rs`: HTTP admin endpoints for node registration,
-  placement reads, migration begin/finish, placement commit, local-engine
-  preparation, learner addition, and membership change.
-- `crates/ursula-ctl`: `ursulactl` commands that wrap the HTTP endpoints.
-- `crates/ursula-raft/src/engine/factory.rs`: dynamic group hosting and
-  runtime-owned group warmup used by local-engine preparation.
+- `crates/ursula-raft/src/log_store`: generic in-memory log-store support used
+  by both data Raft and the meta Raft test foundation.

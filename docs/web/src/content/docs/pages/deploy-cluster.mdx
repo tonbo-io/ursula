@@ -135,28 +135,20 @@ The first tool for day-2 work is [`ursulactl`](/docs/cli):
 - `ursulactl restart` — drain-aware rolling restart with applied-index catch-up gates.
 - `ursulactl status` — leadership distribution per node.
 - `ursulactl wait-ready` — gate scripts on group + leader counts.
-- `ursulactl group ...` — manual-first node registration and one-group-at-a-time membership migration.
 
 For SSH/AWS-side plumbing — pushing binaries, writing systemd units, EC2 Instance Connect, S3 cleanup — use `scripts/ursula_ec2.py`. See [operations](/docs/operations) for the full split.
 
 The HTTP admin surface underneath both tools is small and stable enough to script against directly:
 
 - `GET /__ursula/metrics` — per-node JSON snapshot.
-- `POST /__ursula/admin/nodes/{node_id}/register` — register a data-capable node in the meta group.
-- `GET /__ursula/admin/groups/{group_id}/placement` — inspect a data group's meta placement projection.
-- `POST /__ursula/admin/groups/{group_id}/migrations` — start the single active group migration intent.
-- `POST /__ursula/admin/groups/{group_id}/local-engine` — allow and warm a local data-group engine on the target node.
 - `POST /__ursula/raft/{group_id}/snapshot` — manually trigger a Raft snapshot.
 - `POST /__ursula/raft/{group_id}/purge` — purge stale log entries.
 - `POST /__ursula/raft/{group_id}/learners/{node_id}` — add a learner (non-voting) replica.
-- `POST /__ursula/raft/{group_id}/membership` — change the full voter set for one data group.
-- `POST /__ursula/admin/groups/{group_id}/placement/commit` — commit final placement in the meta group after the data-group membership change.
-- `POST /__ursula/admin/migrations/{migration_id}/finish` — release the active migration lock as success or failure.
 - `POST /__ursula/raft/{group_id}/leader/transfer/{node_id}` — hand off leadership to another voter (the primitive `ursulactl restart` builds on).
 - `POST /__ursula/flush-cold/{bucket}/{stream}` — force a cold flush for one stream.
 
 ## Limits in the current build
 
-- Group membership migration is manual-first: register the new node, migrate one group at a time with `ursulactl group ...`, and let the meta group serialize active migration intent. There is no automatic scheduler or balancer yet.
+- Membership changes (adding/removing voters after bootstrap) are not yet exposed as a routine workflow. Learners can be added via the admin endpoint above.
 - `ursulactl restart` packages the safe rolling restart loop (drain → restart-cmd → wait-ready); version-upgrade tooling that diffs binaries before restart is not yet packaged.
 - There is no zero-downtime config reload. Restart the process to pick up config-file or CLI-override changes.
