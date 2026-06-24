@@ -201,11 +201,10 @@ pub trait SnapshotStore: Send + Sync + Debug {
     /// Best-effort delete; missing is not an error.
     fn delete<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()>;
 
-    /// Best-effort prune of retired snapshots for one Raft group. Backends
-    /// with an external namespace should derive retired objects by listing the
-    /// group's snapshot prefix and keep the published `current` object plus
-    /// `retain_latest` older objects. Inline snapshots have no external
-    /// lifecycle, so the default is a no-op.
+    /// Best-effort prune of retired snapshots for one Raft group. Backends may
+    /// only delete objects that cannot still be referenced by an OpenRaft
+    /// snapshot pointer. Inline snapshots have no external lifecycle, so the
+    /// default is a no-op.
     fn prune_retired<'a>(
         &'a self,
         _raft_group_id: u32,
@@ -408,10 +407,6 @@ mod s3 {
                 unique_snapshot_leaf(&key.snapshot_id),
             )
         }
-
-        fn group_prefix(&self, raft_group_id: u32) -> String {
-            format!("{}/group-{raft_group_id}/", self.prefix)
-        }
     }
 
     impl SnapshotStore for S3SnapshotStore {
@@ -523,26 +518,12 @@ mod s3 {
                 else {
                     return Ok(());
                 };
-                let prefix = self.group_prefix(raft_group_id);
-                let mut keys = self
-                    .operator
-                    .list(&prefix)
-                    .await
-                    .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?
-                    .into_iter()
-                    .filter(|entry| entry.metadata().is_file())
-                    .map(|entry| entry.path().to_owned())
-                    .filter(|key| key.ends_with(".snap") && key != current_key)
-                    .collect::<Vec<_>>();
-                keys.sort();
-                let delete_count = keys.len().saturating_sub(retain_latest);
-                for key in keys.into_iter().take(delete_count) {
-                    match self.operator.delete(&key).await {
-                        Ok(()) => {}
-                        Err(err) if matches!(err.kind(), opendal::ErrorKind::NotFound) => {}
-                        Err(err) => return Err(SnapshotStoreError::Backend(err.to_string())),
-                    }
-                }
+                tracing::debug!(
+                    raft_group_id,
+                    current_key,
+                    retain_latest,
+                    "skipping S3 snapshot pruning until published OpenRaft pointers can be proven unreachable"
+                );
                 Ok(())
             })
         }
@@ -661,10 +642,6 @@ mod local {
                 .join(format!("group-{}", key.raft_group_id))
                 .join(unique_snapshot_leaf(&key.snapshot_id))
         }
-
-        fn group_dir(&self, raft_group_id: u32) -> PathBuf {
-            self.root.join(format!("group-{raft_group_id}"))
-        }
     }
 
     impl SnapshotStore for LocalSnapshotStore {
@@ -742,35 +719,12 @@ mod local {
                 else {
                     return Ok(());
                 };
-                let dir = self.group_dir(raft_group_id);
-                let mut read_dir = match tokio::fs::read_dir(&dir).await {
-                    Ok(read_dir) => read_dir,
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-                    Err(err) => return Err(SnapshotStoreError::Io(err)),
-                };
-                let mut paths = Vec::new();
-                while let Some(entry) = read_dir
-                    .next_entry()
-                    .await
-                    .map_err(SnapshotStoreError::Io)?
-                {
-                    let path = entry.path();
-                    if path == *current_path {
-                        continue;
-                    }
-                    if path.extension().and_then(|ext| ext.to_str()) == Some("snap") {
-                        paths.push(path);
-                    }
-                }
-                paths.sort();
-                let delete_count = paths.len().saturating_sub(retain_latest);
-                for path in paths.into_iter().take(delete_count) {
-                    match tokio::fs::remove_file(&path).await {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                        Err(err) => return Err(SnapshotStoreError::Io(err)),
-                    }
-                }
+                tracing::debug!(
+                    raft_group_id,
+                    current_path = %current_path.display(),
+                    retain_latest,
+                    "skipping local snapshot pruning until published OpenRaft pointers can be proven unreachable"
+                );
                 Ok(())
             })
         }
@@ -892,7 +846,7 @@ mod tests {
 
     #[cfg(not(madsim))]
     #[tokio::test]
-    async fn local_prune_retired_keeps_current_and_latest_retired() {
+    async fn local_prune_retired_keeps_published_snapshot_locations_readable() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalSnapshotStore::new(dir.path());
         let loc1 = store
@@ -910,10 +864,7 @@ mod tests {
 
         store.prune_retired(7, &loc3, 1).await.unwrap();
 
-        assert!(matches!(
-            store.download(&loc1).await,
-            Err(SnapshotStoreError::NotFound(_))
-        ));
+        assert_eq!(store.download(&loc1).await.unwrap(), b"one");
         assert_eq!(store.download(&loc2).await.unwrap(), b"two");
         assert_eq!(store.download(&loc3).await.unwrap(), b"three");
     }

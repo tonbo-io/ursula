@@ -621,6 +621,14 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     self.node_id
                 )));
             }
+            if self.should_initialize_membership(placement.raft_group_id)
+                && self.raft_memory_bootstrap_seen(placement.raft_group_id)
+            {
+                return Err(GroupEngineError::new(format!(
+                    "raft-memory node {} group {} has already bootstrapped once; refusing automatic restart because the volatile Raft log was lost. Use an explicit operator reset or persistent Raft storage.",
+                    self.node_id, placement.raft_group_id.0
+                )));
+            }
             let mut raft_config = Config {
                 cluster_name: format!("ursula-group-{}", placement.raft_group_id.0),
                 // Timeouts tuned for a multi-AZ EC2 cluster carrying chaos faults.
@@ -678,28 +686,13 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             };
             self.registry.register(placement, engine.raft_handle());
             if self.should_initialize_membership(placement.raft_group_id) {
-                // An in-memory Raft node is not crash-recoverable. A later
-                // empty startup should join an existing leader when one is
-                // present, but a full volatile-cluster restart has no leader
-                // to repair from and must bootstrap membership again.
-                let bootstrapped = self.raft_memory_bootstrap_seen(placement.raft_group_id);
-                let recovery_possible = self.snapshot_store.is_some() || bootstrapped;
-                let rejoin_existing_cluster = recovery_possible
+                let rejoin_existing_cluster = self.snapshot_store.is_some()
                     && engine
                         .observe_any_leader(self.engine_config.rejoin_probe)
                         .await;
                 if rejoin_existing_cluster {
-                    if !bootstrapped {
-                        self.mark_raft_memory_bootstrap_seen(placement.raft_group_id)?;
-                    }
-                } else if bootstrapped {
-                    tracing::warn!(
-                        "raft-memory: node {} group {} has a bootstrap marker but observed no existing leader; reinitializing volatile membership after static peer quorum",
-                        self.node_id,
-                        placement.raft_group_id.0
-                    );
-                }
-                if !rejoin_existing_cluster {
+                    self.mark_raft_memory_bootstrap_seen(placement.raft_group_id)?;
+                } else {
                     spawn_deferred_membership_initialization(
                         self.node_id,
                         placement.raft_group_id,
