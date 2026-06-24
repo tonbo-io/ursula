@@ -3705,7 +3705,7 @@ async fn static_grpc_memory_node_rejoins_all_groups_after_allowed_log_revert() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn static_grpc_memory_restart_with_bootstrap_marker_reinitializes_group() {
+async fn static_grpc_memory_restart_with_bootstrap_marker_fails_fast() {
     let marker_dir = tempfile::tempdir().expect("marker dir");
     let mut listeners = Vec::new();
     let mut peers = Vec::new();
@@ -3798,47 +3798,18 @@ async fn static_grpc_memory_restart_with_bootstrap_marker_reinitializes_group() 
             .await,
         );
     }
-    for (index, node) in restarted_nodes.iter().enumerate() {
-        tokio::time::timeout(Duration::from_secs(10), node.runtime.warm_all_groups())
-            .await
-            .unwrap_or_else(|_| panic!("restart warm_all_groups timed out for node {index}"))
-            .expect("restart warm_all_groups");
-    }
-
-    let group_0 = restarted_nodes[0]
-        .registry
-        .get(RaftGroupId(0))
-        .expect("registered group 0");
-    group_0
-        .wait(Some(Duration::from_secs(10)))
-        .current_leader(
-            1,
-            "marker-backed full memory restart should reinitialize group 0",
-        )
-        .await
-        .expect("wait for group 0 leadership after restart");
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("build reqwest client");
-    let stream_id = (0..10_000)
-        .map(|candidate| BucketStreamId::new("benchcmp", format!("stale-marker-{candidate}")))
-        .find(|stream_id| {
-            restarted_nodes[0].runtime.locate(stream_id).raft_group_id == RaftGroupId(0)
-        })
-        .expect("found stream for group 0");
-    let create = client
-        .put(format!("{}/{}", peers[0].1, stream_id))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body("after-restart")
-        .send()
-        .await
-        .expect("send create through reinitialized group");
-    assert_eq!(
-        create.status(),
-        StatusCode::CREATED,
-        "reinitialized group should be externally writable"
+    let restart_error = tokio::time::timeout(
+        Duration::from_secs(10),
+        restarted_nodes[0].runtime.warm_all_groups(),
+    )
+    .await
+    .expect("restart warm_all_groups timed out")
+    .expect_err("marker-backed memory restart must fail instead of reinitializing membership");
+    assert!(
+        restart_error
+            .to_string()
+            .contains("already bootstrapped once"),
+        "unexpected restart error: {restart_error}"
     );
 
     for node in restarted_nodes {
