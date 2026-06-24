@@ -682,7 +682,7 @@ mod tests {
 
     #[cfg(not(madsim))]
     #[tokio::test]
-    async fn snapshot_builder_prunes_retired_external_snapshots_from_store_listing() {
+    async fn snapshot_builder_keeps_external_snapshots_referenced_by_published_pointers() {
         use std::sync::Arc;
 
         use ursula_runtime::S3SnapshotStore;
@@ -757,13 +757,10 @@ mod tests {
         let third_pointer =
             SnapshotPointer::decode(&third_snapshot.snapshot.into_inner()).expect("third pointer");
 
-        assert!(
-            matches!(
-                raw_store.download(&first_pointer.location).await,
-                Err(ursula_runtime::SnapshotStoreError::NotFound(_))
-            ),
-            "snapshot builder should prune external snapshots by listing the group prefix"
-        );
+        raw_store
+            .download(&first_pointer.location)
+            .await
+            .expect("old published snapshot pointer remains readable");
         raw_store
             .download(&second_pointer.location)
             .await
