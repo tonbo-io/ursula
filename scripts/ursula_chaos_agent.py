@@ -429,11 +429,26 @@ class ChaosAgent:
         self.burst_appends = args.burst_appends
         self.old_sample_every = max(1, args.old_sample_every)
         self.started_at = utc_now()
-        self.run_id = args.stream or f"run-{self.started_at.strftime('%Y%m%d%H%M%S')}"
-        self.streams = [
-            WorkloadStream(f"{self.run_id}-{index:04d}")
-            for index in range(max(1, args.stream_count))
-        ]
+        self.workload_stream_count = max(1, args.stream_count)
+        self.workload_stream_ttl_secs = max(0, args.workload_stream_ttl_secs)
+        self.workload_run_secs = max(0, args.workload_run_secs)
+        if (
+            self.workload_stream_ttl_secs > 0
+            and self.workload_run_secs > 0
+            and self.workload_run_secs >= self.workload_stream_ttl_secs
+        ):
+            raise SystemExit("--workload-run-secs must be shorter than --workload-stream-ttl-secs")
+        self.base_run_id = args.stream or f"run-{self.started_at.strftime('%Y%m%d%H%M%S')}"
+        self.run_generation = 0
+        self.current_run_started_at = self.started_at
+        self.next_workload_rollover_at = (
+            time.monotonic() + self.workload_run_secs
+            if self.workload_run_secs > 0
+            else None
+        )
+        self.rollover_in_progress = False
+        self.run_id = self.workload_run_id(self.run_generation)
+        self.streams = self.build_workload_streams(self.run_id)
         self.producer_probe_stream = WorkloadStream(f"{self.run_id}-producer-probe")
         self.producer_probe_id = "chaos-agent-producer-probe"
         self.producer_probe_epoch = 0
@@ -517,6 +532,22 @@ class ChaosAgent:
         self.restored_workload_coverage: dict[str, Any] = {}
         self.restored_started_at: datetime | None = None
         self.restore_published_state()
+
+    def workload_run_id(self, generation: int) -> str:
+        if generation == 0:
+            return self.base_run_id
+        return f"{self.base_run_id}-r{generation:04d}"
+
+    def build_workload_streams(self, run_id: str) -> list[WorkloadStream]:
+        return [
+            WorkloadStream(f"{run_id}-{index:04d}")
+            for index in range(self.workload_stream_count)
+        ]
+
+    def workload_stream_headers(self) -> dict[str, str]:
+        if self.workload_stream_ttl_secs <= 0:
+            return {}
+        return {"stream-ttl": str(self.workload_stream_ttl_secs)}
 
     def choose_next_fault(self, *, initial: bool = False) -> datetime | None:
         if self.disable_faults:
@@ -783,10 +814,11 @@ class ChaosAgent:
         return False
 
     def create_streams(self) -> None:
-        for stream in self.streams:
-            self.create_stream_until_ready(stream)
-        self.create_stream_until_ready(self.producer_probe_stream)
-        self.event("info", f"{len(self.streams)} streams ready for run {self.run_id}")
+        self.create_workload_run_streams(
+            self.run_id,
+            self.streams,
+            self.producer_probe_stream,
+        )
 
     def create_stream_until_ready(self, stream: WorkloadStream) -> None:
         if stream.name in self.created_streams:
@@ -797,6 +829,7 @@ class ChaosAgent:
                 status, _, _ = self.request(
                     "PUT",
                     f"{node.base_url}/{BUCKET}/{stream.name}",
+                    headers=self.workload_stream_headers(),
                     timeout_secs=15,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -811,8 +844,63 @@ class ChaosAgent:
             + (f" ({last_error})" if last_error else "")
         )
 
+    def create_workload_run_streams(
+        self,
+        run_id: str,
+        streams: list[WorkloadStream],
+        producer_probe_stream: WorkloadStream,
+    ) -> None:
+        for stream in streams:
+            self.create_stream_until_ready(stream)
+        self.create_stream_until_ready(producer_probe_stream)
+        ttl_suffix = (
+            f" ttl={self.workload_stream_ttl_secs}s"
+            if self.workload_stream_ttl_secs > 0
+            else " ttl=disabled"
+        )
+        self.event("info", f"{len(streams)} streams ready for run {run_id}{ttl_suffix}")
+
+    def maybe_rollover_workload_streams(self) -> None:
+        if self.next_workload_rollover_at is None:
+            return
+        if time.monotonic() < self.next_workload_rollover_at:
+            return
+        if self.workload_probes_paused():
+            return
+        with self.state_lock:
+            if self.rollover_in_progress or self.has_unknown_appends_locked():
+                return
+            self.rollover_in_progress = True
+            next_generation = self.run_generation + 1
+        next_run_id = self.workload_run_id(next_generation)
+        next_streams = self.build_workload_streams(next_run_id)
+        next_probe_stream = WorkloadStream(f"{next_run_id}-producer-probe")
+        try:
+            self.create_workload_run_streams(next_run_id, next_streams, next_probe_stream)
+        except Exception:
+            with self.state_lock:
+                self.rollover_in_progress = False
+                self.next_workload_rollover_at = time.monotonic() + min(60, self.workload_run_secs)
+            raise
+        with self.state_lock:
+            previous_run_id = self.run_id
+            self.run_generation = next_generation
+            self.run_id = next_run_id
+            self.current_run_started_at = utc_now()
+            self.streams = next_streams
+            self.producer_probe_stream = next_probe_stream
+            self.producer_probe_epoch = 0
+            self.lane_attempts = [0 for _ in range(self.append_workers)]
+            self.lane_unresolved_appends = [False for _ in range(self.append_workers)]
+            self.global_unresolved_append = False
+            self.rollover_in_progress = False
+            self.next_workload_rollover_at = time.monotonic() + self.workload_run_secs
+        self.event("info", f"rolled workload streams {previous_run_id} -> {next_run_id}")
+
     def append_once(self, lane_id: int | None = None) -> bool:
         with self.state_lock:
+            if self.rollover_in_progress:
+                return False
             attempt_id = self.append_attempts
             self.append_attempts += 1
             if lane_id is None:
@@ -2971,6 +3059,17 @@ class ChaosAgent:
         ]
         published_events = list(self.events)[-_PUBLISHED_EVENTS:]
         published_next_fault_at = self.next_fault_at
+        next_workload_rollover_after = (
+            utc_now()
+            + timedelta(
+                seconds=max(
+                    0.0,
+                    self.next_workload_rollover_at - time.monotonic(),
+                )
+            )
+            if self.next_workload_rollover_at is not None
+            else None
+        )
         if self.current_injection() is not None:
             published_next_fault_at = None
         status = {
@@ -2993,6 +3092,12 @@ class ChaosAgent:
                 "reader_error_total": self.reader_errors,
                 "producer_count": len(self.producers),
                 "payload_sizes": self.payload_sizes,
+                "run_id": self.run_id,
+                "run_generation": self.run_generation,
+                "run_started_at": iso(self.current_run_started_at),
+                "workload_stream_ttl_secs": self.workload_stream_ttl_secs,
+                "workload_run_secs": self.workload_run_secs,
+                "next_workload_rollover_after": iso(next_workload_rollover_after),
                 "stream_count": len(self.streams),
                 "gc_churn_created_total": self.gc_churn_created,
                 "gc_churn_deleted_total": self.gc_churn_deleted,
@@ -3111,6 +3216,7 @@ class ChaosAgent:
         while True:
             loop_started = time.monotonic()
             self.maybe_inject_fault()
+            self.maybe_rollover_workload_streams()
             if loop_started - last_status >= self.status_every:
                 self.publish_status()
                 last_status = loop_started
@@ -3196,6 +3302,7 @@ class ChaosAgent:
                 with self.state_lock:
                     append_success = self.append_success
 
+                self.maybe_rollover_workload_streams()
                 if append_success - last_verified_success >= self.verify_every:
                     self.verify_integrity()
                     last_verified_success = append_success
@@ -3240,6 +3347,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--status-s3-uri", default="")
     parser.add_argument("--stream", default="")
     parser.add_argument("--stream-count", type=int, default=24)
+    parser.add_argument("--workload-stream-ttl-secs", type=int, default=7200,
+                        help="server-side TTL for main workload streams (0 disables)")
+    parser.add_argument("--workload-run-secs", type=int, default=3600,
+                        help="seconds before rotating to a fresh workload stream set (0 disables)")
     parser.add_argument("--append-per-second", type=int, default=20)
     parser.add_argument("--payload-bytes", type=int, default=128)
     parser.add_argument("--payload-sizes", default="128,1024,16384,65536")
@@ -3276,7 +3387,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fault-profile",
-        choices=["network", "revert-detection", "custom"],
+        choices=["network", "orthogonal", "revert-detection", "custom"],
         default="network",
         help="Preset fault scenario set. Use custom with --fault-scenarios.",
     )

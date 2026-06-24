@@ -755,6 +755,10 @@ WantedBy=multi-user.target
             args.status_s3_uri,
             "--stream-count",
             str(args.stream_count),
+            "--workload-stream-ttl-secs",
+            str(args.workload_stream_ttl_secs),
+            "--workload-run-secs",
+            str(args.workload_run_secs),
             "--append-per-second",
             str(args.append_per_second),
             "--payload-sizes",
@@ -963,7 +967,7 @@ def build_parser() -> argparse.ArgumentParser:
     chaos_agent.add_argument("--fault-max-secs", type=int, default=1800)
     chaos_agent.add_argument(
         "--fault-profile",
-        choices=["network", "revert-detection", "custom"],
+        choices=["network", "orthogonal", "revert-detection", "custom"],
         default="network",
     )
     chaos_agent.add_argument(
@@ -999,6 +1003,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     deploy_chaos.add_argument("--status-s3-uri", default="s3://ursula-chaos-status-tonbo/status.json")
     deploy_chaos.add_argument("--stream-count", type=int, default=24)
+    deploy_chaos.add_argument("--workload-stream-ttl-secs", type=int, default=7200)
+    deploy_chaos.add_argument("--workload-run-secs", type=int, default=3600)
     deploy_chaos.add_argument("--append-per-second", type=int, default=20)
     deploy_chaos.add_argument("--payload-sizes", default="128,1024,16384,65536")
     deploy_chaos.add_argument("--payload-kinds", default="ascii,binary,zero,utf8")
@@ -1016,7 +1022,7 @@ def build_parser() -> argparse.ArgumentParser:
     deploy_chaos.add_argument("--fault-max-secs", type=int, default=1800)
     deploy_chaos.add_argument(
         "--fault-profile",
-        choices=["network", "revert-detection", "custom"],
+        choices=["network", "orthogonal", "revert-detection", "custom"],
         default="network",
     )
     deploy_chaos.add_argument(
