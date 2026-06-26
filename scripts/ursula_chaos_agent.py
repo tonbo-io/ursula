@@ -267,6 +267,12 @@ _PUBLISHED_EVENTS = 16  # page renders last 10
 _PUBLISHED_INJECTION_TIMELINE = 8  # timeline shown only in expandable details
 
 
+def _minimum_history_points(status_every_secs: int) -> int:
+    interval_secs = max(1, status_every_secs)
+    retention_ms = _PUBLISHED_HISTORY_BUCKETS * _PUBLISHED_HISTORY_BUCKET_MS + _PUBLISHED_HISTORY_RAW_MS
+    return int((retention_ms + interval_secs * 1000 - 1) // (interval_secs * 1000))
+
+
 def _downsample_history(raw: list[dict[str, Any]], now_ms: int) -> list[dict[str, Any]]:
     if not raw:
         return []
@@ -388,7 +394,8 @@ class ChaosAgent:
             raise SystemExit("at least one --node is required")
         self.status_file = args.status_file
         self.status_s3_uri = args.status_s3_uri
-        self.history: deque[dict[str, Any]] = deque(maxlen=args.history_points)
+        history_points = max(args.history_points, _minimum_history_points(args.status_every))
+        self.history: deque[dict[str, Any]] = deque(maxlen=history_points)
         self.append_per_second = args.append_per_second
         self.payload_bytes = args.payload_bytes
         self.payload_sizes = parse_int_list(args.payload_sizes)
