@@ -13,6 +13,7 @@ from ursula_chaos_agent import (
     ProducerState,
     Setsum,
     WorkloadStream,
+    _minimum_history_points,
     _published_started_at,
 )
 
@@ -47,6 +48,11 @@ class ChaosAgentStateTest(unittest.TestCase):
             _published_started_at(process_started_at, [], restored_started_at),
             restored_started_at,
         )
+
+    def test_minimum_history_points_covers_published_window(self) -> None:
+        # Seven days of hourly bars plus the last raw hour at a 15s publish cadence.
+        self.assertEqual(_minimum_history_points(15), 40560)
+        self.assertGreater(_minimum_history_points(10), _minimum_history_points(15))
 
     def test_reconciles_unresolved_impairment_injection(self) -> None:
         agent = object.__new__(ChaosAgent)
