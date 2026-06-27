@@ -541,7 +541,7 @@ impl NodeMemoryMonitor {
                         tracing::error!("{breadcrumb}");
                         use std::io::Write as _;
                         let _ = std::io::stderr().flush();
-                        std::process::exit(134);
+                        std::process::abort();
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(500)).await;
