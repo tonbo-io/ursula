@@ -470,7 +470,7 @@ ExecStart={exec_start}
 Restart={restart_policy}
 RestartSec=3
 LimitNOFILE=1048576
-LimitCORE=0
+LimitCORE=infinity
 {self.systemd_environment_lines()}
 [Install]
 WantedBy=multi-user.target
