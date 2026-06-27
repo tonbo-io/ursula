@@ -221,6 +221,70 @@ impl RuntimeMetrics {
             .iter()
             .map(PaddedAtomicU64::load_relaxed)
             .collect();
+        let per_group_raft_snapshot_builds = self
+            .inner
+            .per_group_raft_snapshot_builds
+            .iter()
+            .map(PaddedAtomicU64::load_relaxed)
+            .collect::<Vec<_>>();
+        let raft_snapshot_builds = per_group_raft_snapshot_builds.iter().sum();
+        let per_group_raft_snapshot_build_ns = self
+            .inner
+            .per_group_raft_snapshot_build_ns
+            .iter()
+            .map(PaddedAtomicU64::load_relaxed)
+            .collect::<Vec<_>>();
+        let raft_snapshot_build_ns = per_group_raft_snapshot_build_ns.iter().sum();
+        let per_group_raft_snapshot_body_bytes = self
+            .inner
+            .per_group_raft_snapshot_body_bytes
+            .iter()
+            .map(PaddedAtomicU64::load_relaxed)
+            .collect::<Vec<_>>();
+        let raft_snapshot_body_bytes = per_group_raft_snapshot_body_bytes.iter().sum();
+        let raft_snapshot_body_bytes_max = per_group_raft_snapshot_body_bytes
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let per_group_raft_snapshot_pointer_bytes = self
+            .inner
+            .per_group_raft_snapshot_pointer_bytes
+            .iter()
+            .map(PaddedAtomicU64::load_relaxed)
+            .collect::<Vec<_>>();
+        let raft_snapshot_pointer_bytes = per_group_raft_snapshot_pointer_bytes.iter().sum();
+        let raft_snapshot_pointer_bytes_max = per_group_raft_snapshot_pointer_bytes
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let per_group_raft_snapshot_streams = self
+            .inner
+            .per_group_raft_snapshot_streams
+            .iter()
+            .map(PaddedAtomicU64::load_relaxed)
+            .collect::<Vec<_>>();
+        let raft_snapshot_streams = per_group_raft_snapshot_streams.iter().sum();
+        let raft_snapshot_streams_max = per_group_raft_snapshot_streams
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let per_group_raft_snapshot_external_uploads = self
+            .inner
+            .per_group_raft_snapshot_external_uploads
+            .iter()
+            .map(PaddedAtomicU64::load_relaxed)
+            .collect::<Vec<_>>();
+        let raft_snapshot_external_uploads = per_group_raft_snapshot_external_uploads.iter().sum();
+        let per_group_raft_snapshot_inline_fallbacks = self
+            .inner
+            .per_group_raft_snapshot_inline_fallbacks
+            .iter()
+            .map(PaddedAtomicU64::load_relaxed)
+            .collect::<Vec<_>>();
+        let raft_snapshot_inline_fallbacks = per_group_raft_snapshot_inline_fallbacks.iter().sum();
         let per_core_live_read_waiters = self
             .inner
             .per_core_live_read_waiters
@@ -400,6 +464,23 @@ impl RuntimeMetrics {
             raft_apply_ns,
             per_core_raft_apply_ns,
             per_group_raft_apply_ns,
+            raft_snapshot_builds,
+            per_group_raft_snapshot_builds,
+            raft_snapshot_build_ns,
+            per_group_raft_snapshot_build_ns,
+            raft_snapshot_body_bytes,
+            raft_snapshot_body_bytes_max,
+            per_group_raft_snapshot_body_bytes,
+            raft_snapshot_pointer_bytes,
+            raft_snapshot_pointer_bytes_max,
+            per_group_raft_snapshot_pointer_bytes,
+            raft_snapshot_streams,
+            raft_snapshot_streams_max,
+            per_group_raft_snapshot_streams,
+            raft_snapshot_external_uploads,
+            per_group_raft_snapshot_external_uploads,
+            raft_snapshot_inline_fallbacks,
+            per_group_raft_snapshot_inline_fallbacks,
             live_read_waiters,
             per_core_live_read_waiters,
             live_read_backpressure_events,
@@ -494,6 +575,23 @@ pub struct RuntimeMetricsSnapshot {
     pub raft_apply_ns: u64,
     pub per_core_raft_apply_ns: Vec<u64>,
     pub per_group_raft_apply_ns: Vec<u64>,
+    pub raft_snapshot_builds: u64,
+    pub per_group_raft_snapshot_builds: Vec<u64>,
+    pub raft_snapshot_build_ns: u64,
+    pub per_group_raft_snapshot_build_ns: Vec<u64>,
+    pub raft_snapshot_body_bytes: u64,
+    pub raft_snapshot_body_bytes_max: u64,
+    pub per_group_raft_snapshot_body_bytes: Vec<u64>,
+    pub raft_snapshot_pointer_bytes: u64,
+    pub raft_snapshot_pointer_bytes_max: u64,
+    pub per_group_raft_snapshot_pointer_bytes: Vec<u64>,
+    pub raft_snapshot_streams: u64,
+    pub raft_snapshot_streams_max: u64,
+    pub per_group_raft_snapshot_streams: Vec<u64>,
+    pub raft_snapshot_external_uploads: u64,
+    pub per_group_raft_snapshot_external_uploads: Vec<u64>,
+    pub raft_snapshot_inline_fallbacks: u64,
+    pub per_group_raft_snapshot_inline_fallbacks: Vec<u64>,
     pub live_read_waiters: u64,
     pub per_core_live_read_waiters: Vec<u64>,
     pub live_read_backpressure_events: u64,
@@ -576,6 +674,13 @@ pub(crate) struct RuntimeMetricsInner {
     pub(crate) per_group_raft_apply_entries: Vec<PaddedAtomicU64>,
     pub(crate) per_core_raft_apply_ns: Vec<PaddedAtomicU64>,
     pub(crate) per_group_raft_apply_ns: Vec<PaddedAtomicU64>,
+    pub(crate) per_group_raft_snapshot_builds: Vec<PaddedAtomicU64>,
+    pub(crate) per_group_raft_snapshot_build_ns: Vec<PaddedAtomicU64>,
+    pub(crate) per_group_raft_snapshot_body_bytes: Vec<PaddedAtomicU64>,
+    pub(crate) per_group_raft_snapshot_pointer_bytes: Vec<PaddedAtomicU64>,
+    pub(crate) per_group_raft_snapshot_streams: Vec<PaddedAtomicU64>,
+    pub(crate) per_group_raft_snapshot_external_uploads: Vec<PaddedAtomicU64>,
+    pub(crate) per_group_raft_snapshot_inline_fallbacks: Vec<PaddedAtomicU64>,
     pub(crate) per_core_live_read_waiters: Vec<PaddedAtomicU64>,
     pub(crate) per_core_live_read_backpressure_events: Vec<PaddedAtomicU64>,
     pub(crate) per_core_routed_requests: Vec<PaddedAtomicU64>,
@@ -616,6 +721,16 @@ pub(crate) struct RaftWriteManySample {
     pub(crate) response_count: u64,
     pub(crate) submit_ns: u64,
     pub(crate) response_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RaftSnapshotBuildSample {
+    pub(crate) streams: u64,
+    pub(crate) body_bytes: u64,
+    pub(crate) pointer_bytes: u64,
+    pub(crate) build_ns: u64,
+    pub(crate) external_upload: bool,
+    pub(crate) inline_fallback: bool,
 }
 
 impl RuntimeMetricsInner {
@@ -694,6 +809,27 @@ impl RuntimeMetricsInner {
                 .collect(),
             per_core_raft_apply_ns: (0..core_count).map(|_| PaddedAtomicU64::new(0)).collect(),
             per_group_raft_apply_ns: (0..raft_group_count)
+                .map(|_| PaddedAtomicU64::new(0))
+                .collect(),
+            per_group_raft_snapshot_builds: (0..raft_group_count)
+                .map(|_| PaddedAtomicU64::new(0))
+                .collect(),
+            per_group_raft_snapshot_build_ns: (0..raft_group_count)
+                .map(|_| PaddedAtomicU64::new(0))
+                .collect(),
+            per_group_raft_snapshot_body_bytes: (0..raft_group_count)
+                .map(|_| PaddedAtomicU64::new(0))
+                .collect(),
+            per_group_raft_snapshot_pointer_bytes: (0..raft_group_count)
+                .map(|_| PaddedAtomicU64::new(0))
+                .collect(),
+            per_group_raft_snapshot_streams: (0..raft_group_count)
+                .map(|_| PaddedAtomicU64::new(0))
+                .collect(),
+            per_group_raft_snapshot_external_uploads: (0..raft_group_count)
+                .map(|_| PaddedAtomicU64::new(0))
+                .collect(),
+            per_group_raft_snapshot_inline_fallbacks: (0..raft_group_count)
                 .map(|_| PaddedAtomicU64::new(0))
                 .collect(),
             per_core_live_read_waiters: (0..core_count).map(|_| PaddedAtomicU64::new(0)).collect(),
@@ -867,6 +1003,25 @@ impl RuntimeMetricsInner {
         self.per_group_raft_apply_entries[group_index].fetch_add_relaxed(entry_count);
         self.per_core_raft_apply_ns[core_index].fetch_add_relaxed(apply_ns);
         self.per_group_raft_apply_ns[group_index].fetch_add_relaxed(apply_ns);
+    }
+
+    pub(crate) fn record_raft_snapshot_build(
+        &self,
+        group_id: RaftGroupId,
+        sample: RaftSnapshotBuildSample,
+    ) {
+        let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
+        self.per_group_raft_snapshot_builds[group_index].fetch_add_relaxed(1);
+        self.per_group_raft_snapshot_build_ns[group_index].fetch_add_relaxed(sample.build_ns);
+        self.per_group_raft_snapshot_body_bytes[group_index].store_relaxed(sample.body_bytes);
+        self.per_group_raft_snapshot_pointer_bytes[group_index].store_relaxed(sample.pointer_bytes);
+        self.per_group_raft_snapshot_streams[group_index].store_relaxed(sample.streams);
+        if sample.external_upload {
+            self.per_group_raft_snapshot_external_uploads[group_index].fetch_add_relaxed(1);
+        }
+        if sample.inline_fallback {
+            self.per_group_raft_snapshot_inline_fallbacks[group_index].fetch_add_relaxed(1);
+        }
     }
 
     pub(crate) fn record_wal_batch(
