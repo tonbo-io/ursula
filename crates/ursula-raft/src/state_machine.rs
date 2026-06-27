@@ -500,6 +500,7 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             meta: self.snapshot_meta(),
             current_snapshot: self.current_snapshot.clone(),
             snapshot_store: self.snapshot_store.clone(),
+            metrics: self.metrics.clone(),
         }
     }
 
@@ -568,11 +569,15 @@ pub struct RaftGroupSnapshotBuilder {
     pub(crate) meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
     current_snapshot: Arc<Mutex<Option<CurrentSnapshot>>>,
     snapshot_store: SharedSnapshotStore,
+    metrics: Option<GroupEngineMetrics>,
 }
 
 impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<UrsulaRaftTypeConfig>, io::Error> {
+        let started_at = Instant::now();
+        let stream_count = self.snapshot.stream_snapshot.streams.len();
         let body = serde_json::to_vec(&self.snapshot).map_err(invalid_data)?;
+        let body_bytes = body.len();
         let snapshot_id = self.meta.snapshot_id.clone();
         let key = SnapshotKey {
             raft_group_id: self.placement.raft_group_id.0,
@@ -611,6 +616,19 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             location,
         };
         let pointer_bytes = pointer.encode().map_err(|err| err.into_io())?;
+        let external_upload = !matches!(pointer.location, SnapshotLocation::Inline { .. });
+        let inline_fallback = !external_upload;
+        if let Some(metrics) = &self.metrics {
+            metrics.record_raft_snapshot_build(
+                self.placement,
+                stream_count,
+                body_bytes,
+                pointer_bytes.len(),
+                elapsed_ns(started_at),
+                external_upload,
+                inline_fallback,
+            );
+        }
         {
             let mut guard = self.current_snapshot.lock().expect("snapshot mutex");
             guard.replace(CurrentSnapshot {
@@ -712,6 +730,7 @@ mod tests {
             meta: test_snapshot_meta(1),
             current_snapshot: current_snapshot.clone(),
             snapshot_store: snapshot_store.clone(),
+            metrics: None,
         };
         let first_snapshot = first.build_snapshot().await.expect("first snapshot");
         let first_pointer =
@@ -723,6 +742,7 @@ mod tests {
             meta: test_snapshot_meta(2),
             current_snapshot: current_snapshot.clone(),
             snapshot_store: snapshot_store.clone(),
+            metrics: None,
         };
         let second_snapshot = second.build_snapshot().await.expect("second snapshot");
         let second_pointer = SnapshotPointer::decode(&second_snapshot.snapshot.into_inner())
@@ -752,6 +772,7 @@ mod tests {
             meta: test_snapshot_meta(3),
             current_snapshot,
             snapshot_store,
+            metrics: None,
         };
         let third_snapshot = third.build_snapshot().await.expect("third snapshot");
         let third_pointer =
@@ -828,6 +849,7 @@ mod tests {
             meta: test_snapshot_meta(3),
             current_snapshot: current_snapshot.clone(),
             snapshot_store: Arc::new(FailingSnapshotStore),
+            metrics: None,
         };
 
         let snapshot = builder.build_snapshot().await.expect("inline fallback");
