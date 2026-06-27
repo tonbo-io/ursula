@@ -71,7 +71,7 @@ class ClusterConfig:
     perf_compare: str | None
 
 
-DEFAULT_RAFT_MEMORY_ABORT_CAP_BYTES = str(1536 * 1024 * 1024)
+DEFAULT_RAFT_MEMORY_ABORT_CAP_BYTES = str(1152 * 1024 * 1024)
 
 
 def run(argv: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:

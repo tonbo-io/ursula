@@ -17,6 +17,7 @@ use ursula_stream::StreamErrorContext;
 
 use crate::command::GroupSnapshot;
 use crate::command::GroupWriteCommand;
+use crate::metrics::RaftSnapshotBuildSample;
 use crate::metrics::RaftWriteManySample;
 use crate::metrics::RuntimeMetricsInner;
 use crate::request::AckColdGcResponse;
@@ -779,6 +780,28 @@ impl GroupEngineMetrics {
             u64::try_from(entry_count).expect("entry count fits u64"),
             apply_ns,
         );
+    }
+
+    pub fn record_raft_snapshot_build(
+        &self,
+        placement: ShardPlacement,
+        stream_count: usize,
+        body_bytes: usize,
+        pointer_bytes: usize,
+        build_ns: u64,
+        external_upload: bool,
+        inline_fallback: bool,
+    ) {
+        self.inner
+            .record_raft_snapshot_build(placement.raft_group_id, RaftSnapshotBuildSample {
+                streams: u64::try_from(stream_count).expect("stream count fits u64"),
+                body_bytes: u64::try_from(body_bytes).expect("snapshot body bytes fits u64"),
+                pointer_bytes: u64::try_from(pointer_bytes)
+                    .expect("snapshot pointer bytes fits u64"),
+                build_ns,
+                external_upload,
+                inline_fallback,
+            });
     }
 }
 
