@@ -1,7 +1,13 @@
+use std::cmp::Ordering;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
+use slotmap::Key;
+use slotmap::SlotMap;
+use slotmap::new_key_type;
 use ursula_shard::BucketStreamId;
 
 use crate::command::StreamCommand;
@@ -45,144 +51,95 @@ use crate::validate::validate_stream_id;
 
 const TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE: usize = 256;
 
+new_key_type! {
+    struct StreamKey;
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StreamStateMachine {
     buckets: HashSet<String>,
-    streams: HashMap<BucketStreamId, StreamMetadata>,
-    stream_attrs: HashMap<BucketStreamId, StreamAttrs>,
-    hot_buffers: HashMap<BucketStreamId, HotBuffer>,
-    cold_index: InMemoryColdIndex,
-    message_records: HashMap<BucketStreamId, Vec<StreamMessageRecord>>,
-    integrities: HashMap<BucketStreamId, StreamIntegrity>,
-    visible_snapshots: HashMap<BucketStreamId, StreamVisibleSnapshot>,
-    producers: HashMap<BucketStreamId, HashMap<String, ProducerState>>,
+    stream_keys: HashMap<BucketStreamId, StreamKey>,
+    streams: SlotMap<StreamKey, StreamSlot>,
+    ttl_index: TtlIndex,
     pending_cold_gc: VecDeque<ColdGcEntry>,
     next_cold_gc_seq: u64,
 }
 
-trait ColdIndexState {
-    fn cold_chunks(&self, stream_id: &BucketStreamId) -> &[ColdChunkRef];
-    fn external_segments(&self, stream_id: &BucketStreamId) -> &[ObjectPayloadRef];
-    fn cold_generation(&self, stream_id: &BucketStreamId) -> u64;
-    fn push_cold_chunk(&mut self, stream_id: BucketStreamId, chunk: ColdChunkRef);
-    fn push_external_segment(&mut self, stream_id: BucketStreamId, object: ObjectPayloadRef);
-    fn restore_stream(
-        &mut self,
-        stream_id: BucketStreamId,
-        cold_frontier_offset: u64,
-        cold_index_generation: u64,
-        cold_chunks: Vec<ColdChunkRef>,
-        external_segments: Vec<ObjectPayloadRef>,
-    );
-    fn remove_stream(&mut self, stream_id: &BucketStreamId) -> bool;
-    fn compact_before(&mut self, stream_id: &BucketStreamId, retained_offset: u64) -> Vec<String>;
-    fn cold_frontier_offset(&self, stream_id: &BucketStreamId, retained_offset: u64) -> u64;
+#[derive(Debug, Clone)]
+struct StreamSlot {
+    metadata: StreamMetadata,
+    attrs: Option<StreamAttrs>,
+    hot_buffer: HotBuffer,
+    cold: StreamColdState,
+    message_records: Vec<StreamMessageRecord>,
+    integrity: StreamIntegrity,
+    visible_snapshot: Option<StreamVisibleSnapshot>,
+    producers: HashMap<String, ProducerState>,
 }
 
 #[derive(Debug, Clone, Default)]
-struct InMemoryColdIndex {
-    cold_chunks: HashMap<BucketStreamId, Vec<ColdChunkRef>>,
-    external_segments: HashMap<BucketStreamId, Vec<ObjectPayloadRef>>,
-    cold_frontiers: HashMap<BucketStreamId, u64>,
+struct StreamColdState {
+    cold_chunks: Vec<ColdChunkRef>,
+    external_segments: Vec<ObjectPayloadRef>,
+    cold_frontier: u64,
 }
 
-impl ColdIndexState for InMemoryColdIndex {
-    fn cold_chunks(&self, stream_id: &BucketStreamId) -> &[ColdChunkRef] {
-        self.cold_chunks
-            .get(stream_id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+impl StreamColdState {
+    fn cold_chunks(&self) -> &[ColdChunkRef] {
+        &self.cold_chunks
     }
 
-    fn external_segments(&self, stream_id: &BucketStreamId) -> &[ObjectPayloadRef] {
-        self.external_segments
-            .get(stream_id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+    fn external_segments(&self) -> &[ObjectPayloadRef] {
+        &self.external_segments
     }
 
-    fn cold_generation(&self, _stream_id: &BucketStreamId) -> u64 {
+    fn cold_generation(&self) -> u64 {
         0
     }
 
-    fn push_cold_chunk(&mut self, stream_id: BucketStreamId, chunk: ColdChunkRef) {
-        self.cold_frontiers.insert(stream_id, chunk.end_offset);
+    fn push_cold_chunk(&mut self, chunk: ColdChunkRef) {
+        self.cold_frontier = chunk.end_offset;
     }
 
-    fn push_external_segment(&mut self, stream_id: BucketStreamId, object: ObjectPayloadRef) {
-        let frontier = self
-            .cold_frontiers
-            .get(&stream_id)
-            .copied()
-            .unwrap_or(object.start_offset)
-            .max(object.end_offset);
-        self.cold_frontiers.insert(stream_id, frontier);
+    fn push_external_segment(&mut self, object: ObjectPayloadRef) {
+        let frontier = self.cold_frontier.max(object.end_offset);
+        self.cold_frontier = frontier;
     }
 
-    fn restore_stream(
-        &mut self,
-        stream_id: BucketStreamId,
+    fn restore(
         cold_frontier_offset: u64,
         _cold_index_generation: u64,
         cold_chunks: Vec<ColdChunkRef>,
         external_segments: Vec<ObjectPayloadRef>,
-    ) {
-        if cold_frontier_offset > 0 {
-            self.cold_frontiers
-                .insert(stream_id.clone(), cold_frontier_offset);
-        }
-        if !cold_chunks.is_empty() {
-            self.cold_chunks.insert(stream_id.clone(), cold_chunks);
-        }
-        if !external_segments.is_empty() {
-            self.external_segments.insert(stream_id, external_segments);
+    ) -> Self {
+        Self {
+            cold_chunks,
+            external_segments,
+            cold_frontier: cold_frontier_offset,
         }
     }
 
-    fn remove_stream(&mut self, stream_id: &BucketStreamId) -> bool {
-        self.cold_frontiers
-            .remove(stream_id)
-            .is_some_and(|frontier| frontier > 0)
-            || self
-                .cold_chunks
-                .remove(stream_id)
-                .is_some_and(|chunks| !chunks.is_empty())
-            || self
-                .external_segments
-                .remove(stream_id)
-                .is_some_and(|objects| !objects.is_empty())
+    fn has_cold_objects(&self) -> bool {
+        self.cold_frontier > 0 || !self.cold_chunks.is_empty() || !self.external_segments.is_empty()
     }
 
-    fn compact_before(&mut self, stream_id: &BucketStreamId, retained_offset: u64) -> Vec<String> {
+    fn compact_before(&mut self, retained_offset: u64) -> Vec<String> {
         let mut dropped_cold_paths = Vec::new();
-        if let Some(chunks) = self.cold_chunks.get_mut(stream_id) {
-            chunks.retain(|chunk| {
-                let retain = chunk.end_offset > retained_offset;
-                if !retain {
-                    dropped_cold_paths.push(chunk.s3_path.clone());
-                }
-                retain
-            });
-            if chunks.is_empty() {
-                self.cold_chunks.remove(stream_id);
+        self.cold_chunks.retain(|chunk| {
+            let retain = chunk.end_offset > retained_offset;
+            if !retain {
+                dropped_cold_paths.push(chunk.s3_path.clone());
             }
-        }
-        if let Some(objects) = self.external_segments.get_mut(stream_id) {
-            objects.retain(|object| object.end_offset > retained_offset);
-            if objects.is_empty() {
-                self.external_segments.remove(stream_id);
-            }
-        }
+            retain
+        });
+        self.external_segments
+            .retain(|object| object.end_offset > retained_offset);
         dropped_cold_paths
     }
 
-    fn cold_frontier_offset(&self, stream_id: &BucketStreamId, retained_offset: u64) -> u64 {
-        let external_segments = self.external_segments(stream_id);
-        let cold_frontier = self
-            .cold_frontiers
-            .get(stream_id)
-            .copied()
-            .unwrap_or(retained_offset);
+    fn cold_frontier_offset(&self, retained_offset: u64) -> u64 {
+        let external_segments = self.external_segments();
+        let cold_frontier = self.cold_frontier.max(retained_offset);
         let mut ranges = Vec::with_capacity(1 + external_segments.len());
         if cold_frontier > retained_offset {
             ranges.push((retained_offset, cold_frontier));
@@ -205,6 +162,33 @@ impl ColdIndexState for InMemoryColdIndex {
             frontier = end_offset;
         }
         frontier
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct TtlIndex {
+    entries: BinaryHeap<Reverse<TtlEntry>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TtlEntry {
+    expires_at_ms: u64,
+    stream_id: BucketStreamId,
+    key: StreamKey,
+}
+
+impl Ord for TtlEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.expires_at_ms
+            .cmp(&other.expires_at_ms)
+            .then_with(|| compare_stream_ids(&self.stream_id, &other.stream_id))
+            .then_with(|| self.key.data().as_ffi().cmp(&other.key.data().as_ffi()))
+    }
+}
+
+impl PartialOrd for TtlEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -412,6 +396,60 @@ impl StreamStateMachine {
         Self::default()
     }
 
+    fn stream_key(&self, stream_id: &BucketStreamId) -> Option<StreamKey> {
+        self.stream_keys.get(stream_id).copied()
+    }
+
+    fn stream_slot(&self, stream_id: &BucketStreamId) -> Option<&StreamSlot> {
+        let key = self.stream_key(stream_id)?;
+        self.streams.get(key)
+    }
+
+    fn stream_slot_mut(&mut self, stream_id: &BucketStreamId) -> Option<&mut StreamSlot> {
+        let key = self.stream_key(stream_id)?;
+        self.streams.get_mut(key)
+    }
+
+    fn stream_metadata(&self, stream_id: &BucketStreamId) -> Option<&StreamMetadata> {
+        self.stream_slot(stream_id).map(|slot| &slot.metadata)
+    }
+
+    fn stream_metadata_mut(&mut self, stream_id: &BucketStreamId) -> Option<&mut StreamMetadata> {
+        self.stream_slot_mut(stream_id)
+            .map(|slot| &mut slot.metadata)
+    }
+
+    fn insert_stream_slot(&mut self, slot: StreamSlot) -> Option<StreamKey> {
+        let stream_id = slot.metadata.stream_id.clone();
+        if self.stream_keys.contains_key(&stream_id) {
+            return None;
+        }
+        let key = self.streams.insert(slot);
+        self.stream_keys.insert(stream_id.clone(), key);
+        self.push_ttl_entry(&stream_id, key);
+        Some(key)
+    }
+
+    fn push_ttl_entry(&mut self, stream_id: &BucketStreamId, key: StreamKey) {
+        let Some(slot) = self.streams.get(key) else {
+            return;
+        };
+        let Some(expires_at_ms) = stream_expiry_at_ms(&slot.metadata) else {
+            return;
+        };
+        self.ttl_index.entries.push(Reverse(TtlEntry {
+            expires_at_ms,
+            stream_id: stream_id.clone(),
+            key,
+        }));
+    }
+
+    fn refresh_ttl_entry(&mut self, stream_id: &BucketStreamId) {
+        if let Some(key) = self.stream_key(stream_id) {
+            self.push_ttl_entry(stream_id, key);
+        }
+    }
+
     pub fn apply(&mut self, command: StreamCommand) -> StreamResponse {
         match command {
             StreamCommand::CreateBucket { bucket_id } => self.create_bucket(bucket_id),
@@ -613,16 +651,17 @@ impl StreamStateMachine {
     }
 
     pub fn head(&self, stream_id: &BucketStreamId) -> Option<&StreamMetadata> {
-        self.streams.get(stream_id)
+        self.stream_metadata(stream_id)
     }
 
     pub fn stream_attrs(&self, stream_id: &BucketStreamId) -> Option<&StreamAttrs> {
-        self.stream_attrs.get(stream_id)
+        self.stream_slot(stream_id)
+            .and_then(|slot| slot.attrs.as_ref())
     }
 
     pub fn head_at(&mut self, stream_id: &BucketStreamId, now_ms: u64) -> Option<&StreamMetadata> {
         self.expire_stream_if_due(stream_id, now_ms);
-        self.streams.get(stream_id)
+        self.stream_metadata(stream_id)
     }
 
     pub fn access_requires_write(
@@ -632,7 +671,7 @@ impl StreamStateMachine {
         renew_ttl: bool,
     ) -> Result<bool, StreamResponse> {
         self.validate_stream_scope(stream_id)?;
-        let Some(stream) = self.streams.get(stream_id) else {
+        let Some(stream) = self.stream_metadata(stream_id) else {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
@@ -653,54 +692,54 @@ impl StreamStateMachine {
     }
 
     pub fn hot_start_offset(&self, stream_id: &BucketStreamId) -> u64 {
-        let Some(stream) = self.streams.get(stream_id) else {
+        let Some(slot) = self.stream_slot(stream_id) else {
             return 0;
         };
-        self.hot_buffers
-            .get(stream_id)
-            .and_then(|buffer| buffer.chunks.front().map(|chunk| chunk.start_offset))
-            .unwrap_or(stream.tail_offset)
+        slot.hot_buffer
+            .chunks
+            .front()
+            .map(|chunk| chunk.start_offset)
+            .unwrap_or(slot.metadata.tail_offset)
     }
 
     pub fn cold_chunks(&self, stream_id: &BucketStreamId) -> &[ColdChunkRef] {
-        self.cold_index().cold_chunks(stream_id)
+        self.stream_slot(stream_id)
+            .map(|slot| slot.cold.cold_chunks())
+            .unwrap_or(&[])
     }
 
     pub fn external_segments(&self, stream_id: &BucketStreamId) -> &[ObjectPayloadRef] {
-        self.cold_index().external_segments(stream_id)
+        self.stream_slot(stream_id)
+            .map(|slot| slot.cold.external_segments())
+            .unwrap_or(&[])
     }
 
     pub fn hot_segments(&self, stream_id: &BucketStreamId) -> Vec<HotPayloadSegment> {
-        self.hot_buffers
-            .get(stream_id)
-            .map(HotBuffer::hot_segments)
+        self.stream_slot(stream_id)
+            .map(|slot| slot.hot_buffer.hot_segments())
             .unwrap_or_default()
     }
 
     pub fn hot_payload_len(&self, stream_id: &BucketStreamId) -> Result<u64, StreamResponse> {
-        let Some(stream) = self.streams.get(stream_id) else {
+        let Some(slot) = self.stream_slot(stream_id) else {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
             ));
         };
-        if is_soft_deleted(stream) {
+        if is_soft_deleted(&slot.metadata) {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamGone,
                 format!("stream '{stream_id}' is gone"),
             ));
         }
-        let payload = self
-            .hot_buffers
-            .get(stream_id)
-            .expect("hot buffer exists for stream metadata");
-        Ok(u64::try_from(payload.len()).expect("payload len fits u64"))
+        Ok(u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64"))
     }
 
     pub fn total_hot_payload_bytes(&self) -> u64 {
-        self.hot_buffers
+        self.streams
             .values()
-            .map(|payload| u64::try_from(payload.len()).expect("payload len fits u64"))
+            .map(|slot| u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64"))
             .sum()
     }
 
@@ -724,23 +763,21 @@ impl StreamStateMachine {
         if max_flush_bytes == 0 {
             return Ok(None);
         }
-        let Some(stream) = self.streams.get(stream_id) else {
+        let Some(slot) = self.stream_slot(stream_id) else {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
             ));
         };
-        if is_soft_deleted(stream) {
+        if is_soft_deleted(&slot.metadata) {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamGone,
                 format!("stream '{stream_id}' is gone"),
             ));
         }
-        let Some(hot_buffer) = self.hot_buffers.get(stream_id) else {
-            return Ok(None);
-        };
         let Some((start_offset, end_offset, payload)) =
-            hot_buffer.plan_cold_flush_from(start_offset, min_hot_bytes, max_flush_bytes)
+            slot.hot_buffer
+                .plan_cold_flush_from(start_offset, min_hot_bytes, max_flush_bytes)
         else {
             return Ok(None);
         };
@@ -762,7 +799,7 @@ impl StreamStateMachine {
         if max_flush_bytes == 0 {
             return Ok(None);
         }
-        let mut stream_ids = self.streams.keys().cloned().collect::<Vec<_>>();
+        let mut stream_ids = self.stream_keys.keys().cloned().collect::<Vec<_>>();
         stream_ids.sort_by(compare_stream_ids);
         for stream_id in &stream_ids {
             let start = start_fn(stream_id);
@@ -815,11 +852,16 @@ impl StreamStateMachine {
                     .unwrap_or_else(|| self.hot_start_offset(stream_id))
             };
             let group_hot_bytes: u64 = self
-                .hot_buffers
-                .iter()
-                .map(|(stream_id, buffer)| {
+                .stream_keys
+                .keys()
+                .map(|stream_id| {
                     let start = start_for(stream_id);
-                    u64::try_from(buffer.remaining_len_from(start)).expect("len fits u64")
+                    self.stream_slot(stream_id)
+                        .map(|slot| {
+                            u64::try_from(slot.hot_buffer.remaining_len_from(start))
+                                .expect("len fits u64")
+                        })
+                        .unwrap_or(0)
                 })
                 .sum();
             let candidate = self.plan_next_cold_flush_from_start(
@@ -841,35 +883,26 @@ impl StreamStateMachine {
         self.buckets.contains(bucket_id)
     }
 
-    fn cold_index(&self) -> &impl ColdIndexState {
-        &self.cold_index
-    }
-
-    fn cold_index_mut(&mut self) -> &mut impl ColdIndexState {
-        &mut self.cold_index
-    }
-
     pub fn integrity_snapshot(
         &self,
         stream_id: &BucketStreamId,
     ) -> Result<crate::integrity::StreamIntegritySnapshot, StreamResponse> {
-        let Some(stream) = self.streams.get(stream_id) else {
+        let Some(slot) = self.stream_slot(stream_id) else {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
             ));
         };
-        if is_soft_deleted(stream) {
+        if is_soft_deleted(&slot.metadata) {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamGone,
                 format!("stream '{stream_id}' is gone"),
             ));
         }
-        Ok(self
-            .integrities
-            .get(stream_id)
-            .expect("integrity exists for stream metadata")
-            .snapshot(self.earliest_retained_offset(stream_id), stream.tail_offset))
+        Ok(slot.integrity.snapshot(
+            self.earliest_retained_offset(stream_id),
+            slot.metadata.tail_offset,
+        ))
     }
 
     pub fn snapshot(&self) -> StreamSnapshot {
@@ -879,40 +912,30 @@ impl StreamStateMachine {
         let mut streams = self
             .streams
             .values()
-            .cloned()
-            .map(|metadata| {
+            .map(|slot| {
+                let metadata = slot.metadata.clone();
                 let stream_id = metadata.stream_id.clone();
                 let tail_offset = metadata.tail_offset;
-                let hot_buffer = self
-                    .hot_buffers
-                    .get(&stream_id)
-                    .expect("hot buffer exists for stream metadata");
-                let payload = hot_buffer.payload();
-                let producer_states = self.producer_snapshot(&stream_id);
+                let payload = slot.hot_buffer.payload();
+                let producer_states = producer_snapshot(&slot.producers);
                 StreamSnapshotEntry {
                     metadata,
-                    attrs: self.stream_attrs.get(&stream_id).cloned(),
+                    attrs: slot.attrs.clone(),
                     hot_start_offset: self.hot_start_offset(&stream_id),
                     payload,
-                    hot_segments: hot_buffer.hot_segments(),
+                    hot_segments: slot.hot_buffer.hot_segments(),
                     cold_frontier_offset: self.cold_frontier_offset(
                         &stream_id,
                         self.earliest_retained_offset(&stream_id),
                     ),
-                    cold_index_generation: self.cold_index().cold_generation(&stream_id),
-                    cold_chunks: self.cold_index().cold_chunks(&stream_id).to_vec(),
-                    external_segments: self.cold_index().external_segments(&stream_id).to_vec(),
-                    message_records: self
-                        .message_records
-                        .get(&stream_id)
-                        .cloned()
-                        .unwrap_or_default(),
-                    integrity: self
-                        .integrities
-                        .get(&stream_id)
-                        .expect("integrity exists for stream metadata")
+                    cold_index_generation: slot.cold.cold_generation(),
+                    cold_chunks: slot.cold.cold_chunks().to_vec(),
+                    external_segments: slot.cold.external_segments().to_vec(),
+                    message_records: slot.message_records.clone(),
+                    integrity: slot
+                        .integrity
                         .snapshot(self.earliest_retained_offset(&stream_id), tail_offset),
-                    visible_snapshot: self.visible_snapshots.get(&stream_id).cloned(),
+                    visible_snapshot: slot.visible_snapshot.clone(),
                     producer_states,
                 }
             })
@@ -994,40 +1017,29 @@ impl StreamStateMachine {
                     stream_id: stream_id.clone(),
                 }
             })?;
-            if machine
-                .streams
-                .insert(entry.metadata.stream_id.clone(), entry.metadata)
-                .is_some()
-            {
+            if machine.stream_keys.contains_key(&stream_id) {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
             }
-            if let Some(attrs) = normalize_stream_attrs(entry.attrs) {
-                machine.stream_attrs.insert(stream_id.clone(), attrs);
-            }
             let producer_states = restore_producer_states(&stream_id, entry.producer_states)?;
-            machine.hot_buffers.insert(
-                stream_id.clone(),
-                HotBuffer::from_snapshot(entry.payload, &hot_segments),
-            );
-            machine.cold_index_mut().restore_stream(
-                stream_id.clone(),
-                entry.cold_frontier_offset,
-                entry.cold_index_generation,
-                entry.cold_chunks,
-                entry.external_segments,
-            );
-            if !entry.message_records.is_empty() {
-                machine
-                    .message_records
-                    .insert(stream_id.clone(), entry.message_records);
+            let visible_snapshot = entry.visible_snapshot;
+            let slot = StreamSlot {
+                metadata: entry.metadata,
+                attrs: normalize_stream_attrs(entry.attrs),
+                hot_buffer: HotBuffer::from_snapshot(entry.payload, &hot_segments),
+                cold: StreamColdState::restore(
+                    entry.cold_frontier_offset,
+                    entry.cold_index_generation,
+                    entry.cold_chunks,
+                    entry.external_segments,
+                ),
+                message_records: entry.message_records,
+                integrity,
+                visible_snapshot,
+                producers: producer_states,
+            };
+            if machine.insert_stream_slot(slot).is_none() {
+                return Err(StreamSnapshotError::DuplicateStream(stream_id));
             }
-            machine.integrities.insert(stream_id.clone(), integrity);
-            if let Some(snapshot) = entry.visible_snapshot {
-                machine
-                    .visible_snapshots
-                    .insert(stream_id.clone(), snapshot);
-            }
-            machine.producers.insert(stream_id.clone(), producer_states);
         }
 
         machine.pending_cold_gc = snapshot.pending_cold_gc.into_iter().collect();
@@ -1092,12 +1104,13 @@ impl StreamStateMachine {
         max_len: usize,
         now_ms: u64,
     ) -> Result<StreamReadPlan, StreamResponse> {
-        let Some(stream) = self.streams.get(stream_id) else {
+        let Some(slot) = self.stream_slot(stream_id) else {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
             ));
         };
+        let stream = &slot.metadata;
         if is_soft_deleted(stream) {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamGone,
@@ -1135,11 +1148,7 @@ impl StreamStateMachine {
         let max_len_u64 = u64::try_from(max_len).unwrap_or(u64::MAX);
         let next_offset = stream.tail_offset.min(offset.saturating_add(max_len_u64));
         let mut segments = Vec::<(u64, StreamReadSegment)>::new();
-        let hot_segments = self
-            .hot_buffers
-            .get(stream_id)
-            .map(|hot_buffer| hot_buffer.read_segments(offset, next_offset))
-            .unwrap_or_default();
+        let hot_segments = slot.hot_buffer.read_segments(offset, next_offset);
         let cold_frontier = self.cold_frontier_offset(stream_id, retained_offset);
         let cold_index_end = next_offset.min(cold_frontier);
         let mut cursor = offset;
@@ -1157,7 +1166,7 @@ impl StreamStateMachine {
             push_cold_index_segments(
                 &mut segments,
                 stream_id,
-                self.cold_index().cold_generation(stream_id),
+                slot.cold.cold_generation(),
                 cursor,
                 gap_end,
             );
@@ -1166,7 +1175,7 @@ impl StreamStateMachine {
         push_cold_index_segments(
             &mut segments,
             stream_id,
-            self.cold_index().cold_generation(stream_id),
+            slot.cold.cold_generation(),
             cursor,
             cold_index_end,
         );
@@ -1221,19 +1230,19 @@ impl StreamStateMachine {
         &self,
         stream_id: &BucketStreamId,
     ) -> Result<Option<StreamVisibleSnapshot>, StreamResponse> {
-        let Some(stream) = self.streams.get(stream_id) else {
+        let Some(slot) = self.stream_slot(stream_id) else {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
             ));
         };
-        if is_soft_deleted(stream) {
+        if is_soft_deleted(&slot.metadata) {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamGone,
                 format!("stream '{stream_id}' is gone"),
             ));
         }
-        Ok(self.visible_snapshots.get(stream_id).cloned())
+        Ok(slot.visible_snapshot.clone())
     }
 
     pub fn read_snapshot(
@@ -1275,34 +1284,30 @@ impl StreamStateMachine {
         &self,
         stream_id: &BucketStreamId,
     ) -> Result<StreamBootstrapPlan, StreamResponse> {
-        let Some(stream) = self.streams.get(stream_id) else {
+        let Some(slot) = self.stream_slot(stream_id) else {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
             ));
         };
+        let stream = &slot.metadata;
         if is_soft_deleted(stream) {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamGone,
                 format!("stream '{stream_id}' is gone"),
             ));
         }
-        let snapshot = self.visible_snapshots.get(stream_id).cloned();
+        let snapshot = slot.visible_snapshot.clone();
         let retained_offset = snapshot
             .as_ref()
             .map(|snapshot| snapshot.offset)
             .unwrap_or(0);
-        let updates = self
+        let updates = slot
             .message_records
-            .get(stream_id)
-            .map(|records| {
-                records
-                    .iter()
-                    .filter(|record| record.start_offset >= retained_offset)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            .iter()
+            .filter(|record| record.start_offset >= retained_offset)
+            .cloned()
+            .collect::<Vec<_>>();
         Ok(StreamBootstrapPlan {
             snapshot,
             updates,
@@ -1330,7 +1335,7 @@ impl StreamStateMachine {
                 "snapshot content type must not be empty",
             );
         }
-        let Some(stream) = self.streams.get(&stream_id) else {
+        let Some(stream) = self.stream_metadata(&stream_id) else {
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
@@ -1381,12 +1386,13 @@ impl StreamStateMachine {
             );
         }
 
-        self.visible_snapshots
-            .insert(stream_id.clone(), StreamVisibleSnapshot {
-                offset: snapshot_offset,
-                content_type,
-                payload,
-            });
+        self.stream_slot_mut(&stream_id)
+            .expect("stream existence checked before snapshot publish")
+            .visible_snapshot = Some(StreamVisibleSnapshot {
+            offset: snapshot_offset,
+            content_type,
+            payload,
+        });
         self.compact_retained_prefix(&stream_id, snapshot_offset);
         StreamResponse::SnapshotPublished { snapshot_offset }
     }
@@ -1407,12 +1413,13 @@ impl StreamStateMachine {
                 "cold chunk object size must be greater than zero",
             );
         }
-        let Some(stream) = self.streams.get(&stream_id) else {
+        let Some(slot) = self.stream_slot(&stream_id) else {
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
             );
         };
+        let stream = &slot.metadata;
         if is_soft_deleted(stream) {
             return StreamResponse::error(
                 StreamErrorCode::StreamGone,
@@ -1437,14 +1444,7 @@ impl StreamStateMachine {
                 vec![StreamErrorContext::StaleColdFlushCandidate],
             );
         }
-        let Some(hot_buffer) = self.hot_buffers.get(&stream_id) else {
-            return StreamResponse::error_with_next_offset_and_context(
-                StreamErrorCode::InvalidColdFlush,
-                format!("cold chunk for stream '{stream_id}' does not match hot payload"),
-                stream.tail_offset,
-                vec![StreamErrorContext::StaleColdFlushCandidate],
-            );
-        };
+        let hot_buffer = &slot.hot_buffer;
         if hot_buffer.hot_start_offset() != chunk.start_offset {
             return StreamResponse::error_with_next_offset_and_context(
                 StreamErrorCode::InvalidColdFlush,
@@ -1463,12 +1463,11 @@ impl StreamStateMachine {
                 vec![StreamErrorContext::StaleColdFlushCandidate],
             );
         }
-        self.hot_buffers
-            .get_mut(&stream_id)
-            .expect("hot buffer exists for stream metadata")
-            .flush_prefix(chunk.end_offset);
-        self.cold_index_mut()
-            .push_cold_chunk(stream_id.clone(), chunk.clone());
+        let slot = self
+            .stream_slot_mut(&stream_id)
+            .expect("stream existence checked before cold flush mutation");
+        slot.hot_buffer.flush_prefix(chunk.end_offset);
+        slot.cold.push_cold_chunk(chunk.clone());
         self.compact_message_records_before(
             &stream_id,
             self.earliest_retained_offset(&stream_id),
@@ -1500,7 +1499,7 @@ impl StreamStateMachine {
             );
         }
         if self
-            .streams
+            .stream_keys
             .keys()
             .any(|stream_id| stream_id.bucket_id == bucket_id)
         {
@@ -1547,14 +1546,14 @@ impl StreamStateMachine {
             );
         }
         if self
-            .streams
-            .get(&input.stream_id)
+            .stream_metadata(&input.stream_id)
             .is_some_and(|existing| stream_is_expired(existing, input.now_ms))
         {
             self.remove_stream_state(&input.stream_id);
         }
 
-        if let Some(existing) = self.streams.get(&input.stream_id) {
+        if let Some(existing_slot) = self.stream_slot(&input.stream_id) {
+            let existing = &existing_slot.metadata;
             if is_soft_deleted(existing) {
                 return StreamResponse::error(
                     StreamErrorCode::StreamAlreadyExistsConflict,
@@ -1570,7 +1569,7 @@ impl StreamStateMachine {
                 && existing.stream_expires_at_ms == input.stream_expires_at_ms
                 && existing.forked_from == input.forked_from
                 && existing.fork_offset == input.fork_offset
-                && self.stream_attrs.get(&input.stream_id) == attrs.as_ref()
+                && existing_slot.attrs.as_ref() == attrs.as_ref()
             {
                 return StreamResponse::AlreadyExists {
                     next_offset: existing.tail_offset,
@@ -1604,31 +1603,20 @@ impl StreamStateMachine {
             fork_offset: input.fork_offset,
             fork_ref_count: 0,
         };
-        self.streams.insert(input.stream_id.clone(), metadata);
-        if let Some(attrs) = attrs {
-            self.stream_attrs.insert(input.stream_id.clone(), attrs);
-        }
-        self.hot_buffers.insert(
-            input.stream_id.clone(),
-            HotBuffer::from_payload(0, input.initial_payload),
-        );
+        let hot_buffer = HotBuffer::from_payload(0, input.initial_payload);
         let mut integrity = StreamIntegrity::default();
         if initial_len > 0 {
-            let payload = self
-                .hot_buffers
-                .get(&input.stream_id)
-                .expect("hot buffer exists for stream metadata")
-                .payload();
+            let payload = hot_buffer.payload();
             integrity.append_payload(&input.stream_id, 0, initial_len, &payload);
         }
-        self.integrities.insert(input.stream_id.clone(), integrity);
-        if initial_len > 0 {
-            self.message_records
-                .insert(input.stream_id.clone(), vec![StreamMessageRecord {
-                    start_offset: 0,
-                    end_offset: initial_len,
-                }]);
-        }
+        let message_records = if initial_len > 0 {
+            vec![StreamMessageRecord {
+                start_offset: 0,
+                end_offset: initial_len,
+            }]
+        } else {
+            Vec::new()
+        };
         let mut producer_states = HashMap::new();
         if let Some(producer) = input.producer {
             let last_item = ProducerAppendRecord {
@@ -1645,8 +1633,26 @@ impl StreamStateMachine {
                 last_items: vec![last_item],
             });
         }
-        self.producers
-            .insert(input.stream_id.clone(), producer_states);
+        let stream_id = input.stream_id.clone();
+        let slot = StreamSlot {
+            metadata,
+            attrs,
+            hot_buffer,
+            cold: StreamColdState::default(),
+            message_records,
+            integrity,
+            visible_snapshot: None,
+            producers: producer_states,
+        };
+        if self.insert_stream_slot(slot).is_none() {
+            return StreamResponse::error(
+                StreamErrorCode::StreamAlreadyExistsConflict,
+                format!(
+                    "stream '{}' already exists with different metadata",
+                    stream_id
+                ),
+            );
+        }
         StreamResponse::Created {
             stream_id: input.stream_id,
             next_offset: initial_len,
@@ -1689,14 +1695,14 @@ impl StreamStateMachine {
             );
         }
         if self
-            .streams
-            .get(&input.stream_id)
+            .stream_metadata(&input.stream_id)
             .is_some_and(|existing| stream_is_expired(existing, input.now_ms))
         {
             self.remove_stream_state(&input.stream_id);
         }
 
-        if let Some(existing) = self.streams.get(&input.stream_id) {
+        if let Some(existing_slot) = self.stream_slot(&input.stream_id) {
+            let existing = &existing_slot.metadata;
             if is_soft_deleted(existing) {
                 return StreamResponse::error(
                     StreamErrorCode::StreamAlreadyExistsConflict,
@@ -1712,7 +1718,7 @@ impl StreamStateMachine {
                 && existing.stream_expires_at_ms == input.stream_expires_at_ms
                 && existing.forked_from == input.forked_from
                 && existing.fork_offset == input.fork_offset
-                && self.stream_attrs.get(&input.stream_id) == attrs.as_ref()
+                && existing_slot.attrs.as_ref() == attrs.as_ref()
             {
                 return StreamResponse::AlreadyExists {
                     next_offset: existing.tail_offset,
@@ -1746,20 +1752,14 @@ impl StreamStateMachine {
             fork_offset: input.fork_offset,
             fork_ref_count: 0,
         };
-        self.streams.insert(input.stream_id.clone(), metadata);
-        if let Some(attrs) = attrs {
-            self.stream_attrs.insert(input.stream_id.clone(), attrs);
-        }
-        self.hot_buffers
-            .insert(input.stream_id.clone(), HotBuffer::default());
         let object = ObjectPayloadRef {
             start_offset: 0,
             end_offset: initial_len,
             s3_path: input.initial_payload.s3_path,
             object_size: input.initial_payload.object_size,
         };
-        self.cold_index_mut()
-            .push_external_segment(input.stream_id.clone(), object.clone());
+        let mut cold = StreamColdState::default();
+        cold.push_external_segment(object.clone());
         let mut integrity = StreamIntegrity::default();
         if initial_len > 0 {
             integrity.append_external(
@@ -1770,12 +1770,10 @@ impl StreamStateMachine {
                 object.object_size,
             );
         }
-        self.integrities.insert(input.stream_id.clone(), integrity);
-        self.message_records
-            .insert(input.stream_id.clone(), vec![StreamMessageRecord {
-                start_offset: 0,
-                end_offset: initial_len,
-            }]);
+        let message_records = vec![StreamMessageRecord {
+            start_offset: 0,
+            end_offset: initial_len,
+        }];
         let mut producer_states = HashMap::new();
         if let Some(producer) = input.producer {
             let last_item = ProducerAppendRecord {
@@ -1792,8 +1790,26 @@ impl StreamStateMachine {
                 last_items: vec![last_item],
             });
         }
-        self.producers
-            .insert(input.stream_id.clone(), producer_states);
+        let stream_id = input.stream_id.clone();
+        let slot = StreamSlot {
+            metadata,
+            attrs,
+            hot_buffer: HotBuffer::default(),
+            cold,
+            message_records,
+            integrity,
+            visible_snapshot: None,
+            producers: producer_states,
+        };
+        if self.insert_stream_slot(slot).is_none() {
+            return StreamResponse::error(
+                StreamErrorCode::StreamAlreadyExistsConflict,
+                format!(
+                    "stream '{}' already exists with different metadata",
+                    stream_id
+                ),
+            );
+        }
         StreamResponse::Created {
             stream_id: input.stream_id,
             next_offset: initial_len,
@@ -1818,7 +1834,7 @@ impl StreamStateMachine {
             return response;
         }
 
-        let Some(_) = self.streams.get(&stream_id) else {
+        let Some(_) = self.stream_metadata(&stream_id) else {
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
@@ -1830,7 +1846,10 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             );
         }
-        if self.streams.get(&stream_id).is_some_and(is_soft_deleted) {
+        if self
+            .stream_metadata(&stream_id)
+            .is_some_and(is_soft_deleted)
+        {
             return StreamResponse::error(
                 StreamErrorCode::StreamGone,
                 format!("stream '{stream_id}' is gone"),
@@ -1864,7 +1883,7 @@ impl StreamStateMachine {
             };
         }
 
-        let Some(stream) = self.streams.get_mut(&stream_id) else {
+        let Some(stream) = self.stream_metadata_mut(&stream_id) else {
             unreachable!("stream existence checked before producer evaluation");
         };
 
@@ -1926,6 +1945,7 @@ impl StreamStateMachine {
         }
         let closed = stream.status == StreamStatus::Closed;
         let next_offset = stream.tail_offset;
+        self.refresh_ttl_entry(&stream_id);
         let producer_ack = producer.clone();
         if let Some(producer) = producer {
             self.record_producer_success(
@@ -1951,21 +1971,16 @@ impl StreamStateMachine {
                 producer: producer_ack,
             }
         } else {
-            self.hot_buffers
-                .get_mut(&stream_id)
-                .expect("hot buffer exists for stream metadata")
-                .push(offset, next_offset, payload);
-            self.integrities
-                .get_mut(&stream_id)
-                .expect("integrity exists for stream metadata")
+            let slot = self
+                .stream_slot_mut(&stream_id)
+                .expect("stream existence checked before append mutation");
+            slot.hot_buffer.push(offset, next_offset, payload);
+            slot.integrity
                 .append_payload(&stream_id, offset, next_offset, payload);
-            self.message_records
-                .entry(stream_id.clone())
-                .or_default()
-                .push(StreamMessageRecord {
-                    start_offset: offset,
-                    end_offset: next_offset,
-                });
+            slot.message_records.push(StreamMessageRecord {
+                start_offset: offset,
+                end_offset: next_offset,
+            });
             StreamResponse::Appended {
                 offset,
                 next_offset,
@@ -1995,7 +2010,7 @@ impl StreamStateMachine {
         if let Err(response) = validate_producer_request(producer.as_ref()) {
             return response;
         }
-        let Some(_) = self.streams.get(&stream_id) else {
+        let Some(_) = self.stream_metadata(&stream_id) else {
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
@@ -2007,7 +2022,10 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             );
         }
-        if self.streams.get(&stream_id).is_some_and(is_soft_deleted) {
+        if self
+            .stream_metadata(&stream_id)
+            .is_some_and(is_soft_deleted)
+        {
             return StreamResponse::error(
                 StreamErrorCode::StreamGone,
                 format!("stream '{stream_id}' is gone"),
@@ -2034,7 +2052,7 @@ impl StreamStateMachine {
             };
         }
 
-        let Some(stream) = self.streams.get(&stream_id) else {
+        let Some(stream) = self.stream_metadata(&stream_id) else {
             unreachable!("stream existence checked before producer evaluation");
         };
         if stream.status == StreamStatus::Closed {
@@ -2067,8 +2085,7 @@ impl StreamStateMachine {
         let offset = stream.tail_offset;
         let next_offset = offset.saturating_add(payload.payload_len);
         let stream = self
-            .streams
-            .get_mut(&stream_id)
+            .stream_metadata_mut(&stream_id)
             .expect("stream existence checked before external append mutation");
         stream.tail_offset = next_offset;
         if let Some(seq) = stream_seq {
@@ -2079,6 +2096,7 @@ impl StreamStateMachine {
             stream.status = StreamStatus::Closed;
         }
         let closed = stream.status == StreamStatus::Closed;
+        self.refresh_ttl_entry(&stream_id);
         let producer_ack = producer.clone();
         if let Some(producer) = producer {
             self.record_producer_success(
@@ -2102,25 +2120,21 @@ impl StreamStateMachine {
             s3_path: payload.s3_path,
             object_size: payload.object_size,
         };
-        self.cold_index_mut()
-            .push_external_segment(stream_id.clone(), object.clone());
-        self.integrities
-            .get_mut(&stream_id)
-            .expect("integrity exists for stream metadata")
-            .append_external(
-                &stream_id,
-                object.start_offset,
-                object.end_offset,
-                &object.s3_path,
-                object.object_size,
-            );
-        self.message_records
-            .entry(stream_id.clone())
-            .or_default()
-            .push(StreamMessageRecord {
-                start_offset: offset,
-                end_offset: next_offset,
-            });
+        let slot = self
+            .stream_slot_mut(&stream_id)
+            .expect("stream existence checked before external append mutation");
+        slot.cold.push_external_segment(object.clone());
+        slot.integrity.append_external(
+            &stream_id,
+            object.start_offset,
+            object.end_offset,
+            &object.s3_path,
+            object.object_size,
+        );
+        slot.message_records.push(StreamMessageRecord {
+            start_offset: offset,
+            end_offset: next_offset,
+        });
         StreamResponse::Appended {
             offset,
             next_offset,
@@ -2152,7 +2166,10 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             ));
         }
-        if self.streams.get(&stream_id).is_some_and(is_soft_deleted) {
+        if self
+            .stream_metadata(&stream_id)
+            .is_some_and(is_soft_deleted)
+        {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamGone,
                 format!("stream '{stream_id}' is gone"),
@@ -2174,7 +2191,7 @@ impl StreamStateMachine {
             });
         }
 
-        let Some(stream) = self.streams.get_mut(&stream_id) else {
+        let Some(stream) = self.stream_metadata_mut(&stream_id) else {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
@@ -2227,26 +2244,22 @@ impl StreamStateMachine {
             .expect("payloads checked non-empty before append")
             .clone();
         renew_stream_ttl(stream, now_ms);
+        self.refresh_ttl_entry(&stream_id);
         if let Some(producer) = producer {
             self.record_producer_success(stream_id.clone(), producer, last.clone(), items.clone());
         }
-        let hot_buffer = self
-            .hot_buffers
-            .get_mut(&stream_id)
-            .expect("hot buffer exists for stream metadata");
+        let slot = self
+            .stream_slot_mut(&stream_id)
+            .expect("stream existence checked before batch append mutation");
         for (item, payload) in items.iter().zip(payloads.iter()) {
-            hot_buffer.push(item.start_offset, item.next_offset, payload);
+            slot.hot_buffer
+                .push(item.start_offset, item.next_offset, payload);
         }
-        let integrity = self
-            .integrities
-            .get_mut(&stream_id)
-            .expect("integrity exists for stream metadata");
         for (item, payload) in items.iter().zip(payloads.iter()) {
-            integrity.append_payload(&stream_id, item.start_offset, item.next_offset, payload);
+            slot.integrity
+                .append_payload(&stream_id, item.start_offset, item.next_offset, payload);
         }
-        self.message_records
-            .entry(stream_id.clone())
-            .or_default()
+        slot.message_records
             .extend(items.iter().map(|item| StreamMessageRecord {
                 start_offset: item.start_offset,
                 end_offset: item.next_offset,
@@ -2287,7 +2300,7 @@ impl StreamStateMachine {
         if let Err(response) = self.validate_stream_scope(stream_id) {
             return response;
         }
-        let Some(stream) = self.streams.get_mut(stream_id) else {
+        let Some(stream) = self.stream_metadata_mut(stream_id) else {
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
@@ -2324,7 +2337,7 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             );
         }
-        let Some(stream) = self.streams.get_mut(stream_id) else {
+        let Some(stream) = self.stream_metadata_mut(stream_id) else {
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
@@ -2357,12 +2370,13 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             );
         }
-        let Some(stream) = self.streams.get(stream_id) else {
+        let Some(slot) = self.stream_slot(stream_id) else {
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
             );
         };
+        let stream = &slot.metadata;
         if is_soft_deleted(stream) {
             return StreamResponse::error(
                 StreamErrorCode::StreamGone,
@@ -2373,14 +2387,12 @@ impl StreamStateMachine {
         if let Err(response) = validate_stream_attrs(attrs.as_ref()) {
             return response;
         }
-        if self.stream_attrs.get(stream_id) == attrs.as_ref() {
+        if slot.attrs.as_ref() == attrs.as_ref() {
             return StreamResponse::AttrsUpdated { changed: false };
         }
-        if let Some(attrs) = attrs {
-            self.stream_attrs.insert(stream_id.clone(), attrs);
-        } else {
-            self.stream_attrs.remove(stream_id);
-        }
+        self.stream_slot_mut(stream_id)
+            .expect("stream existence checked before attrs mutation")
+            .attrs = attrs;
         StreamResponse::AttrsUpdated { changed: true }
     }
 
@@ -2388,7 +2400,7 @@ impl StreamStateMachine {
         if let Err(response) = self.validate_stream_scope(stream_id) {
             return response;
         }
-        let Some(stream) = self.streams.get_mut(stream_id) else {
+        let Some(stream) = self.stream_metadata_mut(stream_id) else {
             return StreamResponse::ForkRefReleased {
                 hard_deleted: false,
                 fork_ref_count: 0,
@@ -2427,7 +2439,7 @@ impl StreamStateMachine {
         if let Err(response) = self.validate_stream_scope(stream_id) {
             return response;
         }
-        let Some(stream) = self.streams.get(stream_id) else {
+        let Some(stream) = self.stream_metadata(stream_id) else {
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
@@ -2448,12 +2460,15 @@ impl StreamStateMachine {
         }
         let changed = if renew_ttl && stream.stream_ttl_seconds.is_some() {
             let stream = self
-                .streams
-                .get_mut(stream_id)
+                .stream_metadata_mut(stream_id)
                 .expect("stream existence checked before TTL renewal");
             let previous = stream.last_ttl_touch_at_ms;
             renew_stream_ttl(stream, now_ms);
-            stream.last_ttl_touch_at_ms != previous
+            let changed = stream.last_ttl_touch_at_ms != previous;
+            if changed {
+                self.refresh_ttl_entry(stream_id);
+            }
+            changed
         } else {
             false
         };
@@ -2465,8 +2480,7 @@ impl StreamStateMachine {
 
     fn expire_stream_if_due(&mut self, stream_id: &BucketStreamId, now_ms: u64) -> bool {
         if self
-            .streams
-            .get(stream_id)
+            .stream_metadata(stream_id)
             .is_some_and(|stream| stream_is_expired(stream, now_ms))
         {
             self.remove_stream_state(stream_id);
@@ -2479,47 +2493,42 @@ impl StreamStateMachine {
         if max_streams == 0 {
             return 0;
         }
-        let candidates = {
-            let mut candidates = Vec::with_capacity(max_streams);
-            for (stream_id, stream) in &self.streams {
-                if !stream_is_expired(stream, now_ms) {
-                    continue;
-                }
-                if candidates.len() < max_streams {
-                    candidates.push(stream_id);
-                    continue;
-                }
-                let mut largest_index = 0;
-                for index in 1..candidates.len() {
-                    if compare_stream_ids(candidates[largest_index], candidates[index]).is_lt() {
-                        largest_index = index;
-                    }
-                }
-                if compare_stream_ids(stream_id, candidates[largest_index]).is_lt() {
-                    candidates[largest_index] = stream_id;
-                }
-            }
-            candidates.sort_by(|left, right| compare_stream_ids(left, right));
-            candidates.into_iter().cloned().collect::<Vec<_>>()
-        };
         let mut removed = 0;
-        for stream_id in candidates {
-            if self.remove_stream_state(&stream_id) {
-                removed += 1;
+        while removed < max_streams {
+            let Some(Reverse(entry)) = self.ttl_index.entries.peek().cloned() else {
+                break;
+            };
+            if entry.expires_at_ms > now_ms {
+                break;
+            }
+            self.ttl_index.entries.pop();
+            let Some(current_key) = self.stream_key(&entry.stream_id) else {
+                continue;
+            };
+            if current_key != entry.key {
+                continue;
+            }
+            let Some(slot) = self.streams.get(entry.key) else {
+                continue;
+            };
+            if stream_expiry_at_ms(&slot.metadata) != Some(entry.expires_at_ms) {
+                continue;
+            }
+            if !stream_is_expired(&slot.metadata, now_ms) {
+                continue;
+            }
+            if self.remove_stream_state(&entry.stream_id) {
+                removed = removed.saturating_add(1);
             }
         }
         removed
     }
 
     fn remove_stream_state(&mut self, stream_id: &BucketStreamId) -> bool {
-        if self.streams.remove(stream_id).is_some() {
-            self.stream_attrs.remove(stream_id);
-            self.hot_buffers.remove(stream_id);
-            let had_cold = self.cold_index_mut().remove_stream(stream_id);
-            self.message_records.remove(stream_id);
-            self.integrities.remove(stream_id);
-            self.visible_snapshots.remove(stream_id);
-            self.producers.remove(stream_id);
+        if let Some(key) = self.stream_keys.remove(stream_id)
+            && let Some(slot) = self.streams.remove(key)
+        {
+            let had_cold = slot.cold.has_cold_objects();
             // The cold objects we wrote for this stream are now unreferenced.
             // Enqueue the whole prefix for the background GC worker to reclaim;
             // cold objects are stream-exclusive (forks copy, never share), so a
@@ -2585,8 +2594,8 @@ impl StreamStateMachine {
     }
 
     fn earliest_retained_offset(&self, stream_id: &BucketStreamId) -> u64 {
-        self.visible_snapshots
-            .get(stream_id)
+        self.stream_slot(stream_id)
+            .and_then(|slot| slot.visible_snapshot.as_ref())
             .map(|snapshot| snapshot.offset)
             .unwrap_or(0)
     }
@@ -2600,11 +2609,10 @@ impl StreamStateMachine {
         snapshot_offset == retained_offset
             || snapshot_offset <= self.cold_frontier_offset(stream_id, retained_offset)
             || self
-                .hot_buffers
-                .get(stream_id)
-                .is_some_and(|buffer| snapshot_offset <= buffer.hot_start_offset())
-            || self.message_records.get(stream_id).is_some_and(|records| {
-                records
+                .stream_slot(stream_id)
+                .is_some_and(|slot| snapshot_offset <= slot.hot_buffer.hot_start_offset())
+            || self.stream_slot(stream_id).is_some_and(|slot| {
+                slot.message_records
                     .iter()
                     .any(|record| record.end_offset == snapshot_offset)
             })
@@ -2612,25 +2620,24 @@ impl StreamStateMachine {
 
     fn compact_retained_prefix(&mut self, stream_id: &BucketStreamId, retained_offset: u64) {
         let frontier = self.cold_frontier_offset(stream_id, retained_offset).max(
-            self.hot_buffers
-                .get(stream_id)
-                .map(|buffer| buffer.hot_start_offset())
+            self.stream_slot(stream_id)
+                .map(|slot| slot.hot_buffer.hot_start_offset())
                 .unwrap_or(retained_offset),
         );
         self.compact_message_records_before(stream_id, retained_offset, frontier);
-        if let Some(integrity) = self.integrities.get_mut(stream_id) {
-            integrity.evict_before(retained_offset);
-        }
-        let dropped_cold_paths = self
-            .cold_index_mut()
-            .compact_before(stream_id, retained_offset);
+        let Some(slot) = self.stream_slot_mut(stream_id) else {
+            return;
+        };
+        slot.integrity.evict_before(retained_offset);
+        let dropped_cold_paths = slot.cold.compact_before(retained_offset);
         if !dropped_cold_paths.is_empty() {
             self.enqueue_cold_gc(ColdGcTarget::Paths(dropped_cold_paths));
         }
 
-        if let Some(hot_buffer) = self.hot_buffers.get_mut(stream_id) {
-            hot_buffer.discard_before(retained_offset);
-        }
+        self.stream_slot_mut(stream_id)
+            .expect("stream existence checked before hot compact")
+            .hot_buffer
+            .discard_before(retained_offset);
     }
 
     fn compact_message_records_before(
@@ -2639,9 +2646,10 @@ impl StreamStateMachine {
         retained_offset: u64,
         frontier: u64,
     ) {
-        let Some(records) = self.message_records.remove(stream_id) else {
+        let Some(slot) = self.stream_slot_mut(stream_id) else {
             return;
         };
+        let records = std::mem::take(&mut slot.message_records);
         let frontier = frontier.max(retained_offset);
         let mut compacted = Vec::with_capacity(records.len());
         if frontier > retained_offset {
@@ -2663,32 +2671,15 @@ impl StreamStateMachine {
         if compacted.is_empty() {
             return;
         }
-        self.message_records.insert(stream_id.clone(), compacted);
+        self.stream_slot_mut(stream_id)
+            .expect("stream existence checked before message record compact")
+            .message_records = compacted;
     }
 
     fn cold_frontier_offset(&self, stream_id: &BucketStreamId, retained_offset: u64) -> u64 {
-        self.cold_index()
-            .cold_frontier_offset(stream_id, retained_offset)
-    }
-
-    fn producer_snapshot(&self, stream_id: &BucketStreamId) -> Vec<ProducerSnapshot> {
-        let mut producer_states = self
-            .producers
-            .get(stream_id)
-            .into_iter()
-            .flat_map(|states| states.iter())
-            .map(|(producer_id, state)| ProducerSnapshot {
-                producer_id: producer_id.clone(),
-                producer_epoch: state.producer_epoch,
-                producer_seq: state.producer_seq,
-                last_start_offset: state.last_start_offset,
-                last_next_offset: state.last_next_offset,
-                last_closed: state.last_closed,
-                last_items: state.last_items.clone(),
-            })
-            .collect::<Vec<_>>();
-        producer_states.sort_by(|left, right| left.producer_id.cmp(&right.producer_id));
-        producer_states
+        self.stream_slot(stream_id)
+            .map(|slot| slot.cold.cold_frontier_offset(retained_offset))
+            .unwrap_or(retained_offset)
     }
 
     fn evaluate_producer(
@@ -2699,7 +2690,7 @@ impl StreamStateMachine {
         let Some(producer) = producer else {
             return Ok(ProducerDecision::Accept);
         };
-        let Some(states) = self.producers.get(stream_id) else {
+        let Some(states) = self.stream_slot(stream_id).map(|slot| &slot.producers) else {
             return Ok(ProducerDecision::Accept);
         };
         let Some(state) = states.get(&producer.producer_id) else {
@@ -2782,9 +2773,9 @@ impl StreamStateMachine {
         last: ProducerAppendRecord,
         last_items: Vec<ProducerAppendRecord>,
     ) {
-        self.producers
-            .entry(stream_id)
-            .or_default()
+        self.stream_slot_mut(&stream_id)
+            .expect("stream existence checked before producer mutation")
+            .producers
             .insert(producer.producer_id, ProducerState {
                 producer_epoch: producer.producer_epoch,
                 producer_seq: producer.producer_seq,
@@ -2794,6 +2785,23 @@ impl StreamStateMachine {
                 last_items,
             });
     }
+}
+
+fn producer_snapshot(states: &HashMap<String, ProducerState>) -> Vec<ProducerSnapshot> {
+    let mut producer_states = states
+        .iter()
+        .map(|(producer_id, state)| ProducerSnapshot {
+            producer_id: producer_id.clone(),
+            producer_epoch: state.producer_epoch,
+            producer_seq: state.producer_seq,
+            last_start_offset: state.last_start_offset,
+            last_next_offset: state.last_next_offset,
+            last_closed: state.last_closed,
+            last_items: state.last_items.clone(),
+        })
+        .collect::<Vec<_>>();
+    producer_states.sort_by(|left, right| left.producer_id.cmp(&right.producer_id));
+    producer_states
 }
 
 #[derive(Debug)]

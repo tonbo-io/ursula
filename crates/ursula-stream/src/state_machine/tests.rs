@@ -2168,6 +2168,107 @@ fn stream_ttl_uses_sliding_access_window() {
 }
 
 #[test]
+fn renewed_ttl_ignores_stale_expiry_index_entry() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    let stream_id = stream("ttl-renew-stale");
+
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateStream {
+            stream_id: stream_id.clone(),
+            content_type: "application/octet-stream".to_owned(),
+            initial_payload: b"hi".to_vec(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: Some(1),
+            stream_expires_at_ms: None,
+            forked_from: None,
+            fork_offset: None,
+            attrs: None,
+            now_ms: 1_000,
+        }),
+        StreamResponse::Created { .. }
+    ));
+    assert_eq!(
+        machine.apply(StreamCommand::TouchStreamAccess {
+            stream_id: stream_id.clone(),
+            now_ms: 1_500,
+            renew_ttl: true,
+        }),
+        StreamResponse::Accessed {
+            changed: true,
+            expired: false,
+        }
+    );
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateStream {
+            stream_id: stream("sweep-trigger"),
+            content_type: "application/octet-stream".to_owned(),
+            initial_payload: Vec::new(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            forked_from: None,
+            fork_offset: None,
+            attrs: None,
+            now_ms: 2_100,
+        }),
+        StreamResponse::Created { .. }
+    ));
+
+    assert!(machine.head(&stream_id).is_some());
+    assert!(machine.head_at(&stream_id, 2_500).is_none());
+}
+
+#[test]
+fn restore_rebuilds_ttl_index_from_stream_metadata() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    let stream_id = stream("ttl-restored");
+
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateStream {
+            stream_id: stream_id.clone(),
+            content_type: "application/octet-stream".to_owned(),
+            initial_payload: Vec::new(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: Some(2_000),
+            forked_from: None,
+            fork_offset: None,
+            attrs: None,
+            now_ms: 1_000,
+        }),
+        StreamResponse::Created { .. }
+    ));
+
+    let mut restored = StreamStateMachine::restore(machine.snapshot()).expect("restore");
+    assert!(matches!(
+        restored.apply(StreamCommand::CreateStream {
+            stream_id: stream("restore-sweep-trigger"),
+            content_type: "application/octet-stream".to_owned(),
+            initial_payload: Vec::new(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            forked_from: None,
+            fork_offset: None,
+            attrs: None,
+            now_ms: 2_100,
+        }),
+        StreamResponse::Created { .. }
+    ));
+    assert!(restored.head(&stream_id).is_none());
+}
+
+#[test]
 fn stream_expires_at_is_absolute_and_recreate_after_expiry() {
     let mut machine = StreamStateMachine::new();
     create_bucket(&mut machine);
