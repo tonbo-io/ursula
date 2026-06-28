@@ -637,7 +637,8 @@ impl StreamStateMachine {
             // cold objects are stream-exclusive (forks copy, never share), so a
             // prefix sweep is safe and keeps the queue O(streams) not O(chunks).
             if had_cold {
-                self.enqueue_cold_gc(ColdGcTarget::Stream(stream_id.clone()));
+                self.cold_gc
+                    .enqueue(ColdGcTarget::Stream(stream_id.clone()));
             }
             true
         } else {

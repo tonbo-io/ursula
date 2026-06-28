@@ -25,6 +25,7 @@ use slotmap::SlotMap;
 use slotmap::new_key_type;
 use ursula_shard::BucketStreamId;
 
+use self::cold_gc::ColdGcQueue;
 use self::cold_state::StreamColdState;
 use self::hot_buffer::HotBuffer;
 use self::ttl::TtlEntry;
@@ -70,6 +71,7 @@ use crate::validate::validate_stream_id;
 
 mod append;
 mod cold;
+mod cold_gc;
 mod cold_state;
 mod hot_buffer;
 mod lifecycle;
@@ -89,8 +91,7 @@ pub struct StreamStateMachine {
     stream_keys: HashMap<BucketStreamId, StreamKey>,
     streams: SlotMap<StreamKey, StreamSlot>,
     ttl_index: TtlIndex,
-    pending_cold_gc: VecDeque<ColdGcEntry>,
-    next_cold_gc_seq: u64,
+    cold_gc: ColdGcQueue,
 }
 
 #[derive(Debug, Clone)]
