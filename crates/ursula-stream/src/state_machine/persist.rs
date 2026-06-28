@@ -2,6 +2,7 @@
 
 use super::BucketStreamId;
 use super::ColdChunkRef;
+use super::ColdGcQueue;
 use super::HashMap;
 use super::HotBuffer;
 use super::HotPayloadSegment;
@@ -87,8 +88,8 @@ impl StreamStateMachine {
         StreamSnapshot {
             buckets,
             streams,
-            pending_cold_gc: self.pending_cold_gc.iter().cloned().collect(),
-            next_cold_gc_seq: self.next_cold_gc_seq,
+            pending_cold_gc: self.cold_gc.entries().cloned().collect(),
+            next_cold_gc_seq: self.cold_gc.next_seq(),
         }
     }
 
@@ -182,8 +183,8 @@ impl StreamStateMachine {
             }
         }
 
-        machine.pending_cold_gc = snapshot.pending_cold_gc.into_iter().collect();
-        machine.next_cold_gc_seq = snapshot.next_cold_gc_seq;
+        machine.cold_gc =
+            ColdGcQueue::from_parts(snapshot.pending_cold_gc, snapshot.next_cold_gc_seq);
 
         Ok(machine)
     }
