@@ -337,33 +337,19 @@ impl StreamStateMachine {
         }
     }
 
-    pub(super) fn enqueue_cold_gc(&mut self, target: ColdGcTarget) {
-        let seq = self.next_cold_gc_seq;
-        self.next_cold_gc_seq = self.next_cold_gc_seq.saturating_add(1);
-        self.pending_cold_gc.push_back(ColdGcEntry { seq, target });
-    }
-
     pub(super) fn ack_cold_gc(&mut self, up_to_seq: u64) -> StreamResponse {
-        let before = self.pending_cold_gc.len();
-        while self
-            .pending_cold_gc
-            .front()
-            .is_some_and(|entry| entry.seq <= up_to_seq)
-        {
-            self.pending_cold_gc.pop_front();
-        }
-        let removed = u64::try_from(before - self.pending_cold_gc.len()).expect("removed fits u64");
+        let removed = self.cold_gc.ack(up_to_seq);
         StreamResponse::ColdGcAcked { removed }
     }
 
     /// A bounded snapshot of the front of the GC queue for the leader's worker
     /// to reclaim. Read-only; draining is confirmed by a replicated `AckColdGc`.
     pub fn pending_cold_gc_batch(&self, max: usize) -> Vec<ColdGcEntry> {
-        self.pending_cold_gc.iter().take(max).cloned().collect()
+        self.cold_gc.batch(max)
     }
 
     pub fn pending_cold_gc_len(&self) -> usize {
-        self.pending_cold_gc.len()
+        self.cold_gc.len()
     }
 
     pub(super) fn earliest_retained_offset(&self, stream_id: &BucketStreamId) -> u64 {
@@ -408,7 +394,8 @@ impl StreamStateMachine {
         slot.integrity.evict_before(retained_offset);
         let dropped_cold_paths = slot.cold.compact_before(retained_offset);
         if !dropped_cold_paths.is_empty() {
-            self.enqueue_cold_gc(ColdGcTarget::Paths(dropped_cold_paths));
+            self.cold_gc
+                .enqueue(ColdGcTarget::Paths(dropped_cold_paths));
         }
 
         self.stream_slot_mut(stream_id)
