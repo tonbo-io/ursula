@@ -43,6 +43,8 @@ use crate::snapshot::StreamSnapshotError;
 use crate::validate::validate_bucket_id;
 use crate::validate::validate_stream_id;
 
+const TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE: usize = 256;
+
 #[derive(Debug, Clone, Default)]
 pub struct StreamStateMachine {
     buckets: HashSet<String>,
@@ -427,20 +429,24 @@ impl StreamStateMachine {
                 fork_offset,
                 attrs,
                 now_ms,
-            } => self.create_stream(CreateStreamInput {
-                stream_id,
-                content_type,
-                initial_payload,
-                close_after,
-                stream_seq,
-                producer,
-                stream_ttl_seconds,
-                stream_expires_at_ms,
-                forked_from,
-                fork_offset,
-                attrs,
-                now_ms,
-            }),
+            } => {
+                let response = self.create_stream(CreateStreamInput {
+                    stream_id,
+                    content_type,
+                    initial_payload,
+                    close_after,
+                    stream_seq,
+                    producer,
+                    stream_ttl_seconds,
+                    stream_expires_at_ms,
+                    forked_from,
+                    fork_offset,
+                    attrs,
+                    now_ms,
+                });
+                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
+                response
+            }
             StreamCommand::CreateExternal {
                 stream_id,
                 content_type,
@@ -454,20 +460,24 @@ impl StreamStateMachine {
                 fork_offset,
                 attrs,
                 now_ms,
-            } => self.create_external_stream(CreateExternalStreamInput {
-                stream_id,
-                content_type,
-                initial_payload,
-                close_after,
-                stream_seq,
-                producer,
-                stream_ttl_seconds,
-                stream_expires_at_ms,
-                forked_from,
-                fork_offset,
-                attrs,
-                now_ms,
-            }),
+            } => {
+                let response = self.create_external_stream(CreateExternalStreamInput {
+                    stream_id,
+                    content_type,
+                    initial_payload,
+                    close_after,
+                    stream_seq,
+                    producer,
+                    stream_ttl_seconds,
+                    stream_expires_at_ms,
+                    forked_from,
+                    fork_offset,
+                    attrs,
+                    now_ms,
+                });
+                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
+                response
+            }
             StreamCommand::Append {
                 stream_id,
                 content_type,
@@ -476,15 +486,19 @@ impl StreamStateMachine {
                 stream_seq,
                 producer,
                 now_ms,
-            } => self.append_borrowed(AppendStreamInput {
-                stream_id,
-                content_type: content_type.as_deref(),
-                payload: &payload,
-                close_after,
-                stream_seq,
-                producer,
-                now_ms,
-            }),
+            } => {
+                let response = self.append_borrowed(AppendStreamInput {
+                    stream_id,
+                    content_type: content_type.as_deref(),
+                    payload: &payload,
+                    close_after,
+                    stream_seq,
+                    producer,
+                    now_ms,
+                });
+                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
+                response
+            }
             StreamCommand::AppendExternal {
                 stream_id,
                 content_type,
@@ -493,65 +507,93 @@ impl StreamStateMachine {
                 stream_seq,
                 producer,
                 now_ms,
-            } => self.append_external(AppendExternalInput {
-                stream_id,
-                content_type: content_type.as_deref(),
-                payload,
-                close_after,
-                stream_seq,
-                producer,
-                now_ms,
-            }),
+            } => {
+                let response = self.append_external(AppendExternalInput {
+                    stream_id,
+                    content_type: content_type.as_deref(),
+                    payload,
+                    close_after,
+                    stream_seq,
+                    producer,
+                    now_ms,
+                });
+                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
+                response
+            }
             StreamCommand::AppendBatch {
                 stream_id,
                 content_type,
                 payloads,
                 producer,
                 now_ms,
-            } => match self.append_batch_borrowed(
-                stream_id,
-                content_type.as_deref(),
-                &payloads.iter().map(Vec::as_slice).collect::<Vec<_>>(),
-                producer,
-                now_ms,
-            ) {
-                Ok(batch) => batch
-                    .items
-                    .last()
-                    .map(|item| StreamResponse::Appended {
-                        offset: item.offset,
-                        next_offset: item.next_offset,
-                        closed: item.closed,
-                        deduplicated: item.deduplicated,
-                        producer: None,
-                    })
-                    .unwrap_or_else(|| {
-                        StreamResponse::error(
-                            StreamErrorCode::EmptyAppend,
-                            "append batch must contain at least one payload",
-                        )
-                    }),
-                Err(response) => response,
-            },
+            } => {
+                let response = match self.append_batch_borrowed(
+                    stream_id,
+                    content_type.as_deref(),
+                    &payloads.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                    producer,
+                    now_ms,
+                ) {
+                    Ok(batch) => batch
+                        .items
+                        .last()
+                        .map(|item| StreamResponse::Appended {
+                            offset: item.offset,
+                            next_offset: item.next_offset,
+                            closed: item.closed,
+                            deduplicated: item.deduplicated,
+                            producer: None,
+                        })
+                        .unwrap_or_else(|| {
+                            StreamResponse::error(
+                                StreamErrorCode::EmptyAppend,
+                                "append batch must contain at least one payload",
+                            )
+                        }),
+                    Err(response) => response,
+                };
+                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
+                response
+            }
             StreamCommand::PublishSnapshot {
                 stream_id,
                 snapshot_offset,
                 content_type,
                 payload,
                 now_ms,
-            } => self.publish_snapshot(stream_id, snapshot_offset, content_type, payload, now_ms),
+            } => {
+                let response = self.publish_snapshot(
+                    stream_id,
+                    snapshot_offset,
+                    content_type,
+                    payload,
+                    now_ms,
+                );
+                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
+                response
+            }
             StreamCommand::TouchStreamAccess {
                 stream_id,
                 now_ms,
                 renew_ttl,
-            } => self.touch_stream_access(&stream_id, now_ms, renew_ttl),
+            } => {
+                let response = self.touch_stream_access(&stream_id, now_ms, renew_ttl);
+                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
+                response
+            }
             StreamCommand::UpdateStreamAttrs {
                 stream_id,
                 attrs,
                 now_ms,
-            } => self.update_stream_attrs(&stream_id, attrs, now_ms),
+            } => {
+                let response = self.update_stream_attrs(&stream_id, attrs, now_ms);
+                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
+                response
+            }
             StreamCommand::AddForkRef { stream_id, now_ms } => {
-                self.add_fork_ref(&stream_id, now_ms)
+                let response = self.add_fork_ref(&stream_id, now_ms);
+                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
+                response
             }
             StreamCommand::ReleaseForkRef { stream_id } => self.release_fork_ref(&stream_id),
             StreamCommand::FlushCold { stream_id, chunk } => self.flush_cold(stream_id, chunk),
@@ -560,7 +602,11 @@ impl StreamStateMachine {
                 stream_seq,
                 producer,
                 now_ms,
-            } => self.close(stream_id, stream_seq, producer, now_ms),
+            } => {
+                let response = self.close(stream_id, stream_seq, producer, now_ms);
+                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
+                response
+            }
             StreamCommand::DeleteStream { stream_id } => self.delete_stream(&stream_id),
             StreamCommand::AckColdGc { up_to_seq } => self.ack_cold_gc(up_to_seq),
         }
@@ -2427,6 +2473,42 @@ impl StreamStateMachine {
             return true;
         }
         false
+    }
+
+    fn sweep_expired_streams(&mut self, now_ms: u64, max_streams: usize) -> usize {
+        if max_streams == 0 {
+            return 0;
+        }
+        let candidates = {
+            let mut candidates = Vec::with_capacity(max_streams);
+            for (stream_id, stream) in &self.streams {
+                if !stream_is_expired(stream, now_ms) {
+                    continue;
+                }
+                if candidates.len() < max_streams {
+                    candidates.push(stream_id);
+                    continue;
+                }
+                let mut largest_index = 0;
+                for index in 1..candidates.len() {
+                    if compare_stream_ids(candidates[largest_index], candidates[index]).is_lt() {
+                        largest_index = index;
+                    }
+                }
+                if compare_stream_ids(stream_id, candidates[largest_index]).is_lt() {
+                    candidates[largest_index] = stream_id;
+                }
+            }
+            candidates.sort_by(|left, right| compare_stream_ids(left, right));
+            candidates.into_iter().cloned().collect::<Vec<_>>()
+        };
+        let mut removed = 0;
+        for stream_id in candidates {
+            if self.remove_stream_state(&stream_id) {
+                removed += 1;
+            }
+        }
+        removed
     }
 
     fn remove_stream_state(&mut self, stream_id: &BucketStreamId) -> bool {
