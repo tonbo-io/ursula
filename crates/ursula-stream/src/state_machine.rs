@@ -21,13 +21,13 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 
 use slotmap::Key;
-use slotmap::SlotMap;
 use slotmap::new_key_type;
 use ursula_shard::BucketStreamId;
 
 use self::cold_gc::ColdGcQueue;
 use self::cold_state::StreamColdState;
 use self::hot_buffer::HotBuffer;
+use self::registry::StreamRegistry;
 use self::ttl::TtlEntry;
 use self::ttl::TtlIndex;
 use crate::command::StreamCommand;
@@ -77,6 +77,7 @@ mod hot_buffer;
 mod lifecycle;
 mod persist;
 mod query;
+mod registry;
 mod ttl;
 
 const TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE: usize = 256;
@@ -88,9 +89,7 @@ new_key_type! {
 #[derive(Debug, Clone, Default)]
 pub struct StreamStateMachine {
     buckets: HashSet<String>,
-    stream_keys: HashMap<BucketStreamId, StreamKey>,
-    streams: SlotMap<StreamKey, StreamSlot>,
-    ttl_index: TtlIndex,
+    registry: StreamRegistry,
     cold_gc: ColdGcQueue,
 }
 
@@ -111,58 +110,28 @@ impl StreamStateMachine {
         Self::default()
     }
 
-    fn stream_key(&self, stream_id: &BucketStreamId) -> Option<StreamKey> {
-        self.stream_keys.get(stream_id).copied()
-    }
-
     fn stream_slot(&self, stream_id: &BucketStreamId) -> Option<&StreamSlot> {
-        let key = self.stream_key(stream_id)?;
-        self.streams.get(key)
+        self.registry.slot(stream_id)
     }
 
     fn stream_slot_mut(&mut self, stream_id: &BucketStreamId) -> Option<&mut StreamSlot> {
-        let key = self.stream_key(stream_id)?;
-        self.streams.get_mut(key)
+        self.registry.slot_mut(stream_id)
     }
 
     fn stream_metadata(&self, stream_id: &BucketStreamId) -> Option<&StreamMetadata> {
-        self.stream_slot(stream_id).map(|slot| &slot.metadata)
+        self.registry.metadata(stream_id)
     }
 
     fn stream_metadata_mut(&mut self, stream_id: &BucketStreamId) -> Option<&mut StreamMetadata> {
-        self.stream_slot_mut(stream_id)
-            .map(|slot| &mut slot.metadata)
+        self.registry.metadata_mut(stream_id)
     }
 
     fn insert_stream_slot(&mut self, slot: StreamSlot) -> Option<StreamKey> {
-        let stream_id = slot.metadata.stream_id.clone();
-        if self.stream_keys.contains_key(&stream_id) {
-            return None;
-        }
-        let key = self.streams.insert(slot);
-        self.stream_keys.insert(stream_id.clone(), key);
-        self.push_ttl_entry(&stream_id, key);
-        Some(key)
-    }
-
-    fn push_ttl_entry(&mut self, stream_id: &BucketStreamId, key: StreamKey) {
-        let Some(slot) = self.streams.get(key) else {
-            return;
-        };
-        let Some(expires_at_ms) = stream_expiry_at_ms(&slot.metadata) else {
-            return;
-        };
-        self.ttl_index.entries.push(Reverse(TtlEntry {
-            expires_at_ms,
-            stream_id: stream_id.clone(),
-            key,
-        }));
+        self.registry.insert(slot)
     }
 
     fn refresh_ttl_entry(&mut self, stream_id: &BucketStreamId) {
-        if let Some(key) = self.stream_key(stream_id) {
-            self.push_ttl_entry(stream_id, key);
-        }
+        self.registry.refresh_ttl(stream_id);
     }
 
     pub fn apply(&mut self, command: StreamCommand) -> StreamResponse {
