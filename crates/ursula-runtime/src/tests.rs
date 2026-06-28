@@ -3774,11 +3774,11 @@ async fn wal_group_engine_batches_append_records_and_recovers() {
     }
 
     let log_path = group_log_path(&wal_root, placement);
-    let line_count = std::fs::read_to_string(&log_path)
-        .expect("read WAL log")
-        .lines()
-        .count();
-    assert_eq!(line_count, 2);
+    let wal_bytes = std::fs::read(&log_path).expect("read WAL log");
+    let (wal_records, _) =
+        crate::journal::decode_frames::<crate::journal::JsonCodec<serde_json::Value>>(&wal_bytes)
+            .expect("decode WAL frames");
+    assert_eq!(wal_records.len(), 2);
 
     let recovered =
         ShardRuntime::spawn_with_engine_factory(config, WalGroupEngineFactory::new(&wal_root))
@@ -4067,11 +4067,11 @@ async fn wal_group_engine_recovers_producer_append_batch_dedup_state() {
     }
 
     let log_path = group_log_path(&wal_root, placement);
-    let line_count = std::fs::read_to_string(&log_path)
-        .expect("read WAL log")
-        .lines()
-        .count();
-    assert_eq!(line_count, 2);
+    let wal_bytes = std::fs::read(&log_path).expect("read WAL log");
+    let (wal_records, _) =
+        crate::journal::decode_frames::<crate::journal::JsonCodec<serde_json::Value>>(&wal_bytes)
+            .expect("decode WAL frames");
+    assert_eq!(wal_records.len(), 2);
 
     let recovered =
         ShardRuntime::spawn_with_engine_factory(config, WalGroupEngineFactory::new(&wal_root))
