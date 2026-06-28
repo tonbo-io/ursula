@@ -14,6 +14,7 @@ autobenches = false
 serde = { workspace = true }
 serde_json = { workspace = true }
 setsum = { workspace = true }
+slotmap = { workspace = true }
 ursula-shard = { workspace = true }
 ursula-proto = { workspace = true }
 
