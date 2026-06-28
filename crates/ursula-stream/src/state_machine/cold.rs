@@ -73,7 +73,7 @@ impl StreamStateMachine {
         if max_flush_bytes == 0 {
             return Ok(None);
         }
-        let mut stream_ids = self.stream_keys.keys().cloned().collect::<Vec<_>>();
+        let mut stream_ids = self.registry.stream_ids().cloned().collect::<Vec<_>>();
         stream_ids.sort_by(compare_stream_ids);
         for stream_id in &stream_ids {
             let start = start_fn(stream_id);
@@ -126,8 +126,8 @@ impl StreamStateMachine {
                     .unwrap_or_else(|| self.hot_start_offset(stream_id))
             };
             let group_hot_bytes: u64 = self
-                .stream_keys
-                .keys()
+                .registry
+                .stream_ids()
                 .map(|stream_id| {
                     let start = start_for(stream_id);
                     self.stream_slot(stream_id)

@@ -51,8 +51,8 @@ impl StreamStateMachine {
         buckets.sort();
 
         let mut streams = self
-            .streams
-            .values()
+            .registry
+            .slots()
             .map(|slot| {
                 let metadata = slot.metadata.clone();
                 let stream_id = metadata.stream_id.clone();
@@ -158,7 +158,7 @@ impl StreamStateMachine {
                     stream_id: stream_id.clone(),
                 }
             })?;
-            if machine.stream_keys.contains_key(&stream_id) {
+            if machine.registry.contains_key(&stream_id) {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
             }
             let producer_states = restore_producer_states(&stream_id, entry.producer_states)?;
