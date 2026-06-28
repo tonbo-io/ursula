@@ -1,11 +1,7 @@
 use std::fmt::Debug;
 use std::fs;
-use std::fs::File;
-use std::fs::OpenOptions;
 use std::io;
-use std::io::Cursor;
-use std::io::Read;
-use std::io::Write;
+use std::marker::PhantomData;
 use std::ops::RangeBounds;
 use std::path::Path;
 use std::path::PathBuf;
@@ -24,6 +20,7 @@ use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use prost::Message;
 use ursula_runtime::GroupEngineMetrics;
+use ursula_runtime::journal;
 use ursula_shard::ShardPlacement;
 
 use super::CoreJournalRecord;
@@ -62,11 +59,8 @@ pub(crate) struct RaftGroupFileLogStoreMetrics {
     metrics: GroupEngineMetrics,
 }
 
-#[derive(Debug)]
-pub(crate) struct RaftGroupFileLogHandle {
-    file: Option<File>,
-    parent_needs_sync: bool,
-}
+/// Raft log writes frame protobuf records into the shared append-only journal.
+type RaftGroupFileLogHandle = journal::JournalWriter;
 
 #[derive(Debug)]
 pub(crate) struct CoreFileLogWriter {
@@ -138,10 +132,7 @@ impl RaftGroupFileLogStore {
         Ok(Self {
             path,
             inner: Mutex::new(inner),
-            file: Mutex::new(RaftGroupFileLogHandle {
-                file: None,
-                parent_needs_sync,
-            }),
+            file: Mutex::new(RaftGroupFileLogHandle::new(parent_needs_sync)),
             metrics,
             core_writer,
         })
@@ -264,10 +255,7 @@ pub(crate) fn run_core_file_log_writer(
     journal_path: PathBuf,
     rx: mpsc::Receiver<CoreFileLogWrite>,
 ) {
-    let mut journal_handle = RaftGroupFileLogHandle {
-        parent_needs_sync: !journal_path.exists(),
-        file: None,
-    };
+    let mut journal_handle = RaftGroupFileLogHandle::new(!journal_path.exists());
 
     while let Ok(first) = rx.recv() {
         let mut batch = vec![first];
@@ -556,15 +544,25 @@ pub(crate) fn load_log_store_inner_from_core_journal(
     Ok(inner)
 }
 
+/// Frames Raft log records as length-delimited protobuf for the shared journal.
+struct ProtobufCodec<M>(PhantomData<M>);
+
+impl<M: Message + Default> journal::FrameCodec for ProtobufCodec<M> {
+    type Record = M;
+
+    fn encode(record: &M) -> Vec<u8> {
+        record.encode_to_vec()
+    }
+
+    fn decode(payload: &[u8]) -> Result<M, io::Error> {
+        M::decode(payload).map_err(invalid_data)
+    }
+}
+
 pub(crate) fn read_protobuf_frames_from_file<M: Message + Default>(
     path: &Path,
 ) -> Result<Vec<M>, io::Error> {
-    let bytes = fs::read(path)?;
-    let (records, valid_len) = read_protobuf_frames_with_valid_len::<M>(&bytes)?;
-    if valid_len < bytes.len() {
-        truncate_file_to_len(path, valid_len)?;
-    }
-    Ok(records)
+    journal::replay::<ProtobufCodec<M>>(path)
 }
 
 pub(crate) fn append_log_store_record(
@@ -581,96 +579,26 @@ pub(crate) fn append_log_store_record(
     Ok((write_ns, elapsed_ns(sync_started_at)))
 }
 
-pub(crate) fn write_protobuf_frame_to_file<M: Message>(
+pub(crate) fn write_protobuf_frame_to_file<M: Message + Default>(
     path: &Path,
     handle: &mut RaftGroupFileLogHandle,
     value: &M,
 ) -> Result<(), io::Error> {
-    if handle.file.is_none() {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        handle.file = Some(OpenOptions::new().create(true).append(true).open(path)?);
-    }
-    let file = handle
-        .file
-        .as_mut()
-        .expect("file handle is opened before write");
-    let bytes = value.encode_to_vec();
-    let len = u32::try_from(bytes.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "OpenRaft journal record too large",
-        )
-    })?;
-    file.write_all(&len.to_le_bytes())?;
-    file.write_all(&bytes)
+    handle.append::<ProtobufCodec<M>>(path, value)
 }
 
 #[cfg(test)]
 pub(crate) fn read_protobuf_frames<M: Message + Default>(
     bytes: &[u8],
 ) -> Result<Vec<M>, io::Error> {
-    read_protobuf_frames_with_valid_len(bytes).map(|(records, _)| records)
-}
-
-pub(crate) fn read_protobuf_frames_with_valid_len<M: Message + Default>(
-    bytes: &[u8],
-) -> Result<(Vec<M>, usize), io::Error> {
-    if bytes.is_empty() {
-        return Ok((Vec::new(), 0));
-    }
-
-    let mut cursor = Cursor::new(bytes);
-    let mut records = Vec::new();
-    while usize::try_from(cursor.position()).expect("cursor position fits usize") < bytes.len() {
-        let frame_start = usize::try_from(cursor.position()).expect("cursor position fits usize");
-        if bytes.len() - frame_start < 4 {
-            return Ok((records, frame_start));
-        }
-
-        let mut len_bytes = [0_u8; 4];
-        cursor.read_exact(&mut len_bytes)?;
-        let len = usize::try_from(u32::from_le_bytes(len_bytes)).expect("u32 fits usize");
-        let start = usize::try_from(cursor.position()).expect("cursor position fits usize");
-        let end = start.checked_add(len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "OpenRaft journal frame length overflow",
-            )
-        })?;
-        if end > bytes.len() {
-            return Ok((records, frame_start));
-        }
-        records.push(M::decode(&bytes[start..end]).map_err(invalid_data)?);
-        cursor.set_position(u64::try_from(end).expect("frame end fits u64"));
-    }
-    Ok((records, bytes.len()))
-}
-
-pub(crate) fn truncate_file_to_len(path: &Path, valid_len: usize) -> Result<(), io::Error> {
-    let file = OpenOptions::new().write(true).open(path)?;
-    file.set_len(u64::try_from(valid_len).expect("valid protobuf frame offset fits u64"))?;
-    file.sync_data()
+    journal::decode_frames::<ProtobufCodec<M>>(bytes).map(|(records, _)| records)
 }
 
 pub(crate) fn sync_file_handle(
     path: &Path,
     handle: &mut RaftGroupFileLogHandle,
 ) -> Result<(), io::Error> {
-    let file = handle
-        .file
-        .as_mut()
-        .expect("file handle is opened before sync");
-    file.sync_data()?;
-    if handle.parent_needs_sync
-        && let Some(parent) = path.parent()
-        && let Ok(parent_dir) = File::open(parent)
-    {
-        parent_dir.sync_all()?;
-        handle.parent_needs_sync = false;
-    }
-    Ok(())
+    handle.sync(path)
 }
 
 pub(crate) fn raft_group_log_record_count(record: &RaftGroupLogRecord) -> usize {
@@ -751,6 +679,8 @@ pub(crate) fn apply_log_store_record(
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
 
@@ -790,10 +720,7 @@ mod tests {
     fn load_log_store_inner_truncates_torn_tail() {
         let path = temp_journal_path("group-log-torn-tail");
         let vote = committed_vote();
-        let mut handle = RaftGroupFileLogHandle {
-            file: None,
-            parent_needs_sync: true,
-        };
+        let mut handle = RaftGroupFileLogHandle::new(true);
         append_log_store_record(&path, &mut handle, &save_vote_record(vote))
             .expect("write complete vote record");
         drop(handle);
@@ -828,10 +755,7 @@ mod tests {
             raft_group_id: RaftGroupId(3),
         };
         let vote = committed_vote();
-        let mut handle = RaftGroupFileLogHandle {
-            file: None,
-            parent_needs_sync: true,
-        };
+        let mut handle = RaftGroupFileLogHandle::new(true);
         write_protobuf_frame_to_file(&path, &mut handle, &CoreJournalRecord {
             group_id: placement.raft_group_id.0,
             record: Some(save_vote_record(vote)),

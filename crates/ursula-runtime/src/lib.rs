@@ -26,6 +26,7 @@ mod engine;
 
 mod error;
 mod group_actor;
+pub mod journal;
 mod metrics;
 mod request;
 mod rt;
