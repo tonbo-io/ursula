@@ -1,9 +1,3 @@
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::fs::{self};
-use std::io::BufRead;
-use std::io::BufReader;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -11,7 +5,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
-use ursula_stream::StreamCommand;
 use ursula_stream::StreamErrorCode;
 use ursula_stream::StreamSnapshot;
 
@@ -47,6 +40,7 @@ use super::in_memory::InMemoryGroupEngine;
 use crate::cold_store::ColdStoreHandle;
 use crate::command::GroupSnapshot;
 use crate::command::GroupWriteCommand;
+use crate::journal;
 use crate::metrics::elapsed_ns;
 use crate::request::AppendBatchRequest;
 use crate::request::AppendRequest;
@@ -175,45 +169,37 @@ impl WalGroupEngine {
     }
 
     fn append_records(&self, commands: &[GroupWriteCommand]) -> Result<(), GroupEngineError> {
-        if commands.is_empty() {
+        let records = commands
+            .iter()
+            .map(|command| WalRecord::Command {
+                command: Box::new(command.clone()),
+            })
+            .collect::<Vec<_>>();
+        self.append_wal_records(&records)
+    }
+
+    /// Frame each record into the WAL, `fsync` once, and meter the batch.
+    fn append_wal_records(&self, records: &[WalRecord]) -> Result<(), GroupEngineError> {
+        if records.is_empty() {
             return Ok(());
         }
-        let Some(parent) = self.log_path.parent() else {
-            return Err(GroupEngineError::new(format!(
-                "WAL path '{}' has no parent directory",
-                self.log_path.display()
-            )));
-        };
-        fs::create_dir_all(parent).map_err(|err| {
-            GroupEngineError::new(format!("create WAL dir '{}': {err}", parent.display()))
-        })?;
+        let mut writer = journal::JournalWriter::new(!self.log_path.exists());
         let write_started_at = Instant::now();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)
-            .map_err(|err| {
-                GroupEngineError::new(format!("open WAL '{}': {err}", self.log_path.display()))
-            })?;
-        for command in commands {
-            let record = WalRecord::Command {
-                command: Box::new(command.clone()),
-            };
-            serde_json::to_writer(&mut file, &record).map_err(|err| {
-                GroupEngineError::new(format!("encode WAL '{}': {err}", self.log_path.display()))
-            })?;
-            file.write_all(b"\n").map_err(|err| {
-                GroupEngineError::new(format!("write WAL '{}': {err}", self.log_path.display()))
-            })?;
+        for record in records {
+            writer
+                .append::<journal::JsonCodec<WalRecord>>(&self.log_path, record)
+                .map_err(|err| {
+                    GroupEngineError::new(format!("write WAL '{}': {err}", self.log_path.display()))
+                })?;
         }
         let write_ns = elapsed_ns(write_started_at);
         let sync_started_at = Instant::now();
-        file.sync_data().map_err(|err| {
+        writer.sync(&self.log_path).map_err(|err| {
             GroupEngineError::new(format!("sync WAL '{}': {err}", self.log_path.display()))
         })?;
         self.metrics.record_wal_batch(
             self.placement,
-            commands.len(),
+            records.len(),
             write_ns,
             elapsed_ns(sync_started_at),
         );
@@ -226,37 +212,7 @@ impl WalGroupEngine {
             stream_snapshot: snapshot.stream_snapshot.clone(),
             stream_append_counts: snapshot.stream_append_counts.clone(),
         };
-        let Some(parent) = self.log_path.parent() else {
-            return Err(GroupEngineError::new(format!(
-                "WAL path '{}' has no parent directory",
-                self.log_path.display()
-            )));
-        };
-        fs::create_dir_all(parent).map_err(|err| {
-            GroupEngineError::new(format!("create WAL dir '{}': {err}", parent.display()))
-        })?;
-        let write_started_at = Instant::now();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)
-            .map_err(|err| {
-                GroupEngineError::new(format!("open WAL '{}': {err}", self.log_path.display()))
-            })?;
-        serde_json::to_writer(&mut file, &record).map_err(|err| {
-            GroupEngineError::new(format!("encode WAL '{}': {err}", self.log_path.display()))
-        })?;
-        file.write_all(b"\n").map_err(|err| {
-            GroupEngineError::new(format!("write WAL '{}': {err}", self.log_path.display()))
-        })?;
-        let write_ns = elapsed_ns(write_started_at);
-        let sync_started_at = Instant::now();
-        file.sync_data().map_err(|err| {
-            GroupEngineError::new(format!("sync WAL '{}': {err}", self.log_path.display()))
-        })?;
-        self.metrics
-            .record_wal_batch(self.placement, 1, write_ns, elapsed_ns(sync_started_at));
-        Ok(())
+        self.append_wal_records(std::slice::from_ref(&record))
     }
 
     fn commit_access_if_needed(
@@ -798,42 +754,29 @@ pub(crate) fn group_log_path(root: &Path, placement: ShardPlacement) -> PathBuf 
 }
 
 fn replay_group_log(log_path: &Path) -> Result<InMemoryGroupEngine, GroupEngineError> {
-    if !log_path.exists() {
-        return Ok(InMemoryGroupEngine::default());
-    }
-
-    let file = File::open(log_path).map_err(|err| {
-        GroupEngineError::new(format!("open WAL '{}': {err}", log_path.display()))
+    let records = journal::replay::<journal::JsonCodec<WalRecord>>(log_path).map_err(|err| {
+        GroupEngineError::new(format!("read WAL '{}': {err}", log_path.display()))
     })?;
-    let reader = BufReader::new(file);
     let mut inner = InMemoryGroupEngine::default();
-    for (line_index, line) in reader.lines().enumerate() {
-        let line = line.map_err(|err| {
-            GroupEngineError::new(format!(
-                "read WAL '{}' line {}: {err}",
-                log_path.display(),
-                line_index + 1
-            ))
-        })?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(record) = serde_json::from_str::<WalRecord>(&line) {
-            match record {
-                WalRecord::Command { command } => inner
+    for (index, record) in records.into_iter().enumerate() {
+        match record {
+            WalRecord::Command { command } => {
+                inner
                     .apply_replayed_write_command(*command)
                     .map_err(|err| {
                         GroupEngineError::new(format!(
-                            "replay WAL command '{}' line {}: {err}",
+                            "replay WAL command '{}' record {}: {err}",
                             log_path.display(),
-                            line_index + 1
+                            index + 1
                         ))
-                    })?,
-                WalRecord::Snapshot {
-                    group_commit_index,
-                    stream_snapshot,
-                    stream_append_counts,
-                } => inner
+                    })?;
+            }
+            WalRecord::Snapshot {
+                group_commit_index,
+                stream_snapshot,
+                stream_append_counts,
+            } => {
+                inner
                     .install_snapshot_parts(
                         group_commit_index,
                         stream_snapshot,
@@ -841,29 +784,13 @@ fn replay_group_log(log_path: &Path) -> Result<InMemoryGroupEngine, GroupEngineE
                     )
                     .map_err(|err| {
                         GroupEngineError::new(format!(
-                            "replay WAL snapshot '{}' line {}: {err}",
+                            "replay WAL snapshot '{}' record {}: {err}",
                             log_path.display(),
-                            line_index + 1
+                            index + 1
                         ))
-                    })?,
+                    })?;
             }
-            continue;
         }
-
-        let command = serde_json::from_str::<StreamCommand>(&line).map_err(|err| {
-            GroupEngineError::new(format!(
-                "decode WAL '{}' line {}: {err}",
-                log_path.display(),
-                line_index + 1
-            ))
-        })?;
-        inner.apply_replayed_command(command).map_err(|err| {
-            GroupEngineError::new(format!(
-                "replay WAL '{}' line {}: {err}",
-                log_path.display(),
-                line_index + 1
-            ))
-        })?;
     }
     Ok(inner)
 }
