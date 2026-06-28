@@ -12,7 +12,6 @@ use super::ObjectPayloadRef;
 use super::ProducerAppendRecord;
 use super::ProducerRequest;
 use super::ProducerState;
-use super::Reverse;
 use super::StreamAttrs;
 use super::StreamColdState;
 use super::StreamErrorCode;
@@ -27,7 +26,6 @@ use super::StreamStatus;
 use super::is_soft_deleted;
 use super::normalize_stream_attrs;
 use super::renew_stream_ttl;
-use super::stream_expiry_at_ms;
 use super::stream_is_expired;
 use super::validate_bucket_id;
 use super::validate_external_payload_ref;
@@ -56,8 +54,8 @@ impl StreamStateMachine {
             );
         }
         if self
-            .stream_keys
-            .keys()
+            .registry
+            .stream_ids()
             .any(|stream_id| stream_id.bucket_id == bucket_id)
         {
             return StreamResponse::error(
@@ -598,29 +596,10 @@ impl StreamStateMachine {
         }
         let mut removed = 0;
         while removed < max_streams {
-            let Some(Reverse(entry)) = self.ttl_index.entries.peek().cloned() else {
+            let Some(stream_id) = self.registry.pop_expired(now_ms) else {
                 break;
             };
-            if entry.expires_at_ms > now_ms {
-                break;
-            }
-            self.ttl_index.entries.pop();
-            let Some(current_key) = self.stream_key(&entry.stream_id) else {
-                continue;
-            };
-            if current_key != entry.key {
-                continue;
-            }
-            let Some(slot) = self.streams.get(entry.key) else {
-                continue;
-            };
-            if stream_expiry_at_ms(&slot.metadata) != Some(entry.expires_at_ms) {
-                continue;
-            }
-            if !stream_is_expired(&slot.metadata, now_ms) {
-                continue;
-            }
-            if self.remove_stream_state(&entry.stream_id) {
+            if self.remove_stream_state(&stream_id) {
                 removed = removed.saturating_add(1);
             }
         }
@@ -628,22 +607,18 @@ impl StreamStateMachine {
     }
 
     pub(super) fn remove_stream_state(&mut self, stream_id: &BucketStreamId) -> bool {
-        if let Some(key) = self.stream_keys.remove(stream_id)
-            && let Some(slot) = self.streams.remove(key)
-        {
-            let had_cold = slot.cold.has_cold_objects();
-            // The cold objects we wrote for this stream are now unreferenced.
-            // Enqueue the whole prefix for the background GC worker to reclaim;
-            // cold objects are stream-exclusive (forks copy, never share), so a
-            // prefix sweep is safe and keeps the queue O(streams) not O(chunks).
-            if had_cold {
-                self.cold_gc
-                    .enqueue(ColdGcTarget::Stream(stream_id.clone()));
-            }
-            true
-        } else {
-            false
+        let Some(slot) = self.registry.remove(stream_id) else {
+            return false;
+        };
+        // The cold objects we wrote for this stream are now unreferenced.
+        // Enqueue the whole prefix for the background GC worker to reclaim;
+        // cold objects are stream-exclusive (forks copy, never share), so a
+        // prefix sweep is safe and keeps the queue O(streams) not O(chunks).
+        if slot.cold.has_cold_objects() {
+            self.cold_gc
+                .enqueue(ColdGcTarget::Stream(stream_id.clone()));
         }
+        true
     }
 
     pub(super) fn validate_stream_scope(

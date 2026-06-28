@@ -107,8 +107,8 @@ impl StreamStateMachine {
     }
 
     pub fn total_hot_payload_bytes(&self) -> u64 {
-        self.streams
-            .values()
+        self.registry
+            .slots()
             .map(|slot| u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64"))
             .sum()
     }
