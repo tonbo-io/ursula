@@ -852,6 +852,65 @@ fn expired_stream_with_cold_chunks_enqueues_cold_gc() {
 }
 
 #[test]
+fn writes_sweep_expired_streams_in_bounded_deterministic_batches() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    create_stream(&mut machine, "active");
+
+    let expired_count = TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE + 6;
+    for index in 0..expired_count {
+        let id = format!("old-{index:04}");
+        assert!(matches!(
+            machine.apply(StreamCommand::CreateStream {
+                stream_id: stream(&id),
+                content_type: "application/octet-stream".to_owned(),
+                initial_payload: Vec::new(),
+                close_after: false,
+                stream_seq: None,
+                producer: None,
+                stream_ttl_seconds: None,
+                stream_expires_at_ms: Some(1_000),
+                forked_from: None,
+                fork_offset: None,
+                attrs: None,
+                now_ms: 0,
+            }),
+            StreamResponse::Created { .. }
+        ));
+    }
+    assert_eq!(machine.snapshot().streams.len(), expired_count + 1);
+
+    assert!(matches!(
+        machine.apply(StreamCommand::Append {
+            stream_id: stream("active"),
+            content_type: Some("application/octet-stream".to_owned()),
+            payload: b"x".to_vec(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            now_ms: 2_000,
+        }),
+        StreamResponse::Appended { .. }
+    ));
+
+    let snapshot = machine.snapshot();
+    let stream_ids = snapshot
+        .streams
+        .iter()
+        .map(|entry| entry.metadata.stream_id.stream_id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(stream_ids.len(), 7);
+    assert!(stream_ids.contains(&"active"));
+    assert!(!stream_ids.contains(&"old-0000"));
+    let last_swept = format!("old-{:04}", TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE - 1);
+    let first_retained = format!("old-{:04}", TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
+    let last_retained = format!("old-{:04}", expired_count - 1);
+    assert!(!stream_ids.contains(&last_swept.as_str()));
+    assert!(stream_ids.contains(&first_retained.as_str()));
+    assert!(stream_ids.contains(&last_retained.as_str()));
+}
+
+#[test]
 fn stream_without_cold_chunks_enqueues_nothing_on_delete() {
     let mut machine = StreamStateMachine::new();
     create_bucket(&mut machine);
