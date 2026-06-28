@@ -4,6 +4,7 @@ use proptest::collection::vec;
 use proptest::prelude::*;
 use serde_json::json;
 
+use super::persist::message_records_cover_retained_suffix;
 use super::*;
 use crate::integrity::StreamIntegritySnapshot;
 
