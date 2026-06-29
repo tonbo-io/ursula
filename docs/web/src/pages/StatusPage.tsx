@@ -38,6 +38,10 @@ type HealthHistoryPoint = {
   reasons?: string[];
 };
 
+type HealthHistoryCell = HealthHistoryPoint & {
+  bucket_start_time: string | null;
+};
+
 type TopologyReplica = {
   node_id?: number | null;
   node_name?: string | null;
@@ -374,14 +378,23 @@ function statusWorse(a: string | null | undefined, b: string | null | undefined)
 function bucketHistory(
   history: HealthHistoryPoint[],
   bucketMs: number,
-  bucketCount: number,
+  maxBucketCount: number,
   nowMs: number,
-): HealthHistoryPoint[] {
-  const cells: Array<HealthHistoryPoint & { sampleCount: number }> = [];
-  for (let i = bucketCount - 1; i >= 0; i--) {
-    const end = nowMs - i * bucketMs;
-    const start = end - bucketMs;
+  startedAtMs?: number,
+): HealthHistoryCell[] {
+  const historyStartMs = Number.isFinite(startedAtMs)
+    ? Math.max(startedAtMs ?? nowMs, nowMs - maxBucketCount * bucketMs)
+    : nowMs - maxBucketCount * bucketMs;
+  const bucketCount = Math.max(
+    1,
+    Math.min(maxBucketCount, Math.ceil(Math.max(1, nowMs - historyStartMs) / bucketMs)),
+  );
+  const cells: Array<HealthHistoryCell & { sampleCount: number }> = [];
+  for (let i = 0; i < bucketCount; i++) {
+    const start = historyStartMs + i * bucketMs;
+    const end = Math.min(start + bucketMs, nowMs);
     cells.push({
+      bucket_start_time: new Date(start).toISOString(),
       time: new Date(end).toISOString(),
       status: "unknown",
       sampleCount: 0,
@@ -1016,9 +1029,10 @@ function StatusPage() {
   const displayedOverall = stale ? "major_outage" : status?.overall ?? "unknown";
   const HEALTH_BUCKET_MS = 60 * 60 * 1000;
   const HEALTH_BUCKET_COUNT = 7 * 24;
+  const startedAtMs = status?.started_at ? new Date(status.started_at).getTime() : NaN;
   const healthHistory = useMemo(
-    () => bucketHistory(status?.history ?? [], HEALTH_BUCKET_MS, HEALTH_BUCKET_COUNT, now),
-    [status, now],
+    () => bucketHistory(status?.history ?? [], HEALTH_BUCKET_MS, HEALTH_BUCKET_COUNT, now, startedAtMs),
+    [status, now, startedAtMs],
   );
   const rateSamples = useMemo(() => {
     const samples = appendRateSamples(status?.history ?? []);
@@ -1073,8 +1087,10 @@ function StatusPage() {
   const updatedRelative = formatRelative(status?.updated_at);
   void now;
 
-  const startedAtMs = status?.started_at ? new Date(status.started_at).getTime() : NaN;
   const runtime = Number.isFinite(startedAtMs) ? formatRunningFor(Math.max(0, now - startedAtMs)) : null;
+  const healthAxisStart = Number.isFinite(startedAtMs) && now - startedAtMs < HEALTH_BUCKET_COUNT * HEALTH_BUCKET_MS
+    ? "started"
+    : "7d ago";
 
   const chaosActive = Boolean(status?.chaos.enabled && status?.chaos.active_fault);
   const heroPillLabel =
@@ -1248,7 +1264,7 @@ function StatusPage() {
               <div className="history-grid status-history-grid">
                 {healthHistory.map((point, index) => {
                   const end = point.time ? new Date(point.time) : null;
-                  const start = end ? new Date(end.getTime() - HEALTH_BUCKET_MS) : null;
+                  const start = point.bucket_start_time ? new Date(point.bucket_start_time) : null;
                   const bucketLabel =
                     start && end
                       ? `${start.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}–${end.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`
@@ -1263,7 +1279,7 @@ function StatusPage() {
                 })}
               </div>
               <div className="status-history-axis">
-                <span>7d ago</span>
+                <span>{healthAxisStart}</span>
                 <span>now</span>
               </div>
             </>
