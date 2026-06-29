@@ -380,19 +380,12 @@ function bucketHistory(
   bucketMs: number,
   maxBucketCount: number,
   nowMs: number,
-  startedAtMs?: number,
 ): HealthHistoryCell[] {
-  const historyStartMs = Number.isFinite(startedAtMs)
-    ? Math.max(startedAtMs ?? nowMs, nowMs - maxBucketCount * bucketMs)
-    : nowMs - maxBucketCount * bucketMs;
-  const bucketCount = Math.max(
-    1,
-    Math.min(maxBucketCount, Math.ceil(Math.max(1, nowMs - historyStartMs) / bucketMs)),
-  );
+  const currentBucketStart = Math.floor(nowMs / bucketMs) * bucketMs;
   const cells: Array<HealthHistoryCell & { sampleCount: number }> = [];
-  for (let i = 0; i < bucketCount; i++) {
-    const start = historyStartMs + i * bucketMs;
-    const end = Math.min(start + bucketMs, nowMs);
+  for (let i = maxBucketCount - 1; i >= 0; i--) {
+    const start = currentBucketStart - i * bucketMs;
+    const end = i === 0 ? nowMs : start + bucketMs;
     cells.push({
       bucket_start_time: new Date(start).toISOString(),
       time: new Date(end).toISOString(),
@@ -401,8 +394,12 @@ function bucketHistory(
     });
     const bucket = cells[cells.length - 1];
     for (const point of history) {
-      const ts = point.time ? new Date(point.time).getTime() : NaN;
-      if (Number.isNaN(ts) || ts < start || ts >= end) continue;
+      const tsText = point.time ?? "";
+      const ts = tsText ? new Date(tsText).getTime() : NaN;
+      if (Number.isNaN(ts)) continue;
+      const isHourlySummary = /^\d{4}-\d{2}-\d{2}T\d{2}:00:00Z$/.test(tsText);
+      const belongsToBucket = isHourlySummary ? ts > start && ts <= end : ts >= start && ts < end;
+      if (!belongsToBucket) continue;
       if (bucket.sampleCount === 0) {
         bucket.status = point.status;
         bucket.reasons = point.reasons;
@@ -1031,8 +1028,8 @@ function StatusPage() {
   const HEALTH_BUCKET_COUNT = 7 * 24;
   const startedAtMs = status?.started_at ? new Date(status.started_at).getTime() : NaN;
   const healthHistory = useMemo(
-    () => bucketHistory(status?.history ?? [], HEALTH_BUCKET_MS, HEALTH_BUCKET_COUNT, now, startedAtMs),
-    [status, now, startedAtMs],
+    () => bucketHistory(status?.history ?? [], HEALTH_BUCKET_MS, HEALTH_BUCKET_COUNT, now),
+    [status, now],
   );
   const rateSamples = useMemo(() => {
     const samples = appendRateSamples(status?.history ?? []);
@@ -1088,9 +1085,6 @@ function StatusPage() {
   void now;
 
   const runtime = Number.isFinite(startedAtMs) ? formatRunningFor(Math.max(0, now - startedAtMs)) : null;
-  const healthAxisStart = Number.isFinite(startedAtMs) && now - startedAtMs < HEALTH_BUCKET_COUNT * HEALTH_BUCKET_MS
-    ? "started"
-    : "7d ago";
 
   const chaosActive = Boolean(status?.chaos.enabled && status?.chaos.active_fault);
   const heroPillLabel =
@@ -1279,7 +1273,7 @@ function StatusPage() {
                 })}
               </div>
               <div className="status-history-axis">
-                <span>{healthAxisStart}</span>
+                <span>7d ago</span>
                 <span>now</span>
               </div>
             </>
