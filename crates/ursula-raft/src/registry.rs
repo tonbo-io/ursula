@@ -34,7 +34,6 @@ use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
 use openraft::type_config::alias::SnapshotOf as TypeConfigSnapshotOf;
 use ursula_runtime::GroupEngineError;
-use ursula_runtime::GroupSnapshot;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::SnapshotLocation;
 use ursula_runtime::SnapshotPointer;
@@ -43,7 +42,9 @@ use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 
 use crate::meta::MetaRaftTypeConfig;
+use crate::snapshot_codec::decode_group_snapshot;
 use crate::state_machine::RaftGroupStateMachine;
+use crate::state_machine::SnapshotBuildCoordinator;
 use crate::state_machine::SnapshotInstallCoordinator;
 use crate::types::RaftGroupMetricsSnapshot;
 use crate::types::RaftLogProgressSnapshot;
@@ -839,6 +840,7 @@ pub struct RaftGroupHandleRegistry {
     dynamic_hosted_groups: Arc<Mutex<BTreeSet<RaftGroupId>>>,
     leadership_shed: LeadershipShedFlag,
     snapshot_store: Arc<Mutex<SharedSnapshotStore>>,
+    snapshot_build: Arc<Mutex<SnapshotBuildCoordinator>>,
     snapshot_install: SnapshotInstallCoordinator,
 }
 
@@ -849,6 +851,7 @@ impl Default for RaftGroupHandleRegistry {
             dynamic_hosted_groups: Arc::new(Mutex::new(BTreeSet::new())),
             leadership_shed: Arc::new(AtomicU8::new(0)),
             snapshot_store: Arc::new(Mutex::new(default_snapshot_store())),
+            snapshot_build: Arc::new(Mutex::new(SnapshotBuildCoordinator::new(1))),
             snapshot_install: SnapshotInstallCoordinator::new(1),
         }
     }
@@ -929,6 +932,14 @@ impl RaftGroupHandleRegistry {
         self
     }
 
+    pub fn set_snapshot_build_max_concurrency(&self, max_concurrency: usize) {
+        *self
+            .snapshot_build
+            .lock()
+            .expect("raft group snapshot build coordinator mutex") =
+            SnapshotBuildCoordinator::new(max_concurrency);
+    }
+
     pub fn set_snapshot_store(&self, snapshot_store: Option<SharedSnapshotStore>) {
         *self
             .snapshot_store
@@ -946,6 +957,13 @@ impl RaftGroupHandleRegistry {
 
     pub fn snapshot_install_coordinator(&self) -> SnapshotInstallCoordinator {
         self.snapshot_install.clone()
+    }
+
+    pub fn snapshot_build_coordinator(&self) -> SnapshotBuildCoordinator {
+        self.snapshot_build
+            .lock()
+            .expect("raft group snapshot build coordinator mutex")
+            .clone()
     }
 
     pub fn leadership_shed_flag(&self) -> LeadershipShedFlag {
@@ -1076,7 +1094,7 @@ impl RaftGroupHandleRegistry {
                 "prefetch OpenRaft snapshot {snapshot_id} before install: {err}"
             ))
         })?;
-        serde_json::from_slice::<GroupSnapshot>(&snapshot_bytes).map_err(|err| {
+        decode_group_snapshot(&snapshot_bytes).map_err(|err| {
             GroupEngineError::new(format!(
                 "decode prefetched OpenRaft snapshot {snapshot_id}: {err}"
             ))
@@ -1165,6 +1183,8 @@ pub(crate) fn log_progress_snapshot(
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use ursula_runtime::GroupSnapshot;
     use ursula_runtime::SnapshotStore;
     use ursula_runtime::SnapshotStoreError;
     use ursula_runtime::SnapshotStoreFuture;
@@ -1180,9 +1200,13 @@ mod tests {
         fn upload<'a>(
             &'a self,
             _key: ursula_runtime::SnapshotKey,
-            bytes: Vec<u8>,
+            bytes: Bytes,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-            Box::pin(async move { Ok(SnapshotLocation::Inline { bytes }) })
+            Box::pin(async move {
+                Ok(SnapshotLocation::Inline {
+                    bytes: bytes.to_vec(),
+                })
+            })
         }
 
         fn download<'a>(
@@ -1209,20 +1233,21 @@ mod tests {
     }
 
     fn group_snapshot_bytes() -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "placement": {
-                "core_id": 0,
-                "shard_id": 0,
-                "raft_group_id": 7,
+        crate::snapshot_codec::group_snapshot_frames(GroupSnapshot {
+            placement: ShardPlacement {
+                core_id: ursula_shard::CoreId(0),
+                shard_id: ursula_shard::ShardId(0),
+                raft_group_id: ursula_shard::RaftGroupId(7),
             },
-            "group_commit_index": 0,
-            "stream_snapshot": {
-                "buckets": [],
-                "streams": [],
-            },
-            "stream_append_counts": [],
-        }))
-        .expect("serialize test group snapshot")
+            group_commit_index: 0,
+            stream_snapshot: Default::default(),
+            stream_append_counts: Vec::new(),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .expect("encode test group snapshot")
+        .into_iter()
+        .flat_map(|chunk| chunk.to_vec())
+        .collect()
     }
 
     fn external_snapshot(snapshot_id: &str) -> TypeConfigSnapshotOf<UrsulaRaftTypeConfig> {
@@ -1260,7 +1285,7 @@ mod tests {
             .snapshot_install_coordinator()
             .take_prefetched(&pointer)
             .expect("external snapshot is cached for install");
-        serde_json::from_slice::<GroupSnapshot>(&bytes).unwrap();
+        decode_group_snapshot(&bytes).unwrap();
     }
 
     #[tokio::test]
@@ -1290,6 +1315,7 @@ mod tests {
             None,
             None,
             Arc::new(StaticSnapshotStore { bytes: None }),
+            SnapshotBuildCoordinator::default(),
             coordinator,
         );
         state_machine

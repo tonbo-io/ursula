@@ -3,6 +3,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/types.proto",
         "proto/errors.proto",
         "proto/durable.proto",
+        "proto/snapshot.proto",
     ];
     for proto in protos {
         println!("cargo:rerun-if-changed={proto}");
@@ -12,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     prost_build::Config::new()
+        .boxed(".ursula.durable.v1.SnapshotFrameV1.frame.stream")
         .type_attribute("ProducerRequestV1", "#[derive(Eq)]")
         .type_attribute(
             "ProducerRequestV1",

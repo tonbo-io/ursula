@@ -154,6 +154,7 @@ pub use snapshot_store::LocalSnapshotStore;
 #[cfg(not(madsim))]
 pub use snapshot_store::S3SnapshotStore;
 pub use snapshot_store::SharedSnapshotStore;
+pub use snapshot_store::SnapshotBytesIterator;
 pub use snapshot_store::SnapshotCompression;
 pub use snapshot_store::SnapshotKey;
 pub use snapshot_store::SnapshotLocation;

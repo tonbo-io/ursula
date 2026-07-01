@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use bytes::Bytes;
 use crossbeam_utils::CachePadded;
 use serde::Deserialize;
 use serde::Serialize;
@@ -185,6 +186,7 @@ impl SnapshotStoreError {
 
 pub type SnapshotStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, SnapshotStoreError>> + Send + 'a>>;
+pub type SnapshotBytesIterator = Box<dyn Iterator<Item = Result<Bytes, SnapshotStoreError>> + Send>;
 
 pub trait SnapshotStore: Send + Sync + Debug {
     /// Persist a snapshot blob and return its location. Stores own naming and
@@ -192,8 +194,23 @@ pub trait SnapshotStore: Send + Sync + Debug {
     fn upload<'a>(
         &'a self,
         key: SnapshotKey,
-        bytes: Vec<u8>,
+        bytes: Bytes,
     ) -> SnapshotStoreFuture<'a, SnapshotLocation>;
+
+    /// Persist snapshot bytes from an incremental producer.
+    fn upload_iter<'a>(
+        &'a self,
+        key: SnapshotKey,
+        chunks: SnapshotBytesIterator,
+    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+        Box::pin(async move {
+            let mut bytes = Vec::new();
+            for chunk in chunks {
+                bytes.extend_from_slice(chunk?.as_ref());
+            }
+            self.upload(key, Bytes::from(bytes)).await
+        })
+    }
 
     /// Retrieve a snapshot blob given its location.
     fn download<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, Vec<u8>>;
@@ -255,9 +272,27 @@ impl SnapshotStore for InlineSnapshotStore {
     fn upload<'a>(
         &'a self,
         _key: SnapshotKey,
-        bytes: Vec<u8>,
+        bytes: Bytes,
     ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-        Box::pin(async move { Ok(SnapshotLocation::Inline { bytes }) })
+        Box::pin(async move {
+            Ok(SnapshotLocation::Inline {
+                bytes: bytes.to_vec(),
+            })
+        })
+    }
+
+    fn upload_iter<'a>(
+        &'a self,
+        _key: SnapshotKey,
+        chunks: SnapshotBytesIterator,
+    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+        Box::pin(async move {
+            let mut bytes = Vec::new();
+            for chunk in chunks {
+                bytes.extend_from_slice(chunk?.as_ref());
+            }
+            Ok(SnapshotLocation::Inline { bytes })
+        })
     }
 
     fn download<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, Vec<u8>> {
@@ -278,9 +313,11 @@ impl SnapshotStore for InlineSnapshotStore {
 
 #[cfg(not(madsim))]
 mod s3 {
+    use bytes::Bytes;
     use opendal::Operator;
     use opendal::Scheme;
 
+    use super::SnapshotBytesIterator;
     use super::SnapshotCompression;
     use super::SnapshotKey;
     use super::SnapshotLocation;
@@ -413,7 +450,7 @@ mod s3 {
         fn upload<'a>(
             &'a self,
             key: SnapshotKey,
-            bytes: Vec<u8>,
+            bytes: Bytes,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
             Box::pin(async move {
                 let object_key = self.object_key(&key);
@@ -432,6 +469,44 @@ mod s3 {
                     size_bytes,
                     stored_size_bytes: Some(stored_size_bytes),
                     compression: SnapshotCompression::Zstd,
+                })
+            })
+        }
+
+        fn upload_iter<'a>(
+            &'a self,
+            key: SnapshotKey,
+            chunks: SnapshotBytesIterator,
+        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+            Box::pin(async move {
+                let object_key = self.object_key(&key);
+                let mut size_bytes = 0u64;
+                let mut writer = self
+                    .operator
+                    .writer(&object_key)
+                    .await
+                    .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
+                for chunk in chunks {
+                    let chunk = chunk?;
+                    size_bytes = size_bytes.checked_add(chunk.len() as u64).ok_or_else(|| {
+                        SnapshotStoreError::Integrity(format!(
+                            "s3 snapshot {object_key} size overflows u64"
+                        ))
+                    })?;
+                    writer
+                        .write(chunk)
+                        .await
+                        .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
+                }
+                writer
+                    .close()
+                    .await
+                    .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
+                Ok(SnapshotLocation::S3 {
+                    key: object_key,
+                    size_bytes,
+                    stored_size_bytes: Some(size_bytes),
+                    compression: SnapshotCompression::None,
                 })
             })
         }
@@ -619,6 +694,10 @@ mod local {
     use std::io;
     use std::path::PathBuf;
 
+    use bytes::Bytes;
+    use tokio::io::AsyncWriteExt;
+
+    use super::SnapshotBytesIterator;
     use super::SnapshotKey;
     use super::SnapshotLocation;
     use super::SnapshotStore;
@@ -648,7 +727,7 @@ mod local {
         fn upload<'a>(
             &'a self,
             key: SnapshotKey,
-            bytes: Vec<u8>,
+            bytes: Bytes,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
             Box::pin(async move {
                 let path = self.path_for(key);
@@ -656,7 +735,34 @@ mod local {
                     tokio::fs::create_dir_all(parent).await?;
                 }
                 let size_bytes = bytes.len() as u64;
-                tokio::fs::write(&path, &bytes).await?;
+                tokio::fs::write(&path, bytes.as_ref()).await?;
+                Ok(SnapshotLocation::Local { path, size_bytes })
+            })
+        }
+
+        fn upload_iter<'a>(
+            &'a self,
+            key: SnapshotKey,
+            chunks: SnapshotBytesIterator,
+        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+            Box::pin(async move {
+                let path = self.path_for(key);
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                let mut size_bytes = 0u64;
+                let mut file = tokio::fs::File::create(&path).await?;
+                for chunk in chunks {
+                    let chunk = chunk?;
+                    size_bytes = size_bytes.checked_add(chunk.len() as u64).ok_or_else(|| {
+                        SnapshotStoreError::Integrity(format!(
+                            "local snapshot at {} size overflows u64",
+                            path.display()
+                        ))
+                    })?;
+                    file.write_all(chunk.as_ref()).await?;
+                }
+                file.sync_all().await?;
                 Ok(SnapshotLocation::Local { path, size_bytes })
             })
         }
@@ -749,7 +855,10 @@ mod tests {
     async fn inline_roundtrip() {
         let store = InlineSnapshotStore;
         let key = test_key(0, "group-0-T1-N1-100");
-        let loc = store.upload(key, b"hello world".to_vec()).await.unwrap();
+        let loc = store
+            .upload(key, b"hello world".to_vec().into())
+            .await
+            .unwrap();
         assert!(matches!(loc, SnapshotLocation::Inline { .. }));
         let bytes = store.download(&loc).await.unwrap();
         assert_eq!(bytes, b"hello world");
@@ -808,7 +917,7 @@ mod tests {
         let store = LocalSnapshotStore::new(dir.path());
         let key = test_key(7, "group-7-T2-N1-500");
         let loc = store
-            .upload(key, b"some snapshot bytes".to_vec())
+            .upload(key, b"some snapshot bytes".to_vec().into())
             .await
             .unwrap();
         let bytes = store.download(&loc).await.unwrap();
@@ -827,8 +936,8 @@ mod tests {
         let store = LocalSnapshotStore::new(dir.path());
         let key1 = test_key(4, "group-4-T18-N3-264150");
         let key2 = test_key(4, "group-4-T18-N3-264150");
-        let loc1 = store.upload(key1, b"body1".to_vec()).await.unwrap();
-        let loc2 = store.upload(key2, b"body2".to_vec()).await.unwrap();
+        let loc1 = store.upload(key1, b"body1".to_vec().into()).await.unwrap();
+        let loc2 = store.upload(key2, b"body2".to_vec().into()).await.unwrap();
         let (path1, path2) = match (&loc1, &loc2) {
             (
                 SnapshotLocation::Local { path: path1, .. },
@@ -850,15 +959,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalSnapshotStore::new(dir.path());
         let loc1 = store
-            .upload(test_key(7, "group-7-T1-N1-1"), b"one".to_vec())
+            .upload(test_key(7, "group-7-T1-N1-1"), b"one".to_vec().into())
             .await
             .unwrap();
         let loc2 = store
-            .upload(test_key(7, "group-7-T1-N1-2"), b"two".to_vec())
+            .upload(test_key(7, "group-7-T1-N1-2"), b"two".to_vec().into())
             .await
             .unwrap();
         let loc3 = store
-            .upload(test_key(7, "group-7-T1-N1-3"), b"three".to_vec())
+            .upload(test_key(7, "group-7-T1-N1-3"), b"three".to_vec().into())
             .await
             .unwrap();
 
@@ -875,7 +984,7 @@ mod tests {
         let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
         let key = test_key(3, "group-3-T5-N2-9876");
         let payload = b"raw snapshot bytes".repeat(64);
-        let loc = store.upload(key, payload.clone()).await.unwrap();
+        let loc = store.upload(key, payload.clone().into()).await.unwrap();
         match &loc {
             SnapshotLocation::S3 {
                 key,
@@ -907,7 +1016,10 @@ mod tests {
     async fn s3_download_accepts_legacy_uncompressed_pointer() {
         let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
         let key = test_key(5, "group-5-T1-N1-10");
-        let loc = store.upload(key, b"legacy body".to_vec()).await.unwrap();
+        let loc = store
+            .upload(key, b"legacy body".to_vec().into())
+            .await
+            .unwrap();
         let SnapshotLocation::S3 { key, .. } = loc else {
             panic!("expected s3 location")
         };
@@ -934,8 +1046,8 @@ mod tests {
         let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
         let key1 = test_key(4, "group-4-T18-N3-264150");
         let key2 = test_key(4, "group-4-T18-N3-264150");
-        let loc1 = store.upload(key1, b"body1".to_vec()).await.unwrap();
-        let loc2 = store.upload(key2, b"body2".to_vec()).await.unwrap();
+        let loc1 = store.upload(key1, b"body1".to_vec().into()).await.unwrap();
+        let loc2 = store.upload(key2, b"body2".to_vec().into()).await.unwrap();
         let (k1, k2) = match (&loc1, &loc2) {
             (SnapshotLocation::S3 { key: k1, .. }, SnapshotLocation::S3 { key: k2, .. }) => {
                 (k1.clone(), k2.clone())
@@ -960,7 +1072,7 @@ mod tests {
     async fn s3_verify_uploaded_catches_missing_object() {
         let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
         let key = test_key(2, "group-2-T1-N1-7");
-        let loc = store.upload(key, b"payload".to_vec()).await.unwrap();
+        let loc = store.upload(key, b"payload".to_vec().into()).await.unwrap();
         // Round-trip after a real upload: must succeed.
         store.verify_uploaded(&loc).await.unwrap();
         // Same location, after an out-of-band delete: must report missing so
@@ -980,7 +1092,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalSnapshotStore::new(dir.path());
         let key = test_key(1, "group-1-T1-N1-1");
-        let loc = store.upload(key, b"abcd".to_vec()).await.unwrap();
+        let loc = store.upload(key, b"abcd".to_vec().into()).await.unwrap();
         let SnapshotLocation::Local { path, .. } = &loc else {
             unreachable!()
         };

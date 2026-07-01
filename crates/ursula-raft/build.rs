@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/types.proto");
     println!("cargo:rerun-if-changed=proto/errors.proto");
     println!("cargo:rerun-if-changed=proto/durable.proto");
+    println!("cargo:rerun-if-changed=proto/snapshot.proto");
     // Build scripts run single-threaded for this crate, so setting PROTOC is scoped to
     // the current process and safe for tonic/prost code generation.
     unsafe {

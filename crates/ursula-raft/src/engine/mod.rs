@@ -95,6 +95,7 @@ use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftGroupLogStore;
 use crate::registry::SingleNodeRaftNetworkFactory;
 use crate::state_machine::RaftGroupStateMachine;
+use crate::state_machine::SnapshotBuildCoordinator;
 use crate::state_machine::SnapshotInstallCoordinator;
 use crate::types::UrsulaRaftTypeConfig;
 
@@ -229,6 +230,7 @@ impl RaftGroupEngine {
             cold_store,
             None,
             None,
+            None,
         )
         .await?;
 
@@ -275,6 +277,7 @@ impl RaftGroupEngine {
             cold_store,
             None,
             None,
+            None,
         )
         .await
     }
@@ -289,6 +292,7 @@ impl RaftGroupEngine {
         metrics: Option<GroupEngineMetrics>,
         cold_store: Option<ColdStoreHandle>,
         snapshot_store: Option<SharedSnapshotStore>,
+        snapshot_build: Option<SnapshotBuildCoordinator>,
         snapshot_install: Option<SnapshotInstallCoordinator>,
     ) -> Result<Self, GroupEngineError>
     where
@@ -296,6 +300,7 @@ impl RaftGroupEngine {
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
         let snapshot_store = snapshot_store.unwrap_or_else(default_snapshot_store);
+        let snapshot_build = snapshot_build.unwrap_or_default();
         let snapshot_install = snapshot_install.unwrap_or_default();
         let raft = Raft::<UrsulaRaftTypeConfig, RaftGroupStateMachine>::new(
             node_id,
@@ -307,6 +312,7 @@ impl RaftGroupEngine {
                 metrics.clone(),
                 cold_store.clone(),
                 snapshot_store,
+                snapshot_build,
                 snapshot_install,
             ),
         )

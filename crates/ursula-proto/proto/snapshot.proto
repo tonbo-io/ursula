@@ -1,0 +1,130 @@
+syntax = "proto3";
+
+package ursula.durable.v1;
+
+import "types.proto";
+
+message SnapshotFrameV1 {
+  oneof frame {
+    SnapshotHeaderV1 header = 1;
+    StreamSnapshotEntryV1 stream = 2;
+    StreamAppendCountV1 append_count = 3;
+    ColdGcEntryV1 cold_gc = 4;
+    SnapshotFooterV1 footer = 5;
+  }
+}
+
+message SnapshotHeaderV1 {
+  ShardPlacementV1 placement = 1;
+  uint64 group_commit_index = 2;
+  repeated string buckets = 3;
+  uint64 next_cold_gc_seq = 4;
+}
+
+message SnapshotFooterV1 {}
+
+message StreamSnapshotEntryV1 {
+  StreamMetadataV1 metadata = 1;
+  optional bytes attrs_json = 2;
+  uint64 hot_start_offset = 3;
+  bytes payload = 4;
+  repeated HotPayloadSegmentV1 hot_segments = 5;
+  uint64 cold_frontier_offset = 6;
+  uint64 cold_index_generation = 7;
+  repeated ColdChunkRefV1 cold_chunks = 8;
+  repeated ObjectPayloadRefV1 external_segments = 9;
+  repeated StreamMessageRecordV1 message_records = 10;
+  StreamIntegritySnapshotV1 integrity = 11;
+  StreamVisibleSnapshotV1 visible_snapshot = 12;
+  repeated ProducerSnapshotV1 producer_states = 13;
+}
+
+message StreamMetadataV1 {
+  BucketStreamIdV1 stream_id = 1;
+  string content_type = 2;
+  StreamStatusV1 status = 3;
+  uint64 tail_offset = 4;
+  optional string last_stream_seq = 5;
+  optional uint64 stream_ttl_seconds = 6;
+  optional uint64 stream_expires_at_ms = 7;
+  uint64 created_at_ms = 8;
+  uint64 last_ttl_touch_at_ms = 9;
+  BucketStreamIdV1 forked_from = 10;
+  optional uint64 fork_offset = 11;
+  uint64 fork_ref_count = 12;
+}
+
+enum StreamStatusV1 {
+  STREAM_STATUS_OPEN = 0;
+  STREAM_STATUS_CLOSED = 1;
+  STREAM_STATUS_SOFT_DELETED = 2;
+}
+
+message HotPayloadSegmentV1 {
+  uint64 start_offset = 1;
+  uint64 end_offset = 2;
+  uint64 payload_start = 3;
+  uint64 payload_end = 4;
+}
+
+message ObjectPayloadRefV1 {
+  uint64 start_offset = 1;
+  uint64 end_offset = 2;
+  string s3_path = 3;
+  uint64 object_size = 4;
+}
+
+message StreamMessageRecordV1 {
+  uint64 start_offset = 1;
+  uint64 end_offset = 2;
+}
+
+message StreamIntegritySnapshotV1 {
+  string live_setsum = 1;
+  string evicted_setsum = 2;
+  string total_setsum = 3;
+  uint64 live_start_offset = 4;
+  uint64 tail_offset = 5;
+  uint64 live_records = 6;
+  uint64 evicted_records = 7;
+  uint64 total_records = 8;
+}
+
+message StreamVisibleSnapshotV1 {
+  uint64 offset = 1;
+  string content_type = 2;
+  bytes payload = 3;
+}
+
+message ProducerSnapshotV1 {
+  string producer_id = 1;
+  uint64 producer_epoch = 2;
+  uint64 producer_seq = 3;
+  uint64 last_start_offset = 4;
+  uint64 last_next_offset = 5;
+  bool last_closed = 6;
+  repeated ProducerAppendRecordV1 last_items = 7;
+}
+
+message ProducerAppendRecordV1 {
+  uint64 start_offset = 1;
+  uint64 next_offset = 2;
+  bool closed = 3;
+}
+
+message StreamAppendCountV1 {
+  BucketStreamIdV1 stream_id = 1;
+  uint64 append_count = 2;
+}
+
+message ColdGcEntryV1 {
+  uint64 seq = 1;
+  oneof target {
+    BucketStreamIdV1 stream = 2;
+    ColdGcPathsV1 paths = 3;
+  }
+}
+
+message ColdGcPathsV1 {
+  repeated string paths = 1;
+}

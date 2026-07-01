@@ -48,6 +48,7 @@ pub struct RaftEngineConfig {
     pub snapshot_drive_interval_ms: u64,
     pub memory_bootstrap_marker_dir: Option<PathBuf>,
     pub grpc_reconnect_after_failures: u32,
+    pub snapshot_build_max_concurrency: usize,
 }
 
 impl Default for RaftEngineConfig {
@@ -61,6 +62,7 @@ impl Default for RaftEngineConfig {
             snapshot_drive_interval_ms: 0,
             memory_bootstrap_marker_dir: None,
             grpc_reconnect_after_failures: 8,
+            snapshot_build_max_concurrency: 1,
         }
     }
 }
@@ -78,6 +80,7 @@ impl From<&ursula_config::RaftConfig> for RaftEngineConfig {
             memory_bootstrap_marker_dir: cfg.memory_bootstrap_marker_dir.clone(),
             grpc_reconnect_after_failures: u32::try_from(cfg.grpc_reconnect_after_failures)
                 .expect("config validation ensures grpc_reconnect_after_failures fits u32"),
+            snapshot_build_max_concurrency: cfg.snapshot_build_max_concurrency,
         }
     }
 }
@@ -464,6 +467,8 @@ impl StaticGrpcRaftGroupEngineFactory {
     }
 
     pub fn with_engine_config(mut self, config: RaftEngineConfig) -> Self {
+        self.registry
+            .set_snapshot_build_max_concurrency(config.snapshot_build_max_concurrency);
         self.engine_config = config;
         self
     }
@@ -666,6 +671,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     Some(metrics),
                     self.cold_store.clone(),
                     self.snapshot_store.clone(),
+                    Some(self.registry.snapshot_build_coordinator()),
                     Some(self.registry.snapshot_install_coordinator()),
                 )
                 .await?
@@ -680,6 +686,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     Some(metrics),
                     self.cold_store.clone(),
                     self.snapshot_store.clone(),
+                    Some(self.registry.snapshot_build_coordinator()),
                     Some(self.registry.snapshot_install_coordinator()),
                 )
                 .await?
