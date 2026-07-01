@@ -3780,6 +3780,7 @@ dependencies = [
 name = "ursula-raft"
 version = "0.1.5"
 dependencies = [
+ "bytes",
  "futures-util",
  "madsim",
  "madsim-tokio",
@@ -3802,6 +3803,7 @@ dependencies = [
  "ursula-proto",
  "ursula-runtime",
  "ursula-shard",
+ "ursula-stream",
 ]
 
 [[package]]

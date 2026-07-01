@@ -156,6 +156,8 @@ pub struct RaftConfig {
     pub memory_bootstrap_marker_dir: Option<PathBuf>,
     /// Consecutive gRPC RPC failures before forcing a transport reconnect.
     pub grpc_reconnect_after_failures: usize,
+    /// Max concurrent snapshot builds across all groups on this node.
+    pub snapshot_build_max_concurrency: usize,
     /// Max concurrent snapshot installs across all groups on this node.
     pub snapshot_install_max_concurrency: usize,
 }
@@ -180,6 +182,7 @@ impl Default for RaftConfig {
             install_snapshot_timeout: HumanDuration::sec(120),
             memory_bootstrap_marker_dir: None,
             grpc_reconnect_after_failures: 8,
+            snapshot_build_max_concurrency: 1,
             snapshot_install_max_concurrency: 1,
         }
     }

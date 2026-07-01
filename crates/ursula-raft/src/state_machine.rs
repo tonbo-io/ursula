@@ -59,7 +59,44 @@ use crate::log_store::elapsed_ns;
 use crate::rt::sync::OwnedSemaphorePermit;
 use crate::rt::sync::Semaphore;
 use crate::rt::time::Instant;
+use crate::snapshot_codec::decode_group_snapshot;
+use crate::snapshot_codec::group_snapshot_frames;
 use crate::types::UrsulaRaftTypeConfig;
+
+#[derive(Debug, Clone)]
+pub struct SnapshotBuildCoordinator {
+    inner: Arc<SnapshotBuildCoordinatorInner>,
+}
+
+#[derive(Debug)]
+struct SnapshotBuildCoordinatorInner {
+    semaphore: Arc<Semaphore>,
+}
+
+impl Default for SnapshotBuildCoordinator {
+    fn default() -> Self {
+        Self::new(1)
+    }
+}
+
+impl SnapshotBuildCoordinator {
+    pub fn new(max_concurrency: usize) -> Self {
+        Self {
+            inner: Arc::new(SnapshotBuildCoordinatorInner {
+                semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
+            }),
+        }
+    }
+
+    pub async fn acquire(&self) -> Result<OwnedSemaphorePermit, GroupEngineError> {
+        self.inner
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|err| GroupEngineError::new(format!("snapshot build gate closed: {err}")))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SnapshotInstallCoordinator {
@@ -172,6 +209,7 @@ pub struct RaftGroupStateMachine {
     pub(crate) last_membership: StoredMembershipOf<UrsulaRaftTypeConfig>,
     pub(crate) current_snapshot: Arc<Mutex<Option<CurrentSnapshot>>>,
     pub(crate) snapshot_store: SharedSnapshotStore,
+    pub(crate) snapshot_build: SnapshotBuildCoordinator,
     pub(crate) snapshot_install: SnapshotInstallCoordinator,
 }
 
@@ -206,6 +244,7 @@ impl RaftGroupStateMachine {
             metrics,
             cold_store,
             snapshot_store,
+            SnapshotBuildCoordinator::default(),
             SnapshotInstallCoordinator::default(),
         )
     }
@@ -215,6 +254,7 @@ impl RaftGroupStateMachine {
         metrics: Option<GroupEngineMetrics>,
         cold_store: Option<ColdStoreHandle>,
         snapshot_store: SharedSnapshotStore,
+        snapshot_build: SnapshotBuildCoordinator,
         snapshot_install: SnapshotInstallCoordinator,
     ) -> Self {
         Self {
@@ -228,6 +268,7 @@ impl RaftGroupStateMachine {
             last_membership: StoredMembershipOf::<UrsulaRaftTypeConfig>::default(),
             current_snapshot: Arc::new(Mutex::new(None)),
             snapshot_store,
+            snapshot_build,
             snapshot_install,
         }
     }
@@ -490,6 +531,11 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        let build_permit = self
+            .snapshot_build
+            .acquire()
+            .await
+            .expect("snapshot build coordinator should not close");
         let snapshot = self
             .group_snapshot()
             .await
@@ -501,6 +547,7 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             current_snapshot: self.current_snapshot.clone(),
             snapshot_store: self.snapshot_store.clone(),
             metrics: self.metrics.clone(),
+            _build_permit: build_permit,
         }
     }
 
@@ -533,8 +580,8 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                 }
             }
         };
-        let group_snapshot: GroupSnapshot =
-            serde_json::from_slice(snapshot_bytes.as_slice()).map_err(invalid_data)?;
+        let group_snapshot =
+            decode_group_snapshot(snapshot_bytes.as_slice()).map_err(|err| err.into_io())?;
         self.engine
             .install_snapshot(group_snapshot)
             .await
@@ -570,20 +617,23 @@ pub struct RaftGroupSnapshotBuilder {
     current_snapshot: Arc<Mutex<Option<CurrentSnapshot>>>,
     snapshot_store: SharedSnapshotStore,
     metrics: Option<GroupEngineMetrics>,
+    _build_permit: OwnedSemaphorePermit,
 }
 
 impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<UrsulaRaftTypeConfig>, io::Error> {
         let started_at = Instant::now();
         let stream_count = self.snapshot.stream_snapshot.streams.len();
-        let body = serde_json::to_vec(&self.snapshot).map_err(invalid_data)?;
-        let body_bytes = body.len();
         let snapshot_id = self.meta.snapshot_id.clone();
         let key = SnapshotKey {
             raft_group_id: self.placement.raft_group_id.0,
             snapshot_id: snapshot_id.clone(),
         };
-        let location = match self.snapshot_store.upload(key, body.clone()).await {
+        let location = match self
+            .snapshot_store
+            .upload_iter(key, group_snapshot_frames(self.snapshot.clone()))
+            .await
+        {
             Ok(location) => {
                 // Re-stat immediately so a silent partial-success (multipart
                 // Complete failing after the parts uploaded, opendal retry
@@ -598,7 +648,14 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                             error = %err,
                             "falling back to inline OpenRaft snapshot after external snapshot verification failed"
                         );
-                        SnapshotLocation::Inline { bytes: body }
+                        SnapshotLocation::Inline {
+                            bytes: group_snapshot_frames(self.snapshot.clone())
+                                .collect::<Result<Vec<_>, _>>()
+                                .map_err(|err| err.into_io())?
+                                .into_iter()
+                                .flat_map(|chunk| chunk.to_vec())
+                                .collect(),
+                        }
                     }
                 }
             }
@@ -608,7 +665,14 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                     error = %err,
                     "falling back to inline OpenRaft snapshot after external snapshot upload failed"
                 );
-                SnapshotLocation::Inline { bytes: body }
+                SnapshotLocation::Inline {
+                    bytes: group_snapshot_frames(self.snapshot.clone())
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|err| err.into_io())?
+                        .into_iter()
+                        .flat_map(|chunk| chunk.to_vec())
+                        .collect(),
+                }
             }
         };
         let pointer = SnapshotPointer {
@@ -622,7 +686,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             metrics.record_raft_snapshot_build(
                 self.placement,
                 stream_count,
-                body_bytes,
+                usize::try_from(pointer.location.size_hint()).unwrap_or(usize::MAX),
                 pointer_bytes.len(),
                 elapsed_ns(started_at),
                 external_upload,
@@ -660,6 +724,8 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::*;
 
     #[cfg(not(madsim))]
@@ -699,6 +765,14 @@ mod tests {
     }
 
     #[cfg(not(madsim))]
+    async fn test_build_permit() -> OwnedSemaphorePermit {
+        SnapshotBuildCoordinator::default()
+            .acquire()
+            .await
+            .expect("test snapshot build permit")
+    }
+
+    #[cfg(not(madsim))]
     #[tokio::test]
     async fn snapshot_builder_keeps_external_snapshots_referenced_by_published_pointers() {
         use std::sync::Arc;
@@ -731,6 +805,7 @@ mod tests {
             current_snapshot: current_snapshot.clone(),
             snapshot_store: snapshot_store.clone(),
             metrics: None,
+            _build_permit: test_build_permit().await,
         };
         let first_snapshot = first.build_snapshot().await.expect("first snapshot");
         let first_pointer =
@@ -743,6 +818,7 @@ mod tests {
             current_snapshot: current_snapshot.clone(),
             snapshot_store: snapshot_store.clone(),
             metrics: None,
+            _build_permit: test_build_permit().await,
         };
         let second_snapshot = second.build_snapshot().await.expect("second snapshot");
         let second_pointer = SnapshotPointer::decode(&second_snapshot.snapshot.into_inner())
@@ -756,10 +832,9 @@ mod tests {
             .download(&second_pointer.location)
             .await
             .expect("current snapshot remains readable");
-        let first_group: GroupSnapshot =
-            serde_json::from_slice(&first_bytes).expect("decode first group snapshot");
-        let second_group: GroupSnapshot =
-            serde_json::from_slice(&second_bytes).expect("decode second group snapshot");
+        let first_group = decode_group_snapshot(&first_bytes).expect("decode first group snapshot");
+        let second_group =
+            decode_group_snapshot(&second_bytes).expect("decode second group snapshot");
         assert_eq!(first_group.group_commit_index, 1);
         assert_eq!(second_group.group_commit_index, 2);
 
@@ -773,6 +848,7 @@ mod tests {
             current_snapshot,
             snapshot_store,
             metrics: None,
+            _build_permit: test_build_permit().await,
         };
         let third_snapshot = third.build_snapshot().await.expect("third snapshot");
         let third_pointer =
@@ -809,7 +885,7 @@ mod tests {
             fn upload<'a>(
                 &'a self,
                 _key: SnapshotKey,
-                _bytes: Vec<u8>,
+                _bytes: Bytes,
             ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
                 Box::pin(async move {
                     Err(SnapshotStoreError::Backend(
@@ -850,6 +926,7 @@ mod tests {
             current_snapshot: current_snapshot.clone(),
             snapshot_store: Arc::new(FailingSnapshotStore),
             metrics: None,
+            _build_permit: test_build_permit().await,
         };
 
         let snapshot = builder.build_snapshot().await.expect("inline fallback");
@@ -858,7 +935,7 @@ mod tests {
         let SnapshotLocation::Inline { bytes } = pointer.location else {
             panic!("expected inline fallback");
         };
-        let group: GroupSnapshot = serde_json::from_slice(&bytes).expect("decode inline snapshot");
+        let group = decode_group_snapshot(&bytes).expect("decode inline snapshot");
         assert_eq!(group.group_commit_index, 3);
         assert!(current_snapshot.lock().expect("snapshot mutex").is_some());
     }
