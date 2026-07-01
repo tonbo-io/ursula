@@ -31,6 +31,7 @@ mod registry;
 mod rt;
 #[cfg(madsim)]
 mod sim_runtime;
+mod snapshot_codec;
 mod state_machine;
 mod telemetry;
 mod types;

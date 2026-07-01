@@ -10,6 +10,7 @@ readme.workspace = true
 description = "OpenRaft integration for Ursula's per-group multi-Raft replication: network, log store, and snapshot transport."
 
 [dependencies]
+bytes = { workspace = true }
 futures-util = { workspace = true }
 openraft-rt = { workspace = true }
 openraft = { workspace = true }
@@ -26,6 +27,7 @@ ursula-runtime = { workspace = true }
 ursula-proto = { workspace = true }
 ursula-config = { workspace = true }
 ursula-shard = { workspace = true }
+ursula-stream = { workspace = true }
 
 [build-dependencies]
 protoc-bin-vendored = { workspace = true }
