@@ -48,7 +48,7 @@ api: "PUT /{bucket}/{stream}"
 </ParamField>
 
 <ParamField header="Stream-Forked-From" type="string">
- Parent stream path (e.g. `{bucket}/{stream}`). When set, the new stream is created as a fork of the parent: the server copies the parent's data up to `Stream-Fork-Offset` (or the parent's current tail if omitted) into the new stream's initial payload. The new stream is independent after creation — subsequent appends and reads do not touch the parent.
+ Parent stream path (e.g. `{bucket}/{stream}`). When set, the new stream is created as a fork of the parent: the server copies the parent's data up to `Stream-Fork-Offset` (or the parent's current tail if omitted) into the new stream's initial payload. The new stream is independent after creation. Subsequent appends and reads do not touch the parent.
 </ParamField>
 
 <ParamField header="Stream-Fork-Offset" type="string">

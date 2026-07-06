@@ -8,13 +8,13 @@ title: ursulactl
 - after a restart, refuse to move on until `last_applied_index` has caught up to peers' `committed_index`;
 - abort the rollout rather than corner a group with no leader.
 
-The same orchestration is exercised under [deterministic simulation](/docs/architecture/overview) so the failure modes — leader transfer timing out, the target node entering a crash loop, a partition during drain — produce a clean abort instead of a half-rolled cluster.
+The same orchestration is exercised under [deterministic simulation](/docs/architecture/overview), so failure modes like a leader transfer timing out, the target node entering a crash loop, or a partition during drain produce a clean abort instead of a half-rolled cluster.
 
 ## When to use ursulactl vs. the other surfaces
 
 | Task | Tool |
 |------|------|
-| Day-2 cluster operations — restart, observe, gate on readiness | **`ursulactl`** |
+| Day-2 cluster operations: restart, observe, gate on readiness | **`ursulactl`** |
 | Push binaries, write systemd units, EC2 Instance Connect, S3 cleanup | `scripts/ursula_ec2.py` |
 | One-off introspection or scripting against a single node | `curl /__ursula/metrics` |
 | Custom operator tooling | The HTTP endpoints listed under [Underlying HTTP surface](#underlying-http-surface) |
@@ -65,7 +65,7 @@ ursulactl restart \
   --lag-tolerance 16
 ```
 
-`--restart-cmd` runs in `sh -c` on the control machine. SSH, AWS SSM, `kubectl exec`, `nomad alloc exec` — anything that can take a templated host argument fits. Add `--dry-run` to print the drain plan and skip the actual transfers.
+`--restart-cmd` runs in `sh -c` on the control machine. Anything that can take a templated host argument fits: SSH, AWS SSM, `kubectl exec`, `nomad alloc exec`. Add `--dry-run` to print the drain plan and skip the actual transfers.
 
 Restrict the rollout with `--only`:
 
@@ -74,12 +74,12 @@ ursulactl restart --config cluster.json --restart-cmd '...' --only 2,3
 ```
 
 <Warning>
-The naive manual procedure — "restart followers, then leader" — does **not** wait for `applied_index` to catch up between steps. Under `raft.wal.backend = "memory"` mode a target can come back as a voter while still missing committed entries, and a second restart pointed at a different node can corner the group with no live leader. `ursulactl restart` is the path that closes this gap.
+The naive manual procedure of "restart followers, then leader" does **not** wait for `applied_index` to catch up between steps. Under `raft.wal.backend = "memory"` mode a target can come back as a voter while still missing committed entries, and a second restart pointed at a different node can corner the group with no live leader. `ursulactl restart` is the path that closes this gap.
 </Warning>
 
 ## `status`
 
-Per-node summary of Raft group count and leadership distribution, sourced from every node's `/__ursula/metrics`. Nodes whose metrics fail are reported with `metrics unavailable — …` rather than aborting the report — `status` is meant to surface partial cluster health.
+Per-node summary of Raft group count and leadership distribution, sourced from every node's `/__ursula/metrics`. Nodes whose metrics fail are reported with `metrics unavailable — …` rather than aborting the report, because `status` is meant to surface partial cluster health.
 
 ```bash
 ursulactl status --config cluster.json
@@ -117,9 +117,9 @@ Exits non-zero with a one-line reason if the timeout passes (`cluster not ready 
 
 These still live in `scripts/ursula_ec2.py` because they require SSH or AWS APIs and benefit from the same EC2 Instance Connect plumbing that the script already does:
 
-- `upload-binary`, `install-binary` — push and stage release artefacts.
-- `install-service`, `install-chaos-agent`, `install-faultd`, `deploy-chaos` — write/refresh systemd units.
-- `cleanup-s3`, `perf` / `perf-many` — AWS S3 and benchmark drivers.
+- `upload-binary`, `install-binary`: push and stage release artefacts.
+- `install-service`, `install-chaos-agent`, `install-faultd`, `deploy-chaos`: write/refresh systemd units.
+- `cleanup-s3`, `perf` / `perf-many`: AWS S3 and benchmark drivers.
 
 They will move to `ursulactl` once a `NodeProvider`-backed SSH transport lands; the AWS deployment scaffolding (IAM / EC2 lifecycle / security groups) stays in Python permanently.
 
