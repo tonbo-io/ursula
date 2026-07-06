@@ -3,7 +3,7 @@ title: Quick Start
 sidebarTitle: Quick Start
 ---
 
-> For now, Ursula builds from Rust source. Pre-built release binaries are on the way.
+> Prefer containers? `docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.2.0` starts the same single node. See [Install](/docs/install). This page uses a source build.
 
 Start a local node from the workspace root. The default preset is in-memory (no on-disk state, good for kicking the tires):
 
@@ -80,7 +80,7 @@ curl -N 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
 
 ## Inspect runtime state
 
-For a multi-node cluster the canonical day-2 tool is [`ursulactl`](/docs/cli) — it speaks to every node, summarises leadership, and is what you'll use for rolling restarts. For a single local node you can either point it at a one-line manifest:
+For a multi-node cluster the canonical day-2 tool is [`ursulactl`](/docs/cli). It speaks to every node, summarises leadership, and is what you'll use for rolling restarts. For a single local node you can either point it at a one-line manifest:
 
 ```bash
 cat > /tmp/local.json <<'JSON'
@@ -103,6 +103,7 @@ The raw endpoint is also what `ursulactl` consumes; reach for it when you want t
 - [ursulactl](/docs/cli): the operator CLI you'll use once a cluster is up
 - [Run locally](/docs/run-locally): config files, presets, and durability modes
 - [Deploy a cluster](/docs/deploy-cluster): static gRPC Raft cluster shape
+- [Deploy on Kubernetes](/docs/deploy-kubernetes): one `helm install` from the published chart
 - [Configure S3](/docs/configure-s3): shared cold storage for clusters
 - [API overview](/docs/api/overview): the HTTP surface Ursula currently exposes
 - [Streams](/docs/concepts/streams): the core stream abstraction and lifecycle

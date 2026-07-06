@@ -14,7 +14,25 @@ Raft voter expansion, voter removal, leader handoff during Kubernetes rolling
 updates, or post-bootstrap membership flag mutation. Those operations belong to
 the future Ursula operator workflow.
 
-## Build an image
+## Install
+
+The chart and server images are published to GHCR on every release. One command
+starts a three-voter cluster from the published artifacts:
+
+```bash
+helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.2.0
+```
+
+The chart defaults to the `ghcr.io/tonbo-io/ursula` image pinned to the chart's
+`appVersion`, so no image overrides are needed. The default install starts
+three voters and 64 Raft groups. To use your own registry mirror, set
+`global.image.repository`, `global.image.tag`, and optionally
+`global.imagePullSecrets`.
+
+## Install from a local build
+
+To run unreleased code, build the image from the repository and install the
+chart from the working tree instead:
 
 ```bash
 docker build -t ursula:dev .
@@ -26,9 +44,7 @@ For kind:
 kind load docker-image ursula:dev
 ```
 
-## Install
-
-For a local image loaded into the cluster:
+Then point the chart at the local image:
 
 ```bash
 helm install ursula charts/ursula \
@@ -36,10 +52,6 @@ helm install ursula charts/ursula \
   --set global.image.tag=dev \
   --set global.image.pullPolicy=Never
 ```
-
-The default install starts three voters and 64 Raft groups. For a registry
-image, set `global.image.repository`, `global.image.tag`, and optionally
-`global.imagePullSecrets`.
 
 ## Verify readiness
 
@@ -58,13 +70,15 @@ initialize per-group Raft membership automatically. After `helm test` passes,
 update your values and run:
 
 ```bash
-helm upgrade ursula charts/ursula \
+helm upgrade ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.2.0 \
   --reuse-values \
   --set raft.initMembershipPerGroup=false
 ```
 
-If you do not use `--reuse-values`, repeat your image overrides or use a values
-file so the upgrade does not roll pods back to the chart default image.
+Use the same chart source you installed from (`charts/ursula` for a local
+build). If you do not use `--reuse-values`, repeat your image overrides or use
+a values file so the upgrade does not roll pods back to the chart default
+image.
 
 Keep this value false for normal restarts and upgrades. A future Kubernetes
 operator will own this transition automatically.
@@ -108,7 +122,7 @@ For MinIO or another S3-compatible backend, set `s3.endpoint`.
 
 Ursula exposes a single admin endpoint on the client plane:
 
-- `GET /__ursula/metrics` — per-node JSON snapshot with Raft group state, hot
+- `GET /__ursula/metrics`: per-node JSON snapshot with Raft group state, hot
   bytes, cold backpressure counters, and per-core mailbox depth.
 
 There are no dedicated `/__ursula/healthz` or `/__ursula/readyz` probes yet.

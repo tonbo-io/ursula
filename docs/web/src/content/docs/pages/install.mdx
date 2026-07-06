@@ -2,12 +2,23 @@
 title: Install
 ---
 
-Ursula is currently installed from source. Pre-built release binaries are on the way. The build is plain Rust plus the standard C toolchain that Cargo expects — no embedded KV dependency.
+Ursula installs two ways: pull the pre-built Docker image from GHCR, or build from source. Standalone release binaries are on the way; the source build is plain Rust plus the standard C toolchain that Cargo expects, with no embedded KV dependency.
 
 Ursula ships **two binaries** you will use side by side:
 
-- **`ursula`** — the server daemon. Runs on every node in the cluster.
-- **`ursulactl`** — the operator CLI. Lives on your control machine and talks to each node's HTTP surface. See [ursulactl](/docs/cli) for the verbs it exposes.
+- **`ursula`**: the server daemon. Runs on every node in the cluster.
+- **`ursulactl`**: the operator CLI. Lives on your control machine and talks to each node's HTTP surface. See [ursulactl](/docs/cli) for the verbs it exposes.
+
+## Docker image
+
+Every release publishes a multi-arch image containing `ursula`, `ursulactl`, and the `ursulagw` gateway:
+
+```bash
+docker pull ghcr.io/tonbo-io/ursula:0.2.0
+docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.2.0
+```
+
+The image runs as a non-root user and exposes port 4437. `latest` tracks the main branch; pin a version tag for anything you keep running. For Kubernetes, the [Helm chart](/docs/deploy-kubernetes) wires this image up for you.
 
 ## Prerequisites
 
@@ -88,8 +99,9 @@ Kill the background process when you're done.
 
 ## Next
 
-- [Quick start](/docs/quick-start) — drive the HTTP API end-to-end
-- [Run locally](/docs/run-locally) — durability modes and flags
-- [Deploy a cluster](/docs/deploy-cluster) — static gRPC Raft cluster
-- [ursulactl](/docs/cli) — the verbs you'll use once the cluster is up
-- [Configure S3](/docs/configure-s3) — shared cold storage
+- [Quick start](/docs/quick-start): drive the HTTP API end-to-end
+- [Run locally](/docs/run-locally): durability modes and flags
+- [Deploy a cluster](/docs/deploy-cluster): static gRPC Raft cluster
+- [Deploy on Kubernetes](/docs/deploy-kubernetes): one `helm install` from the published chart
+- [ursulactl](/docs/cli): the verbs you'll use once the cluster is up
+- [Configure S3](/docs/configure-s3): shared cold storage
