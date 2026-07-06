@@ -2,7 +2,7 @@
 title: Operations
 ---
 
-The first tool to reach for is [`ursulactl`](/docs/cli). It covers the raft-aware verbs operators run most often — rolling restart, status, readiness gate. This page covers everything **around** it: the metrics shape ursulactl reads, the admin endpoints it (and your custom tooling) can call, the SSH-side lifecycle that still lives in Python, and the operational policies ursulactl does not encode (backups, log levels, S3 cleanup).
+The first tool to reach for is [`ursulactl`](/docs/cli). It covers the raft-aware verbs operators run most often: rolling restart, status, readiness gate. This page covers everything **around** it: the metrics shape ursulactl reads, the admin endpoints it (and your custom tooling) can call, the SSH-side lifecycle that still lives in Python, and the operational policies ursulactl does not encode (backups, log levels, S3 cleanup).
 
 ## Tooling map
 
@@ -43,11 +43,11 @@ curl -X POST http://127.0.0.1:4437/__ursula/raft/42/learners/4
 curl -X POST http://127.0.0.1:4437/__ursula/raft/42/leader/transfer/2
 ```
 
-The leader-transfer endpoint refuses with `409 Conflict` if the receiving node isn't the current leader and `400 Bad Request` if the target isn't a voter — this is why `ursulactl` is the safer way to chain these calls: it consults metrics first.
+The leader-transfer endpoint refuses with `409 Conflict` if the receiving node isn't the current leader and `400 Bad Request` if the target isn't a voter. This is why `ursulactl` is the safer way to chain these calls: it consults metrics first.
 
 ## SSH-side lifecycle
 
-`scripts/ursula_ec2.py` drives a static EC2 manifest (instance IDs, IPs, port, binary path, cold env, peer list) over SSH. It complements `ursulactl` — push binaries and start daemons here, then switch to `ursulactl` for raft-aware verbs.
+`scripts/ursula_ec2.py` drives a static EC2 manifest (instance IDs, IPs, port, binary path, cold env, peer list) over SSH. It complements `ursulactl`: push binaries and start daemons here, then switch to `ursulactl` for raft-aware verbs.
 
 ```bash
 # Push a fresh binary to every server in the manifest
@@ -68,7 +68,7 @@ python3 scripts/ursula_ec2.py --config cluster.json perf-many \
 
 `perf-many` rotates entrypoints across service nodes by default; use `--target-mode first` only to reproduce a single-ingress run. `stop` kills only the recorded PID rather than running `pkill`, because broad patterns can match the SSH cleanup command itself. If a pid file is stale, kill by hand.
 
-The Python script still exposes `status` and `wait-ready`, kept around for environments where `ursulactl` isn't deployed yet. They print the same numbers but via SSH-curl — prefer `ursulactl` when you have a choice. Verbs scheduled to migrate to `ursulactl` once SSH transport lands: `upload-binary`, `install-binary`, `install-service`, `install-chaos-agent`, `install-faultd`, `deploy-chaos`. AWS deployment scaffolding (IAM / EC2 lifecycle / security groups) stays in Python permanently.
+The Python script still exposes `status` and `wait-ready`, kept around for environments where `ursulactl` isn't deployed yet. They print the same numbers but via SSH-curl, so prefer `ursulactl` when you have a choice. Verbs scheduled to migrate to `ursulactl` once SSH transport lands: `upload-binary`, `install-binary`, `install-service`, `install-chaos-agent`, `install-faultd`, `deploy-chaos`. AWS deployment scaffolding (IAM / EC2 lifecycle / security groups) stays in Python permanently.
 
 ## Cleaning S3
 
