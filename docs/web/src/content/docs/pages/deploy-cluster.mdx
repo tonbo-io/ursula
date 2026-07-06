@@ -132,20 +132,20 @@ See [configure S3](/docs/configure-s3) for canonical `[storage.cold]` and `[stor
 
 The first tool for day-2 work is [`ursulactl`](/docs/cli):
 
-- `ursulactl restart` — drain-aware rolling restart with applied-index catch-up gates.
-- `ursulactl status` — leadership distribution per node.
-- `ursulactl wait-ready` — gate scripts on group + leader counts.
+- `ursulactl restart`: drain-aware rolling restart with applied-index catch-up gates.
+- `ursulactl status`: leadership distribution per node.
+- `ursulactl wait-ready`: gate scripts on group + leader counts.
 
-For SSH/AWS-side plumbing — pushing binaries, writing systemd units, EC2 Instance Connect, S3 cleanup — use `scripts/ursula_ec2.py`. See [operations](/docs/operations) for the full split.
+Use `scripts/ursula_ec2.py` for the SSH/AWS-side plumbing: pushing binaries, writing systemd units, EC2 Instance Connect, S3 cleanup. See [operations](/docs/operations) for the full split.
 
 The HTTP admin surface underneath both tools is small and stable enough to script against directly:
 
-- `GET /__ursula/metrics` — per-node JSON snapshot.
-- `POST /__ursula/raft/{group_id}/snapshot` — manually trigger a Raft snapshot.
-- `POST /__ursula/raft/{group_id}/purge` — purge stale log entries.
-- `POST /__ursula/raft/{group_id}/learners/{node_id}` — add a learner (non-voting) replica.
-- `POST /__ursula/raft/{group_id}/leader/transfer/{node_id}` — hand off leadership to another voter (the primitive `ursulactl restart` builds on).
-- `POST /__ursula/flush-cold/{bucket}/{stream}` — force a cold flush for one stream.
+- `GET /__ursula/metrics`: per-node JSON snapshot.
+- `POST /__ursula/raft/{group_id}/snapshot`: manually trigger a Raft snapshot.
+- `POST /__ursula/raft/{group_id}/purge`: purge stale log entries.
+- `POST /__ursula/raft/{group_id}/learners/{node_id}`: add a learner (non-voting) replica.
+- `POST /__ursula/raft/{group_id}/leader/transfer/{node_id}`: hand off leadership to another voter (the primitive `ursulactl restart` builds on).
+- `POST /__ursula/flush-cold/{bucket}/{stream}`: force a cold flush for one stream.
 
 ## Limits in the current build
 

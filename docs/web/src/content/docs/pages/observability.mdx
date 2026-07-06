@@ -33,7 +33,7 @@ endpoint is unset, the process stays on the stderr `fmt` logger driven by
 
 Spans batch-export continuously and metrics export on a fixed interval
 (`OTEL_METRIC_EXPORT_INTERVAL`, milliseconds). A final flush on clean shutdown
-is only a backstop — don't rely on it to observe data.
+is only a backstop. Don't rely on it to observe data.
 
 ### Identifying the node
 
@@ -41,8 +41,8 @@ Every span and metric carries the process's OpenTelemetry **resource**. The
 server sets `service.name=ursula` and, when running with a Raft node id,
 `service.instance.id=<node_id>` so a cluster's nodes are distinguishable. Add
 more resource attributes (e.g. `host.name`, region, AZ) with the standard
-variable — bounded by cluster size, so this is a resource dimension, not a
-high-cardinality label:
+variable. They stay bounded by cluster size, so this is a resource dimension,
+not a high-cardinality label:
 
 ```bash
 export OTEL_RESOURCE_ATTRIBUTES="host.name=$(hostname),deployment.environment=prod"
@@ -51,7 +51,7 @@ export OTEL_RESOURCE_ATTRIBUTES="host.name=$(hostname),deployment.environment=pr
 ## Traces
 
 A single request produces one boundary span (`http.append`, `http.read`, or
-`http.head`) tagged with `bucket` and `stream` — never the payload. That span
+`http.head`) tagged with `bucket` and `stream`, never the payload. That span
 is propagated across the internal actor mailboxes, so on-core work
 (`core.append`, `core.read`, …) nests underneath it. When a follower forwards a
 read to the leader, the W3C `traceparent` rides the Raft gRPC request, so the
@@ -81,7 +81,7 @@ export volume.
 
 The `core.*` spans only materialize in a build without `release-max-info` (e.g.
 a debug build), and only when their target is enabled. Use a **crate-scoped**
-filter — never a global `debug`:
+filter, never a global `debug`:
 
 ```bash
 # Good: only Ursula's own crates emit debug spans.
@@ -101,12 +101,12 @@ crates instead.
 
 Two surfaces expose the same counters:
 
-- **OTLP** — when an endpoint is configured, runtime metrics are exported
+- **OTLP**: when an endpoint is configured, runtime metrics are exported
   periodically as OpenTelemetry instruments (`ursula.appends.accepted`,
   `ursula.mutations.applied`, `ursula.raft_apply.ns`, `ursula.wal.records`,
   `ursula.group_mailbox.depth`, …), ready for Prometheus/Grafana via a
   collector.
-- **JSON** — `GET /__ursula/metrics` returns the full per-core/per-group
+- **JSON**: `GET /__ursula/metrics` returns the full per-core/per-group
   snapshot for quick inspection and is what `ursulactl status` reads.
 
 Metrics are gathered on the hot path with lock-free per-core counters. The OTLP
