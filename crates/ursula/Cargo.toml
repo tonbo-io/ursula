@@ -15,6 +15,14 @@ default = ["release-max-info"]
 # it (`--no-default-features --features tokio-console`) when using tokio-console.
 release-max-info = ["ursula-observability/release-max-info"]
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]
+jemalloc-prof = [
+    "dep:tempfile",
+    "dep:tikv-jemalloc-ctl",
+    "dep:tikv-jemallocator",
+    "tikv-jemalloc-ctl/profiling",
+    "tikv-jemallocator/profiling",
+    "tikv-jemallocator/unprefixed_malloc_on_supported_platforms",
+]
 
 [dependencies]
 axum = { workspace = true }
@@ -29,6 +37,9 @@ opentelemetry = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true, optional = true }
+tikv-jemalloc-ctl = { workspace = true, optional = true }
+tikv-jemallocator = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 tonic = { workspace = true, features = ["transport"] }
 tower = { workspace = true, features = ["util", "limit", "load-shed"] }
