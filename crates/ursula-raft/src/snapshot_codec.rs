@@ -168,11 +168,11 @@ fn stream_to_proto(
         metadata: Some(metadata_to_proto(entry.metadata)),
         attrs_json: entry
             .attrs
-            .map(|attrs| serde_json::to_vec(&attrs))
+            .map(|attrs| serde_json::to_vec(&attrs).map(Bytes::from))
             .transpose()
             .map_err(|err| SnapshotStoreError::Serialize(format!("stream attrs: {err}")))?,
         hot_start_offset: entry.hot_start_offset,
-        payload: entry.payload,
+        payload: entry.payload.into(),
         hot_segments: entry
             .hot_segments
             .into_iter()
@@ -212,7 +212,7 @@ fn stream_from_proto(
             .transpose()
             .map_err(|err| SnapshotStoreError::Deserialize(format!("stream attrs: {err}")))?,
         hot_start_offset: entry.hot_start_offset,
-        payload: entry.payload,
+        payload: entry.payload.to_vec(),
         hot_segments: entry
             .hot_segments
             .into_iter()
@@ -387,7 +387,7 @@ fn visible_snapshot_to_proto(snapshot: StreamVisibleSnapshot) -> proto::StreamVi
     proto::StreamVisibleSnapshotV1 {
         offset: snapshot.offset,
         content_type: snapshot.content_type,
-        payload: snapshot.payload,
+        payload: snapshot.payload.into(),
     }
 }
 
@@ -395,7 +395,7 @@ fn visible_snapshot_from_proto(snapshot: proto::StreamVisibleSnapshotV1) -> Stre
     StreamVisibleSnapshot {
         offset: snapshot.offset,
         content_type: snapshot.content_type,
-        payload: snapshot.payload,
+        payload: snapshot.payload.to_vec(),
     }
 }
 

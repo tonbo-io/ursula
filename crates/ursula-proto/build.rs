@@ -13,6 +13,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     prost_build::Config::new()
+        // Generate `bytes` fields as `Bytes` instead of `Vec<u8>` so decoding
+        // payload-heavy commands slices the receive buffer instead of copying.
+        .bytes(["."])
         .boxed(".ursula.durable.v1.SnapshotFrameV1.frame.stream")
         .type_attribute("ProducerRequestV1", "#[derive(Eq)]")
         .type_attribute(
