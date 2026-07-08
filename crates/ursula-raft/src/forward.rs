@@ -56,14 +56,13 @@ pub(crate) async fn forward_head_stream_to_leader(
     )
     .await?;
     if response.ok {
-        let response =
-            raft_internal_proto::HeadStreamResponsePayloadV1::decode(response.payload.as_slice())
-                .map_err(|err| {
-                GroupEngineError::new(format!("decode forwarded head response: {err}"))
-            })?;
+        let response = raft_internal_proto::HeadStreamResponsePayloadV1::decode(response.payload)
+            .map_err(|err| {
+            GroupEngineError::new(format!("decode forwarded head response: {err}"))
+        })?;
         head_stream_response_from_proto(response)
     } else {
-        let err = raft_app_proto::GroupEngineErrorV1::decode(response.payload.as_slice())
+        let err = raft_app_proto::GroupEngineErrorV1::decode(response.payload)
             .map_err(|err| GroupEngineError::new(format!("decode forwarded head error: {err}")))?;
         Err(group_engine_error_from_proto(err)?)
     }
@@ -95,14 +94,13 @@ pub(crate) async fn forward_read_stream_to_leader(
     )
     .await?;
     if response.ok {
-        let response =
-            raft_internal_proto::ReadStreamResponsePayloadV1::decode(response.payload.as_slice())
-                .map_err(|err| {
-                GroupEngineError::new(format!("decode forwarded read response: {err}"))
-            })?;
+        let response = raft_internal_proto::ReadStreamResponsePayloadV1::decode(response.payload)
+            .map_err(|err| {
+            GroupEngineError::new(format!("decode forwarded read response: {err}"))
+        })?;
         read_stream_response_from_proto(response)
     } else {
-        let err = raft_app_proto::GroupEngineErrorV1::decode(response.payload.as_slice())
+        let err = raft_app_proto::GroupEngineErrorV1::decode(response.payload)
             .map_err(|err| GroupEngineError::new(format!("decode forwarded read error: {err}")))?;
         Err(group_engine_error_from_proto(err)?)
     }
@@ -129,17 +127,18 @@ pub(crate) async fn forward_get_stream_attrs_to_leader(
     )
     .await?;
     if response.ok {
-        let response = raft_internal_proto::GetStreamAttrsResponsePayloadV1::decode(
-            response.payload.as_slice(),
-        )
-        .map_err(|err| {
-            GroupEngineError::new(format!("decode forwarded get stream attrs response: {err}"))
-        })?;
+        let response =
+            raft_internal_proto::GetStreamAttrsResponsePayloadV1::decode(response.payload)
+                .map_err(|err| {
+                    GroupEngineError::new(format!(
+                        "decode forwarded get stream attrs response: {err}"
+                    ))
+                })?;
         get_stream_attrs_response_from_proto(response)
     } else {
-        let err = raft_app_proto::GroupEngineErrorV1::decode(response.payload.as_slice()).map_err(
-            |err| GroupEngineError::new(format!("decode forwarded get stream attrs error: {err}")),
-        )?;
+        let err = raft_app_proto::GroupEngineErrorV1::decode(response.payload).map_err(|err| {
+            GroupEngineError::new(format!("decode forwarded get stream attrs error: {err}"))
+        })?;
         Err(group_engine_error_from_proto(err)?)
     }
 }

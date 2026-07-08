@@ -145,7 +145,7 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
             } => Command::CreateStream(raft_app_proto::CreateStreamCommandV1 {
                 stream_id: Some(stream_id.into()),
                 content_type,
-                initial_payload: initial_payload.to_vec(),
+                initial_payload,
                 close_after,
                 stream_seq,
                 producer,
@@ -194,7 +194,7 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
             } => Command::Append(raft_app_proto::AppendCommandV1 {
                 stream_id: Some(stream_id.into()),
                 content_type,
-                payload: payload.to_vec(),
+                payload,
                 close_after,
                 stream_seq,
                 producer,
@@ -226,10 +226,7 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
             } => Command::AppendBatch(raft_app_proto::AppendBatchCommandV1 {
                 stream_id: Some(stream_id.into()),
                 content_type,
-                payloads: payloads
-                    .into_iter()
-                    .map(|payload| payload.to_vec())
-                    .collect(),
+                payloads,
                 producer,
                 now_ms,
             }),
@@ -243,7 +240,7 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
                 stream_id: Some(stream_id.into()),
                 snapshot_offset,
                 content_type,
-                payload: payload.to_vec(),
+                payload,
                 now_ms,
             }),
             GroupWriteCommand::TouchStreamAccess {
@@ -315,8 +312,10 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
     }
 }
 
-fn stream_attrs_json(attrs: ursula_runtime::StreamAttrs) -> Vec<u8> {
-    serde_json::to_vec(&attrs).expect("stream attrs serialize to JSON")
+fn stream_attrs_json(attrs: ursula_runtime::StreamAttrs) -> bytes::Bytes {
+    serde_json::to_vec(&attrs)
+        .expect("stream attrs serialize to JSON")
+        .into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

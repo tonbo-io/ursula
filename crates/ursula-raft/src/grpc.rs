@@ -215,7 +215,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         let meta = snapshot_meta_from_required_proto(request.snapshot_meta)?;
         let snapshot = SnapshotOf::<UrsulaRaftTypeConfig> {
             meta,
-            snapshot: Cursor::new(request.snapshot_payload),
+            snapshot: Cursor::new(request.snapshot_payload.to_vec()),
         };
         let response = self
             .registry
@@ -253,8 +253,8 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 .command_payloads
                 .into_iter()
                 .map(|payload| {
-                    let command = raft_app_proto::RaftGroupCommandV1::decode(payload.as_slice())
-                        .map_err(|err| {
+                    let command =
+                        raft_app_proto::RaftGroupCommandV1::decode(payload).map_err(|err| {
                             GroupEngineError::new(format!("decode group command: {err}"))
                         })?;
                     group_write_command_from_proto(RaftGroupCommand(command))
@@ -367,7 +367,9 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     .await
                     .map(|response| raft_internal_proto::GroupReadResponseV1 {
                         ok: true,
-                        payload: head_stream_response_to_proto(response).encode_to_vec(),
+                        payload: head_stream_response_to_proto(response)
+                            .encode_to_vec()
+                            .into(),
                     }),
                 raft_internal_proto::group_read_request_v1::Read::GetStreamAttrs(_) => engine
                     .get_stream_attrs(
@@ -380,7 +382,9 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     .await
                     .map(|response| raft_internal_proto::GroupReadResponseV1 {
                         ok: true,
-                        payload: get_stream_attrs_response_to_proto(response).encode_to_vec(),
+                        payload: get_stream_attrs_response_to_proto(response)
+                            .encode_to_vec()
+                            .into(),
                     }),
                 raft_internal_proto::group_read_request_v1::Read::ReadStream(read) => {
                     let max_len = usize::try_from(read.max_len).map_err(|_| {
@@ -399,7 +403,9 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                         .await
                         .map(|response| raft_internal_proto::GroupReadResponseV1 {
                             ok: true,
-                            payload: read_stream_response_to_proto(response).encode_to_vec(),
+                            payload: read_stream_response_to_proto(response)
+                                .encode_to_vec()
+                                .into(),
                         })
                 }
             };
@@ -407,7 +413,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 Ok(response) => response,
                 Err(err) => raft_internal_proto::GroupReadResponseV1 {
                     ok: false,
-                    payload: group_engine_error_to_proto(err).encode_to_vec(),
+                    payload: group_engine_error_to_proto(err).encode_to_vec().into(),
                 },
             };
             Ok(tonic::Response::new(response))
@@ -758,7 +764,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
             vote: Some(vote_to_proto(vote)),
             snapshot_meta: Some(snapshot_meta_to_proto(snapshot.meta)),
-            snapshot_payload: snapshot.snapshot.into_inner(),
+            snapshot_payload: snapshot.snapshot.into_inner().into(),
         };
         let mut request = tonic::Request::new(request);
         self.apply_rpc_timeout(&mut request, option);

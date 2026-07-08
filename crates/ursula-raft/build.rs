@@ -18,6 +18,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
+        // Generate `bytes` fields as `Bytes` instead of `Vec<u8>` so decoding
+        // payload-heavy RPCs slices the receive buffer instead of copying.
+        .bytes(["."])
         .extern_path(".ursula.durable.v1", "::ursula_proto")
         // Keep the generated `StoredLogEntryV1::Payload` enum small: the `normal`
         // variant carries an entire `RaftGroupCommandV1` (~288 B) and would otherwise
