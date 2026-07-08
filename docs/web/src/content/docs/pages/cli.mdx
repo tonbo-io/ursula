@@ -50,11 +50,12 @@ Legacy `public_ip` / `private_ip` / `http_port` fields from the EC2 helper are a
 Safe rolling restart. Per target node, in manifest order (or `--only` order):
 
 1. Snapshot every node's `/__ursula/metrics`.
-2. For every Raft group the target leads, pick the most-caught-up voter as successor and call `POST /__ursula/raft/{group}/leader/transfer/{successor}`.
-3. Poll until the target leads zero groups, or abort on drain timeout.
-4. Run `--restart-cmd` with `{node_id}` / `{host}` / `{http_url}` / `{name}` substituted.
-5. Poll until the target is back as a voter in every group and its `last_applied_index` is within `--lag-tolerance` of peers' `committed_index`, or abort on readiness timeout.
-6. Move to the next node only on success. Any abort stops the rollout.
+2. Mark the target's [maintenance drain](/docs/operations) so it stops campaigning and re-acquiring leaderships mid-drain.
+3. For every Raft group the target leads, pick the most-caught-up voter as successor and call `POST /__ursula/raft/{group}/leader/transfer/{successor}`.
+4. Poll until the target leads zero groups, or abort on drain timeout.
+5. Run `--restart-cmd` with `{node_id}` / `{host}` / `{http_url}` / `{name}` substituted.
+6. Poll until the target is back as a voter in every group and its `last_applied_index` is within `--lag-tolerance` of peers' `committed_index`, or abort on readiness timeout.
+7. Clear the maintenance drain and move to the next node only on success. Any abort clears the drain mark on the current target and stops the rollout.
 
 ```bash
 ursulactl restart \
@@ -130,6 +131,7 @@ For custom tooling, every verb maps onto a small set of HTTP endpoints on each n
 | Verb | Endpoint |
 |------|----------|
 | `status`, `wait-ready` | `GET /__ursula/metrics` |
+| `restart` (maintenance guard) | `POST /__ursula/leadership-shed/maintenance` before the drain, `DELETE` once the node is back or the rollout aborts |
 | `restart` (drain step) | `POST /__ursula/raft/{raft_group_id}/leader/transfer/{node_id}` |
 | `restart` (readiness step) | `GET /__ursula/metrics` polled across all peers |
 
