@@ -77,6 +77,15 @@ ursulactl restart --config cluster.json --restart-cmd '...' --only 2,3
 The naive manual procedure of "restart followers, then leader" does **not** wait for `applied_index` to catch up between steps. Under `raft.wal.backend = "memory"` mode a target can come back as a voter while still missing committed entries, and a second restart pointed at a different node can corner the group with no live leader. `ursulactl restart` is the path that closes this gap.
 </Warning>
 
+### Restarting raft-memory nodes
+
+On clusters running the volatile `raft.wal.backend = "memory"`, a restarted node rejoins with an **empty** log, and group leaders refuse that log reversion unless it was explicitly permitted. Two flags matter:
+
+- `--allow-empty-raft-rejoin`: before running the restart command, ask the current leader of every group to accept one empty-log rejoin from the target. Without it the target never catches up and the readiness step times out. Do not use it on persistent-backend clusters, where an unexpected empty rejoin means data loss that deserves to be refused.
+- `--ready-timeout-secs`: an amnesiac node rebuilds every group from snapshots, which for large groups takes 10+ minutes, not the default two. Size the timeout for a full rebuild.
+
+The permission must land on the node that is leader at that moment; the endpoint answers `409 Conflict` from any other node (ursulactl resolves leadership per group and handles this). A node that is the membership initializer for some groups additionally refuses to start at all after losing its volatile log (the bootstrap-marker guard) — that recovery is an explicit operator reset on the host, outside ursulactl's reach.
+
 ## `status`
 
 Per-node summary of Raft group count and leadership distribution, sourced from every node's `/__ursula/metrics`. Nodes whose metrics fail are reported with `metrics unavailable — …` rather than aborting the report, because `status` is meant to surface partial cluster health.
