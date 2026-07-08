@@ -50,7 +50,7 @@ pub(crate) fn group_write_command_from_proto(
         Command::CreateStream(command) => Ok(GroupWriteCommand::CreateStream {
             stream_id: stream_id_from_proto(command.stream_id, "create_stream.stream_id")?,
             content_type: command.content_type,
-            initial_payload: command.initial_payload.into(),
+            initial_payload: command.initial_payload,
             close_after: command.close_after,
             stream_seq: command.stream_seq,
             producer: command.producer,
@@ -78,7 +78,7 @@ pub(crate) fn group_write_command_from_proto(
         Command::Append(command) => Ok(GroupWriteCommand::Append {
             stream_id: stream_id_from_proto(command.stream_id, "append.stream_id")?,
             content_type: command.content_type,
-            payload: command.payload.into(),
+            payload: command.payload,
             close_after: command.close_after,
             stream_seq: command.stream_seq,
             producer: command.producer,
@@ -96,11 +96,7 @@ pub(crate) fn group_write_command_from_proto(
         Command::AppendBatch(command) => Ok(GroupWriteCommand::AppendBatch {
             stream_id: stream_id_from_proto(command.stream_id, "append_batch.stream_id")?,
             content_type: command.content_type,
-            payloads: command
-                .payloads
-                .into_iter()
-                .map(Into::into)
-                .collect::<Vec<_>>(),
+            payloads: command.payloads,
             producer: command.producer,
             now_ms: command.now_ms,
         }),
@@ -108,7 +104,7 @@ pub(crate) fn group_write_command_from_proto(
             stream_id: stream_id_from_proto(command.stream_id, "publish_snapshot.stream_id")?,
             snapshot_offset: command.snapshot_offset,
             content_type: command.content_type,
-            payload: command.payload.into(),
+            payload: command.payload,
             now_ms: command.now_ms,
         }),
         Command::TouchStreamAccess(command) => Ok(GroupWriteCommand::TouchStreamAccess {
@@ -168,7 +164,7 @@ pub(crate) fn optional_stream_id_from_proto(
 }
 
 fn stream_attrs_from_proto(
-    attrs_json: Option<Vec<u8>>,
+    attrs_json: Option<bytes::Bytes>,
     field: &str,
 ) -> Result<Option<StreamAttrs>, GroupEngineError> {
     let Some(attrs_json) = attrs_json.filter(|bytes| !bytes.is_empty()) else {
@@ -381,9 +377,11 @@ pub(crate) fn get_stream_attrs_response_to_proto(
         core_id: u32::from(response.placement.core_id.0),
         shard_id: response.placement.shard_id.0,
         raft_group_id: response.placement.raft_group_id.0,
-        attrs_json: response
-            .attrs
-            .map(|attrs| serde_json::to_vec(&attrs).expect("stream attrs serialize to JSON")),
+        attrs_json: response.attrs.map(|attrs| {
+            serde_json::to_vec(&attrs)
+                .expect("stream attrs serialize to JSON")
+                .into()
+        }),
     }
 }
 
@@ -729,7 +727,7 @@ pub(crate) fn read_stream_response_to_proto(
         offset: response.offset,
         next_offset: response.next_offset,
         content_type: response.content_type,
-        payload: response.payload,
+        payload: response.payload.into(),
         up_to_date: response.up_to_date,
         closed: response.closed,
     }
@@ -748,7 +746,7 @@ pub(crate) fn read_stream_response_from_proto(
         offset: response.offset,
         next_offset: response.next_offset,
         content_type: response.content_type,
-        payload: response.payload,
+        payload: response.payload.to_vec(),
         up_to_date: response.up_to_date,
         closed: response.closed,
     })
@@ -807,11 +805,13 @@ pub(crate) fn encode_group_write_result(
     match result {
         Ok(response) => raft_internal_proto::GroupWriteResultV1 {
             ok: true,
-            payload: write_applied_response_to_proto(response).encode_to_vec(),
+            payload: write_applied_response_to_proto(response)
+                .encode_to_vec()
+                .into(),
         },
         Err(err) => raft_internal_proto::GroupWriteResultV1 {
             ok: false,
-            payload: group_engine_error_to_proto(err).encode_to_vec(),
+            payload: group_engine_error_to_proto(err).encode_to_vec().into(),
         },
     }
 }
