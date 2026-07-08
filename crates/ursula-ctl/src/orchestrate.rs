@@ -283,15 +283,51 @@ async fn restart_one(
         }
         if Instant::now() >= deadline {
             clear_maintenance_drain(client, target).await;
-            return Ok(RestartOutcome::Aborted {
-                reason: format!(
-                    "readiness timeout after {:?}: {}",
-                    options.ready_timeout,
-                    format_unready(&snap, &report)
-                ),
-            });
+            let mut reason = format!(
+                "readiness timeout after {:?}: {}",
+                options.ready_timeout,
+                format_unready(&snap, &report)
+            );
+            if let Some(hint) = amnesiac_timeout_hint(&report, options) {
+                reason.push_str("; ");
+                reason.push_str(hint);
+            }
+            return Ok(RestartOutcome::Aborted { reason });
         }
         tokio::time::sleep(options.poll_interval).await;
+    }
+}
+
+/// A target that reports no applied entries in any group after the readiness
+/// window either never got permission to rejoin with an empty log or never
+/// came back up at all; plain gap numbers do not tell an operator that.
+fn amnesiac_timeout_hint(
+    report: &crate::plan::ReadinessReport,
+    options: &RestartOptions,
+) -> Option<&'static str> {
+    let all_unapplied = !report.per_group.is_empty()
+        && report
+            .per_group
+            .values()
+            .all(|g| g.target_applied_index.is_none());
+    if !all_unapplied {
+        return None;
+    }
+    if options.allow_empty_raft_rejoin {
+        Some(
+            "target reports no applied entries in any group despite \
+             --allow-empty-raft-rejoin; it may be failing to start (check its \
+             service logs, e.g. a raft-memory bootstrap marker refusing \
+             restart) or still installing snapshots — consider a larger \
+             --ready-timeout-secs",
+        )
+    } else {
+        Some(
+            "target reports no applied entries in any group; if this cluster \
+             runs the volatile raft-memory backend, rerun with \
+             --allow-empty-raft-rejoin and a --ready-timeout-secs large \
+             enough for full snapshot rebuilds (often 10+ minutes)",
+        )
     }
 }
 
@@ -569,6 +605,45 @@ mod tests {
         assert!(!report.all_ready);
         let formatted = format_unready(&snapshot, &report);
         assert!(formatted.contains("gap=Some(50)"), "{formatted}");
+    }
+
+    #[test]
+    fn amnesiac_timeout_hint_suggests_rejoin_flag_only_when_unset() {
+        let snapshot = ClusterSnapshot {
+            per_node: vec![NodeMetricsView {
+                node: n(2, "10.0.0.2"),
+                groups: vec![group(7, 2, Some(2), 100, 100)],
+            }],
+        };
+        let report = check_readiness(&snapshot, 1, 5);
+        assert!(!report.all_ready);
+
+        let mut options = RestartOptions::default();
+        let hint = amnesiac_timeout_hint(&report, &options).expect("hint for unset flag");
+        assert!(hint.contains("--allow-empty-raft-rejoin"), "{hint}");
+
+        options.allow_empty_raft_rejoin = true;
+        let hint = amnesiac_timeout_hint(&report, &options).expect("hint for set flag");
+        assert!(hint.contains("failing to start"), "{hint}");
+    }
+
+    #[test]
+    fn amnesiac_timeout_hint_absent_when_target_has_applied_entries() {
+        let snapshot = ClusterSnapshot {
+            per_node: vec![
+                NodeMetricsView {
+                    node: n(1, "10.0.0.1"),
+                    groups: vec![group(7, 1, Some(2), 50, 50)],
+                },
+                NodeMetricsView {
+                    node: n(2, "10.0.0.2"),
+                    groups: vec![group(7, 2, Some(2), 100, 100)],
+                },
+            ],
+        };
+        let report = check_readiness(&snapshot, 1, 5);
+        assert!(!report.all_ready);
+        assert!(amnesiac_timeout_hint(&report, &RestartOptions::default()).is_none());
     }
 
     #[test]

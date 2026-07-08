@@ -1546,6 +1546,23 @@ pub(crate) async fn allow_raft_node_next_revert(
         Ok(resolved) => resolved,
         Err(response) => return *response,
     };
+    // The trigger is a fire-and-forget command that the raft core silently
+    // drops on non-leaders, so a 200 from a follower would report an arming
+    // that never happened. Refuse here like the transfer/membership handlers.
+    let metrics = raft.metrics().borrow_watched().clone();
+    if metrics.current_leader != Some(metrics.id) {
+        return json_response(
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "raft_group_id": raft_group_id.0,
+                "node_id": node_id,
+                "current_leader": metrics.current_leader,
+                "allow_next_revert": false,
+                "reason": "not leader",
+            })
+            .to_string(),
+        );
+    }
     match raft.trigger().allow_next_revert(&node_id, true).await {
         Ok(Ok(())) => json_response(
             StatusCode::OK,

@@ -3360,6 +3360,19 @@ async fn static_grpc_memory_node_rejoins_empty_after_allowed_log_revert() {
         .await
         .expect("wait for leader purge");
 
+    // A follower must refuse to arm the revert: the raft core drops the
+    // trigger on non-leaders, so a 200 here would report an arming that
+    // never happened.
+    let follower_base = peers[1].1.as_str();
+    let follower_reject = client
+        .post(format!(
+            "{follower_base}/__ursula/raft/0/nodes/3/allow-next-revert"
+        ))
+        .send()
+        .await
+        .expect("allow-next-revert request to follower");
+    assert_eq!(follower_reject.status(), StatusCode::CONFLICT);
+
     let allow_revert = client
         .post(format!(
             "{leader_base}/__ursula/raft/0/nodes/3/allow-next-revert"
