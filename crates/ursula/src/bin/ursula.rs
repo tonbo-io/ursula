@@ -15,8 +15,13 @@ use ursula_config::find_default_config;
 use ursula_config::load_config;
 use ursula_shard::RaftGroupId;
 
+#[cfg(not(feature = "jemalloc-prof"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "jemalloc-prof")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Ursula durable-stream server")]

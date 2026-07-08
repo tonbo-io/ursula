@@ -44,6 +44,8 @@ use axum::http::Method;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::http::Uri;
+#[cfg(feature = "jemalloc-prof")]
+use axum::http::header::CONTENT_DISPOSITION;
 use axum::http::header::CONTENT_LENGTH;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::header::LOCATION;
@@ -168,6 +170,16 @@ const HEADER_PREFER: &str = "prefer";
 const HEADER_X_CONTENT_TYPE_OPTIONS: &str = "x-content-type-options";
 const HEADER_CROSS_ORIGIN_RESOURCE_POLICY: &str = "cross-origin-resource-policy";
 const HEADER_URSULA_RAFT_LEADER_ID: &str = "x-ursula-raft-leader-id";
+#[cfg(feature = "jemalloc-prof")]
+const HEADER_URSULA_DEBUG_TOKEN: &str = "x-ursula-debug-token";
+// tikv-jemalloc-sys forces the `_rjem_` symbol prefix on Apple targets, so
+// jemalloc reads `_RJEM_MALLOC_CONF` there instead of `MALLOC_CONF`.
+#[cfg(feature = "jemalloc-prof")]
+const MALLOC_CONF_ENV_VAR: &str = if cfg!(target_vendor = "apple") {
+    "_RJEM_MALLOC_CONF"
+} else {
+    "MALLOC_CONF"
+};
 const APPEND_BATCH_MAX_ITEMS: usize = 512;
 const APPEND_BATCH_MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -905,7 +917,7 @@ async fn clear_maintenance_drain(State(state): State<HttpState>) -> Response {
 }
 
 pub fn client_router_with_admission(state: HttpState, admission: IngressAdmission) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/__ursula/metrics", get(metrics))
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route(
@@ -939,7 +951,10 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         .route(
             "/__ursula/leadership-shed/maintenance",
             post(mark_maintenance_drain).delete(clear_maintenance_drain),
-        )
+        );
+    #[cfg(feature = "jemalloc-prof")]
+    let router = router.route("/__ursula/debug/heap-profile", get(heap_profile));
+    router
         .route(
             "/v1/stream/{*path}",
             put(create_stream_v1)
@@ -1104,6 +1119,169 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         );
     }
     json_response(StatusCode::OK, body.to_string())
+}
+
+#[cfg(feature = "jemalloc-prof")]
+pub(crate) async fn heap_profile(headers: HeaderMap) -> Response {
+    if let Err(response) = authorize_debug_endpoint(&headers) {
+        return *response;
+    }
+
+    let profile = tokio::task::spawn_blocking(dump_jemalloc_heap_profile).await;
+    let bytes = match profile {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(HeapProfileError::Disabled(message))) => {
+            return json_response(
+                StatusCode::CONFLICT,
+                serde_json::json!({
+                    "error": "heap_profile_unavailable",
+                    "message": message,
+                    "required_build_feature": "jemalloc-prof",
+                    "required_malloc_conf":
+                        format!("{MALLOC_CONF_ENV_VAR}=prof:true,prof_active:true,lg_prof_sample:19"),
+                })
+                .to_string(),
+            );
+        }
+        Ok(Err(HeapProfileError::Io(message))) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({
+                    "error": "heap_profile_io_failed",
+                    "message": message,
+                })
+                .to_string(),
+            );
+        }
+        Err(err) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({
+                    "error": "heap_profile_task_failed",
+                    "message": err.to_string(),
+                })
+                .to_string(),
+            );
+        }
+    };
+
+    let mut response_headers = HeaderMap::new();
+    insert_default_response_headers(&mut response_headers);
+    response_headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    response_headers.insert(
+        CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"ursula-heap.heap\""),
+    );
+    (StatusCode::OK, response_headers, bytes).into_response()
+}
+
+#[cfg(feature = "jemalloc-prof")]
+fn authorize_debug_endpoint(headers: &HeaderMap) -> Result<(), BoxResponse> {
+    // Any failure answers with the router's plain 404 so unauthenticated
+    // probes cannot tell this endpoint apart from an unknown path.
+    let expected = match std::env::var("URSULA_DEBUG_TOKEN") {
+        Ok(token) if !token.is_empty() => token,
+        _ => return Err(Box::new(StatusCode::NOT_FOUND.into_response())),
+    };
+
+    let authorized = headers
+        .get(HEADER_URSULA_DEBUG_TOKEN)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|actual| constant_time_str_eq(actual, &expected));
+    if authorized {
+        Ok(())
+    } else {
+        Err(Box::new(StatusCode::NOT_FOUND.into_response()))
+    }
+}
+
+// Token comparison must not short-circuit on the first mismatching byte;
+// this route is reachable through the gateway, so response timing is
+// attacker-observable. Only the length may leak.
+#[cfg(feature = "jemalloc-prof")]
+fn constant_time_str_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+#[cfg(feature = "jemalloc-prof")]
+enum HeapProfileError {
+    /// Profiling cannot produce data under the current build or runtime
+    /// configuration; the response carries remediation hints.
+    Disabled(String),
+    /// The dump itself failed for reasons unrelated to configuration.
+    Io(String),
+}
+
+#[cfg(feature = "jemalloc-prof")]
+fn dump_jemalloc_heap_profile() -> Result<Vec<u8>, HeapProfileError> {
+    let profiling_enabled = tikv_jemalloc_ctl::profiling::prof::read()
+        .map_err(|err| HeapProfileError::Io(format!("read jemalloc opt.prof: {err}")))?;
+    if !profiling_enabled {
+        return Err(HeapProfileError::Disabled(format!(
+            "jemalloc profiling is disabled; restart with \
+             {MALLOC_CONF_ENV_VAR}=prof:true,prof_active:true"
+        )));
+    }
+
+    // Dump into a fresh mode-0700 temp directory: a fixed path in
+    // world-writable /tmp would be symlink-attackable, readable by other
+    // local users, and shared between co-located nodes.
+    let dump_dir = tempfile::tempdir()
+        .map_err(|err| HeapProfileError::Io(format!("create heap profile dir: {err}")))?;
+    let dump_path = dump_dir.path().join("ursula-heap.heap");
+    let dump_path = dump_path
+        .to_str()
+        .ok_or_else(|| HeapProfileError::Io("heap profile path is not UTF-8".to_owned()))?;
+    // `raw::write_str` only accepts a `'static` value; leaking the short
+    // path string on each authorized dump is the price of staying on the
+    // safe mallctl API.
+    let dump_path_nul: &'static [u8] =
+        Box::leak(format!("{dump_path}\0").into_bytes().into_boxed_slice());
+    tikv_jemalloc_ctl::raw::write_str(b"prof.dump\0", dump_path_nul).map_err(|err| {
+        HeapProfileError::Io(format!("dump jemalloc heap profile to {dump_path}: {err}"))
+    })?;
+    let bytes = std::fs::read(dump_path).map_err(|err| {
+        HeapProfileError::Io(format!("read jemalloc heap profile {dump_path}: {err}"))
+    })?;
+    if !heap_profile_has_samples(&bytes) {
+        return Err(HeapProfileError::Disabled(format!(
+            "heap profile contains no samples; ensure {MALLOC_CONF_ENV_VAR} sets \
+             prof_active:true and that jemalloc is this process's allocator"
+        )));
+    }
+    Ok(bytes)
+}
+
+// A jemalloc `heap_v2` dump aggregates its totals on the first `t*:` line as
+// `t*: <live count>: <live bytes> [...]`. Zero live samples means sampling is
+// not actually recording (prof_active:false, or jemalloc is linked but not
+// the process's global allocator), which must surface as an error instead of
+// an empty-but-200 profile.
+#[cfg(feature = "jemalloc-prof")]
+fn heap_profile_has_samples(profile: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(profile);
+    for line in text.lines() {
+        let Some(totals) = line.trim_start().strip_prefix("t*:") else {
+            continue;
+        };
+        return totals
+            .split(':')
+            .next()
+            .and_then(|count| count.trim().parse::<u64>().ok())
+            .is_none_or(|count| count > 0);
+    }
+    true
 }
 
 pub(crate) async fn flush_cold_stream(
