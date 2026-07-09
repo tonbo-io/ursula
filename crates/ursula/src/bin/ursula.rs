@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use ursula::HttpState;
@@ -215,6 +217,18 @@ async fn serve(
         .as_ref()
         .map(|s| s.parse::<SocketAddr>())
         .transpose()?;
+    let admin_listen: SocketAddr = config.server.admin_listen.parse()?;
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    spawn_shutdown_signal_task(shutdown.clone());
+
+    let admin_app = ursula::admin_router(state.clone());
+    let admin_listener = tokio::net::TcpListener::bind(admin_listen).await?;
+    let admin_task = tokio::spawn(serve_until_shutdown(
+        admin_listener,
+        admin_app,
+        shutdown.clone(),
+    ));
 
     if let Some(cluster_addr) = cluster_listen {
         let client_app = client_router_with_admission(
@@ -224,23 +238,97 @@ async fn serve(
         let cluster_app = cluster_router_from_state(state);
         let client_listener = tokio::net::TcpListener::bind(listen).await?;
         let cluster_listener = tokio::net::TcpListener::bind(cluster_addr).await?;
-        let client_task =
-            tokio::spawn(async move { axum::serve(client_listener, client_app).await });
-        let cluster_task =
-            tokio::spawn(async move { axum::serve(cluster_listener, cluster_app).await });
-        tokio::select! {
-            res = client_task => res??,
-            res = cluster_task => res??,
-        }
+        let client_task = tokio::spawn(serve_until_shutdown(
+            client_listener,
+            client_app,
+            shutdown.clone(),
+        ));
+        let cluster_task = tokio::spawn(serve_until_shutdown(
+            cluster_listener,
+            cluster_app,
+            shutdown,
+        ));
+        let (client_res, cluster_res, admin_res) =
+            tokio::try_join!(client_task, cluster_task, admin_task)?;
+        client_res?;
+        cluster_res?;
+        admin_res?;
     } else {
         let app = cluster_router_from_state(state.clone()).merge(client_router_with_admission(
             state,
             ursula::IngressAdmission::new(&config.server),
         ));
         let listener = tokio::net::TcpListener::bind(listen).await?;
-        axum::serve(listener, app).await?;
+        let serve_task = tokio::spawn(serve_until_shutdown(listener, app, shutdown));
+        let (serve_res, admin_res) = tokio::try_join!(serve_task, admin_task)?;
+        serve_res?;
+        admin_res?;
     }
+    tracing::info!("all listeners drained; exiting");
     Ok(())
+}
+
+/// Serve one listener until the shared shutdown notification fires, then stop
+/// accepting and drain in-flight requests before returning.
+async fn serve_until_shutdown(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    shutdown: Arc<tokio::sync::Notify>,
+) -> Result<(), std::io::Error> {
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move { shutdown.notified().await })
+        .await
+}
+
+/// Grace period between the first shutdown signal and a forced exit, so a hung
+/// in-flight request (or a long live-read poll) cannot block termination past
+/// what systemd/Kubernetes allot before SIGKILL.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
+
+/// Translate SIGTERM (systemd stop, Kubernetes pod termination) and Ctrl-C
+/// into one graceful-shutdown notification. A second signal, or the grace
+/// deadline expiring, exits immediately: quorum replication and the WAL make
+/// abrupt exit safe for acknowledged data, so the escape hatch stays cheap.
+fn spawn_shutdown_signal_task(shutdown: Arc<tokio::sync::Notify>) {
+    tokio::spawn(async move {
+        wait_for_termination_signal().await;
+        tracing::info!(
+            "received shutdown signal; draining listeners (forced exit after {SHUTDOWN_GRACE:?})"
+        );
+        shutdown.notify_waiters();
+        tokio::select! {
+            () = wait_for_termination_signal() => {
+                tracing::warn!("second shutdown signal; exiting immediately");
+            }
+            () = tokio::time::sleep(SHUTDOWN_GRACE) => {
+                tracing::warn!("shutdown grace period expired; exiting with drains incomplete");
+            }
+        }
+        std::process::exit(0);
+    });
+}
+
+async fn wait_for_termination_signal() {
+    #[cfg(unix)]
+    {
+        let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+        match sigterm {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(err) => {
+                tracing::error!("install SIGTERM handler: {err}; falling back to Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 pub mod metrics;
 pub mod observe;
+pub mod operation;
 pub mod orchestrate;
 pub mod plan;
 pub mod provider;
@@ -10,6 +11,8 @@ pub use metrics::RaftGroupView;
 pub use observe::StatusReport;
 pub use observe::wait_ready;
 pub use observe::write_status;
+pub use operation::AdminAccess;
+pub use operation::OperationProvider;
 pub use orchestrate::RestartOptions;
 pub use orchestrate::RestartOutcome;
 pub use orchestrate::RestartReport;
