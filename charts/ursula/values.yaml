@@ -37,16 +37,19 @@ server:
   # StatefulSet pod management policy. Parallel avoids readiness-gated bootstrap serialization.
   podManagementPolicy: Parallel
   ports:
-    # Ursula HTTP/admin client-plane process port.
+    # Ursula public client-plane HTTP port (stream reads/writes). The mutating
+    # admin plane binds to pod loopback (127.0.0.1:4438) and is intentionally
+    # not exposed as a container port or Service; reach it with
+    # `kubectl port-forward <pod> 4438:4438` and point ursulactl at it.
     client: 4437
   service:
-    # Render the internal client/admin Service.
+    # Render the internal client Service.
     enabled: true
-    # Client/admin Service type.
+    # Client Service type.
     type: ClusterIP
-    # Client/admin Service port.
+    # Client Service port.
     port: 4437
-    # Client/admin Service annotations.
+    # Client Service annotations.
     annotations: {}
   headlessService:
     # Headless peer Service annotations.

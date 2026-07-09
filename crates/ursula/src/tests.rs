@@ -5545,10 +5545,12 @@ async fn maintenance_drain_endpoint_marks_and_clears_leadership_shed() {
         .runtime,
         registry,
     );
-    let router = cluster_router_from_state(state.clone()).merge(client_router_with_admission(
-        state,
-        IngressAdmission::default(),
-    ));
+    let router = cluster_router_from_state(state.clone())
+        .merge(admin_ops_router(state.clone()))
+        .merge(client_router_with_admission(
+            state,
+            IngressAdmission::default(),
+        ));
 
     let response = router
         .clone()
@@ -5605,10 +5607,12 @@ async fn merged_router_serves_both_planes() {
         .expect("runtime")
         .runtime,
     );
-    let merged = cluster_router_from_state(state.clone()).merge(client_router_with_admission(
-        state,
-        IngressAdmission::default(),
-    ));
+    let merged = cluster_router_from_state(state.clone())
+        .merge(admin_ops_router(state.clone()))
+        .merge(client_router_with_admission(
+            state,
+            IngressAdmission::default(),
+        ));
     let merged_for_cluster = merged.clone();
 
     // Client-plane: HEAD on an unknown stream returns 404 (route mounted).

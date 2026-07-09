@@ -546,6 +546,7 @@ mod tests {
         NodeInfo {
             id,
             http_url: url::Url::parse(&format!("http://{host}:8080")).unwrap(),
+            admin_url: url::Url::parse(&format!("http://{host}:4438")).unwrap(),
             host: host.to_owned(),
             name: Some(format!("node-{id}")),
         }

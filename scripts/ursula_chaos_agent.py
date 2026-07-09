@@ -220,6 +220,16 @@ class Node:
         host = parsed.hostname or self.base_url
         return f"http://{host}:4492"
 
+    @property
+    def admin_url(self) -> str:
+        # Mutating raft operations moved off the public client plane to the
+        # admin plane (server.admin_listen, :4438). The chaos nodes bind it to
+        # the private interface and the security group restricts it to the
+        # client, so the agent reaches it directly.
+        parsed = urllib.parse.urlparse(self.base_url)
+        host = parsed.hostname or self.base_url
+        return f"http://{host}:4438"
+
 
 @dataclass
 class ProducerState:
@@ -1867,7 +1877,7 @@ class ChaosAgent:
                 try:
                     status, body, _ = self.request(
                         "POST",
-                        f"{node.base_url}/__ursula/raft/{group_id}/nodes/{target_id}/allow-next-revert",
+                        f"{node.admin_url}/__ursula/raft/{group_id}/nodes/{target_id}/allow-next-revert",
                     )
                 except Exception as exc:  # noqa: BLE001
                     last_error = str(exc)

@@ -130,6 +130,16 @@ Server HTTP probes are disabled in the current chart. Gateway probes use TCP
 socket checks, and cluster-level readiness should come from `helm test` or
 `ursulactl wait-ready`.
 
+The mutating operator surface (raft operations, maintenance drain, cold-flush
+trigger) lives on the admin plane bound to pod loopback (`127.0.0.1:4438`);
+reach it with `kubectl port-forward <pod> 4438:4438`.
+
+On pod termination the server handles SIGTERM by draining its listeners:
+it stops accepting, finishes in-flight requests, and exits 0, forcing exit
+after 20 seconds if a request hangs. Keep `terminationGracePeriodSeconds`
+above that (the Kubernetes default of 30s is fine). For zero-disruption
+rollouts, still drain leaderships first with `ursulactl restart`.
+
 ## Access locally
 
 ```bash

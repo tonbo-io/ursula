@@ -62,6 +62,11 @@ pub struct ServerConfig {
     /// Optional separate bind for the cluster / Raft gRPC plane.
     /// When omitted, both planes share `listen`.
     pub cluster_listen: Option<String>,
+    /// Admin-plane bind for mutating operator endpoints (raft ops,
+    /// maintenance drain, cold-flush trigger). Loopback by default so nodes
+    /// expose no cluster-mutation surface on the network; operator tooling
+    /// reaches it through an SSH/SSM/port-forward tunnel.
+    pub admin_listen: String,
     /// Process-wide cap on accepted write body bytes held by the HTTP layer.
     pub http_inflight_body_size: HumanSize,
 }
@@ -71,6 +76,7 @@ impl Default for ServerConfig {
         Self {
             listen: "127.0.0.1:4437".to_string(),
             cluster_listen: None,
+            admin_listen: "127.0.0.1:4438".to_string(),
             http_inflight_body_size: HumanSize::mib(256),
         }
     }

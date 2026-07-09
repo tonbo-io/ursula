@@ -9,6 +9,7 @@ use clap::Parser;
 use clap::Subcommand;
 use ursula_ctl::MetricsClient;
 use ursula_ctl::NodeProvider;
+use ursula_ctl::OperationProvider;
 use ursula_ctl::RestartOptions;
 use ursula_ctl::RestartOutcome;
 use ursula_ctl::StaticNodeProvider;
@@ -38,12 +39,45 @@ enum Command {
     WaitReady(WaitReadyArgs),
 }
 
+/// How to reach each node's loopback-bound admin plane. Shared by every
+/// subcommand.
+#[derive(Args, Debug)]
+struct AdminAccessArgs {
+    /// Shell command that opens a port-forward from a local port to a node's
+    /// admin plane, staying in the foreground for the tunnel's lifetime.
+    /// Placeholders: `{local_port}`, `{admin_port}`, `{admin_host}`, `{host}`,
+    /// `{node_id}`, `{name}`. When omitted, ursulactl hits `admin_url` directly
+    /// (assumes it is already reachable). Examples:
+    ///   ssh:  `ssh -N -L {local_port}:127.0.0.1:{admin_port} ec2-user@{host}`
+    ///   ssm:  `aws ssm start-session --target {name} --document-name AWS-StartPortForwardingSessionToRemoteHost --parameters host=127.0.0.1,portNumber={admin_port},localPortNumber={local_port}`
+    ///   kube: `kubectl port-forward pod/{name} {local_port}:{admin_port}`
+    #[arg(long, value_name = "CMD")]
+    admin_forward_cmd: Option<String>,
+    /// Seconds to wait for a forwarded local port to accept connections.
+    #[arg(long, default_value_t = 20)]
+    admin_forward_ready_secs: u64,
+}
+
+impl AdminAccessArgs {
+    fn provider(&self) -> OperationProvider {
+        match &self.admin_forward_cmd {
+            Some(template) => OperationProvider::Forward {
+                template: template.clone(),
+                ready_timeout: Duration::from_secs(self.admin_forward_ready_secs),
+            },
+            None => OperationProvider::Direct,
+        }
+    }
+}
+
 #[derive(Args, Debug)]
 struct ObserveArgs {
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
     #[arg(long, default_value_t = 10)]
     http_timeout_secs: u64,
+    #[command(flatten)]
+    admin: AdminAccessArgs,
 }
 
 #[derive(Args, Debug)]
@@ -60,6 +94,8 @@ struct WaitReadyArgs {
     poll_interval_secs: u64,
     #[arg(long, default_value_t = 5)]
     http_timeout_secs: u64,
+    #[command(flatten)]
+    admin: AdminAccessArgs,
 }
 
 #[derive(Args, Debug)]
@@ -99,6 +135,8 @@ struct RestartArgs {
     /// Print the drain plan and stop before issuing transfers or restart commands.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+    #[command(flatten)]
+    admin: AdminAccessArgs,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -114,26 +152,40 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn run_status_subcommand(args: ObserveArgs) -> Result<()> {
-    let provider = StaticNodeProvider::from_path(&args.config)?;
+/// Load the manifest and open admin access to every node. The returned
+/// `AdminAccess` must stay in scope for the whole operation — dropping it tears
+/// down any tunnels — so callers bind it and read `.nodes` from it.
+async fn connect_nodes(
+    config: &std::path::Path,
+    admin: &AdminAccessArgs,
+) -> Result<ursula_ctl::AdminAccess> {
+    let provider = StaticNodeProvider::from_path(config)
+        .with_context(|| format!("load node config {}", config.display()))?;
     let nodes = provider.list_nodes().await?;
+    if nodes.is_empty() {
+        bail!("node config {} contains no nodes", config.display());
+    }
+    admin.provider().connect(&nodes).await
+}
+
+async fn run_status_subcommand(args: ObserveArgs) -> Result<()> {
+    let access = connect_nodes(&args.config, &args.admin).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
-    let report = collect_status(&client, &nodes).await;
+    let report = collect_status(&client, &access.nodes).await;
     let mut stdout = std::io::stdout().lock();
     write_status(&mut stdout, &report)?;
     Ok(())
 }
 
 async fn run_wait_ready_subcommand(args: WaitReadyArgs) -> Result<()> {
-    let provider = StaticNodeProvider::from_path(&args.config)?;
-    let nodes = provider.list_nodes().await?;
     if args.expected_groups == 0 {
         bail!("--expected-groups must be positive");
     }
+    let access = connect_nodes(&args.config, &args.admin).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
     let snapshot = wait_ready(
         &client,
-        &nodes,
+        &access.nodes,
         args.expected_groups,
         Duration::from_secs(args.timeout_secs),
         Duration::from_secs(args.poll_interval_secs),
@@ -148,12 +200,7 @@ async fn run_wait_ready_subcommand(args: WaitReadyArgs) -> Result<()> {
 }
 
 async fn run_restart_subcommand(args: RestartArgs) -> Result<()> {
-    let provider = StaticNodeProvider::from_path(&args.config)
-        .with_context(|| format!("load node config {}", args.config.display()))?;
-    let nodes = provider.list_nodes().await?;
-    if nodes.is_empty() {
-        bail!("node config {} contains no nodes", args.config.display());
-    }
+    let access = connect_nodes(&args.config, &args.admin).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
     let options = RestartOptions {
         restart_cmd: args.restart_cmd.unwrap_or_default(),
@@ -165,7 +212,7 @@ async fn run_restart_subcommand(args: RestartArgs) -> Result<()> {
         only: args.only,
         dry_run: args.dry_run,
     };
-    let report = run_restart(&nodes, &client, &options).await?;
+    let report = run_restart(&access.nodes, &client, &options).await?;
     for (id, outcome) in &report.per_node {
         match outcome {
             RestartOutcome::Restarted => println!("node {id}: restarted"),
