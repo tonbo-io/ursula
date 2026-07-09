@@ -157,8 +157,15 @@ struct RestartArgs {
     /// Seconds to wait for a target to relinquish all leaderships before aborting.
     #[arg(long, default_value_t = 60)]
     drain_timeout_secs: u64,
-    /// Seconds to wait for a target to come back as voter + caught-up before aborting.
-    #[arg(long, default_value_t = 180)]
+    /// Abort the post-restart wait if the target makes no catch-up progress for
+    /// this long (no new applied entries or voter memberships). This is the
+    /// real control; a steadily rebuilding node is never timed out.
+    #[arg(long, default_value_t = 90)]
+    stall_timeout_secs: u64,
+    /// Absolute backstop on the post-restart wait, above the stall detector.
+    /// A healthy rollout finishes as soon as the target catches up regardless,
+    /// so this only bounds pathological cases; size it above a full rebuild.
+    #[arg(long, default_value_t = 1800)]
     ready_timeout_secs: u64,
     /// Poll interval between metrics fetches.
     #[arg(long, default_value_t = 2)]
@@ -260,6 +267,7 @@ async fn run_restart_subcommand(args: RestartArgs) -> Result<()> {
         ready_timeout: Duration::from_secs(args.ready_timeout_secs),
         poll_interval: Duration::from_secs(args.poll_interval_secs),
         lag_tolerance: args.lag_tolerance,
+        stall_timeout: Duration::from_secs(args.stall_timeout_secs),
         force_allow_empty: args.allow_empty_raft_rejoin,
         only: args.only,
         dry_run: args.dry_run,
