@@ -36,6 +36,62 @@ impl Drop for ChildGuard {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_sigterm_drains_listeners_and_exits_cleanly() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping SIGTERM smoke test");
+        return;
+    };
+    let port = free_port();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let root = std::env::temp_dir().join(format!(
+        "ursula-cli-sigterm-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create temp root");
+    let config_path = root.join("cluster.toml");
+    let log_dir = root.join("raft-log");
+    write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, true, &log_dir);
+
+    let mut child = spawn_node_with_cluster_config(binary, &config_path);
+    let client = reqwest::Client::new();
+    wait_until_ready(&client, &base_url, std::slice::from_mut(&mut child)).await;
+
+    let pid = child.child.id();
+    let kill_status = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()
+        .expect("send SIGTERM");
+    assert!(kill_status.success(), "kill -TERM failed: {kill_status}");
+
+    // The server drains its listeners and must exit 0 well inside the 20s
+    // forced-exit grace period; a SIGKILL'd or crashed exit fails the test.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let exit_status = loop {
+        if let Some(status) = child.child.try_wait().expect("poll child") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node did not exit within 30s of SIGTERM"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(
+        exit_status.success(),
+        "expected clean exit after SIGTERM, got {exit_status}"
+    );
+
+    std::fs::remove_dir_all(&root).expect("remove temp root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_cluster_forwards_follower_writes() {
     let _guard = static_cluster_cli_test_guard().await;
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
