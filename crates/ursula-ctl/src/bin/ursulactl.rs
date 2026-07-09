@@ -39,34 +39,81 @@ enum Command {
     WaitReady(WaitReadyArgs),
 }
 
-/// How to reach each node's loopback-bound admin plane. Shared by every
-/// subcommand.
+/// How ursulactl reaches each node's loopback-bound admin plane. A named
+/// provider builds its own forward/restart commands; the manifest's optional
+/// `[provider]` block supplies defaults and these flags override it.
 #[derive(Args, Debug)]
-struct AdminAccessArgs {
-    /// Shell command that opens a port-forward from a local port to a node's
-    /// admin plane, staying in the foreground for the tunnel's lifetime.
-    /// Placeholders: `{local_port}`, `{admin_port}`, `{admin_host}`, `{host}`,
-    /// `{node_id}`, `{name}`. When omitted, ursulactl hits `admin_url` directly
-    /// (assumes it is already reachable). Examples:
-    ///   ssh:  `ssh -N -L {local_port}:127.0.0.1:{admin_port} ec2-user@{host}`
-    ///   ssm:  `aws ssm start-session --target {name} --document-name AWS-StartPortForwardingSessionToRemoteHost --parameters host=127.0.0.1,portNumber={admin_port},localPortNumber={local_port}`
-    ///   kube: `kubectl port-forward pod/{name} {local_port}:{admin_port}`
+struct ProviderArgs {
+    /// Transport: `direct` (admin reachable, observe-only), `ssh`, `eice`
+    /// (ssh over AWS EC2 Instance Connect), or `command` (raw templates).
+    /// Overrides the manifest `[provider] kind`.
+    #[arg(long)]
+    provider: Option<String>,
+    /// AWS region (eice).
+    #[arg(long)]
+    region: Option<String>,
+    /// SSH login user (ssh, eice).
+    #[arg(long)]
+    ssh_user: Option<String>,
+    /// SSH private key path (ssh, eice); its `.pub` is sent for eice.
+    #[arg(long)]
+    ssh_key: Option<String>,
+    /// systemd unit to restart (ssh, eice).
+    #[arg(long)]
+    restart_unit: Option<String>,
+    /// Raw port-forward command for `--provider command`. Placeholders:
+    /// `{local_port}` `{admin_port}` `{admin_host}` `{host}` `{instance_id}`
+    /// `{node_id}` `{name}`.
     #[arg(long, value_name = "CMD")]
-    admin_forward_cmd: Option<String>,
+    forward_cmd: Option<String>,
+    /// Raw restart command for `--provider command`. Same placeholders minus
+    /// the port ones.
+    #[arg(long, value_name = "CMD")]
+    restart_cmd: Option<String>,
     /// Seconds to wait for a forwarded local port to accept connections.
     #[arg(long, default_value_t = 20)]
-    admin_forward_ready_secs: u64,
+    forward_ready_secs: u64,
 }
 
-impl AdminAccessArgs {
-    fn provider(&self) -> OperationProvider {
-        match &self.admin_forward_cmd {
-            Some(template) => OperationProvider::Forward {
-                template: template.clone(),
-                ready_timeout: Duration::from_secs(self.admin_forward_ready_secs),
-            },
-            None => OperationProvider::Direct,
-        }
+impl ProviderArgs {
+    /// Merge manifest `[provider]` defaults with these flag overrides into a
+    /// resolved [`OperationProvider`].
+    fn resolve(&self, manifest: Option<&ursula_ctl::RawProvider>) -> Result<OperationProvider> {
+        let m = manifest;
+        let kind_str = self
+            .provider
+            .clone()
+            .or_else(|| m.and_then(|p| p.kind.clone()))
+            .unwrap_or_else(|| "direct".to_owned());
+        let kind = ursula_ctl::ProviderKind::parse(&kind_str)?;
+        Ok(OperationProvider {
+            kind,
+            region: self
+                .region
+                .clone()
+                .or_else(|| m.and_then(|p| p.region.clone())),
+            ssh_user: self
+                .ssh_user
+                .clone()
+                .or_else(|| m.and_then(|p| p.ssh_user.clone())),
+            ssh_key: self
+                .ssh_key
+                .clone()
+                .or_else(|| m.and_then(|p| p.ssh_key.clone())),
+            restart_unit: self
+                .restart_unit
+                .clone()
+                .or_else(|| m.and_then(|p| p.restart_unit.clone())),
+            forward_cmd: self
+                .forward_cmd
+                .clone()
+                .or_else(|| m.and_then(|p| p.forward_cmd.clone())),
+            restart_cmd: self
+                .restart_cmd
+                .clone()
+                .or_else(|| m.and_then(|p| p.restart_cmd.clone())),
+            forward_ready: Duration::from_secs(self.forward_ready_secs),
+        })
     }
 }
 
@@ -77,7 +124,7 @@ struct ObserveArgs {
     #[arg(long, default_value_t = 10)]
     http_timeout_secs: u64,
     #[command(flatten)]
-    admin: AdminAccessArgs,
+    provider: ProviderArgs,
 }
 
 #[derive(Args, Debug)]
@@ -95,7 +142,7 @@ struct WaitReadyArgs {
     #[arg(long, default_value_t = 5)]
     http_timeout_secs: u64,
     #[command(flatten)]
-    admin: AdminAccessArgs,
+    provider: ProviderArgs,
 }
 
 #[derive(Args, Debug)]
@@ -103,11 +150,6 @@ struct RestartArgs {
     /// Path to the node config JSON (compatible with scripts/ursula_ec2.py's nodes.json).
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
-    /// Shell command template to restart a single node. Supported placeholders:
-    /// `{node_id}`, `{host}`, `{http_url}`, `{name}`. Example:
-    /// `ssh ec2-user@{host} sudo systemctl restart ursula-chaos.service`
-    #[arg(long, value_name = "CMD")]
-    restart_cmd: Option<String>,
     /// Restrict the rollout to these node ids (in the supplied order).
     /// Default: every node from the provider, in config order.
     #[arg(long = "only", value_delimiter = ',')]
@@ -136,7 +178,7 @@ struct RestartArgs {
     #[arg(long, default_value_t = false)]
     dry_run: bool,
     #[command(flatten)]
-    admin: AdminAccessArgs,
+    provider: ProviderArgs,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -152,24 +194,31 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Load the manifest and open admin access to every node. The returned
+/// Load the manifest, resolve the provider (manifest `[provider]` block merged
+/// with CLI flags), and open admin access to every node. The returned
 /// `AdminAccess` must stay in scope for the whole operation — dropping it tears
-/// down any tunnels — so callers bind it and read `.nodes` from it.
+/// down any tunnels — so callers bind it and read `.nodes` from it. The
+/// resolved provider is returned alongside so `restart` can build restart
+/// commands from it.
 async fn connect_nodes(
     config: &std::path::Path,
-    admin: &AdminAccessArgs,
-) -> Result<ursula_ctl::AdminAccess> {
-    let provider = StaticNodeProvider::from_path(config)
+    args: &ProviderArgs,
+    restart_needed: bool,
+) -> Result<(OperationProvider, ursula_ctl::AdminAccess)> {
+    let manifest = StaticNodeProvider::from_path(config)
         .with_context(|| format!("load node config {}", config.display()))?;
-    let nodes = provider.list_nodes().await?;
+    let nodes = manifest.list_nodes().await?;
     if nodes.is_empty() {
         bail!("node config {} contains no nodes", config.display());
     }
-    admin.provider().connect(&nodes).await
+    let provider = args.resolve(manifest.provider_config())?;
+    provider.validate(restart_needed)?;
+    let access = provider.connect(&nodes).await?;
+    Ok((provider, access))
 }
 
 async fn run_status_subcommand(args: ObserveArgs) -> Result<()> {
-    let access = connect_nodes(&args.config, &args.admin).await?;
+    let (_provider, access) = connect_nodes(&args.config, &args.provider, false).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
     let report = collect_status(&client, &access.nodes).await;
     let mut stdout = std::io::stdout().lock();
@@ -181,7 +230,7 @@ async fn run_wait_ready_subcommand(args: WaitReadyArgs) -> Result<()> {
     if args.expected_groups == 0 {
         bail!("--expected-groups must be positive");
     }
-    let access = connect_nodes(&args.config, &args.admin).await?;
+    let (_provider, access) = connect_nodes(&args.config, &args.provider, false).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
     let snapshot = wait_ready(
         &client,
@@ -200,10 +249,11 @@ async fn run_wait_ready_subcommand(args: WaitReadyArgs) -> Result<()> {
 }
 
 async fn run_restart_subcommand(args: RestartArgs) -> Result<()> {
-    let access = connect_nodes(&args.config, &args.admin).await?;
+    // dry-run only prints the plan, so it needs no restart channel.
+    let restart_needed = !args.dry_run;
+    let (provider, access) = connect_nodes(&args.config, &args.provider, restart_needed).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
     let options = RestartOptions {
-        restart_cmd: args.restart_cmd.unwrap_or_default(),
         drain_timeout: Duration::from_secs(args.drain_timeout_secs),
         ready_timeout: Duration::from_secs(args.ready_timeout_secs),
         poll_interval: Duration::from_secs(args.poll_interval_secs),
@@ -212,7 +262,7 @@ async fn run_restart_subcommand(args: RestartArgs) -> Result<()> {
         only: args.only,
         dry_run: args.dry_run,
     };
-    let report = run_restart(&access.nodes, &client, &options).await?;
+    let report = run_restart(&access.nodes, &client, &provider, &options).await?;
     for (id, outcome) in &report.per_node {
         match outcome {
             RestartOutcome::Restarted => println!("node {id}: restarted"),

@@ -17,7 +17,6 @@ use crate::provider::NodeInfo;
 
 #[derive(Debug, Clone)]
 pub struct RestartOptions {
-    pub restart_cmd: String,
     pub drain_timeout: Duration,
     pub ready_timeout: Duration,
     pub poll_interval: Duration,
@@ -27,14 +26,13 @@ pub struct RestartOptions {
     pub allow_empty_raft_rejoin: bool,
     /// Per-node ids to restart, in order. Empty means every node from the provider.
     pub only: Option<Vec<u64>>,
-    /// Print plan without executing the restart_cmd.
+    /// Print plan without executing the restart command.
     pub dry_run: bool,
 }
 
 impl Default for RestartOptions {
     fn default() -> Self {
         Self {
-            restart_cmd: String::new(),
             drain_timeout: Duration::from_secs(60),
             ready_timeout: Duration::from_secs(120),
             poll_interval: Duration::from_secs(2),
@@ -72,13 +70,11 @@ impl RestartReport {
 pub async fn run_restart(
     nodes: &[NodeInfo],
     client: &MetricsClient,
+    provider: &crate::operation::OperationProvider,
     options: &RestartOptions,
 ) -> Result<RestartReport> {
     if nodes.is_empty() {
         bail!("provider returned no nodes");
-    }
-    if options.restart_cmd.trim().is_empty() && !options.dry_run {
-        bail!("--restart-cmd is required unless --dry-run is set");
     }
     let ordered: Vec<&NodeInfo> = match &options.only {
         Some(ids) => {
@@ -110,7 +106,7 @@ pub async fn run_restart(
             idx + 1,
             ordered.len()
         );
-        let outcome = restart_one(nodes, target, client, options).await;
+        let outcome = restart_one(nodes, target, client, provider, options).await;
         match &outcome {
             Ok(RestartOutcome::Aborted { reason }) => {
                 tracing::error!(
@@ -146,6 +142,7 @@ async fn restart_one(
     nodes: &[NodeInfo],
     target: &NodeInfo,
     client: &MetricsClient,
+    provider: &crate::operation::OperationProvider,
     options: &RestartOptions,
 ) -> Result<RestartOutcome> {
     if !options.dry_run {
@@ -257,8 +254,16 @@ async fn restart_one(
         });
     }
 
-    // Execute --restart-cmd.
-    if let Err(err) = execute_restart_cmd(target, &options.restart_cmd).await {
+    // Execute the provider's restart command for this node.
+    let restart_cmd = match provider.restart_command(target) {
+        Ok(cmd) => cmd,
+        Err(err) => {
+            clear_maintenance_drain(client, target).await;
+            return Err(err)
+                .with_context(|| format!("build restart command for node {}", target.id));
+        }
+    };
+    if let Err(err) = execute_restart_cmd(target, &restart_cmd).await {
         clear_maintenance_drain(client, target).await;
         return Err(err).with_context(|| format!("restart command for node {}", target.id));
     }
@@ -505,15 +510,15 @@ fn format_unready(_snap: &ClusterSnapshot, report: &crate::plan::ReadinessReport
     }
 }
 
-async fn execute_restart_cmd(target: &NodeInfo, template: &str) -> Result<()> {
-    let rendered = render_template(template, target);
+/// Run the provider-built restart command (already fully rendered) under `sh -c`.
+async fn execute_restart_cmd(target: &NodeInfo, rendered: &str) -> Result<()> {
     tracing::info!(
         "exec restart command: target_node_id={} cmd={rendered}",
         target.id
     );
     let status = Command::new("sh")
         .arg("-c")
-        .arg(&rendered)
+        .arg(rendered)
         .stdin(Stdio::null())
         .status()
         .await
@@ -522,17 +527,6 @@ async fn execute_restart_cmd(target: &NodeInfo, template: &str) -> Result<()> {
         bail!("restart command exited with {status}: {rendered}");
     }
     Ok(())
-}
-
-fn render_template(template: &str, node: &NodeInfo) -> String {
-    template
-        .replace("{node_id}", &node.id.to_string())
-        .replace("{host}", &node.host)
-        .replace("{http_url}", node.http_url.as_str())
-        .replace(
-            "{name}",
-            node.name.as_deref().unwrap_or(&node.id.to_string()),
-        )
 }
 
 #[cfg(test)]
@@ -545,22 +539,29 @@ mod tests {
     fn n(id: u64, host: &str) -> NodeInfo {
         NodeInfo {
             id,
-            http_url: url::Url::parse(&format!("http://{host}:8080")).unwrap(),
             admin_url: url::Url::parse(&format!("http://{host}:4438")).unwrap(),
             host: host.to_owned(),
+            instance_id: None,
+            ssh_host: None,
+            http_url: Some(url::Url::parse(&format!("http://{host}:8080")).unwrap()),
             name: Some(format!("node-{id}")),
         }
     }
 
     #[test]
-    fn render_template_substitutes_known_placeholders() {
-        let rendered = render_template(
-            "ssh ec2-user@{host} sudo systemctl restart ursula-chaos@{node_id}.service # {name}",
-            &n(3, "10.0.0.3"),
-        );
+    fn ssh_provider_builds_restart_command() {
+        use crate::operation::OperationProvider;
+        use crate::operation::ProviderKind;
+        let provider = OperationProvider {
+            kind: ProviderKind::Ssh,
+            ssh_user: Some("ec2-user".to_owned()),
+            restart_unit: Some("ursula-chaos.service".to_owned()),
+            ..Default::default()
+        };
+        let rendered = provider.restart_command(&n(3, "10.0.0.3")).unwrap();
         assert_eq!(
             rendered,
-            "ssh ec2-user@10.0.0.3 sudo systemctl restart ursula-chaos@3.service # node-3"
+            "ssh -o StrictHostKeyChecking=no -o BatchMode=yes ec2-user@10.0.0.3 'sudo systemctl restart ursula-chaos.service'"
         );
     }
 
