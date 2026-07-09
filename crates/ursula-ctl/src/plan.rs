@@ -206,6 +206,7 @@ mod tests {
         NodeMetricsView {
             node: node(node_id),
             groups,
+            wal_backend: None,
         }
     }
 

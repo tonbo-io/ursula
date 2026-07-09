@@ -193,6 +193,7 @@ impl RollingRestartValidator {
                     voter_ids,
                     learner_ids,
                 }],
+                wal_backend: None,
             };
             per_node.push(view);
         }

@@ -188,6 +188,9 @@ pub struct TransferLeaderResponse {
 struct RawMetrics {
     #[serde(default)]
     raft_groups: Vec<RawRaftGroup>,
+    /// Raft WAL backend (`"memory"`/`"disk"`); absent on older servers.
+    #[serde(default)]
+    wal_backend: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -210,6 +213,9 @@ struct RawRaftGroup {
 pub struct NodeMetricsView {
     pub node: NodeInfo,
     pub groups: Vec<RaftGroupView>,
+    /// Raft WAL backend this node reports (`"memory"`/`"disk"`); `None` on
+    /// servers predating the field.
+    pub wal_backend: Option<String>,
 }
 
 impl NodeMetricsView {
@@ -227,7 +233,11 @@ impl NodeMetricsView {
                 learner_ids: g.learner_ids,
             })
             .collect();
-        Self { node, groups }
+        Self {
+            node,
+            groups,
+            wal_backend: raw.wal_backend,
+        }
     }
 
     pub fn group(&self, raft_group_id: u64) -> Option<&RaftGroupView> {

@@ -229,10 +229,12 @@ mod tests {
                 NodeMetricsView {
                     node: node(1),
                     groups: vec![group(7, Some(1)), group(8, Some(2))],
+                    wal_backend: None,
                 },
                 NodeMetricsView {
                     node: node(2),
                     groups: vec![group(7, Some(1)), group(8, Some(2))],
+                    wal_backend: None,
                 },
             ],
         };
@@ -246,6 +248,7 @@ mod tests {
             per_node: vec![NodeMetricsView {
                 node: node(1),
                 groups: vec![group(7, None)],
+                wal_backend: None,
             }],
         };
         let mut summary = String::new();
@@ -259,6 +262,7 @@ mod tests {
             per_node: vec![NodeMetricsView {
                 node: node(1),
                 groups: vec![group(7, Some(1)), empty_group(8)],
+                wal_backend: None,
             }],
         };
         let mut summary = String::new();

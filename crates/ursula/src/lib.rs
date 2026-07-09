@@ -222,6 +222,10 @@ pub struct HttpState {
     pub node_memory: NodeMemoryMonitor,
     leadership_shed: LeadershipShedFlag,
     external_payload_min_bytes: usize,
+    /// Raft WAL backend name (`"memory"` / `"disk"`) surfaced in the metrics
+    /// JSON so operator tooling can tell a volatile node from a durable one
+    /// (e.g. ursulactl auto-enabling empty-log rejoin only for `memory`).
+    wal_backend: &'static str,
 }
 
 impl HttpState {
@@ -242,6 +246,7 @@ impl HttpState {
             node_memory: NodeMemoryMonitor::default(),
             leadership_shed: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             external_payload_min_bytes: 1024 * 1024,
+            wal_backend: "memory",
         }
     }
 
@@ -259,6 +264,7 @@ impl HttpState {
             node_memory: NodeMemoryMonitor::default(),
             leadership_shed,
             external_payload_min_bytes: 1024 * 1024,
+            wal_backend: "memory",
         }
     }
 
@@ -297,6 +303,7 @@ impl HttpState {
             node_memory: NodeMemoryMonitor::default(),
             leadership_shed,
             external_payload_min_bytes: 1024 * 1024,
+            wal_backend: "memory",
         }
     }
 
@@ -325,6 +332,12 @@ impl HttpState {
 
     pub fn with_external_payload_min_bytes(mut self, min_bytes: usize) -> Self {
         self.external_payload_min_bytes = min_bytes;
+        self
+    }
+
+    /// Record the raft WAL backend so it appears in the metrics JSON.
+    pub fn with_wal_backend(mut self, backend: &'static str) -> Self {
+        self.wal_backend = backend;
         self
     }
 
@@ -1145,6 +1158,10 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         object.insert(
             "node_memory_abort_cap_bytes".to_owned(),
             serde_json::json!(cap),
+        );
+        object.insert(
+            "wal_backend".to_owned(),
+            serde_json::json!(state.wal_backend),
         );
     }
     json_response(StatusCode::OK, body.to_string())
