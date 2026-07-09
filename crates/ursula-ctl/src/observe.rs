@@ -190,6 +190,7 @@ mod tests {
         NodeInfo {
             id,
             http_url: Url::parse(&format!("http://10.0.0.{id}/")).unwrap(),
+            admin_url: Url::parse(&format!("http://10.0.0.{id}:4438")).unwrap(),
             host: format!("10.0.0.{id}"),
             name: None,
         }

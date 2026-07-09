@@ -6,13 +6,21 @@ use serde::Deserialize;
 use serde::Serialize;
 use url::Url;
 
+/// Default admin-plane port; must match `server.admin_listen`'s default.
+const DEFAULT_ADMIN_PORT: u16 = 4438;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
     pub id: u64,
     pub http_url: Url,
-    /// Host string used for {host} template interpolation in --restart-cmd.
-    /// Typically equals http_url's host but may differ when ursulactl talks to
-    /// a public address while the restart command targets a private one.
+    /// Admin-plane endpoint carrying the operator surface (raft ops,
+    /// maintenance drain, metrics). ursulactl sends every request here, never
+    /// to the public client plane. Nodes bind this to loopback, so this URL is
+    /// typically reached through a tunnel an [`OperationProvider`] sets up.
+    pub admin_url: Url,
+    /// Host string used for {host} template interpolation in --restart-cmd and
+    /// forward commands. Typically equals http_url's host but may differ when
+    /// ursulactl talks to a public address while commands target a private one.
     pub host: String,
     #[serde(default)]
     pub name: Option<String>,
@@ -98,6 +106,10 @@ struct RawNode {
     #[serde(default)]
     http_url: Option<String>,
     #[serde(default)]
+    admin_url: Option<String>,
+    #[serde(default)]
+    admin_port: Option<u16>,
+    #[serde(default)]
     host: Option<String>,
     #[serde(default)]
     public_ip: Option<String>,
@@ -150,9 +162,17 @@ impl RawNode {
                 .to_owned();
             (parsed, host)
         };
+        let admin_url = if let Some(url) = self.admin_url.as_deref().and_then(non_empty) {
+            Url::parse(url).with_context(|| format!("invalid admin_url for node {}", self.id))?
+        } else {
+            let admin_port = self.admin_port.unwrap_or(DEFAULT_ADMIN_PORT);
+            Url::parse(&format!("http://{host}:{admin_port}"))
+                .with_context(|| format!("synthesize admin_url for node {}", self.id))?
+        };
         Ok(NodeInfo {
             id: self.id,
             http_url,
+            admin_url,
             host,
             name: self.name,
         })

@@ -11,7 +11,7 @@
     "path": "crates/ursula-runtime/src/cold_store.rs",
     "snippet_contains": "SystemTime::now()",
     "reason": "already-cfg-gated",
-    "plan": "no action: cold_object_unix_nanos() is split — cfg(not(madsim)) calls SystemTime::now(); cfg(madsim) returns 0. Cold object uniqueness under cfg(madsim) is provided by COLD_CHUNK_SEQUENCE, and reset_cold_chunk_sequence_for_sim() lets the simulator clear the counter between scenarios for Runtime::check_determinism replay."
+    "plan": "no action: cold_object_unix_nanos() is split \u2014 cfg(not(madsim)) calls SystemTime::now(); cfg(madsim) returns 0. Cold object uniqueness under cfg(madsim) is provided by COLD_CHUNK_SEQUENCE, and reset_cold_chunk_sequence_for_sim() lets the simulator clear the counter between scenarios for Runtime::check_determinism replay."
   },
   {
     "category": "system_time_now",
@@ -39,7 +39,7 @@
     "path": "crates/ursula-raft/src/log_store/file.rs",
     "snippet_contains": "std::thread::Builder::new()",
     "reason": "already-cfg-gated",
-    "plan": "no action: CoreFileLogWriter::shared has split impls — cfg(not(madsim)) spawns the writer thread, cfg(madsim) panics with a message pointing simulator paths at memory-backed RaftGroupEngineFactory / RegisteredRaftGroupEngineFactory / MadsimScopedRaftGroupEngineFactory"
+    "plan": "no action: CoreFileLogWriter::shared has split impls \u2014 cfg(not(madsim)) spawns the writer thread, cfg(madsim) panics with a message pointing simulator paths at memory-backed RaftGroupEngineFactory / RegisteredRaftGroupEngineFactory / MadsimScopedRaftGroupEngineFactory"
   },
   {
     "category": "std_thread_sleep",
@@ -61,5 +61,12 @@
     "snippet_contains": "use std::time::Instant;",
     "reason": "not-sim-reachable",
     "plan": "no action: orchestrate.rs holds the host-only drain / wait-ready deadline loops invoked by the ursulactl binary. DST reaches ursula-ctl through ursula_ctl::plan helpers only, which take pre-built ClusterSnapshot/NodeMetricsView arguments and don't touch wall-clock time."
+  },
+  {
+    "category": "std_time_instant_import",
+    "path": "crates/ursula-ctl/src/operation.rs",
+    "snippet_contains": "use std::time::Instant;",
+    "reason": "not-sim-reachable",
+    "plan": "no action: operation.rs holds the host-only port-forward readiness deadline used when ursulactl opens admin-plane tunnels. DST reaches ursula-ctl through ursula_ctl::plan helpers only; OperationProvider spawns real subprocesses and is never invoked from madsim scenarios."
   }
 ]
