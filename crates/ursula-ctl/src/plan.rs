@@ -193,9 +193,11 @@ mod tests {
     fn node(id: u64) -> NodeInfo {
         NodeInfo {
             id,
-            http_url: Url::parse(&format!("http://10.0.0.{id}:8080")).unwrap(),
             admin_url: Url::parse(&format!("http://10.0.0.{id}:4438")).unwrap(),
             host: format!("10.0.0.{id}"),
+            instance_id: None,
+            ssh_host: None,
+            http_url: Some(Url::parse(&format!("http://10.0.0.{id}:8080")).unwrap()),
             name: None,
         }
     }
