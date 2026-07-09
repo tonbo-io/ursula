@@ -21,6 +21,12 @@ pub struct RestartOptions {
     pub ready_timeout: Duration,
     pub poll_interval: Duration,
     pub lag_tolerance: u64,
+    /// Abort the post-restart readiness wait when the target makes no catch-up
+    /// progress (no new applied entries, no new voter memberships) for this
+    /// long. This is the real control: a rebuild that keeps advancing is never
+    /// timed out, while a stuck or crash-looping node aborts quickly.
+    /// `ready_timeout` is only an absolute backstop above it.
+    pub stall_timeout: Duration,
     /// Force empty-log rejoin on regardless of detected backend. Normally the
     /// policy is auto-derived from each node's reported `wal_backend`: `memory`
     /// enables it, `disk` refuses it, an older server with no field honors this
@@ -40,6 +46,7 @@ impl Default for RestartOptions {
             ready_timeout: Duration::from_secs(120),
             poll_interval: Duration::from_secs(2),
             lag_tolerance: 16,
+            stall_timeout: Duration::from_secs(90),
             force_allow_empty: false,
             only: None,
             dry_run: false,
@@ -351,8 +358,14 @@ async fn restart_one(
         return Err(err).with_context(|| format!("restart command for node {}", target.id));
     }
 
-    // Wait for readiness.
-    let deadline = Instant::now() + options.ready_timeout;
+    // Wait for readiness, gated on progress rather than a fixed wall-clock
+    // budget: a target whose applied index (or voter membership) keeps
+    // advancing is still rebuilding and must not be timed out, while one that
+    // stops advancing aborts within `stall_timeout`. `ready_timeout` is only an
+    // absolute backstop.
+    let ceiling = Instant::now() + options.ready_timeout;
+    let mut best = TargetProgress::default();
+    let mut last_advance = Instant::now();
     loop {
         let snap = client.try_fetch_cluster(nodes).await;
         let report = check_readiness(&snap, target.id, options.lag_tolerance);
@@ -369,13 +382,27 @@ async fn restart_one(
             .await?;
             return Ok(RestartOutcome::Restarted);
         }
-        if Instant::now() >= deadline {
+
+        let now = Instant::now();
+        let current = TargetProgress::of(&report);
+        if current.advanced_past(&best) {
+            best = current;
+            last_advance = now;
+        }
+
+        let stalled = now.duration_since(last_advance) >= options.stall_timeout;
+        let hit_ceiling = now >= ceiling;
+        if stalled || hit_ceiling {
             clear_maintenance_drain(client, target).await;
-            let mut reason = format!(
-                "readiness timeout after {:?}: {}",
-                options.ready_timeout,
-                format_unready(&snap, &report)
-            );
+            let cause = if hit_ceiling {
+                format!(
+                    "readiness backstop reached after {:?}",
+                    options.ready_timeout
+                )
+            } else {
+                format!("no catch-up progress for {:?}", options.stall_timeout)
+            };
+            let mut reason = format!("{cause}: {}", format_unready(&snap, &report));
             if let Some(hint) = amnesiac_timeout_hint(&report, allow_empty) {
                 reason.push_str("; ");
                 reason.push_str(hint);
@@ -383,6 +410,35 @@ async fn restart_one(
             return Ok(RestartOutcome::Aborted { reason });
         }
         tokio::time::sleep(options.poll_interval).await;
+    }
+}
+
+/// A monotonic snapshot of how far a restarting target has caught up. Both
+/// components only grow during a healthy rebuild: `applied_sum` climbs as
+/// entries (or a whole snapshot) are applied, and `voters_ready` climbs as the
+/// target rejoins each group's voter set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TargetProgress {
+    applied_sum: u128,
+    voters_ready: usize,
+}
+
+impl TargetProgress {
+    fn of(report: &crate::plan::ReadinessReport) -> Self {
+        let mut p = TargetProgress::default();
+        for g in report.per_group.values() {
+            p.applied_sum += u128::from(g.target_applied_index.unwrap_or(0));
+            if g.voter_member {
+                p.voters_ready += 1;
+            }
+        }
+        p
+    }
+
+    /// True if either dimension advanced past `prev` — any forward motion
+    /// resets the stall clock.
+    fn advanced_past(&self, prev: &TargetProgress) -> bool {
+        self.applied_sum > prev.applied_sum || self.voters_ready > prev.voters_ready
     }
 }
 
@@ -712,6 +768,41 @@ mod tests {
 
         let hint = amnesiac_timeout_hint(&report, true).expect("hint when rejoin on");
         assert!(hint.contains("failing to start"), "{hint}");
+    }
+
+    #[test]
+    fn target_progress_advances_on_applied_or_voter_gain() {
+        use std::collections::BTreeMap;
+
+        use crate::plan::GroupReadiness;
+        use crate::plan::ReadinessReport;
+
+        let report = |voter: bool, applied: Option<u64>| {
+            let mut per_group = BTreeMap::new();
+            per_group.insert(7, GroupReadiness {
+                raft_group_id: 7,
+                voter_member: voter,
+                target_applied_index: applied,
+                peer_max_committed_index: Some(100),
+                catch_up_gap: None,
+                ready: false,
+            });
+            ReadinessReport {
+                all_ready: false,
+                per_group,
+            }
+        };
+
+        let none = TargetProgress::of(&report(false, None));
+        let voter = TargetProgress::of(&report(true, None));
+        let applying = TargetProgress::of(&report(true, Some(50)));
+        let more = TargetProgress::of(&report(true, Some(80)));
+
+        assert!(voter.advanced_past(&none)); // rejoined voter set
+        assert!(applying.advanced_past(&voter)); // applied index climbing
+        assert!(more.advanced_past(&applying));
+        assert!(!applying.advanced_past(&applying)); // no motion → stall clock keeps running
+        assert!(!voter.advanced_past(&more)); // a regression is not progress
     }
 
     #[test]
