@@ -305,7 +305,7 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
     let node1_config = root.join("node-1.toml");
     let node2_config = root.join("node-2.toml");
     let node3_config = root.join("node-3.toml");
-    write_cluster_config(
+    let node1_admin_port = write_cluster_config(
         &node1_config,
         ports[0],
         1,
@@ -314,6 +314,7 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
         true,
         &root.join("node-1-log"),
     );
+    let node1_admin = format!("http://127.0.0.1:{node1_admin_port}");
     write_cluster_config(
         &node2_config,
         ports[1],
@@ -363,7 +364,7 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
     assert_eq!(follower_payload, b"cli-late-learner-payload");
 
     let snapshot = client
-        .post(format!("{}/__ursula/raft/0/snapshot", peers[0].1))
+        .post(format!("{node1_admin}/__ursula/raft/0/snapshot"))
         .send()
         .await
         .expect("trigger leader snapshot");
@@ -378,8 +379,7 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
 
     let purge = client
         .post(format!(
-            "{}/__ursula/raft/0/purge?upto={snapshot_index}",
-            peers[0].1
+            "{node1_admin}/__ursula/raft/0/purge?upto={snapshot_index}"
         ))
         .send()
         .await
@@ -391,8 +391,8 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
 
     let add_learner = client
         .post(format!(
-            "{}/__ursula/raft/0/learners/3?addr={}",
-            peers[0].1, peers[2].1
+            "{node1_admin}/__ursula/raft/0/learners/3?addr={}",
+            peers[2].1
         ))
         .send()
         .await
@@ -465,10 +465,11 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
     std::fs::create_dir_all(&root).expect("create temp root");
 
     let mut configs = Vec::new();
+    let mut admin_ports = Vec::new();
     for (index, (node_id, _)) in peers.iter().enumerate() {
         let config_path = root.join(format!("node-{node_id}.toml"));
         let log_dir = root.join(format!("node-{node_id}-log"));
-        write_node_toml(
+        admin_ports.push(write_node_toml(
             &config_path,
             ports[index],
             *node_id,
@@ -479,9 +480,10 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
             Some(&log_dir),
             "s3",
             Some(&cold_root),
-        );
+        ));
         configs.push(config_path);
     }
+    let node1_admin = format!("http://127.0.0.1:{}", admin_ports[0]);
 
     let config = ursula_config::load_config(Some(&configs[0]), None, None)
         .unwrap_or_else(|err| panic!("load config for cold store: {err}"));
@@ -518,7 +520,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
         .await;
         flush_stream_until_cold_hot_bytes_zero(
             &client,
-            &peers[0].1,
+            &node1_admin,
             "benchcmp",
             "cli-s3-cold-restart",
         )
@@ -618,15 +620,17 @@ fn write_node_toml(
     wal_path: Option<&Path>,
     cold_backend: &str,
     cold_root: Option<&str>,
-) {
+) -> u16 {
     use std::fmt::Write;
 
+    let admin_port = free_port();
     let mut config = String::new();
 
     writeln!(
         config,
         r#"[server]
 listen = "127.0.0.1:{port}"
+admin_listen = "127.0.0.1:{admin_port}"
 "#
     )
     .unwrap();
@@ -713,6 +717,7 @@ gc_interval = "1s"
     }
 
     std::fs::write(path, config).expect("write node toml config");
+    admin_port
 }
 
 fn spawn_node(
@@ -881,7 +886,7 @@ fn write_single_node_cluster_config(
     base_url: &str,
     init_membership: bool,
     log_dir: &Path,
-) {
+) -> u16 {
     write_cluster_config(
         path,
         port,
@@ -890,7 +895,7 @@ fn write_single_node_cluster_config(
         &[(node_id, base_url.to_owned())],
         init_membership,
         log_dir,
-    );
+    )
 }
 
 fn write_cluster_config(
@@ -901,7 +906,7 @@ fn write_cluster_config(
     peers: &[(u64, String)],
     init_membership: bool,
     log_dir: &Path,
-) {
+) -> u16 {
     write_node_toml(
         path,
         port,
@@ -913,7 +918,7 @@ fn write_cluster_config(
         Some(log_dir),
         "memory",
         None,
-    );
+    )
 }
 
 async fn wait_until_ready(client: &reqwest::Client, base_url: &str, children: &mut [ChildGuard]) {

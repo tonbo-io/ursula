@@ -644,10 +644,12 @@ fn raft_grpc_service(
 
 pub fn router(runtime: ShardRuntime) -> Router {
     let state = HttpState::new(runtime);
-    cluster_router_from_state(state.clone()).merge(client_router_with_admission(
-        state,
-        IngressAdmission::default(),
-    ))
+    cluster_router_from_state(state.clone())
+        .merge(admin_ops_router(state.clone()))
+        .merge(client_router_with_admission(
+            state,
+            IngressAdmission::default(),
+        ))
 }
 
 pub fn router_with_raft_registry(
@@ -687,19 +689,78 @@ pub fn router_with_static_raft_cluster_topology(
         peers,
         per_group_voters,
     );
-    cluster_router_from_state(state.clone()).merge(client_router_with_admission(
-        state,
-        IngressAdmission::default(),
-    ))
+    cluster_router_from_state(state.clone())
+        .merge(admin_ops_router(state.clone()))
+        .merge(client_router_with_admission(
+            state,
+            IngressAdmission::default(),
+        ))
 }
 
-/// Convenience wrapper that merges both client and cluster planes into a
-/// single router.  Used by in-process tests and the madsim harness.
+/// Convenience wrapper that merges the client, cluster, and admin planes into
+/// a single router.  Used by in-process tests and the madsim harness, where
+/// per-plane listeners would only add noise.
 pub fn router_with_http_state(state: HttpState) -> Router {
-    cluster_router_from_state(state.clone()).merge(client_router_with_admission(
-        state,
-        IngressAdmission::default(),
-    ))
+    cluster_router_from_state(state.clone())
+        .merge(admin_ops_router(state.clone()))
+        .merge(client_router_with_admission(
+            state,
+            IngressAdmission::default(),
+        ))
+}
+
+/// Admin-plane routes: the mutating operator surface (raft group operations,
+/// maintenance drain, cold-flush trigger) plus read-only metrics so operator
+/// tooling works over a single tunnel. Production binds this to
+/// `server.admin_listen` (loopback by default) — nodes expose no
+/// cluster-mutation endpoints on the client or cluster planes.
+pub fn admin_router(state: HttpState) -> Router {
+    admin_ops_router(state.clone()).merge(
+        Router::new()
+            .route("/__ursula/metrics", get(metrics))
+            .with_state(state),
+    )
+}
+
+/// The mutating admin routes without the metrics alias. The single-router
+/// convenience mergers use this directly because the client plane already
+/// serves `/__ursula/metrics`.
+fn admin_ops_router(state: HttpState) -> Router {
+    Router::new()
+        .route(
+            "/__ursula/flush-cold/{bucket}/{stream}",
+            post(flush_cold_stream),
+        )
+        .route(
+            "/__ursula/raft/{raft_group_id}/snapshot",
+            post(trigger_raft_snapshot),
+        )
+        .route(
+            "/__ursula/raft/{raft_group_id}/purge",
+            post(trigger_raft_purge),
+        )
+        .route(
+            "/__ursula/raft/{raft_group_id}/membership",
+            post(change_raft_membership),
+        )
+        .route(
+            "/__ursula/raft/{raft_group_id}/learners/{node_id}",
+            post(add_raft_learner),
+        )
+        .route(
+            "/__ursula/raft/{raft_group_id}/nodes/{node_id}/allow-next-revert",
+            post(allow_raft_node_next_revert),
+        )
+        .route(
+            "/__ursula/raft/{raft_group_id}/leader/transfer/{node_id}",
+            post(transfer_raft_leader),
+        )
+        .route(
+            "/__ursula/leadership-shed/maintenance",
+            post(mark_maintenance_drain).delete(clear_maintenance_drain),
+        )
+        .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+        .with_state(state)
 }
 
 /// Cluster-plane routes: inter-node gRPC carrying Raft RPCs, snapshot
@@ -908,38 +969,6 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
     Router::new()
         .route("/__ursula/metrics", get(metrics))
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
-        .route(
-            "/__ursula/flush-cold/{bucket}/{stream}",
-            post(flush_cold_stream),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/snapshot",
-            post(trigger_raft_snapshot),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/purge",
-            post(trigger_raft_purge),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/membership",
-            post(change_raft_membership),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/learners/{node_id}",
-            post(add_raft_learner),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/nodes/{node_id}/allow-next-revert",
-            post(allow_raft_node_next_revert),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/leader/transfer/{node_id}",
-            post(transfer_raft_leader),
-        )
-        .route(
-            "/__ursula/leadership-shed/maintenance",
-            post(mark_maintenance_drain).delete(clear_maintenance_drain),
-        )
         .route(
             "/v1/stream/{*path}",
             put(create_stream_v1)

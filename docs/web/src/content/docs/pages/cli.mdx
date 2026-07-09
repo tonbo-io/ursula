@@ -2,7 +2,7 @@
 title: ursulactl
 ---
 
-`ursulactl` is the first interface to reach for once a cluster is running. It speaks only to each node's HTTP surface (`/__ursula/*`), so it needs neither SSH keys nor a control-plane daemon. Its verbs encode the safety properties an operator otherwise has to remember manually:
+`ursulactl` is the first interface to reach for once a cluster is running. Its verbs encode the safety properties an operator otherwise has to remember manually:
 
 - before restarting a node, transfer every Raft group it leads to a healthy successor;
 - after a restart, refuse to move on until `last_applied_index` has caught up to peers' `committed_index`;
@@ -10,14 +10,36 @@ title: ursulactl
 
 The same orchestration is exercised under [deterministic simulation](/docs/architecture/overview), so failure modes like a leader transfer timing out, the target node entering a crash loop, or a partition during drain produce a clean abort instead of a half-rolled cluster.
 
+## The admin plane
+
+Nodes carry **no cluster-mutation surface on the network**. The mutating operator endpoints (raft snapshot/purge/membership/learners/leader-transfer/allow-next-revert, maintenance drain, cold-flush trigger) plus metrics are served on a separate **admin plane** bound to `server.admin_listen` — loopback (`127.0.0.1:4438`) by default. The public client plane (`:4437`) serves only stream traffic and read-only metrics.
+
+ursulactl sends every request to the admin plane. Because that plane is loopback-bound, ursulactl reaches it through an **operation provider** — a per-node tunnel:
+
+- **direct** (default): hit `admin_url` as configured. Use when it is already reachable — a node bound to a private interface with a security group in front, an outer tunnel you manage, or a local node.
+- **forward** (`--admin-forward-cmd`): ursulactl picks a free local port, runs your command to forward it to the node's admin plane, and talks to the local end. SSH, SSM, and `kubectl port-forward` all fit this one shape; the command is rendered with `{local_port}`, `{admin_port}`, `{admin_host}`, `{host}`, `{node_id}`, `{name}` and run under `sh -c`, staying in the foreground for the tunnel's life (ursulactl tears it down when done).
+
+```bash
+# SSH
+ursulactl status --config cluster.json \
+  --admin-forward-cmd 'ssh -N -L {local_port}:127.0.0.1:{admin_port} ec2-user@{host}'
+
+# AWS SSM (no inbound SSH needed)
+ursulactl status --config cluster.json \
+  --admin-forward-cmd 'aws ssm start-session --target {name} --document-name AWS-StartPortForwardingSessionToRemoteHost --parameters host=127.0.0.1,portNumber={admin_port},localPortNumber={local_port}'
+
+# Kubernetes
+ursulactl status --config cluster.json \
+  --admin-forward-cmd 'kubectl port-forward pod/{name} {local_port}:{admin_port}'
+```
+
 ## When to use ursulactl vs. the other surfaces
 
 | Task | Tool |
 |------|------|
 | Day-2 cluster operations: restart, observe, gate on readiness | **`ursulactl`** |
 | Push binaries, write systemd units, EC2 Instance Connect, S3 cleanup | `scripts/ursula_ec2.py` |
-| One-off introspection or scripting against a single node | `curl /__ursula/metrics` |
-| Custom operator tooling | The HTTP endpoints listed under [Underlying HTTP surface](#underlying-http-surface) |
+| Custom operator tooling | The admin-plane HTTP endpoints, reached over your own tunnel |
 
 ## Install
 
@@ -44,6 +66,8 @@ Most verbs accept `--config <path>`, a JSON manifest describing the cluster. The
 ```
 
 Legacy `public_ip` / `private_ip` / `http_port` fields from the EC2 helper are accepted; if `http_url` is missing it is synthesised from those plus the port. `host` is the value substituted into `--restart-cmd` templates and defaults to the URL's host string.
+
+Each node's admin endpoint defaults to `http://{host}:4438`; override it with an explicit `admin_url`, or set `admin_port` to change only the port. Under `--admin-forward-cmd` ursulactl rewrites this to the local forwarded port automatically, so the manifest value only needs to name the in-pod/on-host admin port.
 
 ## `restart`
 
@@ -134,7 +158,7 @@ They will move to `ursulactl` once a `NodeProvider`-backed SSH transport lands; 
 
 ## Underlying HTTP surface
 
-For custom tooling, every verb maps onto a small set of HTTP endpoints on each node:
+For custom tooling, every verb maps onto a small set of admin-plane HTTP endpoints on each node (reached over your own tunnel to `admin_listen`):
 
 | Verb | Endpoint |
 |------|----------|

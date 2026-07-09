@@ -208,6 +208,9 @@ fn synthetic_node_info(node_id: u64) -> NodeInfo {
         http_url: format!("http://node-{node_id}.sim/")
             .parse()
             .expect("synthetic url"),
+        admin_url: format!("http://node-{node_id}.sim:4438/")
+            .parse()
+            .expect("synthetic admin url"),
         host: format!("node-{node_id}"),
         name: None,
     }

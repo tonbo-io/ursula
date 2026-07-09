@@ -401,7 +401,14 @@ class Ec2Ops:
             snapshot["drive_interval"] = f'{cold_env[self._SNAPSHOT_DRIVE_INTERVAL_ENV]}ms'
 
         cfg = {
-            "server": {"listen": f"0.0.0.0:{self.config.port}"},
+            # The admin plane carries the mutating operator surface and binds
+            # to loopback by default. The chaos agent drives raft repair from
+            # the client host, so bind it to the private interface; the security
+            # group restricts :4438 to the client, same as the :4491 API port.
+            "server": {
+                "listen": f"0.0.0.0:{self.config.port}",
+                "admin_listen": "0.0.0.0:4438",
+            },
             "runtime": runtime,
             "raft": raft,
             "storage": {

@@ -31,7 +31,7 @@ impl MetricsClient {
 
     pub async fn fetch_node(&self, node: &NodeInfo) -> Result<NodeMetricsView> {
         let url = node
-            .http_url
+            .admin_url
             .join("/__ursula/metrics")
             .with_context(|| format!("compose metrics url for node {}", node.id))?;
         let resp = self
@@ -79,7 +79,7 @@ impl MetricsClient {
     ) -> Result<TransferLeaderResponse> {
         let path = format!("/__ursula/raft/{raft_group_id}/leader/transfer/{to}");
         let url = leader
-            .http_url
+            .admin_url
             .join(&path)
             .with_context(|| format!("compose transfer-leader url at node {}", leader.id))?;
         let resp = self
@@ -107,7 +107,7 @@ impl MetricsClient {
 
     pub async fn set_maintenance_drain(&self, node: &NodeInfo, enabled: bool) -> Result<()> {
         let url = node
-            .http_url
+            .admin_url
             .join("/__ursula/leadership-shed/maintenance")
             .with_context(|| format!("compose maintenance-drain url for node {}", node.id))?;
         let request = if enabled {
@@ -141,7 +141,7 @@ impl MetricsClient {
         node_id: u64,
     ) -> Result<()> {
         let path = format!("/__ursula/raft/{raft_group_id}/nodes/{node_id}/allow-next-revert");
-        let url = leader.http_url.join(&path).with_context(|| {
+        let url = leader.admin_url.join(&path).with_context(|| {
             format!(
                 "compose allow-next-revert url at leader node {} for node {}",
                 leader.id, node_id

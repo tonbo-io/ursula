@@ -210,6 +210,11 @@ async fn serve(
         .as_ref()
         .map(|s| s.parse::<SocketAddr>())
         .transpose()?;
+    let admin_listen: SocketAddr = config.server.admin_listen.parse()?;
+
+    let admin_app = ursula::admin_router(state.clone());
+    let admin_listener = tokio::net::TcpListener::bind(admin_listen).await?;
+    let admin_task = tokio::spawn(async move { axum::serve(admin_listener, admin_app).await });
 
     if let Some(cluster_addr) = cluster_listen {
         let client_app = client_router_with_admission(
@@ -226,6 +231,7 @@ async fn serve(
         tokio::select! {
             res = client_task => res??,
             res = cluster_task => res??,
+            res = admin_task => res??,
         }
     } else {
         let app = cluster_router_from_state(state.clone()).merge(client_router_with_admission(
@@ -233,7 +239,11 @@ async fn serve(
             ursula::IngressAdmission::new(&config.server),
         ));
         let listener = tokio::net::TcpListener::bind(listen).await?;
-        axum::serve(listener, app).await?;
+        let serve_task = tokio::spawn(async move { axum::serve(listener, app).await });
+        tokio::select! {
+            res = serve_task => res??,
+            res = admin_task => res??,
+        }
     }
     Ok(())
 }
