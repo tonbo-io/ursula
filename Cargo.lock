@@ -3766,11 +3766,14 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "toml",
  "tracing",
  "url",
  "ursula-observability",
+ "yaml_serde",
 ]
 
 [[package]]

@@ -204,14 +204,14 @@ fn synthetic_node_info(node_id: u64) -> NodeInfo {
     NodeInfo {
         id: node_id,
         // The planner never reaches over the network in this validator; we
-        // synthesise URLs so NodeInfo's invariants are satisfied.
-        http_url: format!("http://node-{node_id}.sim/")
-            .parse()
-            .expect("synthetic url"),
+        // synthesise the admin URL so NodeInfo's invariants are satisfied.
         admin_url: format!("http://node-{node_id}.sim:4438/")
             .parse()
             .expect("synthetic admin url"),
         host: format!("node-{node_id}"),
+        instance_id: None,
+        ssh_host: None,
+        http_url: None,
         name: None,
     }
 }
