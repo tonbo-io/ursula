@@ -170,8 +170,10 @@ struct RestartArgs {
     /// for the target to be considered ready.
     #[arg(long, default_value_t = 16)]
     lag_tolerance: u64,
-    /// Permit one empty-log rejoin per group before restarting a node.
-    /// Use only for volatile --raft-memory clusters.
+    /// Force empty-log rejoin on. Normally auto-derived from each node's
+    /// reported `wal_backend` (memory enables it, disk refuses it); this flag
+    /// only matters for servers too old to report the backend. Setting it on a
+    /// disk-backed cluster is refused.
     #[arg(long, default_value_t = false)]
     allow_empty_raft_rejoin: bool,
     /// Print the drain plan and stop before issuing transfers or restart commands.
@@ -258,7 +260,7 @@ async fn run_restart_subcommand(args: RestartArgs) -> Result<()> {
         ready_timeout: Duration::from_secs(args.ready_timeout_secs),
         poll_interval: Duration::from_secs(args.poll_interval_secs),
         lag_tolerance: args.lag_tolerance,
-        allow_empty_raft_rejoin: args.allow_empty_raft_rejoin,
+        force_allow_empty: args.allow_empty_raft_rejoin,
         only: args.only,
         dry_run: args.dry_run,
     };

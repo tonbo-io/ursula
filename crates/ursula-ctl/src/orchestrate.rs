@@ -21,9 +21,12 @@ pub struct RestartOptions {
     pub ready_timeout: Duration,
     pub poll_interval: Duration,
     pub lag_tolerance: u64,
-    /// Before restarting a target, ask current leaders to allow one empty-log
-    /// rejoin from that target. Use for volatile `--raft-memory` clusters only.
-    pub allow_empty_raft_rejoin: bool,
+    /// Force empty-log rejoin on regardless of detected backend. Normally the
+    /// policy is auto-derived from each node's reported `wal_backend`: `memory`
+    /// enables it, `disk` refuses it, an older server with no field honors this
+    /// flag. Forcing it on a `disk` cluster is refused (that would auto-accept a
+    /// wiped node the leader is meant to reject).
+    pub force_allow_empty: bool,
     /// Per-node ids to restart, in order. Empty means every node from the provider.
     pub only: Option<Vec<u64>>,
     /// Print plan without executing the restart command.
@@ -37,7 +40,7 @@ impl Default for RestartOptions {
             ready_timeout: Duration::from_secs(120),
             poll_interval: Duration::from_secs(2),
             lag_tolerance: 16,
-            allow_empty_raft_rejoin: false,
+            force_allow_empty: false,
             only: None,
             dry_run: false,
         }
@@ -96,6 +99,14 @@ pub async fn run_restart(
         None => nodes.iter().collect(),
     };
 
+    // Decide the empty-log rejoin policy once from the cluster's reported WAL
+    // backend, so the operator does not have to know it per invocation.
+    let allow_empty = if options.dry_run {
+        false
+    } else {
+        resolve_empty_rejoin_policy(client, nodes, options.force_allow_empty).await?
+    };
+
     let mut report = RestartReport {
         per_node: Vec::new(),
     };
@@ -106,7 +117,7 @@ pub async fn run_restart(
             idx + 1,
             ordered.len()
         );
-        let outcome = restart_one(nodes, target, client, provider, options).await;
+        let outcome = restart_one(nodes, target, client, provider, options, allow_empty).await;
         match &outcome {
             Ok(RestartOutcome::Aborted { reason }) => {
                 tracing::error!(
@@ -138,12 +149,84 @@ pub async fn run_restart(
     Ok(report)
 }
 
+/// Auto-derive the empty-log rejoin policy from the cluster's reported WAL
+/// backend. `memory` needs it (every restart is amnesiac); `disk` refuses it
+/// (an empty rejoin there means a wiped node the leader should reject); an
+/// older server that omits the field honors the explicit `force` flag.
+async fn resolve_empty_rejoin_policy(
+    client: &MetricsClient,
+    nodes: &[NodeInfo],
+    force: bool,
+) -> Result<bool> {
+    let snap = client.try_fetch_cluster(nodes).await;
+    let backends: Vec<Option<&str>> = snap
+        .per_node
+        .iter()
+        .map(|v| v.wal_backend.as_deref())
+        .collect();
+    let decision = decide_empty_rejoin(&backends, force)?;
+    match decision {
+        EmptyRejoinDecision::Memory => {
+            tracing::info!("empty-log rejoin: enabled (raft-memory backend detected)")
+        }
+        EmptyRejoinDecision::Disk => {
+            tracing::info!("empty-log rejoin: disabled (disk WAL backend detected)")
+        }
+        EmptyRejoinDecision::UnknownHonorFlag => tracing::info!(
+            "empty-log rejoin: cluster did not report wal_backend; using --allow-empty-raft-rejoin={force}"
+        ),
+    }
+    Ok(decision.allow(force))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyRejoinDecision {
+    Memory,
+    Disk,
+    UnknownHonorFlag,
+}
+
+impl EmptyRejoinDecision {
+    fn allow(self, force: bool) -> bool {
+        match self {
+            EmptyRejoinDecision::Memory => true,
+            EmptyRejoinDecision::Disk => false,
+            EmptyRejoinDecision::UnknownHonorFlag => force,
+        }
+    }
+}
+
+/// Pure policy: `memory` anywhere enables empty rejoin; all-`disk` disables it
+/// and refuses an explicit `force` (that would auto-accept a wiped node the
+/// leader must reject); an all-unknown cluster (older server) honors the flag.
+fn decide_empty_rejoin(backends: &[Option<&str>], force: bool) -> Result<EmptyRejoinDecision> {
+    let any_memory = backends.contains(&Some("memory"));
+    let any_known = backends
+        .iter()
+        .any(|b| matches!(*b, Some("memory") | Some("disk")));
+    if any_memory {
+        return Ok(EmptyRejoinDecision::Memory);
+    }
+    if !any_known {
+        return Ok(EmptyRejoinDecision::UnknownHonorFlag);
+    }
+    if force {
+        bail!(
+            "--allow-empty-raft-rejoin was set but every node reports a disk WAL backend; \
+             an empty-log rejoin on a durable cluster means a wiped node the leader must \
+             reject — refusing rather than auto-accepting potential data loss"
+        );
+    }
+    Ok(EmptyRejoinDecision::Disk)
+}
+
 async fn restart_one(
     nodes: &[NodeInfo],
     target: &NodeInfo,
     client: &MetricsClient,
     provider: &crate::operation::OperationProvider,
     options: &RestartOptions,
+    allow_empty: bool,
 ) -> Result<RestartOutcome> {
     if !options.dry_run {
         wait_cluster_ready(
@@ -212,7 +295,7 @@ async fn restart_one(
                         return Err(err).context("post-drain metrics");
                     }
                 };
-                if options.allow_empty_raft_rejoin
+                if allow_empty
                     && let Err(err) = allow_empty_raft_rejoin(nodes, target, client, &snap).await
                 {
                     clear_maintenance_drain(client, target).await;
@@ -293,7 +376,7 @@ async fn restart_one(
                 options.ready_timeout,
                 format_unready(&snap, &report)
             );
-            if let Some(hint) = amnesiac_timeout_hint(&report, options) {
+            if let Some(hint) = amnesiac_timeout_hint(&report, allow_empty) {
                 reason.push_str("; ");
                 reason.push_str(hint);
             }
@@ -308,7 +391,7 @@ async fn restart_one(
 /// came back up at all; plain gap numbers do not tell an operator that.
 fn amnesiac_timeout_hint(
     report: &crate::plan::ReadinessReport,
-    options: &RestartOptions,
+    allow_empty: bool,
 ) -> Option<&'static str> {
     let all_unapplied = !report.per_group.is_empty()
         && report
@@ -318,7 +401,7 @@ fn amnesiac_timeout_hint(
     if !all_unapplied {
         return None;
     }
-    if options.allow_empty_raft_rejoin {
+    if allow_empty {
         Some(
             "target reports no applied entries in any group despite \
              --allow-empty-raft-rejoin; it may be failing to start (check its \
@@ -590,14 +673,17 @@ mod tests {
                 NodeMetricsView {
                     node: n(1, "10.0.0.1"),
                     groups: vec![group(7, 1, Some(1), 50, 50)],
+                    wal_backend: None,
                 },
                 NodeMetricsView {
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(1), 100, 100)],
+                    wal_backend: None,
                 },
                 NodeMetricsView {
                     node: n(3, "10.0.0.3"),
                     groups: vec![group(7, 3, Some(1), 95, 100)],
+                    wal_backend: None,
                 },
             ],
         };
@@ -615,18 +701,40 @@ mod tests {
             per_node: vec![NodeMetricsView {
                 node: n(2, "10.0.0.2"),
                 groups: vec![group(7, 2, Some(2), 100, 100)],
+                wal_backend: None,
             }],
         };
         let report = check_readiness(&snapshot, 1, 5);
         assert!(!report.all_ready);
 
-        let mut options = RestartOptions::default();
-        let hint = amnesiac_timeout_hint(&report, &options).expect("hint for unset flag");
+        let hint = amnesiac_timeout_hint(&report, false).expect("hint when rejoin off");
         assert!(hint.contains("--allow-empty-raft-rejoin"), "{hint}");
 
-        options.allow_empty_raft_rejoin = true;
-        let hint = amnesiac_timeout_hint(&report, &options).expect("hint for set flag");
+        let hint = amnesiac_timeout_hint(&report, true).expect("hint when rejoin on");
         assert!(hint.contains("failing to start"), "{hint}");
+    }
+
+    #[test]
+    fn empty_rejoin_policy_follows_reported_backend() {
+        // memory anywhere → on
+        assert_eq!(
+            decide_empty_rejoin(&[Some("disk"), Some("memory")], false).unwrap(),
+            EmptyRejoinDecision::Memory
+        );
+        // all disk, not forced → off
+        assert_eq!(
+            decide_empty_rejoin(&[Some("disk"), Some("disk")], false).unwrap(),
+            EmptyRejoinDecision::Disk
+        );
+        // all disk, forced → refused
+        assert!(decide_empty_rejoin(&[Some("disk")], true).is_err());
+        // unknown (older server) honors the flag
+        assert!(
+            decide_empty_rejoin(&[None, None], true)
+                .unwrap()
+                .allow(true)
+        );
+        assert!(!decide_empty_rejoin(&[None], false).unwrap().allow(false));
     }
 
     #[test]
@@ -636,16 +744,18 @@ mod tests {
                 NodeMetricsView {
                     node: n(1, "10.0.0.1"),
                     groups: vec![group(7, 1, Some(2), 50, 50)],
+                    wal_backend: None,
                 },
                 NodeMetricsView {
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(2), 100, 100)],
+                    wal_backend: None,
                 },
             ],
         };
         let report = check_readiness(&snapshot, 1, 5);
         assert!(!report.all_ready);
-        assert!(amnesiac_timeout_hint(&report, &RestartOptions::default()).is_none());
+        assert!(amnesiac_timeout_hint(&report, false).is_none());
     }
 
     #[test]
@@ -655,14 +765,17 @@ mod tests {
                 NodeMetricsView {
                     node: n(1, "10.0.0.1"),
                     groups: vec![group(7, 1, Some(2), 100, 100)],
+                    wal_backend: None,
                 },
                 NodeMetricsView {
                     node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(2), 100, 100)],
+                    wal_backend: None,
                 },
                 NodeMetricsView {
                     node: n(3, "10.0.0.3"),
                     groups: vec![group(7, 3, Some(1), 100, 100)],
+                    wal_backend: None,
                 },
             ],
         };
