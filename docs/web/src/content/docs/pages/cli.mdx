@@ -81,7 +81,7 @@ instance_id = "i-0e4f5a6b"
 
 ```bash
 # provider lives in the file, so the command is just intent
-ursulactl restart --config cluster.toml --allow-empty-raft-rejoin --ready-timeout-secs 900
+ursulactl restart --config cluster.toml --ready-timeout-secs 900
 ```
 
 Any `[provider]` field can be overridden on the command line (`--provider`, `--region`, `--ssh-user`, `--restart-unit`, …); flags win over the file.
@@ -131,9 +131,9 @@ The naive manual procedure of "restart followers, then leader" does **not** wait
 
 ### Restarting raft-memory nodes
 
-On clusters running the volatile `raft.wal.backend = "memory"`, a restarted node rejoins with an **empty** log, and group leaders refuse that log reversion unless it was explicitly permitted. Two flags matter:
+On clusters running the volatile `raft.wal.backend = "memory"`, a restarted node rejoins with an **empty** log, and group leaders refuse that log reversion unless it was explicitly permitted. ursulactl handles this automatically:
 
-- `--allow-empty-raft-rejoin`: before running the restart command, ask the current leader of every group to accept one empty-log rejoin from the target. Without it the target never catches up and the readiness step times out. Do not use it on persistent-backend clusters, where an unexpected empty rejoin means data loss that deserves to be refused.
+- **Empty-log rejoin is auto-derived from the cluster's backend.** Each node reports its `wal_backend` in `/__ursula/metrics`; when ursulactl sees `memory` it asks every group's leader to accept one empty-log rejoin from the target before restarting it, and when it sees `disk` it refuses to (an empty rejoin on a durable cluster means a wiped node the leader is meant to reject). You do not pass a flag. `--allow-empty-raft-rejoin` still exists but only matters against servers too old to report the backend; setting it on a disk-backed cluster is refused.
 - `--ready-timeout-secs`: an amnesiac node rebuilds every group from snapshots, which for large groups takes 10+ minutes, not the default two. Size the timeout for a full rebuild.
 
 The permission must land on the node that is leader at that moment; the endpoint answers `409 Conflict` from any other node (ursulactl resolves leadership per group and handles this). A node that is the membership initializer for some groups additionally refuses to start at all after losing its volatile log (the bootstrap-marker guard) — that recovery is an explicit operator reset on the host, outside ursulactl's reach.

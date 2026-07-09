@@ -189,7 +189,13 @@ async fn init_state(
             per_group_voters,
         )
     };
-    let state = state.with_runtime_config(&config.runtime);
+    let wal_backend = match config.raft.wal.backend {
+        ursula_config::WalBackend::Memory => "memory",
+        ursula_config::WalBackend::Disk => "disk",
+    };
+    let state = state
+        .with_runtime_config(&config.runtime)
+        .with_wal_backend(wal_backend);
     Ok(state)
 }
 
