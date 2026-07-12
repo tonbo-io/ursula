@@ -1,47 +1,36 @@
-/* Tonbo, weight-remapped onto the cuts the homepage uses. */
+/* Tonbo: Univers Next Pro webfont kit, weight-remapped one notch down
+   (TE-style): declared 300 gets Thin, body 400 gets Light. url() only —
+   no local() fallbacks, so every visitor renders the licensed bytes. */
 @font-face {
   font-family: "Tonbo";
   font-style: normal;
-  font-weight: 100 249;
+  font-weight: 100 349;
   font-display: swap;
-  src:
-    url("/fonts/Tonbo-Thin.woff") format("woff"),
-    local("Univers Next Pro Thin"),
-    local("UniversNextPro-Thin");
+  src: url("/fonts/Tonbo-Thin.woff") format("woff");
 }
 
 @font-face {
   font-family: "Tonbo";
   font-style: normal;
-  font-weight: 250 399;
+  font-weight: 350 549;
   font-display: swap;
-  src:
-    url("/fonts/Tonbo-Light.woff") format("woff"),
-    local("Univers Next Pro Light"),
-    local("UniversNextPro-Light");
+  src: url("/fonts/Tonbo-Light.woff") format("woff");
 }
 
 @font-face {
   font-family: "Tonbo";
   font-style: normal;
-  font-weight: 400 449;
+  font-weight: 550 649;
   font-display: swap;
-  src:
-    url("/fonts/Tonbo-Regular.woff") format("woff"),
-    local("Univers Next Pro Regular"),
-    local("UniversNextPro-Regular"),
-    local("Univers Next Pro");
+  src: url("/fonts/Tonbo-Regular.woff") format("woff");
 }
 
 @font-face {
   font-family: "Tonbo";
   font-style: normal;
-  font-weight: 450 1000;
+  font-weight: 650 1000;
   font-display: swap;
-  src:
-    url("/fonts/Tonbo-Medium.woff") format("woff"),
-    local("Univers Next Pro Medium"),
-    local("UniversNextPro-Medium");
+  src: url("/fonts/Tonbo-Medium.woff") format("woff");
 }
 
 @font-face {
