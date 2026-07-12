@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  @font-face {
+    font-family: "Univers Next Pro Web";
+    font-weight: 100 349;
+    src: url("/fonts/Tonbo-Thin.woff") format("woff");
+  }
+  @font-face {
+    font-family: "Univers Next Pro Web";
+    font-weight: 350 549;
+    src: url("/fonts/Tonbo-Light.woff") format("woff");
+  }
+  @font-face {
+    font-family: "Univers Next Pro Web";
+    font-weight: 550 1000;
+    src: url("/fonts/Tonbo-Regular.woff") format("woff");
+  }
+  @font-face {
+    font-family: "Iosevka";
+    font-weight: 400;
+    src: url("/fonts/Iosevka-Regular.woff2") format("woff2");
+  }
+  @font-face {
+    font-family: "Iosevka";
+    font-weight: 700;
+    src: url("/fonts/Iosevka-Bold.woff2") format("woff2");
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1200px; height: 630px; }
+  body {
+    background: #f3f2ee;
+    color: #1d1b17;
+    font-family: "Univers Next Pro Web", "Helvetica Neue", sans-serif;
+    overflow: hidden;
+    position: relative;
+  }
+
+  /* One giant thing; everything else is a whisper at the edges. */
+
+  .model {
+    font-family: "Iosevka", monospace;
+    font-size: 15px;
+    font-weight: 700;
+    left: 56px;
+    letter-spacing: 0.08em;
+    position: absolute;
+    top: 48px;
+  }
+  .maker {
+    align-items: center;
+    display: flex;
+    gap: 12px;
+    position: absolute;
+    right: 56px;
+    top: 44px;
+  }
+  .maker .who {
+    color: #45413a;
+    font-family: "Iosevka", monospace;
+    font-size: 10.5px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+  .maker .sq { background: #d64a03; height: 18px; width: 18px; }
+
+  .lic {
+    color: #8b867a;
+    font-family: "Iosevka", monospace;
+    font-size: 8.5px;
+    letter-spacing: 0.06em;
+    position: absolute;
+    right: 20px;
+    text-transform: uppercase;
+    top: 150px;
+    writing-mode: vertical-rl;
+  }
+
+  .word {
+    left: 44px;
+    position: absolute;
+    top: 168px;
+  }
+  .word .big {
+    -webkit-text-fill-color: transparent;
+    -webkit-text-stroke: 3px #1d1b17;
+    font-size: 262px;
+    font-weight: 400;
+    letter-spacing: -0.012em;
+    line-height: 1;
+  }
+  .word .stop {
+    background: #d64a03;
+    bottom: 4px;
+    display: inline-block;
+    height: 32px;
+    margin-left: 12px;
+    position: relative;
+    width: 32px;
+  }
+  .category {
+    color: #45413a;
+    font-family: "Iosevka", monospace;
+    font-size: 12px;
+    font-weight: 400;
+    letter-spacing: 0.14em;
+    position: absolute;
+    right: 92px;
+    text-transform: uppercase;
+    top: 452px;
+  }
+
+  .ports {
+    align-items: center;
+    bottom: 52px;
+    display: flex;
+    left: 56px;
+    position: absolute;
+  }
+  .hatch {
+    background: repeating-linear-gradient(-45deg, #1d1b17 0 1.5px, transparent 1.5px 4.5px);
+    height: 14px;
+    margin-right: 16px;
+    width: 30px;
+  }
+  .plabel {
+    font-family: "Iosevka", monospace;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    margin-right: 18px;
+  }
+  .pblock {
+    background: #d64a03;
+    color: #f3f2ee;
+    font-family: "Iosevka", monospace;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    margin-right: 18px;
+    padding: 4px 10px 3px;
+  }
+  .pbar {
+    background: #26241f;
+    color: #edebdd;
+    display: flex;
+    font-family: "Iosevka", monospace;
+    font-size: 11px;
+    font-weight: 700;
+    gap: 20px;
+    letter-spacing: 0.12em;
+    margin-right: 18px;
+    padding: 4px 12px 3px;
+  }
+
+  /* our own event ticks, quiet, one hot */
+  .ticks { bottom: 52px; height: 22px; position: absolute; right: 56px; width: 150px; }
+  .ticks i { background: #1d1b17; bottom: 0; height: 16px; position: absolute; width: 2px; }
+  .ticks i.hot { background: #d64a03; }
+</style>
+</head>
+<body>
+  <div class="model">PORT—4437 · V0.2 · APACHE-2.0</div>
+  <div class="maker"><span class="who">tonbo.io</span><span class="sq"></span></div>
+
+  <div class="lic">apache license 2.0 · apache.org/licenses/license-2.0</div>
+
+  <div class="word"><span class="big">ursula</span><span class="stop"></span></div>
+  <div class="category">append-only event timeline server · durable streams over plain http</div>
+
+  <div class="ports">
+    <div class="hatch"></div>
+    <div class="plabel">PUT</div>
+    <div class="pblock">POST</div>
+    <div class="plabel">GET</div>
+    <div class="pbar"><span>LONG-POLL</span><span>SSE</span></div>
+    <div class="pbar" style="margin-right:0"><span>S3</span></div>
+  </div>
+
+  <div class="ticks">
+    <i style="left:0"></i><i style="left:7px"></i><i style="left:40px"></i>
+    <i style="left:76px"></i><i style="left:83px"></i><i style="left:90px"></i>
+    <i class="hot" style="left:148px"></i>
+  </div>
+</body>
+</html>
