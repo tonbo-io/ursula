@@ -1,3 +1,39 @@
+/* Univers Next Pro, weight-remapped one notch down onto specific cuts,
+   the way TE inks their site (Thin and Light do almost everything;
+   nothing heavier than Medium). Sources are local() only until the
+   licensed webfont kit lands; then add url() before each local(). */
+@font-face {
+  font-family: "Univers Next Pro Web";
+  font-style: normal;
+  font-weight: 100 349;
+  src:
+    local("Univers Next Pro Thin"),
+    local("UniversNextPro-Thin"),
+    local("Univers Next Pro Ultra Light"),
+    local("UniversNextPro-UltraLight");
+}
+
+@font-face {
+  font-family: "Univers Next Pro Web";
+  font-style: normal;
+  font-weight: 350 549;
+  src:
+    local("Univers Next Pro Light"),
+    local("UniversNextPro-Light");
+}
+
+@font-face {
+  font-family: "Univers Next Pro Web";
+  font-style: normal;
+  font-weight: 550 1000;
+  src:
+    local("Univers Next Pro Regular"),
+    local("UniversNextPro-Regular"),
+    local("Univers Next Pro"),
+    local("Univers Next Pro Medium"),
+    local("UniversNextPro-Medium");
+}
+
 @font-face {
   font-family: "Iosevka";
   font-style: normal;
@@ -95,7 +131,13 @@
     "SFMono-Regular",
     "Consolas",
     monospace;
+  /* Local-font trial rung: install the Monotype desktop trial of Univers
+     Next and it renders directly; otherwise Helvetica Neue approximates
+     the Swiss grotesque direction. Ship nothing we don't license. */
   --font-reading:
+    "Univers Next Pro Web",
+    "Helvetica Neue",
+    "Archivo Variable",
     "Inter Variable",
     Inter,
     -apple-system,
@@ -6220,7 +6262,7 @@ a.docs-card:focus-visible {
 
 .home-hero-copy h1 {
   font-family: var(--font-reading);
-  font-size: clamp(34px, 4.8vw, 62px);
+  font-size: clamp(34px, 4.5vw, 58px);
   font-weight: 300;
   letter-spacing: -0.015em;
   line-height: 1.12;
@@ -6606,10 +6648,11 @@ a.docs-card:focus-visible {
 
 .home-keeps h3 {
   color: var(--text-primary);
-  font-size: 16px;
-  font-weight: 700;
+  font-size: 20px;
+  font-weight: 400;
+  letter-spacing: 0.005em;
   line-height: 1.25;
-  margin: 1px 0 0;
+  margin: 0;
 }
 
 .home-keeps p {
@@ -7556,8 +7599,9 @@ a.docs-card:focus-visible {
 
 .bench-h3 {
   color: var(--text-primary);
-  font-size: 19px;
-  font-weight: 600;
+  font-size: 20px;
+  font-weight: 400;
+  letter-spacing: 0.005em;
   margin: 56px 0 10px;
 }
 
