@@ -126,7 +126,7 @@ const multiStreamThroughput: Scenario = {
     ],
   },
   annotation:
-    "Ursula keeps every append on a 3-voter Raft quorum while asynchronously flushing cold chunks to S3; this run uploaded ~675 MiB through that background path. Durable Streams is shown on a real EBS-backed data directory; earlier tmpfs-backed file-durable numbers are excluded.",
+    "Ursula keeps every append on a 3-voter Raft quorum while asynchronously flushing cold chunks to S3, and this run uploaded ~675 MiB through that background path. Durable Streams is shown on a real EBS-backed data directory. Earlier tmpfs-backed file-durable numbers are excluded.",
 };
 
 const multiStreamLatency: Scenario = {
@@ -206,7 +206,7 @@ const multiStreamLatency: Scenario = {
     ],
   },
   annotation:
-    "S2 Lite's per-append latency is dominated by the S3 PUT round-trip. Durable Streams pays local EBS fdatasync on the file-durable path; Ursula pays the cross-node quorum cost plus background cold-flush pressure and remains below both at every measured concurrency.",
+    "S2 Lite's per-append latency is dominated by the S3 PUT round-trip. Durable Streams pays local EBS fdatasync on the file-durable path. Ursula pays the cross-node quorum cost plus background cold-flush pressure and remains below both at every measured concurrency.",
 };
 
 const fanoutLatency: Scenario = {
@@ -710,7 +710,7 @@ function BenchmarkPage() {
                 </dd>
                 <dt>sse fan-out · 1,000 subscribers</dt>
                 <p>
-                  Single-digit alongside Durable Streams — which is faster here
+                  Single-digit alongside Durable Streams, which is faster here
                   at 6.5 ms. S2 Lite sits at 112 ms on its S3-backed path.
                 </p>
               </div>
@@ -743,7 +743,7 @@ function BenchmarkPage() {
             Throughput and latency are only fair to compare if the durability
             properties are clear. Here is what each system actually guarantees
             in this benchmark's configuration. Ursula pays a quorum round-trip
-            on every commit; S2 Lite pays an S3 PUT; the file-durable Durable
+            on every commit. S2 Lite pays an S3 PUT. The file-durable Durable
             Streams server writes to a single EBS volume.
           </p>
           <div className="benchmark-table-wrap">
@@ -773,8 +773,8 @@ function BenchmarkPage() {
                     Ursula
                   </th>
                   <td>3 Raft voters across us-east-1a / 1b / 1c</td>
-                  <td>service stays up; data preserved (2/3 quorum)</td>
-                  <td>service stays up; data preserved (2/3 quorum)</td>
+                  <td>service stays up · data preserved (2/3 quorum)</td>
+                  <td>service stays up · data preserved (2/3 quorum)</td>
                   <td>
                     ~10<sup>−7</sup> (needs concurrent loss of 2 voters across
                     AZs before recovery)
@@ -825,10 +825,10 @@ function BenchmarkPage() {
                     durability)
                   </td>
                   <td>
-                    service down until restart; committed data preserved on S3
+                    service down until restart · committed data preserved on S3
                   </td>
                   <td>
-                    service down until restart; committed data preserved on S3
+                    service down until restart · committed data preserved on S3
                   </td>
                   <td>
                     ~10<sup>−11</sup> per object (S3 durability), service
@@ -922,7 +922,7 @@ function BenchmarkPage() {
                 <li>3 × c7g.4xlarge, one voter per AZ</li>
                 <li>256 Raft groups, 16 cores per node</li>
                 <li>Every commit replicates to a majority quorum (2 of 3)</li>
-                <li>S3 cold flush enabled; ~675 MiB uploaded in this run</li>
+                <li>S3 cold flush enabled · ~675 MiB uploaded in this run</li>
                 <li>Bench targets all 3 nodes via round-robin</li>
               </ul>
             </article>
