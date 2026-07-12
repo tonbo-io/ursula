@@ -1,10 +1,10 @@
 <svg width="120" height="120" viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg">
-<rect width="120" height="120" fill="#458588"/>
-<rect x="64.1667" y="11.25" width="19.1667" height="19.1667" fill="#282828"/>
-<rect x="45" y="30.4167" width="19.1667" height="19.1667" fill="#282828"/>
-<rect x="64.1667" y="30.4167" width="19.1667" height="19.1667" fill="#282828"/>
-<rect x="83.3333" y="30.4167" width="19.1667" height="19.1667" fill="#282828"/>
-<rect x="64.1667" y="49.5835" width="19.1667" height="19.1667" fill="#282828"/>
-<rect x="64.1667" y="68.7501" width="19.1667" height="19.1667" fill="#282828"/>
-<rect x="83.3333" y="68.7501" width="19.1667" height="19.1667" fill="#282828"/>
+  <!-- Graphite instrument tile; cream event bars, dense to sparse;
+       the orange one is the latest write. Same vocabulary as the
+       site's event-stream transitions and the "latest" glyph. -->
+  <rect width="120" height="120" rx="24" fill="#26241f"/>
+  <rect x="22" y="58" width="11" height="32" fill="#f3f2ee"/>
+  <rect x="39" y="42" width="11" height="48" fill="#f3f2ee"/>
+  <rect x="56" y="66" width="11" height="24" fill="#f3f2ee"/>
+  <rect x="86" y="30" width="11" height="60" fill="#d64a03"/>
 </svg>

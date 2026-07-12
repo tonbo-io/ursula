@@ -33,11 +33,20 @@ function absoluteUrl(path: string) {
 function getHeadForUrl(url: string): HeadData {
   const canonical = absoluteUrl(url);
 
-  if (url === DOCS_PATH || url.startsWith(DOCS_PAGE_PREFIX) || url === HOME_PATH) {
+  if (url === HOME_PATH) {
+    return {
+      title: "Ursula — Durable Streams over HTTP, backed by S3",
+      description:
+        "Self-hosted, distributed Durable Streams server. Quorum-replicated appends in single-digit milliseconds, cold data on plain S3, any HTTP client is a valid client.",
+      ogType: "website",
+      ogImage: DEFAULT_OG_IMAGE,
+      canonical,
+    };
+  }
+
+  if (url === DOCS_PATH || url.startsWith(DOCS_PAGE_PREFIX)) {
     const slug =
-      url === HOME_PATH || url === DOCS_PATH
-        ? "introduction"
-        : url.slice(DOCS_PAGE_PREFIX.length) || "overview";
+      url === DOCS_PATH ? "introduction" : url.slice(DOCS_PAGE_PREFIX.length) || "overview";
     const page = getDocsPageBySlug(slug);
 
     if (page) {

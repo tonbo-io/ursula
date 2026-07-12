@@ -9,8 +9,10 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@fontsource-variable/inter": "^5.2.8",
     "@fontsource/ibm-plex-sans": "^5.2.8",
     "@mdx-js/react": "^3.1.1",
+    "dseg": "^0.46.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

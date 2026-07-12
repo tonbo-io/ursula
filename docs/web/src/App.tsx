@@ -5,6 +5,7 @@ import BenchmarkPage from "./pages/BenchmarkPage";
 import BlogIndexPage from "./pages/BlogIndexPage";
 import BlogPostPage from "./pages/BlogPostPage";
 import DocsPage from "./pages/DocsPage";
+import HomePage from "./pages/HomePage";
 import StatusPage from "./pages/StatusPage";
 import {
   BENCHMARK_PATH,
@@ -22,9 +23,9 @@ type AppProps = {
 };
 
 function resolveDocsSlug(path: string) {
-  if (path === HOME_PATH || path === DOCS_PATH) return "introduction";
+  if (path === DOCS_PATH) return "introduction";
   if (path.startsWith(DOCS_PAGE_PREFIX)) return path.slice(DOCS_PAGE_PREFIX.length) || "overview";
-  return "overview";
+  return "introduction";
 }
 
 function App({ initialUrl }: AppProps) {
@@ -37,6 +38,11 @@ function App({ initialUrl }: AppProps) {
   }, []);
 
   useEffect(() => {
+    if (currentPath === HOME_PATH) {
+      document.title = "Ursula — Durable Streams over HTTP, backed by S3";
+      return;
+    }
+
     if (currentPath === BENCHMARK_PATH) {
       document.title = "OSS HTTP Streams Benchmark | Ursula";
       return;
@@ -63,6 +69,14 @@ function App({ initialUrl }: AppProps) {
     const page = getDocsPageBySlug(slug);
     document.title = page ? `${page.title} | Ursula` : "Ursula";
   }, [currentPath]);
+
+  if (currentPath === HOME_PATH) {
+    return (
+      <div className="page-shell">
+        <HomePage />
+      </div>
+    );
+  }
 
   if (currentPath === BENCHMARK_PATH) {
     return (
