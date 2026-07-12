@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 
+import "@fontsource-variable/archivo";
 import "@fontsource-variable/inter";
 
 import App from "./App";

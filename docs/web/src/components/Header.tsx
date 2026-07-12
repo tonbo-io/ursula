@@ -164,7 +164,7 @@ function Header({ navItems, version, githubUrl, className }: HeaderProps) {
         <span className="hb-plate">
           durable streams
           <br />
-          port 4437{version ? ` · v${version}` : ""}
+          {version ? `v${version} · ` : ""}apache-2.0
         </span>
       </a>
 
