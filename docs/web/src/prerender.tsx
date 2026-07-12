@@ -16,7 +16,9 @@ import {
 const ORIGIN = "https://ursula.tonbo.io";
 const DEFAULT_DESCRIPTION =
   "Open-source Distributed Durable Streams over HTTP, backed by S3.";
-const DEFAULT_OG_IMAGE = `${ORIGIN}/og-default.png`;
+// Version query busts scraper caches (X keys cards by exact URL and has
+// no manual refresh); bump it whenever the card image changes.
+const DEFAULT_OG_IMAGE = `${ORIGIN}/og-default.png?v=20260713`;
 
 type HeadData = {
   title: string;
