@@ -1,23 +1,22 @@
-/* Univers Next Pro, weight-remapped one notch down onto specific cuts,
-   the way TE inks their site (Thin and Light do almost everything;
-   nothing heavier than Medium). Sources are local() only until the
-   licensed webfont kit lands; then add url() before each local(). */
+/* Univers Next Pro, weight-remapped onto the cuts the homepage uses. */
 @font-face {
   font-family: "Univers Next Pro Web";
   font-style: normal;
-  font-weight: 100 349;
+  font-weight: 100 249;
+  font-display: swap;
   src:
+    url("/fonts/UniversNextPro-Thin.woff") format("woff"),
     local("Univers Next Pro Thin"),
-    local("UniversNextPro-Thin"),
-    local("Univers Next Pro Ultra Light"),
-    local("UniversNextPro-UltraLight");
+    local("UniversNextPro-Thin");
 }
 
 @font-face {
   font-family: "Univers Next Pro Web";
   font-style: normal;
-  font-weight: 350 549;
+  font-weight: 250 399;
+  font-display: swap;
   src:
+    url("/fonts/UniversNextPro-Light.woff") format("woff"),
     local("Univers Next Pro Light"),
     local("UniversNextPro-Light");
 }
@@ -25,11 +24,22 @@
 @font-face {
   font-family: "Univers Next Pro Web";
   font-style: normal;
-  font-weight: 550 1000;
+  font-weight: 400 449;
+  font-display: swap;
   src:
+    url("/fonts/UniversNextPro-Regular.woff") format("woff"),
     local("Univers Next Pro Regular"),
     local("UniversNextPro-Regular"),
-    local("Univers Next Pro"),
+    local("Univers Next Pro");
+}
+
+@font-face {
+  font-family: "Univers Next Pro Web";
+  font-style: normal;
+  font-weight: 450 1000;
+  font-display: swap;
+  src:
+    url("/fonts/UniversNextPro-Medium.woff") format("woff"),
     local("Univers Next Pro Medium"),
     local("UniversNextPro-Medium");
 }
@@ -131,9 +141,6 @@
     "SFMono-Regular",
     "Consolas",
     monospace;
-  /* Local-font trial rung: install the Monotype desktop trial of Univers
-     Next and it renders directly; otherwise Helvetica Neue approximates
-     the Swiss grotesque direction. Ship nothing we don't license. */
   --font-reading:
     "Univers Next Pro Web",
     "Helvetica Neue",
@@ -8230,5 +8237,4 @@ a.docs-card:focus-visible {
     width: 13px;
   }
 }
-
 
