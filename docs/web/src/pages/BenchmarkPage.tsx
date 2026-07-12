@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+import EdgeStream from "../components/EdgeStream";
 import Footer from "../components/Footer";
 import Header from "../components/Header";
 
@@ -11,17 +12,17 @@ const backends: Record<
 > = {
   ursula: {
     label: "Ursula",
-    color: "#83a598",
+    color: "#d64a03",
     note: "3 × c7g.4xlarge, Raft quorum + S3 cold flush",
   },
   durable: {
     label: "Durable Streams",
-    color: "#fb4934",
+    color: "#27529b",
     note: "1 × c7g.4xlarge, file-durable on EBS",
   },
   s2: {
     label: "S2 Lite",
-    color: "#fabd2f",
+    color: "#8f6b00",
     note: "1 × c7g.4xlarge, S3 backend",
   },
 };
@@ -415,7 +416,7 @@ function TrendChart({ scenario }: { scenario: Scenario }) {
   const width = 760;
   const height = 320;
   const left = 72;
-  const right = 24;
+  const right = 136;
   const top = 32;
   const bottom = 64;
   const chartWidth = width - left - right;
@@ -439,6 +440,21 @@ function TrendChart({ scenario }: { scenario: Scenario }) {
     top + chartHeight - ((v - yMin) / (yMax - yMin || 1)) * chartHeight;
 
   const tickFractions = [0, 0.25, 0.5, 0.75, 1];
+
+  // Direct labels at line ends, nudged apart when endpoints collide
+  const endLabels = backendOrder
+    .filter((b) => (scenario.series[b] ?? []).length > 0)
+    .map((b) => {
+      const pts = scenario.series[b] ?? [];
+      const last = pts[pts.length - 1];
+      return { b, y: yPos(last?.y ?? 0), text: `${backends[b].label} ${last?.label ?? ""}` };
+    })
+    .sort((a, z) => a.y - z.y);
+  for (let i = 1; i < endLabels.length; i += 1) {
+    const prev = endLabels[i - 1];
+    const cur = endLabels[i];
+    if (prev && cur && cur.y - prev.y < 15) cur.y = prev.y + 15;
+  }
 
   return (
     <div
@@ -540,7 +556,7 @@ function TrendChart({ scenario }: { scenario: Scenario }) {
                 stroke={color}
                 strokeLinecap="round"
                 strokeLinejoin="round"
-                strokeWidth="3"
+                strokeWidth="2"
               />
               {pts.map((p) => {
                 const px = xPos(p.x);
@@ -584,7 +600,7 @@ function TrendChart({ scenario }: { scenario: Scenario }) {
                       className="benchmark-trend-point"
                       cx={px}
                       cy={py}
-                      r="5"
+                      r="4"
                       fill={color}
                     />
                   </g>
@@ -593,6 +609,21 @@ function TrendChart({ scenario }: { scenario: Scenario }) {
             </g>
           );
         })}
+
+        {endLabels.map((e) => (
+          <g key={`end-${e.b}`}>
+            <rect
+              x={width - right + 10}
+              y={e.y - 4}
+              width="8"
+              height="8"
+              fill={backends[e.b].color}
+            />
+            <text className="benchmark-trend-endlabel" x={width - right + 24} y={e.y + 4}>
+              {e.text}
+            </text>
+          </g>
+        ))}
       </svg>
 
       {tooltip && (
@@ -607,29 +638,11 @@ function TrendChart({ scenario }: { scenario: Scenario }) {
         </div>
       )}
 
-      <div
-        style={{
-          display: "flex",
-          gap: 18,
-          flexWrap: "wrap",
-          marginTop: 10,
-          fontSize: 12,
-          color: "#a89984",
-        }}
-      >
+      <div className="benchmark-trend-legend">
         {backendOrder.map((b) =>
           scenario.series[b] ? (
             <span key={b}>
-              <span
-                style={{
-                  display: "inline-block",
-                  width: 16,
-                  height: 3,
-                  background: backends[b].color,
-                  verticalAlign: "middle",
-                  marginRight: 6,
-                }}
-              />
+              <i style={{ background: backends[b].color }} aria-hidden="true" />
               {backends[b].label}
             </span>
           ) : null,
@@ -648,22 +661,9 @@ function ScenarioBlock({ scenario }: { scenario: Scenario }) {
           {scenario.lowerIsBetter ? "lower is better" : "higher is better"}
         </span>
       </div>
-      <p style={{ color: "#bdae93" }}>{scenario.subtitle}</p>
+      <p className="bench-sub">{scenario.subtitle}</p>
       <TrendChart scenario={scenario} />
-      {scenario.annotation && (
-        <p
-          style={{
-            padding: "12px 16px",
-            borderLeft: `3px solid ${backends.ursula.color}`,
-            background: "rgba(131, 166, 152, 0.08)",
-            color: "#ebdbb2",
-            fontSize: 14,
-            lineHeight: 1.55,
-          }}
-        >
-          {scenario.annotation}
-        </p>
-      )}
+      {scenario.annotation && <p className="bench-annotation">{scenario.annotation}</p>}
     </article>
   );
 }
@@ -682,263 +682,63 @@ function BenchmarkPage() {
         githubUrl="https://github.com/tonbo-io/ursula"
       />
 
-      <main className="benchmark-page">
-        <div className="benchmark-hero">
-          <header>
-            <h1>OSS HTTP Streams Benchmark</h1>
-            <p className="benchmark-lead">
-              A comparison of Ursula, Durable Streams, and S2 Lite across
-              multi-stream writes, catch-up replay, and SSE live tail.
+      <main className="bench-main">
+        {/* Verdict room — blue is this site's measured-data material */}
+        <section className="home-band home-band-orange">
+          <div className="home-inner">
+            <h1 className="bench-title">OSS HTTP Streams Benchmark</h1>
+            <p className="bench-lead">
+              Ursula, Durable Streams, and S2 Lite answering the same three
+              workloads from the same client binary. The frame that makes these
+              numbers comparable, every chart, and the commands to reproduce
+              them all follow.
             </p>
-          </header>
-          <aside className="benchmark-scoreboard" aria-label="Headline gaps">
-            <article className="benchmark-score ursula">
-              <div className="benchmark-score-name">
-                Multi-stream write @ 500 streams
+            <dl className="bench-verdict">
+              <div>
+                <dd>
+                  41.6k<small>commits/s</small>
+                </dd>
+                <dt>multi-stream write · 500 streams</dt>
+                <p>
+                  12× Durable Streams (3.4k) and 6.9× S2 Lite (6.0k), every
+                  commit quorum-acknowledged across three availability zones.
+                </p>
               </div>
-              <div className="benchmark-score-pair">
-                <div>
-                  <b>41.6k</b>
-                  <span>Ursula ops/s</span>
-                </div>
-                <div>
-                  <b>6.9×</b>
-                  <span>vs S2 Lite (S3)</span>
-                </div>
+              <div>
+                <dd>
+                  8.3 ms<small>p99</small>
+                </dd>
+                <dt>sse fan-out · 1,000 subscribers</dt>
+                <p>
+                  Single-digit alongside Durable Streams — which is faster here
+                  at 6.5 ms. S2 Lite sits at 112 ms on its S3-backed path.
+                </p>
               </div>
-              <div className="benchmark-score-foot">
-                <div>
-                  <b>3.4k</b>
-                  <span>DS single-node EBS file-durable</span>
-                </div>
-                <div>
-                  <b>3 voter</b>
-                  <span>quorum on every commit</span>
-                </div>
+              <div>
+                <dd>
+                  253 ms<small>p99</small>
+                </dd>
+                <dt>catch-up replay · 1,000 clients</dt>
+                <p>
+                  Lowest p99 and smallest response body (172 KB): Durable
+                  Streams 366 ms · S2 Lite 794 ms.
+                </p>
               </div>
-            </article>
-            <article className="benchmark-score s2">
-              <div className="benchmark-score-name">
-                SSE fan-out @ 1000 subscribers
-              </div>
-              <div className="benchmark-score-pair">
-                <div>
-                  <b>8.3 ms</b>
-                  <span>Ursula p99</span>
-                </div>
-                <div>
-                  <b>13×</b>
-                  <span>vs S2 Lite p99</span>
-                </div>
-              </div>
-              <div className="benchmark-score-foot">
-                <div>
-                  <b>6.5 ms</b>
-                  <span>DS p99</span>
-                </div>
-                <div>
-                  <b>112 ms</b>
-                  <span>S2 Lite p99</span>
-                </div>
-              </div>
-            </article>
-            <article className="benchmark-score durable">
-              <div className="benchmark-score-name">
-                Catch-up replay @ 1,000 clients
-              </div>
-              <div className="benchmark-score-pair">
-                <div>
-                  <b>1.8×</b>
-                  <span>vs DS p99</span>
-                </div>
-                <div>
-                  <b>3.1×</b>
-                  <span>vs S2 Lite p99</span>
-                </div>
-              </div>
-              <div className="benchmark-score-foot">
-                <div>
-                  <b>253 ms</b>
-                  <span>Ursula p99</span>
-                </div>
-                <div>
-                  <b>snapshot</b>
-                  <span>172 KB body vs 200 KB (DS) / 471 KB (S2 Lite)</span>
-                </div>
-              </div>
-            </article>
-          </aside>
-        </div>
-
-        <section className="benchmark-section">
-          <h2>What was measured</h2>
-          <p>
-            All three systems answered the exact same three workloads from the
-            exact same client binary. The bench client picks a backend with{" "}
-            <code>--api-style ursula|durable|s2</code> and switches its HTTP
-            plumbing (URLs, body shape, auth headers) so the workload itself is
-            identical across backends.
-          </p>
-          <div className="benchmark-deploy-grid">
-            <article>
-              <h3>
-                <span
-                  style={{
-                    display: "inline-block",
-                    width: 10,
-                    height: 10,
-                    borderRadius: "50%",
-                    background: backends.ursula.color,
-                    marginRight: 6,
-                  }}
-                />
-                Ursula
-              </h3>
-              <ul>
-                <li>3 × c7g.4xlarge, one voter per AZ</li>
-                <li>256 Raft groups, 16 cores per node</li>
-                <li>Every commit replicates to a majority quorum (2 of 3)</li>
-                <li>S3 cold flush enabled; ~675 MiB uploaded in this run</li>
-                <li>Bench targets all 3 nodes via round-robin</li>
-              </ul>
-            </article>
-            <article>
-              <h3>
-                <span
-                  style={{
-                    display: "inline-block",
-                    width: 10,
-                    height: 10,
-                    borderRadius: "50%",
-                    background: backends.durable.color,
-                    marginRight: 6,
-                  }}
-                />
-                Durable Streams
-              </h3>
-              <ul>
-                <li>1 × c7g.4xlarge, single Rust server process</li>
-                <li>durable-streams-server v0.3.0</li>
-                <li>file-durable storage on the root EBS volume</li>
-                <li>Capacity limits raised above workload size; replay uses ?offset=-1</li>
-              </ul>
-            </article>
-            <article>
-              <h3>
-                <span
-                  style={{
-                    display: "inline-block",
-                    width: 10,
-                    height: 10,
-                    borderRadius: "50%",
-                    background: backends.s2.color,
-                    marginRight: 6,
-                  }}
-                />
-                S2 Lite
-              </h3>
-              <ul>
-                <li>1 × c7g.4xlarge, single S2 Lite process</li>
-                <li>s2-cli v0.33.0 (s2-lite)</li>
-                <li>S3 backend (S3 Standard, same region)</li>
-                <li>S2 Lite's own API, not Durable Streams protocol</li>
-              </ul>
-            </article>
-          </div>
-          <p>
-            <strong>All three backends are persistent in this run.</strong>{" "}
-            Ursula commits each write to a 3-voter Raft quorum across three
-            c7g.4xlarge nodes and runs background S3 cold flush; Durable
-            Streams' file-backed store fsyncs to the root EBS volume on a single node;
-            S2 Lite writes through to S3 on a single node. Ursula append
-            acknowledgements are not gated by the S3 flush, but this run did
-            exercise that background path. This is the durable-vs-durable
-            comparison. Aggregate throughput reflects Ursula getting 3× the
-            hardware in exchange for delivering quorum-replicated durability
-            across AZs that the other two do not provide here.
-          </p>
-          <p>
-            The OS file descriptor limit was set to 65,535 on the client and
-            servers. With S2 Lite artificially constrained to 256 fds, the same
-            harness reproduces connection failures as <code>Too many open files</code>;
-            those failures are excluded from the headline results.
-          </p>
-          <p>
-            Durable Streams' <code>max_memory_bytes</code> is a hard payload
-            capacity limit, not an eviction cache. It is raised here only to
-            avoid benchmark-induced 413 responses; the data directory is on EBS,
-            not <code>/tmp</code> tmpfs.
-          </p>
-        </section>
-
-        <section className="benchmark-section">
-          <h2>Multi-stream write</h2>
-          <p>
-            The question this scenario answers: when many streams are writing
-            concurrently, does the system commit them in parallel or does some
-            shared point serialize them? Ursula's bet is multi-Raft sharding
-            across nodes and cores.
-          </p>
-          <div style={{ display: "grid", gap: 24 }}>
-            <ScenarioBlock scenario={multiStreamThroughput} />
-            <ScenarioBlock scenario={multiStreamLatency} />
+            </dl>
+            <p className="bench-spec">
+              2026-05-22 · ursula-bench · ursula 3 × c7g.4xlarge, raft quorum +
+              s3 cold flush · ds / s2 lite 1 × c7g.4xlarge · 256 B payloads · fd
+              limit 65,535
+            </p>
           </div>
         </section>
 
-        <section className="benchmark-section">
-          <h2>SSE fan-out</h2>
-          <p>
-            One popular document with N concurrent SSE viewers and a steady-rate
-            publisher. The bet: a server with an O(unique-request) wake path
-            delivers each event to all viewers in one round; a naive O(N) wake
-            loop or storage-backed tail path can add latency as subscriber
-            count grows.
-          </p>
-          <ScenarioBlock scenario={fanoutLatency} />
-        </section>
-
-        <section className="benchmark-section">
-          <h2>Catch-up replay</h2>
-          <p>
-            After a deploy or a network blip, many clients reconnect - each to
-            its own document. Each client wants "give me the full current state
-            of this stream". The mechanism differs by system: Ursula uses{" "}
-            <code>/bootstrap</code> which returns a snapshot plus the tail since
-            that snapshot, while DS and S2 Lite must replay the full log because
-            neither ships a matching snapshot endpoint in this harness.
-          </p>
-          <ScenarioBlock scenario={replayLatency} />
-        </section>
-
-        <section className="benchmark-section">
-          <h2>Takeaways</h2>
-          <ul style={{ color: "#ebdbb2", lineHeight: 1.6, paddingLeft: 20 }}>
-            <li>
-              <strong>Write throughput</strong> at 500 streams: Ursula 41.6k
-              quorum commits/s vs S2 Lite 6.0k; Durable Streams reaches 3.4k
-              on its single-node EBS file-durable path.
-            </li>
-            <li>
-              <strong>SSE fan-out</strong> at 1,000 subscribers: Ursula 8.3 ms
-              p99 and DS 6.5 ms p99 both stay in single-digit milliseconds; S2
-              Lite is 112 ms p99 on the S3-backed path.
-            </li>
-            <li>
-              <strong>Catch-up replay</strong> at 1,000 clients: Ursula has
-              the lowest p99 at 253 ms and the smallest response body at 172 KB.
-            </li>
-            <li>
-              <strong>Caveats:</strong> Ursula uses 3 × c7g vs DS / S2 Lite's 1 ×
-              c7g (deployment-shape comparison, not per-CPU). DS numbers use
-              file-durable on EBS with capacity limits raised above the benchmark
-              footprint, and S2 Lite uses S3 Standard with a 65,535-fd process
-              limit.
-            </li>
-          </ul>
-        </section>
-
-        <section className="benchmark-section">
-          <h2>Durability and availability posture</h2>
+        {/* The frame — signal yellow: read this before believing any chart */}
+        <section className="home-band home-band-yellow edge-tint">
+          <EdgeStream />
+          <div className="home-inner bench-prose">
+            <h2 className="home-label"><i>01</i>Read before the charts</h2>
+            <h3 className="bench-h2">Three different shapes of durable</h3>
           <p>
             Throughput and latency are only fair to compare if the durability
             properties are clear. Here is what each system actually guarantees
@@ -1045,14 +845,162 @@ function BenchmarkPage() {
             disk, service on one process. S2 Lite has the best raw
             object-storage durability but its service front-end is
             single-instance, so an instance failure means downtime even though
-            the data is intact. Read the throughput and latency numbers above
+            the data is intact. Read the throughput and latency charts below
             with this in mind: Ursula is paying for that quorum replication on
             every write.
           </p>
+          </div>
         </section>
 
-        <section className="benchmark-section">
-          <h2>Reproduce</h2>
+        {/* Evidence — paper */}
+        <section className="home-band">
+          <div className="home-inner">
+            <h2 className="home-label"><i>02</i>Measured</h2>
+
+            <h3 className="bench-h3">Multi-stream write</h3>
+            <p className="bench-q">
+              When many streams are writing concurrently, does the system
+              commit them in parallel or does some shared point serialize them?
+              Ursula's bet is multi-Raft sharding across nodes and cores.
+            </p>
+            <div className="bench-scenarios">
+              <ScenarioBlock scenario={multiStreamThroughput} />
+              <ScenarioBlock scenario={multiStreamLatency} />
+            </div>
+
+            <h3 className="bench-h3">SSE fan-out</h3>
+            <p className="bench-q">
+              One popular document with N concurrent SSE viewers and a
+              steady-rate publisher. The bet: a server with an
+              O(unique-request) wake path delivers each event to all viewers in
+              one round; a naive O(N) wake loop or storage-backed tail path
+              adds latency as subscriber count grows.
+            </p>
+            <ScenarioBlock scenario={fanoutLatency} />
+
+            <h3 className="bench-h3">Catch-up replay</h3>
+            <p className="bench-q">
+              After a deploy or a network blip, many clients reconnect - each
+              to its own document, each asking for the full current state of
+              its stream. Ursula uses <code>/bootstrap</code>, which returns a
+              snapshot plus the tail since that snapshot; DS and S2 Lite replay
+              the full log because neither ships a matching snapshot endpoint
+              in this harness.
+            </p>
+            <ScenarioBlock scenario={replayLatency} />
+          </div>
+        </section>
+
+        {/* The bench itself — workbench recess */}
+        <section className="home-band home-band-recess">
+          <div className="home-inner bench-prose">
+            <h2 className="home-label"><i>03</i>The bench</h2>
+            <h3 className="bench-h2">Same client, same workloads</h3>
+          <p>
+            All three systems answered the exact same three workloads from the
+            exact same client binary. The bench client picks a backend with{" "}
+            <code>--api-style ursula|durable|s2</code> and switches its HTTP
+            plumbing (URLs, body shape, auth headers) so the workload itself is
+            identical across backends.
+          </p>
+          <div className="benchmark-deploy-grid">
+            <article>
+              <h3>
+                <span
+                  style={{
+                    display: "inline-block",
+                    width: 10,
+                    height: 10,
+                    borderRadius: "50%",
+                    background: backends.ursula.color,
+                    marginRight: 6,
+                  }}
+                />
+                Ursula
+              </h3>
+              <ul>
+                <li>3 × c7g.4xlarge, one voter per AZ</li>
+                <li>256 Raft groups, 16 cores per node</li>
+                <li>Every commit replicates to a majority quorum (2 of 3)</li>
+                <li>S3 cold flush enabled; ~675 MiB uploaded in this run</li>
+                <li>Bench targets all 3 nodes via round-robin</li>
+              </ul>
+            </article>
+            <article>
+              <h3>
+                <span
+                  style={{
+                    display: "inline-block",
+                    width: 10,
+                    height: 10,
+                    borderRadius: "50%",
+                    background: backends.durable.color,
+                    marginRight: 6,
+                  }}
+                />
+                Durable Streams
+              </h3>
+              <ul>
+                <li>1 × c7g.4xlarge, single Rust server process</li>
+                <li>durable-streams-server v0.3.0</li>
+                <li>file-durable storage on the root EBS volume</li>
+                <li>Capacity limits raised above workload size; replay uses ?offset=-1</li>
+              </ul>
+            </article>
+            <article>
+              <h3>
+                <span
+                  style={{
+                    display: "inline-block",
+                    width: 10,
+                    height: 10,
+                    borderRadius: "50%",
+                    background: backends.s2.color,
+                    marginRight: 6,
+                  }}
+                />
+                S2 Lite
+              </h3>
+              <ul>
+                <li>1 × c7g.4xlarge, single S2 Lite process</li>
+                <li>s2-cli v0.33.0 (s2-lite)</li>
+                <li>S3 backend (S3 Standard, same region)</li>
+                <li>S2 Lite's own API, not Durable Streams protocol</li>
+              </ul>
+            </article>
+          </div>
+          <p>
+            <strong>All three backends are persistent in this run.</strong>{" "}
+            Ursula commits each write to a 3-voter Raft quorum across three
+            c7g.4xlarge nodes and runs background S3 cold flush; Durable
+            Streams' file-backed store fsyncs to the root EBS volume on a single node;
+            S2 Lite writes through to S3 on a single node. Ursula append
+            acknowledgements are not gated by the S3 flush, but this run did
+            exercise that background path. This is the durable-vs-durable
+            comparison. Aggregate throughput reflects Ursula getting 3× the
+            hardware in exchange for delivering quorum-replicated durability
+            across AZs that the other two do not provide here.
+          </p>
+          <p>
+            The OS file descriptor limit was set to 65,535 on the client and
+            servers. With S2 Lite artificially constrained to 256 fds, the same
+            harness reproduces connection failures as <code>Too many open files</code>;
+            those failures are excluded from the headline results.
+          </p>
+          <p>
+            Durable Streams' <code>max_memory_bytes</code> is a hard payload
+            capacity limit, not an eviction cache. It is raised here only to
+            avoid benchmark-induced 413 responses; the data directory is on EBS,
+            not <code>/tmp</code> tmpfs.
+          </p>
+          </div>
+        </section>
+
+        {/* Reproduce — graphite terminal band */}
+        <section className="home-band home-band-dark edge-recess">
+          <EdgeStream />
+          <div className="home-inner">
+            <h2 className="home-label"><i>04</i>Reproduce</h2>
           <div className="benchmark-code-block">
             <pre>{`# 1. Build the bench client and the Ursula HTTP server
 cargo build --release -p ursula -p ursula-bench
@@ -1079,6 +1027,7 @@ for api in ursula durable s2; do
  ursula-bench bootstrap --target http://NODE:PORT --api-style "$api" \\
  --clients 1000 --pre-events 200 --per-client-stream
 done`}</pre>
+          </div>
           </div>
         </section>
       </main>

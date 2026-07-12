@@ -37,6 +37,7 @@ function Footer() {
       <div className="footer-brand-column">
         <p className="footer-brand-title">Ursula</p>
         <p className="footer-copyright">Distributed Durable Streams over HTTP, backed by S3.</p>
+        <p className="footer-typeplate">port 4437 · v{__URSULA_VERSION__} · apache-2.0</p>
         <div className="footer-built-by">
           <span className="footer-built-by-label">Built by</span>
           <a

@@ -22,151 +22,183 @@ type HeaderProps = {
   className?: string;
 };
 
-function Header({ navItems, version, githubUrl, cta, className }: HeaderProps) {
-  const handleLinkClick = (href: string) => (event: React.MouseEvent<HTMLElement>) => {
+/* Miniature portraits of the site's own objects, TE-style: free-standing,
+   mixed technique, ink + one orange mark. Basic shapes only. */
+function GlyphDocs() {
+  return (
+    <svg aria-hidden="true" fill="none" height="48" viewBox="0 0 48 48" width="48">
+      <rect fill="var(--bg-elevated)" height="36" rx="3" stroke="currentColor" strokeWidth="1.5" width="45" x="1.5" y="6" />
+      <line stroke="currentColor" strokeWidth="1.5" x1="5" x2="43" y1="17" y2="17" />
+      <rect fill="var(--bg-elevated)" height="8" stroke="currentColor" strokeWidth="1.5" width="11" x="12" y="13" />
+      <circle cx="31" cy="17" fill="currentColor" r="2" />
+      <line stroke="currentColor" strokeWidth="1.5" x1="31" x2="31" y1="17" y2="29" />
+      <rect fill="var(--bg-elevated)" height="6" stroke="currentColor" strokeWidth="1.5" width="10" x="26" y="29" />
+      <rect fill="currentColor" height="4.5" width="9" x="5" y="33" />
+    </svg>
+  );
+}
+
+function GlyphProof() {
+  return (
+    <svg aria-hidden="true" fill="none" height="48" viewBox="0 0 48 48" width="48">
+      <rect fill="currentColor" height="36" rx="4" width="44" x="2" y="6" />
+      <path d="M10 36 A14 14 0 0 1 38 36 Z" fill="var(--bg-base)" />
+      <line stroke="currentColor" strokeWidth="1.5" x1="14.5" x2="16.5" y1="28.5" y2="30.5" />
+      <line stroke="currentColor" strokeWidth="1.5" x1="24" x2="24" y1="23" y2="26.5" />
+      <line stroke="currentColor" strokeWidth="1.5" x1="33.5" x2="31.5" y1="28.5" y2="30.5" />
+      <line stroke="var(--bg-accent)" strokeLinecap="round" strokeWidth="2.5" x1="24" x2="32" y1="36" y2="25" />
+      <circle cx="24" cy="36" fill="currentColor" r="2.5" />
+    </svg>
+  );
+}
+
+function GlyphLatest() {
+  // Thin long rail, thin ticks, one massive block — and a bright cursor.
+  // The block tops out at y6 so the silhouette matches docs/proof (y6–42).
+  return (
+    <svg aria-hidden="true" fill="none" height="48" viewBox="0 0 48 48" width="48">
+      <line stroke="currentColor" strokeWidth="2" x1="2" x2="46" y1="41" y2="41" />
+      <rect fill="currentColor" height="16" width="3" x="4" y="24" />
+      <rect fill="currentColor" height="10" width="3" x="10" y="30" />
+      <rect fill="currentColor" height="34" width="9" x="16" y="6" />
+      <rect fill="currentColor" height="20" width="3" x="28" y="20" />
+      <rect fill="currentColor" height="12" width="3" x="34" y="28" />
+      <rect fill="var(--bg-accent)" height="27" width="3" x="40" y="13" />
+      <circle cx="41.5" cy="9" fill="var(--bg-accent)" r="3" />
+    </svg>
+  );
+}
+
+const GLYPHS: Record<string, () => JSX.Element> = {
+  comp: GlyphDocs,
+  gauge: GlyphProof,
+  stream: GlyphLatest,
+};
+
+type CatalogGroup = {
+  key: string;
+  label: string;
+  href: string;
+  glyph: "comp" | "gauge" | "stream";
+  match: string[];
+  sub: { label: string; href: string }[];
+};
+
+// The header is a catalog: every destination printed in the open — no
+// dropdowns, nothing hidden. Each group wears a pictogram drawn from the
+// site's own circuit vocabulary.
+const CATALOG: CatalogGroup[] = [
+  {
+    key: "docs",
+    label: "docs",
+    href: "/docs",
+    glyph: "comp",
+    match: ["/docs", "/"],
+    sub: [
+      { label: "quick start", href: "/docs/quick-start" },
+      { label: "api reference", href: "/docs/api/overview" },
+      { label: "protocol spec", href: "/docs/specs/durable-stream" },
+    ],
+  },
+  {
+    key: "proof",
+    label: "proof",
+    href: "/benchmark",
+    glyph: "gauge",
+    match: ["/benchmark", "/chaos-test"],
+    sub: [
+      { label: "benchmark", href: "/benchmark" },
+      { label: "chaos test", href: "/chaos-test" },
+    ],
+  },
+  {
+    key: "latest",
+    label: "latest",
+    href: "/blog",
+    glyph: "stream",
+    match: ["/blog"],
+    sub: [
+      { label: "blog", href: "/blog" },
+      { label: "github", href: "__github__" },
+      { label: "llms.txt", href: "/llms.txt" },
+    ],
+  },
+];
+
+function Header({ navItems, version, githubUrl, className }: HeaderProps) {
+  const activeHref = navItems.find((item) => item.active)?.href ?? "";
+
+  const handleClick = (href: string) => (event: React.MouseEvent<HTMLElement>) => {
     if (!isInternalAppPath(href)) {
       return;
     }
-
     event.preventDefault();
     navigateTo(href);
   };
 
-  const showActions = Boolean(githubUrl) || Boolean(cta);
+  const renderLink = (href: string, label: string, cls: string) => {
+    const resolved = href === "__github__" ? (githubUrl ?? "https://github.com/tonbo-io/ursula") : href;
+    const internal = isInternalAppPath(resolved);
+    return (
+      <a
+        className={cls}
+        href={internal ? buildAppHref(resolved) : resolved}
+        target={internal ? undefined : "_blank"}
+        rel={internal ? undefined : "noopener noreferrer"}
+        onClick={handleClick(resolved)}
+      >
+        {label}
+      </a>
+    );
+  };
 
   return (
     <header className={className ? `site-header ${className}` : "site-header"}>
-      <div className="header-primary">
-        <a
-          className="header-brand"
-          aria-label="Ursula"
-          href={buildAppHref("/")}
-          onClick={handleLinkClick("/")}
-        >
-          <span className="header-brand-wordmark">
-            <span className="header-brand-wordmark-accent">Ursula</span>
-          </span>
-        </a>
+      <a
+        aria-label="Ursula"
+        className="header-brand"
+        href={buildAppHref("/")}
+        onClick={handleClick("/")}
+      >
+        <span className="hb-name">ursula</span>
+        <span className="hb-plate">
+          durable streams
+          <br />
+          port 4437{version ? ` · v${version}` : ""}
+        </span>
+      </a>
 
-        {version ? (
-          githubUrl ? (
-            <a
-              className="header-brand-version"
-              href={`${githubUrl}/releases`}
-              target="_blank"
-              rel="noopener noreferrer"
-              title="Releases"
-            >
-              v{version}
-            </a>
-          ) : (
-            <span className="header-brand-version">v{version}</span>
-          )
-        ) : null}
-
-        <nav className="nav-links" aria-label="Primary">
-          {navItems.map((item) => {
-            if (item.children && item.children.length > 0) {
-              return (
-                <div className="nav-link-group" key={item.label}>
-                  <button
-                    type="button"
-                    className={
-                      item.active
-                        ? "nav-link nav-link-active nav-link-trigger"
-                        : "nav-link nav-link-trigger"
-                    }
-                    aria-haspopup="menu"
-                  >
-                    <span>{item.label}</span>
-                    <span className="nav-caret" aria-hidden="true" />
-                  </button>
-                  <div className="nav-dropdown-menu" role="menu">
-                    {item.children.map((child) => (
-                      <a
-                        key={child.label}
-                        className="nav-dropdown-item"
-                        href={child.href}
-                        role="menuitem"
-                        target={isInternalAppPath(child.href) ? undefined : "_blank"}
-                        rel={isInternalAppPath(child.href) ? undefined : "noopener noreferrer"}
-                        onClick={handleLinkClick(child.href)}
-                      >
-                        {child.label}
-                      </a>
-                    ))}
-                  </div>
-                </div>
-              );
-            }
-
-            if (item.href && !item.disabled) {
-              return (
-                <a
-                  key={item.label}
-                  className={item.active ? "nav-link nav-link-active" : "nav-link"}
-                  href={isInternalAppPath(item.href) ? buildAppHref(item.href) : item.href}
-                  onClick={handleLinkClick(item.href)}
-                  aria-current={item.active ? "page" : undefined}
-                >
-                  <span>{item.label}</span>
-                  {item.caret ? <span className="nav-caret" aria-hidden="true" /> : null}
-                </a>
-              );
-            }
-
-            return (
-              <span
-                key={item.label}
-                className={
-                  item.active
-                    ? "nav-link nav-link-active nav-link-disabled"
-                    : "nav-link nav-link-disabled"
-                }
-                aria-disabled="true"
-              >
-                <span>{item.label}</span>
-                {item.caret ? <span className="nav-caret" aria-hidden="true" /> : null}
+      <nav aria-label="Primary" className="header-catalog">
+        {CATALOG.map((group) => {
+          const active =
+            activeHref !== "" && group.match.some((m) => activeHref.startsWith(m));
+          return (
+            <div className={active ? "hgroup hgroup-active" : "hgroup"} key={group.key}>
+              <span aria-hidden="true" className="hglyph">
+                {GLYPHS[group.glyph]?.()}
               </span>
-            );
-          })}
-        </nav>
-      </div>
+              <div className="hgroup-body">
+                {renderLink(group.href, group.label, "hgroup-title")}
+                <ul className="hgroup-sub">
+                  {group.sub.map((item) => (
+                    <li key={item.label}>{renderLink(item.href, item.label, "hgroup-link")}</li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+          );
+        })}
+      </nav>
 
-      {showActions ? (
-        <div className="header-actions">
-          {githubUrl ? (
-            <a
-              className="header-github-link"
-              href={githubUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              aria-label="GitHub repository"
-              title="GitHub"
-            >
-              <svg
-                viewBox="0 0 24 24"
-                width="20"
-                height="20"
-                fill="currentColor"
-                aria-hidden="true"
-              >
-                <path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.4 3-.405 1.02.005 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12" />
-              </svg>
-            </a>
-          ) : null}
-          {cta ? (
-            <a
-              className="button button-header button-primary"
-              href={cta.href}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              {cta.label}
-            </a>
-          ) : null}
-        </div>
-      ) : null}
+      <p aria-hidden="true" className="header-statement">
+        put creates a stream.
+        <br />
+        post appends at quorum.
+        <br />
+        get replays or tails.
+      </p>
+
+      <span aria-hidden="true" className="header-mark" />
     </header>
   );
 }

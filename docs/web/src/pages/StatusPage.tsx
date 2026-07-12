@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import Footer from "../components/Footer";
 import Header from "../components/Header";
+import { bucketHistory } from "../utils/chaosHealth";
 
 type StatusLevel = "operational" | "degraded_performance" | "partial_outage" | "major_outage" | "maintenance" | "unknown";
 
@@ -36,10 +37,6 @@ type HealthHistoryPoint = {
   integrity_status?: StatusLevel | string;
   active_fault?: string | null;
   reasons?: string[];
-};
-
-type HealthHistoryCell = HealthHistoryPoint & {
-  bucket_start_time: string | null;
 };
 
 type TopologyReplica = {
@@ -361,60 +358,6 @@ function formatBytesShort(value: number) {
   return `${scaled.toFixed(digits)} ${units[unitIndex]}`;
 }
 
-const STATUS_RANK: Record<string, number> = {
-  operational: 0,
-  maintenance: 1,
-  degraded_performance: 2,
-  partial_outage: 3,
-  major_outage: 4,
-};
-
-function statusWorse(a: string | null | undefined, b: string | null | undefined): string {
-  const aRank = STATUS_RANK[a ?? ""] ?? -1;
-  const bRank = STATUS_RANK[b ?? ""] ?? -1;
-  return aRank >= bRank ? (a ?? "unknown") : (b ?? "unknown");
-}
-
-function bucketHistory(
-  history: HealthHistoryPoint[],
-  bucketMs: number,
-  maxBucketCount: number,
-  nowMs: number,
-): HealthHistoryCell[] {
-  const currentBucketStart = Math.floor(nowMs / bucketMs) * bucketMs;
-  const cells: Array<HealthHistoryCell & { sampleCount: number }> = [];
-  for (let i = maxBucketCount - 1; i >= 0; i--) {
-    const start = currentBucketStart - i * bucketMs;
-    const end = i === 0 ? nowMs : start + bucketMs;
-    cells.push({
-      bucket_start_time: new Date(start).toISOString(),
-      time: new Date(end).toISOString(),
-      status: "unknown",
-      sampleCount: 0,
-    });
-    const bucket = cells[cells.length - 1];
-    for (const point of history) {
-      const tsText = point.time ?? "";
-      const ts = tsText ? new Date(tsText).getTime() : NaN;
-      if (Number.isNaN(ts)) continue;
-      const isHourlySummary = /^\d{4}-\d{2}-\d{2}T\d{2}:00:00Z$/.test(tsText);
-      const belongsToBucket = isHourlySummary ? ts > start && ts <= end : ts >= start && ts < end;
-      if (!belongsToBucket) continue;
-      if (bucket.sampleCount === 0) {
-        bucket.status = point.status;
-        bucket.reasons = point.reasons;
-      } else {
-        const winner = statusWorse(bucket.status, point.status);
-        if (winner !== bucket.status) {
-          bucket.status = winner;
-          bucket.reasons = point.reasons;
-        }
-      }
-      bucket.sampleCount += 1;
-    }
-  }
-  return cells;
-}
 
 type ActivitySample = { time: string; rate: number; errorDelta: number };
 
@@ -828,11 +771,11 @@ function TopologyCanvas({ topology }: { topology?: ChaosTopology }) {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, width, height);
 
-      const muted = "#928374";
-      const text = "#f9f5d7";
-      const secondary = "#d5c4a1";
+      const muted = "#767061";
+      const text = "#1d1b17";
+      const secondary = "#45413a";
       const voter = "rgba(168, 153, 132, 0.32)";
-      const danger = "#fb4934";
+      const danger = "#b23325";
       const groups = topology?.raft_groups ?? [];
       const nodes = (topology?.nodes ?? []).filter((node) => typeof node.node_id === "number");
 
@@ -1179,33 +1122,6 @@ function StatusPage() {
               <div className="status-brand">24/7 reliability test</div>
               <h1>Chaos Test</h1>
             </div>
-            <div className="status-hero-pill">
-              {runtime ? (
-                <div className="status-hero-runtime" title={`started ${formatTime(status?.started_at ?? null)}`}>
-                  <span className="status-hero-runtime-label">continuously running for</span>
-                  <span className="status-hero-runtime-value">
-                    {runtime.primary}
-                    {runtime.secondary ? <span className="status-hero-runtime-sub">{runtime.secondary}</span> : null}
-                  </span>
-                </div>
-              ) : null}
-              <StatusPill status={displayedOverall} label={heroPillLabel} />
-            </div>
-          </div>
-          <p className="status-summary">
-            {status?.summary ?? "Waiting for the EC2 chaos runner to publish live test data."}
-          </p>
-          <p className="status-hero-blurb">
-            A 3-node cluster on EC2 takes continuous reads and writes while a scheduler injects faults
-            and verifies the cluster recovers inside the SLO.
-          </p>
-          <div className="status-hero-controls">
-            <div className="status-hero-meta">
-              {streamCount ? <>{streamCount.toLocaleString()} streams</> : "-"}
-              {producerCount ? <> · {producerCount.toLocaleString()} producers</> : null}
-              {payloadRange ? <> · payloads {payloadRange}</> : null}
-              {status?.chaos.recovery_slo_secs ? <> · recovery SLO {status.chaos.recovery_slo_secs}s</> : null}
-            </div>
             <div className="status-hero-refresh">
               {updatedRelative ? (
                 <span className="status-updated-relative" title={formatTime(status?.updated_at ?? null)}>
@@ -1229,82 +1145,76 @@ function StatusPage() {
               </label>
             </div>
           </div>
+          <p className="status-summary">
+            {status?.summary ?? "Waiting for the EC2 chaos runner to publish live test data."}
+          </p>
+        </section>
+
+        {/* Verdict: the four load-bearing facts, answer before detail */}
+        <section className="status-verdict">
+          <dl className="status-verdict-grid">
+            <div className="status-verdict-cell">
+              <dd>
+                <StatusPill status={displayedOverall} label={heroPillLabel} />
+              </dd>
+              <dt>cluster status now</dt>
+            </div>
+            <div className="status-verdict-cell">
+              <dd title={`started ${formatTime(status?.started_at ?? null)}`}>
+                {runtime ? runtime.primary : "-"}
+                {runtime?.secondary ? (
+                  <span className="status-verdict-sub">{runtime.secondary}</span>
+                ) : null}
+              </dd>
+              <dt>continuously running</dt>
+            </div>
+            <div className="status-verdict-cell">
+              <dd>
+                {numberValue(status?.chaos.injection_count)}
+                {formatScheduleDelta(status?.chaos.next_fault_after) ? (
+                  <span
+                    className="status-verdict-sub"
+                    title={formatTime(status?.chaos.next_fault_after ?? null)}
+                  >
+                    next {formatScheduleDelta(status?.chaos.next_fault_after)}
+                  </span>
+                ) : null}
+              </dd>
+              <dt>faults injected</dt>
+            </div>
+            <div className="status-verdict-cell">
+              <dd>{numberValue(status?.integrity.verified_offsets)}</dd>
+              <dt>offsets verified against checksums</dt>
+            </div>
+            <div
+              className={`status-verdict-cell ${
+                (status?.integrity.setsum_mismatch_count ?? 0) > 0
+                  ? "status-verdict-bad"
+                  : "status-verdict-ok"
+              }`}
+            >
+              <dd>{numberValue(status?.integrity.setsum_mismatch_count)}</dd>
+              <dt>data corruptions detected</dt>
+            </div>
+          </dl>
+          <p className="status-verdict-spec">
+            3-node cluster on EC2
+            {topologyPlacement ? <> · {topologyPlacement}</> : null}
+            {streamCount ? <> · {streamCount.toLocaleString()} streams</> : null}
+            {producerCount ? <> · {producerCount.toLocaleString()} producers</> : null}
+            {payloadRange ? <> · payloads {payloadRange}</> : null}
+            {status?.chaos.recovery_slo_secs ? <> · recovery SLO {status.chaos.recovery_slo_secs}s</> : null}
+          </p>
+          <p className="status-hero-blurb">
+            A scheduler injects faults while the cluster takes continuous reads and writes; every
+            read is verified against a running checksum, and recovery is measured against the SLO.
+          </p>
         </section>
 
         {stale ? (
           <div className="status-warning">Status feed stale. Last update {updatedRelative ?? "long ago"}.</div>
         ) : null}
         {loadError ? <div className="status-warning">Refresh failed: {loadError}</div> : null}
-
-        <section className="status-section">
-          <div className="status-section-heading">
-            <h2>
-              Health
-              <span className="status-section-subtitle">1 h per bar</span>
-            </h2>
-            <div className="status-history-legend" role="list">
-              {HISTORY_LEGEND.map((entry) => (
-                <span className="status-history-legend-item" key={entry.status} role="listitem">
-                  <span aria-hidden="true" className={`status-history-legend-swatch history-day-${entry.status}`} />
-                  {entry.label}
-                </span>
-              ))}
-            </div>
-          </div>
-          {healthHistory.length === 0 ? (
-            <div className="status-empty">No samples yet.</div>
-          ) : (
-            <>
-              <div className="history-grid status-history-grid">
-                {healthHistory.map((point, index) => {
-                  const end = point.time ? new Date(point.time) : null;
-                  const start = point.bucket_start_time ? new Date(point.bucket_start_time) : null;
-                  const bucketLabel =
-                    start && end
-                      ? `${start.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}–${end.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`
-                      : "-";
-                  return (
-                    <HistoryCell
-                      bucketLabel={bucketLabel}
-                      key={`${point.time ?? "sample"}-${index}`}
-                      point={point}
-                    />
-                  );
-                })}
-              </div>
-              <div className="status-history-axis">
-                <span>7d ago</span>
-                <span>now</span>
-              </div>
-            </>
-          )}
-        </section>
-
-        <section className="status-section">
-          <div className="status-section-heading">
-            <h2>
-              Topology
-              {topologyPlacement ? (
-                <span className="status-section-subtitle">{topologyPlacement}</span>
-              ) : null}
-            </h2>
-            <div className="topology-legend">
-              <span>
-                <span className="topology-legend-line topology-legend-line-leader" aria-hidden="true" />
-                leader
-              </span>
-              <span>
-                <span className="topology-legend-line topology-legend-line-voter" aria-hidden="true" />
-                voter
-              </span>
-              <span>
-                <span className="topology-legend-swatch topology-legend-swatch-noleader" aria-hidden="true" />
-                no leader
-              </span>
-            </div>
-          </div>
-          <TopologyCanvas topology={status?.topology} />
-        </section>
 
         <section className="status-section">
           <div className="status-section-heading">
@@ -1344,14 +1254,6 @@ function StatusPage() {
               >
                 <em>read errors</em>
                 {numberValue(status?.workload.reader_error_total)}
-              </span>
-              <span>
-                <em>faults</em>
-                {numberValue(status?.chaos.injection_count)}
-              </span>
-              <span title={formatTime(status?.chaos.next_fault_after ?? null)}>
-                <em>next</em>
-                {formatScheduleDelta(status?.chaos.next_fault_after) ?? "-"}
               </span>
             </div>
           </div>
@@ -1506,6 +1408,50 @@ function StatusPage() {
 
         <section className="status-section">
           <div className="status-section-heading">
+            <h2>
+              Health
+              <span className="status-section-subtitle">1 h per bar</span>
+            </h2>
+            <div className="status-history-legend" role="list">
+              {HISTORY_LEGEND.map((entry) => (
+                <span className="status-history-legend-item" key={entry.status} role="listitem">
+                  <span aria-hidden="true" className={`status-history-legend-swatch history-day-${entry.status}`} />
+                  {entry.label}
+                </span>
+              ))}
+            </div>
+          </div>
+          {healthHistory.length === 0 ? (
+            <div className="status-empty">No samples yet.</div>
+          ) : (
+            <>
+              <div className="history-grid status-history-grid">
+                {healthHistory.map((point, index) => {
+                  const end = point.time ? new Date(point.time) : null;
+                  const start = point.bucket_start_time ? new Date(point.bucket_start_time) : null;
+                  const bucketLabel =
+                    start && end
+                      ? `${start.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}–${end.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`
+                      : "-";
+                  return (
+                    <HistoryCell
+                      bucketLabel={bucketLabel}
+                      key={`${point.time ?? "sample"}-${index}`}
+                      point={point}
+                    />
+                  );
+                })}
+              </div>
+              <div className="status-history-axis">
+                <span>7d ago</span>
+                <span>now</span>
+              </div>
+            </>
+          )}
+        </section>
+
+        <section className="status-section">
+          <div className="status-section-heading">
             <h2>Integrity</h2>
             <div className="status-section-stats">
               <StatusPill status={status?.integrity.status ?? "unknown"} />
@@ -1576,6 +1522,32 @@ function StatusPage() {
               })}
             </div>
           ) : null}
+        </section>
+
+        <section className="status-section">
+          <div className="status-section-heading">
+            <h2>
+              Topology
+              {topologyPlacement ? (
+                <span className="status-section-subtitle">{topologyPlacement}</span>
+              ) : null}
+            </h2>
+            <div className="topology-legend">
+              <span>
+                <span className="topology-legend-line topology-legend-line-leader" aria-hidden="true" />
+                leader
+              </span>
+              <span>
+                <span className="topology-legend-line topology-legend-line-voter" aria-hidden="true" />
+                voter
+              </span>
+              <span>
+                <span className="topology-legend-swatch topology-legend-swatch-noleader" aria-hidden="true" />
+                no leader
+              </span>
+            </div>
+          </div>
+          <TopologyCanvas topology={status?.topology} />
         </section>
 
         <section className="status-section">
