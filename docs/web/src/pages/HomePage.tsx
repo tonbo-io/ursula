@@ -205,7 +205,7 @@ const KEEP_GLYPHS: Record<string, () => JSX.Element> = {
 const KEEPS = [
   {
     title: "Open-source self-hosting",
-    body: "Apache-2.0. Build it, run it, keep it.",
+    body: "Apache-2.0, the complete server. Deploys as one binary, a Docker image, or a Helm chart.",
     glyph: "host",
   },
   {
@@ -354,17 +354,17 @@ function HomePage() {
               <dt>commits/s aggregate · 500 streams</dt>
             </div>
             <div>
-              <dd>2 of 3</dd>
-              <dt>quorum ack on every append</dt>
+              <dd>8.3 ms</dd>
+              <dt>sse fan-out p99 · 1,000 subscribers, one stream</dt>
             </div>
             <div>
-              <dd>S3 Standard</dd>
-              <dt>cold tier, commodity per-GB price</dt>
+              <dd>253 ms</dd>
+              <dt>catch-up replay p99 · 1,000 cold clients</dt>
             </div>
           </dl>
           <p className="home-footnote home-spec">
-            measured 2026-05-22 · 3 × c7g.4xlarge · s3 cold flush on · 256 B payloads ·
-            one client binary
+            measured 2026-05-22 · 3 × c7g.4xlarge · s3 cold flush on, ~675 MiB uploaded ·
+            256 B payloads · one client binary
           </p>
           <p className="home-footnote home-exit">
             <AppLink className="home-link" href="/benchmark">
@@ -411,9 +411,9 @@ function HomePage() {
           <div className="home-inner">
             <h2 className="home-label"><i>03</i>Proven live</h2>
             <h3 className="hp-title">
-              Under continuous attack,
+              Survives single-node failure,
               <br />
-              on purpose.
+              on record.
             </h3>
             <p className="home-lede">
               A 3-node cluster on EC2 takes faults around the clock: nodes killed, networks
@@ -482,7 +482,7 @@ function HomePage() {
             )}
             <p className="home-footnote home-exit">
               <AppLink className="home-link" href="/chaos-test">
-                Watch the live run →
+                Full record →
               </AppLink>
             </p>
           </div>
@@ -583,7 +583,7 @@ function HomePage() {
           </h3>
           <p className="home-lede">
             These two questions decide the fit. In-network services pushing a few
-            high-throughput pipelines is the wrong shape. Take the right tool:
+            high-throughput pipelines is the wrong shape:
           </p>
           <ul className="hw-routes">
             <li>
