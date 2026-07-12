@@ -1,45 +1,45 @@
-/* Univers Next Pro, weight-remapped onto the cuts the homepage uses. */
+/* Tonbo, weight-remapped onto the cuts the homepage uses. */
 @font-face {
-  font-family: "Univers Next Pro Web";
+  font-family: "Tonbo";
   font-style: normal;
   font-weight: 100 249;
   font-display: swap;
   src:
-    url("/fonts/UniversNextPro-Thin.woff") format("woff"),
+    url("/fonts/Tonbo-Thin.woff") format("woff"),
     local("Univers Next Pro Thin"),
     local("UniversNextPro-Thin");
 }
 
 @font-face {
-  font-family: "Univers Next Pro Web";
+  font-family: "Tonbo";
   font-style: normal;
   font-weight: 250 399;
   font-display: swap;
   src:
-    url("/fonts/UniversNextPro-Light.woff") format("woff"),
+    url("/fonts/Tonbo-Light.woff") format("woff"),
     local("Univers Next Pro Light"),
     local("UniversNextPro-Light");
 }
 
 @font-face {
-  font-family: "Univers Next Pro Web";
+  font-family: "Tonbo";
   font-style: normal;
   font-weight: 400 449;
   font-display: swap;
   src:
-    url("/fonts/UniversNextPro-Regular.woff") format("woff"),
+    url("/fonts/Tonbo-Regular.woff") format("woff"),
     local("Univers Next Pro Regular"),
     local("UniversNextPro-Regular"),
     local("Univers Next Pro");
 }
 
 @font-face {
-  font-family: "Univers Next Pro Web";
+  font-family: "Tonbo";
   font-style: normal;
   font-weight: 450 1000;
   font-display: swap;
   src:
-    url("/fonts/UniversNextPro-Medium.woff") format("woff"),
+    url("/fonts/Tonbo-Medium.woff") format("woff"),
     local("Univers Next Pro Medium"),
     local("UniversNextPro-Medium");
 }
@@ -142,7 +142,7 @@
     "Consolas",
     monospace;
   --font-reading:
-    "Univers Next Pro Web",
+    "Tonbo",
     "Helvetica Neue",
     "Archivo Variable",
     "Inter Variable",
@@ -8237,4 +8237,3 @@ a.docs-card:focus-visible {
     width: 13px;
   }
 }
-
