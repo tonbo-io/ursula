@@ -274,7 +274,9 @@ function HomePage() {
             <h1>
               Durable streams
               <br />
-              over <span className="hx">plain&nbsp;HTTP</span>,
+              over
+              <br />
+              <span className="hx">plain&nbsp;HTTP</span>,
               <br />
               backed by&nbsp;S3.
             </h1>
