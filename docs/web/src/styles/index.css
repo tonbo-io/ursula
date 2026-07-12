@@ -3608,8 +3608,8 @@ a.header-brand-version:focus-visible {
 }
 
 .markdown-content code {
-  background: rgba(40, 40, 40, 0.92);
-  border: 1px solid rgba(80, 73, 69, 0.9);
+  background: var(--bg-elevated-alt);
+  border: 1px solid var(--border-muted);
   border-radius: 6px;
   color: var(--text-primary);
   font-size: 0.94em;
@@ -5189,8 +5189,8 @@ a.header-brand-version:focus-visible {
 }
 
 .docs-content-body code {
-  background: rgba(40, 40, 40, 0.92);
-  border: 1px solid rgba(80, 73, 69, 0.9);
+  background: var(--bg-elevated-alt);
+  border: 1px solid var(--border-muted);
   border-radius: 6px;
   color: var(--text-primary);
   font-family: var(--font-mono);
