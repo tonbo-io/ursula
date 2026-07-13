@@ -6228,6 +6228,8 @@ a.docs-card:focus-visible {
 .home-link:hover,
 .home-link-primary:hover {
   color: var(--text-primary);
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .home-link,
