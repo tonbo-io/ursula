@@ -444,6 +444,8 @@ function HomePage() {
             {live ? (
               <div className="hp-cluster">
                 <div className="hp-head">
+                  {/* The lamp speaks for itself; the prose summary rides
+                      along as its label for hover and screen readers. */}
                   <span
                     className={`home-live-dot${
                       live.corruptions > 0
@@ -452,10 +454,11 @@ function HomePage() {
                           ? ""
                           : " home-live-dot-warn"
                     }`}
-                    aria-hidden="true"
+                    role="img"
+                    aria-label={live.summary ?? "cluster status"}
+                    title={live.summary ?? undefined}
                   />
                   <span className="hp-legend">chaos test · ec2</span>
-                  {live.summary ? <span className="hp-summary">{live.summary}</span> : null}
                   {live.updatedAt != null ? (
                     <span className="hp-updated">
                       updated {formatAgo(Math.max(0, Math.round((Date.now() - live.updatedAt) / 1000)))}
