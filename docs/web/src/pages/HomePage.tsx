@@ -295,20 +295,6 @@ function HomePage() {
               <br />
               backed by&nbsp;S3.
             </h1>
-            <div className="home-verbs" role="group" aria-label="The client API">
-              <AppLink className="hv" href="/docs/api/create-stream">
-                <span className="hv-key">PUT</span>
-                <i className="hv-legend">create</i>
-              </AppLink>
-              <AppLink className="hv hv-pressed" href="/docs/api/append">
-                <span className="hv-key">POST</span>
-                <i className="hv-legend">append · rec</i>
-              </AppLink>
-              <AppLink className="hv" href="/docs/api/read">
-                <span className="hv-key">GET</span>
-                <i className="hv-legend">replay · tail</i>
-              </AppLink>
-            </div>
             <p>
               One durable timeline per document, session, or agent run. Replayable,
               tailable, self-hosted.

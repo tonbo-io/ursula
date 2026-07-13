@@ -6160,108 +6160,6 @@ a.docs-card:focus-visible {
   grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
 }
 
-/* Cassette-deck transport keys. The track is recessed into the panel; keys
-   stand proud with brushed caps; POST is latched down with the record lamp
-   lit — a durable log is a tape machine that never stops recording. */
-.home-verbs {
-  background: var(--bg-elevated-alt);
-  border: 1px solid var(--border-muted);
-  border-radius: 8px;
-  box-shadow: var(--shadow-well);
-  display: inline-flex;
-  gap: 8px;
-  margin: 4px 0 24px;
-  padding: 7px 7px 4px;
-}
-
-.hv {
-  align-items: center;
-  border-bottom: none;
-  display: flex;
-  flex-direction: column;
-}
-
-.hv:focus-visible {
-  border-radius: 6px;
-  outline: 2px solid var(--bg-accent);
-  outline-offset: 2px;
-}
-
-.hv-key {
-  background:
-    repeating-linear-gradient(
-      90deg,
-      rgba(255, 255, 255, 0.35) 0 1px,
-      rgba(255, 255, 255, 0) 1px 3px
-    ),
-    linear-gradient(180deg, #fcfbf8, #e8e5dc);
-  border: 1px solid var(--border-muted);
-  border-radius: 5px;
-  box-shadow:
-    0 2px 0 rgba(28, 26, 21, 0.18),
-    0 3px 6px rgba(28, 26, 21, 0.1),
-    inset 0 1px 0 rgba(255, 255, 255, 0.85);
-  color: var(--text-primary);
-  font-family: var(--font-mono);
-  font-size: 13.5px;
-  font-weight: 600;
-  letter-spacing: 0.06em;
-  padding: 10px 20px 9px;
-  transition:
-    transform 0.06s ease,
-    box-shadow 0.06s ease;
-}
-
-.hv:hover .hv-key {
-  box-shadow:
-    0 1px 0 rgba(28, 26, 21, 0.18),
-    0 2px 4px rgba(28, 26, 21, 0.1),
-    inset 0 1px 0 rgba(255, 255, 255, 0.85);
-  transform: translateY(1px);
-}
-
-.hv:active .hv-key {
-  box-shadow:
-    0 0 0 rgba(28, 26, 21, 0.18),
-    inset 0 2px 3px rgba(28, 26, 21, 0.25);
-  transform: translateY(2px);
-}
-
-/* The latched key: darker cap, sunk into the track, record lamp on */
-.hv-pressed .hv-key {
-  background:
-    repeating-linear-gradient(
-      90deg,
-      rgba(255, 255, 255, 0.05) 0 1px,
-      rgba(255, 255, 255, 0) 1px 3px
-    ),
-    linear-gradient(180deg, #2c2923, #26241f);
-  border-color: #1c1a16;
-  box-shadow:
-    0 0 0 rgba(28, 26, 21, 0),
-    inset 0 2px 4px rgba(0, 0, 0, 0.45);
-  color: var(--panel-dark-text);
-  transform: translateY(2px);
-}
-
-.hv-pressed .hv-key::before {
-  background: #e05545;
-  border-radius: 50%;
-  box-shadow: 0 0 4px rgba(224, 85, 69, 0.7);
-  content: "";
-  display: inline-block;
-  height: 5px;
-  margin-right: 8px;
-  vertical-align: 1px;
-  width: 5px;
-}
-
-.hv-pressed:hover .hv-key,
-.hv-pressed:active .hv-key {
-  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.45);
-  transform: translateY(2px);
-}
-
 /* Legends engraved on the track, beneath each key */
 /* The conclusion the keys add up to — second voice after the h1 */
 /* The nameplate signs the object, title-block style: bottom right */
@@ -6273,17 +6171,6 @@ a.docs-card:focus-visible {
   line-height: 1.4;
   margin: 16px 0 0;
   text-align: right;
-}
-
-.hv-legend {
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: 9px;
-  font-style: normal;
-  letter-spacing: 0.14em;
-  margin-top: 6px;
-  padding-bottom: 2px;
-  text-transform: uppercase;
 }
 
 .home-hero-copy h1 {
@@ -6775,16 +6662,6 @@ a.docs-card:focus-visible {
   .home-band {
     min-height: 0;
     padding: 56px 0;
-  }
-
-  .home-verbs {
-    display: flex;
-    flex-wrap: wrap;
-  }
-
-  .hv-key {
-    font-size: 12.5px;
-    padding: 8px 14px 7px;
   }
 
   .home-hero-grid {
@@ -8310,10 +8187,6 @@ a.docs-card:focus-visible {
 
   .home-hero-copy h1 {
     margin-bottom: 28px;
-  }
-
-  .home-verbs {
-    margin: 8px 0 28px;
   }
 
   .home-label {
