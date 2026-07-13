@@ -4,7 +4,22 @@ import EdgeStream from "../components/EdgeStream";
 import Footer from "../components/Footer";
 import Header from "../components/Header";
 import { buildAppHref, isInternalAppPath, navigateTo } from "../utils/navigation";
-import { bucketHistory, type HealthHistoryPoint } from "../utils/chaosHealth";
+import { bucketHistory, statusWorse, type HealthHistoryPoint } from "../utils/chaosHealth";
+
+/** Requantize hourly cells into wider buckets, worst status wins.
+    Phones show the same 7 days at 6-hour resolution instead of
+    truncating the record. */
+function coarsen(history: Array<string | null>, factor: number): Array<string | null> {
+  const out: Array<string | null> = [];
+  for (let i = 0; i < history.length; i += factor) {
+    let worst: string | null = null;
+    for (const st of history.slice(i, i + factor)) {
+      if (st != null) worst = worst == null ? st : statusWorse(worst, st);
+    }
+    out.push(worst);
+  }
+  return out;
+}
 
 const CHAOS_STATUS_URL =
   (import.meta.env.VITE_CHAOS_STATUS_URL as string | undefined) ||
@@ -463,11 +478,20 @@ function HomePage() {
                 </dl>
                 <div>
                   <div
-                    className="hp-strip"
+                    className="hp-strip hp-strip-fine"
                     role="img"
                     aria-label="Cluster health over the last 7 days, one cell per hour"
                   >
                     {live.history.map((st, i) => (
+                      <i key={i} className={`hp-cell${st ? ` hp-${st}` : ""}`} />
+                    ))}
+                  </div>
+                  <div
+                    className="hp-strip hp-strip-coarse"
+                    role="img"
+                    aria-label="Cluster health over the last 7 days, one cell per six hours"
+                  >
+                    {coarsen(live.history, 6).map((st, i) => (
                       <i key={i} className={`hp-cell${st ? ` hp-${st}` : ""}`} />
                     ))}
                   </div>
