@@ -166,20 +166,29 @@ function KeepHost() {
 }
 
 function KeepClock() {
-  // A Braun table clock: dark case, light face, thin ticks, black hour
-  // hand and the orange sweep hand. No crown — that's icon vocabulary,
-  // not product vocabulary.
+  // The Braun phase clock, black-dial variant: solid disc, tick ring
+  // knocked out of the rim (long cardinals, short in-betweens), chunky
+  // light hands, and the sweep hand with its counterweight tail —
+  // orange here, where the original wears yellow.
   return (
     <svg aria-hidden="true" fill="none" height="80" viewBox="0 0 80 80" width="80">
       <circle cx="40" cy="42" fill="currentColor" r="32" />
-      <circle cx="40" cy="42" fill="var(--glyph-bg)" r="26" />
-      <line stroke="currentColor" strokeWidth="2.5" x1="40" x2="40" y1="18" y2="23" />
-      <line stroke="currentColor" strokeWidth="2.5" x1="64" x2="59" y1="42" y2="42" />
-      <line stroke="currentColor" strokeWidth="2.5" x1="40" x2="40" y1="61" y2="66" />
-      <line stroke="currentColor" strokeWidth="2.5" x1="16" x2="21" y1="42" y2="42" />
-      <line stroke="currentColor" strokeLinecap="round" strokeWidth="3" x1="40" x2="31" y1="42" y2="33" />
-      <line stroke="var(--bg-accent)" strokeLinecap="round" strokeWidth="3" x1="40" x2="51" y1="42" y2="26" />
-      <circle cx="40" cy="42" fill="currentColor" r="3" />
+      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="40" x2="40" y1="12" y2="18" />
+      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="70" x2="64" y1="42" y2="42" />
+      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="40" x2="40" y1="66" y2="72" />
+      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="10" x2="16" y1="42" y2="42" />
+      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="55" x2="53.2" y1="16" y2="19.1" />
+      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="66" x2="62.9" y1="27" y2="28.8" />
+      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="66" x2="62.9" y1="57" y2="55.2" />
+      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="55" x2="53.2" y1="68" y2="64.9" />
+      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="25" x2="26.8" y1="68" y2="64.9" />
+      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="14" x2="17.1" y1="57" y2="55.2" />
+      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="14" x2="17.1" y1="27" y2="28.8" />
+      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="25" x2="26.8" y1="16" y2="19.1" />
+      <line stroke="var(--glyph-bg)" strokeLinecap="round" strokeWidth="4" x1="40" x2="28.7" y1="42" y2="35.5" />
+      <line stroke="var(--glyph-bg)" strokeLinecap="round" strokeWidth="4" x1="40" x2="50" y1="42" y2="59.3" />
+      <line stroke="var(--bg-accent)" strokeWidth="2.5" x1="40" x2="40" y1="49" y2="18" />
+      <circle cx="40" cy="42" fill="var(--bg-accent)" r="3" />
     </svg>
   );
 }
