@@ -632,15 +632,17 @@ function HomePage() {
               <b>etcd</b>
               <span>Small consistent cluster-wide state</span>
             </li>
+            <li className="hw-ours">
+              <AppLink className="hw-ursula" href="/docs/why-ursula">
+                <b>Ursula</b>
+                <span>
+                  Many small per-resource streams, open-internet HTTP clients, replay and live
+                  tail in one primitive
+                </span>
+                <i aria-hidden="true">→</i>
+              </AppLink>
+            </li>
           </ul>
-          <AppLink className="hw-ursula" href="/docs/why-ursula">
-            <b>Ursula</b>
-            <span>
-              Many small per-resource streams, open-internet HTTP clients, replay and live
-              tail in one primitive
-            </span>
-            <i aria-hidden="true">→</i>
-          </AppLink>
           <p className="home-footnote home-exit">
             <AppLink className="home-link" href="/docs/competitive-comparison">
               Full comparison →

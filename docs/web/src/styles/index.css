@@ -7274,21 +7274,30 @@ a.docs-card:focus-visible {
   line-height: 1.5;
 }
 
+/* The last row of the same table, highlighted: graphite is a material,
+   so a full row of it stays inside the hue budget; orange marks the
+   name and the arrow. Negative margins bleed the plate past the text
+   column so the columns still align with the rows above. */
+.hw-routes li.hw-ours {
+  border-bottom: none;
+  display: block;
+  padding: 0;
+}
+
 .hw-ursula {
   align-items: baseline;
   background: var(--panel-dark);
-  border-bottom: none;
   border-radius: 6px;
   box-shadow: var(--shadow-2);
   display: grid;
   gap: 24px;
   grid-template-columns: 200px minmax(0, 1fr) auto;
-  margin-top: 28px;
-  padding: 20px 24px;
+  margin: 10px -24px 4px;
+  padding: 16px 24px;
 }
 
 .hw-ursula b {
-  color: #f1b400;
+  color: #f08b4b;
   font-family: var(--font-mono);
   font-size: 16px;
   font-weight: 700;
@@ -7307,7 +7316,7 @@ a.docs-card:focus-visible {
 }
 
 .hw-ursula:hover i {
-  color: #f1b400;
+  color: #f08b4b;
 }
 
 /* Live chaos readout — an instrument bar on the terminal panel itself.
