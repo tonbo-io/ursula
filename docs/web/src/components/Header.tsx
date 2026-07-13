@@ -47,7 +47,7 @@ function GlyphProof() {
       {/* Drawn on a 48 grid, mapped into the shared y6-42 content band;
           stroke widths compensate for the 0.75 scale. */}
       <g transform="translate(6 6) scale(0.75)">
-        <rect fill="currentColor" height="48" rx="4" width="42" x="3" y="0" />
+        <rect fill="currentColor" height="48" rx="4" width="48" x="0" y="0" />
         <path
           d="M30.4 5.6 A24 24 0 0 1 27 44.8 L19.5 31.8 A9 9 0 0 0 20.8 17.1 Z"
           fill="var(--bg-base)"
