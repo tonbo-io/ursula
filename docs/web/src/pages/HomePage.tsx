@@ -200,8 +200,10 @@ function KeepS3() {
       <ellipse cx="40" cy="16" fill="currentColor" rx="25" ry="8" />
       <rect fill="currentColor" height="48" width="50" x="15" y="16" />
       <ellipse cx="40" cy="64" fill="currentColor" rx="25" ry="8" />
-      <path d="M17 34 a23 7.4 0 0 0 46 0" stroke="var(--glyph-bg)" strokeWidth="2.5" />
-      <path d="M17 50 a23 7.4 0 0 0 46 0" stroke="var(--bg-accent)" strokeWidth="3" />
+      {/* Band endpoints sit half a stroke inside the silhouette, so the
+          stroke's outer edge lands exactly on the cylinder's outline. */}
+      <path d="M16.25 34 a23.75 7.6 0 0 0 47.5 0" stroke="var(--glyph-bg)" strokeWidth="2.5" />
+      <path d="M16.5 50 a23.5 7.5 0 0 0 47 0" stroke="var(--bg-accent)" strokeWidth="3" />
     </svg>
   );
 }
