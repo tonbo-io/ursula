@@ -204,8 +204,8 @@ function KeepS3() {
           a stroke's butt cap is perpendicular to the tangent (horizontal
           here), while a real wrapped band ends with a vertical face
           flush against the vertical silhouette. */}
-      <path d="M15 32.75 a25 8 0 0 0 50 0 l0 2.5 a25 8 0 0 1 -50 0 Z" fill="var(--glyph-bg)" />
-      <path d="M15 48.5 a25 8 0 0 0 50 0 l0 3 a25 8 0 0 1 -50 0 Z" fill="var(--bg-accent)" />
+      <path d="M15 31.75 a25 8 0 0 0 50 0 l0 3.5 a25 8 0 0 1 -50 0 Z" fill="var(--glyph-bg)" />
+      <path d="M15 47.5 a25 8 0 0 0 50 0 l0 4 a25 8 0 0 1 -50 0 Z" fill="var(--bg-accent)" />
     </svg>
   );
 }
