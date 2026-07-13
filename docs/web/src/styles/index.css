@@ -4724,6 +4724,17 @@ a.header-brand-version:focus-visible {
     display: none;
   }
 
+  /* Exit rows stack: three links plus separators don't fit one line,
+     and a mid-list wrap leaves an orphaned separator dot. */
+  .home-exit .home-link {
+    display: block;
+    margin-top: 8px;
+  }
+
+  .home-exit .home-sep {
+    display: none;
+  }
+
   /* 168 hourly cells merge into mud at phone width; show the last
      2 days so each cell keeps its own body and a visible seam. */
   .hp-strip .hp-cell:nth-child(-n + 120) {
@@ -6282,7 +6293,7 @@ a.docs-card:focus-visible {
 
 .home-hero-copy h1 {
   font-family: var(--font-reading);
-  font-size: clamp(34px, 4.5vw, 58px);
+  font-size: clamp(42px, 4.5vw, 58px);
   font-weight: 300;
   letter-spacing: -0.015em;
   line-height: 1.12;
