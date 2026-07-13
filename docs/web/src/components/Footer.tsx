@@ -18,8 +18,9 @@ const footerColumns = [
   {
     title: "Project",
     links: [
-      { label: "Open Durability", href: "https://github.com/tonbo-io/ursula" },
-      { label: "GitHub", href: "https://github.com/tonbo-io/ursula" },
+      { label: "Tonbo Artifacts", href: "https://artifacts.tonbo.io/" },
+      { label: "Tonbo DB", href: "https://tonbo.io/" },
+      { label: "Durable Sessions", href: "https://sessions.tonbo.io/" },
     ] satisfies FooterLink[],
   },
   {
