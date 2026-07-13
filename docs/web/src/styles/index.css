@@ -146,6 +146,15 @@
   box-sizing: border-box;
 }
 
+html {
+  /* iOS Safari otherwise inflates long text blocks, pushing mono spec
+     lines past the viewport. clip (not hidden) so no scroll container
+     is created and position: sticky keeps working. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  overflow-x: clip;
+}
+
 ::selection {
   background: var(--bg-accent);
   color: var(--bg-base);
