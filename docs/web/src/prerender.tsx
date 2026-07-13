@@ -37,7 +37,7 @@ function getHeadForUrl(url: string): HeadData {
 
   if (url === HOME_PATH) {
     return {
-      title: "Ursula — Durable Streams over HTTP, backed by S3",
+      title: "Ursula - Durable Streams over HTTP, backed by S3",
       description:
         "Self-hosted, distributed Durable Streams server. Quorum-replicated appends in single-digit milliseconds, cold data on plain S3, any HTTP client is a valid client.",
       ogType: "website",
