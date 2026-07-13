@@ -150,17 +150,20 @@ function AppLink({ href, children, className }: LinkProps) {
 /* Miniature portraits, one per keep — the reader's own objects drawn
    TE-style: free-standing, one technique each, ink + one orange mark. */
 function KeepHost() {
-  // A square case, as built: the circle rules the square
+  // Two rack units, yours: vent slots, a drive bay each, and one
+  // power lamp lit orange.
   return (
     <svg aria-hidden="true" fill="none" height="80" viewBox="0 0 80 80" width="80">
-      <rect fill="currentColor" height="64" rx="8" width="64" x="8" y="8" />
-      <circle cx="32" cy="40" fill="var(--glyph-bg)" r="18" />
-      <circle cx="32" cy="40" fill="currentColor" r="7" />
-      <rect fill="var(--glyph-bg)" height="2.5" width="12" x="54" y="24" />
-      <rect fill="var(--glyph-bg)" height="2.5" width="12" x="54" y="32" />
-      <rect fill="var(--glyph-bg)" height="2.5" width="12" x="54" y="40" />
-      <rect fill="var(--glyph-bg)" height="2.5" width="12" x="54" y="48" />
-      <circle cx="60" cy="60" fill="var(--bg-accent)" r="4" />
+      <rect fill="currentColor" height="21" rx="2.5" width="64" x="8" y="16" />
+      <rect fill="var(--glyph-bg)" height="2.5" width="24" x="15" y="22" />
+      <rect fill="var(--glyph-bg)" height="2.5" width="24" x="15" y="28" />
+      <rect fill="var(--glyph-bg)" height="7" width="7" x="48" y="22.5" />
+      <circle cx="64" cy="26.5" fill="var(--bg-accent)" r="3" />
+      <rect fill="currentColor" height="21" rx="2.5" width="64" x="8" y="43" />
+      <rect fill="var(--glyph-bg)" height="2.5" width="24" x="15" y="49" />
+      <rect fill="var(--glyph-bg)" height="2.5" width="24" x="15" y="55" />
+      <rect fill="var(--glyph-bg)" height="7" width="7" x="48" y="49.5" />
+      <circle cx="64" cy="53.5" fill="var(--glyph-bg)" r="3" />
     </svg>
   );
 }
