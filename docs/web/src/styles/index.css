@@ -7693,6 +7693,23 @@ a.docs-card:focus-visible {
   background: #7cc47c;
 }
 
+/* Lamp + what it indicates, in the legend register */
+.hp-lamp {
+  align-items: center;
+  color: var(--text-muted);
+  display: inline-flex;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  gap: 7px;
+  letter-spacing: 0.18em;
+  margin-right: 10px;
+  text-transform: uppercase;
+}
+
+.hp-lamp i {
+  font-style: normal;
+}
+
 .hp-head .home-live-dot-warn {
   background: #f1b400;
 }

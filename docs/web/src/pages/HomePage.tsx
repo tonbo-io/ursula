@@ -444,24 +444,46 @@ function HomePage() {
             {live ? (
               <div className="hp-cluster">
                 <div className="hp-head">
-                  {/* The lamp speaks for itself; the prose summary rides
-                      along as its label for hover and screen readers. */}
-                  <span
-                    className={`home-live-dot${
-                      live.corruptions > 0
-                        ? " home-live-dot-bad"
-                        : live.overall === "operational"
+                  {/* A row of lamps, each labelled with what it indicates;
+                      the prose detail rides along as title/aria-label. */}
+                  <span className="hp-lamp" title={live.summary ?? undefined}>
+                    <i
+                      className={`home-live-dot${
+                        live.overall === "operational"
+                          ? ""
+                          : live.overall === "major_outage"
+                            ? " home-live-dot-bad"
+                            : " home-live-dot-warn"
+                      }`}
+                      role="img"
+                      aria-label={live.summary ?? "cluster status"}
+                    />
+                    nodes
+                  </span>
+                  <span className="hp-lamp" title={`${live.corruptions} data corruptions detected`}>
+                    <i
+                      className={`home-live-dot${live.corruptions > 0 ? " home-live-dot-bad" : ""}`}
+                      role="img"
+                      aria-label={`${live.corruptions} data corruptions detected`}
+                    />
+                    integrity
+                  </span>
+                  <span className="hp-lamp" title="telemetry freshness">
+                    <i
+                      className={`home-live-dot${
+                        live.updatedAt != null && Date.now() - live.updatedAt < 90_000
                           ? ""
                           : " home-live-dot-warn"
-                    }`}
-                    role="img"
-                    aria-label={live.summary ?? "cluster status"}
-                    title={live.summary ?? undefined}
-                  />
-                  <span className="hp-legend">chaos test · ec2</span>
+                      }`}
+                      role="img"
+                      aria-label="telemetry freshness"
+                    />
+                    feed
+                  </span>
                   {live.updatedAt != null ? (
                     <span className="hp-updated">
-                      updated {formatAgo(Math.max(0, Math.round((Date.now() - live.updatedAt) / 1000)))}
+                      chaos test · ec2 · updated{" "}
+                      {formatAgo(Math.max(0, Math.round((Date.now() - live.updatedAt) / 1000)))}
                     </span>
                   ) : null}
                 </div>
