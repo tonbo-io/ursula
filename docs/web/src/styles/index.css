@@ -6273,7 +6273,9 @@ a.docs-card:focus-visible {
 
 .home-terminal .t-prompt,
 .home-run .t-prompt {
-  color: #f1b400;
+  /* The prompt is an action point: orange territory. Lifted a step
+     from --bg-accent so it carries on the graphite plate. */
+  color: #e8641f;
 }
 
 .home-terminal .t-output {
