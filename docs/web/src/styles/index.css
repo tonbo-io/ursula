@@ -7718,6 +7718,11 @@ a.docs-card:focus-visible {
   background: #f47c66;
 }
 
+/* Unlit: the panel is standing by, no telemetry to judge */
+.hp-head .home-live-dot-off {
+  background: #4a453d;
+}
+
 .hp-legend {
   color: var(--text-muted);
   font-family: var(--font-mono);
