@@ -7278,6 +7278,12 @@ a.docs-card:focus-visible {
    so a full row of it stays inside the hue budget; orange marks the
    name and the arrow. Negative margins bleed the plate past the text
    column so the columns still align with the rows above. */
+/* The material change is the divider; the hairline right above the
+   graphite row would double it. */
+.hw-routes li:has(+ .hw-ours) {
+  border-bottom-color: transparent;
+}
+
 .hw-routes li.hw-ours {
   border-bottom: none;
   display: block;
