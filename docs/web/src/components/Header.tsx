@@ -65,18 +65,18 @@ function GlyphProof() {
 }
 
 function GlyphLatest() {
-  // Thin long rail, thin ticks, one massive block — and a bright cursor.
-  // The block tops out at y6 so the silhouette matches docs/proof (y6–42).
+  // The SK4 turntable from above: light deck, black record, tonearm
+  // dropped onto the groove. The orange stylus dot is what is playing
+  // right now — the latest.
   return (
     <svg aria-hidden="true" fill="none" height="48" viewBox="0 0 48 48" width="48">
-      <line stroke="currentColor" strokeWidth="2" x1="2" x2="46" y1="41" y2="41" />
-      <rect fill="currentColor" height="16" width="3" x="4" y="24" />
-      <rect fill="currentColor" height="10" width="3" x="10" y="30" />
-      <rect fill="currentColor" height="34" width="9" x="16" y="6" />
-      <rect fill="currentColor" height="20" width="3" x="28" y="20" />
-      <rect fill="currentColor" height="12" width="3" x="34" y="28" />
-      <rect fill="var(--bg-accent)" height="27" width="3" x="40" y="13" />
-      <circle cx="41.5" cy="9" fill="var(--bg-accent)" r="3" />
+      <rect fill="var(--bg-base)" height="36" rx="3" stroke="currentColor" strokeWidth="1.5" width="45" x="1.5" y="6" />
+      <circle cx="19" cy="24" fill="currentColor" r="12" />
+      <circle cx="19" cy="24" fill="var(--bg-base)" r="3.5" />
+      <line stroke="currentColor" strokeLinecap="round" strokeWidth="2.5" x1="39" x2="28" y1="14" y2="29" />
+      <circle cx="39" cy="14" fill="currentColor" r="2.5" />
+      <circle cx="28" cy="29" fill="var(--bg-accent)" r="3" />
+      <rect fill="currentColor" height="5" rx="1" width="5" x="38" y="33" />
     </svg>
   );
 }
