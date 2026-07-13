@@ -8356,4 +8356,10 @@ a.docs-card:focus-visible {
   .hw-routes li {
     padding: 18px 0;
   }
+
+  /* Companion to the nth-child hide in the earlier 720px block: with
+     the oldest 120 cells gone, the track count must follow. */
+  .hp-strip {
+    grid-template-columns: repeat(48, 1fr);
+  }
 }
