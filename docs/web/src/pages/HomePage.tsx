@@ -166,18 +166,20 @@ function KeepHost() {
 }
 
 function KeepClock() {
-  // One black disc; hairline ticks; a long thin orange needle
+  // A Braun table clock: dark case, light face, thin ticks, black hour
+  // hand and the orange sweep hand. No crown — that's icon vocabulary,
+  // not product vocabulary.
   return (
     <svg aria-hidden="true" fill="none" height="80" viewBox="0 0 80 80" width="80">
-      <rect fill="currentColor" height="8" rx="2" width="12" x="34" y="0" />
-      <rect fill="currentColor" height="6" rx="2" transform="rotate(38 61 10)" width="11" x="56" y="7" />
-      <circle cx="40" cy="46" fill="currentColor" r="32" />
-      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="40" x2="40" y1="18" y2="26" />
-      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="70" x2="62" y1="46" y2="46" />
-      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="40" x2="40" y1="66" y2="74" />
-      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="10" x2="18" y1="46" y2="46" />
-      <line stroke="var(--bg-accent)" strokeLinecap="round" strokeWidth="3" x1="40" x2="57" y1="46" y2="26" />
-      <circle cx="40" cy="46" fill="var(--glyph-bg)" r="3" />
+      <circle cx="40" cy="42" fill="currentColor" r="32" />
+      <circle cx="40" cy="42" fill="var(--glyph-bg)" r="26" />
+      <line stroke="currentColor" strokeWidth="2.5" x1="40" x2="40" y1="18" y2="23" />
+      <line stroke="currentColor" strokeWidth="2.5" x1="64" x2="59" y1="42" y2="42" />
+      <line stroke="currentColor" strokeWidth="2.5" x1="40" x2="40" y1="61" y2="66" />
+      <line stroke="currentColor" strokeWidth="2.5" x1="16" x2="21" y1="42" y2="42" />
+      <line stroke="currentColor" strokeLinecap="round" strokeWidth="3" x1="40" x2="31" y1="42" y2="33" />
+      <line stroke="var(--bg-accent)" strokeLinecap="round" strokeWidth="3" x1="40" x2="51" y1="42" y2="26" />
+      <circle cx="40" cy="42" fill="currentColor" r="3" />
     </svg>
   );
 }
