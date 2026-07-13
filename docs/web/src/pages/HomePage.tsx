@@ -207,7 +207,7 @@ function KeepQuorum() {
     <svg aria-hidden="true" fill="none" height="80" viewBox="0 0 80 80" width="80">
       <rect fill="var(--glyph-bg)" height="12" stroke="currentColor" strokeWidth="2" width="24" x="48" y="14" />
       <rect fill="currentColor" height="20" width="40" x="28" y="23" />
-      <rect fill="currentColor" height="28" width="56" x="8" y="38" />
+      <rect fill="currentColor" height="28" stroke="var(--glyph-bg)" strokeWidth="2" width="56" x="8" y="38" />
       <circle cx="20" cy="52" fill="var(--bg-accent)" r="4" />
     </svg>
   );
