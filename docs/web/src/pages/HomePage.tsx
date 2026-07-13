@@ -200,10 +200,12 @@ function KeepS3() {
       <ellipse cx="40" cy="16" fill="currentColor" rx="25" ry="8" />
       <rect fill="currentColor" height="48" width="50" x="15" y="16" />
       <ellipse cx="40" cy="64" fill="currentColor" rx="25" ry="8" />
-      {/* Band endpoints sit half a stroke inside the silhouette, so the
-          stroke's outer edge lands exactly on the cylinder's outline. */}
-      <path d="M16.25 34 a23.75 7.6 0 0 0 47.5 0" stroke="var(--glyph-bg)" strokeWidth="2.5" />
-      <path d="M16.5 50 a23.5 7.5 0 0 0 47 0" stroke="var(--bg-accent)" strokeWidth="3" />
+      {/* Bands are filled regions between two arcs, not stroked paths:
+          a stroke's butt cap is perpendicular to the tangent (horizontal
+          here), while a real wrapped band ends with a vertical face
+          flush against the vertical silhouette. */}
+      <path d="M15 32.75 a25 8 0 0 0 50 0 l0 2.5 a25 8 0 0 1 -50 0 Z" fill="var(--glyph-bg)" />
+      <path d="M15 48.5 a25 8 0 0 0 50 0 l0 3 a25 8 0 0 1 -50 0 Z" fill="var(--bg-accent)" />
     </svg>
   );
 }
