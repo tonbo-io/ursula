@@ -98,8 +98,18 @@ function formatAgo(sec: number) {
   return `${Math.round(sec / 60)} m ago`;
 }
 
-/** Transport clock: bright digits, small engraved units, ticking. */
-function ClockDigits({ ms }: { ms: number }) {
+const EMPTY_HISTORY: Array<string | null> = Array.from({ length: 168 }, () => null);
+
+/** Transport clock: bright digits, small engraved units, ticking.
+    With no feed it shows the LCD rest state, all dashes. */
+function ClockDigits({ ms }: { ms: number | null }) {
+  if (ms == null) {
+    return (
+      <>
+        --<i>d</i>--<i>h</i>--<i>m</i>--<i>s</i>
+      </>
+    );
+  }
   const total = Math.max(0, Math.floor(ms / 1000));
   const d = Math.floor(total / 86_400);
   const hh = String(Math.floor((total % 86_400) / 3_600)).padStart(2, "0");
@@ -441,100 +451,105 @@ function HomePage() {
               partitioned, clocks skewed. Every read is verified against a running
               checksum.
             </p>
-            {live ? (
-              <div className="hp-cluster">
-                <div className="hp-head">
-                  {/* A row of lamps, each labelled with what it indicates;
-                      the prose detail rides along as title/aria-label. */}
-                  <span className="hp-lamp" title={live.summary ?? undefined}>
-                    <i
-                      className={`home-live-dot${
-                        live.overall === "operational"
+            <div className="hp-cluster">
+              <div className="hp-head">
+                {/* A row of lamps, each labelled with what it indicates;
+                    the prose detail rides along as title/aria-label. With
+                    no feed the panel stands by: lamps unlit, feed amber,
+                    dashes in the windows. */}
+                <span className="hp-lamp" title={live?.summary ?? "no telemetry"}>
+                  <i
+                    className={`home-live-dot${
+                      live == null
+                        ? " home-live-dot-off"
+                        : live.overall === "operational"
                           ? ""
                           : live.overall === "major_outage"
                             ? " home-live-dot-bad"
                             : " home-live-dot-warn"
-                      }`}
-                      role="img"
-                      aria-label={live.summary ?? "cluster status"}
-                    />
-                    nodes
-                  </span>
-                  <span className="hp-lamp" title={`${live.corruptions} data corruptions detected`}>
-                    <i
-                      className={`home-live-dot${live.corruptions > 0 ? " home-live-dot-bad" : ""}`}
-                      role="img"
-                      aria-label={`${live.corruptions} data corruptions detected`}
-                    />
-                    integrity
-                  </span>
-                  <span className="hp-lamp" title="telemetry freshness">
-                    <i
-                      className={`home-live-dot${
-                        live.updatedAt != null && Date.now() - live.updatedAt < 90_000
-                          ? ""
-                          : " home-live-dot-warn"
-                      }`}
-                      role="img"
-                      aria-label="telemetry freshness"
-                    />
-                    feed
-                  </span>
-                  {live.updatedAt != null ? (
-                    <span className="hp-updated">
-                      chaos test · ec2 · updated{" "}
-                      {formatAgo(Math.max(0, Math.round((Date.now() - live.updatedAt) / 1000)))}
-                    </span>
-                  ) : null}
-                </div>
-                <dl className="hp-meters">
-                  <div>
-                    <dd><ClockDigits ms={Date.now() - live.startedAt} /></dd>
-                    <dt>running</dt>
-                  </div>
-                  <div>
-                    <dd>{live.faults}</dd>
-                    <dt>faults injected</dt>
-                  </div>
-                  <div>
-                    <dd>{live.verified}</dd>
-                    <dt>offsets verified</dt>
-                  </div>
-                  <div className={live.corruptions > 0 ? "hp-bad" : undefined}>
-                    <dd>{live.corruptions}</dd>
-                    <dt>data corruptions</dt>
-                  </div>
-                </dl>
+                    }`}
+                    role="img"
+                    aria-label={live?.summary ?? "cluster status unknown"}
+                  />
+                  nodes
+                </span>
+                <span
+                  className="hp-lamp"
+                  title={live ? `${live.corruptions} data corruptions detected` : "no telemetry"}
+                >
+                  <i
+                    className={`home-live-dot${
+                      live == null ? " home-live-dot-off" : live.corruptions > 0 ? " home-live-dot-bad" : ""
+                    }`}
+                    role="img"
+                    aria-label={
+                      live ? `${live.corruptions} data corruptions detected` : "integrity unknown"
+                    }
+                  />
+                  integrity
+                </span>
+                <span className="hp-lamp" title="telemetry freshness">
+                  <i
+                    className={`home-live-dot${
+                      live?.updatedAt != null && Date.now() - live.updatedAt < 90_000
+                        ? ""
+                        : " home-live-dot-warn"
+                    }`}
+                    role="img"
+                    aria-label="telemetry freshness"
+                  />
+                  feed
+                </span>
+                <span className="hp-updated">
+                  chaos test · ec2 ·{" "}
+                  {live?.updatedAt != null
+                    ? `updated ${formatAgo(Math.max(0, Math.round((Date.now() - live.updatedAt) / 1000)))}`
+                    : "feed unreachable"}
+                </span>
+              </div>
+              <dl className="hp-meters">
                 <div>
-                  <div
-                    className="hp-strip hp-strip-fine"
-                    role="img"
-                    aria-label="Cluster health over the last 7 days, one cell per hour"
-                  >
-                    {live.history.map((st, i) => (
-                      <i key={i} className={`hp-cell${st ? ` hp-${st}` : ""}`} />
-                    ))}
-                  </div>
-                  <div
-                    className="hp-strip hp-strip-coarse"
-                    role="img"
-                    aria-label="Cluster health over the last 7 days, one cell per six hours"
-                  >
-                    {coarsen(live.history, 6).map((st, i) => (
-                      <i key={i} className={`hp-cell${st ? ` hp-${st}` : ""}`} />
-                    ))}
-                  </div>
-                  <div className="hp-axis">
-                    <span>7 d ago</span>
-                    <span>now</span>
-                  </div>
+                  <dd><ClockDigits ms={live ? Date.now() - live.startedAt : null} /></dd>
+                  <dt>running</dt>
+                </div>
+                <div>
+                  <dd>{live ? live.faults : "----"}</dd>
+                  <dt>faults injected</dt>
+                </div>
+                <div>
+                  <dd>{live ? live.verified : "------"}</dd>
+                  <dt>offsets verified</dt>
+                </div>
+                <div className={live && live.corruptions > 0 ? "hp-bad" : undefined}>
+                  <dd>{live ? live.corruptions : "-"}</dd>
+                  <dt>data corruptions</dt>
+                </div>
+              </dl>
+              <div>
+                <div
+                  className="hp-strip hp-strip-fine"
+                  role="img"
+                  aria-label="Cluster health over the last 7 days, one cell per hour"
+                >
+                  {(live?.history ?? EMPTY_HISTORY).map((st, i) => (
+                    <i key={i} className={`hp-cell${st ? ` hp-${st}` : ""}`} />
+                  ))}
+                </div>
+                <div
+                  className="hp-strip hp-strip-coarse"
+                  role="img"
+                  aria-label="Cluster health over the last 7 days, one cell per six hours"
+                >
+                  {coarsen(live?.history ?? EMPTY_HISTORY, 6).map((st, i) => (
+                    <i key={i} className={`hp-cell${st ? ` hp-${st}` : ""}`} />
+                  ))}
+                </div>
+                <div className="hp-axis">
+                  <span>7 d ago</span>
+                  <span>now</span>
                 </div>
               </div>
-            ) : (
-              <p className="home-footnote">
-                Live feed unavailable right now. The full record is on the chaos test page.
-              </p>
-            )}
+            </div>
             <p className="home-footnote home-exit">
               <AppLink className="home-link" href="/chaos-test">
                 Full record →
