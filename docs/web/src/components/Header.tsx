@@ -39,20 +39,27 @@ function GlyphDocs() {
 }
 
 function GlyphProof() {
-  // A Braun panel meter: knob on top, solid case, wide face window,
-  // a fan of scale ticks, the needle leaning left off vertical.
+  // The Braun radio tuning window: a plain slab with a fan-shaped
+  // cutout, one thin arc of scale, a horizontal needle and the orange
+  // triangle marker. The silhouette does the talking.
   return (
     <svg aria-hidden="true" fill="none" height="48" viewBox="0 0 48 48" width="48">
-      <rect fill="currentColor" height="5" rx="1" width="8" x="20" y="6" />
-      <rect fill="currentColor" height="32" rx="4" width="44" x="2" y="10" />
-      <rect fill="var(--bg-base)" height="19" rx="2.5" width="35" x="6.5" y="14.5" />
-      <line stroke="currentColor" strokeWidth="1.5" x1="12.9" x2="15.1" y1="21" y2="23" />
-      <line stroke="currentColor" strokeWidth="1.5" x1="17.9" x2="19.1" y1="17.3" y2="20" />
-      <line stroke="currentColor" strokeWidth="1.5" x1="24" x2="24" y1="16" y2="19" />
-      <line stroke="currentColor" strokeWidth="1.5" x1="30.1" x2="28.9" y1="17.3" y2="20" />
-      <line stroke="currentColor" strokeWidth="1.5" x1="35.1" x2="32.9" y1="21" y2="23" />
-      <line stroke="var(--bg-accent)" strokeLinecap="round" strokeWidth="2.5" x1="24" x2="15" y1="31" y2="20.3" />
-      <circle cx="24" cy="31" fill="currentColor" r="2.5" />
+      {/* Drawn on a 48 grid, mapped into the shared y6-42 content band;
+          stroke widths compensate for the 0.75 scale. */}
+      <g transform="translate(6 6) scale(0.75)">
+        <rect fill="currentColor" height="48" rx="4" width="42" x="3" y="0" />
+        <path
+          d="M30.4 5.6 A24 24 0 0 1 27 44.8 L19.5 31.8 A9 9 0 0 0 20.8 17.1 Z"
+          fill="var(--bg-base)"
+        />
+        <path
+          d="M25.6 8.7 A16.5 16.5 0 0 1 23.3 38.3"
+          stroke="currentColor"
+          strokeWidth="2"
+        />
+        <line stroke="var(--bg-accent)" strokeWidth="3" x1="21" x2="31.5" y1="24.5" y2="24.5" />
+        <path d="M38 21.5 L38 28.5 L32.5 25 Z" fill="var(--bg-accent)" />
+      </g>
     </svg>
   );
 }
