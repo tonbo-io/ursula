@@ -527,18 +527,9 @@ function HomePage() {
               </dl>
               <div>
                 <div
-                  className="hp-strip hp-strip-fine"
+                  className="hp-strip"
                   role="img"
-                  aria-label="Cluster health over the last 7 days, one cell per hour"
-                >
-                  {(live?.history ?? EMPTY_HISTORY).map((st, i) => (
-                    <i key={i} className={`hp-cell${st ? ` hp-${st}` : ""}`} />
-                  ))}
-                </div>
-                <div
-                  className="hp-strip hp-strip-coarse"
-                  role="img"
-                  aria-label="Cluster health over the last 7 days, one cell per six hours"
+                  aria-label="Cluster health over the last 7 days, one step per six hours"
                 >
                   {coarsen(live?.history ?? EMPTY_HISTORY, 6).map((st, i) => (
                     <i key={i} className={`hp-cell${st ? ` hp-${st}` : ""}`} />
