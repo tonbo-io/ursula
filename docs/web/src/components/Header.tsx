@@ -93,7 +93,7 @@ const CATALOG: CatalogGroup[] = [
     label: "docs",
     href: "/docs",
     glyph: "comp",
-    match: ["/docs", "/"],
+    match: ["/docs"],
     sub: [
       { label: "quick start", href: "/docs/quick-start" },
       { label: "api reference", href: "/docs/api/overview" },
