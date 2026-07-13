@@ -8288,3 +8288,63 @@ a.docs-card:focus-visible {
     width: 13px;
   }
 }
+
+/* Phone breathing scale - lives at the end of the file so it wins the
+   source-order fight against the base rules above. */
+@media (max-width: 720px) {
+  /* Single-column breathing scale: group separations open up one
+     notch; spacing inside a group stays. */
+  .home-band {
+    padding: 72px 0;
+  }
+
+  .home-hero {
+    padding: 56px 0;
+  }
+
+  .home-hero-grid {
+    gap: 44px;
+  }
+
+  .home-hero-copy h1 {
+    margin-bottom: 28px;
+  }
+
+  .home-verbs {
+    margin: 8px 0 28px;
+  }
+
+  .home-label {
+    margin-bottom: 32px;
+  }
+
+  .home-lede {
+    margin-bottom: 32px;
+  }
+
+  .hp-title,
+  .ha-title,
+  .hw-title {
+    margin-bottom: 20px;
+  }
+
+  .home-stat-hero {
+    margin-bottom: 40px;
+  }
+
+  .home-stats {
+    row-gap: 36px;
+  }
+
+  .home-keeps {
+    row-gap: 56px;
+  }
+
+  .home-arch > div {
+    padding: 24px 0;
+  }
+
+  .hw-routes li {
+    padding: 18px 0;
+  }
+}
