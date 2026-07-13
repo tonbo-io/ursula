@@ -4744,20 +4744,6 @@ a.header-brand-version:focus-visible {
     display: none;
   }
 
-  /* 168 hourly cells merge into mud at phone width; show the last
-     2 days so each cell keeps its own body and a visible seam. */
-  .hp-strip .hp-cell:nth-child(-n + 120) {
-    display: none;
-  }
-
-  .hp-axis span:first-child {
-    font-size: 0;
-  }
-
-  .hp-axis span:first-child::before {
-    content: "2 d ago";
-    font-size: 10px;
-  }
 
   .page-content {
     padding-inline: 16px;
@@ -7914,6 +7900,13 @@ a.docs-card:focus-visible {
   padding: 9px 12px;
 }
 
+/* Phone variant: 28 six-hour buckets, real seams. Hidden on desktop. */
+.hp-strip-coarse {
+  display: none;
+  gap: 2px;
+  grid-template-columns: repeat(28, 1fr);
+}
+
 .hp-cell {
   background: rgba(238, 244, 236, 0.1);
   border-radius: 1px;
@@ -8357,9 +8350,16 @@ a.docs-card:focus-visible {
     padding: 18px 0;
   }
 
-  /* Companion to the nth-child hide in the earlier 720px block: with
-     the oldest 120 cells gone, the track count must follow. */
-  .hp-strip {
-    grid-template-columns: repeat(48, 1fr);
+  /* Same 7 days, requantized: hourly cells give way to six-hour
+     buckets that keep real seams at phone width. */
+  .hp-strip-fine {
+    display: none;
+  }
+
+  .hp-strip-coarse {
+    display: grid;
+    /* an old narrow-screen rule zeroes .hp-strip gap to squeeze 168
+       cells in; the coarse strip wants its seams back */
+    gap: 2px;
   }
 }
