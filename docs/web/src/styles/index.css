@@ -7810,18 +7810,23 @@ a.docs-card:focus-visible {
   border-radius: 6px;
   box-shadow: var(--shadow-well-dark);
   display: grid;
-  gap: 10px;
-  grid-template-columns: repeat(28, 1fr);
-  height: 52px;
-  padding: 10px 12px;
+  gap: 1px;
+  grid-template-columns: repeat(168, 1fr);
+  height: 44px;
+  padding: 9px 12px;
 }
 
 
-/* Sequencer steps: 28 chunky lamps, six hours each. The gaps make it
-   a row of lamps instead of a wall of color. */
+/* Phone variant: 28 six-hour buckets, real seams. Hidden on desktop. */
+.hp-strip-coarse {
+  display: none;
+  gap: 2px;
+  grid-template-columns: repeat(28, 1fr);
+}
+
 .hp-cell {
-  background: rgba(238, 244, 236, 0.08);
-  border-radius: 2px;
+  background: rgba(238, 244, 236, 0.1);
+  border-radius: 1px;
 }
 
 .hp-operational {
@@ -8260,4 +8265,14 @@ a.docs-card:focus-visible {
     padding: 18px 0;
   }
 
+  /* Same 7 days, requantized: hourly cells give way to six-hour
+     buckets that keep real seams at phone width. */
+  .hp-strip-fine {
+    display: none;
+  }
+
+  .hp-strip-coarse {
+    display: grid;
+    gap: 2px;
+  }
 }
