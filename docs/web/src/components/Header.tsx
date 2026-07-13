@@ -39,15 +39,20 @@ function GlyphDocs() {
 }
 
 function GlyphProof() {
+  // A Braun panel meter: knob on top, solid case, wide face window,
+  // a fan of scale ticks, the needle leaning left off vertical.
   return (
     <svg aria-hidden="true" fill="none" height="48" viewBox="0 0 48 48" width="48">
-      <rect fill="currentColor" height="36" rx="4" width="44" x="2" y="6" />
-      <path d="M10 36 A14 14 0 0 1 38 36 Z" fill="var(--bg-base)" />
-      <line stroke="currentColor" strokeWidth="1.5" x1="14.5" x2="16.5" y1="28.5" y2="30.5" />
-      <line stroke="currentColor" strokeWidth="1.5" x1="24" x2="24" y1="23" y2="26.5" />
-      <line stroke="currentColor" strokeWidth="1.5" x1="33.5" x2="31.5" y1="28.5" y2="30.5" />
-      <line stroke="var(--bg-accent)" strokeLinecap="round" strokeWidth="2.5" x1="24" x2="32" y1="36" y2="25" />
-      <circle cx="24" cy="36" fill="currentColor" r="2.5" />
+      <rect fill="currentColor" height="5" rx="1" width="8" x="20" y="6" />
+      <rect fill="currentColor" height="32" rx="4" width="44" x="2" y="10" />
+      <rect fill="var(--bg-base)" height="19" rx="2.5" width="35" x="6.5" y="14.5" />
+      <line stroke="currentColor" strokeWidth="1.5" x1="12.9" x2="15.1" y1="21" y2="23" />
+      <line stroke="currentColor" strokeWidth="1.5" x1="17.9" x2="19.1" y1="17.3" y2="20" />
+      <line stroke="currentColor" strokeWidth="1.5" x1="24" x2="24" y1="16" y2="19" />
+      <line stroke="currentColor" strokeWidth="1.5" x1="30.1" x2="28.9" y1="17.3" y2="20" />
+      <line stroke="currentColor" strokeWidth="1.5" x1="35.1" x2="32.9" y1="21" y2="23" />
+      <line stroke="var(--bg-accent)" strokeLinecap="round" strokeWidth="2.5" x1="24" x2="15" y1="31" y2="20.3" />
+      <circle cx="24" cy="31" fill="currentColor" r="2.5" />
     </svg>
   );
 }
