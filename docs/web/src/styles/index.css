@@ -7833,7 +7833,9 @@ a.docs-card:focus-visible {
 .hp-degraded_performance,
 .hp-maintenance,
 .hp-partial_outage {
-  background: #f1b400;
+  /* Chunky keys carry more ink than the chaos page's hairline cells;
+     the darker amber keeps the same perceived loudness. */
+  background: #a8821f;
 }
 
 .hp-major_outage {
