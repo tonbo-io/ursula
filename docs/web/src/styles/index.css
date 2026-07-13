@@ -4716,6 +4716,29 @@ a.header-brand-version:focus-visible {
 }
 
 @media (max-width: 720px) {
+  /* The circuit sheet is a drafting-table drawing; on a phone the
+     home-arch dl below carries the same content in text. (Scoped
+     selector: the base .lt-grid rule sits later in the file and would
+     win a same-specificity fight across media blocks.) */
+  .home-band .lt-grid {
+    display: none;
+  }
+
+  /* 168 hourly cells merge into mud at phone width; show the last
+     2 days so each cell keeps its own body and a visible seam. */
+  .hp-strip .hp-cell:nth-child(-n + 120) {
+    display: none;
+  }
+
+  .hp-axis span:first-child {
+    font-size: 0;
+  }
+
+  .hp-axis span:first-child::before {
+    content: "2 d ago";
+    font-size: 10px;
+  }
+
   .page-content {
     padding-inline: 16px;
   }
@@ -6119,6 +6142,7 @@ a.docs-card:focus-visible {
 .home-hero {
   align-content: center;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   min-height: 84vh;
   padding: 72px 0 64px;
 }
@@ -6375,6 +6399,10 @@ a.docs-card:focus-visible {
   align-content: center;
   background: var(--bg-base);
   display: grid;
+  /* Explicit clamped track: an implicit auto track sizes to content
+     max-content, so one wide <pre> widens the whole band and every
+     width:100% inside it resolves against the inflated track. */
+  grid-template-columns: minmax(0, 1fr);
   min-height: 72vh;
   padding: 88px 0;
 }
@@ -6755,7 +6783,16 @@ a.docs-card:focus-visible {
 
   .home-hero-grid {
     gap: 32px;
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .home-terminal code,
+  .home-run code {
+    font-size: 12.5px;
+  }
+
+  .home-band-dark .home-run code {
+    font-size: 14px;
   }
 
   .home-stats {
