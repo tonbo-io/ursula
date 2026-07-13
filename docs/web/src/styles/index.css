@@ -8068,6 +8068,9 @@ a.docs-card:focus-visible {
 
 .site-header {
   align-items: flex-start;
+  /* explicit: an old <=1100px rule still sets column for the retired
+     header generation */
+  flex-direction: row;
   gap: 0;
   height: auto;
   justify-content: flex-start;
@@ -8238,8 +8241,19 @@ a.docs-card:focus-visible {
 @media (max-width: 900px) {
   .site-header {
     align-items: center;
+    flex-direction: column;
     gap: 18px;
     padding: 14px 16px;
+    position: relative;
+  }
+
+  /* The mark is a seal; it pins to the corner instead of joining the
+     stacked rows. */
+  .header-mark {
+    margin: 0;
+    position: absolute;
+    right: 16px;
+    top: 16px;
   }
 
   .header-brand {
