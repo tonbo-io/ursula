@@ -7287,13 +7287,11 @@ a.docs-card:focus-visible {
 .hw-ursula {
   align-items: baseline;
   background: var(--panel-dark);
-  border-radius: 6px;
-  box-shadow: var(--shadow-2);
   display: grid;
   gap: 24px;
   grid-template-columns: 200px minmax(0, 1fr) auto;
-  margin: 10px -24px 4px;
-  padding: 16px 24px;
+  margin: 0 -16px;
+  padding: 12px 16px;
 }
 
 .hw-ursula b {
