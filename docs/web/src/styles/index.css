@@ -7810,10 +7810,10 @@ a.docs-card:focus-visible {
   border-radius: 6px;
   box-shadow: var(--shadow-well-dark);
   display: grid;
-  gap: 4px;
+  gap: 10px;
   grid-template-columns: repeat(28, 1fr);
-  height: 44px;
-  padding: 9px 12px;
+  height: 52px;
+  padding: 10px 12px;
 }
 
 
