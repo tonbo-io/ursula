@@ -7810,22 +7810,18 @@ a.docs-card:focus-visible {
   border-radius: 6px;
   box-shadow: var(--shadow-well-dark);
   display: grid;
-  gap: 1px;
-  grid-template-columns: repeat(168, 1fr);
+  gap: 4px;
+  grid-template-columns: repeat(28, 1fr);
   height: 44px;
   padding: 9px 12px;
 }
 
-/* Phone variant: 28 six-hour buckets, real seams. Hidden on desktop. */
-.hp-strip-coarse {
-  display: none;
-  gap: 2px;
-  grid-template-columns: repeat(28, 1fr);
-}
 
+/* Sequencer steps: 28 chunky lamps, six hours each. The gaps make it
+   a row of lamps instead of a wall of color. */
 .hp-cell {
-  background: rgba(238, 244, 236, 0.1);
-  border-radius: 1px;
+  background: rgba(238, 244, 236, 0.08);
+  border-radius: 2px;
 }
 
 .hp-operational {
@@ -7866,7 +7862,7 @@ a.docs-card:focus-visible {
   }
 
   .hp-strip {
-    gap: 0;
+    gap: 3px;
   }
 
   .hp-updated {
@@ -8262,16 +8258,4 @@ a.docs-card:focus-visible {
     padding: 18px 0;
   }
 
-  /* Same 7 days, requantized: hourly cells give way to six-hour
-     buckets that keep real seams at phone width. */
-  .hp-strip-fine {
-    display: none;
-  }
-
-  .hp-strip-coarse {
-    display: grid;
-    /* an old narrow-screen rule zeroes .hp-strip gap to squeeze 168
-       cells in; the coarse strip wants its seams back */
-    gap: 2px;
-  }
 }
