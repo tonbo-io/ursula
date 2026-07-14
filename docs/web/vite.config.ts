@@ -17,61 +17,6 @@ const workspaceCargo = readFileSync(resolve(__dirname, "../../Cargo.toml"), "utf
 const workspaceVersion = workspaceCargo.match(/^version\s*=\s*"([^"]+)"/m)?.[1] ?? "0.0.0";
 
 // Rams-style syntax palette on the graphite panel: three functional colors only.
-// Operative tokens (keywords, commands, tags) = signal yellow; data (strings,
-// numbers, constants) = warm amber; structure names (keys, attributes) = olive.
-// Comments and punctuation recede; everything else stays plain.
-const braunGraphite = {
-  name: "braun-graphite",
-  type: "dark",
-  colors: {
-    "editor.background": "#26241f",
-    "editor.foreground": "#edebdd",
-  },
-  tokenColors: [
-    { settings: { foreground: "#edebdd" } },
-    {
-      scope: ["comment", "punctuation.definition.comment"],
-      settings: { foreground: "#8b867a" },
-    },
-    {
-      scope: [
-        "keyword",
-        "storage",
-        "keyword.control",
-        "entity.name.tag",
-        "entity.name.function",
-        "support.function",
-        "markup.heading",
-      ],
-      settings: { foreground: "#f1b400" },
-    },
-    {
-      scope: [
-        "string",
-        "punctuation.definition.string",
-        "constant.numeric",
-        "constant.language",
-        "constant.character.escape",
-        "constant.other",
-      ],
-      settings: { foreground: "#e0b16e" },
-    },
-    {
-      scope: [
-        "variable.other",
-        "variable.parameter",
-        "entity.other.attribute-name",
-        "support.type.property-name",
-        "meta.object-literal.key",
-      ],
-      settings: { foreground: "#a9b665" },
-    },
-    {
-      scope: ["punctuation", "keyword.operator", "punctuation.separator", "meta.brace"],
-      settings: { foreground: "#8b867a" },
-    },
-  ],
-};
 
 export default defineConfig({
   define: {
@@ -101,7 +46,7 @@ export default defineConfig({
           [
             rehypeShiki,
             {
-              theme: braunGraphite,
+              theme: "gruvbox-dark-medium",
               defaultLanguage: "text",
               parseMetaString(meta: string) {
                 const titleMatch = meta.match(/title="([^"]+)"/);

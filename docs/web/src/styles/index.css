@@ -3633,6 +3633,7 @@ a.header-brand-version:focus-visible {
 .markdown-content pre code {
   background: transparent;
   border: 0;
+  color: #ebdbb2;
   display: block;
   font-size: 14px;
   line-height: 1.6;
@@ -5308,7 +5309,9 @@ a.header-brand-version:focus-visible {
 .docs-content-body pre code {
   background: none;
   border: 0;
-  color: var(--text-secondary);
+  /* plaintext blocks have no shiki spans; they inherit this. Gruvbox
+     cream, not page ink, against the dark plate. */
+  color: #ebdbb2;
   font-size: 13px;
   line-height: 1.55;
   padding: 0;
