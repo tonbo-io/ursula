@@ -7813,18 +7813,24 @@ a.docs-card:focus-visible {
   border-radius: 6px;
   box-shadow: var(--shadow-well-dark);
   display: grid;
-  gap: 1px;
-  grid-template-columns: repeat(168, 1fr);
+  /* An instrument has fixed dimensions: 168 bars x 2px + 167 gaps x 3px
+     + 24px padding = 861px exactly. No fractions anywhere. */
+  gap: 3px;
+  grid-template-columns: repeat(168, 2px);
   height: 44px;
   padding: 9px 12px;
+  width: 861px;
 }
 
 
 /* Phone variant: 28 six-hour buckets, real seams. Hidden on desktop. */
 .hp-strip-coarse {
   display: none;
-  gap: 2px;
-  grid-template-columns: repeat(28, 1fr);
+  /* 28 x 6px + 27 x 5px + 24px = 327px, an exact fit for a 375px
+     phone's content column. */
+  gap: 5px;
+  grid-template-columns: repeat(28, 6px);
+  width: 327px;
 }
 
 .hp-cell {
@@ -7853,6 +7859,8 @@ a.docs-card:focus-visible {
 .hp-axis {
   color: var(--text-muted);
   display: flex;
+  max-width: 100%;
+  width: 861px;
   font-family: var(--font-mono);
   font-size: 10px;
   font-variant-numeric: tabular-nums;
@@ -8057,6 +8065,13 @@ a.docs-card:focus-visible {
 
 .hgroup-active .hglyph {
   color: var(--bg-accent);
+}
+
+/* Lit glyphs swap their two inks: the body goes orange, and whatever
+   was orange goes black. A symmetric inversion that reads on every
+   ground. */
+.hgroup-active .hglyph svg {
+  --bg-accent: var(--text-primary);
 }
 
 .hgroup-title {
@@ -8268,14 +8283,20 @@ a.docs-card:focus-visible {
     padding: 18px 0;
   }
 
-  /* Same 7 days, requantized: hourly cells give way to six-hour
-     buckets that keep real seams at phone width. */
+}
+
+/* The fine tape is a fixed 861px instrument; below that it swaps for
+   the 327px six-hour tape. */
+@media (max-width: 909px) {
   .hp-strip-fine {
     display: none;
   }
 
   .hp-strip-coarse {
     display: grid;
-    gap: 2px;
+  }
+
+  .hp-axis {
+    width: 327px;
   }
 }
