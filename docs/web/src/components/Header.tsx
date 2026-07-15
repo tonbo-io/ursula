@@ -52,11 +52,6 @@ function GlyphProof() {
           d="M30.4 5.6 A24 24 0 0 1 27 44.8 L19.5 31.8 A9 9 0 0 0 20.8 17.1 Z"
           fill="var(--bg-base)"
         />
-        <path
-          d="M25.6 8.7 A16.5 16.5 0 0 1 23.3 38.3"
-          stroke="currentColor"
-          strokeWidth="2"
-        />
         <line stroke="var(--bg-accent)" strokeWidth="3" x1="21" x2="31.5" y1="24.5" y2="24.5" />
         <path d="M38 21.5 L38 28.5 L32.5 25 Z" fill="var(--bg-accent)" />
       </g>
@@ -65,18 +60,13 @@ function GlyphProof() {
 }
 
 function GlyphLatest() {
-  // The SK4 turntable from above: light deck, black record, tonearm
-  // dropped onto the groove. The orange stylus dot is what is playing
-  // right now — the latest.
+  // The record, reduced to geometry: a disc, its spindle, and the
+  // orange point on the groove that is playing right now.
   return (
     <svg aria-hidden="true" fill="none" height="48" viewBox="0 0 48 48" width="48">
-      <rect fill="var(--bg-base)" height="36" rx="3" stroke="currentColor" strokeWidth="1.5" width="45" x="1.5" y="6" />
-      <circle cx="19" cy="24" fill="currentColor" r="12" />
-      <circle cx="19" cy="24" fill="var(--bg-base)" r="3.5" />
-      <line stroke="currentColor" strokeLinecap="round" strokeWidth="2.5" x1="39" x2="28" y1="14" y2="29" />
-      <circle cx="39" cy="14" fill="currentColor" r="2.5" />
-      <circle cx="28" cy="29" fill="var(--bg-accent)" r="3" />
-      <rect fill="currentColor" height="5" rx="1" width="5" x="38" y="33" />
+      <circle cx="24" cy="24" fill="currentColor" r="18" />
+      <circle cx="24" cy="24" fill="var(--bg-base)" r="3.5" />
+      <circle cx="31.8" cy="16.2" fill="var(--bg-accent)" r="3" />
     </svg>
   );
 }
