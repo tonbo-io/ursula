@@ -160,48 +160,28 @@ function AppLink({ href, children, className }: LinkProps) {
 /* Miniature portraits, one per keep — the reader's own objects drawn
    TE-style: free-standing, one technique each, ink + one orange mark. */
 function KeepHost() {
-  // Two rack units, yours: vent slots, a drive bay each, and one
-  // power lamp lit orange.
+  // Two rack units reduced to geometry: aligned slabs, one slot each,
+  // one power lamp. (The quorum glyph cascades; this one stacks.)
   return (
     <svg aria-hidden="true" fill="none" height="80" viewBox="0 0 80 80" width="80">
-      <rect fill="currentColor" height="21" rx="2.5" width="64" x="8" y="16" />
-      <rect fill="var(--glyph-bg)" height="2.5" width="24" x="15" y="22" />
-      <rect fill="var(--glyph-bg)" height="2.5" width="24" x="15" y="28" />
-      <rect fill="var(--glyph-bg)" height="7" width="7" x="48" y="22.5" />
-      <circle cx="64" cy="26.5" fill="var(--bg-accent)" r="3" />
-      <rect fill="currentColor" height="21" rx="2.5" width="64" x="8" y="43" />
-      <rect fill="var(--glyph-bg)" height="2.5" width="24" x="15" y="49" />
-      <rect fill="var(--glyph-bg)" height="2.5" width="24" x="15" y="55" />
-      <rect fill="var(--glyph-bg)" height="7" width="7" x="48" y="49.5" />
-      <circle cx="64" cy="53.5" fill="var(--glyph-bg)" r="3" />
+      <rect fill="currentColor" height="21" width="64" x="8" y="16" />
+      <rect fill="var(--glyph-bg)" height="2.5" width="20" x="15" y="25" />
+      <circle cx="63" cy="26.5" fill="var(--bg-accent)" r="3" />
+      <rect fill="currentColor" height="21" width="64" x="8" y="43" />
+      <rect fill="var(--glyph-bg)" height="2.5" width="20" x="15" y="52" />
     </svg>
   );
 }
 
 function KeepClock() {
-  // The Braun phase clock, black-dial variant: solid disc, tick ring
-  // knocked out of the rim (long cardinals, short in-betweens), chunky
-  // light hands, and the sweep hand with its counterweight tail —
-  // orange here, where the original wears yellow.
+  // A dial reduced to geometry: the disc, one tick at twelve, and the
+  // needle. The deflection is the latency.
   return (
     <svg aria-hidden="true" fill="none" height="80" viewBox="0 0 80 80" width="80">
       <circle cx="40" cy="42" fill="currentColor" r="32" />
-      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="40" x2="40" y1="12" y2="18" />
-      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="70" x2="64" y1="42" y2="42" />
-      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="40" x2="40" y1="66" y2="72" />
-      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="10" x2="16" y1="42" y2="42" />
-      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="55" x2="53.2" y1="16" y2="19.1" />
-      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="66" x2="62.9" y1="27" y2="28.8" />
-      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="66" x2="62.9" y1="57" y2="55.2" />
-      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="55" x2="53.2" y1="68" y2="64.9" />
-      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="25" x2="26.8" y1="68" y2="64.9" />
-      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="14" x2="17.1" y1="57" y2="55.2" />
-      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="14" x2="17.1" y1="27" y2="28.8" />
-      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="25" x2="26.8" y1="16" y2="19.1" />
-      <line stroke="var(--glyph-bg)" strokeLinecap="round" strokeWidth="4" x1="40" x2="28.7" y1="42" y2="35.5" />
-      <line stroke="var(--glyph-bg)" strokeLinecap="round" strokeWidth="4" x1="40" x2="50" y1="42" y2="59.3" />
-      <line stroke="var(--bg-accent)" strokeWidth="2.5" x1="40" x2="40" y1="49" y2="18" />
-      <circle cx="40" cy="42" fill="var(--bg-accent)" r="3" />
+      <line stroke="var(--glyph-bg)" strokeWidth="2.5" x1="40" x2="40" y1="13" y2="19" />
+      <line stroke="var(--bg-accent)" strokeLinecap="round" strokeWidth="3" x1="40" x2="52" y1="42" y2="24" />
+      <circle cx="40" cy="42" fill="var(--glyph-bg)" r="3" />
     </svg>
   );
 }
@@ -213,12 +193,10 @@ function KeepS3() {
       <ellipse cx="40" cy="16" fill="currentColor" rx="25" ry="8" />
       <rect fill="currentColor" height="48" width="50" x="15" y="16" />
       <ellipse cx="40" cy="64" fill="currentColor" rx="25" ry="8" />
-      {/* Bands are filled regions between two arcs, not stroked paths:
-          a stroke's butt cap is perpendicular to the tangent (horizontal
-          here), while a real wrapped band ends with a vertical face
-          flush against the vertical silhouette. */}
-      <path d="M15 31.75 a25 8 0 0 0 50 0 l0 3.5 a25 8 0 0 1 -50 0 Z" fill="var(--glyph-bg)" />
-      <path d="M15 47.5 a25 8 0 0 0 50 0 l0 4 a25 8 0 0 1 -50 0 Z" fill="var(--bg-accent)" />
+      {/* One wrapped band, filled between two arcs (a stroke's butt cap
+          would sit perpendicular to the tangent instead of flush with
+          the vertical silhouette). */}
+      <path d="M15 39 a25 8 0 0 0 50 0 l0 4 a25 8 0 0 1 -50 0 Z" fill="var(--bg-accent)" />
     </svg>
   );
 }
