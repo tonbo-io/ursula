@@ -3384,13 +3384,6 @@ a.docs-card:focus-visible {
   background: var(--bg-elevated);
 }
 
-.home-label i {
-  color: var(--text-soft);
-  font-style: normal;
-  font-variant-numeric: tabular-nums;
-  letter-spacing: 0.08em;
-}
-
 .home-label {
   align-items: center;
   color: var(--text-muted);
