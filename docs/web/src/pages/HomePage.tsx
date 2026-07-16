@@ -348,7 +348,7 @@ function HomePage() {
         <section className="home-band home-band-orange edge-ink">
           <EdgeStream />
           <div className="home-inner">
-          <h2 className="home-label"><i>01</i>Measured</h2>
+          <h2 className="home-label">Measured</h2>
           <div className="home-stat-hero">
             <span className="hsh-value">
               7.4<i className="hsh-unit">ms</i>
@@ -385,7 +385,7 @@ function HomePage() {
 
         <section className="home-band">
           <div className="home-inner">
-          <h2 className="home-label"><i>02</i>What Ursula keeps</h2>
+          <h2 className="home-label">What Ursula keeps</h2>
           <p className="home-lede">
             Every other server we evaluated for the Durable Streams Protocol gives up at least
             one of these four. Keeping all four is Ursula's reason to exist.
@@ -418,7 +418,7 @@ function HomePage() {
         <section className="home-band home-band-green edge-paper">
           <EdgeStream />
           <div className="home-inner">
-            <h2 className="home-label"><i>03</i>Proven live</h2>
+            <h2 className="home-label">Proven live</h2>
             <h3 className="hp-title">
               Survives single-node failure,
               <br />
@@ -538,7 +538,7 @@ function HomePage() {
 
         <section className="home-band home-band-recess">
           <div className="home-inner">
-          <h2 className="home-label"><i>04</i>How</h2>
+          <h2 className="home-label">How</h2>
           <h3 className="ha-title">
             Replicate in memory,
             <br />
@@ -623,7 +623,7 @@ function HomePage() {
         <section className="home-band home-band-yellow edge-dark">
           <EdgeStream />
           <div className="home-inner">
-          <h2 className="home-label"><i>05</i>When it's the wrong shape</h2>
+          <h2 className="home-label">When it's the wrong shape</h2>
           <h3 className="hw-title">
             Where do your clients run,
             <br />
@@ -672,7 +672,7 @@ function HomePage() {
         <section className="home-band home-band-dark home-band-short edge-yellow">
           <EdgeStream />
           <div className="home-inner">
-          <h2 className="home-label"><i>06</i>Run it</h2>
+          <h2 className="home-label">Run it</h2>
           <div className="home-run">
             <pre>
               <code>
