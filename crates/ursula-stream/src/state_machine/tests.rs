@@ -6,6 +6,8 @@ use serde_json::json;
 
 use super::persist::message_records_cover_retained_suffix;
 use super::*;
+use crate::RecordIndexError;
+use crate::StreamRecordRange;
 use crate::integrity::StreamIntegritySnapshot;
 
 fn stream(id: &str) -> BucketStreamId {
@@ -57,6 +59,106 @@ fn attrs(title: &str, purpose: &str) -> StreamAttrs {
         title: Some(title.to_owned()),
         metadata,
     }
+}
+
+#[test]
+fn json_record_coordinates_survive_flush_restore_and_retention() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    let stream_id = stream("json-records");
+    assert_eq!(
+        machine.apply(StreamCommand::CreateStream {
+            stream_id: stream_id.clone(),
+            content_type: "application/json".to_owned(),
+            initial_payload: b"{\"a\":1}\n{\"b\":2}\n".to_vec(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            attrs: None,
+            now_ms: 0,
+        }),
+        StreamResponse::Created {
+            stream_id: stream_id.clone(),
+            next_offset: 16,
+            closed: false,
+        }
+    );
+    assert_eq!(
+        machine.apply(StreamCommand::Append {
+            stream_id: stream_id.clone(),
+            content_type: Some("application/json".to_owned()),
+            payload: b"{\"c\":3}\n".to_vec(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            now_ms: 1,
+        }),
+        StreamResponse::Appended {
+            offset: 16,
+            next_offset: 24,
+            closed: false,
+            deduplicated: false,
+            producer: None,
+        }
+    );
+    assert_eq!(
+        machine.record_range(&stream_id),
+        Ok(Some(StreamRecordRange {
+            first_record: 0,
+            next_record: 3,
+        }))
+    );
+    assert_eq!(machine.offset_for_record(&stream_id, 2), Ok(Some(16)));
+
+    let candidate = machine
+        .plan_cold_flush(&stream_id, 1, 1024)
+        .expect("plan cold flush")
+        .expect("flush candidate");
+    assert_eq!(
+        machine.apply(StreamCommand::FlushCold {
+            stream_id: stream_id.clone(),
+            chunk: ColdChunkRef {
+                start_offset: candidate.start_offset,
+                end_offset: candidate.end_offset,
+                s3_path: "s3://bucket/json-records".to_owned(),
+                object_size: u64::try_from(candidate.payload.len()).expect("payload len fits u64"),
+            },
+        }),
+        StreamResponse::ColdFlushed {
+            hot_start_offset: candidate.end_offset,
+        }
+    );
+    let mut restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
+    assert_eq!(restored.offset_for_record(&stream_id, 1), Ok(Some(8)));
+    assert_eq!(
+        restored.apply(StreamCommand::PublishSnapshot {
+            stream_id: stream_id.clone(),
+            snapshot_offset: 16,
+            content_type: "application/json".to_owned(),
+            payload: b"{\"state\":2}".to_vec(),
+            now_ms: 2,
+        }),
+        StreamResponse::SnapshotPublished {
+            snapshot_offset: 16,
+        }
+    );
+    assert_eq!(
+        restored.record_range(&stream_id),
+        Ok(Some(StreamRecordRange {
+            first_record: 2,
+            next_record: 3,
+        }))
+    );
+    assert_eq!(
+        restored.offset_for_record(&stream_id, 1),
+        Err(RecordIndexError::RecordGone {
+            first_record: 2,
+            next_record: 3,
+        })
+    );
+    assert_eq!(restored.offset_for_record(&stream_id, 3), Ok(Some(24)));
 }
 
 fn producer(id: &str, epoch: u64, seq: u64) -> ProducerRequest {
@@ -1557,6 +1659,7 @@ fn snapshot_restore_rejects_invalid_entries() {
                 cold_chunks: Vec::new(),
                 external_segments: Vec::new(),
                 message_records: Vec::new(),
+                record_index: None,
                 integrity: empty_integrity(),
                 visible_snapshot: None,
                 producer_states: Vec::new(),
@@ -1591,6 +1694,7 @@ fn snapshot_restore_rejects_invalid_entries() {
                 cold_chunks: Vec::new(),
                 external_segments: Vec::new(),
                 message_records: Vec::new(),
+                record_index: None,
                 integrity: empty_integrity(),
                 visible_snapshot: None,
                 producer_states: Vec::new(),
@@ -1625,6 +1729,7 @@ fn snapshot_restore_rejects_invalid_entries() {
                 cold_chunks: Vec::new(),
                 external_segments: Vec::new(),
                 message_records: Vec::new(),
+                record_index: None,
                 integrity: empty_integrity(),
                 visible_snapshot: None,
                 producer_states: vec![

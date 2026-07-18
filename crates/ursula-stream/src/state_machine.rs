@@ -60,6 +60,9 @@ use crate::model::StreamReadPlan;
 use crate::model::StreamReadSegment;
 use crate::model::StreamStatus;
 use crate::model::StreamVisibleSnapshot;
+use crate::record_index::StreamRecordIndex;
+use crate::record_index::canonical_json_record_ends;
+use crate::record_index::is_json_record_content_type;
 use crate::response::StreamErrorCode;
 use crate::response::StreamErrorContext;
 use crate::response::StreamResponse;
@@ -100,6 +103,7 @@ struct StreamSlot {
     hot_buffer: HotBuffer,
     cold: StreamColdState,
     message_records: Vec<StreamMessageRecord>,
+    record_index: Option<StreamRecordIndex>,
     integrity: StreamIntegrity,
     visible_snapshot: Option<StreamVisibleSnapshot>,
     producers: HashMap<String, ProducerState>,
@@ -150,10 +154,13 @@ impl StreamStateMachine {
                 attrs,
                 now_ms,
             } => {
+                let record_ends =
+                    canonical_json_record_ends(&content_type, &initial_payload).unwrap_or_default();
                 let response = self.create_stream(CreateStreamInput {
                     stream_id,
                     content_type,
                     initial_payload,
+                    record_ends,
                     close_after,
                     stream_seq,
                     producer,
@@ -169,6 +176,7 @@ impl StreamStateMachine {
                 stream_id,
                 content_type,
                 initial_payload,
+                record_ends,
                 close_after,
                 stream_seq,
                 producer,
@@ -181,6 +189,7 @@ impl StreamStateMachine {
                     stream_id,
                     content_type,
                     initial_payload,
+                    record_ends,
                     close_after,
                     stream_seq,
                     producer,
@@ -217,6 +226,7 @@ impl StreamStateMachine {
                 stream_id,
                 content_type,
                 payload,
+                record_ends,
                 close_after,
                 stream_seq,
                 producer,
@@ -226,6 +236,7 @@ impl StreamStateMachine {
                     stream_id,
                     content_type: content_type.as_deref(),
                     payload,
+                    record_ends,
                     close_after,
                     stream_seq,
                     producer,
@@ -326,6 +337,7 @@ struct CreateStreamInput {
     stream_id: BucketStreamId,
     content_type: String,
     initial_payload: Vec<u8>,
+    record_ends: Vec<u64>,
     close_after: bool,
     stream_seq: Option<String>,
     producer: Option<ProducerRequest>,
@@ -340,6 +352,7 @@ struct CreateExternalStreamInput {
     stream_id: BucketStreamId,
     content_type: String,
     initial_payload: ExternalPayloadRef,
+    record_ends: Vec<u64>,
     close_after: bool,
     stream_seq: Option<String>,
     producer: Option<ProducerRequest>,
@@ -432,6 +445,67 @@ fn validate_external_payload_ref(payload: &ExternalPayloadRef) -> Result<(), Str
         ));
     }
     Ok(())
+}
+
+fn build_record_index(
+    content_type: &str,
+    payload_len: u64,
+    record_ends: &[u64],
+) -> Result<Option<StreamRecordIndex>, StreamResponse> {
+    if !is_json_record_content_type(content_type) {
+        return record_ends.is_empty().then_some(None).ok_or_else(|| {
+            StreamResponse::error(
+                StreamErrorCode::InvalidRecordBoundaries,
+                "record boundaries are only valid for application/json streams",
+            )
+        });
+    }
+    if payload_len > 0 && record_ends.is_empty() {
+        // Pre-extension WAL and snapshot entries have no boundary metadata.
+        // Keep those JSON streams readable without activating coordinates
+        // part-way through their history.
+        return Ok(None);
+    }
+    let mut index = StreamRecordIndex::new();
+    index
+        .append_relative_ends(0, payload_len, record_ends)
+        .map_err(|_| {
+            StreamResponse::error(
+                StreamErrorCode::InvalidRecordBoundaries,
+                "record boundaries do not match the canonical JSON payload",
+            )
+        })?;
+    Ok(Some(index))
+}
+
+fn prepare_record_append(
+    current: Option<&StreamRecordIndex>,
+    json_stream: bool,
+    base_offset: u64,
+    payload_len: u64,
+    record_ends: &[u64],
+) -> Result<Option<StreamRecordIndex>, StreamResponse> {
+    let Some(current) = current else {
+        if json_stream {
+            return Ok(None);
+        }
+        return record_ends.is_empty().then_some(None).ok_or_else(|| {
+            StreamResponse::error(
+                StreamErrorCode::InvalidRecordBoundaries,
+                "binary streams cannot carry JSON record boundaries",
+            )
+        });
+    };
+    let mut updated = current.clone();
+    updated
+        .append_relative_ends(base_offset, payload_len, record_ends)
+        .map_err(|_| {
+            StreamResponse::error(
+                StreamErrorCode::InvalidRecordBoundaries,
+                "record boundaries do not match the canonical JSON payload",
+            )
+        })?;
+    Ok(Some(updated))
 }
 
 fn compare_stream_ids(left: &BucketStreamId, right: &BucketStreamId) -> std::cmp::Ordering {
