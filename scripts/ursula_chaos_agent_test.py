@@ -13,7 +13,7 @@ from ursula_chaos_agent import (
     ProducerState,
     Setsum,
     WorkloadStream,
-    _minimum_history_points,
+    _prune_history,
     _published_started_at,
 )
 
@@ -49,10 +49,21 @@ class ChaosAgentStateTest(unittest.TestCase):
             restored_started_at,
         )
 
-    def test_minimum_history_points_covers_published_window(self) -> None:
-        # Seven days of hourly bars plus the last raw hour at a 15s publish cadence.
-        self.assertEqual(_minimum_history_points(15), 40560)
-        self.assertGreater(_minimum_history_points(10), _minimum_history_points(15))
+    def test_history_retention_is_time_based_under_extra_publishes(self) -> None:
+        now = datetime(2026, 7, 18, 8, 0, tzinfo=timezone.utc)
+        start = now - timedelta(days=7, hours=2)
+        history: deque[dict[str, object]] = deque()
+        sample = start
+        while sample <= now:
+            history.append({"time": sample.isoformat().replace("+00:00", "Z")})
+            sample += timedelta(seconds=13)
+
+        _prune_history(history, int(now.timestamp() * 1000))
+
+        oldest = datetime.fromisoformat(str(history[0]["time"]).replace("Z", "+00:00"))
+        self.assertGreater(len(history), 40_560)
+        self.assertGreaterEqual(oldest, now - timedelta(days=7, hours=1))
+        self.assertLess(oldest, now - timedelta(days=7, hours=1) + timedelta(seconds=13))
 
     def test_reconciles_unresolved_impairment_injection(self) -> None:
         agent = object.__new__(ChaosAgent)
