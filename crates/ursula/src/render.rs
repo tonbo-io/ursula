@@ -100,7 +100,8 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         | StreamErrorCode::InvalidRetention
         | StreamErrorCode::InvalidColdFlush
         | StreamErrorCode::InvalidSnapshot
-        | StreamErrorCode::InvalidStreamAttrs => StatusCode::BAD_REQUEST,
+        | StreamErrorCode::InvalidStreamAttrs
+        | StreamErrorCode::InvalidRecordBoundaries => StatusCode::BAD_REQUEST,
     }
 }
 

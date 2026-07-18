@@ -372,6 +372,13 @@ impl StreamStateMachine {
         let Some(slot) = self.stream_slot_mut(stream_id) else {
             return;
         };
+        if let Some(record_index) = slot.record_index.as_mut()
+            && record_index
+                .retain_from_offset(retained_offset, slot.metadata.tail_offset)
+                .is_err()
+        {
+            return;
+        }
         slot.integrity.evict_before(retained_offset);
         let dropped_cold_paths = slot.cold.compact_before(retained_offset);
         if !dropped_cold_paths.is_empty() {
