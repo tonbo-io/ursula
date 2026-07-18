@@ -65,6 +65,7 @@ pub(crate) struct AppendExternalInput<'a> {
     pub(crate) stream_id: BucketStreamId,
     pub(crate) content_type: Option<&'a str>,
     pub(crate) payload: ExternalPayloadRef,
+    pub(crate) record_ends: Vec<u64>,
     pub(crate) close_after: bool,
     pub(crate) stream_seq: Option<String>,
     pub(crate) producer: Option<ProducerRequest>,
