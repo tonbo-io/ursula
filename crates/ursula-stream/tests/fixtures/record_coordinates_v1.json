@@ -1,0 +1,51 @@
+{
+  "capability_cases": [
+    {"content_type":"application/json","active":true},
+    {"content_type":"application/json; charset=utf-8","active":true},
+    {"content_type":"Application/JSON","active":true},
+    {"content_type":"application/x-ndjson","active":false},
+    {"content_type":"application/octet-stream","active":false},
+    {"content_type":"text/plain","active":false}
+  ],
+  "append_cases": [
+    {
+      "name":"single-object",
+      "body":"{\"type\":\"navigation_started\"}",
+      "allow_empty_array":false,
+      "canonical":"{\"type\":\"navigation_started\"}\n",
+      "record_count":1
+    },
+    {
+      "name":"array-flattens-once",
+      "body":"[{\"type\":\"console\"},{\"type\":\"network\"}]",
+      "allow_empty_array":false,
+      "canonical":"{\"type\":\"console\"}\n{\"type\":\"network\"}\n",
+      "record_count":2
+    },
+    {
+      "name":"nested-array-remains-one-record",
+      "body":"[[1,2,3]]",
+      "allow_empty_array":false,
+      "canonical":"[1,2,3]\n",
+      "record_count":1
+    },
+    {
+      "name":"scalar-is-one-record",
+      "body":"42",
+      "allow_empty_array":false,
+      "canonical":"42\n",
+      "record_count":1
+    },
+    {
+      "name":"empty-array-create",
+      "body":"[]",
+      "allow_empty_array":true,
+      "canonical":"",
+      "record_count":0
+    }
+  ],
+  "invalid_append_cases": [
+    {"name":"empty-array-append","body":"[]","allow_empty_array":false},
+    {"name":"invalid-json","body":"{","allow_empty_array":false}
+  ]
+}
