@@ -6,8 +6,7 @@ description: Run Ursula on Kubernetes with the Helm chart.
 The Ursula Helm chart starts a static-membership Raft cluster with stable
 StatefulSet pod identities, durable per-pod Raft logs, a headless peer Service,
 a client/admin Service, a quorum-protecting PodDisruptionBudget, and a Helm test
-powered by `ursulactl`. The default chart also adds a stateless gateway for
-single-URL external access and soft multi-pod spread hints.
+powered by `ursulactl`, together with soft multi-pod spread hints.
 
 The chart is for fresh static-membership clusters. It does not perform online
 Raft voter expansion, voter removal, leader handoff during Kubernetes rolling
@@ -126,9 +125,8 @@ Ursula exposes a single admin endpoint on the client plane:
   bytes, cold backpressure counters, and per-core mailbox depth.
 
 There are no dedicated `/__ursula/healthz` or `/__ursula/readyz` probes yet.
-Server HTTP probes are disabled in the current chart. Gateway probes use TCP
-socket checks, and cluster-level readiness should come from `helm test` or
-`ursulactl wait-ready`.
+Server HTTP probes are disabled in the current chart, and cluster-level
+readiness should come from `helm test` or `ursulactl wait-ready`.
 
 The mutating operator surface (raft operations, maintenance drain, cold-flush
 trigger) lives on the admin plane bound to pod loopback (`127.0.0.1:4438`);
