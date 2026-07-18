@@ -270,7 +270,7 @@ operationally safe restarts on an initialized cluster.
 
 | Value | Default | Description |
 | --- | --- | --- |
-| `global.image.repository` | `ghcr.io/tonbo-io/ursula` | Ursula image repository. The image must contain `ursula`, `ursulactl`, and `ursulagw`. |
+| `global.image.repository` | `ghcr.io/tonbo-io/ursula` | Ursula image repository. The image must contain the binaries required by the enabled chart components. |
 | `global.image.tag` | `""` | Image tag. Empty uses the chart `appVersion`. |
 | `global.image.pullPolicy` | `IfNotPresent` | Kubernetes image pull policy for server, gateway, and test pods. |
 | `global.imagePullSecrets` | `[]` | Optional image pull secret references rendered into server, gateway, and test pods. |
