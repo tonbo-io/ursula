@@ -40,6 +40,8 @@ message StreamSnapshotEntryV1 {
 }
 
 message StreamMetadataV1 {
+  reserved 10, 11, 12;
+
   BucketStreamIdV1 stream_id = 1;
   string content_type = 2;
   StreamStatusV1 status = 3;
@@ -49,15 +51,13 @@ message StreamMetadataV1 {
   optional uint64 stream_expires_at_ms = 7;
   uint64 created_at_ms = 8;
   uint64 last_ttl_touch_at_ms = 9;
-  BucketStreamIdV1 forked_from = 10;
-  optional uint64 fork_offset = 11;
-  uint64 fork_ref_count = 12;
 }
 
 enum StreamStatusV1 {
+  reserved 2;
+
   STREAM_STATUS_OPEN = 0;
   STREAM_STATUS_CLOSED = 1;
-  STREAM_STATUS_SOFT_DELETED = 2;
 }
 
 message HotPayloadSegmentV1 {

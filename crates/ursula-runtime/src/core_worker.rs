@@ -48,7 +48,6 @@ use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
 use crate::request::FlushColdRequest;
 use crate::request::FlushColdResponse;
-use crate::request::ForkRefResponse;
 use crate::request::GetStreamAttrsRequest;
 use crate::request::GetStreamAttrsResponse;
 use crate::request::GroupReadStreamParts;
@@ -156,17 +155,6 @@ pub(crate) enum CoreCommand {
         request: UpdateStreamAttrsRequest,
         placement: ShardPlacement,
         response_tx: oneshot::Sender<Result<UpdateStreamAttrsResponse, RuntimeError>>,
-    },
-    AddForkRef {
-        stream_id: BucketStreamId,
-        now_ms: u64,
-        placement: ShardPlacement,
-        response_tx: oneshot::Sender<Result<ForkRefResponse, RuntimeError>>,
-    },
-    ReleaseForkRef {
-        stream_id: BucketStreamId,
-        placement: ShardPlacement,
-        response_tx: oneshot::Sender<Result<ForkRefResponse, RuntimeError>>,
     },
     DeleteStream {
         request: DeleteStreamRequest,
@@ -514,32 +502,6 @@ impl CoreWorker {
                 debug_assert_eq!(placement.core_id, self.core_id);
                 self.send_group_command(placement, GroupCommand::UpdateStreamAttrs {
                     request,
-                    response_tx,
-                })
-                .await;
-            }
-            CoreCommand::AddForkRef {
-                stream_id,
-                now_ms,
-                placement,
-                response_tx,
-            } => {
-                debug_assert_eq!(placement.core_id, self.core_id);
-                self.send_group_command(placement, GroupCommand::AddForkRef {
-                    stream_id,
-                    now_ms,
-                    response_tx,
-                })
-                .await;
-            }
-            CoreCommand::ReleaseForkRef {
-                stream_id,
-                placement,
-                response_tx,
-            } => {
-                debug_assert_eq!(placement.core_id, self.core_id);
-                self.send_group_command(placement, GroupCommand::ReleaseForkRef {
-                    stream_id,
                     response_tx,
                 })
                 .await;
@@ -1164,72 +1126,6 @@ impl CoreWorker {
             .as_ref()
             .is_ok_and(|response| !response.deduplicated)
         {
-            metrics.record_applied_mutation(
-                placement.core_id,
-                placement.raft_group_id,
-                elapsed_ns(started_at),
-            );
-            Self::notify_read_watchers(
-                group,
-                metrics,
-                read_materialization,
-                read_watchers,
-                &stream_id,
-                placement,
-            )
-            .await;
-        }
-        response
-    }
-
-    pub(crate) async fn add_fork_ref(
-        group: &mut Box<dyn GroupEngine>,
-        metrics: Arc<RuntimeMetricsInner>,
-        stream_id: BucketStreamId,
-        now_ms: u64,
-        placement: ShardPlacement,
-    ) -> Result<ForkRefResponse, RuntimeError> {
-        let started_at = Instant::now();
-        let exec_started_at = Instant::now();
-        let response = group
-            .add_fork_ref(stream_id, now_ms, placement)
-            .await
-            .map_err(|err| RuntimeError::group_engine(placement, err));
-        metrics.record_group_engine_exec(
-            placement.core_id,
-            placement.raft_group_id,
-            elapsed_ns(exec_started_at),
-        );
-        if response.is_ok() {
-            metrics.record_applied_mutation(
-                placement.core_id,
-                placement.raft_group_id,
-                elapsed_ns(started_at),
-            );
-        }
-        response
-    }
-
-    pub(crate) async fn release_fork_ref(
-        group: &mut Box<dyn GroupEngine>,
-        metrics: Arc<RuntimeMetricsInner>,
-        read_materialization: Arc<Semaphore>,
-        read_watchers: &mut ReadWatchers,
-        stream_id: BucketStreamId,
-        placement: ShardPlacement,
-    ) -> Result<ForkRefResponse, RuntimeError> {
-        let started_at = Instant::now();
-        let exec_started_at = Instant::now();
-        let response = group
-            .release_fork_ref(stream_id.clone(), placement)
-            .await
-            .map_err(|err| RuntimeError::group_engine(placement, err));
-        metrics.record_group_engine_exec(
-            placement.core_id,
-            placement.raft_group_id,
-            elapsed_ns(exec_started_at),
-        );
-        if response.is_ok() {
             metrics.record_applied_mutation(
                 placement.core_id,
                 placement.raft_group_id,

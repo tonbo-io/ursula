@@ -69,7 +69,6 @@ use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineFactory;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::GroupFlushColdFuture;
-use ursula_runtime::GroupForkRefFuture;
 use ursula_runtime::GroupGetStreamAttrsFuture;
 use ursula_runtime::GroupHeadStreamFuture;
 use ursula_runtime::GroupInstallSnapshotFuture;
@@ -1242,27 +1241,6 @@ impl GroupEngine for MadsimScopedGroupEngine {
     ) -> GroupUpdateStreamAttrsFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
             self.inner.update_stream_attrs(request, placement).await
-        }))
-    }
-
-    fn add_fork_ref<'a>(
-        &'a mut self,
-        stream_id: BucketStreamId,
-        now_ms: u64,
-        placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a> {
-        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner.add_fork_ref(stream_id, now_ms, placement).await
-        }))
-    }
-
-    fn release_fork_ref<'a>(
-        &'a mut self,
-        stream_id: BucketStreamId,
-        placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a> {
-        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner.release_fork_ref(stream_id, placement).await
         }))
     }
 

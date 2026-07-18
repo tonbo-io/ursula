@@ -1,4 +1,4 @@
-//! Bucket/stream lifecycle: create, close, delete, fork refs, attrs, and TTL expiry.
+//! Bucket/stream lifecycle: create, close, delete, attrs, and TTL expiry.
 
 use super::AppendStreamInput;
 use super::BucketStreamId;
@@ -23,7 +23,6 @@ use super::StreamResponse;
 use super::StreamSlot;
 use super::StreamStateMachine;
 use super::StreamStatus;
-use super::is_soft_deleted;
 use super::normalize_stream_attrs;
 use super::renew_stream_ttl;
 use super::stream_is_expired;
@@ -109,21 +108,10 @@ impl StreamStateMachine {
 
         if let Some(existing_slot) = self.stream_slot(&input.stream_id) {
             let existing = &existing_slot.metadata;
-            if is_soft_deleted(existing) {
-                return StreamResponse::error(
-                    StreamErrorCode::StreamAlreadyExistsConflict,
-                    format!(
-                        "stream '{}' is gone and cannot be recreated yet",
-                        input.stream_id
-                    ),
-                );
-            }
             if existing.content_type == input.content_type
                 && existing.status == status_from_closed(input.close_after)
                 && existing.stream_ttl_seconds == input.stream_ttl_seconds
                 && existing.stream_expires_at_ms == input.stream_expires_at_ms
-                && existing.forked_from == input.forked_from
-                && existing.fork_offset == input.fork_offset
                 && existing_slot.attrs.as_ref() == attrs.as_ref()
             {
                 return StreamResponse::AlreadyExists {
@@ -154,9 +142,6 @@ impl StreamStateMachine {
             stream_expires_at_ms: input.stream_expires_at_ms,
             created_at_ms: input.now_ms,
             last_ttl_touch_at_ms: input.now_ms,
-            forked_from: input.forked_from,
-            fork_offset: input.fork_offset,
-            fork_ref_count: 0,
         };
         let hot_buffer = HotBuffer::from_payload(0, input.initial_payload);
         let mut integrity = StreamIntegrity::default();
@@ -261,21 +246,10 @@ impl StreamStateMachine {
 
         if let Some(existing_slot) = self.stream_slot(&input.stream_id) {
             let existing = &existing_slot.metadata;
-            if is_soft_deleted(existing) {
-                return StreamResponse::error(
-                    StreamErrorCode::StreamAlreadyExistsConflict,
-                    format!(
-                        "stream '{}' is gone and cannot be recreated yet",
-                        input.stream_id
-                    ),
-                );
-            }
             if existing.content_type == input.content_type
                 && existing.status == status_from_closed(input.close_after)
                 && existing.stream_ttl_seconds == input.stream_ttl_seconds
                 && existing.stream_expires_at_ms == input.stream_expires_at_ms
-                && existing.forked_from == input.forked_from
-                && existing.fork_offset == input.fork_offset
                 && existing_slot.attrs.as_ref() == attrs.as_ref()
             {
                 return StreamResponse::AlreadyExists {
@@ -306,9 +280,6 @@ impl StreamStateMachine {
             stream_expires_at_ms: input.stream_expires_at_ms,
             created_at_ms: input.now_ms,
             last_ttl_touch_at_ms: input.now_ms,
-            forked_from: input.forked_from,
-            fork_offset: input.fork_offset,
-            fork_ref_count: 0,
         };
         let object = ObjectPayloadRef {
             start_offset: 0,
@@ -397,63 +368,14 @@ impl StreamStateMachine {
         if let Err(response) = self.validate_stream_scope(stream_id) {
             return response;
         }
-        let Some(stream) = self.stream_metadata_mut(stream_id) else {
+        let Some(_) = self.stream_metadata(stream_id) else {
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
             );
         };
-        if is_soft_deleted(stream) {
-            return StreamResponse::error(
-                StreamErrorCode::StreamGone,
-                format!("stream '{stream_id}' is gone"),
-            );
-        }
-        if stream.fork_ref_count > 0 {
-            stream.status = StreamStatus::SoftDeleted;
-            return StreamResponse::Deleted {
-                hard_deleted: false,
-                parent_to_release: None,
-            };
-        }
-        let parent_to_release = stream.forked_from.clone();
         self.remove_stream_state(stream_id);
-        StreamResponse::Deleted {
-            hard_deleted: true,
-            parent_to_release,
-        }
-    }
-
-    pub(super) fn add_fork_ref(
-        &mut self,
-        stream_id: &BucketStreamId,
-        now_ms: u64,
-    ) -> StreamResponse {
-        if let Err(response) = self.validate_stream_scope(stream_id) {
-            return response;
-        }
-        if self.expire_stream_if_due(stream_id, now_ms) {
-            return StreamResponse::error(
-                StreamErrorCode::StreamNotFound,
-                format!("stream '{stream_id}' does not exist"),
-            );
-        }
-        let Some(stream) = self.stream_metadata_mut(stream_id) else {
-            return StreamResponse::error(
-                StreamErrorCode::StreamNotFound,
-                format!("stream '{stream_id}' does not exist"),
-            );
-        };
-        if is_soft_deleted(stream) {
-            return StreamResponse::error(
-                StreamErrorCode::StreamGone,
-                format!("stream '{stream_id}' is gone"),
-            );
-        }
-        stream.fork_ref_count = stream.fork_ref_count.saturating_add(1);
-        StreamResponse::ForkRefAdded {
-            fork_ref_count: stream.fork_ref_count,
-        }
+        StreamResponse::Deleted
     }
 
     pub(super) fn update_stream_attrs(
@@ -477,13 +399,6 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             );
         };
-        let stream = &slot.metadata;
-        if is_soft_deleted(stream) {
-            return StreamResponse::error(
-                StreamErrorCode::StreamGone,
-                format!("stream '{stream_id}' is gone"),
-            );
-        }
         let attrs = normalize_stream_attrs(attrs);
         if let Err(response) = validate_stream_attrs(attrs.as_ref()) {
             return response;
@@ -495,40 +410,6 @@ impl StreamStateMachine {
             .expect("stream existence checked before attrs mutation")
             .attrs = attrs;
         StreamResponse::AttrsUpdated { changed: true }
-    }
-
-    pub(super) fn release_fork_ref(&mut self, stream_id: &BucketStreamId) -> StreamResponse {
-        if let Err(response) = self.validate_stream_scope(stream_id) {
-            return response;
-        }
-        let Some(stream) = self.stream_metadata_mut(stream_id) else {
-            return StreamResponse::ForkRefReleased {
-                hard_deleted: false,
-                fork_ref_count: 0,
-                parent_to_release: None,
-            };
-        };
-        if stream.fork_ref_count == 0 {
-            return StreamResponse::error(
-                StreamErrorCode::InvalidFork,
-                format!("stream '{stream_id}' has no fork reference to release"),
-            );
-        }
-        stream.fork_ref_count -= 1;
-        if stream.fork_ref_count == 0 && is_soft_deleted(stream) {
-            let parent_to_release = stream.forked_from.clone();
-            self.remove_stream_state(stream_id);
-            return StreamResponse::ForkRefReleased {
-                hard_deleted: true,
-                fork_ref_count: 0,
-                parent_to_release,
-            };
-        }
-        StreamResponse::ForkRefReleased {
-            hard_deleted: false,
-            fork_ref_count: stream.fork_ref_count,
-            parent_to_release: None,
-        }
     }
 
     pub(super) fn touch_stream_access(
@@ -546,12 +427,6 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             );
         };
-        if is_soft_deleted(stream) {
-            return StreamResponse::error(
-                StreamErrorCode::StreamGone,
-                format!("stream '{stream_id}' is gone"),
-            );
-        }
         if stream_is_expired(stream, now_ms) {
             self.remove_stream_state(stream_id);
             return StreamResponse::Accessed {
@@ -612,8 +487,7 @@ impl StreamStateMachine {
         };
         // The cold objects we wrote for this stream are now unreferenced.
         // Enqueue the whole prefix for the background GC worker to reclaim;
-        // cold objects are stream-exclusive (forks copy, never share), so a
-        // prefix sweep is safe and keeps the queue O(streams) not O(chunks).
+        // A prefix sweep is safe and keeps the queue O(streams), not O(chunks).
         if slot.cold.has_cold_objects() {
             self.cold_gc
                 .enqueue(ColdGcTarget::Stream(stream_id.clone()));

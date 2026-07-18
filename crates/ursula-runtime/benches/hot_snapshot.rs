@@ -100,8 +100,6 @@ fn build_machine(scenario: SnapshotScenario) -> StreamStateMachine {
                 producer: None,
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
-                forked_from: None,
-                fork_offset: None,
                 attrs: None,
                 now_ms: 0,
             }),

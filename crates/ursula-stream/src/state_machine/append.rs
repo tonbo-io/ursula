@@ -16,7 +16,6 @@ use super::StreamMetadata;
 use super::StreamResponse;
 use super::StreamStateMachine;
 use super::StreamStatus;
-use super::is_soft_deleted;
 use super::renew_stream_ttl;
 use super::validate_external_payload_ref;
 use super::validate_producer_request;
@@ -49,15 +48,6 @@ impl StreamStateMachine {
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
-            );
-        }
-        if self
-            .stream_metadata(&stream_id)
-            .is_some_and(is_soft_deleted)
-        {
-            return StreamResponse::error(
-                StreamErrorCode::StreamGone,
-                format!("stream '{stream_id}' is gone"),
             );
         }
         let producer_decision = match self.evaluate_producer(&stream_id, producer.as_ref()) {
@@ -227,15 +217,6 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             );
         }
-        if self
-            .stream_metadata(&stream_id)
-            .is_some_and(is_soft_deleted)
-        {
-            return StreamResponse::error(
-                StreamErrorCode::StreamGone,
-                format!("stream '{stream_id}' is gone"),
-            );
-        }
         let producer_decision = match self.evaluate_producer(&stream_id, producer.as_ref()) {
             Ok(decision) => decision,
             Err(response) => return response,
@@ -369,15 +350,6 @@ impl StreamStateMachine {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
-            ));
-        }
-        if self
-            .stream_metadata(&stream_id)
-            .is_some_and(is_soft_deleted)
-        {
-            return Err(StreamResponse::error(
-                StreamErrorCode::StreamGone,
-                format!("stream '{stream_id}' is gone"),
             ));
         }
         let producer_decision = self.evaluate_producer(&stream_id, producer.as_ref())?;

@@ -32,8 +32,6 @@ pub struct CreateStreamRequest {
     pub producer: Option<ProducerRequest>,
     pub stream_ttl_seconds: Option<u64>,
     pub stream_expires_at_ms: Option<u64>,
-    pub forked_from: Option<BucketStreamId>,
-    pub fork_offset: Option<u64>,
     pub attrs: Option<StreamAttrs>,
     pub now_ms: u64,
 }
@@ -48,8 +46,6 @@ pub struct CreateStreamExternalRequest {
     pub producer: Option<ProducerRequest>,
     pub stream_ttl_seconds: Option<u64>,
     pub stream_expires_at_ms: Option<u64>,
-    pub forked_from: Option<BucketStreamId>,
-    pub fork_offset: Option<u64>,
     pub attrs: Option<StreamAttrs>,
     pub now_ms: u64,
 }
@@ -68,8 +64,6 @@ impl CreateStreamExternalRequest {
             producer: request.producer,
             stream_ttl_seconds: request.stream_ttl_seconds,
             stream_expires_at_ms: request.stream_expires_at_ms,
-            forked_from: request.forked_from,
-            fork_offset: request.fork_offset,
             attrs: request.attrs,
             now_ms: request.now_ms,
         }
@@ -88,8 +82,6 @@ impl CreateStreamRequest {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: None,
             now_ms: 0,
         }
@@ -380,23 +372,12 @@ pub struct DeleteStreamRequest {
 pub struct DeleteStreamResponse {
     pub placement: ShardPlacement,
     pub group_commit_index: u64,
-    pub hard_deleted: bool,
-    pub parent_to_release: Option<BucketStreamId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AckColdGcResponse {
     pub placement: ShardPlacement,
     pub removed: u64,
-    pub group_commit_index: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForkRefResponse {
-    pub placement: ShardPlacement,
-    pub fork_ref_count: u64,
-    pub hard_deleted: bool,
-    pub parent_to_release: Option<BucketStreamId>,
     pub group_commit_index: u64,
 }
 

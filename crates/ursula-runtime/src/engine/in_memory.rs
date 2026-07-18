@@ -35,7 +35,6 @@ use super::GroupEngineError;
 use super::GroupEngineFactory;
 use super::GroupEngineMetrics;
 use super::GroupFlushColdFuture;
-use super::GroupForkRefFuture;
 use super::GroupGetStreamAttrsFuture;
 use super::GroupHeadStreamFuture;
 use super::GroupInstallSnapshotFuture;
@@ -80,7 +79,6 @@ use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
 use crate::request::FlushColdRequest;
 use crate::request::FlushColdResponse;
-use crate::request::ForkRefResponse;
 use crate::request::GetStreamAttrsRequest;
 use crate::request::GetStreamAttrsResponse;
 use crate::request::GroupReadStreamParts;
@@ -153,8 +151,6 @@ impl InMemoryGroupEngine {
                 producer,
                 stream_ttl_seconds,
                 stream_expires_at_ms,
-                forked_from,
-                fork_offset,
                 attrs,
                 now_ms,
             } => {
@@ -168,8 +164,6 @@ impl InMemoryGroupEngine {
                     producer,
                     stream_ttl_seconds,
                     stream_expires_at_ms,
-                    forked_from,
-                    fork_offset,
                     attrs,
                     now_ms,
                 });
@@ -224,8 +218,6 @@ impl InMemoryGroupEngine {
                 producer,
                 stream_ttl_seconds,
                 stream_expires_at_ms,
-                forked_from,
-                fork_offset,
                 attrs,
                 now_ms,
             } => {
@@ -239,8 +231,6 @@ impl InMemoryGroupEngine {
                     producer,
                     stream_ttl_seconds,
                     stream_expires_at_ms,
-                    forked_from,
-                    fork_offset,
                     attrs,
                     now_ms,
                 });
@@ -573,72 +563,6 @@ impl InMemoryGroupEngine {
                     ))),
                 }
             }
-            GroupWriteCommand::AddForkRef { stream_id, now_ms } => {
-                let response = self
-                    .state_machine
-                    .apply(StreamCommand::AddForkRef { stream_id, now_ms });
-                match response {
-                    StreamResponse::ForkRefAdded { fork_ref_count } => {
-                        self.commit_index += 1;
-                        Ok(GroupWriteResponse::AddForkRef(ForkRefResponse {
-                            placement,
-                            fork_ref_count,
-                            hard_deleted: false,
-                            parent_to_release: None,
-                            group_commit_index: self.commit_index,
-                        }))
-                    }
-                    StreamResponse::Error {
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    } => Err(GroupEngineError::stream_with_context(
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    )),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected add fork ref response: {other:?}"
-                    ))),
-                }
-            }
-            GroupWriteCommand::ReleaseForkRef { stream_id } => {
-                let response = self
-                    .state_machine
-                    .apply(StreamCommand::ReleaseForkRef { stream_id });
-                match response {
-                    StreamResponse::ForkRefReleased {
-                        hard_deleted,
-                        fork_ref_count,
-                        parent_to_release,
-                    } => {
-                        self.commit_index += 1;
-                        Ok(GroupWriteResponse::ReleaseForkRef(ForkRefResponse {
-                            placement,
-                            fork_ref_count,
-                            hard_deleted,
-                            parent_to_release,
-                            group_commit_index: self.commit_index,
-                        }))
-                    }
-                    StreamResponse::Error {
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    } => Err(GroupEngineError::stream_with_context(
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    )),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected release fork ref response: {other:?}"
-                    ))),
-                }
-            }
             GroupWriteCommand::FlushCold { stream_id, chunk } => {
                 let response = self
                     .state_machine
@@ -717,22 +641,14 @@ impl InMemoryGroupEngine {
                     stream_id: stream_id.clone(),
                 });
                 match response {
-                    StreamResponse::Deleted {
-                        hard_deleted,
-                        parent_to_release,
-                    } => {
+                    StreamResponse::Deleted => {
                         self.commit_index += 1;
-                        if hard_deleted {
-                            // Stream is gone: drop its runtime append count so the
-                            // map stays bounded under delete churn (snapshot build
-                            // also filters, but this avoids unbounded growth).
-                            self.stream_append_counts.remove(&stream_id);
-                        }
+                        // Stream is gone: drop its runtime append count so the map
+                        // stays bounded under delete churn.
+                        self.stream_append_counts.remove(&stream_id);
                         Ok(GroupWriteResponse::DeleteStream(DeleteStreamResponse {
                             placement,
                             group_commit_index: self.commit_index,
-                            hard_deleted,
-                            parent_to_release,
                         }))
                     }
                     StreamResponse::Error {
@@ -1590,42 +1506,6 @@ impl GroupEngine for InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> GroupTouchStreamAccessFuture<'a> {
         Box::pin(async move { self.apply_access_command(stream_id, now_ms, renew_ttl, placement) })
-    }
-
-    fn add_fork_ref<'a>(
-        &'a mut self,
-        stream_id: BucketStreamId,
-        now_ms: u64,
-        placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a> {
-        Box::pin(async move {
-            match self.apply_committed_write(
-                GroupWriteCommand::AddForkRef { stream_id, now_ms },
-                placement,
-            )? {
-                GroupWriteResponse::AddForkRef(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected add fork ref write response: {other:?}"
-                ))),
-            }
-        })
-    }
-
-    fn release_fork_ref<'a>(
-        &'a mut self,
-        stream_id: BucketStreamId,
-        placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a> {
-        Box::pin(async move {
-            match self
-                .apply_committed_write(GroupWriteCommand::ReleaseForkRef { stream_id }, placement)?
-            {
-                GroupWriteResponse::ReleaseForkRef(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected release fork ref write response: {other:?}"
-                ))),
-            }
-        })
     }
 
     fn head_stream<'a>(

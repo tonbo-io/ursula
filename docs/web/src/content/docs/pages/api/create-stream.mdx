@@ -47,16 +47,8 @@ api: "PUT /{bucket}/{stream}"
  Producer sequence number (must accompany `Producer-Id`).
 </ParamField>
 
-<ParamField header="Stream-Forked-From" type="string">
- Parent stream path (e.g. `{bucket}/{stream}`). When set, the new stream is created as a fork of the parent: the server copies the parent's data up to `Stream-Fork-Offset` (or the parent's current tail if omitted) into the new stream's initial payload. The new stream is independent after creation. Subsequent appends and reads do not touch the parent.
-</ParamField>
-
-<ParamField header="Stream-Fork-Offset" type="string">
- Offset into the parent stream up to which data is copied. Must be `<=` the parent's current tail offset. Defaults to the parent's tail offset when omitted. A value of `0` creates an empty fork that inherits metadata but copies no data.
-</ParamField>
-
 <ParamField body="body" type="binary">
- Optional initial payload. If provided, becomes the first entry in the stream. Ignored when `Stream-Forked-From` is set (the forked prefix becomes the initial payload instead).
+ Optional initial payload. If provided, becomes the first entry in the stream.
 </ParamField>
 
 ## Response
@@ -86,11 +78,6 @@ curl -X PUT http://127.0.0.1:4437/demo/ephemeral \
   -H 'Stream-TTL: 3600'
 ```
 
-```bash Fork an existing stream
-curl -X PUT http://127.0.0.1:4437/demo/child \
-  -H 'Stream-Forked-From: demo/hello'
-```
-
 ```bash Create with attributes
 curl -X PUT http://127.0.0.1:4437/demo/session-1 \
   -H 'Stream-Attrs: {"title":"Support session","metadata":{"purpose":"customer-support"}}'
@@ -99,7 +86,5 @@ curl -X PUT http://127.0.0.1:4437/demo/session-1 \
 </RequestExample>
 
 <Note>
-If a stream with the same ID already exists and has identical configuration, the response is `200 OK` (idempotent). If the existing stream differs in content type, closed state, retention, fork source, or stream attributes, the response is `409 Conflict`.
-
-When forking, the child inherits the parent's `content_type` (unless explicitly overridden) and TTL / expiration policy (unless explicitly set). The parent stream is protected from hard deletion by a reference count until all of its forks are deleted.
+If a stream with the same ID already exists and has identical configuration, the response is `200 OK` (idempotent). If the existing stream differs in content type, closed state, retention, or stream attributes, the response is `409 Conflict`.
 </Note>

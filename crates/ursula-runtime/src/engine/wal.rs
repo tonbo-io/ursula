@@ -22,7 +22,6 @@ use super::GroupEngineError;
 use super::GroupEngineFactory;
 use super::GroupEngineMetrics;
 use super::GroupFlushColdFuture;
-use super::GroupForkRefFuture;
 use super::GroupGetStreamAttrsFuture;
 use super::GroupHeadStreamFuture;
 use super::GroupInstallSnapshotFuture;
@@ -452,53 +451,6 @@ impl GroupEngine for WalGroupEngine {
             if response.changed {
                 self.append_record(&command)?;
             }
-            self.inner = preview;
-            Ok(response)
-        })
-    }
-
-    fn add_fork_ref<'a>(
-        &'a mut self,
-        stream_id: BucketStreamId,
-        now_ms: u64,
-        placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a> {
-        Box::pin(async move {
-            self.ensure_ready()?;
-            let command = GroupWriteCommand::AddForkRef { stream_id, now_ms };
-            let mut preview = self.inner.clone();
-            let response = match preview.apply_committed_write(command.clone(), placement)? {
-                GroupWriteResponse::AddForkRef(response) => response,
-                other => {
-                    return Err(GroupEngineError::new(format!(
-                        "unexpected add fork ref write response: {other:?}"
-                    )));
-                }
-            };
-            self.append_record(&command)?;
-            self.inner = preview;
-            Ok(response)
-        })
-    }
-
-    fn release_fork_ref<'a>(
-        &'a mut self,
-        stream_id: BucketStreamId,
-        placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a> {
-        Box::pin(async move {
-            self.ensure_ready()?;
-            let command = GroupWriteCommand::ReleaseForkRef { stream_id };
-            let mut preview = self.inner.clone();
-            let response = match preview.apply_committed_write(command.clone(), placement)? {
-                GroupWriteResponse::ReleaseForkRef(response) => response,
-                other => {
-                    return Err(GroupEngineError::new(format!(
-                        "unexpected release fork ref write response: {other:?}"
-                    )));
-                }
-            };
-            self.append_record(&command)?;
             self.inner = preview;
             Ok(response)
         })

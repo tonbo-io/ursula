@@ -39,7 +39,6 @@ use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
 use crate::request::FlushColdRequest;
 use crate::request::FlushColdResponse;
-use crate::request::ForkRefResponse;
 use crate::request::GetStreamAttrsRequest;
 use crate::request::GetStreamAttrsResponse;
 use crate::request::HeadStreamRequest;
@@ -173,15 +172,6 @@ pub(crate) enum GroupCommand {
         request: UpdateStreamAttrsRequest,
         response_tx: oneshot::Sender<Result<UpdateStreamAttrsResponse, RuntimeError>>,
     },
-    AddForkRef {
-        stream_id: BucketStreamId,
-        now_ms: u64,
-        response_tx: oneshot::Sender<Result<ForkRefResponse, RuntimeError>>,
-    },
-    ReleaseForkRef {
-        stream_id: BucketStreamId,
-        response_tx: oneshot::Sender<Result<ForkRefResponse, RuntimeError>>,
-    },
     DeleteStream {
         request: DeleteStreamRequest,
         response_tx: oneshot::Sender<Result<DeleteStreamResponse, RuntimeError>>,
@@ -276,9 +266,6 @@ impl GroupCommand {
                 let _ = response_tx.send(Err(err));
             }
             Self::UpdateStreamAttrs { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
-            }
-            Self::AddForkRef { response_tx, .. } | Self::ReleaseForkRef { response_tx, .. } => {
                 let _ = response_tx.send(Err(err));
             }
             Self::DeleteStream { response_tx, .. } => {
@@ -553,36 +540,6 @@ impl GroupActor {
                     &mut self.engine,
                     self.metrics.clone(),
                     request,
-                    self.placement,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::AddForkRef {
-                stream_id,
-                now_ms,
-                response_tx,
-            } => {
-                let response = CoreWorker::add_fork_ref(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    stream_id,
-                    now_ms,
-                    self.placement,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::ReleaseForkRef {
-                stream_id,
-                response_tx,
-            } => {
-                let response = CoreWorker::release_fork_ref(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    self.read_materialization.clone(),
-                    &mut self.read_watchers,
-                    stream_id,
                     self.placement,
                 )
                 .await;

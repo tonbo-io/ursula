@@ -108,10 +108,6 @@ impl fmt::Display for RaftGroupCommand {
             Some(raft_app_proto::raft_group_command_v1::Command::UpdateStreamAttrs(_)) => {
                 "update_stream_attrs"
             }
-            Some(raft_app_proto::raft_group_command_v1::Command::AddForkRef(_)) => "add_fork_ref",
-            Some(raft_app_proto::raft_group_command_v1::Command::ReleaseForkRef(_)) => {
-                "release_fork_ref"
-            }
             Some(raft_app_proto::raft_group_command_v1::Command::FlushCold(_)) => "flush_cold",
             Some(raft_app_proto::raft_group_command_v1::Command::CloseStream(_)) => "close_stream",
             Some(raft_app_proto::raft_group_command_v1::Command::DeleteStream(_)) => {
@@ -138,8 +134,6 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
                 producer,
                 stream_ttl_seconds,
                 stream_expires_at_ms,
-                forked_from,
-                fork_offset,
                 attrs,
                 now_ms,
             } => Command::CreateStream(raft_app_proto::CreateStreamCommandV1 {
@@ -151,8 +145,6 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
                 producer,
                 stream_ttl_seconds,
                 stream_expires_at_ms,
-                forked_from: forked_from.map(Into::into),
-                fork_offset,
                 now_ms,
                 attrs_json: attrs.map(stream_attrs_json),
             }),
@@ -165,8 +157,6 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
                 producer,
                 stream_ttl_seconds,
                 stream_expires_at_ms,
-                forked_from,
-                fork_offset,
                 attrs,
                 now_ms,
             } => Command::CreateExternal(raft_app_proto::CreateExternalCommandV1 {
@@ -178,8 +168,6 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
                 producer,
                 stream_ttl_seconds,
                 stream_expires_at_ms,
-                forked_from: forked_from.map(Into::into),
-                fork_offset,
                 now_ms,
                 attrs_json: attrs.map(stream_attrs_json),
             }),
@@ -261,17 +249,6 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
                 attrs_json: attrs.map(stream_attrs_json),
                 now_ms,
             }),
-            GroupWriteCommand::AddForkRef { stream_id, now_ms } => {
-                Command::AddForkRef(raft_app_proto::AddForkRefCommandV1 {
-                    stream_id: Some(stream_id.into()),
-                    now_ms,
-                })
-            }
-            GroupWriteCommand::ReleaseForkRef { stream_id } => {
-                Command::ReleaseForkRef(raft_app_proto::ReleaseForkRefCommandV1 {
-                    stream_id: Some(stream_id.into()),
-                })
-            }
             GroupWriteCommand::FlushCold { stream_id, chunk } => {
                 Command::FlushCold(raft_app_proto::FlushColdCommandV1 {
                     stream_id: Some(stream_id.into()),

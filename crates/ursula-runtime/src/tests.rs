@@ -291,8 +291,6 @@ fn committed_write_command_is_state_machine_apply_boundary() {
                 producer: None,
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
-                forked_from: None,
-                fork_offset: None,
                 attrs: None,
                 now_ms: 0,
             },
@@ -397,8 +395,6 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
                 producer: None,
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
-                forked_from: None,
-                fork_offset: None,
                 attrs: None,
                 now_ms: 0,
             },
@@ -570,8 +566,6 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: None,
             now_ms: 0,
         })
@@ -3029,77 +3023,6 @@ async fn delete_stream_removes_state_on_owner_group() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fork_ref_keeps_deleted_source_gone_until_last_fork_delete() {
-    let runtime = runtime(2, 8);
-    let source = BucketStreamId::new("benchcmp", "fork-ref-source");
-    let fork = BucketStreamId::new("benchcmp", "fork-ref-child");
-    let mut source_create = CreateStreamRequest::new(source.clone(), DEFAULT_CONTENT_TYPE);
-    source_create.initial_payload = Bytes::from_static(b"abc");
-    runtime
-        .create_stream(source_create)
-        .await
-        .expect("create source");
-
-    let mut fork_create = CreateStreamRequest::new(fork.clone(), DEFAULT_CONTENT_TYPE);
-    fork_create.forked_from = Some(source.clone());
-    runtime
-        .create_stream(fork_create)
-        .await
-        .expect("create fork");
-
-    runtime
-        .delete_stream(DeleteStreamRequest {
-            stream_id: source.clone(),
-        })
-        .await
-        .expect("delete source");
-    let err = runtime
-        .head_stream(HeadStreamRequest {
-            stream_id: source.clone(),
-            now_ms: 0,
-        })
-        .await
-        .expect_err("soft-deleted source is gone");
-    match err {
-        RuntimeError::GroupEngine { error, .. } => {
-            let message = error.message();
-            assert!(message.contains("StreamGone"), "message={message}");
-        }
-        other => panic!("expected group engine error, got {other:?}"),
-    }
-
-    let fork_read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: fork.clone(),
-            offset: 0,
-            max_len: 16,
-            now_ms: 0,
-        })
-        .await
-        .expect("fork remains readable");
-    assert_eq!(fork_read.payload, b"abc");
-
-    runtime
-        .delete_stream(DeleteStreamRequest { stream_id: fork })
-        .await
-        .expect("delete fork");
-    let err = runtime
-        .head_stream(HeadStreamRequest {
-            stream_id: source,
-            now_ms: 0,
-        })
-        .await
-        .expect_err("source is hard-deleted after last fork");
-    match err {
-        RuntimeError::GroupEngine { error, .. } => {
-            let message = error.message();
-            assert!(message.contains("StreamNotFound"), "message={message}");
-        }
-        other => panic!("expected group engine error, got {other:?}"),
-    }
-}
-
 #[cfg(not(madsim))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn thread_per_core_runtime_reaches_all_configured_cores() {
@@ -4329,23 +4252,6 @@ impl GroupEngine for BlockingReadEngine {
             .touch_stream_access(stream_id, now_ms, renew_ttl, placement)
     }
 
-    fn add_fork_ref<'a>(
-        &'a mut self,
-        stream_id: BucketStreamId,
-        now_ms: u64,
-        placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a> {
-        self.inner.add_fork_ref(stream_id, now_ms, placement)
-    }
-
-    fn release_fork_ref<'a>(
-        &'a mut self,
-        stream_id: BucketStreamId,
-        placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a> {
-        self.inner.release_fork_ref(stream_id, placement)
-    }
-
     fn close_stream<'a>(
         &'a mut self,
         request: CloseStreamRequest,
@@ -4484,43 +4390,6 @@ impl GroupEngine for RecordingEngine {
         })
     }
 
-    fn add_fork_ref<'a>(
-        &'a mut self,
-        _stream_id: BucketStreamId,
-        _now_ms: u64,
-        placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a> {
-        Box::pin(async move {
-            assert_eq!(placement, self.placement);
-            self.commit_index += 1;
-            Ok(ForkRefResponse {
-                placement,
-                fork_ref_count: 1,
-                hard_deleted: false,
-                parent_to_release: None,
-                group_commit_index: self.commit_index,
-            })
-        })
-    }
-
-    fn release_fork_ref<'a>(
-        &'a mut self,
-        _stream_id: BucketStreamId,
-        placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a> {
-        Box::pin(async move {
-            assert_eq!(placement, self.placement);
-            self.commit_index += 1;
-            Ok(ForkRefResponse {
-                placement,
-                fork_ref_count: 0,
-                hard_deleted: false,
-                parent_to_release: None,
-                group_commit_index: self.commit_index,
-            })
-        })
-    }
-
     fn close_stream<'a>(
         &'a mut self,
         _request: CloseStreamRequest,
@@ -4549,8 +4418,6 @@ impl GroupEngine for RecordingEngine {
             Ok(DeleteStreamResponse {
                 placement,
                 group_commit_index: self.commit_index,
-                hard_deleted: true,
-                parent_to_release: None,
             })
         })
     }
@@ -4744,23 +4611,6 @@ impl GroupEngine for BlockingFirstCreateEngine {
             .touch_stream_access(stream_id, now_ms, renew_ttl, placement)
     }
 
-    fn add_fork_ref<'a>(
-        &'a mut self,
-        stream_id: BucketStreamId,
-        now_ms: u64,
-        placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a> {
-        self.inner.add_fork_ref(stream_id, now_ms, placement)
-    }
-
-    fn release_fork_ref<'a>(
-        &'a mut self,
-        stream_id: BucketStreamId,
-        placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a> {
-        self.inner.release_fork_ref(stream_id, placement)
-    }
-
     fn close_stream<'a>(
         &'a mut self,
         request: CloseStreamRequest,
@@ -4889,23 +4739,6 @@ impl GroupEngine for FailingEngine {
         _renew_ttl: bool,
         _placement: ShardPlacement,
     ) -> GroupTouchStreamAccessFuture<'a> {
-        Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
-    }
-
-    fn add_fork_ref<'a>(
-        &'a mut self,
-        _stream_id: BucketStreamId,
-        _now_ms: u64,
-        _placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a> {
-        Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
-    }
-
-    fn release_fork_ref<'a>(
-        &'a mut self,
-        _stream_id: BucketStreamId,
-        _placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a> {
         Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
     }
 

@@ -39,18 +39,7 @@ pub enum StreamResponse {
         deduplicated: bool,
         producer: Option<ProducerRequest>,
     },
-    Deleted {
-        hard_deleted: bool,
-        parent_to_release: Option<BucketStreamId>,
-    },
-    ForkRefAdded {
-        fork_ref_count: u64,
-    },
-    ForkRefReleased {
-        hard_deleted: bool,
-        fork_ref_count: u64,
-        parent_to_release: Option<BucketStreamId>,
-    },
+    Deleted,
     ColdFlushed {
         hot_start_offset: u64,
     },
@@ -93,7 +82,6 @@ pub enum StreamErrorCode {
     ProducerEpochStale,
     ProducerSeqConflict,
     InvalidRetention,
-    InvalidFork,
     OffsetOutOfRange,
     InvalidColdFlush,
     InvalidSnapshot,

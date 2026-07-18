@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use bytes::Bytes;
 #[cfg(not(madsim))]
 use tokio::task::JoinSet;
 use ursula_shard::BucketStreamId;
@@ -16,7 +15,6 @@ use ursula_stream::ColdChunkRef;
 use ursula_stream::ColdFlushCandidate;
 use ursula_stream::ColdGcEntry;
 use ursula_stream::ColdGcTarget;
-use ursula_stream::StreamErrorCode;
 
 use crate::admission::RaftUncommittedAdmission;
 use crate::admission::RaftUncommittedBytesTracker;
@@ -30,11 +28,9 @@ use crate::core_worker::CoreCommand;
 use crate::core_worker::CoreMailbox;
 use crate::core_worker::CoreWorker;
 use crate::core_worker::WaitReadCancel;
-use crate::engine::GroupEngineError;
 use crate::engine::GroupEngineFactory;
 use crate::engine::in_memory::InMemoryGroupEngineFactory;
 use crate::error::RuntimeError;
-use crate::error::map_fork_source_ref_error;
 use crate::metrics::COLD_FLUSH_GROUP_BATCH_MAX_CHUNKS;
 use crate::metrics::RuntimeMailboxSnapshot;
 use crate::metrics::RuntimeMetrics;
@@ -60,7 +56,6 @@ use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
 use crate::request::FlushColdRequest;
 use crate::request::FlushColdResponse;
-use crate::request::ForkRefResponse;
 use crate::request::GetStreamAttrsRequest;
 use crate::request::GetStreamAttrsResponse;
 use crate::request::HeadStreamRequest;
@@ -237,9 +232,6 @@ impl ShardRuntime {
         &self,
         request: CreateStreamRequest,
     ) -> Result<CreateStreamResponse, RuntimeError> {
-        if request.forked_from.is_some() {
-            return self.create_fork_stream(request).await;
-        }
         self.create_stream_on_owner(request).await
     }
 
@@ -279,101 +271,6 @@ impl ShardRuntime {
             response_rx,
         )
         .await
-    }
-
-    async fn create_fork_stream(
-        &self,
-        mut request: CreateStreamRequest,
-    ) -> Result<CreateStreamResponse, RuntimeError> {
-        let source_id = request
-            .forked_from
-            .clone()
-            .expect("forked_from checked before create_fork_stream");
-        let now_ms = request.now_ms;
-        let source_placement = self.shard_map.locate(&source_id);
-        let source_head = self
-            .head_stream(HeadStreamRequest {
-                stream_id: source_id.clone(),
-                now_ms,
-            })
-            .await
-            .map_err(|err| map_fork_source_ref_error(err, source_placement))?;
-
-        if request.content_type_explicit {
-            if request.content_type != source_head.content_type {
-                return Err(RuntimeError::group_engine(
-                    source_placement,
-                    GroupEngineError::stream(
-                        StreamErrorCode::ContentTypeMismatch,
-                        format!(
-                            "fork content type '{}' does not match source content type '{}'",
-                            request.content_type, source_head.content_type
-                        ),
-                    ),
-                ));
-            }
-        } else {
-            request.content_type.clone_from(&source_head.content_type);
-        }
-
-        let fork_offset = request.fork_offset.unwrap_or(source_head.tail_offset);
-        if fork_offset > source_head.tail_offset {
-            return Err(RuntimeError::group_engine(
-                source_placement,
-                GroupEngineError::stream(
-                    StreamErrorCode::InvalidFork,
-                    format!(
-                        "fork offset {fork_offset} is beyond source stream '{}' tail {}",
-                        source_id, source_head.tail_offset
-                    ),
-                ),
-            ));
-        }
-
-        let max_len = usize::try_from(fork_offset).map_err(|_| {
-            RuntimeError::group_engine(
-                source_placement,
-                GroupEngineError::stream(
-                    StreamErrorCode::InvalidFork,
-                    format!("fork offset {fork_offset} cannot fit in memory on this host"),
-                ),
-            )
-        })?;
-        request.initial_payload = if fork_offset == 0 {
-            Bytes::new()
-        } else {
-            self.read_stream(ReadStreamRequest {
-                stream_id: source_id.clone(),
-                offset: 0,
-                max_len,
-                now_ms,
-            })
-            .await?
-            .payload
-            .into()
-        };
-        self.add_fork_ref_on_owner(source_id.clone(), now_ms)
-            .await
-            .map_err(|err| map_fork_source_ref_error(err, source_placement))?;
-        request.close_after = false;
-        request.stream_seq = None;
-        request.producer = None;
-        if request.stream_ttl_seconds.is_none() && request.stream_expires_at_ms.is_none() {
-            request.stream_ttl_seconds = source_head.stream_ttl_seconds;
-            request.stream_expires_at_ms = source_head.stream_expires_at_ms;
-        }
-        request.fork_offset = Some(fork_offset);
-        match self.create_stream_on_owner(request).await {
-            Ok(response) if response.already_exists => {
-                self.release_fork_ref_cascade(source_id).await?;
-                Ok(response)
-            }
-            Ok(response) => Ok(response),
-            Err(err) => {
-                let _ = self.release_fork_ref_cascade(source_id).await;
-                Err(err)
-            }
-        }
     }
 
     pub async fn head_stream(
@@ -595,17 +492,6 @@ impl ShardRuntime {
         &self,
         request: DeleteStreamRequest,
     ) -> Result<DeleteStreamResponse, RuntimeError> {
-        let response = self.delete_stream_on_owner(request).await?;
-        if let Some(parent_to_release) = response.parent_to_release.clone() {
-            self.release_fork_ref_cascade(parent_to_release).await?;
-        }
-        Ok(response)
-    }
-
-    async fn delete_stream_on_owner(
-        &self,
-        request: DeleteStreamRequest,
-    ) -> Result<DeleteStreamResponse, RuntimeError> {
         let placement = self.shard_map.locate(&request.stream_id);
         let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
         let (response_tx, response_rx) = oneshot::channel();
@@ -619,58 +505,6 @@ impl ShardRuntime {
             response_rx,
         )
         .await
-    }
-
-    async fn add_fork_ref_on_owner(
-        &self,
-        stream_id: BucketStreamId,
-        now_ms: u64,
-    ) -> Result<ForkRefResponse, RuntimeError> {
-        let placement = self.shard_map.locate(&stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::AddForkRef {
-                stream_id,
-                now_ms,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    async fn release_fork_ref_on_owner(
-        &self,
-        stream_id: BucketStreamId,
-    ) -> Result<ForkRefResponse, RuntimeError> {
-        let placement = self.shard_map.locate(&stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::ReleaseForkRef {
-                stream_id,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    async fn release_fork_ref_cascade(
-        &self,
-        stream_id: BucketStreamId,
-    ) -> Result<(), RuntimeError> {
-        let mut next = Some(stream_id);
-        while let Some(current) = next {
-            let response = self.release_fork_ref_on_owner(current).await?;
-            next = response.parent_to_release;
-        }
-        Ok(())
     }
 
     pub async fn flush_cold(

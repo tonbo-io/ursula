@@ -145,8 +145,6 @@ const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 const HEADER_STREAM_CLOSED: &str = "stream-closed";
 const HEADER_STREAM_CURSOR: &str = "stream-cursor";
 const HEADER_STREAM_EXPIRES_AT: &str = "stream-expires-at";
-const HEADER_STREAM_FORK_OFFSET: &str = "stream-fork-offset";
-const HEADER_STREAM_FORKED_FROM: &str = "stream-forked-from";
 const HEADER_STREAM_INTEGRITY_EVICTED_RECORDS: &str = "stream-integrity-evicted-records";
 const HEADER_STREAM_INTEGRITY_EVICTED_SETSUM: &str = "stream-integrity-evicted-setsum";
 const HEADER_STREAM_INTEGRITY_LIVE_RECORDS: &str = "stream-integrity-live-records";
@@ -1768,30 +1766,7 @@ pub(crate) async fn create_stream_by_id(
     body: Bytes,
 ) -> Response {
     let content_type_explicit = has_content_type(&request_headers);
-    let forked_from = match stream_forked_from(&request_headers) {
-        Ok(forked_from) => forked_from,
-        Err(response) => return *response,
-    };
-    let fork_offset = match stream_fork_offset(&request_headers) {
-        Ok(fork_offset) => fork_offset,
-        Err(response) => return *response,
-    };
-    let mut content_type = request_content_type(&request_headers);
-    if let Some(source_id) = forked_from.as_ref()
-        && !content_type_explicit
-    {
-        match state
-            .runtime
-            .head_stream(HeadStreamRequest {
-                stream_id: source_id.clone(),
-                now_ms: state.unix_time_ms(),
-            })
-            .await
-        {
-            Ok(source) => content_type = source.content_type,
-            Err(err) => return runtime_error_response(err),
-        }
-    }
+    let content_type = request_content_type(&request_headers);
     let (stream_ttl_seconds, stream_expires_at_ms) = match stream_lifetime(&request_headers) {
         Ok(lifetime) => lifetime,
         Err(response) => return *response,
@@ -1812,8 +1787,6 @@ pub(crate) async fn create_stream_by_id(
     request.stream_seq = stream_seq(&request_headers);
     request.stream_ttl_seconds = stream_ttl_seconds;
     request.stream_expires_at_ms = stream_expires_at_ms;
-    request.forked_from = forked_from;
-    request.fork_offset = fork_offset;
     request.attrs = attrs;
     let producer = match producer_request(&request_headers) {
         Ok(producer) => producer,
@@ -1821,11 +1794,7 @@ pub(crate) async fn create_stream_by_id(
     };
     request.producer = producer.clone();
 
-    if should_externalize_payload(
-        &state,
-        request.initial_payload.len(),
-        request.forked_from.is_none(),
-    ) {
+    if should_externalize_payload(&state, request.initial_payload.len(), true) {
         return create_stream_external_by_id(
             state,
             request_target,
@@ -2874,32 +2843,6 @@ pub(crate) fn request_content_type(headers: &HeaderMap) -> String {
         .filter(|value| !value.trim().is_empty())
         .map(normalize_content_type)
         .unwrap_or_else(|| DEFAULT_CONTENT_TYPE.to_owned())
-}
-
-pub(crate) fn stream_forked_from(
-    headers: &HeaderMap,
-) -> Result<Option<BucketStreamId>, BoxResponse> {
-    let Some(raw) = header_value(headers, HEADER_STREAM_FORKED_FROM) else {
-        return Ok(None);
-    };
-    let path = raw
-        .strip_prefix("/v1/stream/")
-        .or_else(|| raw.strip_prefix("v1/stream/"))
-        .unwrap_or(raw)
-        .trim_start_matches('/');
-    v1_stream_id(path).map(Some).map_err(|_| {
-        Box::new((StatusCode::BAD_REQUEST, "invalid stream-forked-from").into_response())
-    })
-}
-
-pub(crate) fn stream_fork_offset(headers: &HeaderMap) -> Result<Option<u64>, BoxResponse> {
-    let Some(raw) = header_value(headers, HEADER_STREAM_FORK_OFFSET) else {
-        return Ok(None);
-    };
-    let normalized = raw.replace('_', "");
-    normalized.parse::<u64>().map(Some).map_err(|_| {
-        Box::new((StatusCode::BAD_REQUEST, "invalid stream-fork-offset").into_response())
-    })
 }
 
 pub(crate) fn stream_attrs(headers: &HeaderMap) -> Result<Option<StreamAttrs>, BoxResponse> {

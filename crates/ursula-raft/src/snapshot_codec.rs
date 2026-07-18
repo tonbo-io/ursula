@@ -252,9 +252,6 @@ fn metadata_to_proto(metadata: StreamMetadata) -> proto::StreamMetadataV1 {
         stream_expires_at_ms: metadata.stream_expires_at_ms,
         created_at_ms: metadata.created_at_ms,
         last_ttl_touch_at_ms: metadata.last_ttl_touch_at_ms,
-        forked_from: metadata.forked_from.map(Into::into),
-        fork_offset: metadata.fork_offset,
-        fork_ref_count: metadata.fork_ref_count,
     }
 }
 
@@ -271,9 +268,6 @@ fn metadata_from_proto(
         stream_expires_at_ms: metadata.stream_expires_at_ms,
         created_at_ms: metadata.created_at_ms,
         last_ttl_touch_at_ms: metadata.last_ttl_touch_at_ms,
-        forked_from: metadata.forked_from.map(Into::into),
-        fork_offset: metadata.fork_offset,
-        fork_ref_count: metadata.fork_ref_count,
     })
 }
 
@@ -281,7 +275,6 @@ fn status_to_proto(status: StreamStatus) -> proto::StreamStatusV1 {
     match status {
         StreamStatus::Open => proto::StreamStatusV1::StreamStatusOpen,
         StreamStatus::Closed => proto::StreamStatusV1::StreamStatusClosed,
-        StreamStatus::SoftDeleted => proto::StreamStatusV1::StreamStatusSoftDeleted,
     }
 }
 
@@ -291,7 +284,6 @@ fn status_from_proto(status: i32) -> Result<StreamStatus, SnapshotStoreError> {
     })? {
         proto::StreamStatusV1::StreamStatusOpen => Ok(StreamStatus::Open),
         proto::StreamStatusV1::StreamStatusClosed => Ok(StreamStatus::Closed),
-        proto::StreamStatusV1::StreamStatusSoftDeleted => Ok(StreamStatus::SoftDeleted),
     }
 }
 

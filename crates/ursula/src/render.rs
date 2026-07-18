@@ -98,7 +98,6 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         | StreamErrorCode::EmptyAppend
         | StreamErrorCode::InvalidProducer
         | StreamErrorCode::InvalidRetention
-        | StreamErrorCode::InvalidFork
         | StreamErrorCode::InvalidColdFlush
         | StreamErrorCode::InvalidSnapshot
         | StreamErrorCode::InvalidStreamAttrs => StatusCode::BAD_REQUEST,

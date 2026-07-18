@@ -458,7 +458,6 @@ GET {stream_url}/attrs
 
 - `200 OK`: Returns the current attribute object as `application/json`.
 - `404 Not Found`: The stream does not exist or has expired.
-- `410 Gone`: The stream was soft-deleted.
 
 When no attributes are set, the response body is `{}`.
 
@@ -478,7 +477,6 @@ The request body replaces the complete attribute object. Partial merge semantics
 - `204 No Content`: Attributes were replaced, or the submitted object already matched the stored attributes.
 - `400 Bad Request`: The request is missing `Content-Type`, the content type is not `application/json`, the body is not a valid attribute JSON object, or the attribute object exceeds the size limit.
 - `404 Not Found`: The stream does not exist or has expired.
-- `410 Gone`: The stream was soft-deleted.
 
 Submitting `{}` clears the stream attributes. Attributes MAY be updated after a stream is closed because stream closure only forbids further appends.
 

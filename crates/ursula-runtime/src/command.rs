@@ -43,8 +43,6 @@ pub enum GroupWriteCommand {
         producer: Option<ProducerRequest>,
         stream_ttl_seconds: Option<u64>,
         stream_expires_at_ms: Option<u64>,
-        forked_from: Option<BucketStreamId>,
-        fork_offset: Option<u64>,
         // `default` keeps pre-attrs WAL records decodable.
         #[serde(default)]
         attrs: Option<StreamAttrs>,
@@ -59,8 +57,6 @@ pub enum GroupWriteCommand {
         producer: Option<ProducerRequest>,
         stream_ttl_seconds: Option<u64>,
         stream_expires_at_ms: Option<u64>,
-        forked_from: Option<BucketStreamId>,
-        fork_offset: Option<u64>,
         // `default` keeps pre-attrs WAL records decodable.
         #[serde(default)]
         attrs: Option<StreamAttrs>,
@@ -108,13 +104,6 @@ pub enum GroupWriteCommand {
         attrs: Option<StreamAttrs>,
         now_ms: u64,
     },
-    AddForkRef {
-        stream_id: BucketStreamId,
-        now_ms: u64,
-    },
-    ReleaseForkRef {
-        stream_id: BucketStreamId,
-    },
     FlushCold {
         stream_id: BucketStreamId,
         chunk: ColdChunkRef,
@@ -147,8 +136,6 @@ impl From<CreateStreamRequest> for GroupWriteCommand {
             producer: request.producer,
             stream_ttl_seconds: request.stream_ttl_seconds,
             stream_expires_at_ms: request.stream_expires_at_ms,
-            forked_from: request.forked_from,
-            fork_offset: request.fork_offset,
             attrs: request.attrs,
             now_ms: request.now_ms,
         }
@@ -166,8 +153,6 @@ impl From<&CreateStreamRequest> for GroupWriteCommand {
             producer: request.producer.clone(),
             stream_ttl_seconds: request.stream_ttl_seconds,
             stream_expires_at_ms: request.stream_expires_at_ms,
-            forked_from: request.forked_from.clone(),
-            fork_offset: request.fork_offset,
             attrs: request.attrs.clone(),
             now_ms: request.now_ms,
         }
@@ -185,8 +170,6 @@ impl From<CreateStreamExternalRequest> for GroupWriteCommand {
             producer: request.producer,
             stream_ttl_seconds: request.stream_ttl_seconds,
             stream_expires_at_ms: request.stream_expires_at_ms,
-            forked_from: request.forked_from,
-            fork_offset: request.fork_offset,
             attrs: request.attrs,
             now_ms: request.now_ms,
         }
@@ -204,8 +187,6 @@ impl From<&CreateStreamExternalRequest> for GroupWriteCommand {
             producer: request.producer.clone(),
             stream_ttl_seconds: request.stream_ttl_seconds,
             stream_expires_at_ms: request.stream_expires_at_ms,
-            forked_from: request.forked_from.clone(),
-            fork_offset: request.fork_offset,
             attrs: request.attrs.clone(),
             now_ms: request.now_ms,
         }
@@ -451,12 +432,6 @@ impl fmt::Display for GroupWriteCommand {
             }
             Self::UpdateStreamAttrs { stream_id, .. } => {
                 write!(f, "update_stream_attrs:{stream_id}")
-            }
-            Self::AddForkRef { stream_id, .. } => {
-                write!(f, "add_fork_ref:{stream_id}")
-            }
-            Self::ReleaseForkRef { stream_id } => {
-                write!(f, "release_fork_ref:{stream_id}")
             }
             Self::FlushCold { stream_id, chunk } => {
                 write!(
