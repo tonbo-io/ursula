@@ -666,15 +666,13 @@ With `record_view=envelope`, each SSE `event: data` MUST contain exactly one env
 
 A reconnecting client MAY use either the last `streamNextRecord` or `streamNextOffset`. Offset-based reconnection remains the base-protocol path.
 
-### 6.10. Retention, Snapshots, Bootstrap, and Forks
+### 6.10. Retention, Snapshots, and Bootstrap
 
 Retention MUST advance `F` only at a record boundary. A trimmed ordinal MUST return `410 Gone`; surviving records keep their original ordinals.
 
 When a snapshot advances the earliest retained offset, that offset MUST map to one record boundary. Snapshot publication at an intra-record offset MUST return `400 Bad Request`. Snapshot and bootstrap responses SHOULD include `Stream-Record-First` and `Stream-Record-Next` when the underlying stream implements this extension. Bootstrap update parts MUST preserve one logical JSON message per update part.
 
-When a new stream is forked from a JSON stream implementing this extension, the copied messages form the child stream's initial record sequence starting at ordinal `0`. The child does not inherit the parent's ordinal namespace. A fork offset MUST align with a source record boundary.
-
-Implementations MAY reclaim ordinal index entries only after the corresponding records fall before `F` and are no longer required by a visible snapshot, bootstrap response, or fork.
+Implementations MAY reclaim ordinal index entries only after the corresponding records fall before `F` and are no longer required by a visible snapshot or bootstrap response.
 
 ### 6.11. Append Batch Integration
 
@@ -711,7 +709,7 @@ Implementations MUST preserve these invariants:
 5. `O(r)` always identifies the first canonical byte of record `r`.
 6. Offset reads and record reads expose the same canonical JSON sequence.
 7. Record-aware reads never return partial records.
-8. Flush, compaction, snapshot, restart, fork, and retention never change a surviving record's ordinal.
+8. Flush, compaction, snapshot, restart, and retention never change a surviving record's ordinal.
 9. `N - F` equals the number of retained logical messages.
 10. Base-protocol clients observe no semantic change.
 
