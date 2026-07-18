@@ -39,7 +39,6 @@ use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
 use crate::request::FlushColdRequest;
 use crate::request::FlushColdResponse;
-use crate::request::ForkRefResponse;
 use crate::request::GetStreamAttrsRequest;
 use crate::request::GetStreamAttrsResponse;
 use crate::request::GroupReadStreamParts;
@@ -103,8 +102,6 @@ pub type GroupAckColdGcFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AckColdGcResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupPlanColdGcFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<ColdGcEntry>, GroupEngineError>> + Send + 'a>>;
-pub type GroupForkRefFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<ForkRefResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = Result<GroupSnapshot, GroupEngineError>> + Send + 'a>>;
 pub type GroupInstallSnapshotFuture<'a> =
@@ -139,8 +136,6 @@ pub enum GroupWriteResponse {
     PublishSnapshot(PublishSnapshotResponse),
     TouchStreamAccess(TouchStreamAccessResponse),
     UpdateStreamAttrs(UpdateStreamAttrsResponse),
-    AddForkRef(ForkRefResponse),
-    ReleaseForkRef(ForkRefResponse),
     FlushCold(FlushColdResponse),
     CloseStream(CloseStreamResponse),
     DeleteStream(DeleteStreamResponse),
@@ -287,19 +282,6 @@ pub trait GroupEngine: Send + 'static {
             )))
         })
     }
-
-    fn add_fork_ref<'a>(
-        &'a mut self,
-        stream_id: BucketStreamId,
-        now_ms: u64,
-        placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a>;
-
-    fn release_fork_ref<'a>(
-        &'a mut self,
-        stream_id: BucketStreamId,
-        placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a>;
 
     fn close_stream<'a>(
         &'a mut self,
@@ -497,8 +479,6 @@ pub trait GroupEngine: Send + 'static {
                         producer,
                         stream_ttl_seconds,
                         stream_expires_at_ms,
-                        forked_from,
-                        fork_offset,
                         attrs,
                         now_ms,
                     } => self
@@ -513,8 +493,6 @@ pub trait GroupEngine: Send + 'static {
                                 producer,
                                 stream_ttl_seconds,
                                 stream_expires_at_ms,
-                                forked_from,
-                                fork_offset,
                                 attrs,
                                 now_ms,
                             },
@@ -531,8 +509,6 @@ pub trait GroupEngine: Send + 'static {
                         producer,
                         stream_ttl_seconds,
                         stream_expires_at_ms,
-                        forked_from,
-                        fork_offset,
                         attrs,
                         now_ms,
                     } => self
@@ -546,8 +522,6 @@ pub trait GroupEngine: Send + 'static {
                                 producer,
                                 stream_ttl_seconds,
                                 stream_expires_at_ms,
-                                forked_from,
-                                fork_offset,
                                 attrs,
                                 now_ms,
                             },
@@ -662,14 +636,6 @@ pub trait GroupEngine: Send + 'static {
                         )
                         .await
                         .map(GroupWriteResponse::UpdateStreamAttrs),
-                    GroupWriteCommand::AddForkRef { stream_id, now_ms } => self
-                        .add_fork_ref(stream_id, now_ms, placement)
-                        .await
-                        .map(GroupWriteResponse::AddForkRef),
-                    GroupWriteCommand::ReleaseForkRef { stream_id } => self
-                        .release_fork_ref(stream_id, placement)
-                        .await
-                        .map(GroupWriteResponse::ReleaseForkRef),
                     GroupWriteCommand::FlushCold { stream_id, chunk } => self
                         .flush_cold(FlushColdRequest { stream_id, chunk }, placement)
                         .await

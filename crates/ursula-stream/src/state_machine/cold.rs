@@ -13,7 +13,6 @@ use super::StreamResponse;
 use super::StreamStateMachine;
 use super::StreamVisibleSnapshot;
 use super::compare_stream_ids;
-use super::is_soft_deleted;
 use super::stream_is_expired;
 
 impl StreamStateMachine {
@@ -43,12 +42,6 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             ));
         };
-        if is_soft_deleted(&slot.metadata) {
-            return Err(StreamResponse::error(
-                StreamErrorCode::StreamGone,
-                format!("stream '{stream_id}' is gone"),
-            ));
-        }
         let Some((start_offset, end_offset, payload)) =
             slot.hot_buffer
                 .plan_cold_flush_from(start_offset, min_hot_bytes, max_flush_bytes)
@@ -176,12 +169,6 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             );
         };
-        if is_soft_deleted(stream) {
-            return StreamResponse::error(
-                StreamErrorCode::StreamGone,
-                format!("stream '{stream_id}' is gone"),
-            );
-        }
         if stream_is_expired(stream, now_ms) {
             self.remove_stream_state(&stream_id);
             return StreamResponse::error(
@@ -259,12 +246,6 @@ impl StreamStateMachine {
             );
         };
         let stream = &slot.metadata;
-        if is_soft_deleted(stream) {
-            return StreamResponse::error(
-                StreamErrorCode::StreamGone,
-                format!("stream '{stream_id}' is gone"),
-            );
-        }
         if chunk.end_offset <= chunk.start_offset {
             return StreamResponse::error_with_next_offset(
                 StreamErrorCode::InvalidColdFlush,

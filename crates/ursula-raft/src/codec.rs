@@ -6,7 +6,6 @@ use ursula_runtime::CloseStreamResponse;
 use ursula_runtime::CreateStreamResponse;
 use ursula_runtime::DeleteStreamResponse;
 use ursula_runtime::FlushColdResponse;
-use ursula_runtime::ForkRefResponse;
 use ursula_runtime::GetStreamAttrsResponse;
 use ursula_runtime::GroupAppendBatchResponse;
 use ursula_runtime::GroupEngineError;
@@ -56,8 +55,6 @@ pub(crate) fn group_write_command_from_proto(
             producer: command.producer,
             stream_ttl_seconds: command.stream_ttl_seconds,
             stream_expires_at_ms: command.stream_expires_at_ms,
-            forked_from: optional_stream_id_from_proto(command.forked_from)?,
-            fork_offset: command.fork_offset,
             attrs: stream_attrs_from_proto(command.attrs_json, "create_stream.attrs_json")?,
             now_ms: command.now_ms,
         }),
@@ -70,8 +67,6 @@ pub(crate) fn group_write_command_from_proto(
             producer: command.producer,
             stream_ttl_seconds: command.stream_ttl_seconds,
             stream_expires_at_ms: command.stream_expires_at_ms,
-            forked_from: optional_stream_id_from_proto(command.forked_from)?,
-            fork_offset: command.fork_offset,
             attrs: stream_attrs_from_proto(command.attrs_json, "create_external.attrs_json")?,
             now_ms: command.now_ms,
         }),
@@ -117,13 +112,6 @@ pub(crate) fn group_write_command_from_proto(
             attrs: stream_attrs_from_proto(command.attrs_json, "update_stream_attrs.attrs_json")?,
             now_ms: command.now_ms,
         }),
-        Command::AddForkRef(command) => Ok(GroupWriteCommand::AddForkRef {
-            stream_id: stream_id_from_proto(command.stream_id, "add_fork_ref.stream_id")?,
-            now_ms: command.now_ms,
-        }),
-        Command::ReleaseForkRef(command) => Ok(GroupWriteCommand::ReleaseForkRef {
-            stream_id: stream_id_from_proto(command.stream_id, "release_fork_ref.stream_id")?,
-        }),
         Command::FlushCold(command) => Ok(GroupWriteCommand::FlushCold {
             stream_id: stream_id_from_proto(command.stream_id, "flush_cold.stream_id")?,
             chunk: required(command.chunk, "flush_cold.chunk")?,
@@ -155,12 +143,6 @@ pub(crate) fn stream_id_from_proto(
     field: &str,
 ) -> Result<BucketStreamId, GroupEngineError> {
     Ok(required(stream_id, field)?.into())
-}
-
-pub(crate) fn optional_stream_id_from_proto(
-    stream_id: Option<raft_app_proto::BucketStreamIdV1>,
-) -> Result<Option<BucketStreamId>, GroupEngineError> {
-    Ok(stream_id.map(Into::into))
 }
 
 fn stream_attrs_from_proto(
@@ -268,12 +250,6 @@ pub(crate) fn write_applied_response_to_proto(
         }
         GroupWriteResponse::UpdateStreamAttrs(response) => {
             Response::UpdateStreamAttrs(update_stream_attrs_response_to_proto(response))
-        }
-        GroupWriteResponse::AddForkRef(response) => {
-            Response::AddForkRef(fork_ref_response_to_proto(response))
-        }
-        GroupWriteResponse::ReleaseForkRef(response) => {
-            Response::ReleaseForkRef(fork_ref_response_to_proto(response))
         }
         GroupWriteResponse::FlushCold(response) => {
             Response::FlushCold(flush_cold_response_to_proto(response))
@@ -385,18 +361,6 @@ pub(crate) fn get_stream_attrs_response_to_proto(
     }
 }
 
-pub(crate) fn fork_ref_response_to_proto(
-    response: ForkRefResponse,
-) -> raft_app_proto::ForkRefResponseV1 {
-    raft_app_proto::ForkRefResponseV1 {
-        placement: Some(placement_to_proto(response.placement)),
-        fork_ref_count: response.fork_ref_count,
-        hard_deleted: response.hard_deleted,
-        parent_to_release: response.parent_to_release.map(Into::into),
-        group_commit_index: response.group_commit_index,
-    }
-}
-
 pub(crate) fn flush_cold_response_to_proto(
     response: FlushColdResponse,
 ) -> raft_app_proto::FlushColdResponseV1 {
@@ -424,8 +388,6 @@ pub(crate) fn delete_stream_response_to_proto(
     raft_app_proto::DeleteStreamResponseV1 {
         placement: Some(placement_to_proto(response.placement)),
         group_commit_index: response.group_commit_index,
-        hard_deleted: response.hard_deleted,
-        parent_to_release: response.parent_to_release.map(Into::into),
     }
 }
 
@@ -507,12 +469,6 @@ pub(crate) fn group_write_response_from_proto(
         )),
         Response::UpdateStreamAttrs(response) => Ok(GroupWriteResponse::UpdateStreamAttrs(
             update_stream_attrs_response_from_proto(response)?,
-        )),
-        Response::AddForkRef(response) => Ok(GroupWriteResponse::AddForkRef(
-            fork_ref_response_from_proto(response)?,
-        )),
-        Response::ReleaseForkRef(response) => Ok(GroupWriteResponse::ReleaseForkRef(
-            fork_ref_response_from_proto(response)?,
         )),
         Response::FlushCold(response) => Ok(GroupWriteResponse::FlushCold(
             flush_cold_response_from_proto(response)?,
@@ -627,18 +583,6 @@ pub(crate) fn get_stream_attrs_response_from_proto(
             response.attrs_json,
             "get_stream_attrs_response.attrs_json",
         )?,
-    })
-}
-
-pub(crate) fn fork_ref_response_from_proto(
-    response: raft_app_proto::ForkRefResponseV1,
-) -> Result<ForkRefResponse, GroupEngineError> {
-    Ok(ForkRefResponse {
-        placement: placement_from_proto(response.placement, "fork_ref_response.placement")?,
-        fork_ref_count: response.fork_ref_count,
-        hard_deleted: response.hard_deleted,
-        parent_to_release: optional_stream_id_from_proto(response.parent_to_release)?,
-        group_commit_index: response.group_commit_index,
     })
 }
 
@@ -758,8 +702,6 @@ pub(crate) fn delete_stream_response_from_proto(
     Ok(DeleteStreamResponse {
         placement: placement_from_proto(response.placement, "delete_stream_response.placement")?,
         group_commit_index: response.group_commit_index,
-        hard_deleted: response.hard_deleted,
-        parent_to_release: optional_stream_id_from_proto(response.parent_to_release)?,
     })
 }
 
@@ -1067,9 +1009,6 @@ pub(crate) fn stream_error_code_to_proto(
         StreamErrorCode::InvalidRetention => {
             raft_app_proto::StreamErrorCodeV1::StreamErrorCodeInvalidRetention
         }
-        StreamErrorCode::InvalidFork => {
-            raft_app_proto::StreamErrorCodeV1::StreamErrorCodeInvalidFork
-        }
         StreamErrorCode::OffsetOutOfRange => {
             raft_app_proto::StreamErrorCodeV1::StreamErrorCodeOffsetOutOfRange
         }
@@ -1145,9 +1084,6 @@ pub(crate) fn stream_error_code_from_proto(code: i32) -> Result<StreamErrorCode,
         }
         raft_app_proto::StreamErrorCodeV1::StreamErrorCodeInvalidRetention => {
             Ok(StreamErrorCode::InvalidRetention)
-        }
-        raft_app_proto::StreamErrorCodeV1::StreamErrorCodeInvalidFork => {
-            Ok(StreamErrorCode::InvalidFork)
         }
         raft_app_proto::StreamErrorCodeV1::StreamErrorCodeOffsetOutOfRange => {
             Ok(StreamErrorCode::OffsetOutOfRange)

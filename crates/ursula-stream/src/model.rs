@@ -13,7 +13,6 @@ pub const COLD_INDEX_PAGE_SPAN_BYTES: u64 = 64 * 1024 * 1024;
 pub enum StreamStatus {
     Open,
     Closed,
-    SoftDeleted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,9 +26,6 @@ pub struct StreamMetadata {
     pub stream_expires_at_ms: Option<u64>,
     pub created_at_ms: u64,
     pub last_ttl_touch_at_ms: u64,
-    pub forked_from: Option<BucketStreamId>,
-    pub fork_offset: Option<u64>,
-    pub fork_ref_count: u64,
 }
 
 /// Maximum encoded JSON size of a stream attribute object. Attrs travel in
@@ -161,9 +157,8 @@ pub struct ColdGcEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColdGcTarget {
-    /// Every cold object owned by a fully removed stream. Cold objects are
-    /// stream-exclusive (forks copy, never share), so the whole `{stream}/chunks/`
-    /// prefix can be reclaimed at once.
+    /// Every cold object owned by a fully removed stream. The whole
+    /// `{stream}/chunks/` prefix can be reclaimed at once.
     Stream(BucketStreamId),
     /// Specific cold object paths dropped while the stream lives on (snapshot
     /// retention compaction).

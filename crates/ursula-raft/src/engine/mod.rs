@@ -48,7 +48,6 @@ use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::GroupFlushColdFuture;
-use ursula_runtime::GroupForkRefFuture;
 use ursula_runtime::GroupGetStreamAttrsFuture;
 use ursula_runtime::GroupHeadStreamFuture;
 use ursula_runtime::GroupInstallSnapshotFuture;
@@ -887,43 +886,6 @@ impl GroupEngine for RaftGroupEngine {
                 GroupWriteResponse::UpdateStreamAttrs(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
                     "unexpected update stream attrs write response: {other:?}"
-                ))),
-            }
-        })
-    }
-
-    fn add_fork_ref<'a>(
-        &'a mut self,
-        stream_id: BucketStreamId,
-        now_ms: u64,
-        _placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a> {
-        Box::pin(async move {
-            match self
-                .write(GroupWriteCommand::AddForkRef { stream_id, now_ms })
-                .await?
-            {
-                GroupWriteResponse::AddForkRef(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected add fork ref write response: {other:?}"
-                ))),
-            }
-        })
-    }
-
-    fn release_fork_ref<'a>(
-        &'a mut self,
-        stream_id: BucketStreamId,
-        _placement: ShardPlacement,
-    ) -> GroupForkRefFuture<'a> {
-        Box::pin(async move {
-            match self
-                .write(GroupWriteCommand::ReleaseForkRef { stream_id })
-                .await?
-            {
-                GroupWriteResponse::ReleaseForkRef(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected release fork ref write response: {other:?}"
                 ))),
             }
         })
