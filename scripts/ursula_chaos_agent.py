@@ -265,6 +265,7 @@ _STATUS_RANK = {
 _PUBLISHED_HISTORY_BUCKET_MS = 60 * 60 * 1000  # 1 hour, matches StatusPage rendering
 _PUBLISHED_HISTORY_BUCKETS = 7 * 24  # 7 days
 _PUBLISHED_HISTORY_RAW_MS = 60 * 60 * 1000  # keep raw samples for the last hour so the sparkline has points
+_HISTORY_RETENTION_MS = _PUBLISHED_HISTORY_BUCKETS * _PUBLISHED_HISTORY_BUCKET_MS + _PUBLISHED_HISTORY_RAW_MS
 # Recovery / probe-pass tolerance: at steady state we expect zero errors, but
 # during the drain right after a fault clears, queued retries cause sporadic
 # errors. Anything under this fraction of successful work is treated as healthy.
@@ -277,10 +278,24 @@ _PUBLISHED_EVENTS = 16  # page renders last 10
 _PUBLISHED_INJECTION_TIMELINE = 8  # timeline shown only in expandable details
 
 
-def _minimum_history_points(status_every_secs: int) -> int:
-    interval_secs = max(1, status_every_secs)
-    retention_ms = _PUBLISHED_HISTORY_BUCKETS * _PUBLISHED_HISTORY_BUCKET_MS + _PUBLISHED_HISTORY_RAW_MS
-    return int((retention_ms + interval_secs * 1000 - 1) // (interval_secs * 1000))
+def _prune_history(history: deque[dict[str, Any]], now_ms: int) -> None:
+    """Discard samples outside the published window without assuming a publish cadence."""
+    cutoff_ms = now_ms - _HISTORY_RETENTION_MS
+    while history:
+        ts_text = history[0].get("time")
+        if not isinstance(ts_text, str):
+            history.popleft()
+            continue
+        try:
+            entry_ms = int(
+                datetime.fromisoformat(ts_text.replace("Z", "+00:00")).timestamp() * 1000
+            )
+        except ValueError:
+            history.popleft()
+            continue
+        if entry_ms >= cutoff_ms:
+            break
+        history.popleft()
 
 
 def _downsample_history(raw: list[dict[str, Any]], now_ms: int) -> list[dict[str, Any]]:
@@ -404,8 +419,10 @@ class ChaosAgent:
             raise SystemExit("at least one --node is required")
         self.status_file = args.status_file
         self.status_s3_uri = args.status_s3_uri
-        history_points = max(args.history_points, _minimum_history_points(args.status_every))
-        self.history: deque[dict[str, Any]] = deque(maxlen=history_points)
+        # Fault transitions publish immediately in addition to the regular
+        # cadence, so a point-count limit cannot guarantee a seven-day window.
+        # `build_status` prunes this deque by timestamp after every append.
+        self.history: deque[dict[str, Any]] = deque()
         self.append_per_second = args.append_per_second
         self.payload_bytes = args.payload_bytes
         self.payload_sizes = parse_int_list(args.payload_sizes)
@@ -3066,8 +3083,10 @@ class ChaosAgent:
                 "reasons": reasons,
             }
         )
+        history_now_ms = int(time.time() * 1000)
+        _prune_history(self.history, history_now_ms)
         raw_history = list(self.history)
-        published_history = _downsample_history(raw_history, int(time.time() * 1000))
+        published_history = _downsample_history(raw_history, history_now_ms)
         published_started_at = _published_started_at(
             self.started_at, raw_history, self.restored_started_at
         )
@@ -3392,7 +3411,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gc-churn-ttl-secs", type=int, default=120,
                         help="server-side TTL backstop on churn streams")
     parser.add_argument("--status-every", type=int, default=15)
-    parser.add_argument("--history-points", type=int, default=5760)
+    parser.add_argument(
+        "--history-points",
+        type=int,
+        default=5760,
+        help="Deprecated compatibility option; health history retention is time-based",
+    )
     parser.add_argument("--injection-history", type=int, default=32)
     parser.add_argument("--fault-min-secs", type=int, default=900)
     parser.add_argument("--fault-max-secs", type=int, default=1800)
