@@ -19,10 +19,37 @@ use super::StreamStateMachine;
 use super::StreamStatus;
 use super::StreamVisibleSnapshot;
 use super::stream_is_expired;
+use crate::RecordIndexError;
+use crate::StreamRecordIndex;
+use crate::StreamRecordRange;
 
 impl StreamStateMachine {
     pub fn head(&self, stream_id: &BucketStreamId) -> Option<&StreamMetadata> {
         self.stream_metadata(stream_id)
+    }
+
+    pub fn record_range(
+        &self,
+        stream_id: &BucketStreamId,
+    ) -> Result<Option<StreamRecordRange>, RecordIndexError> {
+        self.stream_slot(stream_id)
+            .and_then(|slot| slot.record_index.as_ref())
+            .map(StreamRecordIndex::range)
+            .transpose()
+    }
+
+    pub fn offset_for_record(
+        &self,
+        stream_id: &BucketStreamId,
+        record: u64,
+    ) -> Result<Option<u64>, RecordIndexError> {
+        let Some(slot) = self.stream_slot(stream_id) else {
+            return Ok(None);
+        };
+        slot.record_index
+            .as_ref()
+            .map(|index| index.offset_for(record, slot.metadata.tail_offset))
+            .transpose()
     }
 
     pub fn stream_attrs(&self, stream_id: &BucketStreamId) -> Option<&StreamAttrs> {

@@ -62,6 +62,7 @@ pub(crate) fn group_write_command_from_proto(
             stream_id: stream_id_from_proto(command.stream_id, "create_external.stream_id")?,
             content_type: command.content_type,
             initial_payload: required(command.initial_payload, "create_external.initial_payload")?,
+            record_ends: command.record_ends,
             close_after: command.close_after,
             stream_seq: command.stream_seq,
             producer: command.producer,
@@ -83,6 +84,7 @@ pub(crate) fn group_write_command_from_proto(
             stream_id: stream_id_from_proto(command.stream_id, "append_external.stream_id")?,
             content_type: command.content_type,
             payload: required(command.payload, "append_external.payload")?,
+            record_ends: command.record_ends,
             close_after: command.close_after,
             stream_seq: command.stream_seq,
             producer: command.producer,
@@ -1027,6 +1029,9 @@ pub(crate) fn stream_error_code_to_proto(
         StreamErrorCode::InvalidStreamAttrs => {
             raft_app_proto::StreamErrorCodeV1::StreamErrorCodeInvalidStreamAttrs
         }
+        StreamErrorCode::InvalidRecordBoundaries => {
+            raft_app_proto::StreamErrorCodeV1::StreamErrorCodeInvalidRecordBoundaries
+        }
     }
 }
 
@@ -1102,6 +1107,9 @@ pub(crate) fn stream_error_code_from_proto(code: i32) -> Result<StreamErrorCode,
         }
         raft_app_proto::StreamErrorCodeV1::StreamErrorCodeInvalidStreamAttrs => {
             Ok(StreamErrorCode::InvalidStreamAttrs)
+        }
+        raft_app_proto::StreamErrorCodeV1::StreamErrorCodeInvalidRecordBoundaries => {
+            Ok(StreamErrorCode::InvalidRecordBoundaries)
         }
     }
 }

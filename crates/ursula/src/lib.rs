@@ -1833,6 +1833,7 @@ pub(crate) async fn create_stream_external_by_id(
     let content_type = request.content_type.clone();
     let stream_ttl_seconds = request.stream_ttl_seconds;
     let stream_expires_at_ms = request.stream_expires_at_ms;
+    let record_ends = request.canonical_record_ends();
     let payload = std::mem::take(&mut request.initial_payload);
     let external_payload = match stage_external_payload(&state, &stream_id, &payload).await {
         Ok(payload) => payload,
@@ -1840,7 +1841,7 @@ pub(crate) async fn create_stream_external_by_id(
     };
     let external_path = external_payload.s3_path.clone();
     let external_request =
-        CreateStreamExternalRequest::from_create_request(request, external_payload);
+        CreateStreamExternalRequest::from_create_request(request, external_payload, record_ends);
 
     match state.runtime.create_stream_external(external_request).await {
         Ok(response) => create_stream_http_response(CreateStreamHttpResponseInput {
@@ -1965,13 +1966,15 @@ pub(crate) async fn append_stream_external_by_id(
     mut request: AppendRequest,
 ) -> Response {
     let stream_id = request.stream_id.clone();
+    let record_ends = request.canonical_record_ends();
     let payload = std::mem::take(&mut request.payload);
     let external_payload = match stage_external_payload(&state, &stream_id, &payload).await {
         Ok(payload) => payload,
         Err(response) => return response,
     };
     let external_path = external_payload.s3_path.clone();
-    let external_request = AppendExternalRequest::from_append_request(request, external_payload);
+    let external_request =
+        AppendExternalRequest::from_append_request(request, external_payload, record_ends);
     match state.runtime.append_external(external_request).await {
         Ok(response) => append_http_response(response),
         Err(err) => {

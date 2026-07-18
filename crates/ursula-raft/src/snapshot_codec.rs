@@ -164,6 +164,17 @@ fn encode_frame(frame: proto::SnapshotFrameV1) -> Result<Bytes, SnapshotStoreErr
 fn stream_to_proto(
     entry: StreamSnapshotEntry,
 ) -> Result<proto::StreamSnapshotEntryV1, SnapshotStoreError> {
+    let (first_record, record_offsets) = entry
+        .record_index
+        .as_ref()
+        .map(|index| {
+            index
+                .range()
+                .map(|range| (Some(range.first_record), index.record_offsets().to_vec()))
+        })
+        .transpose()
+        .map_err(|err| SnapshotStoreError::Serialize(format!("record index: {err:?}")))?
+        .unwrap_or((None, Vec::new()));
     Ok(proto::StreamSnapshotEntryV1 {
         metadata: Some(metadata_to_proto(entry.metadata)),
         attrs_json: entry
@@ -198,12 +209,36 @@ fn stream_to_proto(
             .into_iter()
             .map(producer_to_proto)
             .collect(),
+        first_record,
+        record_offsets,
     })
 }
 
 fn stream_from_proto(
     entry: proto::StreamSnapshotEntryV1,
 ) -> Result<StreamSnapshotEntry, SnapshotStoreError> {
+    let retained_offset = entry
+        .visible_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.offset)
+        .unwrap_or(0);
+    let tail_offset = entry
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.tail_offset)
+        .unwrap_or(0);
+    let record_index = entry
+        .first_record
+        .map(|first_record| {
+            ursula_stream::StreamRecordIndex::restore(
+                first_record,
+                entry.record_offsets.clone(),
+                retained_offset,
+                tail_offset,
+            )
+        })
+        .transpose()
+        .map_err(|err| SnapshotStoreError::Deserialize(format!("record index: {err:?}")))?;
     Ok(StreamSnapshotEntry {
         metadata: metadata_from_proto(required(entry.metadata, "snapshot stream metadata")?)?,
         attrs: entry
@@ -231,6 +266,7 @@ fn stream_from_proto(
             .into_iter()
             .map(message_record_from_proto)
             .collect(),
+        record_index,
         integrity: integrity_from_proto(required(entry.integrity, "snapshot stream integrity")?),
         visible_snapshot: entry.visible_snapshot.map(visible_snapshot_from_proto),
         producer_states: entry

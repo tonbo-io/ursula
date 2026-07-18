@@ -53,6 +53,7 @@ message CreateExternalCommandV1 {
   optional uint64 stream_expires_at_ms = 8;
   uint64 now_ms = 11;
   optional bytes attrs_json = 12;
+  repeated uint64 record_ends = 13;
 }
 
 message AppendCommandV1 {
@@ -73,6 +74,7 @@ message AppendExternalCommandV1 {
   optional string stream_seq = 5;
   ProducerRequestV1 producer = 6;
   uint64 now_ms = 7;
+  repeated uint64 record_ends = 8;
 }
 
 message AppendBatchCommandV1 {

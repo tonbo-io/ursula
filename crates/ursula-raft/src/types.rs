@@ -152,6 +152,7 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
                 stream_id,
                 content_type,
                 initial_payload,
+                record_ends,
                 close_after,
                 stream_seq,
                 producer,
@@ -170,6 +171,7 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
                 stream_expires_at_ms,
                 now_ms,
                 attrs_json: attrs.map(stream_attrs_json),
+                record_ends,
             }),
             GroupWriteCommand::Append {
                 stream_id,
@@ -192,6 +194,7 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
                 stream_id,
                 content_type,
                 payload,
+                record_ends,
                 close_after,
                 stream_seq,
                 producer,
@@ -204,6 +207,7 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
                 stream_seq,
                 producer,
                 now_ms,
+                record_ends,
             }),
             GroupWriteCommand::AppendBatch {
                 stream_id,

@@ -88,6 +88,7 @@ pub enum StreamErrorCode {
     SnapshotNotFound,
     SnapshotConflict,
     InvalidStreamAttrs,
+    InvalidRecordBoundaries,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -12,6 +12,7 @@ use crate::model::StreamAttrs;
 use crate::model::StreamMessageRecord;
 use crate::model::StreamMetadata;
 use crate::model::StreamVisibleSnapshot;
+use crate::record_index::StreamRecordIndex;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamSnapshot {
@@ -38,6 +39,8 @@ pub struct StreamSnapshotEntry {
     pub cold_chunks: Vec<ColdChunkRef>,
     pub external_segments: Vec<ObjectPayloadRef>,
     pub message_records: Vec<StreamMessageRecord>,
+    #[serde(default)]
+    pub record_index: Option<StreamRecordIndex>,
     pub integrity: StreamIntegritySnapshot,
     pub visible_snapshot: Option<StreamVisibleSnapshot>,
     pub producer_states: Vec<ProducerSnapshot>,
@@ -58,6 +61,9 @@ pub enum StreamSnapshotError {
         payload_len: usize,
     },
     MessageBoundaryMismatch {
+        stream_id: BucketStreamId,
+    },
+    RecordBoundaryMismatch {
         stream_id: BucketStreamId,
     },
     IntegrityMismatch {
@@ -103,6 +109,10 @@ impl std::fmt::Display for StreamSnapshotError {
             Self::MessageBoundaryMismatch { stream_id } => write!(
                 f,
                 "snapshot stream '{stream_id}' has inconsistent message boundaries"
+            ),
+            Self::RecordBoundaryMismatch { stream_id } => write!(
+                f,
+                "snapshot stream '{stream_id}' has inconsistent record boundaries"
             ),
             Self::IntegrityMismatch { stream_id } => write!(
                 f,

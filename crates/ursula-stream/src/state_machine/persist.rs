@@ -66,6 +66,7 @@ impl StreamStateMachine {
                     cold_chunks: slot.cold.cold_chunks().to_vec(),
                     external_segments: slot.cold.external_segments().to_vec(),
                     message_records: slot.message_records.clone(),
+                    record_index: slot.record_index.clone(),
                     integrity: slot
                         .integrity
                         .snapshot(self.earliest_retained_offset(&stream_id), tail_offset),
@@ -113,6 +114,13 @@ impl StreamStateMachine {
                 .as_ref()
                 .map(|snapshot| snapshot.offset)
                 .unwrap_or(0);
+            if let Some(record_index) = entry.record_index.as_ref()
+                && record_index
+                    .validate(retained_offset, entry.metadata.tail_offset)
+                    .is_err()
+            {
+                return Err(StreamSnapshotError::RecordBoundaryMismatch { stream_id });
+            }
             let hot_segments = if entry.hot_segments.is_empty() && !entry.payload.is_empty() {
                 vec![HotPayloadSegment {
                     start_offset: entry.hot_start_offset,
@@ -167,6 +175,7 @@ impl StreamStateMachine {
                     entry.external_segments,
                 ),
                 message_records: entry.message_records,
+                record_index: entry.record_index,
                 integrity,
                 visible_snapshot,
                 producers: producer_states,

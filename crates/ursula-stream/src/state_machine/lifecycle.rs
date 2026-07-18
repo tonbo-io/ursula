@@ -23,6 +23,7 @@ use super::StreamResponse;
 use super::StreamSlot;
 use super::StreamStateMachine;
 use super::StreamStatus;
+use super::build_record_index;
 use super::normalize_stream_attrs;
 use super::renew_stream_ttl;
 use super::stream_is_expired;
@@ -84,6 +85,12 @@ impl StreamStateMachine {
         if let Err(response) = validate_producer_request(input.producer.as_ref()) {
             return response;
         }
+        let initial_len = input.initial_len();
+        let record_index =
+            match build_record_index(&input.content_type, initial_len, &input.record_ends) {
+                Ok(index) => index,
+                Err(response) => return response,
+            };
         if let Some(producer) = input.producer.as_ref()
             && producer.producer_seq != 0
         {
@@ -131,7 +138,6 @@ impl StreamStateMachine {
             );
         }
 
-        let initial_len = input.initial_len();
         let metadata = StreamMetadata {
             stream_id: input.stream_id.clone(),
             content_type: input.content_type,
@@ -180,6 +186,7 @@ impl StreamStateMachine {
             hot_buffer,
             cold: StreamColdState::default(),
             message_records,
+            record_index,
             integrity,
             visible_snapshot: None,
             producers: producer_states,
@@ -222,6 +229,14 @@ impl StreamStateMachine {
         if let Err(response) = validate_producer_request(input.producer.as_ref()) {
             return response;
         }
+        let record_index = match build_record_index(
+            &input.content_type,
+            input.initial_payload.payload_len,
+            &input.record_ends,
+        ) {
+            Ok(index) => index,
+            Err(response) => return response,
+        };
         if let Some(producer) = input.producer.as_ref()
             && producer.producer_seq != 0
         {
@@ -326,6 +341,7 @@ impl StreamStateMachine {
             hot_buffer: HotBuffer::default(),
             cold,
             message_records,
+            record_index,
             integrity,
             visible_snapshot: None,
             producers: producer_states,

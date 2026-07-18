@@ -16,6 +16,8 @@ use super::StreamMetadata;
 use super::StreamResponse;
 use super::StreamStateMachine;
 use super::StreamStatus;
+use super::canonical_json_record_ends;
+use super::prepare_record_append;
 use super::renew_stream_ttl;
 use super::validate_external_payload_ref;
 use super::validate_producer_request;
@@ -78,6 +80,26 @@ impl StreamStateMachine {
             };
         }
 
+        let payload_len = u64::try_from(payload.len()).expect("payload len fits u64");
+        let record_ends = content_type
+            .map(|value| canonical_json_record_ends(value, payload).unwrap_or_default())
+            .unwrap_or_default();
+        let prepared_record_index = {
+            let slot = self
+                .stream_slot(&stream_id)
+                .expect("stream existence checked before record validation");
+            match prepare_record_append(
+                slot.record_index.as_ref(),
+                super::is_json_record_content_type(&slot.metadata.content_type),
+                slot.metadata.tail_offset,
+                payload_len,
+                &record_ends,
+            ) {
+                Ok(index) => index,
+                Err(response) => return response,
+            }
+        };
+
         let Some(stream) = self.stream_metadata_mut(&stream_id) else {
             unreachable!("stream existence checked before producer evaluation");
         };
@@ -129,7 +151,6 @@ impl StreamStateMachine {
         }
 
         let offset = stream.tail_offset;
-        let payload_len = u64::try_from(payload.len()).expect("payload len fits u64");
         stream.tail_offset = stream.tail_offset.saturating_add(payload_len);
         if let Some(seq) = stream_seq {
             stream.last_stream_seq = Some(seq);
@@ -169,6 +190,7 @@ impl StreamStateMachine {
             let slot = self
                 .stream_slot_mut(&stream_id)
                 .expect("stream existence checked before append mutation");
+            slot.record_index = prepared_record_index;
             slot.hot_buffer.push(offset, next_offset, payload);
             slot.integrity
                 .append_payload(&stream_id, offset, next_offset, payload);
@@ -191,6 +213,7 @@ impl StreamStateMachine {
             stream_id,
             content_type,
             payload,
+            record_ends,
             close_after,
             stream_seq,
             producer,
@@ -237,6 +260,22 @@ impl StreamStateMachine {
                 producer: Some(producer),
             };
         }
+
+        let prepared_record_index = {
+            let slot = self
+                .stream_slot(&stream_id)
+                .expect("stream existence checked before record validation");
+            match prepare_record_append(
+                slot.record_index.as_ref(),
+                super::is_json_record_content_type(&slot.metadata.content_type),
+                slot.metadata.tail_offset,
+                payload.payload_len,
+                &record_ends,
+            ) {
+                Ok(index) => index,
+                Err(response) => return response,
+            }
+        };
 
         let Some(stream) = self.stream_metadata(&stream_id) else {
             unreachable!("stream existence checked before producer evaluation");
@@ -309,6 +348,7 @@ impl StreamStateMachine {
         let slot = self
             .stream_slot_mut(&stream_id)
             .expect("stream existence checked before external append mutation");
+        slot.record_index = prepared_record_index;
         slot.cold.push_external_segment(object.clone());
         slot.integrity.append_external(
             &stream_id,
@@ -368,6 +408,10 @@ impl StreamStateMachine {
             });
         }
 
+        let mut prepared_record_index = self
+            .stream_slot(&stream_id)
+            .and_then(|slot| slot.record_index.clone());
+
         let Some(stream) = self.stream_metadata_mut(&stream_id) else {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
@@ -405,6 +449,20 @@ impl StreamStateMachine {
             ));
         }
 
+        let mut record_offset = stream.tail_offset;
+        for payload in payloads {
+            let payload_len = u64::try_from(payload.len()).expect("payload len fits u64");
+            let record_ends = canonical_json_record_ends(content_type, payload).unwrap_or_default();
+            prepared_record_index = prepare_record_append(
+                prepared_record_index.as_ref(),
+                super::is_json_record_content_type(content_type),
+                record_offset,
+                payload_len,
+                &record_ends,
+            )?;
+            record_offset = record_offset.saturating_add(payload_len);
+        }
+
         let mut items = Vec::with_capacity(payloads.len());
         for payload in payloads {
             let offset = stream.tail_offset;
@@ -428,6 +486,7 @@ impl StreamStateMachine {
         let slot = self
             .stream_slot_mut(&stream_id)
             .expect("stream existence checked before batch append mutation");
+        slot.record_index = prepared_record_index;
         for (item, payload) in items.iter().zip(payloads.iter()) {
             slot.hot_buffer
                 .push(item.start_offset, item.next_offset, payload);

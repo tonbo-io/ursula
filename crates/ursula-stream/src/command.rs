@@ -33,6 +33,8 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
         content_type: String,
         initial_payload: ExternalPayloadRef,
+        #[serde(default)]
+        record_ends: Vec<u64>,
         close_after: bool,
         stream_seq: Option<String>,
         producer: Option<ProducerRequest>,
@@ -56,6 +58,8 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
         content_type: Option<String>,
         payload: ExternalPayloadRef,
+        #[serde(default)]
+        record_ends: Vec<u64>,
         close_after: bool,
         stream_seq: Option<String>,
         producer: Option<ProducerRequest>,

@@ -37,6 +37,8 @@ message StreamSnapshotEntryV1 {
   StreamIntegritySnapshotV1 integrity = 11;
   StreamVisibleSnapshotV1 visible_snapshot = 12;
   repeated ProducerSnapshotV1 producer_states = 13;
+  optional uint64 first_record = 14;
+  repeated uint64 record_offsets = 15;
 }
 
 message StreamMetadataV1 {

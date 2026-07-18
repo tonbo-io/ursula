@@ -24,6 +24,34 @@ pub enum RecordIndexError {
     OffsetNotRecordBoundary,
 }
 
+pub fn is_json_record_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+}
+
+pub fn canonical_json_record_ends(
+    content_type: &str,
+    payload: &[u8],
+) -> Result<Vec<u64>, RecordIndexError> {
+    if !is_json_record_content_type(content_type) {
+        return Ok(Vec::new());
+    }
+    if payload.is_empty() {
+        return Ok(Vec::new());
+    }
+    if payload.last() != Some(&b'\n') {
+        return Err(RecordIndexError::InvalidBoundaries);
+    }
+    payload
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == b'\n').then_some(index + 1))
+        .map(|end| u64::try_from(end).map_err(|_| RecordIndexError::ArithmeticOverflow))
+        .collect()
+}
+
 impl StreamRecordIndex {
     pub fn new() -> Self {
         Self::default()
@@ -198,6 +226,7 @@ mod tests {
     use super::RecordIndexError;
     use super::StreamRecordIndex;
     use super::StreamRecordRange;
+    use super::canonical_json_record_ends;
 
     #[test]
     fn append_maps_contiguous_ordinals_to_exact_offsets() {
@@ -269,6 +298,25 @@ mod tests {
         );
         assert_eq!(
             index.append_relative_ends(0, 0, &[0]),
+            Err(RecordIndexError::InvalidBoundaries)
+        );
+    }
+
+    #[test]
+    fn canonical_json_payload_exposes_each_ndjson_boundary() {
+        assert_eq!(
+            canonical_json_record_ends(
+                "application/json; charset=utf-8",
+                b"{\"a\":1}\n{\"b\":2}\n"
+            ),
+            Ok(vec![8, 16])
+        );
+        assert_eq!(
+            canonical_json_record_ends("application/octet-stream", b"x"),
+            Ok(vec![])
+        );
+        assert_eq!(
+            canonical_json_record_ends("application/json", b"{}"),
             Err(RecordIndexError::InvalidBoundaries)
         );
     }
