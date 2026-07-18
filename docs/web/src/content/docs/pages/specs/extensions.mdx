@@ -22,6 +22,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 
 ## Table of Contents
 
+- [Extension Capability Advertisement](#extension-capability-advertisement)
 1. [Buckets](#1-buckets)
 2. [Snapshots](#2-snapshots)
 3. [Bootstrap](#3-bootstrap)
@@ -32,6 +33,12 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 8. [URL Encoding](#8-url-encoding)
 
 ---
+
+## Extension Capability Advertisement
+
+`Stream-Extensions` is a response header for advertising protocol extensions that are active for the target stream. Its value is a comma-separated list of extension tokens registered by the specifications that define them. A server MUST advertise only tokens whose extension semantics apply to the target stream; server-wide support for an extension is not sufficient. An extension specification defines its token and the responses on which an active implementation MUST advertise it.
+
+Clients MUST ignore unrecognized extension tokens. A client that depends on an extension MUST verify its token before relying on extension-specific request parameters, response headers, or body semantics.
 
 ## 1. Buckets
 
@@ -487,7 +494,9 @@ Submitting `{}` clears the stream attributes. Attributes MAY be updated after a 
 
 The JSON Record Coordinates extension adds a stable logical message coordinate to streams configured with `Content-Type: application/json`. It is a pure superset of the base protocol: offsets remain the canonical exact-resume cursor, ordinary offset reads remain byte-oriented, and clients that do not understand record coordinates continue to operate unchanged.
 
-Servers implementing this extension MUST advertise `json-record-coordinates-v1` in a comma-separated `Stream-Extensions` response header on `HEAD` and stream-operation responses. Record-aware clients MUST verify this capability before relying on record query parameters or response headers and MUST reject a record-aware response that omits it.
+This extension registers the token `json-record-coordinates-v1`. It is active only for an `application/json` stream for which the server maintains the record model defined below. Responses to `HEAD` and stream operations targeting such a stream MUST advertise this token in `Stream-Extensions`. A server MUST NOT advertise this token for a stream on which the extension is inactive, including a stream with a non-JSON content type.
+
+Record-aware clients MUST verify this token before relying on record query parameters or response headers and MUST reject a record-aware response that omits it.
 
 ### 6.1. Record Model
 
