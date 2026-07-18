@@ -50,6 +50,8 @@ pub use model::StreamVisibleSnapshot;
 pub use record_index::RecordIndexError;
 pub use record_index::StreamRecordIndex;
 pub use record_index::StreamRecordRange;
+pub use record_index::canonical_json_record_ends;
+pub use record_index::is_json_record_content_type;
 pub use response::StreamErrorCode;
 pub use response::StreamErrorContext;
 pub use response::StreamResponse;

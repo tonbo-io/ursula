@@ -41,6 +41,8 @@ pub struct CreateStreamExternalRequest {
     pub stream_id: BucketStreamId,
     pub content_type: String,
     pub initial_payload: ExternalPayloadRef,
+    #[serde(default)]
+    pub record_ends: Vec<u64>,
     pub close_after: bool,
     pub stream_seq: Option<String>,
     pub producer: Option<ProducerRequest>,
@@ -54,11 +56,13 @@ impl CreateStreamExternalRequest {
     pub fn from_create_request(
         request: CreateStreamRequest,
         initial_payload: ExternalPayloadRef,
+        record_ends: Vec<u64>,
     ) -> Self {
         Self {
             stream_id: request.stream_id,
             content_type: request.content_type,
             initial_payload,
+            record_ends,
             close_after: request.close_after,
             stream_seq: request.stream_seq,
             producer: request.producer,
@@ -71,6 +75,11 @@ impl CreateStreamExternalRequest {
 }
 
 impl CreateStreamRequest {
+    pub fn canonical_record_ends(&self) -> Vec<u64> {
+        ursula_stream::canonical_json_record_ends(&self.content_type, &self.initial_payload)
+            .unwrap_or_default()
+    }
+
     pub fn new(stream_id: BucketStreamId, content_type: impl Into<String>) -> Self {
         Self {
             stream_id,
@@ -449,6 +458,8 @@ pub struct AppendExternalRequest {
     pub stream_id: BucketStreamId,
     pub content_type: String,
     pub payload: ExternalPayloadRef,
+    #[serde(default)]
+    pub record_ends: Vec<u64>,
     pub close_after: bool,
     pub stream_seq: Option<String>,
     pub producer: Option<ProducerRequest>,
@@ -456,11 +467,16 @@ pub struct AppendExternalRequest {
 }
 
 impl AppendExternalRequest {
-    pub fn from_append_request(request: AppendRequest, payload: ExternalPayloadRef) -> Self {
+    pub fn from_append_request(
+        request: AppendRequest,
+        payload: ExternalPayloadRef,
+        record_ends: Vec<u64>,
+    ) -> Self {
         Self {
             stream_id: request.stream_id,
             content_type: request.content_type,
             payload,
+            record_ends,
             close_after: request.close_after,
             stream_seq: request.stream_seq,
             producer: request.producer,
@@ -470,6 +486,11 @@ impl AppendExternalRequest {
 }
 
 impl AppendRequest {
+    pub fn canonical_record_ends(&self) -> Vec<u64> {
+        ursula_stream::canonical_json_record_ends(&self.content_type, &self.payload)
+            .unwrap_or_default()
+    }
+
     pub fn new(stream_id: BucketStreamId, payload_len: u64) -> Self {
         Self {
             stream_id,
