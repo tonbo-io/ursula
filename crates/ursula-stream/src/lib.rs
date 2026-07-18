@@ -5,6 +5,7 @@
 //! - [`command`]: replicated command variants applied to the state machine.
 //! - [`response`]: result variants and error codes returned per command.
 //! - [`model`]: persistent data types (metadata, segments, producer state, plans).
+//! - [`record_index`]: exact retained record-ordinal to offset boundaries.
 //! - [`snapshot`]: snapshot wire format and restoration errors.
 //! - [`state_machine`]: the deterministic [`StreamStateMachine`] that drives a Raft group.
 //! - [`validate`]: bucket/stream id validation used by HTTP and Raft entry points.
@@ -12,6 +13,7 @@
 mod command;
 mod integrity;
 mod model;
+mod record_index;
 mod response;
 mod snapshot;
 mod state_machine;
@@ -45,6 +47,9 @@ pub use model::StreamReadPlan;
 pub use model::StreamReadSegment;
 pub use model::StreamStatus;
 pub use model::StreamVisibleSnapshot;
+pub use record_index::RecordIndexError;
+pub use record_index::StreamRecordIndex;
+pub use record_index::StreamRecordRange;
 pub use response::StreamErrorCode;
 pub use response::StreamErrorContext;
 pub use response::StreamResponse;
