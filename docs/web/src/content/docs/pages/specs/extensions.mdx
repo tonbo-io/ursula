@@ -4,13 +4,13 @@ title: "Durable Streams Extensions"
 
 **Document:** Durable Streams Protocol Extensions
 **Status:** Draft
-**Date:** 2025-03-14
+**Date:** 2026-07-18
 
 ---
 
 ## Abstract
 
-This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, multipart bootstrap delivery, mutable stream attributes, and Ursula-specific append batching for high-throughput small-event writes.
+This document defines extensions to the [Durable Streams Protocol](/docs/specs/durable-stream). It adds bucket namespacing, snapshot and bootstrap semantics, multipart bootstrap delivery, mutable stream attributes, Ursula-specific append batching for high-throughput small-event writes, and stable record coordinates for JSON streams.
 
 The snapshot and bootstrap design in sections 2 and 3 was proposed by [Loro](https://loro.dev/); Ursula adopts that design.
 
@@ -27,8 +27,9 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 3. [Bootstrap](#3-bootstrap)
 4. [Append Batch](#4-append-batch)
 5. [Stream Attributes](#5-stream-attributes)
-6. [Ordinary SSE Compatibility](#6-ordinary-sse-compatibility)
-7. [URL Encoding](#7-url-encoding)
+6. [JSON Record Coordinates](#6-json-record-coordinates)
+7. [Ordinary SSE Compatibility](#7-ordinary-sse-compatibility)
+8. [URL Encoding](#8-url-encoding)
 
 ---
 
@@ -482,7 +483,258 @@ Submitting `{}` clears the stream attributes. Attributes MAY be updated after a 
 
 ---
 
-## 6. Ordinary SSE Compatibility
+## 6. JSON Record Coordinates
+
+The JSON Record Coordinates extension adds a stable logical message coordinate to streams configured with `Content-Type: application/json`. It is a pure superset of the base protocol: offsets remain the canonical exact-resume cursor, ordinary offset reads remain byte-oriented, and clients that do not understand record coordinates continue to operate unchanged.
+
+Servers implementing this extension MUST advertise `json-record-coordinates-v1` in a comma-separated `Stream-Extensions` response header on `HEAD` and stream-operation responses. Record-aware clients MUST verify this capability before relying on record query parameters or response headers and MUST reject a record-aware response that omits it.
+
+### 6.1. Record Model
+
+Each logical JSON message has a zero-based unsigned integer record ordinal. Ordinals are assigned consecutively in committed stream order and are scoped to one stream.
+
+For one stream:
+
+- `F` is the first retained record ordinal.
+- `N` is the next record ordinal and record tail.
+- Retained records occupy `[F, N)`.
+- `O(r)` is the canonical Durable Streams offset at the first byte of record `r`.
+- `C(r)` is the server-assigned commit timestamp of record `r`.
+
+A new empty stream has `F = N = 0`. An ordinal MUST NOT be reused or changed after it becomes externally visible. Retention MAY advance `F`, but MUST NOT renumber surviving records.
+
+Record ordinals are independent from offsets, `Stream-Seq`, idempotent-producer sequence numbers, and sequence fields inside application JSON values. Clients MAY perform arithmetic on ordinals, but MUST continue to treat offsets as opaque tokens.
+
+The JSON-mode normalization rules in the base protocol define the records:
+
+- A non-array JSON value creates one record.
+- A top-level JSON array creates one record per array element after exactly one level of flattening.
+- An empty array creates no records on `PUT` and remains invalid on `POST`.
+
+An implementation MUST preserve each normalized message boundary and its ordinal across hot storage, WAL, cold flush, compaction, snapshot, restart, and retention. Coalescing physical storage objects MUST NOT coalesce the logical record coordinate space.
+
+### 6.2. Commit Timestamps
+
+The server MUST assign an RFC 3339 commit timestamp to every committed record. Commit timestamps MUST be nondecreasing within a stream. If the wall clock moves backwards, the server MUST clamp the new timestamp to at least the previous committed timestamp.
+
+All records created by one atomic append MAY share one commit timestamp. Equal timestamps are ordered by record ordinal. Commit timestamps are immutable after assignment and MUST survive recovery and compaction.
+
+Commit time is not application event time. Applications SHOULD continue to include domain event time in their JSON values when that distinction matters.
+
+### 6.3. Create and Append Acknowledgements
+
+When `PUT` creates a JSON stream with initial messages, or `POST` appends one or more JSON messages, successful responses MUST include:
+
+- `Stream-Record-Start`: Inclusive ordinal of the first record created by this operation.
+- `Stream-Record-Next`: Exclusive ordinal after the last record created by this operation.
+- `Stream-Commit-Timestamp`: Commit timestamp assigned to the operation.
+
+For an operation that creates no records, `Stream-Record-Start` and `Stream-Record-Next` MUST both equal the current record tail and `Stream-Commit-Timestamp` MUST be omitted.
+
+All messages from one JSON request body MUST commit atomically and receive one contiguous ordinal range, or the operation MUST fail without making any ordinal visible. Concurrent appenders MUST receive disjoint ranges in committed stream order.
+
+When an idempotent-producer retry is deduplicated, the server MUST return the original `Stream-Record-Start`, `Stream-Record-Next`, and `Stream-Commit-Timestamp` values.
+
+For example, if the current record tail is `42`:
+
+```http
+POST {stream_url}
+Content-Type: application/json
+
+[
+  {"type":"navigation_started"},
+  {"type":"network_response","status":500}
+]
+```
+
+The successful response includes:
+
+```http
+Stream-Extensions: json-record-coordinates-v1
+Stream-Record-Start: 42
+Stream-Record-Next: 44
+Stream-Commit-Timestamp: 2026-07-18T10:30:00.123Z
+Stream-Next-Offset: <opaque-offset>
+```
+
+### 6.4. Conditional Append by Record Tail
+
+A writer MAY require the current record tail to match an expected value:
+
+```http
+Stream-Record-Match: 42
+```
+
+The server MUST accept the append only when the current `N` equals the supplied unsigned integer. A mismatch MUST return `412 Precondition Failed` with the current `Stream-Record-Next` and `Stream-Next-Offset`. This precondition composes with, but does not replace, `Stream-Seq` or idempotent-producer headers.
+
+### 6.5. Record Metadata on HEAD
+
+For a JSON stream implementing this extension, `HEAD {stream_url}` MUST include:
+
+- `Stream-Record-First`: First retained record ordinal `F`.
+- `Stream-Record-Next`: Next record ordinal `N`.
+- `Stream-Record-First-Timestamp`: Commit timestamp of record `F`, when the retained range is non-empty.
+- `Stream-Record-Last-Timestamp`: Commit timestamp of record `N - 1`, when the retained range is non-empty.
+
+The timestamp headers MUST be absent when `F = N`.
+
+### 6.6. Record-Aware Read Parameters
+
+A record-aware read selects its starting position with exactly one of:
+
+- `record=<ordinal>`: Start at the specified record boundary.
+- `record=now`: Start at the current record tail.
+- `tail_records=<count>`: Start at `max(F, N - count)`.
+- `timestamp=<rfc3339>`: Start at the first retained record whose commit timestamp is greater than or equal to the supplied timestamp.
+
+These parameters are mutually exclusive with each other and with `offset`. `tail_records` MUST be a non-negative integer.
+
+The following rules apply:
+
+- `record < F` MUST return `410 Gone` with `Stream-Record-First` and `Stream-Record-Next`.
+- `record = N` is a valid up-to-date empty read.
+- `record > N` MUST return `400 Bad Request` with `Stream-Record-Next`.
+- `tail_records=0` is equivalent to `record=now`.
+- A timestamp later than the last committed timestamp resolves to `N`.
+- When `F > 0`, a timestamp earlier than `C(F)` MUST return `410 Gone` so trimmed history is not silently hidden.
+
+Record-aware reads MAY also specify `max_records=<positive-integer>`. `max_records` limits the number of complete records returned. `max_records` without a record-aware start parameter MUST return `400 Bad Request`.
+
+`max_bytes` and `max_records` MUST NOT appear in the same request. A record-aware read that includes `max_bytes` MUST return `400 Bad Request`. This keeps the base protocol's partial-byte behavior separate from the extension's complete-record guarantee.
+
+### 6.7. Record-Aligned Read Responses
+
+A successful record-aware catch-up or long-poll response MUST:
+
+- begin at a complete record boundary;
+- contain only complete normalized JSON messages;
+- return `Content-Type: application/x-ndjson` by default;
+- return at most `max_records` messages when supplied;
+- include `Stream-Record-First`, `Stream-Record-Start`, `Stream-Record-Next`, and `Stream-Next-Offset`.
+
+`Stream-Record-Start` is the resolved starting ordinal. `Stream-Record-Next` is the continuation ordinal after the last complete returned record. `Stream-Next-Offset` MUST identify the same logical boundary as `Stream-Record-Next`.
+
+An empty successful response MUST set `Stream-Record-Start` and `Stream-Record-Next` to the resolved starting ordinal.
+
+Example:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/x-ndjson
+Stream-Extensions: json-record-coordinates-v1
+Stream-Record-First: 0
+Stream-Record-Start: 42
+Stream-Record-Next: 44
+Stream-Next-Offset: <opaque-offset>
+
+{"type":"navigation_started"}
+{"type":"network_response","status":500}
+```
+
+Ordinary `GET {stream_url}?offset=...` behavior is unchanged and MAY still end in the middle of a JSON record as defined by the base protocol.
+
+### 6.8. Optional Record Envelope View
+
+A record-aware client MAY request `record_view=envelope`. This parameter MUST be combined with a record-aware start parameter.
+
+The response MUST use:
+
+```http
+Content-Type: application/vnd.durable-stream-records+ndjson
+```
+
+Each response line MUST be a JSON object containing:
+
+- `record`: Record ordinal.
+- `timestamp`: RFC 3339 commit timestamp.
+- `value`: The original normalized JSON value.
+
+Example:
+
+```json
+{"record":42,"timestamp":"2026-07-18T10:30:00.123Z","value":{"type":"navigation_started"}}
+{"record":43,"timestamp":"2026-07-18T10:30:00.123Z","value":{"type":"network_response","status":500}}
+```
+
+The envelope is an alternate read representation only. It MUST NOT change canonical stream bytes, offsets, record ordinals, ETags for the canonical representation, snapshots, bootstrap data, or ordinary reads.
+
+### 6.9. Live Reads and SSE
+
+Record start parameters compose with `live=long-poll` and `live=sse`.
+
+SSE control events for record-aware reads MUST add:
+
+```json
+{
+  "streamNextOffset": "<opaque-offset>",
+  "streamFirstRecord": 0,
+  "streamNextRecord": 44,
+  "upToDate": true
+}
+```
+
+For the default JSON view, SSE data events retain the base protocol's JSON-mode representation and MAY contain multiple newline-delimited messages. Control-event record coordinates MUST refer to the boundary after every complete message represented before that control event.
+
+With `record_view=envelope`, each SSE `event: data` MUST contain exactly one envelope object and the response MUST include `Stream-Data-Content-Type: application/vnd.durable-stream-record+json`.
+
+A reconnecting client MAY use either the last `streamNextRecord` or `streamNextOffset`. Offset-based reconnection remains the base-protocol path.
+
+### 6.10. Retention, Snapshots, Bootstrap, and Forks
+
+Retention MUST advance `F` only at a record boundary. A trimmed ordinal MUST return `410 Gone`; surviving records keep their original ordinals and commit timestamps.
+
+When a snapshot advances the earliest retained offset, that offset MUST map to one record boundary. Snapshot publication at an intra-record offset MUST return `400 Bad Request`. Snapshot and bootstrap responses SHOULD include `Stream-Record-First` and `Stream-Record-Next` when the underlying stream implements this extension. Bootstrap update parts MUST preserve one logical JSON message per update part.
+
+When a new stream is forked from a JSON stream implementing this extension, the copied messages form the child stream's initial record sequence starting at ordinal `0`. The child does not inherit the parent's ordinal namespace. A fork offset MUST align with a source record boundary.
+
+Implementations MAY reclaim ordinal and timestamp index entries only after the corresponding records fall before `F` and are no longer required by a visible snapshot, bootstrap response, or fork.
+
+### 6.11. Append Batch Integration
+
+For JSON streams implementing this extension, each successful Append Batch frame receives its own contiguous record range. Frame acknowledgements defined in Section 4.3 MUST additionally include:
+
+- `stream_record_start`;
+- `stream_record_next`;
+- `stream_commit_timestamp`.
+
+One outer Append Batch request remains transport batching, not an atomic multi-frame transaction. A failed frame assigns no visible record ordinal; successful later frames continue from the last committed record tail.
+
+### 6.12. Compatibility and Non-Goals
+
+A base Durable Streams client continues to append JSON values or arrays, read by offset, and receive canonical NDJSON. It MAY ignore all `Stream-Record-*` and `Stream-Extensions` headers.
+
+This extension does not define:
+
+- schema validation or schema evolution;
+- indexes over arbitrary JSON fields;
+- SQL, Arrow, Parquet, or DataFusion integration;
+- consumer groups;
+- per-record arbitrary byte headers;
+- authentication or authorization;
+- a bidirectional append-session transport;
+- record framing for arbitrary binary content types.
+
+### 6.13. Correctness Requirements
+
+Implementations MUST preserve these invariants:
+
+1. Every successfully appended normalized JSON message receives exactly one ordinal.
+2. Ordinals are contiguous in committed stream order and are never reused.
+3. One atomic append receives one contiguous ordinal range or no range.
+4. A deduplicated append returns its original ordinal range and commit timestamp.
+5. `O(r)` always identifies the first canonical byte of record `r`.
+6. Offset reads and record reads expose the same canonical JSON sequence.
+7. Record-aware reads never return partial records.
+8. Flush, compaction, snapshot, restart, fork, and retention never change a surviving record's ordinal or commit timestamp.
+9. `N - F` equals the number of retained logical messages.
+10. Timestamp navigation with ordinal tie-breaking is deterministic.
+11. Base-protocol clients observe no semantic change.
+
+Conformance tests SHOULD cover JSON array flattening, concurrent append ordering, idempotent retry, record-tail preconditions, partial offset reads, record-aligned reads, timestamp ties, retention, snapshot/bootstrap boundaries, cold flush, restart, and live-read reconnection.
+
+---
+
+## 7. Ordinary SSE Compatibility
 
 Ordinary SSE behavior, including binary stream handling, is defined by `docs/specs/durable-stream.md`.
 
@@ -491,6 +743,6 @@ Ordinary SSE behavior, including binary stream handling, is defined by `docs/spe
 
 ---
 
-## 7. URL Encoding
+## 8. URL Encoding
 
 `snapshot_offset` values originate from `Stream-Next-Offset` and MAY contain characters requiring URL encoding. Clients and servers MUST apply standard URL encoding/decoding when using offset values in path segments.
