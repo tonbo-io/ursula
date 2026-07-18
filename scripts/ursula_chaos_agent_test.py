@@ -13,6 +13,7 @@ from ursula_chaos_agent import (
     ProducerState,
     Setsum,
     WorkloadStream,
+    _downsample_history,
     _prune_history,
     _published_started_at,
 )
@@ -64,6 +65,20 @@ class ChaosAgentStateTest(unittest.TestCase):
         self.assertGreater(len(history), 40_560)
         self.assertGreaterEqual(oldest, now - timedelta(days=7, hours=1))
         self.assertLess(oldest, now - timedelta(days=7, hours=1) + timedelta(seconds=13))
+
+    def test_downsample_preserves_restored_hourly_bucket_end(self) -> None:
+        now = datetime(2026, 7, 18, 8, 30, tzinfo=timezone.utc)
+        restored = [
+            {
+                "time": "2026-07-12T00:00:00Z",
+                "status": "operational",
+                "append_success_delta": 100,
+            }
+        ]
+
+        published = _downsample_history(restored, int(now.timestamp() * 1000))
+
+        self.assertEqual(published[0]["time"], "2026-07-12T00:00:00Z")
 
     def test_reconciles_unresolved_impairment_injection(self) -> None:
         agent = object.__new__(ChaosAgent)
