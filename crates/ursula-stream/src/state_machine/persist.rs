@@ -20,7 +20,6 @@ use super::StreamSnapshotEntry;
 use super::StreamSnapshotError;
 use super::StreamStateMachine;
 use super::compare_stream_ids;
-use super::is_soft_deleted;
 use super::normalize_stream_attrs;
 
 impl StreamStateMachine {
@@ -34,12 +33,6 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             ));
         };
-        if is_soft_deleted(&slot.metadata) {
-            return Err(StreamResponse::error(
-                StreamErrorCode::StreamGone,
-                format!("stream '{stream_id}' is gone"),
-            ));
-        }
         Ok(slot.integrity.snapshot(
             self.earliest_retained_offset(stream_id),
             slot.metadata.tail_offset,

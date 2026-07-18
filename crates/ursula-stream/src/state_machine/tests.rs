@@ -34,8 +34,6 @@ fn create_stream(machine: &mut StreamStateMachine, id: &str) {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: None,
             now_ms: 0,
         }),
@@ -99,8 +97,6 @@ fn create_stream_stores_stream_attrs_separately() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: Some(attrs.clone()),
             now_ms: 0,
         }),
@@ -201,8 +197,6 @@ fn create_stream_rejects_oversized_attrs() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: Some(oversized_attrs()),
             now_ms: 0,
         }),
@@ -245,8 +239,6 @@ fn stream_command_decodes_pre_attrs_wal_records() {
         producer: None,
         stream_ttl_seconds: None,
         stream_expires_at_ms: None,
-        forked_from: None,
-        fork_offset: None,
         attrs: None,
         now_ms: 7,
     };
@@ -286,8 +278,6 @@ fn stream_create_requires_existing_bucket_and_valid_ids() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: None,
             now_ms: 0,
         }),
@@ -308,8 +298,6 @@ fn stream_create_requires_existing_bucket_and_valid_ids() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: None,
             now_ms: 0,
         }),
@@ -336,8 +324,6 @@ fn create_stream_is_idempotent_only_when_metadata_matches() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: None,
             now_ms: 0,
         }),
@@ -360,8 +346,6 @@ fn create_stream_is_idempotent_only_when_metadata_matches() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: None,
             now_ms: 0,
         }),
@@ -389,8 +373,6 @@ fn create_stream_is_idempotent_only_when_attrs_match() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: Some(first.clone()),
             now_ms: 0,
         }),
@@ -411,8 +393,6 @@ fn create_stream_is_idempotent_only_when_attrs_match() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: Some(first),
             now_ms: 0,
         }),
@@ -435,8 +415,6 @@ fn create_stream_is_idempotent_only_when_attrs_match() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: Some(second),
             now_ms: 0,
         }),
@@ -782,10 +760,7 @@ fn delete_stream_enqueues_cold_gc_then_ack_drains_it() {
             machine.apply(StreamCommand::DeleteStream {
                 stream_id: stream(id)
             }),
-            StreamResponse::Deleted {
-                hard_deleted: true,
-                ..
-            }
+            StreamResponse::Deleted
         ));
     }
 
@@ -838,8 +813,6 @@ fn expired_stream_with_cold_chunks_enqueues_cold_gc() {
         producer: None,
         stream_ttl_seconds: None,
         stream_expires_at_ms: Some(1_000),
-        forked_from: None,
-        fork_offset: None,
         attrs: None,
         now_ms: 0,
     });
@@ -871,8 +844,6 @@ fn writes_sweep_expired_streams_in_bounded_deterministic_batches() {
                 producer: None,
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: Some(1_000),
-                forked_from: None,
-                fork_offset: None,
                 attrs: None,
                 now_ms: 0,
             }),
@@ -1186,10 +1157,7 @@ fn stale_cold_flush_candidate_after_delete_recreate_is_invalid_without_mutation(
         machine.apply(StreamCommand::DeleteStream {
             stream_id: stream("stale-cold")
         }),
-        StreamResponse::Deleted {
-            hard_deleted: true,
-            ..
-        }
+        StreamResponse::Deleted
     ));
     create_stream(&mut machine, "stale-cold");
     assert!(matches!(
@@ -1244,7 +1212,7 @@ fn stale_cold_flush_candidate_after_delete_recreate_is_invalid_without_mutation(
 }
 
 #[test]
-fn plan_next_cold_flush_skips_soft_deleted_streams() {
+fn plan_next_cold_flush_skips_deleted_streams() {
     let mut machine = StreamStateMachine::new();
     create_bucket(&mut machine);
     create_stream(&mut machine, "a-gone");
@@ -1261,21 +1229,11 @@ fn plan_next_cold_flush_skips_soft_deleted_streams() {
         }),
         StreamResponse::Appended { .. }
     ));
-    assert!(matches!(
-        machine.apply(StreamCommand::AddForkRef {
-            stream_id: stream("a-gone"),
-            now_ms: 0,
-        }),
-        StreamResponse::ForkRefAdded { .. }
-    ));
     assert_eq!(
         machine.apply(StreamCommand::DeleteStream {
             stream_id: stream("a-gone"),
         }),
-        StreamResponse::Deleted {
-            hard_deleted: false,
-            parent_to_release: None,
-        }
+        StreamResponse::Deleted
     );
     assert!(matches!(
         machine.apply(StreamCommand::Append {
@@ -1394,8 +1352,6 @@ fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
             producer: None,
             stream_ttl_seconds: Some(60),
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: Some(attrs.clone()),
             now_ms: 0,
         }),
@@ -1431,8 +1387,6 @@ fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: None,
             now_ms: 0,
         }),
@@ -1540,8 +1494,6 @@ fn snapshot_order_is_deterministic() {
                 producer: None,
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
-                forked_from: None,
-                fork_offset: None,
                 attrs: None,
                 now_ms: 0,
             }),
@@ -1595,9 +1547,6 @@ fn snapshot_restore_rejects_invalid_entries() {
                     stream_expires_at_ms: None,
                     created_at_ms: 0,
                     last_ttl_touch_at_ms: 0,
-                    forked_from: None,
-                    fork_offset: None,
-                    fork_ref_count: 0,
                 },
                 attrs: None,
                 hot_start_offset: 0,
@@ -1632,9 +1581,6 @@ fn snapshot_restore_rejects_invalid_entries() {
                     stream_expires_at_ms: None,
                     created_at_ms: 0,
                     last_ttl_touch_at_ms: 0,
-                    forked_from: None,
-                    fork_offset: None,
-                    fork_ref_count: 0,
                 },
                 attrs: None,
                 hot_start_offset: 0,
@@ -1669,9 +1615,6 @@ fn snapshot_restore_rejects_invalid_entries() {
                     stream_expires_at_ms: None,
                     created_at_ms: 0,
                     last_ttl_touch_at_ms: 0,
-                    forked_from: None,
-                    fork_offset: None,
-                    fork_ref_count: 0,
                 },
                 attrs: None,
                 hot_start_offset: 0,
@@ -2091,8 +2034,6 @@ fn stream_ttl_uses_sliding_access_window() {
             producer: None,
             stream_ttl_seconds: Some(1),
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: None,
             now_ms: 1_000,
         }),
@@ -2184,8 +2125,6 @@ fn renewed_ttl_ignores_stale_expiry_index_entry() {
             producer: None,
             stream_ttl_seconds: Some(1),
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: None,
             now_ms: 1_000,
         }),
@@ -2212,8 +2151,6 @@ fn renewed_ttl_ignores_stale_expiry_index_entry() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: None,
             now_ms: 2_100,
         }),
@@ -2240,8 +2177,6 @@ fn restore_rebuilds_ttl_index_from_stream_metadata() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: Some(2_000),
-            forked_from: None,
-            fork_offset: None,
             attrs: None,
             now_ms: 1_000,
         }),
@@ -2259,8 +2194,6 @@ fn restore_rebuilds_ttl_index_from_stream_metadata() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: None,
             now_ms: 2_100,
         }),
@@ -2285,8 +2218,6 @@ fn stream_expires_at_is_absolute_and_recreate_after_expiry() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: Some(2_000),
-            forked_from: None,
-            fork_offset: None,
             attrs: None,
             now_ms: 1_000,
         }),
@@ -2333,8 +2264,6 @@ fn stream_expires_at_is_absolute_and_recreate_after_expiry() {
             producer: None,
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
-            forked_from: None,
-            fork_offset: None,
             attrs: None,
             now_ms: 2_001,
         }),
@@ -2468,10 +2397,7 @@ fn bucket_delete_requires_empty_bucket() {
         machine.apply(StreamCommand::DeleteStream {
             stream_id: stream("s-1"),
         }),
-        StreamResponse::Deleted {
-            hard_deleted: true,
-            parent_to_release: None,
-        }
+        StreamResponse::Deleted
     );
     assert_eq!(
         machine.apply(StreamCommand::DeleteBucket {
@@ -2481,58 +2407,6 @@ fn bucket_delete_requires_empty_bucket() {
             bucket_id: "benchcmp".to_owned(),
         }
     );
-}
-
-#[test]
-fn fork_refs_soft_delete_and_release_parent_on_last_child() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
-    create_stream(&mut machine, "source");
-    create_stream(&mut machine, "fork");
-
-    assert_eq!(
-        machine.apply(StreamCommand::AddForkRef {
-            stream_id: stream("source"),
-            now_ms: 0,
-        }),
-        StreamResponse::ForkRefAdded { fork_ref_count: 1 }
-    );
-    assert_eq!(
-        machine.apply(StreamCommand::DeleteStream {
-            stream_id: stream("source"),
-        }),
-        StreamResponse::Deleted {
-            hard_deleted: false,
-            parent_to_release: None,
-        }
-    );
-    assert!(matches!(
-        machine.read_plan(&stream("source"), 0, 1),
-        Err(StreamResponse::Error {
-            code: StreamErrorCode::StreamGone,
-            ..
-        })
-    ));
-    assert_eq!(
-        machine.apply(StreamCommand::DeleteStream {
-            stream_id: stream("fork"),
-        }),
-        StreamResponse::Deleted {
-            hard_deleted: true,
-            parent_to_release: None,
-        }
-    );
-    assert_eq!(
-        machine.apply(StreamCommand::ReleaseForkRef {
-            stream_id: stream("source"),
-        }),
-        StreamResponse::ForkRefReleased {
-            hard_deleted: true,
-            fork_ref_count: 0,
-            parent_to_release: None,
-        }
-    );
-    assert!(machine.head(&stream("source")).is_none());
 }
 
 #[test]
@@ -2756,8 +2630,6 @@ proptest! {
                 producer: None,
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
-                forked_from: None,
-                fork_offset: None,
                 attrs: None,
                 now_ms: 0,
             }),
@@ -3086,8 +2958,6 @@ proptest! {
                 producer: None,
                 stream_ttl_seconds: Some(ttl_seconds),
                 stream_expires_at_ms: None,
-                forked_from: None,
-                fork_offset: None,
                 attrs: None,
                 now_ms: start_ms,
             });
@@ -3393,10 +3263,7 @@ proptest! {
         prop_assert!(
             matches!(
                 delete_response,
-                StreamResponse::Deleted {
-                    hard_deleted: true,
-                    ..
-                }
+                StreamResponse::Deleted
             ),
             "unexpected delete response: {:?}",
             delete_response

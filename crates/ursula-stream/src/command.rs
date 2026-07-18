@@ -24,8 +24,6 @@ pub enum StreamCommand {
         producer: Option<ProducerRequest>,
         stream_ttl_seconds: Option<u64>,
         stream_expires_at_ms: Option<u64>,
-        forked_from: Option<BucketStreamId>,
-        fork_offset: Option<u64>,
         // `default` keeps pre-attrs WAL records decodable.
         #[serde(default)]
         attrs: Option<StreamAttrs>,
@@ -40,8 +38,6 @@ pub enum StreamCommand {
         producer: Option<ProducerRequest>,
         stream_ttl_seconds: Option<u64>,
         stream_expires_at_ms: Option<u64>,
-        forked_from: Option<BucketStreamId>,
-        fork_offset: Option<u64>,
         // `default` keeps pre-attrs WAL records decodable.
         #[serde(default)]
         attrs: Option<StreamAttrs>,
@@ -88,13 +84,6 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
         attrs: Option<StreamAttrs>,
         now_ms: u64,
-    },
-    AddForkRef {
-        stream_id: BucketStreamId,
-        now_ms: u64,
-    },
-    ReleaseForkRef {
-        stream_id: BucketStreamId,
     },
     FlushCold {
         stream_id: BucketStreamId,

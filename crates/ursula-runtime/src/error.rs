@@ -191,19 +191,3 @@ impl From<ShardMapError> for RuntimeError {
         Self::InvalidConfig(value)
     }
 }
-
-pub(crate) fn map_fork_source_ref_error(
-    err: RuntimeError,
-    placement: ShardPlacement,
-) -> RuntimeError {
-    if err.stream_error_code() == Some(StreamErrorCode::StreamGone) {
-        return RuntimeError::group_engine(
-            placement,
-            GroupEngineError::stream(
-                StreamErrorCode::StreamAlreadyExistsConflict,
-                "source stream is gone and cannot be forked",
-            ),
-        );
-    }
-    err
-}

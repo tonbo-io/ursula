@@ -18,7 +18,6 @@ use super::StreamResponse;
 use super::StreamStateMachine;
 use super::StreamStatus;
 use super::StreamVisibleSnapshot;
-use super::is_soft_deleted;
 use super::stream_is_expired;
 
 impl StreamStateMachine {
@@ -49,12 +48,6 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             ));
         };
-        if is_soft_deleted(stream) {
-            return Err(StreamResponse::error(
-                StreamErrorCode::StreamGone,
-                format!("stream '{stream_id}' is gone"),
-            ));
-        }
         if stream_is_expired(stream, now_ms) {
             return Ok(true);
         }
@@ -97,12 +90,6 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             ));
         };
-        if is_soft_deleted(&slot.metadata) {
-            return Err(StreamResponse::error(
-                StreamErrorCode::StreamGone,
-                format!("stream '{stream_id}' is gone"),
-            ));
-        }
         Ok(u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64"))
     }
 
@@ -180,12 +167,6 @@ impl StreamStateMachine {
             ));
         };
         let stream = &slot.metadata;
-        if is_soft_deleted(stream) {
-            return Err(StreamResponse::error(
-                StreamErrorCode::StreamGone,
-                format!("stream '{stream_id}' is gone"),
-            ));
-        }
         if stream_is_expired(stream, now_ms) {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
@@ -305,12 +286,6 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             ));
         };
-        if is_soft_deleted(&slot.metadata) {
-            return Err(StreamResponse::error(
-                StreamErrorCode::StreamGone,
-                format!("stream '{stream_id}' is gone"),
-            ));
-        }
         Ok(slot.visible_snapshot.clone())
     }
 
@@ -340,12 +315,6 @@ impl StreamStateMachine {
             ));
         };
         let stream = &slot.metadata;
-        if is_soft_deleted(stream) {
-            return Err(StreamResponse::error(
-                StreamErrorCode::StreamGone,
-                format!("stream '{stream_id}' is gone"),
-            ));
-        }
         let snapshot = slot.visible_snapshot.clone();
         let retained_offset = snapshot
             .as_ref()

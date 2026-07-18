@@ -5,7 +5,7 @@
 //!
 //! - [`query`]: read paths — heads, accessors, read plans, snapshots, bootstrap.
 //! - [`append`]: append paths and idempotent producer bookkeeping.
-//! - [`lifecycle`]: bucket/stream create, close, delete, fork refs, attrs, TTL expiry.
+//! - [`lifecycle`]: bucket/stream create, close, delete, attrs, and TTL expiry.
 //! - [`cold`]: cold-tier flush planning, GC, retention compaction, snapshot publishing.
 //! - [`persist`]: snapshot / restore / integrity serialization.
 //! - [`hot_buffer`], [`cold_state`], [`ttl`]: internal per-stream data structures.
@@ -147,8 +147,6 @@ impl StreamStateMachine {
                 producer,
                 stream_ttl_seconds,
                 stream_expires_at_ms,
-                forked_from,
-                fork_offset,
                 attrs,
                 now_ms,
             } => {
@@ -161,8 +159,6 @@ impl StreamStateMachine {
                     producer,
                     stream_ttl_seconds,
                     stream_expires_at_ms,
-                    forked_from,
-                    fork_offset,
                     attrs,
                     now_ms,
                 });
@@ -178,8 +174,6 @@ impl StreamStateMachine {
                 producer,
                 stream_ttl_seconds,
                 stream_expires_at_ms,
-                forked_from,
-                fork_offset,
                 attrs,
                 now_ms,
             } => {
@@ -192,8 +186,6 @@ impl StreamStateMachine {
                     producer,
                     stream_ttl_seconds,
                     stream_expires_at_ms,
-                    forked_from,
-                    fork_offset,
                     attrs,
                     now_ms,
                 });
@@ -312,12 +304,6 @@ impl StreamStateMachine {
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
             }
-            StreamCommand::AddForkRef { stream_id, now_ms } => {
-                let response = self.add_fork_ref(&stream_id, now_ms);
-                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
-                response
-            }
-            StreamCommand::ReleaseForkRef { stream_id } => self.release_fork_ref(&stream_id),
             StreamCommand::FlushCold { stream_id, chunk } => self.flush_cold(stream_id, chunk),
             StreamCommand::Close {
                 stream_id,
@@ -345,8 +331,6 @@ struct CreateStreamInput {
     producer: Option<ProducerRequest>,
     stream_ttl_seconds: Option<u64>,
     stream_expires_at_ms: Option<u64>,
-    forked_from: Option<BucketStreamId>,
-    fork_offset: Option<u64>,
     attrs: Option<StreamAttrs>,
     now_ms: u64,
 }
@@ -361,8 +345,6 @@ struct CreateExternalStreamInput {
     producer: Option<ProducerRequest>,
     stream_ttl_seconds: Option<u64>,
     stream_expires_at_ms: Option<u64>,
-    forked_from: Option<BucketStreamId>,
-    fork_offset: Option<u64>,
     attrs: Option<StreamAttrs>,
     now_ms: u64,
 }
@@ -371,10 +353,6 @@ impl CreateStreamInput {
     fn initial_len(&self) -> u64 {
         u64::try_from(self.initial_payload.len()).expect("payload len fits u64")
     }
-}
-
-fn is_soft_deleted(stream: &StreamMetadata) -> bool {
-    stream.status == StreamStatus::SoftDeleted
 }
 
 fn normalize_stream_attrs(attrs: Option<StreamAttrs>) -> Option<StreamAttrs> {
