@@ -333,7 +333,14 @@ def _downsample_history(raw: list[dict[str, Any]], now_ms: int) -> list[dict[str
                 )
             )
             continue
-        bucket_index = entry_ms // bucket_ms
+        # Published hourly summaries use the bucket end as their timestamp so
+        # the web UI can place them in (start, end]. Preserve that convention
+        # when restored status is downsampled again after an agent restart.
+        is_hourly_summary = (
+            entry_ms % bucket_ms == 0
+            and ts_text.endswith(":00:00Z")
+        )
+        bucket_index = (entry_ms - 1) // bucket_ms if is_hourly_summary else entry_ms // bucket_ms
         bucket = buckets.get(bucket_index)
         if bucket is None:
             bucket = {
