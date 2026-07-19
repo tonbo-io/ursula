@@ -1,13 +1,13 @@
 use std::fs;
 
 use tempfile::TempDir;
-use ursula_event_index::EventEntry;
-use ursula_event_index::EventIndexConfig;
-use ursula_event_index::IndexError;
-use ursula_event_index::IndexStatus;
-use ursula_event_index::LocalEventIndex as EventIndex;
-use ursula_event_index::QueryCursor;
-use ursula_event_index::SourceEnvelope;
+use ursula_index::EventEntry;
+use ursula_index::EventIndexConfig;
+use ursula_index::IndexError;
+use ursula_index::IndexStatus;
+use ursula_index::LocalEventIndex as EventIndex;
+use ursula_index::QueryCursor;
+use ursula_index::SourceEnvelope;
 
 fn config(flush_entries: usize) -> EventIndexConfig {
     EventIndexConfig {

@@ -1,5 +1,5 @@
 [package]
-name = "ursula-event-index"
+name = "ursula-index"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,7 +10,7 @@ readme = "README.md"
 description = "Rebuildable client-event-time index for Ursula JSON record streams."
 
 [[bin]]
-name = "ursula-event-indexer"
+name = "ursula-indexer"
 path = "src/main.rs"
 
 [[bench]]
