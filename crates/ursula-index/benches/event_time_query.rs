@@ -5,9 +5,9 @@ use criterion::black_box;
 use criterion::criterion_group;
 use criterion::criterion_main;
 use tempfile::TempDir;
-use ursula_event_index::EventEntry;
-use ursula_event_index::EventIndexConfig;
-use ursula_event_index::LocalEventIndex as EventIndex;
+use ursula_index::EventEntry;
+use ursula_index::EventIndexConfig;
+use ursula_index::LocalEventIndex as EventIndex;
 
 const RECORDS: u64 = 100_000;
 

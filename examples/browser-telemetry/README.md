@@ -15,10 +15,10 @@ installBrowserTelemetry(telemetry);
 telemetry.capture("application_started", { release: "2026.07.18" });
 ```
 
-`ursula-event-indexer` is the persistent implementation of the external derived-index contract from issue #86. It consumes the envelope view in record order, writes immutable Parquet parts sorted by `(captured_at, record)` to S3, conditionally publishes each source checkpoint, and reports a retention gap instead of returning incomplete history. S3 is authoritative; the local directory is only a bounded cache and can disappear between invocations.
+`ursula-indexer` is the persistent implementation of the external derived-index contract from issue #86. It consumes the envelope view in record order, writes immutable Parquet parts sorted by `(captured_at, record)` to S3, conditionally publishes each source checkpoint, and reports a retention gap instead of returning incomplete history. S3 is authoritative; the local directory is only a bounded cache and can disappear between invocations.
 
 ```bash
-cargo run -p ursula-event-index --bin ursula-event-indexer -- \
+cargo run -p ursula-index --bin ursula-indexer -- \
   --stream-url http://127.0.0.1:4437/v1/stream/browser-telemetry \
   --s3-bucket my-telemetry-index \
   --s3-prefix production/browser-telemetry \

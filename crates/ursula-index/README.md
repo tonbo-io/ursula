@@ -1,11 +1,11 @@
 # Ursula event-time index
 
-`ursula-event-indexer` is a rebuildable materialized index for the client-supplied event time in Ursula JSON record streams. Ursula remains the event source. The indexer consumes record envelopes over HTTP, writes immutable sorted Parquet parts to S3, and conditionally publishes each source-record checkpoint.
+`ursula-indexer` is a rebuildable materialized index for the client-supplied event time in Ursula JSON record streams. Ursula remains the event source. The indexer consumes record envelopes over HTTP, writes immutable sorted Parquet parts to S3, and conditionally publishes each source-record checkpoint.
 
 The index is deliberately outside Ursula's Raft state machine. S3 is authoritative for the derived index; local disk is only a bounded, disposable Parquet cache. Multiple stateless indexers may race safely because `CURRENT` advances with an ETag compare-and-swap. Losing writers reload the winning checkpoint and verify that overlapping records have identical event times.
 
 ```bash
-cargo run -p ursula-event-index --bin ursula-event-indexer -- \
+cargo run -p ursula-index --bin ursula-indexer -- \
   --stream-url http://127.0.0.1:4437/v1/stream/browser-telemetry \
   --s3-bucket my-telemetry-index \
   --s3-region us-east-1 \
