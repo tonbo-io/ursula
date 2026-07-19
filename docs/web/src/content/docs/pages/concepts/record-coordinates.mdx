@@ -1,0 +1,110 @@
+---
+title: Record Coordinates
+sidebarTitle: Record Coordinates
+---
+
+JSON streams can expose a stable record number for every committed JSON value. Use records when your application thinks in events or messages and needs to replay complete values, count progress, or resume without parsing an opaque byte offset.
+
+Record Coordinates are available only on `application/json` streams that advertise `json-record-coordinates-v1` in the `Stream-Extensions` response header.
+
+## Three different values
+
+| Value | Assigned by | Meaning | Client arithmetic |
+| --- | --- | --- | --- |
+| Offset | Ursula | Exact position in the canonical byte stream | No; pass it back unchanged |
+| Record | Ursula | Zero-based JSON value number in commit order | Yes; records occupy ranges such as `[42, 44)` |
+| `captured_at` | Your application | When the event happened at the source | Query through an external event-time index |
+
+Records and offsets identify the same committed stream order at different levels. A record points to a complete JSON value; an offset points to a byte boundary. `captured_at` is ordinary JSON data and may be out of order after retries, offline buffering, or backfill. It never changes the committed record order.
+
+```json
+{
+  "captured_at": "2026-07-18T10:30:00.100Z",
+  "type": "network_response",
+  "status": 500
+}
+```
+
+Ursula does not create a second server timestamp or reorder this event by `captured_at`.
+
+## Append and receive a record range
+
+A top-level JSON array is normalized into one record per array element. If the current record tail is `42`, this append creates records `42` and `43`:
+
+```bash
+curl -i -X POST http://127.0.0.1:4437/demo/events \
+  -H 'Content-Type: application/json' \
+  --data-binary '[
+    {"captured_at":"2026-07-18T10:30:00.100Z","type":"navigation"},
+    {"captured_at":"2026-07-18T10:29:59.900Z","type":"network_response"}
+  ]'
+```
+
+The successful response includes:
+
+```http
+Stream-Extensions: json-record-coordinates-v1
+Stream-Record-Start: 42
+Stream-Record-Next: 44
+Stream-Next-Offset: <opaque-offset>
+```
+
+The half-open range `[42, 44)` is safe to store, compare, and count. A deduplicated producer retry returns the original range.
+
+## Replay complete records
+
+Read up to 100 complete records beginning at record `42`:
+
+```bash
+curl -i 'http://127.0.0.1:4437/demo/events?record=42&max_records=100'
+```
+
+The body is NDJSON. Continue with the returned `Stream-Record-Next`:
+
+```http
+Stream-Record-First: 0
+Stream-Record-Start: 42
+Stream-Record-Next: 44
+Stream-Next-Offset: <opaque-offset>
+```
+
+Use `record=now` to wait only for future records, or `tail_records=100` to read the most recent retained records. Add `live=long-poll` or `live=sse` for live delivery.
+
+When a consumer needs the ordinal beside each value, request the envelope view:
+
+```bash
+curl 'http://127.0.0.1:4437/demo/events?record=42&max_records=100&record_view=envelope'
+```
+
+```json
+{"record":42,"value":{"captured_at":"2026-07-18T10:30:00.100Z","type":"navigation"}}
+{"record":43,"value":{"captured_at":"2026-07-18T10:29:59.900Z","type":"network_response"}}
+```
+
+If retention has removed the requested record, Ursula returns `410 Gone` and reports the new first retained ordinal in `Stream-Record-First`. Surviving records are never renumbered.
+
+## Conditional append by record tail
+
+Use `Stream-Record-Match` when a writer should append only if no other record has committed since it last read the stream:
+
+```bash
+curl -i -X POST http://127.0.0.1:4437/demo/events \
+  -H 'Content-Type: application/json' \
+  -H 'Stream-Record-Match: 44' \
+  --data-binary '{"captured_at":"2026-07-18T10:31:00Z","type":"checkpoint"}'
+```
+
+A mismatch returns `412 Precondition Failed` with the current `Stream-Record-Next`.
+
+## Query by captured time
+
+`captured_at` is not a Durable Streams coordinate, so `GET ?captured_at=...` is intentionally not part of the stream protocol. The optional `ursula-indexer` tails the envelope view, builds a rebuildable S3-backed event-time index, and returns record ordinals for a time range. Callers can then resolve those records through Ursula.
+
+The index reports `indexed_through_record` and `durable_through_record`. Pagination pins one `through_record` watermark so newly indexed events do not move a query between pages. See the [Browser Telemetry guide](/docs/guides/browser-telemetry) for the complete setup and query flow.
+
+## Related
+
+- [Offsets](/docs/concepts/offsets)
+- [Append API](/docs/api/append)
+- [Read API](/docs/api/read)
+- [Browser Telemetry](/docs/guides/browser-telemetry)

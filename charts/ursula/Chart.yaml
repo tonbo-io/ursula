@@ -1,6 +1,6 @@
 apiVersion: v2
 name: ursula
-description: Ursula durable-stream server for static-membership Raft clusters
+description: Ursula Durable Streams cluster with an optional S3 event-time indexer
 type: application
 version: 0.1.0
 appVersion: "0.2.0"

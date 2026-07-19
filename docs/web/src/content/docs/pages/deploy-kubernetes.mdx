@@ -91,6 +91,17 @@ Changing `server.replicaCount` on an initialized cluster is not safe Raft voter
 reconfiguration. Safe scaling requires an operator workflow that adds learners,
 waits for catch-up, promotes voters, and removes old voters.
 
+## Production topology
+
+- Run three voters across three availability zones for the normal production profile. Each voter needs its own zonal persistent volume for the Raft log; use five voters only when tolerating two simultaneous voter failures justifies the larger write quorum.
+- Configure shared S3 for cold chunks and externalized snapshots. Do not use memory Raft storage or ephemeral voter data in production.
+- Run at least two stateless gateway replicas behind authenticated TLS ingress, while keeping voter and peer Services private.
+- Run one independent event-time indexer Deployment per indexed source stream. Its S3 prefix is authoritative and its local cache is disposable.
+- Use separate workload identities and non-overlapping S3 prefixes for the Ursula storage plane and each indexer security boundary.
+- Spread replicas across zones and nodes, and alert on Raft readiness, S3 failures, indexer blocked state and lag, object growth, PVC pressure, and restarts.
+
+The chart supplies conservative defaults and rejects several unsafe configurations, but it is not yet an operator: turning off bootstrap membership, drain-aware voter upgrades, backups, restore drills, capacity planning, IAM policy, ingress authentication, and alert routing remain deployment responsibilities.
+
 ## Cold storage
 
 Cold storage is disabled by default. Production multi-node clusters should use
@@ -116,6 +127,33 @@ serviceAccount:
 ```
 
 For MinIO or another S3-compatible backend, set `s3.endpoint`.
+
+## Event-time indexer
+
+`ursula-indexer` is an optional separate process rather than a Raft background worker. It consumes one JSON stream in record order, builds the client `captured_at` secondary index, and publishes immutable Parquet parts and manifests to S3. Keeping it outside the voter process prevents query and compaction work from affecting stream commit latency and lets the projection be rebuilt independently.
+
+Create the source as an `application/json` stream before enabling its indexer. The pod performs a source HEAD preflight and will not start unless the stream advertises `json-record-coordinates-v1`.
+
+```yaml
+s3:
+  bucket: my-index-bucket
+  region: us-east-1
+
+indexer:
+  enabled: true
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-index
+  instances:
+    - name: browser-telemetry
+      streamUrl: http://ursula-gateway.default.svc.cluster.local:4437/v1/stream/browser-telemetry
+      s3:
+        prefix: indexes/browser-telemetry
+```
+
+The default is one replica with a `Recreate` rollout. To keep queries available during rollout, set `indexer.replicaCount=2`, `indexer.activeActive=true`, and enable the indexer PodDisruptionBudget. Active-active replicas converge with S3 compare-and-swap, but duplicate source reads and temporary unreferenced uploads are the availability cost.
+
+Indexer Services are internal ClusterIP Services. If remote applications need `/v1/events`, put an authenticated, path-aware proxy in front of it and do not expose the administrative `POST /v1/status/resume` endpoint.
 
 ## Operational endpoints
 

@@ -54,14 +54,7 @@ impl SourceClient {
         if !response.status().is_success() {
             return Err(IndexError::SourceStatus(response.status().as_u16()));
         }
-        let supports_record_coordinates = response
-            .headers()
-            .get_all("stream-extensions")
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .flat_map(|value| value.split(','))
-            .any(|value| value.trim() == RECORD_COORDINATE_EXTENSION);
-        if !supports_record_coordinates {
+        if !supports_record_coordinates(response.headers()) {
             return Err(IndexError::MissingRecordCoordinates);
         }
         let body = response.text().await?;
@@ -71,4 +64,35 @@ impl SourceClient {
         }
         Ok(SourceBatch::Records(records))
     }
+
+    pub async fn probe(&self) -> Result<(), IndexError> {
+        let response = self.client.head(self.stream_url.clone()).send().await?;
+        if !response.status().is_success() {
+            return Err(IndexError::SourceStatus(response.status().as_u16()));
+        }
+        let is_json = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"));
+        if !is_json {
+            return Err(IndexError::InvalidSourceResponse(
+                "source stream is not application/json",
+            ));
+        }
+        if !supports_record_coordinates(response.headers()) {
+            return Err(IndexError::MissingRecordCoordinates);
+        }
+        Ok(())
+    }
+}
+
+fn supports_record_coordinates(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get_all("stream-extensions")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|value| value.trim() == RECORD_COORDINATE_EXTENSION)
 }

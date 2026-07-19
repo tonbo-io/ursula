@@ -2,6 +2,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
+use axum::routing::head;
 use reqwest::Url;
 use ursula_index::SourceBatch;
 use ursula_index::SourceClient;
@@ -110,6 +111,50 @@ async fn source_client_preserves_non_success_http_status() -> anyhow::Result<()>
         .await
         .expect_err("500 must be preserved");
     assert!(matches!(error, ursula_index::IndexError::SourceStatus(500)));
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "the test combines fallible setup with assertions"
+)]
+async fn source_client_probe_requires_json_record_coordinates() -> anyhow::Result<()> {
+    let app = Router::new()
+        .route(
+            "/ready",
+            head(|| async {
+                (StatusCode::OK, [
+                    ("content-type", "application/json; charset=utf-8"),
+                    ("stream-extensions", "json-record-coordinates-v1"),
+                ])
+            }),
+        )
+        .route(
+            "/binary",
+            head(|| async {
+                (StatusCode::OK, [
+                    ("content-type", "application/octet-stream"),
+                    ("stream-extensions", "json-record-coordinates-v1"),
+                ])
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(axum::serve(listener, app).into_future());
+
+    SourceClient::new(Url::parse(&format!("http://{address}/ready"))?, 100)?
+        .probe()
+        .await?;
+    let error = SourceClient::new(Url::parse(&format!("http://{address}/binary"))?, 100)?
+        .probe()
+        .await
+        .expect_err("binary stream must be rejected");
+    assert!(matches!(
+        error,
+        ursula_index::IndexError::InvalidSourceResponse("source stream is not application/json")
+    ));
     server.abort();
     Ok(())
 }

@@ -12,6 +12,17 @@ Internal server Service:
 Gateway entrypoint Service:
   {{ include "ursula.gatewayFullname" . }}.{{ .Release.Namespace }}.svc.{{ .Values.global.clusterDomain }}:{{ .Values.gateway.service.port }}
 {{- end }}
+{{- if .Values.indexer.enabled }}
+
+Event-time indexers:
+{{- $root := . }}
+{{- range $instance := .Values.indexer.instances }}
+  {{ $instance.name }}: {{ include "ursula.indexerFullname" (dict "root" $root "name" $instance.name) }}.{{ $root.Release.Namespace }}.svc.{{ $root.Values.global.clusterDomain }}:{{ $root.Values.indexer.service.port }}
+{{- end }}
+
+The source streams must already exist as application/json streams with the json-record-coordinates-v1 extension before indexer pods start.
+Keep the indexer Services internal unless an authenticated ingress exposes only the query API; /v1/status/resume is an administrative endpoint.
+{{- end }}
 
 Port-forward locally:
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ursula.fullname" . }} {{ .Values.server.service.port }}:{{ .Values.server.service.port }}

@@ -14,7 +14,7 @@ The same orchestration is exercised under [deterministic simulation](/docs/archi
 
 Nodes carry **no cluster-mutation surface on the network**. The mutating operator endpoints (raft snapshot/purge/membership/learners/leader-transfer/allow-next-revert, maintenance drain, cold-flush trigger) plus metrics are served on a separate **admin plane** bound to `server.admin_listen` — loopback (`127.0.0.1:4438`) by default. The public client plane (`:4437`) serves only stream traffic and read-only metrics.
 
-ursulactl sends every request to the admin plane. Because that plane is loopback-bound, it reaches it through a **provider** — a named transport that knows how to both tunnel to a node's admin plane and restart it. You select one and give it a few structured values; the provider builds its own commands, so you never hand-write ssh/aws/kubectl boilerplate.
+`status` and `wait-ready` prefer each node's `http_url` because read-only metrics are available on the client plane; legacy manifests without `http_url` fall back to `admin_url`. Mutating restart operations still use the admin plane. Because that plane is loopback-bound, ursulactl reaches it through a **provider** — a named transport that knows how to both tunnel to a node's admin plane and restart it. You select one and give it a few structured values; the provider builds its own commands, so you never hand-write ssh/aws/kubectl boilerplate.
 
 | Provider | Reaches admin via | Restarts via | Needs |
 |----------|-------------------|--------------|-------|
@@ -91,7 +91,7 @@ Per-node fields, all optional except `id`:
 - `admin_port` (default `4438`) or an explicit `admin_url` — the admin plane to reach. Tunnelling providers only need the port; `direct` needs a reachable `admin_url`.
 - `instance_id` — required by `eice`; how it addresses the node.
 - `host` / `ssh_host` — address for `ssh` and `{host}` interpolation. Falls back to the admin URL host, then the instance id.
-- `http_url` — optional; only used for `{http_url}` in the `command` provider.
+- `http_url` — optional client-plane URL used by `status` and `wait-ready` for read-only metrics, and available as `{http_url}` in the `command` provider. Metrics fall back to `admin_url` when omitted.
 
 The JSON form stays compatible with `scripts/ursula_ec2.py`'s `cluster.json` (bare array, or `public_ip`/`private_ip` + `http_port`), so you can keep pointing both tools at the same file.
 

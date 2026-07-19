@@ -1,0 +1,227 @@
+{{- include "ursula.validateIndexerConfig" . -}}
+{{- if .Values.indexer.enabled -}}
+{{- $root := . -}}
+{{- $replicas := .Values.indexer.replicaCount | int -}}
+{{- $hasS3Credentials := include "ursula.hasS3Credentials" . -}}
+{{- $s3CredentialSecret := include "ursula.s3SecretName" . -}}
+{{- range $instance := .Values.indexer.instances }}
+{{- $context := dict "root" $root "name" $instance.name -}}
+{{- $bucket := default $root.Values.s3.bucket $instance.s3.bucket -}}
+{{- $region := default $root.Values.s3.region $instance.s3.region -}}
+{{- $endpoint := default $root.Values.s3.endpoint $instance.s3.endpoint -}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ursula.indexerFullname" $context }}
+  labels:
+    {{- include "ursula.indexerLabels" $context | nindent 4 }}
+spec:
+  replicas: {{ $replicas }}
+  {{- if $root.Values.indexer.activeActive }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  {{- else }}
+  strategy:
+    type: Recreate
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "ursula.indexerSelectorLabels" $context | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ursula.indexerSelectorLabels" $context | nindent 8 }}
+        {{- with $root.Values.indexer.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with $root.Values.indexer.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "ursula.indexerServiceAccountName" $root }}
+      automountServiceAccountToken: {{ $root.Values.indexer.serviceAccount.automountServiceAccountToken }}
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ $root.Values.indexer.terminationGracePeriodSeconds }}
+      {{- with $root.Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.indexer.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: indexer
+          image: {{ include "ursula.indexerImage" $root | quote }}
+          imagePullPolicy: {{ default $root.Values.global.image.pullPolicy $root.Values.indexer.image.pullPolicy }}
+          command:
+            - /usr/local/bin/ursula-indexer
+          args:
+            - --stream-url
+            - {{ $instance.streamUrl | quote }}
+            - --s3-bucket
+            - {{ $bucket | quote }}
+            - --s3-prefix
+            - {{ $instance.s3.prefix | trimAll "/" | quote }}
+            - --cache-dir
+            - /var/cache/ursula-index
+            - --cache-max-bytes
+            - {{ $root.Values.indexer.cache.servingMaxBytes | int64 | quote }}
+            - --maintenance-cache-max-bytes
+            - {{ $root.Values.indexer.cache.maintenanceMaxBytes | int64 | quote }}
+            - --listen
+            - {{ printf "0.0.0.0:%d" ($root.Values.indexer.ports.http | int) | quote }}
+            - --timestamp-field
+            - {{ $root.Values.indexer.timestampField | quote }}
+            - --flush-entries
+            - {{ $root.Values.indexer.ingest.flushEntries | int64 | quote }}
+            - --row-group-entries
+            - {{ $root.Values.indexer.ingest.rowGroupEntries | int64 | quote }}
+            - --read-batch-records
+            - {{ $root.Values.indexer.ingest.readBatchRecords | int64 | quote }}
+            - --poll-interval-ms
+            - {{ $root.Values.indexer.ingest.pollIntervalMs | quote }}
+            - --compact-parts
+            - {{ $root.Values.indexer.compaction.fanIn | quote }}
+            - --compaction-max-entries
+            - {{ $root.Values.indexer.compaction.maxEntries | int64 | quote }}
+            - --maintenance-interval-ms
+            - {{ $root.Values.indexer.compaction.maintenanceIntervalMs | quote }}
+            - --gc-interval-seconds
+            - {{ $root.Values.indexer.garbageCollection.intervalSeconds | quote }}
+            - --gc-grace-seconds
+            - {{ $root.Values.indexer.garbageCollection.graceSeconds | quote }}
+            - --gc-retain-generations
+            - {{ $root.Values.indexer.garbageCollection.retainGenerations | quote }}
+            {{- if $region }}
+            - --s3-region
+            - {{ $region | quote }}
+            {{- end }}
+            {{- if $endpoint }}
+            - --s3-endpoint
+            - {{ $endpoint | quote }}
+            {{- end }}
+            {{- with $root.Values.indexer.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ $root.Values.indexer.ports.http }}
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: {{ $root.Values.indexer.rustLog | quote }}
+            {{- if $region }}
+            - name: AWS_REGION
+              value: {{ $region | quote }}
+            - name: AWS_DEFAULT_REGION
+              value: {{ $region | quote }}
+            {{- end }}
+            {{- if $hasS3Credentials }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s3CredentialSecret | quote }}
+                  key: accessKeyId
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s3CredentialSecret | quote }}
+                  key: secretAccessKey
+            - name: AWS_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $s3CredentialSecret | quote }}
+                  key: sessionToken
+                  optional: true
+            {{- end }}
+            {{- with $root.Values.indexer.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with $root.Values.indexer.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if $root.Values.indexer.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: http
+            failureThreshold: {{ $root.Values.indexer.probes.startup.failureThreshold }}
+            periodSeconds: {{ $root.Values.indexer.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ $root.Values.indexer.probes.startup.timeoutSeconds }}
+          {{- end }}
+          {{- if $root.Values.indexer.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: {{ $root.Values.indexer.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ $root.Values.indexer.probes.readiness.timeoutSeconds }}
+          {{- end }}
+          {{- if $root.Values.indexer.probes.liveness.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: http
+            periodSeconds: {{ $root.Values.indexer.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ $root.Values.indexer.probes.liveness.timeoutSeconds }}
+          {{- end }}
+          {{- with $root.Values.indexer.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml $root.Values.indexer.resources | nindent 12 }}
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/ursula-index
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: cache
+          emptyDir:
+            sizeLimit: {{ $root.Values.indexer.cache.emptyDir.sizeLimit | quote }}
+        - name: tmp
+          emptyDir: {}
+      {{- with $root.Values.indexer.scheduling.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $root.Values.indexer.scheduling.affinity }}
+      affinity:
+        {{- toYaml $root.Values.indexer.scheduling.affinity | nindent 8 }}
+      {{- else if gt $replicas 1 }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "ursula.indexerSelectorLabels" $context | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
+      {{- end }}
+      {{- with $root.Values.indexer.scheduling.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $root.Values.indexer.scheduling.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml $root.Values.indexer.scheduling.topologySpreadConstraints | nindent 8 }}
+      {{- else if gt $replicas 1 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "ursula.indexerSelectorLabels" $context | nindent 14 }}
+      {{- end }}
+{{- end }}
+{{- end }}

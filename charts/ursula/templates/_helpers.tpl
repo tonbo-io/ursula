@@ -114,6 +114,100 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- printf "%s:%s" $repository $tag -}}
 {{- end -}}
 
+{{- define "ursula.indexerServiceAccountName" -}}
+{{- if .Values.indexer.serviceAccount.create -}}
+{{- default (printf "%s-indexer" (include "ursula.fullname" .) | trunc 63 | trimSuffix "-") .Values.indexer.serviceAccount.name -}}
+{{- else -}}
+{{- default "default" .Values.indexer.serviceAccount.name -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "ursula.indexerImage" -}}
+{{- $repository := default .Values.global.image.repository .Values.indexer.image.repository -}}
+{{- $tag := default (default .Chart.AppVersion .Values.global.image.tag) .Values.indexer.image.tag -}}
+{{- printf "%s:%s" $repository $tag -}}
+{{- end -}}
+
+{{- define "ursula.indexerFullname" -}}
+{{- $base := include "ursula.fullname" .root | trunc 45 | trimSuffix "-" -}}
+{{- printf "%s-index-%s" $base .name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "ursula.indexerSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "ursula.name" .root }}-indexer
+app.kubernetes.io/instance: {{ .root.Release.Name }}
+app.kubernetes.io/component: indexer
+ursula.tonbo.io/indexer: {{ .name }}
+{{- end -}}
+
+{{- define "ursula.indexerLabels" -}}
+helm.sh/chart: {{ include "ursula.chart" .root }}
+{{ include "ursula.indexerSelectorLabels" . }}
+app.kubernetes.io/version: {{ .root.Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .root.Release.Service }}
+{{- end -}}
+
+{{- define "ursula.validateIndexerConfig" -}}
+{{- if .Values.indexer.enabled -}}
+{{- if eq (len .Values.indexer.instances) 0 -}}
+{{- fail "indexer.instances must contain at least one source when indexer.enabled=true" -}}
+{{- end -}}
+{{- $replicas := .Values.indexer.replicaCount | int -}}
+{{- if lt $replicas 1 -}}
+{{- fail "indexer.replicaCount must be at least 1" -}}
+{{- end -}}
+{{- if and (gt $replicas 1) (not .Values.indexer.activeActive) -}}
+{{- fail "indexer.replicaCount greater than 1 requires indexer.activeActive=true" -}}
+{{- end -}}
+{{- if and .Values.indexer.podDisruptionBudget.enabled (lt $replicas 2) -}}
+{{- fail "indexer.podDisruptionBudget.enabled requires indexer.replicaCount greater than 1" -}}
+{{- end -}}
+{{- $port := .Values.indexer.ports.http | int -}}
+{{- if or (lt $port 1) (gt $port 65535) -}}
+{{- fail "indexer.ports.http must be between 1 and 65535" -}}
+{{- end -}}
+{{- $flushEntries := .Values.indexer.ingest.flushEntries | int64 -}}
+{{- $fanIn := .Values.indexer.compaction.fanIn | int64 -}}
+{{- $maxEntries := .Values.indexer.compaction.maxEntries | int64 -}}
+{{- if gt (mul $flushEntries $fanIn) $maxEntries -}}
+{{- fail "indexer.compaction.maxEntries must cover ingest.flushEntries times compaction.fanIn" -}}
+{{- end -}}
+{{- if lt (.Values.indexer.garbageCollection.graceSeconds | int) 300 -}}
+{{- fail "indexer.garbageCollection.graceSeconds must be at least 300" -}}
+{{- end -}}
+{{- $names := dict -}}
+{{- $prefixes := dict -}}
+{{- range $index, $instance := .Values.indexer.instances -}}
+{{- include "ursula.validateDnsLabel" (dict "name" (printf "indexer.instances[%d].name" $index) "value" $instance.name) -}}
+{{- if hasKey $names $instance.name -}}
+{{- fail (printf "indexer instance name %q is duplicated" $instance.name) -}}
+{{- end -}}
+{{- $_ := set $names $instance.name true -}}
+{{- if not (regexMatch "^https?://" $instance.streamUrl) -}}
+{{- fail (printf "indexer.instances[%d].streamUrl must be an http or https URL" $index) -}}
+{{- end -}}
+{{- $bucket := default $.Values.s3.bucket $instance.s3.bucket | toString | trim -}}
+{{- if eq $bucket "" -}}
+{{- fail (printf "indexer.instances[%d] requires s3.bucket or instance s3.bucket" $index) -}}
+{{- end -}}
+{{- $prefix := $instance.s3.prefix | toString | trimAll "/" -}}
+{{- if eq $prefix "" -}}
+{{- fail (printf "indexer.instances[%d].s3.prefix must be non-empty" $index) -}}
+{{- end -}}
+{{- $storageIdentity := printf "%s/%s" $bucket $prefix -}}
+{{- if hasKey $prefixes $storageIdentity -}}
+{{- fail (printf "indexer S3 target %q is used by more than one instance" $storageIdentity) -}}
+{{- end -}}
+{{- $_ := set $prefixes $storageIdentity true -}}
+{{- range $label := list "app.kubernetes.io/name" "app.kubernetes.io/instance" "app.kubernetes.io/component" "ursula.tonbo.io/indexer" -}}
+{{- if hasKey $.Values.indexer.podLabels $label -}}
+{{- fail (printf "indexer.podLabels must not set reserved selector label %q" $label) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{/*
 Validate a DNS-1123 label that is rendered into pod names or peer DNS.
 */}}
@@ -201,9 +295,10 @@ accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 {{- if and ($storageMode | eq "logDir") ($logDir | eq "") -}}
 {{- fail "raft.logDir must be non-empty when raft.storageMode=logDir" -}}
 {{- end -}}
-{{- $usesS3 := or .Values.coldStorage.enabled (.Values.snapshotStore.backend | eq "s3") -}}
+{{- $serverUsesS3 := or .Values.coldStorage.enabled (.Values.snapshotStore.backend | eq "s3") -}}
+{{- $usesS3 := or $serverUsesS3 .Values.indexer.enabled -}}
 {{- if $usesS3 -}}
-{{- if eq (.Values.s3.bucket | toString | trim) "" -}}
+{{- if and $serverUsesS3 (eq (.Values.s3.bucket | toString | trim) "") -}}
 {{- fail "s3.bucket must be set when coldStorage.enabled=true or snapshotStore.backend=s3" -}}
 {{- end -}}
 {{- if and .Values.s3.credentials.existingSecret (include "ursula.hasInlineS3Credentials" .) -}}

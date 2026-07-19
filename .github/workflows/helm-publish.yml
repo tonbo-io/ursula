@@ -54,6 +54,12 @@ jobs:
       - name: Render chart
         run: helm template ursula "$CHART_DIR" >/tmp/ursula-chart-rendered.yaml
 
+      - name: Test chart guardrails
+        run: python3 scripts/helm_template_test.py
+
+      - name: Render production EKS example
+        run: helm template ursula "$CHART_DIR" --namespace ursula -f "$CHART_DIR/examples/production-eks.yaml" >/tmp/ursula-production-eks.yaml
+
       - name: Package chart
         id: package
         env:

@@ -6,14 +6,30 @@ import unittest
 
 
 def render_config(*values: str) -> str:
-    rendered = subprocess.check_output(
-        ["helm", "template", "test", "charts/ursula", *values],
-        text=True,
-    )
+    rendered = render_chart(*values)
     match = re.search(r"cat > \"\$\{config_path\}\" <<EOF\n(?P<config>.*?)\n    EOF", rendered, re.S)
     if not match:
         raise AssertionError("could not find generated Ursula config in helm output")
     return match.group("config")
+
+
+def render_chart(*values: str) -> str:
+    return subprocess.check_output(["helm", "template", "test", "charts/ursula", *values], text=True)
+
+
+def indexer_values() -> tuple[str, ...]:
+    return (
+        "--set",
+        "s3.bucket=index-bucket",
+        "--set",
+        "indexer.enabled=true",
+        "--set",
+        "indexer.instances[0].name=browser",
+        "--set",
+        "indexer.instances[0].streamUrl=http://test-ursula-gateway:4437/v1/stream/browser",
+        "--set",
+        "indexer.instances[0].s3.prefix=indexes/browser",
+    )
 
 
 class HelmTemplateConfigTest(unittest.TestCase):
@@ -87,6 +103,64 @@ class HelmTemplateConfigTest(unittest.TestCase):
         parsed = tomllib.loads(config)
 
         self.assertNotIn("cache", parsed["storage"]["cold"])
+
+    def test_indexer_renders_inherited_s3_and_health_probes(self) -> None:
+        rendered = render_chart(*indexer_values())
+
+        self.assertIn("- --s3-bucket\n            - \"index-bucket\"", rendered)
+        self.assertIn("- --s3-prefix\n            - \"indexes/browser\"", rendered)
+        self.assertIn("path: /livez", rendered)
+        self.assertIn("path: /readyz", rendered)
+        self.assertIn('ursula.tonbo.io/indexer: browser', rendered)
+
+    def test_indexer_multiple_replicas_require_explicit_active_active(self) -> None:
+        result = subprocess.run(
+            ["helm", "template", "test", "charts/ursula", *indexer_values(), "--set", "indexer.replicaCount=2"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("indexer.replicaCount greater than 1 requires indexer.activeActive=true", result.stderr)
+
+    def test_indexer_active_active_renders_pdb_and_spread(self) -> None:
+        rendered = render_chart(
+            *indexer_values(),
+            "--set",
+            "indexer.replicaCount=2",
+            "--set",
+            "indexer.activeActive=true",
+            "--set",
+            "indexer.podDisruptionBudget.enabled=true",
+        )
+
+        self.assertIn("type: RollingUpdate", rendered)
+        self.assertIn("topologyKey: topology.kubernetes.io/zone", rendered)
+        self.assertIn("name: test-ursula-index-browser\n", rendered)
+
+    def test_indexer_rejects_duplicate_s3_target(self) -> None:
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                "charts/ursula",
+                *indexer_values(),
+                "--set",
+                "indexer.instances[1].name=other",
+                "--set",
+                "indexer.instances[1].streamUrl=http://source/other",
+                "--set",
+                "indexer.instances[1].s3.prefix=indexes/browser",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('indexer S3 target "index-bucket/indexes/browser" is used by more than one instance', result.stderr)
 
 
 if __name__ == "__main__":
