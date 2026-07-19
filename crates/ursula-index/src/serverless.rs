@@ -559,6 +559,7 @@ impl ServerlessEventIndex {
         &mut self,
         retain_generations: u64,
         grace: Duration,
+        now: SystemTime,
     ) -> Result<GarbageCollectionReport, IndexError> {
         if retain_generations == 0 {
             return Err(IndexError::InvalidConfig(
@@ -570,9 +571,7 @@ impl ServerlessEventIndex {
         let minimum_generation = current_generation
             .saturating_add(1)
             .saturating_sub(retain_generations);
-        let cutoff = SystemTime::now()
-            .checked_sub(grace)
-            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let cutoff = now.checked_sub(grace).unwrap_or(SystemTime::UNIX_EPOCH);
         let manifest_objects = self.store.list("manifests/").await?;
         let mut retained_manifests = HashSet::new();
         retained_manifests.insert(self.published.manifest_key.clone());
@@ -913,6 +912,6 @@ mod tests {
 
     #[test]
     fn missing_modification_time_is_not_eligible_for_gc() {
-        assert!(!eligible_for_gc(None, SystemTime::now()));
+        assert!(!eligible_for_gc(None, SystemTime::UNIX_EPOCH));
     }
 }

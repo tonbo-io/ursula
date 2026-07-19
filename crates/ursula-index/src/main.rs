@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::Instant;
+use std::time::SystemTime;
 
 use anyhow::Context;
 use axum::Json;
@@ -24,6 +24,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
+use tokio::time::Instant;
 use ursula_index::EventIndexConfig;
 use ursula_index::FsObjectStore;
 use ursula_index::IndexError;
@@ -377,7 +378,10 @@ async fn maintenance_loop(
                     }
                 }
                 if Instant::now() >= next_gc {
-                    match index.garbage_collect(gc_retain_generations, gc_grace).await {
+                    match index
+                        .garbage_collect(gc_retain_generations, gc_grace, gc_wall_clock_now())
+                        .await
+                    {
                         Ok(report) => tracing::info!(
                             deleted_parts = report.deleted_parts,
                             deleted_manifests = report.deleted_manifests,
@@ -409,6 +413,16 @@ async fn wait_or_shutdown(duration: Duration, shutdown: &mut watch::Receiver<boo
             changed.is_err() || *shutdown.borrow()
         }
     }
+}
+
+#[cfg(not(madsim))]
+fn gc_wall_clock_now() -> SystemTime {
+    SystemTime::now()
+}
+
+#[cfg(madsim)]
+fn gc_wall_clock_now() -> SystemTime {
+    SystemTime::UNIX_EPOCH
 }
 
 fn build_router(index: Arc<Mutex<ServerlessEventIndex>>) -> Router {

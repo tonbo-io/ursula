@@ -64,7 +64,9 @@ async fn real_s3_conditional_publish_and_cache_recovery() -> anyhow::Result<()> 
         })
         .await?;
     assert!(writer.compact_partition_once(2, 2).await?);
-    let gc = writer.garbage_collect(1, std::time::Duration::ZERO).await?;
+    let gc = writer
+        .garbage_collect(1, std::time::Duration::ZERO, SystemTime::now())
+        .await?;
     assert_eq!(gc.deleted_parts, 2);
     drop(writer);
     drop(first_cache);
