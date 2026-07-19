@@ -547,7 +547,6 @@ pub(crate) fn snapshot_response(response: ReadSnapshotResponse) -> Response {
         insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
     }
     if let Some(record_range) = response.record_range {
-        insert_record_extension(&mut headers);
         insert_record_head_headers(&mut headers, record_range);
     }
     (StatusCode::OK, headers, response.payload).into_response()
@@ -573,7 +572,6 @@ pub(crate) fn bootstrap_response(response: BootstrapStreamResponse) -> Response 
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
     }
     if let Some(record_range) = response.record_range {
-        insert_record_extension(&mut headers);
         insert_record_head_headers(&mut headers, record_range);
     }
     insert_cache_control(&mut headers, "no-store");
