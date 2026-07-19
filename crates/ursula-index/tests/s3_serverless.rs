@@ -39,7 +39,7 @@ async fn real_s3_conditional_publish_and_cache_recovery() -> anyhow::Result<()> 
     };
     let source_config = EventIndexConfig {
         source_id: "s3-integration-source".to_owned(),
-        flush_entries: 16,
+        flush_entries: 1,
         row_group_entries: 8,
         timestamp_field: "captured_at".to_owned(),
     };
@@ -63,7 +63,9 @@ async fn real_s3_conditional_publish_and_cache_recovery() -> anyhow::Result<()> 
             record: 1,
         })
         .await?;
-    writer.flush().await?;
+    assert!(writer.compact_partition_once(2, 2).await?);
+    let gc = writer.garbage_collect(1, std::time::Duration::ZERO).await?;
+    assert_eq!(gc.deleted_parts, 2);
     drop(writer);
     drop(first_cache);
 

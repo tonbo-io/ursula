@@ -88,6 +88,9 @@ async fn concurrent_writers_converge_on_one_checkpoint() -> anyhow::Result<()> {
     first_result?;
     second_result?;
 
+    let gc = first.garbage_collect(1, std::time::Duration::ZERO).await?;
+    assert!(gc.deleted_manifests >= 1);
+
     let verify_cache = TempDir::new()?;
     let mut verify =
         ServerlessEventIndex::open_fs(store, verify_cache.path(), 16 * 1024 * 1024, config())
@@ -215,7 +218,7 @@ async fn serverless_compaction_survives_cache_loss() -> anyhow::Result<()> {
             .await?;
     }
     assert_eq!(index.part_count(), 3);
-    index.compact_all().await?;
+    assert!(index.compact_partition_once(3, 100).await?);
     assert_eq!(index.part_count(), 1);
     drop(index);
     drop(cache);
@@ -227,6 +230,202 @@ async fn serverless_compaction_survives_cache_loss() -> anyhow::Result<()> {
     let result = reopened.query(0, 20, None, None, 10).await?;
     assert_eq!(result.records.len(), 6);
     assert_eq!(result.durable_through_record, 6);
+    Ok(())
+}
+
+#[tokio::test]
+async fn compaction_is_bounded_to_one_event_time_partition() -> anyhow::Result<()> {
+    let object_dir = TempDir::new()?;
+    let cache = TempDir::new()?;
+    let store = FsObjectStore::new(object_dir.path())?;
+    let mut compact_config = config();
+    compact_config.flush_entries = 1;
+    let mut index =
+        ServerlessEventIndex::open_fs(store, cache.path(), 16 * 1024 * 1024, compact_config)
+            .await?;
+    const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+    for record in 0..6 {
+        let day = i64::try_from(record / 3)?;
+        index
+            .ingest(EventEntry {
+                captured_at_ms: day.saturating_mul(DAY_MS) + i64::try_from(record)?,
+                record,
+            })
+            .await?;
+    }
+    assert_eq!(index.part_count(), 6);
+
+    assert!(index.compact_partition_once(3, 3).await?);
+    assert_eq!(index.part_count(), 4);
+    assert!(index.compact_partition_once(3, 3).await?);
+    assert_eq!(index.part_count(), 2);
+    assert!(!index.compact_partition_once(3, 3).await?);
+
+    for record in 6..9 {
+        index
+            .ingest(EventEntry {
+                captured_at_ms: i64::try_from(record)?,
+                record,
+            })
+            .await?;
+    }
+    assert_eq!(index.part_count(), 5);
+    assert!(index.compact_partition_once(3, 3).await?);
+    assert_eq!(index.part_count(), 3);
+
+    let first_day = index.query(0, DAY_MS, None, None, 10).await?;
+    assert_eq!(first_day.records.len(), 6);
+    let second_day = index.query(DAY_MS, DAY_MS * 2, None, None, 10).await?;
+    assert_eq!(second_day.records.len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn compaction_reduces_fan_in_to_stay_within_the_memory_bound() -> anyhow::Result<()> {
+    let object_dir = TempDir::new()?;
+    let cache = TempDir::new()?;
+    let mut compact_config = config();
+    compact_config.flush_entries = 1;
+    let mut index = ServerlessEventIndex::open_fs(
+        FsObjectStore::new(object_dir.path())?,
+        cache.path(),
+        16 * 1024 * 1024,
+        compact_config,
+    )
+    .await?;
+    for record in 0..3 {
+        index
+            .ingest(EventEntry {
+                captured_at_ms: i64::try_from(record)?,
+                record,
+            })
+            .await?;
+    }
+
+    assert!(index.compact_partition_once(3, 2).await?);
+    assert_eq!(index.part_count(), 2);
+    assert_eq!(index.query(-1, 10, None, None, 10).await?.records.len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn oversized_old_partition_does_not_block_later_partition() -> anyhow::Result<()> {
+    let object_dir = TempDir::new()?;
+    let large_cache = TempDir::new()?;
+    let store = FsObjectStore::new(object_dir.path())?;
+    let mut large_config = config();
+    large_config.flush_entries = 3;
+    let mut large = ServerlessEventIndex::open_fs(
+        store.clone(),
+        large_cache.path(),
+        16 * 1024 * 1024,
+        large_config,
+    )
+    .await?;
+    for record in 0..6 {
+        large
+            .ingest(EventEntry {
+                captured_at_ms: i64::try_from(record)?,
+                record,
+            })
+            .await?;
+    }
+    drop(large);
+
+    let small_cache = TempDir::new()?;
+    let mut small_config = config();
+    small_config.flush_entries = 1;
+    let mut small =
+        ServerlessEventIndex::open_fs(store, small_cache.path(), 16 * 1024 * 1024, small_config)
+            .await?;
+    const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+    for record in 6..8 {
+        small
+            .ingest(EventEntry {
+                captured_at_ms: DAY_MS + i64::try_from(record)?,
+                record,
+            })
+            .await?;
+    }
+
+    assert!(small.compact_partition_once(2, 2).await?);
+    assert_eq!(small.part_count(), 3);
+    assert_eq!(
+        small
+            .query(DAY_MS, DAY_MS * 2, None, None, 10)
+            .await?
+            .records
+            .len(),
+        2
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn garbage_collection_reclaims_unreferenced_parts_and_manifests() -> anyhow::Result<()> {
+    let object_dir = TempDir::new()?;
+    let cache = TempDir::new()?;
+    let store = FsObjectStore::new(object_dir.path())?;
+    let mut compact_config = config();
+    compact_config.flush_entries = 1;
+    let mut index = ServerlessEventIndex::open_fs(
+        store.clone(),
+        cache.path(),
+        16 * 1024 * 1024,
+        compact_config.clone(),
+    )
+    .await?;
+    for record in 0..3 {
+        index
+            .ingest(EventEntry {
+                captured_at_ms: i64::try_from(record)?,
+                record,
+            })
+            .await?;
+    }
+    assert!(index.compact_partition_once(3, 3).await?);
+
+    let retained = index.garbage_collect(2, std::time::Duration::ZERO).await?;
+    assert_eq!(retained.deleted_parts, 0);
+    let reclaimed = index.garbage_collect(1, std::time::Duration::ZERO).await?;
+    assert_eq!(reclaimed.deleted_parts, 3);
+    assert!(reclaimed.deleted_manifests >= 1);
+
+    drop(index);
+    let fresh_cache = TempDir::new()?;
+    let mut reopened =
+        ServerlessEventIndex::open_fs(store, fresh_cache.path(), 16 * 1024 * 1024, compact_config)
+            .await?;
+    let result = reopened.query(-1, 10, None, None, 10).await?;
+    assert_eq!(result.records.len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn garbage_collection_skips_and_reclaims_incompatible_manifests() -> anyhow::Result<()> {
+    let object_dir = TempDir::new()?;
+    let cache = TempDir::new()?;
+    let store = FsObjectStore::new(object_dir.path())?;
+    let mut index =
+        ServerlessEventIndex::open_fs(store, cache.path(), 16 * 1024 * 1024, config()).await?;
+    let legacy = object_dir
+        .path()
+        .join("manifests/00000000000000000000-legacy-v1.json");
+    std::fs::write(
+        &legacy,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "source_id": "https://example.test/v1/stream",
+            "generation": 0,
+            "durable_through_record": 0,
+            "status": {"state": "ready"},
+            "parts": []
+        }))?,
+    )?;
+
+    let report = index.garbage_collect(8, std::time::Duration::ZERO).await?;
+    assert!(report.deleted_manifests >= 1);
+    assert!(!legacy.exists());
     Ok(())
 }
 
