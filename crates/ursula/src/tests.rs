@@ -916,6 +916,7 @@ async fn stream_seq_header_rejects_regressing_appends() {
     assert_eq!(response.status(), StatusCode::CONFLICT);
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -1310,12 +1311,16 @@ async fn json_append_batch_returns_per_frame_record_ranges() {
     assert_eq!(response.status(), StatusCode::CREATED);
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/benchcmp/json-batch-records/append-batch")
                 .header(CONTENT_TYPE, "application/json")
                 .header(HEADER_PREFER, "return=minimal")
+                .header(HEADER_PRODUCER_ID, "json-writer")
+                .header(HEADER_PRODUCER_EPOCH, "0")
+                .header(HEADER_PRODUCER_SEQ, "0")
                 .body(Body::from(batch_body(&[
                     br#"[{"id":1},{"id":2}]"#.as_slice(),
                     br#"{"id":3}"#.as_slice(),
@@ -1339,6 +1344,82 @@ async fn json_append_batch_returns_per_frame_record_ranges() {
             {"status": 204, "stream_record_start": 0, "stream_record_next": 2},
             {"status": 204, "stream_record_start": 2, "stream_record_next": 3}
         ])
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/benchcmp/json-batch-records/append-batch")
+                .header(CONTENT_TYPE, "application/json")
+                .header(HEADER_PREFER, "return=minimal")
+                .header(HEADER_PRODUCER_ID, "json-writer")
+                .header(HEADER_PRODUCER_EPOCH, "0")
+                .header(HEADER_PRODUCER_SEQ, "0")
+                .body(Body::from(batch_body(&[br#"{"ignored":true}"#.as_slice()])))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_EXTENSIONS).unwrap(),
+        JSON_RECORD_COORDINATES_EXTENSION
+    );
+    let retry_body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let retry_body: serde_json::Value =
+        serde_json::from_slice(&retry_body).expect("deduplicated batch ack JSON");
+    assert_eq!(retry_body, body);
+}
+
+#[tokio::test]
+async fn closed_record_long_poll_empty_response_includes_record_headers() {
+    let app = test_router();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/json-record-closed-long-poll")
+                .header(CONTENT_TYPE, "application/json")
+                .header(HEADER_STREAM_CLOSED, "true")
+                .body(Body::from(r#"{"id":1}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(
+                    "/benchcmp/json-record-closed-long-poll?record=1&live=long-poll&timeout_ms=1000",
+                )
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_EXTENSIONS).unwrap(),
+        JSON_RECORD_COORDINATES_EXTENSION
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_FIRST).unwrap(),
+        "0"
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
+        "1"
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
+        "1"
     );
 }
 

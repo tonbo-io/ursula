@@ -85,10 +85,19 @@ impl StreamStateMachine {
         }
 
         let payload_len = u64::try_from(payload.len()).expect("payload len fits u64");
-        let record_ends = content_type
-            .map(|value| canonical_json_record_ends(value, payload).unwrap_or_default())
-            .unwrap_or_default();
-        let (prepared_record_index, record_range) = {
+        let record_ends = match content_type {
+            Some(value) => match canonical_json_record_ends(value, payload) {
+                Ok(record_ends) => record_ends,
+                Err(_) => {
+                    return StreamResponse::error(
+                        StreamErrorCode::InvalidRecordBoundaries,
+                        "application/json append payload must use canonical newline boundaries",
+                    );
+                }
+            },
+            None => Vec::new(),
+        };
+        let prepared_record_append = {
             let slot = self
                 .stream_slot(&stream_id)
                 .expect("stream existence checked before record validation");
@@ -99,10 +108,13 @@ impl StreamStateMachine {
                 payload_len,
                 &record_ends,
             ) {
-                Ok(index) => index,
+                Ok(prepared) => prepared,
                 Err(response) => return response,
             }
         };
+        let record_range = prepared_record_append
+            .as_ref()
+            .map(crate::PreparedRecordAppend::range);
 
         let Some(stream) = self.stream_metadata_mut(&stream_id) else {
             unreachable!("stream existence checked before producer evaluation");
@@ -198,7 +210,11 @@ impl StreamStateMachine {
             let slot = self
                 .stream_slot_mut(&stream_id)
                 .expect("stream existence checked before append mutation");
-            slot.record_index = prepared_record_index;
+            if let (Some(index), Some(prepared)) =
+                (slot.record_index.as_mut(), prepared_record_append)
+            {
+                let _range = index.commit_append(prepared);
+            }
             slot.hot_buffer.push(offset, next_offset, payload);
             slot.integrity
                 .append_payload(&stream_id, offset, next_offset, payload);
@@ -276,7 +292,7 @@ impl StreamStateMachine {
             return response;
         }
 
-        let (prepared_record_index, record_range) = {
+        let prepared_record_append = {
             let slot = self
                 .stream_slot(&stream_id)
                 .expect("stream existence checked before record validation");
@@ -287,10 +303,13 @@ impl StreamStateMachine {
                 payload.payload_len,
                 &record_ends,
             ) {
-                Ok(index) => index,
+                Ok(prepared) => prepared,
                 Err(response) => return response,
             }
         };
+        let record_range = prepared_record_append
+            .as_ref()
+            .map(crate::PreparedRecordAppend::range);
 
         let Some(stream) = self.stream_metadata(&stream_id) else {
             unreachable!("stream existence checked before producer evaluation");
@@ -367,7 +386,10 @@ impl StreamStateMachine {
         let slot = self
             .stream_slot_mut(&stream_id)
             .expect("stream existence checked before external append mutation");
-        slot.record_index = prepared_record_index;
+        if let (Some(index), Some(prepared)) = (slot.record_index.as_mut(), prepared_record_append)
+        {
+            let _range = index.commit_append(prepared);
+        }
         slot.cold.push_external_segment(object.clone());
         slot.integrity.append_external(
             &stream_id,
@@ -429,11 +451,7 @@ impl StreamStateMachine {
             });
         }
 
-        let mut prepared_record_index = self
-            .stream_slot(&stream_id)
-            .and_then(|slot| slot.record_index.clone());
-
-        let Some(stream) = self.stream_metadata_mut(&stream_id) else {
+        let Some(stream) = self.stream_metadata(&stream_id) else {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
@@ -470,22 +488,83 @@ impl StreamStateMachine {
             ));
         }
 
-        let mut record_offset = stream.tail_offset;
-        let mut item_record_ranges = Vec::with_capacity(payloads.len());
+        let base_offset = stream.tail_offset;
+        let mut total_payload_len = 0_u64;
+        let mut combined_record_ends = Vec::new();
+        let mut record_counts = Vec::with_capacity(payloads.len());
+        let mut all_record_ends = Vec::with_capacity(payloads.len());
         for payload in payloads {
             let payload_len = u64::try_from(payload.len()).expect("payload len fits u64");
-            let record_ends = canonical_json_record_ends(content_type, payload).unwrap_or_default();
-            let (updated, range) = prepare_record_append(
-                prepared_record_index.as_ref(),
-                super::is_json_record_content_type(content_type),
-                record_offset,
-                payload_len,
-                &record_ends,
-            )?;
-            prepared_record_index = updated;
-            item_record_ranges.push(range);
-            record_offset = record_offset.saturating_add(payload_len);
+            let record_ends = canonical_json_record_ends(content_type, payload).map_err(|_| {
+                StreamResponse::error(
+                    StreamErrorCode::InvalidRecordBoundaries,
+                    "application/json append payload must use canonical newline boundaries",
+                )
+            })?;
+            record_counts.push(u64::try_from(record_ends.len()).map_err(|_| {
+                StreamResponse::error(
+                    StreamErrorCode::InvalidRecordBoundaries,
+                    "record count exceeds the supported range",
+                )
+            })?);
+            for end in &record_ends {
+                combined_record_ends.push(total_payload_len.checked_add(*end).ok_or_else(
+                    || {
+                        StreamResponse::error(
+                            StreamErrorCode::InvalidRecordBoundaries,
+                            "append batch payload length exceeds the supported range",
+                        )
+                    },
+                )?);
+            }
+            total_payload_len = total_payload_len.checked_add(payload_len).ok_or_else(|| {
+                StreamResponse::error(
+                    StreamErrorCode::InvalidRecordBoundaries,
+                    "append batch payload length exceeds the supported range",
+                )
+            })?;
+            all_record_ends.push(record_ends);
         }
+        let prepared_record_append = {
+            let slot = self
+                .stream_slot(&stream_id)
+                .expect("stream existence checked before record validation");
+            prepare_record_append(
+                slot.record_index.as_ref(),
+                super::is_json_record_content_type(content_type),
+                base_offset,
+                total_payload_len,
+                &combined_record_ends,
+            )?
+        };
+        let mut next_record = prepared_record_append
+            .as_ref()
+            .map(crate::PreparedRecordAppend::range)
+            .map(|range| range.first_record);
+        let mut item_record_ranges = Vec::with_capacity(record_counts.len());
+        for count in record_counts {
+            let range = match next_record {
+                Some(first_record) => {
+                    let next = first_record.checked_add(count).ok_or_else(|| {
+                        StreamResponse::error(
+                            StreamErrorCode::InvalidRecordBoundaries,
+                            "append batch record count exceeds the supported range",
+                        )
+                    })?;
+                    next_record = Some(next);
+                    Some(crate::StreamRecordRange {
+                        first_record,
+                        next_record: next,
+                    })
+                }
+                None => None,
+            };
+            item_record_ranges.push(range);
+        }
+
+        let stream = self
+            .stream_metadata_mut(&stream_id)
+            .expect("stream existence checked before batch append mutation");
 
         let mut items = Vec::with_capacity(payloads.len());
         for (payload, record_range) in payloads.iter().zip(item_record_ranges) {
@@ -512,7 +591,10 @@ impl StreamStateMachine {
         let slot = self
             .stream_slot_mut(&stream_id)
             .expect("stream existence checked before batch append mutation");
-        slot.record_index = prepared_record_index;
+        if let (Some(index), Some(prepared)) = (slot.record_index.as_mut(), prepared_record_append)
+        {
+            let _range = index.commit_append(prepared);
+        }
         for (item, payload) in items.iter().zip(payloads.iter()) {
             slot.hot_buffer
                 .push(item.start_offset, item.next_offset, payload);
@@ -521,13 +603,12 @@ impl StreamStateMachine {
             slot.integrity
                 .append_payload(&stream_id, item.start_offset, item.next_offset, payload);
         }
-        for (item, payload) in items.iter().zip(payloads.iter()) {
-            let record_ends = canonical_json_record_ends(content_type, payload).unwrap_or_default();
+        for (item, record_ends) in items.iter().zip(all_record_ends.iter()) {
             slot.message_records
                 .extend(Self::message_records_for_append(
                     item.start_offset,
                     item.next_offset,
-                    &record_ends,
+                    record_ends,
                 ));
         }
         Ok(StreamBatchAppend {
