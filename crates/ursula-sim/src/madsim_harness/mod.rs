@@ -1611,6 +1611,8 @@ pub(super) async fn verify_runtime_raft_partial_read(
             offset: offset as u64,
             max_len,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("runtime raft partial read");
@@ -1657,6 +1659,8 @@ pub(super) async fn verify_runtime_raft_tail_read(
             offset: request_offset,
             max_len: 8,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("runtime raft tail read");
@@ -1723,6 +1727,8 @@ pub(super) async fn verify_runtime_raft_close_stream(
             offset: 0,
             max_len: expected_payload.len().max(64),
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read closed runtime raft stream");
@@ -2112,6 +2118,8 @@ pub(super) async fn read_local_payload_eventually(
                     offset,
                     max_len,
                     now_ms: 0,
+                    record: None,
+                    max_records: None,
                 },
                 placement(),
             )

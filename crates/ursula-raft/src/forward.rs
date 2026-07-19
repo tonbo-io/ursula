@@ -89,6 +89,8 @@ pub(crate) async fn forward_read_stream_to_leader(
             raft_internal_proto::ReadStreamReadV1 {
                 offset: request.offset,
                 max_len,
+                record: request.record,
+                max_records: request.max_records,
             },
         ),
     )
