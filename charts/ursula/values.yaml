@@ -1,6 +1,6 @@
 global:
   image:
-    # Image repository. The image must contain `ursula`, `ursulactl`, `ursulagw`, and `ursula-event-indexer`.
+    # Image repository. The image must contain `ursula`, `ursulactl`, `ursulagw`, and `ursula-indexer`.
     repository: ghcr.io/tonbo-io/ursula
     # Image tag. Defaults to the chart appVersion when left empty.
     tag: ""
