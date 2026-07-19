@@ -29,13 +29,15 @@ COPY crates/ ./crates/
 RUN --mount=type=cache,sharing=locked,target=/usr/local/cargo/registry \
   --mount=type=cache,sharing=locked,target=/usr/local/cargo/git \
   --mount=type=cache,sharing=locked,target=/ursula/target \
-  cargo build --release --locked --bin ursula --bin ursulactl --bin ursulagw \
+  cargo build --release --locked --bin ursula --bin ursulactl --bin ursulagw --bin ursula-event-indexer \
   && strip --strip-debug target/release/ursula \
   && strip --strip-debug target/release/ursulactl \
   && strip --strip-debug target/release/ursulagw \
+  && strip --strip-debug target/release/ursula-event-indexer \
   && install -Dm755 target/release/ursula /usr/local/bin/ursula \
   && install -Dm755 target/release/ursulactl /usr/local/bin/ursulactl \
-  && install -Dm755 target/release/ursulagw /usr/local/bin/ursulagw
+  && install -Dm755 target/release/ursulagw /usr/local/bin/ursulagw \
+  && install -Dm755 target/release/ursula-event-indexer /usr/local/bin/ursula-event-indexer
 
 FROM debian:bookworm-slim AS runtime
 
@@ -58,6 +60,7 @@ WORKDIR /var/lib/ursula
 COPY --from=builder /usr/local/bin/ursula /usr/local/bin/ursula
 COPY --from=builder /usr/local/bin/ursulactl /usr/local/bin/ursulactl
 COPY --from=builder /usr/local/bin/ursulagw /usr/local/bin/ursulagw
+COPY --from=builder /usr/local/bin/ursula-event-indexer /usr/local/bin/ursula-event-indexer
 
 # Add default config (node_id is supplied at runtime via --node-id)
 COPY <<EOF /etc/ursula/ursula.toml

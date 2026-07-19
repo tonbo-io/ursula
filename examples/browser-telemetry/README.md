@@ -15,10 +15,23 @@ installBrowserTelemetry(telemetry);
 telemetry.capture("application_started", { release: "2026.07.18" });
 ```
 
-`event-time-index.mjs` demonstrates the external derived-index contract from issue #86. It consumes the envelope view in record order, sorts event-time entries by `(captured_at, record)`, publishes `indexed_through_record`, and fails explicitly if retention makes its answer incomplete.
+`ursula-event-indexer` is the persistent implementation of the external derived-index contract from issue #86. It consumes the envelope view in record order, writes immutable Parquet parts sorted by `(captured_at, record)` to S3, conditionally publishes each source checkpoint, and reports a retention gap instead of returning incomplete history. S3 is authoritative; the local directory is only a bounded cache and can disappear between invocations.
 
 ```bash
-node --test examples/browser-telemetry/event-time-index.test.mjs
+cargo run -p ursula-event-index --bin ursula-event-indexer -- \
+  --stream-url http://127.0.0.1:4437/v1/stream/browser-telemetry \
+  --s3-bucket my-telemetry-index \
+  --s3-prefix production/browser-telemetry \
+  --cache-dir ./target/browser-telemetry-cache
+```
+
+For a local run, use `--object-dir ./target/browser-telemetry-objects` instead of the S3 options. This exercises the same immutable manifest and conditional `CURRENT` design; it is not the production durability boundary.
+
+Query event time over ordinary HTTP. `through_record` pins pagination to one fully indexed source prefix; subsequent pages pass `after_captured_at_ms` and `after_record` from the previous response's `next` cursor.
+
+```bash
+curl 'http://127.0.0.1:4493/v1/events?from=2026-07-18T10%3A00%3A00Z&until=2026-07-18T11%3A00%3A00Z&limit=100'
+curl 'http://127.0.0.1:4493/v1/status'
 ```
 
 This example does not require an Ursula SDK or Append Session. Production collectors should add durable local retry storage and an authenticated same-origin gateway appropriate to their environment.

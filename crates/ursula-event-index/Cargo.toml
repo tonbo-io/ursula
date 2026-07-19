@@ -1,0 +1,44 @@
+[package]
+name = "ursula-event-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+description = "Rebuildable client-event-time index for Ursula JSON record streams."
+
+[[bin]]
+name = "ursula-event-indexer"
+path = "src/main.rs"
+
+[[bench]]
+name = "event_time_query"
+harness = false
+
+[dependencies]
+anyhow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+axum = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+clap = { workspace = true, features = ["derive"] }
+parquet = { workspace = true }
+opendal = { workspace = true, features = ["services-s3"] }
+reqwest = { workspace = true, features = ["rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = { workspace = true }
+ursula-observability = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+criterion = { workspace = true }
+tower = { workspace = true, features = ["util"] }
