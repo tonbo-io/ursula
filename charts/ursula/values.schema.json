@@ -614,6 +614,245 @@
         "initContainers"
       ]
     },
+    "indexer": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional S3-authoritative event-time indexer deployments.",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "instances": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string",
+                "maxLength": 63,
+                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+              },
+              "streamUrl": {
+                "type": "string",
+                "pattern": "^https?://"
+              },
+              "s3": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "bucket": { "type": "string" },
+                  "region": { "type": "string" },
+                  "endpoint": { "type": "string" },
+                  "prefix": { "type": "string", "minLength": 1 }
+                },
+                "required": ["prefix"]
+              }
+            },
+            "required": ["name", "streamUrl", "s3"]
+          }
+        },
+        "replicaCount": { "type": "integer", "minimum": 1 },
+        "activeActive": { "type": "boolean" },
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": { "type": "string" },
+            "tag": { "type": "string" },
+            "pullPolicy": { "type": "string", "enum": ["", "Always", "IfNotPresent", "Never"] }
+          },
+          "required": ["repository", "tag", "pullPolicy"]
+        },
+        "serviceAccount": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "create": { "type": "boolean" },
+            "name": {
+              "type": "string",
+              "maxLength": 63,
+              "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+            },
+            "annotations": { "type": "object", "additionalProperties": { "type": "string" } },
+            "automountServiceAccountToken": { "type": "boolean" }
+          },
+          "required": ["create", "name", "annotations", "automountServiceAccountToken"]
+        },
+        "ports": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "http": { "type": "integer", "minimum": 1, "maximum": 65535 }
+          },
+          "required": ["http"]
+        },
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "annotations": { "type": "object", "additionalProperties": { "type": "string" } }
+          },
+          "required": ["enabled", "type", "port", "annotations"]
+        },
+        "timestampField": { "type": "string", "minLength": 1 },
+        "rustLog": { "type": "string" },
+        "cache": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "servingMaxBytes": { "type": "integer", "minimum": 1 },
+            "maintenanceMaxBytes": { "type": "integer", "minimum": 1 },
+            "emptyDir": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "sizeLimit": { "type": "string", "minLength": 1 }
+              },
+              "required": ["sizeLimit"]
+            }
+          },
+          "required": ["servingMaxBytes", "maintenanceMaxBytes", "emptyDir"]
+        },
+        "ingest": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "flushEntries": { "type": "integer", "minimum": 1 },
+            "rowGroupEntries": { "type": "integer", "minimum": 1 },
+            "readBatchRecords": { "type": "integer", "minimum": 1 },
+            "pollIntervalMs": { "type": "integer", "minimum": 1 }
+          },
+          "required": ["flushEntries", "rowGroupEntries", "readBatchRecords", "pollIntervalMs"]
+        },
+        "compaction": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fanIn": { "type": "integer", "minimum": 2 },
+            "maxEntries": { "type": "integer", "minimum": 1 },
+            "maintenanceIntervalMs": { "type": "integer", "minimum": 1 }
+          },
+          "required": ["fanIn", "maxEntries", "maintenanceIntervalMs"]
+        },
+        "garbageCollection": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "intervalSeconds": { "type": "integer", "minimum": 1 },
+            "graceSeconds": { "type": "integer", "minimum": 300 },
+            "retainGenerations": { "type": "integer", "minimum": 1 }
+          },
+          "required": ["intervalSeconds", "graceSeconds", "retainGenerations"]
+        },
+        "probes": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "startup": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "failureThreshold": { "type": "integer", "minimum": 1 },
+                "periodSeconds": { "type": "integer", "minimum": 1 },
+                "timeoutSeconds": { "type": "integer", "minimum": 1 }
+              },
+              "required": ["enabled", "failureThreshold", "periodSeconds", "timeoutSeconds"]
+            },
+            "readiness": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "periodSeconds": { "type": "integer", "minimum": 1 },
+                "timeoutSeconds": { "type": "integer", "minimum": 1 }
+              },
+              "required": ["enabled", "periodSeconds", "timeoutSeconds"]
+            },
+            "liveness": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "periodSeconds": { "type": "integer", "minimum": 1 },
+                "timeoutSeconds": { "type": "integer", "minimum": 1 }
+              },
+              "required": ["enabled", "periodSeconds", "timeoutSeconds"]
+            }
+          },
+          "required": ["startup", "readiness", "liveness"]
+        },
+        "podDisruptionBudget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "maxUnavailable": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["enabled", "maxUnavailable"]
+        },
+        "networkPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "additionalIngress": { "type": "array", "items": { "type": "object" } }
+          },
+          "required": ["enabled", "additionalIngress"]
+        },
+        "podAnnotations": { "type": "object", "additionalProperties": { "type": "string" } },
+        "podLabels": { "type": "object", "additionalProperties": { "type": "string" } },
+        "podSecurityContext": { "type": "object", "additionalProperties": true },
+        "securityContext": { "type": "object", "additionalProperties": true },
+        "resources": { "type": "object" },
+        "terminationGracePeriodSeconds": { "type": "integer", "minimum": 1 },
+        "extraArgs": { "type": "array", "items": { "type": "string" } },
+        "extraEnv": { "type": "array", "items": { "type": "object" } },
+        "extraEnvFrom": { "type": "array", "items": { "type": "object" } },
+        "scheduling": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "nodeSelector": { "type": "object", "additionalProperties": { "type": "string" } },
+            "tolerations": { "type": "array", "items": { "type": "object" } },
+            "affinity": { "type": "object" },
+            "topologySpreadConstraints": { "type": "array", "items": { "type": "object" } }
+          },
+          "required": ["nodeSelector", "tolerations", "affinity", "topologySpreadConstraints"]
+        }
+      },
+      "required": [
+        "enabled",
+        "instances",
+        "replicaCount",
+        "activeActive",
+        "image",
+        "serviceAccount",
+        "ports",
+        "service",
+        "timestampField",
+        "rustLog",
+        "cache",
+        "ingest",
+        "compaction",
+        "garbageCollection",
+        "probes",
+        "podDisruptionBudget",
+        "networkPolicy",
+        "podAnnotations",
+        "podLabels",
+        "podSecurityContext",
+        "securityContext",
+        "resources",
+        "terminationGracePeriodSeconds",
+        "extraArgs",
+        "extraEnv",
+        "extraEnvFrom",
+        "scheduling"
+      ]
+    },
     "raft": {
       "type": "object",
       "description": "Static Raft cluster settings.",
@@ -855,6 +1094,7 @@
     "serviceAccount",
     "server",
     "gateway",
+    "indexer",
     "raft",
     "persistence",
     "s3",
