@@ -199,6 +199,8 @@ message PublishSnapshotResponseV1 {
   ShardPlacementV1 placement = 1;
   uint64 snapshot_offset = 2;
   uint64 group_commit_index = 3;
+  optional uint64 record_start = 4;
+  optional uint64 record_next = 5;
 }
 
 message TouchStreamAccessResponseV1 {
@@ -225,6 +227,8 @@ message CloseStreamResponseV1 {
   uint64 next_offset = 2;
   uint64 group_commit_index = 3;
   bool deduplicated = 4;
+  optional uint64 record_start = 5;
+  optional uint64 record_next = 6;
 }
 
 message DeleteStreamResponseV1 {

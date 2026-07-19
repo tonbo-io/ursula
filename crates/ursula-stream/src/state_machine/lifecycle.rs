@@ -17,7 +17,6 @@ use super::StreamColdState;
 use super::StreamErrorCode;
 use super::StreamErrorContext;
 use super::StreamIntegrity;
-use super::StreamMessageRecord;
 use super::StreamMetadata;
 use super::StreamResponse;
 use super::StreamSlot;
@@ -156,14 +155,7 @@ impl StreamStateMachine {
             let payload = hot_buffer.payload();
             integrity.append_payload(&input.stream_id, 0, initial_len, &payload);
         }
-        let message_records = if initial_len > 0 {
-            vec![StreamMessageRecord {
-                start_offset: 0,
-                end_offset: initial_len,
-            }]
-        } else {
-            Vec::new()
-        };
+        let message_records = Self::message_records_for_append(0, initial_len, &input.record_ends);
         let mut producer_states = HashMap::new();
         if let Some(producer) = input.producer {
             let last_item = ProducerAppendRecord {
@@ -318,10 +310,7 @@ impl StreamStateMachine {
                 object.object_size,
             );
         }
-        let message_records = vec![StreamMessageRecord {
-            start_offset: 0,
-            end_offset: initial_len,
-        }];
+        let message_records = Self::message_records_for_append(0, initial_len, &input.record_ends);
         let mut producer_states = HashMap::new();
         if let Some(producer) = input.producer {
             let last_item = ProducerAppendRecord {
