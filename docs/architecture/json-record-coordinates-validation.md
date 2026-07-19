@@ -60,3 +60,9 @@ This contract will be validated in the browser telemetry example. It is intentio
 ## Implementation acceptance
 
 The production implementation is accepted only when the shared vectors are exercised at the HTTP boundary and recovery tests prove that the state machine, Raft log, snapshots, cold storage, compaction, and restart preserve the reference model's observable state. Performance evidence must report index bytes per record plus representative append, record-seek, and record-aligned-read latency.
+
+## Performance evidence
+
+The in-memory ordinal index stores one `u64` canonical start offset per retained record: 8 bytes per record, plus one 24-byte `Vec` descriptor per indexed stream and allocator capacity overhead. Snapshot and WAL serialization use the same one-offset-per-record representation.
+
+`cargo bench -p ursula-runtime --bench append_apply -- record_coordinates` reports three representative operations against the production state-machine structures: JSON record append, exact seek in a 100,000-record stream, and a record-aligned 100-record read plan. Benchmark results are environment-specific and should be attached to the implementation PR rather than frozen into the protocol document.
