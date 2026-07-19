@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -90,6 +92,7 @@ struct Args {
 #[derive(Clone)]
 struct AppState {
     index: Arc<Mutex<ServerlessEventIndex>>,
+    source_healthy: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,10 +223,16 @@ async fn main() -> anyhow::Result<()> {
     let index = Arc::new(Mutex::new(index));
     let source = SourceClient::new(args.stream_url.clone(), args.read_batch_records)
         .context("configure source client")?;
+    source
+        .probe()
+        .await
+        .context("source stream must be application/json with json-record-coordinates-v1")?;
+    let source_healthy = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let sync_task = tokio::spawn(sync_loop(
         source,
         Arc::clone(&index),
+        Arc::clone(&source_healthy),
         Duration::from_millis(args.poll_interval_ms),
         shutdown_rx.clone(),
     ));
@@ -238,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
         shutdown_rx,
     ));
 
-    let app = build_router(Arc::clone(&index));
+    let app = build_router(Arc::clone(&index), source_healthy);
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!(
         listen = %args.listen,
@@ -271,6 +280,7 @@ async fn main() -> anyhow::Result<()> {
 async fn sync_loop(
     source: SourceClient,
     index: Arc<Mutex<ServerlessEventIndex>>,
+    source_healthy: Arc<AtomicBool>,
     poll_interval: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -293,8 +303,11 @@ async fn sync_loop(
             continue;
         }
         match source.read_from(from_record).await {
-            Ok(SourceBatch::Records(records)) if records.is_empty() => {}
+            Ok(SourceBatch::Records(records)) if records.is_empty() => {
+                source_healthy.store(true, Ordering::Relaxed);
+            }
             Ok(SourceBatch::Records(records)) => {
+                source_healthy.store(true, Ordering::Relaxed);
                 let update = async {
                     let mut index = index.lock().await;
                     for envelope in records {
@@ -328,6 +341,7 @@ async fn sync_loop(
             Ok(SourceBatch::RetentionGap {
                 first_available_record,
             }) => {
+                source_healthy.store(true, Ordering::Relaxed);
                 let result = index
                     .lock()
                     .await
@@ -337,7 +351,10 @@ async fn sync_loop(
                     tracing::error!(%error, "event index cannot cover retained source history");
                 }
             }
-            Err(error) => tracing::warn!(%error, from_record, "source read failed; retrying"),
+            Err(error) => {
+                source_healthy.store(false, Ordering::Relaxed);
+                tracing::warn!(%error, from_record, "source read failed; retrying");
+            }
         }
         if wait_or_shutdown(poll_interval, &mut shutdown).await {
             return Ok(());
@@ -425,12 +442,35 @@ fn gc_wall_clock_now() -> SystemTime {
     SystemTime::UNIX_EPOCH
 }
 
-fn build_router(index: Arc<Mutex<ServerlessEventIndex>>) -> Router {
+fn build_router(
+    index: Arc<Mutex<ServerlessEventIndex>>,
+    source_healthy: Arc<AtomicBool>,
+) -> Router {
     Router::new()
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
         .route("/v1/events", get(query_events))
         .route("/v1/status", get(index_status))
         .route("/v1/status/resume", post(resume_index))
-        .with_state(AppState { index })
+        .with_state(AppState {
+            index,
+            source_healthy,
+        })
+}
+
+async fn livez() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+async fn readyz(State(state): State<AppState>) -> StatusCode {
+    if !state.source_healthy.load(Ordering::Relaxed) {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+    let mut index = state.index.lock().await;
+    match index.refresh().await {
+        Ok(()) if matches!(index.status(), IndexStatus::Ready) => StatusCode::NO_CONTENT,
+        Ok(()) | Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
 }
 
 fn is_deterministic_data_error(error: &IndexError) -> bool {
@@ -552,6 +592,8 @@ mod tests {
     )]
 
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     use axum::body::Body;
     use axum::body::to_bytes;
@@ -616,7 +658,7 @@ mod tests {
                 record: 1,
             })
             .await?;
-        let app = build_router(Arc::new(Mutex::new(index)));
+        let app = build_router(Arc::new(Mutex::new(index)), Arc::new(AtomicBool::new(true)));
         let response = app
             .oneshot(
                 Request::builder()
@@ -631,6 +673,45 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body)?;
         assert_eq!(body["records"][0]["record"], 1);
         assert_eq!(body["records"][1]["record"], 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn health_endpoints_separate_process_liveness_from_source_readiness() -> anyhow::Result<()>
+    {
+        let objects = TempDir::new()?;
+        let cache = TempDir::new()?;
+        let index = ServerlessEventIndex::open_fs(
+            FsObjectStore::new(objects.path())?,
+            cache.path(),
+            16 * 1024 * 1024,
+            EventIndexConfig {
+                source_id: "health-test".to_owned(),
+                flush_entries: 2,
+                row_group_entries: 2,
+                timestamp_field: "captured_at".to_owned(),
+            },
+        )
+        .await?;
+        let source_healthy = Arc::new(AtomicBool::new(true));
+        let app = build_router(Arc::new(Mutex::new(index)), Arc::clone(&source_healthy));
+
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/livez").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        source_healthy.store(false, Ordering::Relaxed);
+        let response = app
+            .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         Ok(())
     }
 }

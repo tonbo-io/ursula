@@ -1,0 +1,26 @@
+{{- if and .Values.indexer.enabled .Values.indexer.service.enabled -}}
+{{- $root := . -}}
+{{- range $instance := .Values.indexer.instances }}
+{{- $context := dict "root" $root "name" $instance.name -}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ursula.indexerFullname" $context }}
+  labels:
+    {{- include "ursula.indexerLabels" $context | nindent 4 }}
+  {{- with $root.Values.indexer.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $root.Values.indexer.service.type }}
+  ports:
+    - name: http
+      port: {{ $root.Values.indexer.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "ursula.indexerSelectorLabels" $context | nindent 4 }}
+{{- end }}
+{{- end }}

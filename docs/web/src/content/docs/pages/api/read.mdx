@@ -23,6 +23,22 @@ api: "GET /{bucket}/{stream}"
  Alias for `cursor`.
 </ParamField>
 
+<ParamField query="record" type="string">
+ For a JSON stream with Record Coordinates, start at a complete record boundary. Supply a zero-based ordinal or `now` for the current record tail. Mutually exclusive with `offset` and `tail_records`.
+</ParamField>
+
+<ParamField query="tail_records" type="number">
+ Start at the most recent retained records: `max(first_record, next_record - count)`. Mutually exclusive with `record` and `offset`.
+</ParamField>
+
+<ParamField query="max_records" type="number">
+ Maximum number of complete records to return. Requires `record` or `tail_records` and cannot be combined with `max_bytes`.
+</ParamField>
+
+<ParamField query="record_view" type="string">
+ Set to `envelope` with a record-aware start to return one `{record, value}` object per NDJSON line.
+</ParamField>
+
 <ParamField query="live" type="string">
  Live mode: `sse` for Server-Sent Events, `long-poll` for long-polling. Omit for catch-up read.
 </ParamField>
@@ -69,6 +85,8 @@ api: "GET /{bucket}/{stream}"
 
 Response headers include `Stream-Next-Offset`, `Stream-Cursor`, `ETag`, `Stream-Up-To-Date`, `Stream-Closed`, and `Content-Type`.
 
+Record-aware responses also advertise `json-record-coordinates-v1` in `Stream-Extensions` and include `Stream-Record-First`, `Stream-Record-Start`, and `Stream-Record-Next`. Continue with `record=<Stream-Record-Next>`. A record below `Stream-Record-First` returns `410`; a record beyond the current tail returns `400`.
+
 Streams written with `Content-Type: application/json` are returned as newline-delimited JSON with response `Content-Type: application/x-ndjson`. `max_bytes` applies to the encoded byte stream, so a response can end mid-line. Resume from `Stream-Next-Offset` and buffer any incomplete trailing line before parsing. `HEAD` reports the configured stream content type; read responses report the wire representation.
 
 ## SSE event format
@@ -91,8 +109,20 @@ curl 'http://127.0.0.1:4437/demo/hello?offset=42&live=long-poll'
 ```bash SSE tail
 curl 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
 ```
+
+```bash Read complete JSON records
+curl -i 'http://127.0.0.1:4437/demo/hello?record=42&max_records=100'
+```
+
+```bash Read the latest JSON records with ordinals
+curl 'http://127.0.0.1:4437/demo/hello?tail_records=100&record_view=envelope'
+```
+
+```bash Tail future JSON records over SSE
+curl -N 'http://127.0.0.1:4437/demo/hello?record=now&record_view=envelope&live=sse'
+```
 </RequestExample>
 
 <Info>
-See [read modes](/docs/concepts/read-modes), [binary SSE](/docs/concepts/binary-sse), and [offsets](/docs/concepts/offsets) for more details.
+See [read modes](/docs/concepts/read-modes), [Record Coordinates](/docs/concepts/record-coordinates), [binary SSE](/docs/concepts/binary-sse), and [offsets](/docs/concepts/offsets) for more details.
 </Info>

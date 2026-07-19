@@ -35,6 +35,10 @@ api: "POST /{bucket}/{stream}"
  Producer sequence number. Starts at `0` for a new epoch and must increase by exactly `1` per append. Exact `(epoch, seq)` duplicates are silently deduplicated. Max value `2^53 − 1`.
 </ParamField>
 
+<ParamField header="Stream-Record-Match" type="string">
+ For JSON streams with Record Coordinates, require the current record tail to equal this ordinal. A mismatch returns `412` with the current `Stream-Record-Next`.
+</ParamField>
+
 <ParamField body="body" type="binary" required>
  The bytes to append. Must not be empty unless `Stream-Closed: true` is set (close-only request).
 </ParamField>
@@ -48,9 +52,12 @@ api: "POST /{bucket}/{stream}"
 | `400` | Empty body without `Stream-Closed: true`, missing content type, or bad JSON. |
 | `404` | Stream not found. |
 | `409` | Stream is already closed, or sequence/producer conflict. |
+| `412` | `Stream-Record-Match` did not match the current JSON record tail. |
 | `503` | Cold-write backpressure. Retry after the duration in `Retry-After`. |
 
 Response headers include `Stream-Next-Offset` (always). When a `Producer-Id` was supplied, the server echoes the accepted `Producer-Epoch` and `Producer-Seq` so the producer can confirm what was durably recorded. `Stream-Closed: true` is set if this request closed the stream. `ETag` is set on reads only, not on appends.
+
+For an `application/json` stream advertising `json-record-coordinates-v1`, the response also includes `Stream-Record-Start` and `Stream-Record-Next`. A JSON object creates one record; a top-level array creates one record per element. The returned half-open range identifies exactly the records created by this request.
 
 <RequestExample>
 ```bash Append binary
@@ -60,9 +67,15 @@ curl -X POST http://127.0.0.1:4437/demo/hello \
 ```
 
 ```bash Append JSON
-curl -X POST http://127.0.0.1:4437/demo/hello \
+curl -i -X POST http://127.0.0.1:4437/demo/hello \
   -H 'Content-Type: application/json' \
-  --data-binary '{"event": "click", "ts": 1711234567}'
+  --data-binary '{"captured_at":"2026-07-18T10:30:00.100Z","event":"click"}'
+```
+
+```bash Append multiple JSON records
+curl -i -X POST http://127.0.0.1:4437/demo/hello \
+  -H 'Content-Type: application/json' \
+  --data-binary '[{"event":"click"},{"event":"navigation"}]'
 ```
 
 ```bash Close a stream
@@ -74,3 +87,7 @@ curl -X POST http://127.0.0.1:4437/demo/hello \
 <Note>
 Appends to JSON streams are validated and normalized. The server may coalesce multiple concurrent appends into a single batch for performance.
 </Note>
+
+<Info>
+See [Record Coordinates](/docs/concepts/record-coordinates) for record ranges, complete-record reads, and the difference between committed record order and client event time.
+</Info>
