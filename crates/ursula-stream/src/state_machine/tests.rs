@@ -215,6 +215,79 @@ fn snapshot_record_trim_failure_does_not_mutate_stream_state() {
     assert_eq!(machine.snapshot(), before);
 }
 
+#[test]
+fn inline_json_create_rejects_noncanonical_initial_payload() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    let stream_id = stream("invalid-inline-json");
+
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateStream {
+            stream_id: stream_id.clone(),
+            content_type: "application/json".to_owned(),
+            initial_payload: br#"{"missing":"newline"}"#.to_vec(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            attrs: None,
+            now_ms: 0,
+        }),
+        StreamResponse::Error {
+            code: StreamErrorCode::InvalidRecordBoundaries,
+            ..
+        }
+    ));
+    assert!(machine.stream_metadata(&stream_id).is_none());
+}
+
+#[test]
+fn legacy_external_json_append_without_boundaries_is_rejected_atomically() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    let stream_id = stream("legacy-external-json");
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateStream {
+            stream_id: stream_id.clone(),
+            content_type: "application/json".to_owned(),
+            initial_payload: b"{\"id\":1}\n".to_vec(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            attrs: None,
+            now_ms: 0,
+        }),
+        StreamResponse::Created { .. }
+    ));
+    let before = machine.snapshot();
+
+    assert!(matches!(
+        machine.apply(StreamCommand::AppendExternal {
+            stream_id,
+            content_type: Some("application/json".to_owned()),
+            payload: ExternalPayloadRef {
+                s3_path: "legacy/append.json".to_owned(),
+                payload_len: 9,
+                object_size: 9,
+            },
+            record_ends: Vec::new(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            now_ms: 1,
+            record_match: None,
+        }),
+        StreamResponse::Error {
+            code: StreamErrorCode::InvalidRecordBoundaries,
+            ..
+        }
+    ));
+    assert_eq!(machine.snapshot(), before);
+}
+
 fn producer(id: &str, epoch: u64, seq: u64) -> ProducerRequest {
     ProducerRequest {
         producer_id: id.to_owned(),

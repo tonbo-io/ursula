@@ -14,6 +14,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::get;
+use axum::routing::post;
 use chrono::DateTime;
 use clap::ArgGroup;
 use clap::Parser;
@@ -109,7 +110,9 @@ impl IntoResponse for ApiError {
             IndexError::InvalidQuery | IndexError::InvalidTimestamp { .. } => {
                 StatusCode::BAD_REQUEST
             }
-            IndexError::RetentionGap { .. } | IndexError::Blocked { .. } => StatusCode::CONFLICT,
+            IndexError::RetentionGap { .. }
+            | IndexError::Blocked { .. }
+            | IndexError::CannotResume(_) => StatusCode::CONFLICT,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (
@@ -229,6 +232,9 @@ async fn sync_loop(
                     for envelope in records {
                         let record = envelope.record;
                         if let Err(error) = index.ingest_envelope(envelope).await {
+                            if !is_deterministic_data_error(&error) {
+                                return Err(error);
+                            }
                             let reason = error.to_string();
                             let blocked_record = index.indexed_through_record();
                             index.mark_blocked(blocked_record, reason.clone()).await?;
@@ -246,7 +252,12 @@ async fn sync_loop(
                 .await;
                 match update {
                     Ok(()) => continue,
-                    Err(error) => tracing::error!(%error, "event index source processing blocked"),
+                    Err(error) if matches!(error, IndexError::Blocked { .. }) => {
+                        tracing::error!(%error, "event index source processing blocked");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "event index update failed transiently; retrying");
+                    }
                 }
             }
             Ok(SourceBatch::RetentionGap {
@@ -282,7 +293,28 @@ fn build_router(index: Arc<Mutex<ServerlessEventIndex>>) -> Router {
     Router::new()
         .route("/v1/events", get(query_events))
         .route("/v1/status", get(index_status))
+        .route("/v1/status/resume", post(resume_index))
         .with_state(AppState { index })
+}
+
+fn is_deterministic_data_error(error: &IndexError) -> bool {
+    matches!(
+        error,
+        IndexError::InvalidTimestamp { .. }
+            | IndexError::UnexpectedRecord { .. }
+            | IndexError::RecordConflict { .. }
+    )
+}
+
+async fn resume_index(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let mut index = state.index.lock().await;
+    index.clear_blocked().await.map_err(ApiError)?;
+    Ok(Json(StatusBody {
+        status: index.status().clone(),
+        indexed_through_record: index.indexed_through_record(),
+        durable_through_record: index.durable_through_record(),
+        parts: index.part_count(),
+    }))
 }
 
 async fn index_status(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
@@ -395,9 +427,30 @@ mod tests {
     use ursula_index::EventEntry;
     use ursula_index::EventIndexConfig;
     use ursula_index::FsObjectStore;
+    use ursula_index::IndexError;
     use ursula_index::ServerlessEventIndex;
 
     use super::build_router;
+    use super::is_deterministic_data_error;
+
+    #[test]
+    fn only_deterministic_source_data_errors_block_the_index() {
+        assert!(is_deterministic_data_error(&IndexError::InvalidTimestamp {
+            record: 7,
+            field: "captured_at".to_owned(),
+        }));
+        assert!(is_deterministic_data_error(&IndexError::UnexpectedRecord {
+            expected: 7,
+            actual: 8,
+        }));
+        assert!(is_deterministic_data_error(&IndexError::RecordConflict {
+            record: 7,
+        }));
+        assert!(!is_deterministic_data_error(&IndexError::PublishConflict));
+        assert!(!is_deterministic_data_error(&IndexError::ObjectStore(
+            "temporary outage".to_owned(),
+        )));
+    }
 
     #[tokio::test]
     async fn http_query_exposes_sorted_records_and_watermarks() -> anyhow::Result<()> {

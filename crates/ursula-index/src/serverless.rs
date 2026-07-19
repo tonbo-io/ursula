@@ -377,6 +377,17 @@ impl ServerlessEventIndex {
             .await
     }
 
+    pub async fn clear_blocked(&mut self) -> Result<(), IndexError> {
+        self.refresh().await?;
+        match self.published.manifest.status {
+            IndexStatus::Ready => Ok(()),
+            IndexStatus::Blocked { .. } => self.publish_status(IndexStatus::Ready).await,
+            IndexStatus::RetentionGap { .. } => Err(IndexError::CannotResume(
+                "a retention gap requires rebuilding the index",
+            )),
+        }
+    }
+
     pub async fn query(
         &mut self,
         from_ms: i64,

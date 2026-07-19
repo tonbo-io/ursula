@@ -15,6 +15,18 @@ pub struct StreamRecordRange {
     pub next_record: u64,
 }
 
+#[derive(Debug)]
+pub(crate) struct PreparedRecordAppend {
+    range: StreamRecordRange,
+    record_offsets: Vec<u64>,
+}
+
+impl PreparedRecordAppend {
+    pub(crate) fn range(&self) -> StreamRecordRange {
+        self.range
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordIndexError {
     InvalidBoundaries,
@@ -94,6 +106,16 @@ impl StreamRecordIndex {
         payload_len: u64,
         relative_ends: &[u64],
     ) -> Result<StreamRecordRange, RecordIndexError> {
+        let prepared = self.prepare_append(base_offset, payload_len, relative_ends)?;
+        Ok(self.commit_append(prepared))
+    }
+
+    pub(crate) fn prepare_append(
+        &self,
+        base_offset: u64,
+        payload_len: u64,
+        relative_ends: &[u64],
+    ) -> Result<PreparedRecordAppend, RecordIndexError> {
         validate_relative_ends(payload_len, relative_ends)?;
         let record_start = self.range()?.next_record;
         let appended =
@@ -117,11 +139,18 @@ impl StreamRecordIndex {
             starts.push(start_offset);
             previous_end = *end;
         }
-        self.record_offsets.extend(starts);
-        Ok(StreamRecordRange {
-            first_record: record_start,
-            next_record: record_next,
+        Ok(PreparedRecordAppend {
+            range: StreamRecordRange {
+                first_record: record_start,
+                next_record: record_next,
+            },
+            record_offsets: starts,
         })
+    }
+
+    pub(crate) fn commit_append(&mut self, prepared: PreparedRecordAppend) -> StreamRecordRange {
+        self.record_offsets.extend(prepared.record_offsets);
+        prepared.range
     }
 
     pub fn offset_for(&self, record: u64, tail_offset: u64) -> Result<u64, RecordIndexError> {
