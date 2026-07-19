@@ -112,6 +112,28 @@ fn record_coordinate_benches(c: &mut Criterion) {
             BatchSize::LargeInput,
         );
     });
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("append_json_record_to_100k_index", |b| {
+        b.iter_batched(
+            || setup_record_machine(RECORD_COUNT),
+            |(mut machine, stream_id)| {
+                let response = machine.apply(StreamCommand::Append {
+                    stream_id,
+                    content_type: Some("application/json".to_owned()),
+                    payload: JSON_RECORD.to_vec(),
+                    close_after: false,
+                    stream_seq: None,
+                    producer: None,
+                    now_ms: 0,
+                    record_match: None,
+                });
+                assert!(matches!(response, StreamResponse::Appended { .. }));
+                black_box(machine);
+            },
+            BatchSize::LargeInput,
+        );
+    });
     group.finish();
 }
 

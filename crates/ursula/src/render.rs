@@ -655,6 +655,12 @@ pub(crate) fn long_poll_no_content_response(
     insert_default_response_headers(&mut headers);
     insert_offset(&mut headers, response.next_offset);
     insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
+    if let (Some(retained_record_range), Some(record_range)) =
+        (response.retained_record_range, response.record_range)
+    {
+        insert_record_head_headers(&mut headers, retained_record_range);
+        insert_record_operation_headers(&mut headers, record_range);
+    }
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
     } else {

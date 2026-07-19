@@ -47,6 +47,7 @@ pub use model::StreamReadPlan;
 pub use model::StreamReadSegment;
 pub use model::StreamStatus;
 pub use model::StreamVisibleSnapshot;
+pub(crate) use record_index::PreparedRecordAppend;
 pub use record_index::RecordIndexError;
 pub use record_index::StreamRecordIndex;
 pub use record_index::StreamRecordRange;
