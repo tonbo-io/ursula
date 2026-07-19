@@ -9,6 +9,7 @@ use ursula_index::EventIndexConfig;
 use ursula_index::FsObjectStore;
 use ursula_index::IndexStatus;
 use ursula_index::ServerlessEventIndex;
+use ursula_index::SourceEnvelope;
 
 fn config() -> EventIndexConfig {
     EventIndexConfig {
@@ -17,6 +18,183 @@ fn config() -> EventIndexConfig {
         row_group_entries: 16,
         timestamp_field: "captured_at".to_owned(),
     }
+}
+
+fn envelopes(start: u64, timestamps: &[i64]) -> Vec<SourceEnvelope> {
+    timestamps
+        .iter()
+        .enumerate()
+        .map(|(index, timestamp)| SourceEnvelope {
+            record: start.saturating_add(u64::try_from(index).unwrap_or(u64::MAX)),
+            value: serde_json::json!({
+                "captured_at": chrono::DateTime::from_timestamp_millis(*timestamp)
+                    .map(|value| value.to_rfc3339())
+                    .unwrap_or_default()
+            }),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn out_of_order_record_segments_advance_only_the_contiguous_watermark() -> anyhow::Result<()>
+{
+    let object_dir = TempDir::new()?;
+    let cache_a = TempDir::new()?;
+    let cache_b = TempDir::new()?;
+    let store = FsObjectStore::new(object_dir.path())?;
+    let mut first =
+        ServerlessEventIndex::open_fs(store.clone(), cache_a.path(), 16 * 1024 * 1024, config())
+            .await?;
+    let mut second =
+        ServerlessEventIndex::open_fs(store.clone(), cache_b.path(), 16 * 1024 * 1024, config())
+            .await?;
+
+    second
+        .commit_envelopes(2, envelopes(2, &[3_000, 2_000]))
+        .await?;
+    assert_eq!(second.durable_through_record(), 0);
+    assert_eq!(second.completed_record_ranges(), &[
+        ursula_index::CompletedRecordRange {
+            start_record: 2,
+            end_record: 4,
+        }
+    ]);
+
+    first
+        .commit_envelopes(0, envelopes(0, &[4_000, 1_000]))
+        .await?;
+    first.refresh().await?;
+    assert_eq!(first.durable_through_record(), 4);
+    assert_eq!(first.completed_record_ranges(), &[
+        ursula_index::CompletedRecordRange {
+            start_record: 0,
+            end_record: 4,
+        }
+    ]);
+    let result = first.query(0, 5_000, None, None, 10).await?;
+    assert_eq!(result.records.len(), 4);
+    assert_eq!(result.durable_through_record, 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn workers_claim_distinct_ranges_and_publish_out_of_order() -> anyhow::Result<()> {
+    let object_dir = TempDir::new()?;
+    let cache_a = TempDir::new()?;
+    let cache_b = TempDir::new()?;
+    let store = FsObjectStore::new(object_dir.path())?;
+    let mut first =
+        ServerlessEventIndex::open_fs(store.clone(), cache_a.path(), 16 * 1024 * 1024, config())
+            .await?;
+    let mut second =
+        ServerlessEventIndex::open_fs(store, cache_b.path(), 16 * 1024 * 1024, config()).await?;
+
+    let first_claim = first
+        .claim_next_segment(6, 2, "worker-a", 1_000, 60_000)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("first range was not claimed"))?;
+    let second_claim = second
+        .claim_next_segment(6, 2, "worker-b", 1_000, 60_000)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("second range was not claimed"))?;
+    assert_eq!((first_claim.start_record, first_claim.end_record), (0, 2));
+    assert_eq!((second_claim.start_record, second_claim.end_record), (2, 4));
+
+    second
+        .finish_segment(&second_claim, envelopes(2, &[3_000, 2_000]))
+        .await?;
+    assert_eq!(second.durable_through_record(), 0);
+    first
+        .finish_segment(&first_claim, envelopes(0, &[4_000, 1_000]))
+        .await?;
+    assert_eq!(first.durable_through_record(), 4);
+
+    let third_claim = second
+        .claim_next_segment(6, 2, "worker-b", 1_001, 60_000)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("third range was not claimed"))?;
+    assert_eq!((third_claim.start_record, third_claim.end_record), (4, 6));
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_workers_split_one_hot_stream_into_distinct_ranges() -> anyhow::Result<()> {
+    let object_dir = TempDir::new()?;
+    let caches = [
+        TempDir::new()?,
+        TempDir::new()?,
+        TempDir::new()?,
+        TempDir::new()?,
+    ];
+    let store = FsObjectStore::new(object_dir.path())?;
+    let mut first =
+        ServerlessEventIndex::open_fs(store.clone(), caches[0].path(), 16 * 1024 * 1024, config())
+            .await?;
+    let mut second =
+        ServerlessEventIndex::open_fs(store.clone(), caches[1].path(), 16 * 1024 * 1024, config())
+            .await?;
+    let mut third =
+        ServerlessEventIndex::open_fs(store.clone(), caches[2].path(), 16 * 1024 * 1024, config())
+            .await?;
+    let mut fourth =
+        ServerlessEventIndex::open_fs(store, caches[3].path(), 16 * 1024 * 1024, config()).await?;
+
+    let claims = tokio::join!(
+        first.claim_next_segment(8, 2, "worker-a", 1_000, 60_000),
+        second.claim_next_segment(8, 2, "worker-b", 1_000, 60_000),
+        third.claim_next_segment(8, 2, "worker-c", 1_000, 60_000),
+        fourth.claim_next_segment(8, 2, "worker-d", 1_000, 60_000),
+    );
+    let mut ranges = [claims.0?, claims.1?, claims.2?, claims.3?]
+        .into_iter()
+        .map(|claim| {
+            claim
+                .map(|claim| (claim.start_record, claim.end_record))
+                .ok_or_else(|| anyhow::anyhow!("worker did not claim a hot-stream range"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ranges.sort_unstable();
+    assert_eq!(ranges, vec![(0, 2), (2, 4), (4, 6), (6, 8)]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_expired_long_claim_can_commit_around_an_already_published_prefix() -> anyhow::Result<()>
+{
+    let object_dir = TempDir::new()?;
+    let cache_a = TempDir::new()?;
+    let cache_b = TempDir::new()?;
+    let store = FsObjectStore::new(object_dir.path())?;
+    let mut short_reader =
+        ServerlessEventIndex::open_fs(store.clone(), cache_a.path(), 16 * 1024 * 1024, config())
+            .await?;
+    let mut long_reader =
+        ServerlessEventIndex::open_fs(store, cache_b.path(), 16 * 1024 * 1024, config()).await?;
+
+    short_reader
+        .commit_envelopes(0, envelopes(0, &[1_000, 2_000]))
+        .await?;
+    long_reader
+        .commit_envelopes(0, envelopes(0, &[1_000, 2_000, 3_000, 4_000]))
+        .await?;
+    assert_eq!(long_reader.durable_through_record(), 4);
+    assert_eq!(
+        long_reader
+            .query(0, 5_000, None, None, 10)
+            .await?
+            .records
+            .len(),
+        4
+    );
+
+    let error = long_reader
+        .commit_envelopes(0, envelopes(0, &[9_000, 2_000, 3_000, 4_000]))
+        .await
+        .expect_err("a retried covered record must match its committed timestamp");
+    assert!(matches!(error, ursula_index::IndexError::RecordConflict {
+        record: 0
+    }));
+    Ok(())
 }
 
 #[tokio::test]

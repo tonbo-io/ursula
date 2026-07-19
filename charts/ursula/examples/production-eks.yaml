@@ -73,14 +73,10 @@ gateway:
 indexer:
   enabled: true
   replicaCount: 2
-  activeActive: true
+  s3:
+    prefix: indexes
   serviceAccount:
     annotations:
       eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-index
-  instances:
-    - name: browser-telemetry
-      streamUrl: http://ursula-gateway.ursula.svc.cluster.local:4437/telemetry/events
-      s3:
-        prefix: indexes/browser-telemetry
   podDisruptionBudget:
     enabled: true

@@ -4,37 +4,30 @@
 {{- $replicas := .Values.indexer.replicaCount | int -}}
 {{- $hasS3Credentials := include "ursula.hasS3Credentials" . -}}
 {{- $s3CredentialSecret := include "ursula.s3SecretName" . -}}
-{{- range $instance := .Values.indexer.instances }}
-{{- $context := dict "root" $root "name" $instance.name -}}
-{{- $bucket := default $root.Values.s3.bucket $instance.s3.bucket -}}
-{{- $region := default $root.Values.s3.region $instance.s3.region -}}
-{{- $endpoint := default $root.Values.s3.endpoint $instance.s3.endpoint -}}
+{{- $bucket := default $root.Values.s3.bucket $root.Values.indexer.s3.bucket -}}
+{{- $region := default $root.Values.s3.region $root.Values.indexer.s3.region -}}
+{{- $endpoint := default $root.Values.s3.endpoint $root.Values.indexer.s3.endpoint -}}
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "ursula.indexerFullname" $context }}
+  name: {{ include "ursula.indexerFullname" $root }}
   labels:
-    {{- include "ursula.indexerLabels" $context | nindent 4 }}
+    {{- include "ursula.indexerLabels" $root | nindent 4 }}
 spec:
   replicas: {{ $replicas }}
-  {{- if $root.Values.indexer.activeActive }}
   strategy:
     type: RollingUpdate
     rollingUpdate:
       maxUnavailable: 1
       maxSurge: 1
-  {{- else }}
-  strategy:
-    type: Recreate
-  {{- end }}
   selector:
     matchLabels:
-      {{- include "ursula.indexerSelectorLabels" $context | nindent 6 }}
+      {{- include "ursula.indexerSelectorLabels" $root | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "ursula.indexerSelectorLabels" $context | nindent 8 }}
+        {{- include "ursula.indexerSelectorLabels" $root | nindent 8 }}
         {{- with $root.Values.indexer.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -62,12 +55,10 @@ spec:
           command:
             - /usr/local/bin/ursula-indexer
           args:
-            - --stream-url
-            - {{ $instance.streamUrl | quote }}
             - --s3-bucket
             - {{ $bucket | quote }}
             - --s3-prefix
-            - {{ $instance.s3.prefix | trimAll "/" | quote }}
+            - {{ $root.Values.indexer.s3.prefix | trimAll "/" | quote }}
             - --cache-dir
             - /var/cache/ursula-index
             - --cache-max-bytes
@@ -76,14 +67,20 @@ spec:
             - {{ $root.Values.indexer.cache.maintenanceMaxBytes | int64 | quote }}
             - --listen
             - {{ printf "0.0.0.0:%d" ($root.Values.indexer.ports.http | int) | quote }}
-            - --timestamp-field
-            - {{ $root.Values.indexer.timestampField | quote }}
             - --flush-entries
             - {{ $root.Values.indexer.ingest.flushEntries | int64 | quote }}
             - --row-group-entries
             - {{ $root.Values.indexer.ingest.rowGroupEntries | int64 | quote }}
             - --read-batch-records
             - {{ $root.Values.indexer.ingest.readBatchRecords | int64 | quote }}
+            - --segment-records
+            - {{ $root.Values.indexer.workers.segmentRecords | int64 | quote }}
+            - --worker-concurrency
+            - {{ $root.Values.indexer.workers.concurrency | quote }}
+            - --segment-lease-ms
+            - {{ $root.Values.indexer.workers.leaseMs | int64 | quote }}
+            - --worker-id
+            - $(POD_NAME)
             - --poll-interval-ms
             - {{ $root.Values.indexer.ingest.pollIntervalMs | quote }}
             - --compact-parts
@@ -116,6 +113,10 @@ spec:
           env:
             - name: RUST_LOG
               value: {{ $root.Values.indexer.rustLog | quote }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             {{- if $region }}
             - name: AWS_REGION
               value: {{ $region | quote }}
@@ -204,7 +205,7 @@ spec:
               podAffinityTerm:
                 labelSelector:
                   matchLabels:
-                    {{- include "ursula.indexerSelectorLabels" $context | nindent 20 }}
+                    {{- include "ursula.indexerSelectorLabels" $root | nindent 20 }}
                 topologyKey: kubernetes.io/hostname
       {{- end }}
       {{- with $root.Values.indexer.scheduling.tolerations }}
@@ -221,7 +222,6 @@ spec:
           whenUnsatisfiable: ScheduleAnyway
           labelSelector:
             matchLabels:
-              {{- include "ursula.indexerSelectorLabels" $context | nindent 14 }}
+              {{- include "ursula.indexerSelectorLabels" $root | nindent 14 }}
       {{- end }}
-{{- end }}
 {{- end }}

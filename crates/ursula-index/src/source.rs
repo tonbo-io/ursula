@@ -12,6 +12,12 @@ pub enum SourceBatch {
     RetentionGap { first_available_record: u64 },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourceRecordRange {
+    pub first_record: u64,
+    pub next_record: u64,
+}
+
 #[derive(Clone)]
 pub struct SourceClient {
     client: reqwest::Client,
@@ -32,11 +38,22 @@ impl SourceClient {
     }
 
     pub async fn read_from(&self, record: u64) -> Result<SourceBatch, IndexError> {
+        self.read_range(record, self.max_records).await
+    }
+
+    pub async fn read_range(
+        &self,
+        record: u64,
+        max_records: usize,
+    ) -> Result<SourceBatch, IndexError> {
+        if max_records == 0 {
+            return Err(IndexError::InvalidConfig("max_records must be positive"));
+        }
         let mut url = self.stream_url.clone();
         url.query_pairs_mut()
             .append_pair("record", &record.to_string())
             .append_pair("record_view", "envelope")
-            .append_pair("max_records", &self.max_records.to_string());
+            .append_pair("max_records", &max_records.to_string());
         let response = self.client.get(url).send().await?;
         if response.status() == StatusCode::GONE {
             let first_available_record = response
@@ -66,6 +83,11 @@ impl SourceClient {
     }
 
     pub async fn probe(&self) -> Result<(), IndexError> {
+        let _range = self.record_range().await?;
+        Ok(())
+    }
+
+    pub async fn record_range(&self) -> Result<SourceRecordRange, IndexError> {
         let response = self.client.head(self.stream_url.clone()).send().await?;
         if !response.status().is_success() {
             return Err(IndexError::SourceStatus(response.status().as_u16()));
@@ -84,8 +106,31 @@ impl SourceClient {
         if !supports_record_coordinates(response.headers()) {
             return Err(IndexError::MissingRecordCoordinates);
         }
-        Ok(())
+        let first_record = record_header(response.headers(), "stream-record-first")?;
+        let next_record = record_header(response.headers(), "stream-record-next")?;
+        if first_record > next_record {
+            return Err(IndexError::InvalidSourceResponse(
+                "source record range is reversed",
+            ));
+        }
+        Ok(SourceRecordRange {
+            first_record,
+            next_record,
+        })
     }
+}
+
+fn record_header(
+    headers: &reqwest::header::HeaderMap,
+    name: &'static str,
+) -> Result<u64, IndexError> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .ok_or(IndexError::InvalidSourceResponse(
+            "source HEAD omitted a record range header",
+        ))
 }
 
 fn supports_record_coordinates(headers: &reqwest::header::HeaderMap) -> bool {

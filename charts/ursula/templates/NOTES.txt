@@ -14,14 +14,11 @@ Gateway entrypoint Service:
 {{- end }}
 {{- if .Values.indexer.enabled }}
 
-Event-time indexers:
-{{- $root := . }}
-{{- range $instance := .Values.indexer.instances }}
-  {{ $instance.name }}: {{ include "ursula.indexerFullname" (dict "root" $root "name" $instance.name) }}.{{ $root.Release.Namespace }}.svc.{{ $root.Values.global.clusterDomain }}:{{ $root.Values.indexer.service.port }}
-{{- end }}
+Event-time indexer worker pool:
+  {{ include "ursula.indexerFullname" . }}.{{ .Release.Namespace }}.svc.{{ .Values.global.clusterDomain }}:{{ .Values.indexer.service.port }}
 
-The source streams must already exist as application/json streams with the json-record-coordinates-v1 extension before indexer pods start.
-Keep the indexer Services internal unless an authenticated ingress exposes only the query API; /v1/status/resume is an administrative endpoint.
+Register application/json source streams dynamically with PUT /v1/indexes/{id}; no Helm upgrade is required when users create streams.
+Keep the indexer Service internal unless an authenticated ingress exposes query routes; registration, deletion, and status/resume are administrative endpoints.
 {{- end }}
 
 Port-forward locally:

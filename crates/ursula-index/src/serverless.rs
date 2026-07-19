@@ -1,10 +1,14 @@
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
 use std::io::Write;
+use std::ops::Deref;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -25,10 +29,26 @@ use crate::object_store::S3ObjectStore;
 use crate::object_store::digest;
 use crate::part;
 
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 const CURRENT_KEY: &str = "CURRENT";
 const MAX_PUBLISH_ATTEMPTS: usize = 8;
 const EVENT_TIME_PARTITION_MS: i64 = 24 * 60 * 60 * 1_000;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CompletedRecordRange {
+    pub start_record: u64,
+    pub end_record: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RecordSegmentLease {
+    pub start_record: u64,
+    pub end_record: u64,
+    pub worker_id: String,
+    pub expires_at_ms: u64,
+    #[serde(skip)]
+    key: String,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PartMeta {
@@ -55,6 +75,7 @@ struct Manifest {
     source_id: String,
     generation: u64,
     durable_through_record: u64,
+    completed_record_ranges: Vec<CompletedRecordRange>,
     status: IndexStatus,
     parts: Vec<PartMeta>,
 }
@@ -72,6 +93,7 @@ impl Manifest {
             source_id,
             generation: 0,
             durable_through_record: 0,
+            completed_record_ranges: Vec::new(),
             status: IndexStatus::Ready,
             parts: Vec::new(),
         }
@@ -98,10 +120,48 @@ pub struct GarbageCollectionReport {
     pub deleted_manifests: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct LocalCache {
     root: PathBuf,
     max_bytes: u64,
+    pins: Arc<Mutex<HashMap<PathBuf, usize>>>,
+}
+
+struct MaterializedPart {
+    path: PathBuf,
+    pins: Arc<Mutex<HashMap<PathBuf, usize>>>,
+}
+
+impl Deref for MaterializedPart {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl Drop for MaterializedPart {
+    fn drop(&mut self) {
+        let Ok(mut pins) = self.pins.lock() else {
+            return;
+        };
+        let Some(count) = pins.get_mut(&self.path) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            pins.remove(&self.path);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EventIndexCache(LocalCache);
+
+impl EventIndexCache {
+    pub fn new(root: impl AsRef<Path>, max_bytes: u64) -> Result<Self, IndexError> {
+        Ok(Self(LocalCache::new(root, max_bytes)?))
+    }
 }
 
 impl LocalCache {
@@ -113,20 +173,30 @@ impl LocalCache {
         }
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
-        Ok(Self { root, max_bytes })
+        Ok(Self {
+            root,
+            max_bytes,
+            pins: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     async fn materialize(
         &self,
         store: &ObjectStore,
         meta: &PartMeta,
-    ) -> Result<PathBuf, IndexError> {
+    ) -> Result<MaterializedPart, IndexError> {
         fs::create_dir_all(&self.root)?;
         let path = self
             .root
             .join(format!("{}.parquet", digest(meta.key.as_bytes())));
-        if valid_cached_part(&path, meta)? {
-            return Ok(path);
+        {
+            let mut pins = self
+                .pins
+                .lock()
+                .map_err(|_error| IndexError::LockPoisoned)?;
+            if valid_cached_part(&path, meta)? {
+                return Ok(pin_locked(&mut pins, path, &self.pins));
+            }
         }
         let object = store
             .get(&meta.key)
@@ -147,17 +217,29 @@ impl LocalCache {
         if digest(&object.bytes) != expected_hash {
             return Err(IndexError::ObjectHashMismatch(meta.key.clone()));
         }
-        self.make_room(meta.bytes, Some(&path))?;
+        let mut pins = self
+            .pins
+            .lock()
+            .map_err(|_error| IndexError::LockPoisoned)?;
+        if valid_cached_part(&path, meta)? {
+            return Ok(pin_locked(&mut pins, path, &self.pins));
+        }
+        self.make_room(meta.bytes, Some(&path), &pins)?;
         let temporary = self.root.join(format!("{}.tmp", digest(&object.bytes)));
         let mut file = File::create(&temporary)?;
         file.write_all(&object.bytes)?;
         file.sync_all()?;
         fs::rename(&temporary, &path)?;
         part::validate(&path)?;
-        Ok(path)
+        Ok(pin_locked(&mut pins, path, &self.pins))
     }
 
-    fn make_room(&self, incoming: u64, protected: Option<&Path>) -> Result<(), IndexError> {
+    fn make_room(
+        &self,
+        incoming: u64,
+        protected: Option<&Path>,
+        pins: &HashMap<PathBuf, usize>,
+    ) -> Result<(), IndexError> {
         if incoming > self.max_bytes {
             return Err(IndexError::CacheCapacity {
                 capacity: self.max_bytes,
@@ -174,6 +256,9 @@ impl LocalCache {
             }
             let metadata = entry.metadata()?;
             total = total.saturating_add(metadata.len());
+            if pins.contains_key(&path) {
+                continue;
+            }
             files.push((
                 metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
                 metadata.len(),
@@ -191,7 +276,26 @@ impl LocalCache {
                 Err(error) => return Err(error.into()),
             }
         }
+        if total.saturating_add(incoming) > self.max_bytes {
+            return Err(IndexError::CacheCapacity {
+                capacity: self.max_bytes,
+                object_size: incoming,
+            });
+        }
         Ok(())
+    }
+}
+
+fn pin_locked(
+    pins: &mut HashMap<PathBuf, usize>,
+    path: PathBuf,
+    shared_pins: &Arc<Mutex<HashMap<PathBuf, usize>>>,
+) -> MaterializedPart {
+    let count = pins.entry(path.clone()).or_default();
+    *count = count.saturating_add(1);
+    MaterializedPart {
+        path,
+        pins: Arc::clone(shared_pins),
     }
 }
 
@@ -210,7 +314,16 @@ impl ServerlessEventIndex {
         cache_max_bytes: u64,
         config: EventIndexConfig,
     ) -> Result<Self, IndexError> {
-        Self::open(store.into(), cache_dir, cache_max_bytes, config).await
+        let cache = EventIndexCache::new(cache_dir, cache_max_bytes)?;
+        Self::open(store.into(), cache, config).await
+    }
+
+    pub async fn open_fs_with_cache(
+        store: FsObjectStore,
+        cache: EventIndexCache,
+        config: EventIndexConfig,
+    ) -> Result<Self, IndexError> {
+        Self::open(store.into(), cache, config).await
     }
 
     pub async fn open_s3(
@@ -219,22 +332,29 @@ impl ServerlessEventIndex {
         cache_max_bytes: u64,
         config: EventIndexConfig,
     ) -> Result<Self, IndexError> {
-        Self::open(store.into(), cache_dir, cache_max_bytes, config).await
+        let cache = EventIndexCache::new(cache_dir, cache_max_bytes)?;
+        Self::open(store.into(), cache, config).await
+    }
+
+    pub async fn open_s3_with_cache(
+        store: S3ObjectStore,
+        cache: EventIndexCache,
+        config: EventIndexConfig,
+    ) -> Result<Self, IndexError> {
+        Self::open(store.into(), cache, config).await
     }
 
     async fn open(
         store: ObjectStore,
-        cache_dir: impl AsRef<Path>,
-        cache_max_bytes: u64,
+        cache: EventIndexCache,
         config: EventIndexConfig,
     ) -> Result<Self, IndexError> {
         validate_config(&config)?;
-        let cache = LocalCache::new(cache_dir, cache_max_bytes)?;
         initialize(&store, &config.source_id).await?;
         let published = load_published(&store, &config.source_id).await?;
         Ok(Self {
             store,
-            cache,
+            cache: cache.0,
             config,
             published,
             active: Vec::new(),
@@ -259,6 +379,103 @@ impl ServerlessEventIndex {
 
     pub fn part_count(&self) -> usize {
         self.published.manifest.parts.len()
+    }
+
+    pub fn completed_record_ranges(&self) -> &[CompletedRecordRange] {
+        &self.published.manifest.completed_record_ranges
+    }
+
+    /// Claim the oldest currently-uncovered source range. Claims coordinate
+    /// work but are not a correctness boundary: duplicate processing remains
+    /// safe because segment publication is immutable and manifest-CAS guarded.
+    pub async fn claim_next_segment(
+        &mut self,
+        tail_record: u64,
+        segment_records: u64,
+        worker_id: &str,
+        now_ms: u64,
+        lease_ms: u64,
+    ) -> Result<Option<RecordSegmentLease>, IndexError> {
+        if segment_records == 0 || lease_ms == 0 || worker_id.is_empty() {
+            return Err(IndexError::InvalidConfig(
+                "segment records, lease duration, and worker id must be non-empty",
+            ));
+        }
+        for _attempt in 0..MAX_PUBLISH_ATTEMPTS {
+            self.refresh().await?;
+            ensure_ready(&self.published.manifest.status)?;
+            let mut covered = self.published.manifest.completed_record_ranges.clone();
+            for object in self.store.list("claims/").await? {
+                if !object.key.ends_with(".json") {
+                    continue;
+                }
+                let Some(stored) = self.store.get(&object.key).await? else {
+                    continue;
+                };
+                let claim: RecordSegmentLease = serde_json::from_slice(&stored.bytes)?;
+                if claim.expires_at_ms > now_ms {
+                    covered.push(CompletedRecordRange {
+                        start_record: claim.start_record,
+                        end_record: claim.end_record,
+                    });
+                }
+            }
+            normalize_completed_ranges(&mut covered);
+            let start_record = first_uncovered_record(&covered, tail_record);
+            if start_record >= tail_record {
+                return Ok(None);
+            }
+            let end_record = start_record
+                .saturating_add(segment_records)
+                .min(tail_record);
+            let key = format!("claims/{start_record:020}.json");
+            let claim = RecordSegmentLease {
+                start_record,
+                end_record,
+                worker_id: worker_id.to_owned(),
+                expires_at_ms: now_ms.saturating_add(lease_ms),
+                key: key.clone(),
+            };
+            let bytes = serde_json::to_vec(&claim)?;
+            match self.store.put_if_absent(&key, &bytes).await? {
+                ConditionalWrite::Written => return Ok(Some(claim)),
+                ConditionalWrite::Conflict => {
+                    let Some(stored) = self.store.get(&key).await? else {
+                        continue;
+                    };
+                    let existing: RecordSegmentLease = serde_json::from_slice(&stored.bytes)?;
+                    if existing.expires_at_ms > now_ms {
+                        continue;
+                    }
+                    match self
+                        .store
+                        .compare_and_swap(&key, &stored.etag, &bytes)
+                        .await?
+                    {
+                        ConditionalWrite::Written => return Ok(Some(claim)),
+                        ConditionalWrite::Conflict => continue,
+                    }
+                }
+            }
+        }
+        Err(IndexError::PublishConflict)
+    }
+
+    pub async fn finish_segment(
+        &mut self,
+        claim: &RecordSegmentLease,
+        envelopes: Vec<SourceEnvelope>,
+    ) -> Result<(), IndexError> {
+        let maximum_len = claim.end_record.saturating_sub(claim.start_record);
+        let actual_len = u64::try_from(envelopes.len())
+            .map_err(|_error| IndexError::InvalidConfig("record segment is too large"))?;
+        if actual_len == 0 || actual_len > maximum_len {
+            return Err(IndexError::InvalidSourceResponse(
+                "source returned an invalid claimed record segment length",
+            ));
+        }
+        self.commit_envelopes(claim.start_record, envelopes).await?;
+        self.store.delete(&claim.key).await
     }
 
     pub fn needs_partition_compaction(&self, fan_in: usize, max_entries: u64) -> bool {
@@ -351,6 +568,11 @@ impl ServerlessEventIndex {
                 return Ok(());
             }
             ensure_ready(&self.published.manifest.status)?;
+            let start_record = self
+                .active
+                .first()
+                .map(|entry| entry.record)
+                .ok_or(IndexError::InvalidQuery)?;
             let checkpoint = self.indexed_through_record();
             let mut partitions = BTreeMap::<i64, Vec<EventEntry>>::new();
             for entry in self.active.iter().copied() {
@@ -369,7 +591,12 @@ impl ServerlessEventIndex {
             }
             let mut next = self.published.manifest.clone();
             next.generation = next.generation.saturating_add(1);
-            next.durable_through_record = checkpoint;
+            next.completed_record_ranges.push(CompletedRecordRange {
+                start_record,
+                end_record: checkpoint,
+            });
+            normalize_completed_ranges(&mut next.completed_record_ranges);
+            next.durable_through_record = contiguous_watermark(&next.completed_record_ranges);
             next.parts.extend(metas);
             if self.publish(next).await? {
                 self.active.clear();
@@ -377,6 +604,116 @@ impl ServerlessEventIndex {
             }
         }
         Err(IndexError::PublishConflict)
+    }
+
+    /// Publish one independently processed source-record segment. Segments may
+    /// complete out of order; the durable watermark advances only across a
+    /// gap-free prefix starting at record zero.
+    pub async fn commit_envelopes(
+        &mut self,
+        start_record: u64,
+        envelopes: Vec<SourceEnvelope>,
+    ) -> Result<(), IndexError> {
+        if envelopes.is_empty() {
+            return Err(IndexError::InvalidSourceResponse(
+                "record segment must not be empty",
+            ));
+        }
+        let mut entries = Vec::with_capacity(envelopes.len());
+        for (index, envelope) in envelopes.into_iter().enumerate() {
+            let relative = u64::try_from(index)
+                .map_err(|_error| IndexError::InvalidConfig("record segment is too large"))?;
+            let expected = start_record
+                .checked_add(relative)
+                .ok_or(IndexError::InvalidConfig("record segment end overflowed"))?;
+            if envelope.record != expected {
+                return Err(IndexError::UnexpectedRecord {
+                    expected,
+                    actual: envelope.record,
+                });
+            }
+            let captured_at_ms = envelope
+                .value
+                .get(&self.config.timestamp_field)
+                .and_then(super::store::parse_timestamp)
+                .ok_or_else(|| IndexError::InvalidTimestamp {
+                    record: envelope.record,
+                    field: self.config.timestamp_field.clone(),
+                })?;
+            entries.push(EventEntry {
+                captured_at_ms,
+                record: envelope.record,
+            });
+        }
+        for _attempt in 0..MAX_PUBLISH_ATTEMPTS {
+            self.refresh().await?;
+            ensure_ready(&self.published.manifest.status)?;
+            let (committed, uncovered): (Vec<_>, Vec<_>) =
+                entries.iter().copied().partition(|entry| {
+                    record_is_covered(
+                        &self.published.manifest.completed_record_ranges,
+                        entry.record,
+                    )
+                });
+            self.verify_committed_entries(&committed).await?;
+            if uncovered.is_empty() {
+                return Ok(());
+            }
+            let new_ranges = completed_ranges_for_entries(&uncovered)?;
+            let mut partitions = BTreeMap::<i64, Vec<EventEntry>>::new();
+            for entry in uncovered {
+                partitions
+                    .entry(event_time_partition(entry.captured_at_ms))
+                    .or_default()
+                    .push(entry);
+            }
+            let mut uploaded_parts = Vec::with_capacity(partitions.len());
+            for (partition_start_ms, mut partition_entries) in partitions {
+                partition_entries.sort_unstable();
+                uploaded_parts.push(
+                    self.write_and_upload_part(&partition_entries, 0, partition_start_ms)
+                        .await?,
+                );
+            }
+            let mut next = self.published.manifest.clone();
+            next.generation = next.generation.saturating_add(1);
+            next.completed_record_ranges.extend(new_ranges);
+            normalize_completed_ranges(&mut next.completed_record_ranges);
+            next.durable_through_record = contiguous_watermark(&next.completed_record_ranges);
+            next.parts.extend(uploaded_parts);
+            if self.publish(next).await? {
+                return Ok(());
+            }
+        }
+        Err(IndexError::PublishConflict)
+    }
+
+    async fn verify_committed_entries(&self, expected: &[EventEntry]) -> Result<(), IndexError> {
+        let Some(first) = expected.first() else {
+            return Ok(());
+        };
+        let Some(last) = expected.last() else {
+            return Ok(());
+        };
+        let mut committed = Vec::new();
+        for meta in self
+            .published
+            .manifest
+            .parts
+            .iter()
+            .filter(|meta| meta.max_record >= first.record && meta.min_record <= last.record)
+        {
+            let path = self.cache.materialize(&self.store, meta).await?;
+            committed.extend(part::read_all(&path)?);
+        }
+        for entry in expected {
+            if !committed.iter().any(|candidate| candidate == entry) {
+                return Err(IndexError::RecordConflict {
+                    record: entry.record,
+                });
+            }
+        }
+        Ok(())
     }
 
     pub async fn mark_retention_gap(
@@ -409,6 +746,16 @@ impl ServerlessEventIndex {
                 actual: record,
             });
         }
+        self.publish_status(IndexStatus::Blocked { record, reason })
+            .await
+    }
+
+    pub async fn mark_segment_blocked(
+        &mut self,
+        record: u64,
+        reason: String,
+    ) -> Result<(), IndexError> {
+        self.refresh().await?;
         self.publish_status(IndexStatus::Blocked { record, reason })
             .await
     }
@@ -796,6 +1143,78 @@ fn event_time_partition(captured_at_ms: i64) -> i64 {
         .saturating_mul(EVENT_TIME_PARTITION_MS)
 }
 
+fn record_is_covered(ranges: &[CompletedRecordRange], record: u64) -> bool {
+    ranges
+        .iter()
+        .any(|range| range.start_record <= record && record < range.end_record)
+}
+
+fn completed_ranges_for_entries(
+    entries: &[EventEntry],
+) -> Result<Vec<CompletedRecordRange>, IndexError> {
+    let mut ranges = Vec::<CompletedRecordRange>::new();
+    for entry in entries {
+        let end_record = entry
+            .record
+            .checked_add(1)
+            .ok_or(IndexError::InvalidConfig("record segment end overflowed"))?;
+        if let Some(previous) = ranges.last_mut()
+            && previous.end_record == entry.record
+        {
+            previous.end_record = end_record;
+        } else {
+            ranges.push(CompletedRecordRange {
+                start_record: entry.record,
+                end_record,
+            });
+        }
+    }
+    Ok(ranges)
+}
+
+fn normalize_completed_ranges(ranges: &mut Vec<CompletedRecordRange>) {
+    ranges.sort_unstable_by_key(|range| (range.start_record, range.end_record));
+    let mut normalized = Vec::<CompletedRecordRange>::with_capacity(ranges.len());
+    for range in ranges
+        .drain(..)
+        .filter(|range| range.start_record < range.end_record)
+    {
+        if let Some(previous) = normalized.last_mut()
+            && range.start_record <= previous.end_record
+        {
+            previous.end_record = previous.end_record.max(range.end_record);
+            continue;
+        }
+        normalized.push(range);
+    }
+    *ranges = normalized;
+}
+
+fn contiguous_watermark(ranges: &[CompletedRecordRange]) -> u64 {
+    let mut watermark = 0_u64;
+    for range in ranges {
+        if range.start_record > watermark {
+            break;
+        }
+        watermark = watermark.max(range.end_record);
+    }
+    watermark
+}
+
+fn first_uncovered_record(ranges: &[CompletedRecordRange], tail_record: u64) -> u64 {
+    let mut next = 0_u64;
+    for range in ranges {
+        if range.start_record > next {
+            break;
+        }
+        next = next.max(range.end_record);
+        if next >= tail_record {
+            return tail_record;
+        }
+    }
+    next.min(tail_record)
+}
+
 fn select_compaction(parts: &[PartMeta], fan_in: usize, max_entries: u64) -> Option<Vec<PartMeta>> {
     let mut partitions = BTreeMap::<i64, Vec<&PartMeta>>::new();
     for part in parts.iter().filter(|part| part.level == 0) {
@@ -906,12 +1325,54 @@ fn ensure_ready(status: &IndexStatus) -> Result<(), IndexError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::time::SystemTime;
 
+    use super::LocalCache;
     use super::eligible_for_gc;
+    use super::pin_locked;
+    use crate::IndexError;
 
     #[test]
     fn missing_modification_time_is_not_eligible_for_gc() {
         assert!(!eligible_for_gc(None, SystemTime::UNIX_EPOCH));
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "the test combines fallible setup with assertions"
+    )]
+    fn shared_cache_never_evicts_a_pinned_part_or_exceeds_its_budget() -> anyhow::Result<()> {
+        let directory = tempfile::TempDir::new()?;
+        let cache = LocalCache::new(directory.path(), 10)?;
+        let path = directory.path().join("part.parquet");
+        fs::write(&path, [0_u8; 6])?;
+        let guard = {
+            let mut pins = cache
+                .pins
+                .lock()
+                .map_err(|_error| anyhow::anyhow!("cache pin lock poisoned"))?;
+            pin_locked(&mut pins, path.clone(), &cache.pins)
+        };
+        let pins = cache
+            .pins
+            .lock()
+            .map_err(|_error| anyhow::anyhow!("cache pin lock poisoned"))?;
+        let error = cache
+            .make_room(6, None, &pins)
+            .expect_err("a pinned part must not be evicted to exceed the cache bound");
+        assert!(matches!(error, IndexError::CacheCapacity { .. }));
+        drop(pins);
+        assert!(path.exists());
+
+        drop(guard);
+        let pins = cache
+            .pins
+            .lock()
+            .map_err(|_error| anyhow::anyhow!("cache pin lock poisoned"))?;
+        cache.make_room(6, None, &pins)?;
+        assert!(!path.exists());
+        Ok(())
     }
 }

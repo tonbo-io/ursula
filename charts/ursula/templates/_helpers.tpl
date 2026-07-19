@@ -129,35 +129,27 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 
 {{- define "ursula.indexerFullname" -}}
-{{- $base := include "ursula.fullname" .root | trunc 45 | trimSuffix "-" -}}
-{{- printf "%s-index-%s" $base .name | trunc 63 | trimSuffix "-" -}}
+{{- printf "%s-indexer" (include "ursula.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{- define "ursula.indexerSelectorLabels" -}}
-app.kubernetes.io/name: {{ include "ursula.name" .root }}-indexer
-app.kubernetes.io/instance: {{ .root.Release.Name }}
+app.kubernetes.io/name: {{ include "ursula.name" . }}-indexer
+app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: indexer
-ursula.tonbo.io/indexer: {{ .name }}
 {{- end -}}
 
 {{- define "ursula.indexerLabels" -}}
-helm.sh/chart: {{ include "ursula.chart" .root }}
+helm.sh/chart: {{ include "ursula.chart" . }}
 {{ include "ursula.indexerSelectorLabels" . }}
-app.kubernetes.io/version: {{ .root.Chart.AppVersion | quote }}
-app.kubernetes.io/managed-by: {{ .root.Release.Service }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 
 {{- define "ursula.validateIndexerConfig" -}}
 {{- if .Values.indexer.enabled -}}
-{{- if eq (len .Values.indexer.instances) 0 -}}
-{{- fail "indexer.instances must contain at least one source when indexer.enabled=true" -}}
-{{- end -}}
 {{- $replicas := .Values.indexer.replicaCount | int -}}
 {{- if lt $replicas 1 -}}
 {{- fail "indexer.replicaCount must be at least 1" -}}
-{{- end -}}
-{{- if and (gt $replicas 1) (not .Values.indexer.activeActive) -}}
-{{- fail "indexer.replicaCount greater than 1 requires indexer.activeActive=true" -}}
 {{- end -}}
 {{- if and .Values.indexer.podDisruptionBudget.enabled (lt $replicas 2) -}}
 {{- fail "indexer.podDisruptionBudget.enabled requires indexer.replicaCount greater than 1" -}}
@@ -175,34 +167,20 @@ app.kubernetes.io/managed-by: {{ .root.Release.Service }}
 {{- if lt (.Values.indexer.garbageCollection.graceSeconds | int) 300 -}}
 {{- fail "indexer.garbageCollection.graceSeconds must be at least 300" -}}
 {{- end -}}
-{{- $names := dict -}}
-{{- $prefixes := dict -}}
-{{- range $index, $instance := .Values.indexer.instances -}}
-{{- include "ursula.validateDnsLabel" (dict "name" (printf "indexer.instances[%d].name" $index) "value" $instance.name) -}}
-{{- if hasKey $names $instance.name -}}
-{{- fail (printf "indexer instance name %q is duplicated" $instance.name) -}}
+{{- if or (lt (.Values.indexer.workers.concurrency | int64) 1) (lt (.Values.indexer.workers.segmentRecords | int64) 1) (lt (.Values.indexer.workers.leaseMs | int64) 1) -}}
+{{- fail "indexer worker concurrency, segmentRecords, and leaseMs must be positive" -}}
 {{- end -}}
-{{- $_ := set $names $instance.name true -}}
-{{- if not (regexMatch "^https?://" $instance.streamUrl) -}}
-{{- fail (printf "indexer.instances[%d].streamUrl must be an http or https URL" $index) -}}
-{{- end -}}
-{{- $bucket := default $.Values.s3.bucket $instance.s3.bucket | toString | trim -}}
+{{- $bucket := default .Values.s3.bucket .Values.indexer.s3.bucket | toString | trim -}}
 {{- if eq $bucket "" -}}
-{{- fail (printf "indexer.instances[%d] requires s3.bucket or instance s3.bucket" $index) -}}
+{{- fail "indexer requires s3.bucket or indexer.s3.bucket" -}}
 {{- end -}}
-{{- $prefix := $instance.s3.prefix | toString | trimAll "/" -}}
+{{- $prefix := .Values.indexer.s3.prefix | toString | trimAll "/" -}}
 {{- if eq $prefix "" -}}
-{{- fail (printf "indexer.instances[%d].s3.prefix must be non-empty" $index) -}}
+{{- fail "indexer.s3.prefix must be non-empty" -}}
 {{- end -}}
-{{- $storageIdentity := printf "%s/%s" $bucket $prefix -}}
-{{- if hasKey $prefixes $storageIdentity -}}
-{{- fail (printf "indexer S3 target %q is used by more than one instance" $storageIdentity) -}}
-{{- end -}}
-{{- $_ := set $prefixes $storageIdentity true -}}
-{{- range $label := list "app.kubernetes.io/name" "app.kubernetes.io/instance" "app.kubernetes.io/component" "ursula.tonbo.io/indexer" -}}
+{{- range $label := list "app.kubernetes.io/name" "app.kubernetes.io/instance" "app.kubernetes.io/component" -}}
 {{- if hasKey $.Values.indexer.podLabels $label -}}
 {{- fail (printf "indexer.podLabels must not set reserved selector label %q" $label) -}}
-{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
