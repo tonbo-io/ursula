@@ -55,7 +55,17 @@ Read complete events from a known ordinal:
 GET /telemetry/events?record=42&max_records=100
 ```
 
-For a self-describing representation, add `record_view=envelope`. For a live native `EventSource`, add `live=sse`; every envelope-mode SSE data event contains exactly one `{record, value}` object, and control events publish `streamNextRecord` for reconnection.
+Check that the response advertises `Stream-Extensions: json-record-coordinates-v1`, then continue from its `Stream-Record-Next` header. For a self-describing representation, add `record_view=envelope`:
+
+```bash
+curl 'http://127.0.0.1:4437/telemetry/events?record=42&max_records=100&record_view=envelope'
+```
+
+```json
+{"record":42,"value":{"captured_at":"2026-07-18T10:30:00.100Z","type":"network_response","status":500}}
+```
+
+For a live native `EventSource`, add `live=sse`; every envelope-mode SSE data event contains exactly one `{record, value}` object, and control events publish `streamNextRecord` for reconnection. See [Record Coordinates](/docs/concepts/record-coordinates) for the complete replay model.
 
 ## Event-time queries
 
@@ -80,6 +90,27 @@ cargo run -p ursula-index --bin ursula-indexer -- \
   --cache-dir ./target/browser-telemetry-cache
 ```
 
+For Kubernetes, create the JSON source stream first, then enable one Helm indexer instance with its own S3 prefix and workload identity:
+
+```yaml
+s3:
+  bucket: my-telemetry-index
+  region: us-east-1
+
+indexer:
+  enabled: true
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-telemetry-index
+  instances:
+    - name: browser-telemetry
+      streamUrl: http://ursula-gateway.default.svc.cluster.local:4437/v1/stream/browser-telemetry
+      s3:
+        prefix: production/browser-telemetry
+```
+
+The chart keeps the query Service internal, uses disposable local cache storage, and fails startup when the source is not JSON or does not advertise record coordinates. One replica is the conservative default; active-active replicas are an explicit availability/cost tradeoff.
+
 S3 stores immutable content-addressed Parquet parts and versioned manifests. Flushes are split into UTC-day event-time partitions, and bounded size-tiered compaction merges only a fixed number of new parts within one day; historical compacted parts are never rewritten when later telemetry arrives. Manifest-aware garbage collection preserves a configurable recent-generation and in-flight grace window, then removes superseded and failed-CAS objects. Compaction and GC use a separate bounded cache and index instance, so their Parquet and S3 work does not hold the HTTP query mutex. The serving cache is bounded and disposable, so a replacement instance can recover from `CURRENT` without a persistent volume. For local development, use `--object-dir ./target/browser-telemetry-objects` in place of the S3 options.
 
 The query API is ordinary HTTP:
@@ -88,3 +119,28 @@ The query API is ordinary HTTP:
 GET http://127.0.0.1:4493/v1/events?from=2026-07-18T10:00:00Z&until=2026-07-18T11:00:00Z&limit=100
 GET http://127.0.0.1:4493/v1/status
 ```
+
+A query returns records sorted by `(captured_at_ms, record)`, plus a cursor and a fixed source-record watermark:
+
+```json
+{
+  "indexed_through_record": 1200,
+  "durable_through_record": 1152,
+  "through_record": 1200,
+  "records": [
+    {"captured_at_ms": 1784370600100, "record": 42},
+    {"captured_at_ms": 1784370600100, "record": 57}
+  ],
+  "next": {"captured_at_ms": 1784370600100, "record": 57}
+}
+```
+
+Fetch the next page with all three cursor fields from the first response:
+
+```http
+GET /v1/events?from=2026-07-18T10:00:00Z&until=2026-07-18T11:00:00Z&limit=100&through_record=1200&after_captured_at_ms=1784370600100&after_record=57
+```
+
+`through_record` prevents newly indexed source records from appearing halfway through one paginated query. `indexed_through_record` includes the current in-memory prefix; `durable_through_record` is the prefix recoverable from the published S3 manifest. Resolve returned record ordinals through Ursula to fetch the canonical event values.
+
+An invalid query returns `400`. A deterministically invalid source record or conflicting event time blocks advancement and returns `409` until an operator repairs the source and calls `POST /v1/status/resume`. A source retention gap also returns `409`, but requires rebuilding the derived index because the missing source prefix can no longer be recovered.

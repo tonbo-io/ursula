@@ -36,6 +36,14 @@ Response headers include:
 | `Stream-Expires-At` | Expiration timestamp (if set). |
 | `Cache-Control` | `no-store`. |
 
+For an `application/json` stream implementing Record Coordinates, `HEAD` also includes:
+
+| Header | Description |
+| --- | --- |
+| `Stream-Extensions` | Contains `json-record-coordinates-v1`; clients must verify this before relying on record parameters or headers. |
+| `Stream-Record-First` | First retained record ordinal. |
+| `Stream-Record-Next` | Current record tail and next ordinal to be assigned. |
+
 <RequestExample>
 ```bash Example
 curl -I http://127.0.0.1:4437/demo/hello
@@ -45,3 +53,7 @@ curl -I http://127.0.0.1:4437/demo/hello
 <Tip>
 Use `If-None-Match` with a previously received `ETag` to efficiently poll for state changes without transferring data.
 </Tip>
+
+<Info>
+See [Record Coordinates](/docs/concepts/record-coordinates) for complete-record replay and client event-time queries.
+</Info>
