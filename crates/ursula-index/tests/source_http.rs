@@ -3,8 +3,8 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use reqwest::Url;
-use ursula_event_index::SourceBatch;
-use ursula_event_index::SourceClient;
+use ursula_index::SourceBatch;
+use ursula_index::SourceClient;
 
 #[tokio::test]
 #[expect(

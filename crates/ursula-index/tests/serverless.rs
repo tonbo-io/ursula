@@ -4,10 +4,10 @@
 )]
 
 use tempfile::TempDir;
-use ursula_event_index::EventEntry;
-use ursula_event_index::EventIndexConfig;
-use ursula_event_index::FsObjectStore;
-use ursula_event_index::ServerlessEventIndex;
+use ursula_index::EventEntry;
+use ursula_index::EventIndexConfig;
+use ursula_index::FsObjectStore;
+use ursula_index::ServerlessEventIndex;
 
 fn config() -> EventIndexConfig {
     EventIndexConfig {

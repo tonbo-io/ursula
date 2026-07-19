@@ -8,11 +8,11 @@ use std::time::SystemTime;
 use anyhow::Context;
 use opendal::Operator;
 use tempfile::TempDir;
-use ursula_event_index::EventEntry;
-use ursula_event_index::EventIndexConfig;
-use ursula_event_index::S3ObjectStore;
-use ursula_event_index::S3ObjectStoreConfig;
-use ursula_event_index::ServerlessEventIndex;
+use ursula_index::EventEntry;
+use ursula_index::EventIndexConfig;
+use ursula_index::S3ObjectStore;
+use ursula_index::S3ObjectStoreConfig;
+use ursula_index::ServerlessEventIndex;
 
 #[tokio::test]
 async fn real_s3_conditional_publish_and_cache_recovery() -> anyhow::Result<()> {
@@ -30,10 +30,7 @@ async fn real_s3_conditional_publish_and_cache_recovery() -> anyhow::Result<()> 
     let unique = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)?
         .as_nanos();
-    let root = format!(
-        "ursula-event-index-integration/{}-{unique}",
-        std::process::id()
-    );
+    let root = format!("ursula-index-integration/{}-{unique}", std::process::id());
     let store_config = S3ObjectStoreConfig {
         bucket: bucket.clone(),
         root: root.clone(),

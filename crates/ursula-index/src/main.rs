@@ -22,16 +22,16 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
-use ursula_event_index::EventIndexConfig;
-use ursula_event_index::FsObjectStore;
-use ursula_event_index::IndexError;
-use ursula_event_index::IndexStatus;
-use ursula_event_index::QueryCursor;
-use ursula_event_index::S3ObjectStore;
-use ursula_event_index::S3ObjectStoreConfig;
-use ursula_event_index::ServerlessEventIndex;
-use ursula_event_index::SourceBatch;
-use ursula_event_index::SourceClient;
+use ursula_index::EventIndexConfig;
+use ursula_index::FsObjectStore;
+use ursula_index::IndexError;
+use ursula_index::IndexStatus;
+use ursula_index::QueryCursor;
+use ursula_index::S3ObjectStore;
+use ursula_index::S3ObjectStoreConfig;
+use ursula_index::ServerlessEventIndex;
+use ursula_index::SourceBatch;
+use ursula_index::SourceClient;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -122,9 +122,8 @@ impl IntoResponse for ApiError {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let _observability = ursula_observability::init(ursula_observability::InitOptions::new(
-        "ursula-event-indexer",
-    ));
+    let _observability =
+        ursula_observability::init(ursula_observability::InitOptions::new("ursula-indexer"));
     let args = Args::parse();
     if args.compact_parts < 2 {
         anyhow::bail!("--compact-parts must be at least 2");
@@ -393,10 +392,10 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::Mutex;
     use tower::ServiceExt;
-    use ursula_event_index::EventEntry;
-    use ursula_event_index::EventIndexConfig;
-    use ursula_event_index::FsObjectStore;
-    use ursula_event_index::ServerlessEventIndex;
+    use ursula_index::EventEntry;
+    use ursula_index::EventIndexConfig;
+    use ursula_index::FsObjectStore;
+    use ursula_index::ServerlessEventIndex;
 
     use super::build_router;
 

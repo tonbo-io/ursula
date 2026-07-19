@@ -13,7 +13,7 @@ members = [
     "crates/ursula-sim",
     "crates/ursula-observability",
     "crates/ursula-gateway",
-    "crates/ursula-event-index",
+    "crates/ursula-index",
 ]
 resolver = "3"
 
