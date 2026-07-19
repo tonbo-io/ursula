@@ -1609,6 +1609,7 @@ pub(super) async fn run_http_producer_protocol_surface_inner(
 
     let read_uri = format!("{path}?offset=0&max_bytes=16");
     let read = app
+        .clone()
         .oneshot(
             HttpRequest::builder()
                 .method("GET")
@@ -1632,6 +1633,114 @@ pub(super) async fn run_http_producer_protocol_surface_inner(
         &body[..] == b"aabbcc" || &body[..] == b"bbaacc",
         "unexpected HTTP producer payload order: {:?}",
         body
+    );
+
+    let record_path = format!("{path}-records");
+    let create_records = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("PUT")
+                .uri(&record_path)
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .expect("record stream create request"),
+        )
+        .await
+        .expect("record stream create response");
+    assert_eq!(create_records.status(), StatusCode::CREATED);
+    assert_eq!(
+        create_records
+            .headers()
+            .get("stream-extensions")
+            .expect("record extension"),
+        "json-record-coordinates-v1"
+    );
+
+    let append_records = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(&record_path)
+                .header("content-type", "application/json")
+                .header("producer-id", "record-writer")
+                .header("producer-epoch", "0")
+                .header("producer-seq", "0")
+                .body(Body::from(
+                    r#"[{"captured_at_ms":120},{"captured_at_ms":100}]"#,
+                ))
+                .expect("record append request"),
+        )
+        .await
+        .expect("record append response");
+    assert_eq!(append_records.status(), StatusCode::OK);
+    assert_eq!(
+        append_records
+            .headers()
+            .get("stream-record-start")
+            .expect("record append start"),
+        "0"
+    );
+    assert_eq!(
+        append_records
+            .headers()
+            .get("stream-record-next")
+            .expect("record append next"),
+        "2"
+    );
+
+    let duplicate_records = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri(&record_path)
+                .header("content-type", "application/json")
+                .header("producer-id", "record-writer")
+                .header("producer-epoch", "0")
+                .header("producer-seq", "0")
+                .body(Body::from(r#"{"ignored":true}"#))
+                .expect("record duplicate request"),
+        )
+        .await
+        .expect("record duplicate response");
+    assert_eq!(duplicate_records.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        duplicate_records
+            .headers()
+            .get("stream-record-next")
+            .expect("record duplicate next"),
+        "2"
+    );
+
+    let record_read = app
+        .oneshot(
+            HttpRequest::builder()
+                .method("GET")
+                .uri(format!(
+                    "{record_path}?record=1&max_records=1&record_view=envelope"
+                ))
+                .body(Body::empty())
+                .expect("record read request"),
+        )
+        .await
+        .expect("record read response");
+    assert_eq!(record_read.status(), StatusCode::OK);
+    assert_eq!(
+        record_read
+            .headers()
+            .get("stream-record-next")
+            .expect("record read next"),
+        "2"
+    );
+    let record_body = to_bytes(record_read.into_body(), usize::MAX)
+        .await
+        .expect("record read body");
+    assert_eq!(
+        &record_body[..],
+        br#"{"record":1,"value":{"captured_at_ms":100}}
+"#
     );
 
     trace.push(SimEvent::HttpProducerProtocolSurfaceVerified {
