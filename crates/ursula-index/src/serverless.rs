@@ -1,8 +1,11 @@
+use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::time::SystemTime;
 
 use serde::Deserialize;
@@ -22,14 +25,16 @@ use crate::object_store::S3ObjectStore;
 use crate::object_store::digest;
 use crate::part;
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const CURRENT_KEY: &str = "CURRENT";
 const MAX_PUBLISH_ATTEMPTS: usize = 8;
+const EVENT_TIME_PARTITION_MS: i64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PartMeta {
     key: String,
     level: u8,
+    partition_start_ms: i64,
     entries: u64,
     min_captured_at_ms: i64,
     max_captured_at_ms: i64,
@@ -52,6 +57,12 @@ struct Manifest {
     durable_through_record: u64,
     status: IndexStatus,
     parts: Vec<PartMeta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestIdentity {
+    version: u32,
+    source_id: String,
 }
 
 impl Manifest {
@@ -77,7 +88,14 @@ struct CurrentPointer {
 #[derive(Clone, Debug)]
 struct PublishedManifest {
     pointer_etag: String,
+    manifest_key: String,
     manifest: Manifest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GarbageCollectionReport {
+    pub deleted_parts: usize,
+    pub deleted_manifests: usize,
 }
 
 #[derive(Debug)]
@@ -243,6 +261,12 @@ impl ServerlessEventIndex {
         self.published.manifest.parts.len()
     }
 
+    pub fn needs_partition_compaction(&self, fan_in: usize, max_entries: u64) -> bool {
+        fan_in >= 2
+            && max_entries > 0
+            && select_compaction(&self.published.manifest.parts, fan_in, max_entries).is_some()
+    }
+
     pub async fn refresh(&mut self) -> Result<(), IndexError> {
         let latest = load_published(&self.store, &self.config.source_id).await?;
         if latest.pointer_etag != self.published.pointer_etag {
@@ -328,13 +352,25 @@ impl ServerlessEventIndex {
             }
             ensure_ready(&self.published.manifest.status)?;
             let checkpoint = self.indexed_through_record();
-            let mut entries = self.active.clone();
-            entries.sort_unstable();
-            let meta = self.write_and_upload_part(&entries, 0).await?;
+            let mut partitions = BTreeMap::<i64, Vec<EventEntry>>::new();
+            for entry in self.active.iter().copied() {
+                partitions
+                    .entry(event_time_partition(entry.captured_at_ms))
+                    .or_default()
+                    .push(entry);
+            }
+            let mut metas = Vec::with_capacity(partitions.len());
+            for (partition_start_ms, mut entries) in partitions {
+                entries.sort_unstable();
+                metas.push(
+                    self.write_and_upload_part(&entries, 0, partition_start_ms)
+                        .await?,
+                );
+            }
             let mut next = self.published.manifest.clone();
             next.generation = next.generation.saturating_add(1);
             next.durable_through_record = checkpoint;
-            next.parts.push(meta);
+            next.parts.extend(metas);
             if self.publish(next).await? {
                 self.active.clear();
                 return Ok(());
@@ -454,29 +490,154 @@ impl ServerlessEventIndex {
         })
     }
 
-    pub async fn compact_all(&mut self) -> Result<(), IndexError> {
-        self.flush().await?;
+    pub async fn compact_partition_once(
+        &mut self,
+        fan_in: usize,
+        max_entries: u64,
+    ) -> Result<bool, IndexError> {
+        if fan_in < 2 {
+            return Err(IndexError::InvalidConfig(
+                "compaction fan-in must be at least 2",
+            ));
+        }
+        if max_entries == 0 {
+            return Err(IndexError::InvalidConfig(
+                "compaction max entries must be positive",
+            ));
+        }
         for _attempt in 0..MAX_PUBLISH_ATTEMPTS {
             self.refresh().await?;
-            if self.published.manifest.parts.len() <= 1 {
-                return Ok(());
-            }
-            let mut entries = Vec::new();
-            for meta in &self.published.manifest.parts {
+            let Some(candidate) =
+                select_compaction(&self.published.manifest.parts, fan_in, max_entries)
+            else {
+                return Ok(false);
+            };
+            let candidate_entries = candidate.iter().try_fold(0_u64, |total, meta| {
+                total
+                    .checked_add(meta.entries)
+                    .ok_or(IndexError::InvalidConfig(
+                        "compaction candidate entry count overflowed",
+                    ))
+            })?;
+            let mut entries =
+                Vec::with_capacity(usize::try_from(candidate_entries).map_err(|_error| {
+                    IndexError::CompactionTooLarge {
+                        entries: candidate_entries,
+                        max_entries,
+                    }
+                })?);
+            let candidate_keys = candidate
+                .iter()
+                .map(|meta| meta.key.as_str())
+                .collect::<HashSet<_>>();
+            for meta in &candidate {
                 let path = self.cache.materialize(&self.store, meta).await?;
                 entries.extend(part::read_all(&path)?);
             }
             entries.sort_unstable();
             entries.dedup_by_key(|entry| entry.record);
-            let meta = self.write_and_upload_part(&entries, 1).await?;
+            let partition_start_ms = candidate
+                .first()
+                .map(|meta| meta.partition_start_ms)
+                .ok_or(IndexError::InvalidQuery)?;
+            let meta = self
+                .write_and_upload_part(&entries, 1, partition_start_ms)
+                .await?;
             let mut next = self.published.manifest.clone();
             next.generation = next.generation.saturating_add(1);
-            next.parts = vec![meta];
+            next.parts
+                .retain(|part| !candidate_keys.contains(part.key.as_str()));
+            next.parts.push(meta);
             if self.publish(next).await? {
-                return Ok(());
+                return Ok(true);
             }
         }
         Err(IndexError::PublishConflict)
+    }
+
+    pub async fn garbage_collect(
+        &mut self,
+        retain_generations: u64,
+        grace: Duration,
+    ) -> Result<GarbageCollectionReport, IndexError> {
+        if retain_generations == 0 {
+            return Err(IndexError::InvalidConfig(
+                "GC retained generations must be positive",
+            ));
+        }
+        self.refresh().await?;
+        let current_generation = self.published.manifest.generation;
+        let minimum_generation = current_generation
+            .saturating_add(1)
+            .saturating_sub(retain_generations);
+        let cutoff = SystemTime::now()
+            .checked_sub(grace)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let manifest_objects = self.store.list("manifests/").await?;
+        let mut retained_manifests = HashSet::new();
+        retained_manifests.insert(self.published.manifest_key.clone());
+        for object in &manifest_objects {
+            if !object.key.ends_with(".json") {
+                continue;
+            }
+            let Some(generation) = manifest_generation(&object.key) else {
+                continue;
+            };
+            if generation >= minimum_generation && generation < current_generation {
+                retained_manifests.insert(object.key.clone());
+            }
+        }
+        let mut retained_parts = HashSet::new();
+        let retained_manifest_keys = retained_manifests.iter().cloned().collect::<Vec<_>>();
+        for key in &retained_manifest_keys {
+            let object = self
+                .store
+                .get(key)
+                .await?
+                .ok_or_else(|| IndexError::MissingObject(key.clone()))?;
+            let identity: ManifestIdentity = serde_json::from_slice(&object.bytes)?;
+            if identity.version != FORMAT_VERSION || identity.source_id != self.config.source_id {
+                tracing::warn!(
+                    manifest = %key,
+                    version = identity.version,
+                    source_id = %identity.source_id,
+                    "skipping incompatible manifest during event-index garbage collection"
+                );
+                retained_manifests.remove(key);
+                continue;
+            }
+            let manifest: Manifest = serde_json::from_slice(&object.bytes)?;
+            retained_parts.extend(manifest.parts.into_iter().map(|part| part.key));
+        }
+        let part_objects = self.store.list("parts/").await?;
+        let latest = load_published(&self.store, &self.config.source_id).await?;
+        retained_manifests.insert(latest.manifest_key);
+        retained_parts.extend(latest.manifest.parts.into_iter().map(|part| part.key));
+        let stale_manifests = manifest_objects
+            .into_iter()
+            .filter(|object| object.key.ends_with(".json"))
+            .filter(|object| eligible_for_gc(object.modified, cutoff))
+            .filter(|object| !retained_manifests.contains(&object.key))
+            .map(|object| object.key)
+            .collect::<Vec<_>>();
+        let stale_parts = part_objects
+            .into_iter()
+            .filter(|object| object.key.ends_with(".parquet"))
+            .filter(|object| eligible_for_gc(object.modified, cutoff))
+            .filter(|object| !retained_parts.contains(&object.key))
+            .map(|object| object.key)
+            .collect::<Vec<_>>();
+        for key in &stale_manifests {
+            self.store.delete(key).await?;
+        }
+        for key in &stale_parts {
+            self.store.delete(key).await?;
+        }
+        self.refresh().await?;
+        Ok(GarbageCollectionReport {
+            deleted_parts: stale_parts.len(),
+            deleted_manifests: stale_manifests.len(),
+        })
     }
 
     async fn publish_status(&mut self, status: IndexStatus) -> Result<(), IndexError> {
@@ -496,7 +657,16 @@ impl ServerlessEventIndex {
         &self,
         entries: &[EventEntry],
         level: u8,
+        partition_start_ms: i64,
     ) -> Result<PartMeta, IndexError> {
+        if entries
+            .iter()
+            .any(|entry| event_time_partition(entry.captured_at_ms) != partition_start_ms)
+        {
+            return Err(IndexError::InvalidSourceResponse(
+                "part entries cross an event-time partition boundary",
+            ));
+        }
         let temporary = tempfile::NamedTempFile::new_in(&self.cache.root)?;
         part::write_part(temporary.path(), entries, self.config.row_group_entries)?;
         let bytes = fs::read(temporary.path())?;
@@ -508,6 +678,7 @@ impl ServerlessEventIndex {
         Ok(PartMeta {
             key,
             level,
+            partition_start_ms,
             entries: u64::try_from(entries.len())
                 .map_err(|_error| IndexError::InvalidConfig("part is too large"))?,
             min_captured_at_ms: first.captured_at_ms,
@@ -615,8 +786,63 @@ async fn load_published(
     }
     Ok(PublishedManifest {
         pointer_etag: current.etag,
+        manifest_key: pointer.manifest,
         manifest,
     })
+}
+
+fn event_time_partition(captured_at_ms: i64) -> i64 {
+    captured_at_ms
+        .div_euclid(EVENT_TIME_PARTITION_MS)
+        .saturating_mul(EVENT_TIME_PARTITION_MS)
+}
+
+fn select_compaction(parts: &[PartMeta], fan_in: usize, max_entries: u64) -> Option<Vec<PartMeta>> {
+    let mut partitions = BTreeMap::<i64, Vec<&PartMeta>>::new();
+    for part in parts.iter().filter(|part| part.level == 0) {
+        partitions
+            .entry(part.partition_start_ms)
+            .or_default()
+            .push(part);
+    }
+    partitions.into_iter().find_map(|(_, mut parts)| {
+        if parts.len() < fan_in {
+            return None;
+        }
+        parts.sort_unstable_by(|left, right| {
+            left.entries
+                .cmp(&right.entries)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        let mut total = 0_u64;
+        let mut selected = Vec::with_capacity(fan_in);
+        for part in parts {
+            if selected.len() == fan_in {
+                break;
+            }
+            let Some(next_total) = total.checked_add(part.entries) else {
+                continue;
+            };
+            if next_total > max_entries {
+                continue;
+            }
+            total = next_total;
+            selected.push(part.clone());
+        }
+        (selected.len() >= 2).then_some(selected)
+    })
+}
+
+fn eligible_for_gc(modified: Option<SystemTime>, cutoff: SystemTime) -> bool {
+    modified.is_some_and(|modified| modified <= cutoff)
+}
+
+fn manifest_generation(key: &str) -> Option<u64> {
+    key.strip_prefix("manifests/")?
+        .split_once('-')?
+        .0
+        .parse()
+        .ok()
 }
 
 fn valid_cached_part(path: &Path, meta: &PartMeta) -> Result<bool, IndexError> {
@@ -676,5 +902,17 @@ fn ensure_ready(status: &IndexStatus) -> Result<(), IndexError> {
             expected_record: *expected_record,
             first_available_record: *first_available_record,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use super::eligible_for_gc;
+
+    #[test]
+    fn missing_modification_time_is_not_eligible_for_gc() {
+        assert!(!eligible_for_gc(None, SystemTime::now()));
     }
 }

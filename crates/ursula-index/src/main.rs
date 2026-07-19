@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use axum::Json;
@@ -57,6 +58,8 @@ struct Args {
     cache_dir: PathBuf,
     #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024_u64)]
     cache_max_bytes: u64,
+    #[arg(long, default_value_t = 512 * 1024 * 1024_u64)]
+    maintenance_cache_max_bytes: u64,
     #[arg(long, default_value = "127.0.0.1:4493")]
     listen: SocketAddr,
     #[arg(long, default_value_t = 65_536)]
@@ -67,8 +70,18 @@ struct Args {
     read_batch_records: usize,
     #[arg(long, default_value_t = 250)]
     poll_interval_ms: u64,
+    #[arg(long = "compact-parts", default_value_t = 8)]
+    compaction_fan_in: usize,
+    #[arg(long, default_value_t = 1_000_000)]
+    compaction_max_entries: u64,
+    #[arg(long, default_value_t = 3_600)]
+    gc_interval_seconds: u64,
+    #[arg(long, default_value_t = 86_400)]
+    gc_grace_seconds: u64,
     #[arg(long, default_value_t = 8)]
-    compact_parts: usize,
+    gc_retain_generations: u64,
+    #[arg(long, default_value_t = 1_000)]
+    maintenance_interval_ms: u64,
     #[arg(long, default_value = "captured_at")]
     timestamp_field: String,
 }
@@ -128,8 +141,27 @@ async fn main() -> anyhow::Result<()> {
     let _observability =
         ursula_observability::init(ursula_observability::InitOptions::new("ursula-indexer"));
     let args = Args::parse();
-    if args.compact_parts < 2 {
+    if args.compaction_fan_in < 2 {
         anyhow::bail!("--compact-parts must be at least 2");
+    }
+    let maximum_l0_entries = u64::try_from(args.flush_entries)
+        .ok()
+        .and_then(|entries| {
+            u64::try_from(args.compaction_fan_in)
+                .ok()
+                .and_then(|fan_in| entries.checked_mul(fan_in))
+        })
+        .context("flush entries times compaction fan-in overflowed")?;
+    if maximum_l0_entries > args.compaction_max_entries {
+        anyhow::bail!("--compaction-max-entries must cover --flush-entries times --compact-parts");
+    }
+    if args.gc_interval_seconds == 0
+        || args.gc_retain_generations == 0
+        || args.maintenance_interval_ms == 0
+    {
+        anyhow::bail!(
+            "maintenance interval, GC interval, and retained generations must be positive"
+        );
     }
     let config = EventIndexConfig {
         source_id: args.stream_url.to_string(),
@@ -137,14 +169,24 @@ async fn main() -> anyhow::Result<()> {
         row_group_entries: args.row_group_entries,
         timestamp_field: args.timestamp_field,
     };
-    let index = if let Some(object_dir) = &args.object_dir {
-        ServerlessEventIndex::open_fs(
-            FsObjectStore::new(object_dir).context("open filesystem object store")?,
+    let maintenance_cache_dir = args.cache_dir.join("maintenance");
+    let (index, maintenance_index) = if let Some(object_dir) = &args.object_dir {
+        let store = FsObjectStore::new(object_dir).context("open filesystem object store")?;
+        let index = ServerlessEventIndex::open_fs(
+            store.clone(),
             &args.cache_dir,
             args.cache_max_bytes,
+            config.clone(),
+        )
+        .await?;
+        let maintenance = ServerlessEventIndex::open_fs(
+            store,
+            &maintenance_cache_dir,
+            args.maintenance_cache_max_bytes,
             config,
         )
-        .await
+        .await?;
+        Ok::<_, IndexError>((index, maintenance))
     } else {
         let bucket = args
             .s3_bucket
@@ -157,7 +199,21 @@ async fn main() -> anyhow::Result<()> {
             endpoint: args.s3_endpoint.clone(),
         })
         .context("configure S3 object store")?;
-        ServerlessEventIndex::open_s3(store, &args.cache_dir, args.cache_max_bytes, config).await
+        let index = ServerlessEventIndex::open_s3(
+            store.clone(),
+            &args.cache_dir,
+            args.cache_max_bytes,
+            config.clone(),
+        )
+        .await?;
+        let maintenance = ServerlessEventIndex::open_s3(
+            store,
+            &maintenance_cache_dir,
+            args.maintenance_cache_max_bytes,
+            config,
+        )
+        .await?;
+        Ok::<_, IndexError>((index, maintenance))
     }
     .context("open event index")?;
     let index = Arc::new(Mutex::new(index));
@@ -168,7 +224,16 @@ async fn main() -> anyhow::Result<()> {
         source,
         Arc::clone(&index),
         Duration::from_millis(args.poll_interval_ms),
-        args.compact_parts,
+        shutdown_rx.clone(),
+    ));
+    let maintenance_task = tokio::spawn(maintenance_loop(
+        maintenance_index,
+        Duration::from_millis(args.maintenance_interval_ms),
+        args.compaction_fan_in,
+        args.compaction_max_entries,
+        Duration::from_secs(args.gc_interval_seconds),
+        Duration::from_secs(args.gc_grace_seconds),
+        args.gc_retain_generations,
         shutdown_rx,
     ));
 
@@ -190,6 +255,9 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
     sync_task.await.context("join source sync loop")??;
+    maintenance_task
+        .await
+        .context("join event index maintenance loop")??;
     index
         .lock()
         .await
@@ -203,7 +271,6 @@ async fn sync_loop(
     source: SourceClient,
     index: Arc<Mutex<ServerlessEventIndex>>,
     poll_interval: Duration,
-    compact_parts: usize,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     loop {
@@ -244,9 +311,6 @@ async fn sync_loop(
                             });
                         }
                     }
-                    if index.part_count() >= compact_parts {
-                        index.compact_all().await?;
-                    }
                     Ok(())
                 }
                 .await;
@@ -275,6 +339,64 @@ async fn sync_loop(
             Err(error) => tracing::warn!(%error, from_record, "source read failed; retrying"),
         }
         if wait_or_shutdown(poll_interval, &mut shutdown).await {
+            return Ok(());
+        }
+    }
+}
+
+async fn maintenance_loop(
+    mut index: ServerlessEventIndex,
+    interval: Duration,
+    compaction_fan_in: usize,
+    compaction_max_entries: u64,
+    gc_interval: Duration,
+    gc_grace: Duration,
+    gc_retain_generations: u64,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let now = Instant::now();
+    let mut next_gc = now.checked_add(gc_interval).unwrap_or(now);
+    loop {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        match index.refresh().await {
+            Ok(()) => {
+                if matches!(index.status(), IndexStatus::Ready)
+                    && index.needs_partition_compaction(compaction_fan_in, compaction_max_entries)
+                {
+                    match index
+                        .compact_partition_once(compaction_fan_in, compaction_max_entries)
+                        .await
+                    {
+                        Ok(true) => tracing::info!("compacted one event-time partition tier"),
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "event index compaction failed; retrying")
+                        }
+                    }
+                }
+                if Instant::now() >= next_gc {
+                    match index.garbage_collect(gc_retain_generations, gc_grace).await {
+                        Ok(report) => tracing::info!(
+                            deleted_parts = report.deleted_parts,
+                            deleted_manifests = report.deleted_manifests,
+                            "event index garbage collection completed"
+                        ),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "event index garbage collection failed; retrying later"
+                        ),
+                    }
+                    let now = Instant::now();
+                    next_gc = now.checked_add(gc_interval).unwrap_or(now);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "event index maintenance refresh failed; retrying")
+            }
+        }
+        if wait_or_shutdown(interval, &mut shutdown).await {
             return Ok(());
         }
     }
