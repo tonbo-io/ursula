@@ -13,6 +13,7 @@ members = [
     "crates/ursula-sim",
     "crates/ursula-observability",
     "crates/ursula-gateway",
+    "crates/ursula-event-index",
 ]
 resolver = "3"
 
@@ -30,6 +31,8 @@ categories = ["database-implementations", "network-programming"]
 [workspace.dependencies]
 anyhow = "1"
 axum = "0.8"
+arrow-array = "59.1.0"
+arrow-schema = "59.1.0"
 base64 = "0.22"
 bytes = "1.7"
 chrono = "0.4"
@@ -45,9 +48,11 @@ mimalloc = { version = "0.1", default-features = false }
 tikv-jemalloc-ctl = { version = "0.7", default-features = false }
 tikv-jemallocator = { version = "0.7", default-features = false }
 opendal = "0.51"
+blake3 = "1"
 opentelemetry = "0.30"
 opentelemetry_sdk = { version = "0.30", features = ["metrics"] }
 opentelemetry-otlp = { version = "0.30", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"] }
+parquet = { version = "59.1.0", default-features = false, features = ["arrow", "zstd"] }
 openraft = { version = "0.10.0-alpha.21", default-features = false, features = ["tokio-rt", "type-alias"] }
 openraft-rt = "0.10.0-alpha.21"
 pin-project-lite = "0.2"
