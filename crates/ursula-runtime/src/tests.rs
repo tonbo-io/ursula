@@ -3704,6 +3704,150 @@ async fn wal_group_engine_recovers_multiple_groups_from_per_group_logs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wal_group_engine_recovers_json_records_after_retention() {
+    let wal_root = std::env::temp_dir().join(format!(
+        "ursula-wal-record-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&wal_root);
+    let config = RuntimeConfig {
+        core_count: 2,
+        raft_group_count: 8,
+        mailbox_capacity: 128,
+        threading: RuntimeThreading::HostedTokio,
+        cold_max_hot_bytes_per_group: None,
+        raft_max_uncommitted_bytes_per_group: None,
+        live_read_max_waiters_per_core: Some(65_536),
+    };
+    let stream = BucketStreamId::new("benchcmp", "wal-record-coordinates");
+
+    {
+        let runtime = ShardRuntime::spawn_with_engine_factory(
+            config.clone(),
+            WalGroupEngineFactory::new(&wal_root),
+        )
+        .expect("spawn WAL runtime");
+        runtime
+            .create_stream(CreateStreamRequest::new(stream.clone(), "application/json"))
+            .await
+            .expect("create JSON stream");
+        let mut append = AppendRequest::from_bytes(
+            stream.clone(),
+            br#"{"id":1}
+{"id":2}
+"#
+            .to_vec(),
+        );
+        append.content_type = "application/json".to_owned();
+        append.producer = Some(producer("writer-1", 0, 0));
+        let append = runtime.append(append).await.expect("append JSON records");
+        assert_eq!(
+            append.record_range,
+            Some(StreamRecordRange {
+                first_record: 0,
+                next_record: 2,
+            })
+        );
+        runtime
+            .publish_snapshot(PublishSnapshotRequest {
+                stream_id: stream.clone(),
+                snapshot_offset: 9,
+                content_type: "application/json".to_owned(),
+                payload: Bytes::from_static(br#"{"count":1}"#),
+                now_ms: 0,
+            })
+            .await
+            .expect("publish record-aligned snapshot");
+    }
+
+    let recovered =
+        ShardRuntime::spawn_with_engine_factory(config, WalGroupEngineFactory::new(&wal_root))
+            .expect("spawn recovered runtime");
+    let head = recovered
+        .head_stream(HeadStreamRequest {
+            stream_id: stream.clone(),
+            now_ms: 0,
+        })
+        .await
+        .expect("head recovered stream");
+    assert_eq!(
+        head.record_range,
+        Some(StreamRecordRange {
+            first_record: 1,
+            next_record: 2,
+        })
+    );
+
+    let mut duplicate = AppendRequest::from_bytes(stream.clone(), b"ignored\n".to_vec());
+    duplicate.content_type = "application/json".to_owned();
+    duplicate.producer = Some(producer("writer-1", 0, 0));
+    let duplicate = recovered
+        .append(duplicate)
+        .await
+        .expect("deduplicated retry after recovery");
+    assert!(duplicate.deduplicated);
+    assert_eq!(
+        duplicate.record_range,
+        Some(StreamRecordRange {
+            first_record: 0,
+            next_record: 2,
+        })
+    );
+
+    let read = recovered
+        .read_stream(ReadStreamRequest {
+            stream_id: stream.clone(),
+            offset: 0,
+            max_len: usize::MAX,
+            now_ms: 0,
+            record: Some(1),
+            max_records: Some(1),
+        })
+        .await
+        .expect("read retained record after recovery");
+    assert_eq!(
+        read.payload,
+        br#"{"id":2}
+"#
+    );
+    assert_eq!(
+        read.record_range,
+        Some(StreamRecordRange {
+            first_record: 1,
+            next_record: 2,
+        })
+    );
+
+    let bootstrap = recovered
+        .bootstrap_stream(BootstrapStreamRequest {
+            stream_id: stream,
+            now_ms: 0,
+        })
+        .await
+        .expect("bootstrap recovered record stream");
+    assert_eq!(bootstrap.updates.len(), 1);
+    assert_eq!(
+        bootstrap.updates[0].payload,
+        br#"{"id":2}
+"#
+    );
+    assert_eq!(
+        bootstrap.record_range,
+        Some(StreamRecordRange {
+            first_record: 1,
+            next_record: 2,
+        })
+    );
+
+    drop(recovered);
+    std::fs::remove_dir_all(&wal_root).expect("remove WAL root");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wal_group_engine_batches_append_records_and_recovers() {
     let wal_root = std::env::temp_dir().join(format!(
         "ursula-wal-batch-test-{}-{}",
