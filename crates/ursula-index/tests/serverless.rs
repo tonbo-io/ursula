@@ -7,6 +7,7 @@ use tempfile::TempDir;
 use ursula_index::EventEntry;
 use ursula_index::EventIndexConfig;
 use ursula_index::FsObjectStore;
+use ursula_index::IndexStatus;
 use ursula_index::ServerlessEventIndex;
 
 fn config() -> EventIndexConfig {
@@ -226,5 +227,31 @@ async fn serverless_compaction_survives_cache_loss() -> anyhow::Result<()> {
     let result = reopened.query(0, 20, None, None, 10).await?;
     assert_eq!(result.records.len(), 6);
     assert_eq!(result.durable_through_record, 6);
+    Ok(())
+}
+
+#[tokio::test]
+async fn blocked_status_can_be_cleared_by_an_operator() -> anyhow::Result<()> {
+    let object_dir = TempDir::new()?;
+    let cache = TempDir::new()?;
+    let store = FsObjectStore::new(object_dir.path())?;
+    let mut index =
+        ServerlessEventIndex::open_fs(store.clone(), cache.path(), 16 * 1024 * 1024, config())
+            .await?;
+    index
+        .mark_blocked(0, "repaired source event".to_owned())
+        .await?;
+    assert!(matches!(index.status(), IndexStatus::Blocked { .. }));
+
+    index.clear_blocked().await?;
+    assert_eq!(index.status(), &IndexStatus::Ready);
+    index.clear_blocked().await?;
+    assert_eq!(index.status(), &IndexStatus::Ready);
+
+    let fresh_cache = TempDir::new()?;
+    let reopened =
+        ServerlessEventIndex::open_fs(store, fresh_cache.path(), 16 * 1024 * 1024, config())
+            .await?;
+    assert_eq!(reopened.status(), &IndexStatus::Ready);
     Ok(())
 }

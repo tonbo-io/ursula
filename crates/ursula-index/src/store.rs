@@ -98,12 +98,16 @@ pub enum IndexError {
     SourceStatus(u16),
     #[error("invalid source response: {0}")]
     InvalidSourceResponse(&'static str),
+    #[error("source response did not advertise json-record-coordinates-v1")]
+    MissingRecordCoordinates,
     #[error("event index lock poisoned")]
     LockPoisoned,
     #[error("blocking event-index worker failed")]
     WorkerFailed,
     #[error("event index is blocked at source record {record}: {reason}")]
     Blocked { record: u64, reason: String },
+    #[error("index status cannot be resumed: {0}")]
+    CannotResume(&'static str),
     #[error("Parquet error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),
     #[error("Arrow error: {0}")]

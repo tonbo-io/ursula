@@ -4,6 +4,8 @@ use reqwest::Url;
 use crate::IndexError;
 use crate::SourceEnvelope;
 
+const RECORD_COORDINATE_EXTENSION: &str = "json-record-coordinates-v1";
+
 #[derive(Debug)]
 pub enum SourceBatch {
     Records(Vec<SourceEnvelope>),
@@ -36,6 +38,16 @@ impl SourceClient {
             .append_pair("record_view", "envelope")
             .append_pair("max_records", &self.max_records.to_string());
         let response = self.client.get(url).send().await?;
+        let supports_record_coordinates = response
+            .headers()
+            .get_all("stream-extensions")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|value| value.trim() == RECORD_COORDINATE_EXTENSION);
+        if !supports_record_coordinates {
+            return Err(IndexError::MissingRecordCoordinates);
+        }
         if response.status() == StatusCode::GONE {
             let first_available_record = response
                 .headers()
