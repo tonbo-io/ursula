@@ -2,24 +2,32 @@
 //!
 //! Module map:
 //!
+//! - [`catalog`]: dynamic index registrations shared by a worker pool.
 //! - [`part`]: immutable sorted Parquet parts.
 //! - [`object_store`]: conditional object operations for S3 and local tests.
 //! - [`serverless`]: S3-authoritative index with a disposable local cache.
 //! - [`store`]: crash-consistent manifest, checkpoint, query, and compaction.
 
+mod catalog;
 mod object_store;
 mod part;
 mod serverless;
 mod source;
 mod store;
 
+pub use catalog::IndexCatalog;
+pub use catalog::IndexRegistration;
 pub use object_store::FsObjectStore;
 pub use object_store::S3ObjectStore;
 pub use object_store::S3ObjectStoreConfig;
+pub use serverless::CompletedRecordRange;
+pub use serverless::EventIndexCache;
 pub use serverless::GarbageCollectionReport;
+pub use serverless::RecordSegmentLease;
 pub use serverless::ServerlessEventIndex;
 pub use source::SourceBatch;
 pub use source::SourceClient;
+pub use source::SourceRecordRange;
 pub use store::EventEntry;
 pub use store::EventIndexConfig;
 pub use store::IndexError;

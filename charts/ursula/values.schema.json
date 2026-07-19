@@ -617,41 +617,21 @@
     "indexer": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Optional S3-authoritative event-time indexer deployments.",
+      "description": "Optional S3-authoritative dynamic event-time indexer worker pool.",
       "properties": {
         "enabled": { "type": "boolean" },
-        "instances": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "name": {
-                "type": "string",
-                "maxLength": 63,
-                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
-              },
-              "streamUrl": {
-                "type": "string",
-                "pattern": "^https?://"
-              },
-              "s3": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                  "bucket": { "type": "string" },
-                  "region": { "type": "string" },
-                  "endpoint": { "type": "string" },
-                  "prefix": { "type": "string", "minLength": 1 }
-                },
-                "required": ["prefix"]
-              }
-            },
-            "required": ["name", "streamUrl", "s3"]
-          }
-        },
         "replicaCount": { "type": "integer", "minimum": 1 },
-        "activeActive": { "type": "boolean" },
+        "s3": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "bucket": { "type": "string" },
+            "region": { "type": "string" },
+            "endpoint": { "type": "string" },
+            "prefix": { "type": "string", "minLength": 1 }
+          },
+          "required": ["bucket", "region", "endpoint", "prefix"]
+        },
         "image": {
           "type": "object",
           "additionalProperties": false,
@@ -696,7 +676,6 @@
           },
           "required": ["enabled", "type", "port", "annotations"]
         },
-        "timestampField": { "type": "string", "minLength": 1 },
         "rustLog": { "type": "string" },
         "cache": {
           "type": "object",
@@ -725,6 +704,16 @@
             "pollIntervalMs": { "type": "integer", "minimum": 1 }
           },
           "required": ["flushEntries", "rowGroupEntries", "readBatchRecords", "pollIntervalMs"]
+        },
+        "workers": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "concurrency": { "type": "integer", "minimum": 1 },
+            "segmentRecords": { "type": "integer", "minimum": 1 },
+            "leaseMs": { "type": "integer", "minimum": 1 }
+          },
+          "required": ["concurrency", "segmentRecords", "leaseMs"]
         },
         "compaction": {
           "type": "object",
@@ -825,17 +814,16 @@
       },
       "required": [
         "enabled",
-        "instances",
         "replicaCount",
-        "activeActive",
+        "s3",
         "image",
         "serviceAccount",
         "ports",
         "service",
-        "timestampField",
         "rustLog",
         "cache",
         "ingest",
+        "workers",
         "compaction",
         "garbageCollection",
         "probes",
