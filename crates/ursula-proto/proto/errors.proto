@@ -60,6 +60,7 @@ message StreamErrorContextV1 {
     uint64 producer_current_epoch = 2;
     ProducerSeqConflictContextV1 producer_seq_conflict = 3;
     BlankResponseV1 stale_cold_flush_candidate = 4;
+    uint64 record_current_tail = 5;
   }
 }
 
@@ -95,4 +96,5 @@ enum StreamErrorCodeV1 {
   STREAM_ERROR_CODE_SNAPSHOT_CONFLICT = 22;
   STREAM_ERROR_CODE_INVALID_STREAM_ATTRS = 23;
   STREAM_ERROR_CODE_INVALID_RECORD_BOUNDARIES = 24;
+  STREAM_ERROR_CODE_RECORD_PRECONDITION_FAILED = 25;
 }

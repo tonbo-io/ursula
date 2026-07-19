@@ -53,6 +53,7 @@ pub enum StreamCommand {
         stream_seq: Option<String>,
         producer: Option<ProducerRequest>,
         now_ms: u64,
+        record_match: Option<u64>,
     },
     AppendExternal {
         stream_id: BucketStreamId,
@@ -64,6 +65,7 @@ pub enum StreamCommand {
         stream_seq: Option<String>,
         producer: Option<ProducerRequest>,
         now_ms: u64,
+        record_match: Option<u64>,
     },
     AppendBatch {
         stream_id: BucketStreamId,

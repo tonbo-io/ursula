@@ -94,6 +94,7 @@ fn json_record_coordinates_survive_flush_restore_and_retention() {
             stream_seq: None,
             producer: None,
             now_ms: 1,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 16,
@@ -542,6 +543,7 @@ fn append_advances_offsets_and_checks_content_type() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 0,
@@ -560,6 +562,7 @@ fn append_advances_offsets_and_checks_content_type() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Error {
             code: StreamErrorCode::ContentTypeMismatch,
@@ -593,6 +596,7 @@ fn catch_up_read_returns_payload_slice_and_bounds_errors() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended { .. }
     ));
@@ -643,6 +647,7 @@ fn flush_cold_moves_hot_prefix_to_manifest_and_read_plan_splits() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 0,
@@ -741,6 +746,7 @@ fn flush_cold_compacts_message_records_to_cold_prefix() {
                 stream_seq: None,
                 producer: None,
                 now_ms: 0,
+                record_match: None,
             }),
             StreamResponse::Appended { .. }
         ));
@@ -832,6 +838,7 @@ fn flush_one_cold_chunk(machine: &mut StreamStateMachine, id: &str) {
         stream_seq: None,
         producer: None,
         now_ms: 0,
+        record_match: None,
     });
     let candidate = machine
         .plan_cold_flush(&stream(id), 4, 4)
@@ -963,6 +970,7 @@ fn writes_sweep_expired_streams_in_bounded_deterministic_batches() {
             stream_seq: None,
             producer: None,
             now_ms: 2_000,
+            record_match: None,
         }),
         StreamResponse::Appended { .. }
     ));
@@ -1009,6 +1017,7 @@ fn flush_cold_can_coalesce_contiguous_hot_segments() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 0,
@@ -1025,6 +1034,7 @@ fn flush_cold_can_coalesce_contiguous_hot_segments() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 3,
@@ -1080,6 +1090,7 @@ fn plan_cold_flush_coalesces_contiguous_hot_segments() {
                 stream_seq: None,
                 producer: None,
                 now_ms: 0,
+                record_match: None,
             }),
             StreamResponse::Appended { .. }
         ));
@@ -1116,6 +1127,7 @@ fn plan_next_cold_flush_selects_deterministic_eligible_stream() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended { .. }
     ));
@@ -1128,6 +1140,7 @@ fn plan_next_cold_flush_selects_deterministic_eligible_stream() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended { .. }
     ));
@@ -1158,6 +1171,7 @@ fn plan_next_cold_flush_drains_distributed_group_hot_bytes() {
                 stream_seq: None,
                 producer: None,
                 now_ms: 0,
+                record_match: None,
             }),
             StreamResponse::Appended { .. }
         ));
@@ -1198,6 +1212,7 @@ fn plan_next_cold_flush_batch_advances() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended { .. }
     ));
@@ -1244,6 +1259,7 @@ fn stale_cold_flush_candidate_after_delete_recreate_is_invalid_without_mutation(
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             next_offset: 18,
@@ -1271,6 +1287,7 @@ fn stale_cold_flush_candidate_after_delete_recreate_is_invalid_without_mutation(
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             next_offset: 17,
@@ -1328,6 +1345,7 @@ fn plan_next_cold_flush_skips_deleted_streams() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended { .. }
     ));
@@ -1346,6 +1364,7 @@ fn plan_next_cold_flush_skips_deleted_streams() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended { .. }
     ));
@@ -1376,6 +1395,7 @@ fn hot_payload_byte_metrics_follow_cold_flush() {
                 stream_seq: None,
                 producer: None,
                 now_ms: 0,
+                record_match: None,
             }),
             StreamResponse::Appended { .. }
         ));
@@ -1417,6 +1437,7 @@ fn hot_start_offset_advances_to_tail_after_full_cold_flush() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended { .. }
     ));
@@ -1472,6 +1493,7 @@ fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
             stream_seq: Some("0002".to_owned()),
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 2,
@@ -1529,6 +1551,7 @@ fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
             stream_seq: Some("0002".to_owned()),
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Error {
             code: StreamErrorCode::StreamSeqConflict,
@@ -1545,6 +1568,7 @@ fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
             stream_seq: Some("0003".to_owned()),
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 5,
@@ -1563,6 +1587,7 @@ fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Error {
             code: StreamErrorCode::StreamClosed,
@@ -1773,6 +1798,7 @@ fn close_is_monotonic_and_close_only_is_idempotent() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 0,
@@ -1804,6 +1830,7 @@ fn close_is_monotonic_and_close_only_is_idempotent() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Error {
             code: StreamErrorCode::StreamClosed,
@@ -1828,6 +1855,7 @@ fn stream_seq_must_strictly_increase() {
             stream_seq: Some("0002".to_owned()),
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended { .. }
     ));
@@ -1840,6 +1868,7 @@ fn stream_seq_must_strictly_increase() {
             stream_seq: Some("0002".to_owned()),
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Error {
             code: StreamErrorCode::StreamSeqConflict,
@@ -1856,6 +1885,7 @@ fn stream_seq_must_strictly_increase() {
             stream_seq: Some("0003".to_owned()),
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 1,
@@ -1880,6 +1910,7 @@ fn producer_headers_deduplicate_retries_and_fence_stale_epochs() {
             stream_seq: None,
             producer: Some(producer("writer-1", 0, 0)),
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 0,
@@ -1898,6 +1929,7 @@ fn producer_headers_deduplicate_retries_and_fence_stale_epochs() {
             stream_seq: None,
             producer: Some(producer("writer-1", 0, 0)),
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 0,
@@ -1924,6 +1956,7 @@ fn producer_headers_deduplicate_retries_and_fence_stale_epochs() {
             stream_seq: None,
             producer: Some(producer("writer-1", 0, 2)),
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Error {
             code: StreamErrorCode::ProducerSeqConflict,
@@ -1940,6 +1973,7 @@ fn producer_headers_deduplicate_retries_and_fence_stale_epochs() {
             stream_seq: None,
             producer: Some(producer("writer-1", 1, 0)),
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 1,
@@ -1958,6 +1992,7 @@ fn producer_headers_deduplicate_retries_and_fence_stale_epochs() {
             stream_seq: None,
             producer: Some(producer("writer-1", 0, 1)),
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Error {
             code: StreamErrorCode::ProducerEpochStale,
@@ -2068,6 +2103,7 @@ fn producer_state_survives_snapshot_restore() {
             stream_seq: None,
             producer: Some(producer("writer-1", 0, 0)),
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             deduplicated: false,
@@ -2082,6 +2118,8 @@ fn producer_state_survives_snapshot_restore() {
             start_offset: 0,
             next_offset: 1,
             closed: false,
+            record_start: None,
+            record_next: None,
         }
     ]);
     let mut restored = StreamStateMachine::restore(snapshot).expect("restore snapshot");
@@ -2095,6 +2133,7 @@ fn producer_state_survives_snapshot_restore() {
             stream_seq: None,
             producer: Some(producer("writer-1", 0, 0)),
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 0,
@@ -2112,6 +2151,7 @@ fn producer_state_survives_snapshot_restore() {
             stream_seq: None,
             producer: Some(producer("writer-1", 0, 1)),
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 1,
@@ -2186,6 +2226,7 @@ fn stream_ttl_uses_sliding_access_window() {
             stream_seq: None,
             producer: None,
             now_ms: 2_400,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 2,
@@ -2206,6 +2247,7 @@ fn stream_ttl_uses_sliding_access_window() {
             stream_seq: None,
             producer: None,
             now_ms: 3_401,
+            record_match: None,
         }),
         StreamResponse::Error {
             code: StreamErrorCode::StreamNotFound,
@@ -2348,6 +2390,7 @@ fn stream_expires_at_is_absolute_and_recreate_after_expiry() {
             stream_seq: None,
             producer: None,
             now_ms: 1_600,
+            record_match: None,
         }),
         StreamResponse::Appended { .. }
     ));
@@ -2395,6 +2438,7 @@ fn producer_duplicate_final_append_remains_idempotent_after_close() {
             stream_seq: None,
             producer: Some(producer("writer-1", 0, 0)),
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 0,
@@ -2413,6 +2457,7 @@ fn producer_duplicate_final_append_remains_idempotent_after_close() {
             stream_seq: None,
             producer: Some(producer("writer-1", 0, 0)),
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 0,
@@ -2431,6 +2476,7 @@ fn producer_duplicate_final_append_remains_idempotent_after_close() {
             stream_seq: None,
             producer: Some(producer("writer-1", 0, 1)),
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Error {
             code: StreamErrorCode::StreamClosed,
@@ -2455,6 +2501,7 @@ fn append_conflict_precedence_reports_closed_before_mismatch_or_seq() {
             stream_seq: Some("0002".to_owned()),
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 0,
@@ -2474,6 +2521,7 @@ fn append_conflict_precedence_reports_closed_before_mismatch_or_seq() {
             stream_seq: Some("0001".to_owned()),
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Error {
             code: StreamErrorCode::StreamClosed,
@@ -2528,6 +2576,7 @@ fn publish_snapshot_advances_retention_on_message_boundary() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 0,
@@ -2544,6 +2593,7 @@ fn publish_snapshot_advances_retention_on_message_boundary() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended {
             offset: 3,
@@ -2618,6 +2668,7 @@ fn publish_snapshot_rejects_unaligned_offset() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }),
         StreamResponse::Appended { .. }
     ));
@@ -2650,6 +2701,7 @@ fn snapshot_restore_preserves_visible_snapshot_and_message_records() {
         stream_seq: None,
         producer: None,
         now_ms: 0,
+        record_match: None,
     });
     let _ = machine.apply(StreamCommand::Append {
         stream_id: stream("restore-snap"),
@@ -2659,6 +2711,7 @@ fn snapshot_restore_preserves_visible_snapshot_and_message_records() {
         stream_seq: None,
         producer: None,
         now_ms: 0,
+        record_match: None,
     });
     let _ = machine.apply(StreamCommand::PublishSnapshot {
         stream_id: stream("restore-snap"),
@@ -2711,6 +2764,7 @@ fn append_payload(
         stream_seq: None,
         producer,
         now_ms: 0,
+        record_match: None,
     })
 }
 

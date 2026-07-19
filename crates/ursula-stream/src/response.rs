@@ -89,6 +89,7 @@ pub enum StreamErrorCode {
     SnapshotConflict,
     InvalidStreamAttrs,
     InvalidRecordBoundaries,
+    RecordPreconditionFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +102,9 @@ pub enum StreamErrorContext {
     ProducerSeqConflict {
         expected_seq: u64,
         received_seq: u64,
+    },
+    RecordTailMismatch {
+        current_record: u64,
     },
 }
 
