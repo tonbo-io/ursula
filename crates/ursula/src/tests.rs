@@ -1783,6 +1783,71 @@ async fn json_record_coordinates_preserve_deduplicated_and_close_only_ranges() {
 }
 
 #[tokio::test]
+async fn json_record_coordinates_concurrent_appends_receive_disjoint_commit_ranges() {
+    let app = test_router();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/stream/json-record-concurrent")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let mut writes = Vec::new();
+    for id in 0..16 {
+        let app = app.clone();
+        writes.push(tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/stream/json-record-concurrent")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"id":{id}}}"#)))
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+        }));
+    }
+
+    let mut ranges = Vec::new();
+    for write in writes {
+        let response = write.await.expect("write task");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let start = response
+            .headers()
+            .get(HEADER_STREAM_RECORD_START)
+            .expect("record start")
+            .to_str()
+            .expect("record start text")
+            .parse::<u64>()
+            .expect("record start integer");
+        let next = response
+            .headers()
+            .get(HEADER_STREAM_RECORD_NEXT)
+            .expect("record next")
+            .to_str()
+            .expect("record next text")
+            .parse::<u64>()
+            .expect("record next integer");
+        ranges.push((start, next));
+    }
+    ranges.sort_unstable();
+    assert_eq!(
+        ranges,
+        (0..16)
+            .map(|record| (record, record + 1))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
 async fn json_record_coordinates_live_reads_resume_by_record() {
     let app = test_router();
     let response = app

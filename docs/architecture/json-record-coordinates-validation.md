@@ -66,3 +66,20 @@ The production implementation is accepted only when the shared vectors are exerc
 The in-memory ordinal index stores one `u64` canonical start offset per retained record: 8 bytes per record, plus one 24-byte `Vec` descriptor per indexed stream and allocator capacity overhead. Snapshot and WAL serialization use the same one-offset-per-record representation.
 
 `cargo bench -p ursula-runtime --bench append_apply -- record_coordinates` reports three representative operations against the production state-machine structures: JSON record append, exact seek in a 100,000-record stream, and a record-aligned 100-record read plan. Benchmark results are environment-specific and should be attached to the implementation PR rather than frozen into the protocol document.
+
+## Implementation audit
+
+| Contract | Production path | Evidence |
+| --- | --- | --- |
+| Activation and scoped capability advertisement | JSON create, append, read, HEAD, live, snapshot, and bootstrap responses | HTTP JSON-mode and snapshot tests; non-JSON compatibility suite |
+| Atomic normalization and committed ranges | Canonical NDJSON boundaries feed the replicated record index | Reference vectors; HTTP array and concurrent-append tests |
+| Idempotent ranges and record-tail preconditions | Producer state persists original ranges; `Stream-Record-Match` is checked in the state owner | HTTP retry/precondition tests; WAL recovery after retention |
+| Exact record seek and aligned reads | Owner resolves ordinal to canonical offset and caps reads at complete boundaries | Reference vectors; catch-up, tail, max-records, and envelope tests |
+| Live continuation | Long-poll and SSE carry record cursors; envelope SSE emits one record per data event | Live wake/reconnect HTTP test; deterministic HTTP simulation |
+| Retention, snapshots, and bootstrap | JSON logical message boundaries equal record boundaries; snapshot/bootstrap expose retained range | State snapshot/cold-flush test; HTTP snapshot/bootstrap test |
+| Raft, protobuf, WAL, and restart | Record starts and producer ranges are encoded in durable commands and snapshots | Codec/workspace tests; focused WAL restart test; madsim replay |
+| Append Batch | Each normalized frame receives its own range and deduplicated frames recover saved ranges | HTTP and runtime batch tests |
+| Client event time | `captured_at` remains JSON data; external index orders `(captured_at, record)` and publishes progress | Browser telemetry example and Node tests |
+| Base compatibility | Offsets remain opaque and ordinary offset reads remain byte-oriented | Existing Durable Streams HTTP suite and partial-offset JSON test |
+
+Append Session (#87) and Table Streams (#81) are intentionally outside this audit and implementation.
