@@ -163,6 +163,10 @@ pub enum IndexError {
     RecordConflict { record: u64 },
     #[error("cache capacity {capacity} bytes cannot hold a {object_size}-byte part")]
     CacheCapacity { capacity: u64, object_size: u64 },
+    #[error("index registration `{0}` already exists with different settings")]
+    RegistrationConflict(String),
+    #[error("index registration `{0}` does not exist")]
+    UnknownIndex(String),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
