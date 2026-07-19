@@ -138,6 +138,35 @@ impl StreamStateMachine {
         self.registry.refresh_ttl(stream_id);
     }
 
+    fn message_records_for_append(
+        start_offset: u64,
+        end_offset: u64,
+        record_ends: &[u64],
+    ) -> Vec<StreamMessageRecord> {
+        if record_ends.is_empty() {
+            return (start_offset < end_offset)
+                .then_some(StreamMessageRecord {
+                    start_offset,
+                    end_offset,
+                })
+                .into_iter()
+                .collect();
+        }
+        let mut start = start_offset;
+        record_ends
+            .iter()
+            .map(|relative_end| {
+                let end = start_offset.saturating_add(*relative_end);
+                let record = StreamMessageRecord {
+                    start_offset: start,
+                    end_offset: end,
+                };
+                start = end;
+                record
+            })
+            .collect()
+    }
+
     pub fn apply(&mut self, command: StreamCommand) -> StreamResponse {
         match command {
             StreamCommand::CreateBucket { bucket_id } => self.create_bucket(bucket_id),

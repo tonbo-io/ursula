@@ -403,7 +403,7 @@ impl InMemoryGroupEngine {
                 producer,
                 now_ms,
             } => {
-                if producer.is_some() {
+                if let Some(producer) = producer {
                     let payload_refs = payloads.iter().map(Bytes::as_ref).collect::<Vec<_>>();
                     let batch = self
                         .state_machine
@@ -411,7 +411,7 @@ impl InMemoryGroupEngine {
                             stream_id.clone(),
                             Some(&content_type),
                             &payload_refs,
-                            producer,
+                            Some(producer.clone()),
                             now_ms,
                         )
                         .map_err(stream_response_error)?;
@@ -454,7 +454,7 @@ impl InMemoryGroupEngine {
                                         &stream_id,
                                         item.offset,
                                         item.next_offset,
-                                        None,
+                                        Some(&producer),
                                     )
                                     .map_err(|err| {
                                         GroupEngineError::new(format!("record range: {err:?}"))
@@ -504,7 +504,7 @@ impl InMemoryGroupEngine {
                 now_ms,
             } => {
                 let response = self.state_machine.apply(StreamCommand::PublishSnapshot {
-                    stream_id,
+                    stream_id: stream_id.clone(),
                     snapshot_offset,
                     content_type,
                     payload: payload.to_vec(),
@@ -513,11 +513,16 @@ impl InMemoryGroupEngine {
                 match response {
                     StreamResponse::SnapshotPublished { snapshot_offset } => {
                         self.commit_index += 1;
+                        let record_range =
+                            self.state_machine.record_range(&stream_id).map_err(|err| {
+                                GroupEngineError::new(format!("record range: {err:?}"))
+                            })?;
                         Ok(GroupWriteResponse::PublishSnapshot(
                             PublishSnapshotResponse {
                                 placement,
                                 snapshot_offset,
                                 group_commit_index: self.commit_index,
+                                record_range,
                             },
                         ))
                     }
@@ -651,6 +656,8 @@ impl InMemoryGroupEngine {
                 producer,
                 now_ms,
             } => {
+                let record_stream_id = stream_id.clone();
+                let record_producer = producer.clone();
                 let response = self.state_machine.apply(StreamCommand::Close {
                     stream_id,
                     stream_seq,
@@ -663,6 +670,17 @@ impl InMemoryGroupEngine {
                         deduplicated,
                         ..
                     } => {
+                        let record_range = self
+                            .state_machine
+                            .record_range_for_append(
+                                &record_stream_id,
+                                next_offset,
+                                next_offset,
+                                record_producer.as_ref(),
+                            )
+                            .map_err(|err| {
+                                GroupEngineError::new(format!("record range: {err:?}"))
+                            })?;
                         if !deduplicated {
                             self.commit_index += 1;
                         }
@@ -671,6 +689,7 @@ impl InMemoryGroupEngine {
                             next_offset,
                             group_commit_index: self.commit_index,
                             deduplicated,
+                            record_range,
                         }))
                     }
                     StreamResponse::Error {
@@ -1554,6 +1573,10 @@ impl GroupEngine for InMemoryGroupEngine {
                 content_type: snapshot.content_type,
                 payload: snapshot.payload,
                 up_to_date: snapshot.offset == tail_offset,
+                record_range: self
+                    .state_machine
+                    .record_range(&request.stream_id)
+                    .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?,
             })
         })
     }
@@ -1626,6 +1649,10 @@ impl GroupEngine for InMemoryGroupEngine {
                 next_offset: plan.next_offset,
                 up_to_date: plan.up_to_date,
                 closed: plan.closed,
+                record_range: self
+                    .state_machine
+                    .record_range(&request.stream_id)
+                    .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?,
             })
         })
     }

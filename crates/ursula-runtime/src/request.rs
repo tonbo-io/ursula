@@ -319,6 +319,7 @@ pub struct PublishSnapshotResponse {
     pub placement: ShardPlacement,
     pub snapshot_offset: u64,
     pub group_commit_index: u64,
+    pub record_range: Option<StreamRecordRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,6 +337,7 @@ pub struct ReadSnapshotResponse {
     pub content_type: String,
     pub payload: Vec<u8>,
     pub up_to_date: bool,
+    pub record_range: Option<StreamRecordRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,6 +371,7 @@ pub struct BootstrapStreamResponse {
     pub next_offset: u64,
     pub up_to_date: bool,
     pub closed: bool,
+    pub record_range: Option<StreamRecordRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,6 +388,7 @@ pub struct CloseStreamResponse {
     pub next_offset: u64,
     pub group_commit_index: u64,
     pub deduplicated: bool,
+    pub record_range: Option<StreamRecordRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

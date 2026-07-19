@@ -1,0 +1,72 @@
+---
+title: Browser Telemetry
+description: Collect replayable browser events with JSON record coordinates and one client event timestamp.
+---
+
+Browser telemetry is a natural fit for an `application/json` stream: the browser appends ordinary JSON over HTTP, Ursula assigns stable record ordinals in commit order, and consumers can replay or tail complete events without interpreting opaque offsets.
+
+The runnable example is in [`examples/browser-telemetry`](https://github.com/tonbo-io/ursula/tree/main/examples/browser-telemetry).
+
+## Data model
+
+Keep one timestamp: the time captured by the browser. It remains application data and may arrive out of order after offline buffering or retries.
+
+```json
+{
+  "captured_at": "2026-07-18T10:30:00.100Z",
+  "type": "network_response",
+  "status": 500
+}
+```
+
+Ursula does not reorder the stream by `captured_at` and does not invent a second protocol timestamp. Record `42` means the 42nd committed JSON event; its opaque offset identifies the same byte boundary for base Durable Streams clients.
+
+## Browser collector
+
+Point plain `fetch` at a same-origin route that proxies to the Ursula stream. The gateway owns browser authentication and CORS policy.
+
+```js
+const events = [{
+  captured_at: new Date().toISOString(),
+  type: "navigation",
+  duration_ms: performance.getEntriesByType("navigation")[0]?.duration,
+}];
+
+const response = await fetch("/telemetry/events", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(events),
+  keepalive: true,
+});
+
+console.log(
+  response.headers.get("Stream-Record-Start"),
+  response.headers.get("Stream-Record-Next"),
+);
+```
+
+One array append is normalized into complete NDJSON records. Each successful response returns the contiguous record range assigned to that operation.
+
+## Replay and live tail
+
+Read complete events from a known ordinal:
+
+```http
+GET /telemetry/events?record=42&max_records=100
+```
+
+For a self-describing representation, add `record_view=envelope`. For a live native `EventSource`, add `live=sse`; every envelope-mode SSE data event contains exactly one `{record, value}` object, and control events publish `streamNextRecord` for reconnection.
+
+## Event-time queries
+
+Event time is an ordinary secondary index, not another Durable Streams coordinate. An external indexer:
+
+1. consumes the envelope view in record order;
+2. extracts `captured_at` and indexes `(captured_at, record)`;
+3. publishes `indexed_through_record`, the exclusive source ordinal fully processed;
+4. returns record ordinals for time queries, which callers resolve back through Ursula;
+5. reports a retention gap instead of presenting an incomplete result.
+
+The source stream remains canonical and the derived index can be rebuilt from retained records. Equal timestamps are ordered by record ordinal.
+
+This flow uses only HTTP/SSE. It does not depend on Append Session.

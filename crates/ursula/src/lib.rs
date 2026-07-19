@@ -1933,6 +1933,9 @@ pub(crate) async fn append_stream_by_id(
                 insert_default_response_headers(&mut headers);
                 insert_offset(&mut headers, response.next_offset);
                 insert_producer_ack(&mut headers, producer.as_ref());
+                if let Some(record_range) = response.record_range {
+                    insert_record_operation_headers(&mut headers, record_range);
+                }
                 insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
                 (StatusCode::NO_CONTENT, headers).into_response()
             }
@@ -2623,6 +2626,10 @@ pub(crate) async fn publish_snapshot(
             let mut headers = HeaderMap::new();
             insert_default_response_headers(&mut headers);
             insert_snapshot_offset(&mut headers, response.snapshot_offset);
+            if let Some(record_range) = response.record_range {
+                insert_record_extension(&mut headers);
+                insert_record_head_headers(&mut headers, record_range);
+            }
             (StatusCode::NO_CONTENT, headers).into_response()
         }
         Err(err) => {
@@ -2663,6 +2670,10 @@ pub(crate) async fn read_latest_snapshot(
     let mut response_headers = HeaderMap::new();
     insert_default_response_headers(&mut response_headers);
     insert_snapshot_offset(&mut response_headers, snapshot_offset);
+    if let Some(record_range) = head.record_range {
+        insert_record_extension(&mut response_headers);
+        insert_record_head_headers(&mut response_headers, record_range);
+    }
     let path = format!("/{bucket}/{stream}/snapshot/{snapshot_offset:020}");
     insert_public_location(&mut response_headers, &headers, &path);
     (StatusCode::TEMPORARY_REDIRECT, response_headers).into_response()

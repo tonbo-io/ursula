@@ -15,6 +15,8 @@ const CONTENT_TYPE: &str = "application/octet-stream";
 const APPENDS_PER_ITER: usize = 1024;
 const PAYLOAD_BYTES: usize = 256;
 const STREAM_COUNT: usize = 1024;
+const RECORD_COUNT: usize = 100_000;
+const JSON_RECORD: &[u8] = b"{\"value\":1}\n";
 
 fn append_apply_benches(c: &mut Criterion) {
     let payload = vec![7; PAYLOAD_BYTES];
@@ -47,6 +49,97 @@ fn append_apply_benches(c: &mut Criterion) {
     }
 
     group.finish();
+}
+
+fn record_coordinate_benches(c: &mut Criterion) {
+    let (machine, stream_id) = setup_record_machine(RECORD_COUNT);
+    let mut group = c.benchmark_group("record_coordinates");
+
+    group.bench_function("seek_100k_records", |b| {
+        b.iter(|| {
+            black_box(
+                machine
+                    .offset_for_record(&stream_id, black_box(75_000))
+                    .expect("record seek"),
+            )
+        });
+    });
+
+    group.bench_function("aligned_read_100_records", |b| {
+        b.iter(|| {
+            let start = machine
+                .offset_for_record(&stream_id, black_box(50_000))
+                .expect("record start")
+                .expect("record index active");
+            let end = machine
+                .offset_for_record(&stream_id, 50_100)
+                .expect("record end")
+                .expect("record index active");
+            black_box(
+                machine
+                    .read_plan(
+                        &stream_id,
+                        start,
+                        usize::try_from(end - start).expect("read length fits usize"),
+                    )
+                    .expect("record-aligned read"),
+            );
+        });
+    });
+
+    group.throughput(Throughput::Elements(
+        u64::try_from(APPENDS_PER_ITER).expect("append count fits u64"),
+    ));
+    group.bench_function("append_json_records", |b| {
+        b.iter_batched(
+            || setup_record_machine(0),
+            |(mut machine, stream_id)| {
+                for _ in 0..APPENDS_PER_ITER {
+                    let response = machine.apply(StreamCommand::Append {
+                        stream_id: stream_id.clone(),
+                        content_type: Some("application/json".to_owned()),
+                        payload: JSON_RECORD.to_vec(),
+                        close_after: false,
+                        stream_seq: None,
+                        producer: None,
+                        now_ms: 0,
+                        record_match: None,
+                    });
+                    assert!(matches!(response, StreamResponse::Appended { .. }));
+                }
+                black_box(machine);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
+fn setup_record_machine(record_count: usize) -> (StreamStateMachine, BucketStreamId) {
+    let stream_id = BucketStreamId::new("benchcmp", "record-coordinates");
+    let mut machine = StreamStateMachine::new();
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateBucket {
+            bucket_id: "benchcmp".to_owned(),
+        }),
+        StreamResponse::BucketCreated { .. }
+    ));
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateStream {
+            stream_id: stream_id.clone(),
+            content_type: "application/json".to_owned(),
+            initial_payload: JSON_RECORD.repeat(record_count),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            attrs: None,
+            now_ms: 0,
+        }),
+        StreamResponse::Created { .. }
+    ));
+    (machine, stream_id)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -226,5 +319,5 @@ fn stream_id(index: usize) -> BucketStreamId {
     BucketStreamId::new("benchcmp", format!("append-{index}"))
 }
 
-criterion_group!(benches, append_apply_benches);
+criterion_group!(benches, append_apply_benches, record_coordinate_benches);
 criterion_main!(benches);

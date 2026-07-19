@@ -11,7 +11,6 @@ use super::StreamBatchAppend;
 use super::StreamBatchAppendItem;
 use super::StreamErrorCode;
 use super::StreamErrorContext;
-use super::StreamMessageRecord;
 use super::StreamMetadata;
 use super::StreamResponse;
 use super::StreamStateMachine;
@@ -203,10 +202,12 @@ impl StreamStateMachine {
             slot.hot_buffer.push(offset, next_offset, payload);
             slot.integrity
                 .append_payload(&stream_id, offset, next_offset, payload);
-            slot.message_records.push(StreamMessageRecord {
-                start_offset: offset,
-                end_offset: next_offset,
-            });
+            slot.message_records
+                .extend(Self::message_records_for_append(
+                    offset,
+                    next_offset,
+                    &record_ends,
+                ));
             StreamResponse::Appended {
                 offset,
                 next_offset,
@@ -375,10 +376,12 @@ impl StreamStateMachine {
             &object.s3_path,
             object.object_size,
         );
-        slot.message_records.push(StreamMessageRecord {
-            start_offset: offset,
-            end_offset: next_offset,
-        });
+        slot.message_records
+            .extend(Self::message_records_for_append(
+                offset,
+                next_offset,
+                &record_ends,
+            ));
         StreamResponse::Appended {
             offset,
             next_offset,
@@ -518,11 +521,15 @@ impl StreamStateMachine {
             slot.integrity
                 .append_payload(&stream_id, item.start_offset, item.next_offset, payload);
         }
-        slot.message_records
-            .extend(items.iter().map(|item| StreamMessageRecord {
-                start_offset: item.start_offset,
-                end_offset: item.next_offset,
-            }));
+        for (item, payload) in items.iter().zip(payloads.iter()) {
+            let record_ends = canonical_json_record_ends(content_type, payload).unwrap_or_default();
+            slot.message_records
+                .extend(Self::message_records_for_append(
+                    item.start_offset,
+                    item.next_offset,
+                    &record_ends,
+                ));
+        }
         Ok(StreamBatchAppend {
             items: items
                 .into_iter()

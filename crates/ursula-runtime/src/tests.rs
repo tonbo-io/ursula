@@ -4504,6 +4504,7 @@ impl GroupEngine for RecordingEngine {
                 next_offset: self.commit_index,
                 group_commit_index: self.commit_index,
                 deduplicated: false,
+                record_range: None,
             })
         })
     }

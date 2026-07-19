@@ -330,6 +330,8 @@ pub(crate) fn publish_snapshot_response_to_proto(
         placement: Some(placement_to_proto(response.placement)),
         snapshot_offset: response.snapshot_offset,
         group_commit_index: response.group_commit_index,
+        record_start: response.record_range.map(|range| range.first_record),
+        record_next: response.record_range.map(|range| range.next_record),
     }
 }
 
@@ -387,6 +389,8 @@ pub(crate) fn close_stream_response_to_proto(
         next_offset: response.next_offset,
         group_commit_index: response.group_commit_index,
         deduplicated: response.deduplicated,
+        record_start: response.record_range.map(|range| range.first_record),
+        record_next: response.record_range.map(|range| range.next_record),
     }
 }
 
@@ -549,6 +553,7 @@ pub(crate) fn publish_snapshot_response_from_proto(
         placement: placement_from_proto(response.placement, "publish_snapshot_response.placement")?,
         snapshot_offset: response.snapshot_offset,
         group_commit_index: response.group_commit_index,
+        record_range: record_range(response.record_start, response.record_next)?,
     })
 }
 
@@ -614,6 +619,7 @@ pub(crate) fn close_stream_response_from_proto(
         next_offset: response.next_offset,
         group_commit_index: response.group_commit_index,
         deduplicated: response.deduplicated,
+        record_range: record_range(response.record_start, response.record_next)?,
     })
 }
 

@@ -37,6 +37,9 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   "why-ursula": { group: "Getting Started", order: 3 },
   clients: { group: "Getting Started", order: 4 },
 
+  // Guides - complete application-shaped examples.
+  "guides/browser-telemetry": { group: "Guides", order: 1 },
+
   // Concepts - encounter order: primitive, organization, reading, writing, long-stream, transport.
   "concepts/streams": { group: "Concepts", order: 1 },
   "concepts/buckets": { group: "Concepts", order: 2 },
@@ -134,6 +137,7 @@ const groupOrder = [
   "Getting Started",
   "Architecture",
   "Comparisons",
+  "Guides",
   "Concepts",
   "API Reference",
   "Install & Deploy",
