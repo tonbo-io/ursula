@@ -1712,6 +1712,284 @@ async fn json_record_coordinates_read_complete_records() {
 }
 
 #[tokio::test]
+async fn json_record_coordinates_preserve_deduplicated_and_close_only_ranges() {
+    let app = test_router();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/stream/json-record-dedup")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    for payload in [r#"[{"id":1},{"id":2}]"#, r#"{"ignored":true}"#] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/stream/json-record-dedup")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(HEADER_PRODUCER_ID, "browser-tab")
+                    .header(HEADER_PRODUCER_EPOCH, "0")
+                    .header(HEADER_PRODUCER_SEQ, "0")
+                    .body(Body::from(payload))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert!(matches!(
+            response.status(),
+            StatusCode::OK | StatusCode::NO_CONTENT
+        ));
+        assert_eq!(
+            response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
+            "2"
+        );
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/stream/json-record-dedup")
+                .header(CONTENT_TYPE, "application/json")
+                .header(HEADER_STREAM_CLOSED, "true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
+        "2"
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
+        "2"
+    );
+}
+
+#[tokio::test]
+async fn json_record_coordinates_live_reads_resume_by_record() {
+    let app = test_router();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/stream/json-record-live")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let read = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            app.oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/stream/json-record-live?record=now&live=long-poll&timeout_ms=1000")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/stream/json-record-live")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"[{"id":1},{"id":2}]"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), read)
+        .await
+        .expect("long poll completed")
+        .expect("read task");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
+        "0"
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
+        "2"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(&body[..], b"{\"id\":1}\n{\"id\":2}\n");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/stream/json-record-live")
+                .header(CONTENT_TYPE, "application/json")
+                .header(HEADER_STREAM_CLOSED, "true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/stream/json-record-live?record=0&record_view=envelope&live=sse")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("stream-data-content-type").unwrap(),
+        "application/vnd.durable-stream-record+json"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("sse body");
+    let body = std::str::from_utf8(&body).expect("utf8 sse body");
+    assert_eq!(body.matches("event: data").count(), 2);
+    assert!(body.contains("data:{\"record\":0,\"value\":{\"id\":1}}"));
+    assert!(body.contains("data:{\"record\":1,\"value\":{\"id\":2}}"));
+    assert!(body.contains("\"streamFirstRecord\":0"));
+    assert!(body.contains("\"streamNextRecord\":2"));
+}
+
+#[tokio::test]
+async fn json_record_coordinates_snapshot_and_bootstrap_headers_are_aligned() {
+    let app = test_router();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/json-record-snapshot")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"[{"id":1},{"id":2}]"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/json-record-snapshot/snapshot/1")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"count":0}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/benchcmp/json-record-snapshot?record=0&max_records=1")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let snapshot_offset = response
+        .headers()
+        .get(HEADER_STREAM_NEXT_OFFSET)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/benchcmp/json-record-snapshot/snapshot/{snapshot_offset}"
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"count":1}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_FIRST).unwrap(),
+        "1"
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
+        "2"
+    );
+
+    for uri in [
+        format!("/benchcmp/json-record-snapshot/snapshot/{snapshot_offset}"),
+        "/benchcmp/json-record-snapshot/bootstrap".to_owned(),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(HEADER_STREAM_RECORD_FIRST).unwrap(),
+            "1"
+        );
+        assert_eq!(
+            response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
+            "2"
+        );
+    }
+}
+
+#[tokio::test]
 async fn json_mode_reads_ndjson_bytes_without_message_boundary_projection() {
     let app = test_router();
 
