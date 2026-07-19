@@ -104,6 +104,7 @@ pub(crate) struct AppendPayloadInput<'a> {
     stream_seq: Option<String>,
     producer: Option<ProducerRequest>,
     now_ms: u64,
+    record_match: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -155,6 +156,7 @@ impl InMemoryGroupEngine {
                 now_ms,
             } => {
                 ensure_bucket_exists(&mut self.state_machine, &stream_id)?;
+                let record_stream_id = stream_id.clone();
                 let response = self.state_machine.apply(StreamCommand::CreateStream {
                     stream_id,
                     content_type,
@@ -180,6 +182,12 @@ impl InMemoryGroupEngine {
                             closed,
                             already_exists: false,
                             group_commit_index: self.commit_index,
+                            record_range: self
+                                .state_machine
+                                .record_range(&record_stream_id)
+                                .map_err(|err| {
+                                    GroupEngineError::new(format!("record range: {err:?}"))
+                                })?,
                         }))
                     }
                     StreamResponse::AlreadyExists {
@@ -192,6 +200,7 @@ impl InMemoryGroupEngine {
                         closed,
                         already_exists: true,
                         group_commit_index: self.commit_index,
+                        record_range: None,
                     })),
                     StreamResponse::Error {
                         code,
@@ -223,6 +232,7 @@ impl InMemoryGroupEngine {
                 now_ms,
             } => {
                 ensure_bucket_exists(&mut self.state_machine, &stream_id)?;
+                let record_stream_id = stream_id.clone();
                 let response = self.state_machine.apply(StreamCommand::CreateExternal {
                     stream_id,
                     content_type,
@@ -249,6 +259,12 @@ impl InMemoryGroupEngine {
                             closed,
                             already_exists: false,
                             group_commit_index: self.commit_index,
+                            record_range: self
+                                .state_machine
+                                .record_range(&record_stream_id)
+                                .map_err(|err| {
+                                    GroupEngineError::new(format!("record range: {err:?}"))
+                                })?,
                         }))
                     }
                     StreamResponse::AlreadyExists {
@@ -261,6 +277,7 @@ impl InMemoryGroupEngine {
                         closed,
                         already_exists: true,
                         group_commit_index: self.commit_index,
+                        record_range: None,
                     })),
                     StreamResponse::Error {
                         code,
@@ -286,6 +303,7 @@ impl InMemoryGroupEngine {
                 stream_seq,
                 producer,
                 now_ms,
+                record_match,
             } => self
                 .append_payload(
                     AppendPayloadInput {
@@ -296,6 +314,7 @@ impl InMemoryGroupEngine {
                         stream_seq,
                         producer,
                         now_ms,
+                        record_match,
                     },
                     placement,
                 )
@@ -309,7 +328,9 @@ impl InMemoryGroupEngine {
                 stream_seq,
                 producer,
                 now_ms,
+                record_match,
             } => {
+                let record_stream_id = stream_id.clone();
                 let response = self.state_machine.apply(StreamCommand::AppendExternal {
                     stream_id: stream_id.clone(),
                     content_type: Some(content_type),
@@ -319,6 +340,7 @@ impl InMemoryGroupEngine {
                     stream_seq,
                     producer,
                     now_ms,
+                    record_match,
                 });
                 match response {
                     StreamResponse::Appended {
@@ -329,6 +351,17 @@ impl InMemoryGroupEngine {
                         producer,
                         ..
                     } => {
+                        let record_range = self
+                            .state_machine
+                            .record_range_for_append(
+                                &record_stream_id,
+                                offset,
+                                next_offset,
+                                producer.as_ref(),
+                            )
+                            .map_err(|err| {
+                                GroupEngineError::new(format!("record range: {err:?}"))
+                            })?;
                         let stream_append_count =
                             self.stream_append_counts.entry(stream_id).or_insert(0);
                         if !deduplicated {
@@ -344,6 +377,7 @@ impl InMemoryGroupEngine {
                             closed,
                             deduplicated,
                             producer,
+                            record_range,
                         }))
                     }
                     StreamResponse::Error {
@@ -386,7 +420,10 @@ impl InMemoryGroupEngine {
                     if !batch.deduplicated {
                         let count = u64::try_from(batch.items.len()).expect("item count fits u64");
                         self.commit_index += count;
-                        *self.stream_append_counts.entry(stream_id).or_insert(0) += count;
+                        *self
+                            .stream_append_counts
+                            .entry(stream_id.clone())
+                            .or_insert(0) += count;
                     }
                     let items = batch
                         .items
@@ -411,6 +448,17 @@ impl InMemoryGroupEngine {
                                 closed: item.closed,
                                 deduplicated: item.deduplicated,
                                 producer: None,
+                                record_range: self
+                                    .state_machine
+                                    .record_range_for_append(
+                                        &stream_id,
+                                        item.offset,
+                                        item.next_offset,
+                                        None,
+                                    )
+                                    .map_err(|err| {
+                                        GroupEngineError::new(format!("record range: {err:?}"))
+                                    })?,
                             })
                         })
                         .collect();
@@ -438,6 +486,7 @@ impl InMemoryGroupEngine {
                             stream_seq: None,
                             producer: None,
                             now_ms,
+                            record_match: None,
                         },
                         placement,
                     ));
@@ -944,6 +993,7 @@ impl InMemoryGroupEngine {
             stream_seq,
             producer,
             now_ms,
+            record_match,
         } = input;
         let stream_count_key = stream_id.clone();
         let response = self.state_machine.append_borrowed(AppendStreamInput {
@@ -954,6 +1004,7 @@ impl InMemoryGroupEngine {
             stream_seq,
             producer,
             now_ms,
+            record_match,
         });
         match response {
             StreamResponse::Appended {
@@ -966,8 +1017,17 @@ impl InMemoryGroupEngine {
             } => {
                 let stream_append_count = self
                     .stream_append_counts
-                    .entry(stream_count_key)
+                    .entry(stream_count_key.clone())
                     .or_insert(0);
+                let record_range = self
+                    .state_machine
+                    .record_range_for_append(
+                        &stream_count_key,
+                        offset,
+                        next_offset,
+                        producer.as_ref(),
+                    )
+                    .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?;
                 if !deduplicated {
                     self.commit_index += 1;
                     *stream_append_count += 1;
@@ -981,6 +1041,7 @@ impl InMemoryGroupEngine {
                     closed,
                     deduplicated,
                     producer,
+                    record_range,
                 })
             }
             StreamResponse::Error {
@@ -1013,14 +1074,77 @@ impl InMemoryGroupEngine {
         &self,
         request: &ReadStreamRequest,
     ) -> Result<StreamReadPlan, GroupEngineError> {
-        self.state_machine
-            .read_plan_at(
-                &request.stream_id,
-                request.offset,
-                request.max_len,
-                request.now_ms,
-            )
-            .map_err(stream_response_error)
+        let Some(record) = request.record else {
+            let mut plan = self
+                .state_machine
+                .read_plan_at(
+                    &request.stream_id,
+                    request.offset,
+                    request.max_len,
+                    request.now_ms,
+                )
+                .map_err(stream_response_error)?;
+            plan.retained_record_range = self
+                .state_machine
+                .record_range(&request.stream_id)
+                .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?;
+            return Ok(plan);
+        };
+        let retained_record_range = self
+            .state_machine
+            .record_range(&request.stream_id)
+            .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?
+            .ok_or_else(|| {
+                GroupEngineError::stream(
+                    StreamErrorCode::InvalidRecordBoundaries,
+                    "record coordinates are inactive for this stream",
+                )
+            })?;
+        if record < retained_record_range.first_record {
+            return Err(GroupEngineError::stream(
+                StreamErrorCode::StreamGone,
+                format!(
+                    "record {record} is older than first retained record {}",
+                    retained_record_range.first_record
+                ),
+            ));
+        }
+        if record > retained_record_range.next_record {
+            return Err(GroupEngineError::stream(
+                StreamErrorCode::InvalidRecordBoundaries,
+                format!(
+                    "record {record} is beyond record tail {}",
+                    retained_record_range.next_record
+                ),
+            ));
+        }
+        let next_record = request
+            .max_records
+            .map(|limit| record.saturating_add(limit))
+            .unwrap_or(retained_record_range.next_record)
+            .min(retained_record_range.next_record);
+        let offset = self
+            .state_machine
+            .offset_for_record(&request.stream_id, record)
+            .map_err(|err| GroupEngineError::new(format!("record offset: {err:?}")))?
+            .ok_or_else(|| GroupEngineError::new("record stream disappeared"))?;
+        let next_offset = self
+            .state_machine
+            .offset_for_record(&request.stream_id, next_record)
+            .map_err(|err| GroupEngineError::new(format!("record offset: {err:?}")))?
+            .ok_or_else(|| GroupEngineError::new("record stream disappeared"))?;
+        let max_len = usize::try_from(next_offset.saturating_sub(offset))
+            .map_err(|_| GroupEngineError::new("record read window exceeds usize"))?;
+        let mut plan = self
+            .state_machine
+            .read_plan_at(&request.stream_id, offset, max_len, request.now_ms)
+            .map_err(stream_response_error)?;
+        plan.retained_record_range = Some(retained_record_range);
+        plan.record_range = Some(ursula_stream::StreamRecordRange {
+            first_record: record,
+            next_record,
+        });
+        Ok(plan)
     }
 
     pub fn head_stream_after_access(
@@ -1060,6 +1184,10 @@ impl InMemoryGroupEngine {
                 .state_machine
                 .integrity_snapshot(&request.stream_id)
                 .map_err(stream_response_error)?,
+            record_range: self
+                .state_machine
+                .record_range(&request.stream_id)
+                .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?,
         })
     }
 

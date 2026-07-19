@@ -173,6 +173,7 @@ pub use ursula_stream::StreamAttrs;
 pub use ursula_stream::StreamErrorCode;
 pub use ursula_stream::StreamErrorContext;
 pub use ursula_stream::StreamIntegritySnapshot;
+pub use ursula_stream::StreamRecordRange;
 
 #[cfg(test)]
 mod tests;

@@ -539,6 +539,7 @@ pub trait GroupEngine: Send + 'static {
                         stream_seq,
                         producer,
                         now_ms,
+                        record_match,
                     } => self
                         .append(
                             AppendRequest {
@@ -549,6 +550,7 @@ pub trait GroupEngine: Send + 'static {
                                 stream_seq,
                                 producer,
                                 now_ms,
+                                record_match,
                             },
                             placement,
                         )
@@ -563,6 +565,7 @@ pub trait GroupEngine: Send + 'static {
                         stream_seq,
                         producer,
                         now_ms,
+                        record_match,
                     } => self
                         .append_external(
                             AppendExternalRequest {
@@ -574,6 +577,7 @@ pub trait GroupEngine: Send + 'static {
                                 stream_seq,
                                 producer,
                                 now_ms,
+                                record_match,
                             },
                             placement,
                         )
