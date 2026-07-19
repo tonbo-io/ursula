@@ -1,18 +1,15 @@
 {{- if and .Values.indexer.enabled .Values.indexer.podDisruptionBudget.enabled -}}
 {{- $root := . -}}
-{{- range $instance := .Values.indexer.instances }}
-{{- $context := dict "root" $root "name" $instance.name -}}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: {{ include "ursula.indexerFullname" $context }}
+  name: {{ include "ursula.indexerFullname" $root }}
   labels:
-    {{- include "ursula.indexerLabels" $context | nindent 4 }}
+    {{- include "ursula.indexerLabels" $root | nindent 4 }}
 spec:
   maxUnavailable: {{ $root.Values.indexer.podDisruptionBudget.maxUnavailable }}
   selector:
     matchLabels:
-      {{- include "ursula.indexerSelectorLabels" $context | nindent 6 }}
-{{- end }}
+      {{- include "ursula.indexerSelectorLabels" $root | nindent 6 }}
 {{- end }}

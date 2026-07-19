@@ -1,8 +1,22 @@
 # Ursula event-time index
 
-`ursula-indexer` is a rebuildable materialized index for the client-supplied event time in Ursula JSON record streams. Ursula remains the event source. The indexer consumes record envelopes over HTTP, writes immutable sorted Parquet parts to S3, and conditionally publishes each source-record checkpoint.
+`ursula-indexer` is a rebuildable materialized index for the client-supplied event time in Ursula JSON record streams. Ursula remains the event source. The indexer consumes record envelopes over HTTP, writes immutable sorted Parquet parts to S3, and conditionally publishes source-record progress.
 
-The index is deliberately outside Ursula's Raft state machine. S3 is authoritative for the derived index; local disk is only a bounded, disposable Parquet cache. Multiple stateless indexers may race safely because `CURRENT` advances with an ETag compare-and-swap. Losing writers reload the winning checkpoint and verify that overlapping records have identical event times.
+The index is deliberately outside Ursula's Raft state machine. S3 is authoritative for the derived index; local disk is only a bounded, disposable Parquet cache. Multiple stateless workers claim different `(stream, record range)` tasks. Claims reduce duplicate work but are not locks: immutable content-addressed parts and an ETag compare-and-swap on each stream's `CURRENT` manifest provide correctness. Ranges may complete out of order, while `durable_through_record` advances only through a gap-free prefix.
+
+Without `--stream-url`, the binary runs as a dynamic worker pool. Register or remove sources at runtime; adding a stream does not restart pods or change Helm values:
+
+```bash
+curl -X PUT http://127.0.0.1:4493/v1/indexes/browser-session-42 \
+  -H 'Content-Type: application/json' \
+  -d '{"stream_url":"http://ursula:4437/sessions/browser-session-42","timestamp_field":"captured_at"}'
+```
+
+The shared S3 root stores the registration catalog and derives a separate logical namespace for every registered source. A fixed worker pool schedules ranges across those namespaces, allowing small streams to share workers and one hot stream to use several workers. Serving and maintenance cache budgets are shared across all registrations in each process rather than multiplied by stream count. Query routes are `/v1/indexes/{id}/events`; registration, deletion, and status resume routes are administrative and should remain behind authenticated internal networking.
+
+The range-aware manifest is format version 3. Version 2 single-source indexes are not adopted automatically; register the source in a new pool root and rebuild from Ursula. This is an intentional prototype-phase format break.
+
+Passing `--stream-url` selects the legacy single-source mode for local development and focused recovery work:
 
 ```bash
 cargo run -p ursula-index --bin ursula-indexer -- \
@@ -24,7 +38,7 @@ Garbage collection runs every `--gc-interval-seconds` and retains objects reacha
 
 Source ingestion and HTTP queries share the serving index and cache. Compaction and GC run on a second serverless index instance with a separate bounded maintenance cache, so Parquet rewrite, S3 upload, full-prefix listing, and retained-manifest reads never hold the query mutex.
 
-Queries use the Parquet page index and return stable `(captured_at, record)` cursors together with a fixed `through_record` pagination watermark:
+Single-source mode exposes:
 
 ```text
 GET /v1/events?from=<RFC3339-or-ms>&until=<RFC3339-or-ms>&limit=1000
@@ -32,6 +46,6 @@ GET /v1/status
 POST /v1/status/resume
 ```
 
-The process stops source advancement and publishes a persistent status only for deterministic source-data failures (an invalid timestamp, unexpected record, or conflicting record) or when source retention has passed its rebuild checkpoint. Transient source, S3, cache, and conditional-publication failures are retried without changing the persistent status. An operator can clear `blocked` with the idempotent `POST /v1/status/resume` operation after repairing the source data; a retention gap requires rebuilding the index and cannot be resumed. The default listener is loopback-only, and deployments that expose the query API must restrict this operator endpoint at their HTTP ingress.
+Pool mode exposes the equivalent operations below `/v1/indexes/{id}`. Processing stops for one registration only on deterministic source-data failures or when source retention has passed its rebuild checkpoint. Transient source, S3, cache, lease, and conditional-publication failures are retried without changing persistent status. An operator can clear `blocked` with the idempotent status resume operation after repairing source data; a retention gap requires rebuilding the derived namespace and cannot be resumed.
 
 Run the opt-in real-S3 recovery test with `URSULA_EVENT_INDEX_S3_INTEGRATION=1`, `URSULA_EVENT_INDEX_S3_BUCKET`, and the optional `URSULA_EVENT_INDEX_S3_REGION` / `URSULA_EVENT_INDEX_S3_ENDPOINT` variables. The test uses and removes a unique prefix.

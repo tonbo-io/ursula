@@ -289,23 +289,17 @@ gateway:
   initContainers: []
 
 indexer:
-  # Deploy one independent event-time indexer per configured source stream.
+  # Deploy a fixed worker pool. Streams are registered dynamically over HTTP;
+  # pod count is independent of stream count.
   enabled: false
-  # Each instance must use a unique name and S3 prefix. Empty bucket/region/endpoint
-  # values inherit the top-level s3 settings.
-  instances: []
-  # Example:
-  # - name: browser-telemetry
-  #   streamUrl: http://ursula-gateway.default.svc.cluster.local:4437/telemetry/events
-  #   s3:
-  #     bucket: ""
-  #     region: ""
-  #     endpoint: ""
-  #     prefix: indexes/browser-telemetry
-  replicaCount: 1
-  # Multiple replicas safely race through manifest CAS but duplicate source reads
-  # and part uploads. Require an explicit opt-in before replicaCount may exceed 1.
-  activeActive: false
+  replicaCount: 2
+  # Empty bucket/region/endpoint values inherit the top-level S3 settings. The
+  # prefix owns the shared registration catalog and per-stream namespaces.
+  s3:
+    bucket: ""
+    region: ""
+    endpoint: ""
+    prefix: event-index
   image:
     repository: ""
     tag: ""
@@ -324,7 +318,6 @@ indexer:
     type: ClusterIP
     port: 4493
     annotations: {}
-  timestampField: captured_at
   rustLog: "ursula_index=info"
   cache:
     servingMaxBytes: 1073741824
@@ -336,6 +329,13 @@ indexer:
     rowGroupEntries: 16384
     readBatchRecords: 4096
     pollIntervalMs: 250
+  workers:
+    # Concurrent range tasks per pod. One hot stream may occupy several slots.
+    concurrency: 4
+    # A hot stream is split into independently claimed source-record ranges.
+    segmentRecords: 4096
+    # Claims reduce duplicate work only; manifest CAS remains authoritative.
+    leaseMs: 60000
   compaction:
     fanIn: 8
     maxEntries: 1000000
@@ -359,7 +359,7 @@ indexer:
       periodSeconds: 10
       timeoutSeconds: 2
   podDisruptionBudget:
-    enabled: false
+    enabled: true
     maxUnavailable: 1
   networkPolicy:
     # Restrict query/admin HTTP ingress to this release namespace. Egress remains
