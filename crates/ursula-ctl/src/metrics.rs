@@ -30,8 +30,7 @@ impl MetricsClient {
     }
 
     pub async fn fetch_node(&self, node: &NodeInfo) -> Result<NodeMetricsView> {
-        let url = node
-            .admin_url
+        let url = metrics_base_url(node)
             .join("/__ursula/metrics")
             .with_context(|| format!("compose metrics url for node {}", node.id))?;
         let resp = self
@@ -168,6 +167,10 @@ impl MetricsClient {
             ))
         }
     }
+}
+
+fn metrics_base_url(node: &NodeInfo) -> &url::Url {
+    node.http_url.as_ref().unwrap_or(&node.admin_url)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -314,5 +317,44 @@ impl ClusterSnapshot {
             }
         }
         map
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use url::Url;
+
+    use super::*;
+
+    #[test]
+    fn metrics_use_client_url_when_available() -> anyhow::Result<()> {
+        let node = NodeInfo {
+            id: 1,
+            admin_url: Url::parse("http://127.0.0.1:4438")?,
+            host: "127.0.0.1".to_owned(),
+            instance_id: None,
+            ssh_host: None,
+            http_url: Some(Url::parse("http://127.0.0.1:4437")?),
+            name: None,
+        };
+
+        assert_eq!(metrics_base_url(&node).port(), Some(4437));
+        Ok(())
+    }
+
+    #[test]
+    fn metrics_fall_back_to_admin_url_for_legacy_manifests() -> anyhow::Result<()> {
+        let node = NodeInfo {
+            id: 1,
+            admin_url: Url::parse("http://127.0.0.1:4438")?,
+            host: "127.0.0.1".to_owned(),
+            instance_id: None,
+            ssh_host: None,
+            http_url: None,
+            name: None,
+        };
+
+        assert_eq!(metrics_base_url(&node).port(), Some(4438));
+        Ok(())
     }
 }

@@ -1,0 +1,86 @@
+global:
+  image:
+    repository: ghcr.io/tonbo-io/ursula
+    tag: "0.2.0"
+    pullPolicy: IfNotPresent
+
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-storage
+
+server:
+  replicaCount: 3
+  coreCount: 4
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+      ephemeral-storage: 2Gi
+    limits:
+      memory: 8Gi
+      ephemeral-storage: 4Gi
+  scheduling:
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: ursula
+            app.kubernetes.io/instance: ursula
+
+raft:
+  groupCount: 256
+  initMembershipPerGroup: true
+  storageMode: logDir
+
+persistence:
+  enabled: true
+  storageClassName: gp3
+  size: 100Gi
+
+s3:
+  bucket: replace-with-production-bucket
+  region: us-east-1
+  prefix: production/ursula
+
+coldStorage:
+  enabled: true
+
+snapshotStore:
+  backend: s3
+
+gateway:
+  replicaCount: 3
+  podDisruptionBudget:
+    enabled: true
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+  scheduling:
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: ursula-gateway
+            app.kubernetes.io/instance: ursula
+
+indexer:
+  enabled: true
+  replicaCount: 2
+  activeActive: true
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-index
+  instances:
+    - name: browser-telemetry
+      streamUrl: http://ursula-gateway.ursula.svc.cluster.local:4437/telemetry/events
+      s3:
+        prefix: indexes/browser-telemetry
+  podDisruptionBudget:
+    enabled: true
