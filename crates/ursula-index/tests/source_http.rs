@@ -89,3 +89,27 @@ async fn source_client_rejects_missing_record_coordinate_capability() -> anyhow:
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "the test combines fallible setup with assertions"
+)]
+async fn source_client_preserves_non_success_http_status() -> anyhow::Result<()> {
+    let app = Router::new().route(
+        "/stream",
+        get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "temporary proxy failure") }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(axum::serve(listener, app).into_future());
+    let client = SourceClient::new(Url::parse(&format!("http://{address}/stream"))?, 100)?;
+
+    let error = client
+        .read_from(0)
+        .await
+        .expect_err("500 must be preserved");
+    assert!(matches!(error, ursula_index::IndexError::SourceStatus(500)));
+    server.abort();
+    Ok(())
+}
