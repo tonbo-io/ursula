@@ -4,6 +4,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use opendal::ErrorKind;
 use opendal::Operator;
@@ -20,6 +21,12 @@ pub(crate) struct StoredObject {
 pub(crate) enum ConditionalWrite {
     Written,
     Conflict,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ObjectInfo {
+    pub key: String,
+    pub modified: Option<SystemTime>,
 }
 
 #[derive(Clone)]
@@ -56,6 +63,20 @@ impl ObjectStore {
         match self {
             Self::Fs(store) => store.compare_and_swap(key, expected_etag, bytes),
             Self::S3(store) => store.compare_and_swap(key, expected_etag, bytes).await,
+        }
+    }
+
+    pub(crate) async fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>, IndexError> {
+        match self {
+            Self::Fs(store) => store.list(prefix),
+            Self::S3(store) => store.list(prefix).await,
+        }
+    }
+
+    pub(crate) async fn delete(&self, key: &str) -> Result<(), IndexError> {
+        match self {
+            Self::Fs(store) => store.delete(key),
+            Self::S3(store) => store.delete(key).await,
         }
     }
 }
@@ -151,6 +172,44 @@ impl FsObjectStore {
         fs::rename(&temporary, &path)?;
         sync_parent(&path)?;
         Ok(ConditionalWrite::Written)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>, IndexError> {
+        let root = self.path(prefix)?;
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+        let mut pending = vec![root];
+        let mut objects = Vec::new();
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
+                let path = entry.path();
+                let metadata = entry.metadata()?;
+                if metadata.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                let key = path
+                    .strip_prefix(&self.root)
+                    .map_err(|_error| IndexError::InvalidObjectKey(prefix.to_owned()))?
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                objects.push(ObjectInfo {
+                    key,
+                    modified: metadata.modified().ok(),
+                });
+            }
+        }
+        Ok(objects)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), IndexError> {
+        match fs::remove_file(self.path(key)?) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -260,6 +319,40 @@ impl S3ObjectStore {
             }
             Err(error) => Err(object_error(error)),
         }
+    }
+
+    async fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>, IndexError> {
+        let entries = self
+            .operator
+            .list_with(prefix)
+            .recursive(true)
+            .await
+            .map_err(object_error)?;
+        let mut objects = Vec::new();
+        for entry in entries {
+            if !entry.metadata().mode().is_file() {
+                continue;
+            }
+            let modified = match entry.metadata().last_modified() {
+                Some(modified) => Some(modified.into()),
+                None => self
+                    .operator
+                    .stat(entry.path())
+                    .await
+                    .map_err(object_error)?
+                    .last_modified()
+                    .map(Into::into),
+            };
+            objects.push(ObjectInfo {
+                key: entry.path().to_owned(),
+                modified,
+            });
+        }
+        Ok(objects)
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), IndexError> {
+        self.operator.delete(key).await.map_err(object_error)
     }
 }
 

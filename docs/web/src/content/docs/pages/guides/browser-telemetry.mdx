@@ -80,7 +80,7 @@ cargo run -p ursula-index --bin ursula-indexer -- \
   --cache-dir ./target/browser-telemetry-cache
 ```
 
-S3 stores immutable content-addressed Parquet parts and versioned manifests. The local cache is bounded and disposable, so a replacement instance can recover from `CURRENT` without a persistent volume. For local development, use `--object-dir ./target/browser-telemetry-objects` in place of the S3 options.
+S3 stores immutable content-addressed Parquet parts and versioned manifests. Flushes are split into UTC-day event-time partitions, and bounded size-tiered compaction merges only a fixed number of new parts within one day; historical compacted parts are never rewritten when later telemetry arrives. Manifest-aware garbage collection preserves a configurable recent-generation and in-flight grace window, then removes superseded and failed-CAS objects. Compaction and GC use a separate bounded cache and index instance, so their Parquet and S3 work does not hold the HTTP query mutex. The serving cache is bounded and disposable, so a replacement instance can recover from `CURRENT` without a persistent volume. For local development, use `--object-dir ./target/browser-telemetry-objects` in place of the S3 options.
 
 The query API is ordinary HTTP:
 

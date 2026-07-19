@@ -155,6 +155,10 @@ pub enum IndexError {
     ObjectHashMismatch(String),
     #[error("conditional manifest publication repeatedly conflicted")]
     PublishConflict,
+    #[error(
+        "compaction candidate has {entries} entries, exceeding configured maximum {max_entries}"
+    )]
+    CompactionTooLarge { entries: u64, max_entries: u64 },
     #[error("record {record} differs from the value already committed by another indexer")]
     RecordConflict { record: u64 },
     #[error("cache capacity {capacity} bytes cannot hold a {object_size}-byte part")]
