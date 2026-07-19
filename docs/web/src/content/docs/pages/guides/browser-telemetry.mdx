@@ -59,14 +59,32 @@ For a self-describing representation, add `record_view=envelope`. For a live nat
 
 ## Event-time queries
 
-Event time is an ordinary secondary index, not another Durable Streams coordinate. An external indexer:
+Event time is an ordinary secondary index, not another Durable Streams coordinate. The optional `ursula-event-indexer` crate:
 
 1. consumes the envelope view in record order;
-2. extracts `captured_at` and indexes `(captured_at, record)`;
-3. publishes `indexed_through_record`, the exclusive source ordinal fully processed;
-4. returns record ordinals for time queries, which callers resolve back through Ursula;
-5. reports a retention gap instead of presenting an incomplete result.
+2. extracts `captured_at` and buffers `(captured_at, record)` in memory;
+3. flushes immutable sorted Parquet parts to S3 and advances `CURRENT` with an ETag compare-and-swap;
+4. publishes `indexed_through_record` and `durable_through_record` so queries can distinguish the live prefix from the crash-recoverable prefix;
+5. returns record ordinals for time queries, which callers resolve back through Ursula;
+6. reports a retention gap instead of presenting an incomplete result.
 
 The source stream remains canonical and the derived index can be rebuilt from retained records. Equal timestamps are ordered by record ordinal.
 
 This flow uses only HTTP/SSE. It does not depend on Append Session.
+
+```bash
+cargo run -p ursula-event-index --bin ursula-event-indexer -- \
+  --stream-url http://127.0.0.1:4437/v1/stream/browser-telemetry \
+  --s3-bucket my-telemetry-index \
+  --s3-prefix production/browser-telemetry \
+  --cache-dir ./target/browser-telemetry-cache
+```
+
+S3 stores immutable content-addressed Parquet parts and versioned manifests. The local cache is bounded and disposable, so a replacement instance can recover from `CURRENT` without a persistent volume. For local development, use `--object-dir ./target/browser-telemetry-objects` in place of the S3 options.
+
+The query API is ordinary HTTP:
+
+```http
+GET http://127.0.0.1:4493/v1/events?from=2026-07-18T10:00:00Z&until=2026-07-18T11:00:00Z&limit=100
+GET http://127.0.0.1:4493/v1/status
+```
