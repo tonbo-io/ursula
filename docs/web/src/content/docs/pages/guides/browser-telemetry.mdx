@@ -90,7 +90,7 @@ cargo run -p ursula-index --bin ursula-indexer -- \
   --cache-dir ./target/browser-telemetry-cache
 ```
 
-For Kubernetes, create the JSON source stream first, then enable one Helm indexer instance with its own S3 prefix and workload identity:
+For Kubernetes, deploy one shared worker pool with its own S3 prefix and workload identity:
 
 ```yaml
 s3:
@@ -99,25 +99,31 @@ s3:
 
 indexer:
   enabled: true
+  replicaCount: 2
+  s3:
+    prefix: production/telemetry-indexes
   serviceAccount:
     annotations:
       eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-telemetry-index
-  instances:
-    - name: browser-telemetry
-      streamUrl: http://ursula-gateway.default.svc.cluster.local:4437/v1/stream/browser-telemetry
-      s3:
-        prefix: production/browser-telemetry
 ```
 
-The chart keeps the query Service internal, uses disposable local cache storage, and fails startup when the source is not JSON or does not advertise record coordinates. One replica is the conservative default; active-active replicas are an explicit availability/cost tradeoff.
+When an application creates a browser stream, register it dynamically without changing the Helm release:
+
+```bash
+curl -X PUT http://ursula-indexer:4493/v1/indexes/browser-session-42 \
+  -H 'Content-Type: application/json' \
+  -d '{"stream_url":"http://ursula-gateway:4437/sessions/browser-session-42","timestamp_field":"captured_at"}'
+```
+
+The registration preflight rejects sources that are not JSON or do not advertise record coordinates. The fixed worker pool then balances `(stream, record range)` tasks: many small browser streams share pods, while a hot stream can occupy several workers. Per-stream S3 namespaces isolate checkpoints and queries without becoming compute-assignment boundaries.
 
 S3 stores immutable content-addressed Parquet parts and versioned manifests. Flushes are split into UTC-day event-time partitions, and bounded size-tiered compaction merges only a fixed number of new parts within one day; historical compacted parts are never rewritten when later telemetry arrives. Manifest-aware garbage collection preserves a configurable recent-generation and in-flight grace window, then removes superseded and failed-CAS objects. Compaction and GC use a separate bounded cache and index instance, so their Parquet and S3 work does not hold the HTTP query mutex. The serving cache is bounded and disposable, so a replacement instance can recover from `CURRENT` without a persistent volume. For local development, use `--object-dir ./target/browser-telemetry-objects` in place of the S3 options.
 
 The query API is ordinary HTTP:
 
 ```http
-GET http://127.0.0.1:4493/v1/events?from=2026-07-18T10:00:00Z&until=2026-07-18T11:00:00Z&limit=100
-GET http://127.0.0.1:4493/v1/status
+GET http://ursula-indexer:4493/v1/indexes/browser-session-42/events?from=2026-07-18T10:00:00Z&until=2026-07-18T11:00:00Z&limit=100
+GET http://ursula-indexer:4493/v1/indexes/browser-session-42/status
 ```
 
 A query returns records sorted by `(captured_at_ms, record)`, plus a cursor and a fixed source-record watermark:
@@ -138,9 +144,9 @@ A query returns records sorted by `(captured_at_ms, record)`, plus a cursor and 
 Fetch the next page with all three cursor fields from the first response:
 
 ```http
-GET /v1/events?from=2026-07-18T10:00:00Z&until=2026-07-18T11:00:00Z&limit=100&through_record=1200&after_captured_at_ms=1784370600100&after_record=57
+GET /v1/indexes/browser-session-42/events?from=2026-07-18T10:00:00Z&until=2026-07-18T11:00:00Z&limit=100&through_record=1200&after_captured_at_ms=1784370600100&after_record=57
 ```
 
-`through_record` prevents newly indexed source records from appearing halfway through one paginated query. `indexed_through_record` includes the current in-memory prefix; `durable_through_record` is the prefix recoverable from the published S3 manifest. Resolve returned record ordinals through Ursula to fetch the canonical event values.
+`through_record` prevents newly indexed source records from appearing halfway through one paginated query. In worker-pool mode, the visible and durable watermarks are the same contiguous S3-published prefix; completed ranges beyond a gap remain invisible until the missing range commits. Resolve returned record ordinals through Ursula to fetch the canonical event values.
 
-An invalid query returns `400`. A deterministically invalid source record or conflicting event time blocks advancement and returns `409` until an operator repairs the source and calls `POST /v1/status/resume`. A source retention gap also returns `409`, but requires rebuilding the derived index because the missing source prefix can no longer be recovered.
+An invalid query returns `400`. A deterministically invalid source record or conflicting event time blocks further advancement for that registration; its existing durable prefix remains queryable and `/status` reports the blocked record until an operator repairs the source and calls `POST /v1/indexes/{id}/status/resume`. A source retention gap returns `409` and requires rebuilding the derived namespace because the missing source prefix can no longer be recovered.

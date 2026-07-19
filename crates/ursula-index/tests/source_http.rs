@@ -128,6 +128,8 @@ async fn source_client_probe_requires_json_record_coordinates() -> anyhow::Resul
                 (StatusCode::OK, [
                     ("content-type", "application/json; charset=utf-8"),
                     ("stream-extensions", "json-record-coordinates-v1"),
+                    ("stream-record-first", "3"),
+                    ("stream-record-next", "17"),
                 ])
             }),
         )
@@ -144,9 +146,11 @@ async fn source_client_probe_requires_json_record_coordinates() -> anyhow::Resul
     let address = listener.local_addr()?;
     let server = tokio::spawn(axum::serve(listener, app).into_future());
 
-    SourceClient::new(Url::parse(&format!("http://{address}/ready"))?, 100)?
-        .probe()
-        .await?;
+    let ready = SourceClient::new(Url::parse(&format!("http://{address}/ready"))?, 100)?;
+    ready.probe().await?;
+    let range = ready.record_range().await?;
+    assert_eq!(range.first_record, 3);
+    assert_eq!(range.next_record, 17);
     let error = SourceClient::new(Url::parse(&format!("http://{address}/binary"))?, 100)?
         .probe()
         .await
