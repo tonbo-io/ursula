@@ -3,6 +3,7 @@ use serde::Serialize;
 use ursula_shard::BucketStreamId;
 
 use crate::model::ProducerRequest;
+use crate::record_index::StreamRecordRange;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamResponse {
@@ -45,6 +46,7 @@ pub enum StreamResponse {
     },
     SnapshotPublished {
         snapshot_offset: u64,
+        record_range: Option<StreamRecordRange>,
     },
     Accessed {
         changed: bool,

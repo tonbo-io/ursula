@@ -504,19 +504,18 @@ impl InMemoryGroupEngine {
                 now_ms,
             } => {
                 let response = self.state_machine.apply(StreamCommand::PublishSnapshot {
-                    stream_id: stream_id.clone(),
+                    stream_id,
                     snapshot_offset,
                     content_type,
                     payload: payload.to_vec(),
                     now_ms,
                 });
                 match response {
-                    StreamResponse::SnapshotPublished { snapshot_offset } => {
+                    StreamResponse::SnapshotPublished {
+                        snapshot_offset,
+                        record_range,
+                    } => {
                         self.commit_index += 1;
-                        let record_range =
-                            self.state_machine.record_range(&stream_id).map_err(|err| {
-                                GroupEngineError::new(format!("record range: {err:?}"))
-                            })?;
                         Ok(GroupWriteResponse::PublishSnapshot(
                             PublishSnapshotResponse {
                                 placement,

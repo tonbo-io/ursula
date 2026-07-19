@@ -143,6 +143,10 @@ fn json_record_coordinates_survive_flush_restore_and_retention() {
         }),
         StreamResponse::SnapshotPublished {
             snapshot_offset: 16,
+            record_range: Some(StreamRecordRange {
+                first_record: 2,
+                next_record: 3,
+            }),
         }
     );
     assert_eq!(
@@ -160,6 +164,55 @@ fn json_record_coordinates_survive_flush_restore_and_retention() {
         })
     );
     assert_eq!(restored.offset_for_record(&stream_id, 3), Ok(Some(24)));
+}
+
+#[test]
+fn snapshot_record_trim_failure_does_not_mutate_stream_state() {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    let stream_id = stream("snapshot-record-atomicity");
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateStream {
+            stream_id: stream_id.clone(),
+            content_type: "application/json".to_owned(),
+            initial_payload: b"{\"a\":1}\n{\"b\":2}\n".to_vec(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            attrs: None,
+            now_ms: 0,
+        }),
+        StreamResponse::Created { .. }
+    ));
+
+    // Simulate an internally inconsistent index so record trimming fails even
+    // though the requested snapshot offset is a retained message boundary.
+    machine
+        .stream_slot_mut(&stream_id)
+        .expect("stream slot")
+        .record_index
+        .as_mut()
+        .expect("record index")
+        .retain_from_offset(8, 16)
+        .expect("advance test index");
+    let before = machine.snapshot();
+
+    assert!(matches!(
+        machine.apply(StreamCommand::PublishSnapshot {
+            stream_id,
+            snapshot_offset: 0,
+            content_type: "application/json".to_owned(),
+            payload: br#"{"state":0}"#.to_vec(),
+            now_ms: 1,
+        }),
+        StreamResponse::Error {
+            code: StreamErrorCode::InvalidRecordBoundaries,
+            ..
+        }
+    ));
+    assert_eq!(machine.snapshot(), before);
 }
 
 fn producer(id: &str, epoch: u64, seq: u64) -> ProducerRequest {
@@ -825,7 +878,10 @@ fn flush_cold_compacts_message_records_to_cold_prefix() {
             payload: b"abc-state".to_vec(),
             now_ms: 0,
         }),
-        StreamResponse::SnapshotPublished { snapshot_offset: 3 }
+        StreamResponse::SnapshotPublished {
+            snapshot_offset: 3,
+            record_range: None,
+        }
     );
 }
 
@@ -2610,7 +2666,10 @@ fn publish_snapshot_advances_retention_on_message_boundary() {
             payload: br#"{"state":"abc"}"#.to_vec(),
             now_ms: 0,
         }),
-        StreamResponse::SnapshotPublished { snapshot_offset: 3 }
+        StreamResponse::SnapshotPublished {
+            snapshot_offset: 3,
+            record_range: None,
+        }
     );
     assert!(matches!(
         machine.read_plan(&stream("snap"), 0, 1),
@@ -3285,7 +3344,10 @@ proptest! {
                 payload: snapshot_payload.clone(),
                 now_ms: 0,
             }),
-            StreamResponse::SnapshotPublished { snapshot_offset }
+            StreamResponse::SnapshotPublished {
+                snapshot_offset,
+                record_range: None,
+            }
         );
 
         let prefix_read = machine.read_plan(&stream_id, 0, 1);

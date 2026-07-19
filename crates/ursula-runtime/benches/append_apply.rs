@@ -289,7 +289,9 @@ fn snapshot_compaction(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 
         payload: b"{}".to_vec(),
         now_ms: 0,
     }) {
-        StreamResponse::SnapshotPublished { snapshot_offset } => snapshot_offset,
+        StreamResponse::SnapshotPublished {
+            snapshot_offset, ..
+        } => snapshot_offset,
         response => panic!("publish snapshot failed: {response:?}"),
     }
 }

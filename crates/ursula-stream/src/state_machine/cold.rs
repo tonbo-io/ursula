@@ -208,6 +208,38 @@ impl StreamStateMachine {
             );
         }
 
+        let mut retained_record_index = self
+            .stream_slot(&stream_id)
+            .expect("stream existence checked before snapshot publish")
+            .record_index
+            .clone();
+        let record_range = if let Some(record_index) = retained_record_index.as_mut() {
+            if record_index
+                .retain_from_offset(snapshot_offset, tail_offset)
+                .is_err()
+            {
+                return StreamResponse::error_with_next_offset(
+                    StreamErrorCode::InvalidRecordBoundaries,
+                    format!(
+                        "snapshot offset {snapshot_offset} is not a retained record boundary for stream '{stream_id}'"
+                    ),
+                    tail_offset,
+                );
+            }
+            match record_index.range() {
+                Ok(range) => Some(range),
+                Err(_) => {
+                    return StreamResponse::error_with_next_offset(
+                        StreamErrorCode::InvalidRecordBoundaries,
+                        format!("stream '{stream_id}' has an invalid retained record index"),
+                        tail_offset,
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
         self.stream_slot_mut(&stream_id)
             .expect("stream existence checked before snapshot publish")
             .visible_snapshot = Some(StreamVisibleSnapshot {
@@ -215,8 +247,11 @@ impl StreamStateMachine {
             content_type,
             payload,
         });
-        self.compact_retained_prefix(&stream_id, snapshot_offset);
-        StreamResponse::SnapshotPublished { snapshot_offset }
+        self.compact_retained_prefix(&stream_id, snapshot_offset, retained_record_index);
+        StreamResponse::SnapshotPublished {
+            snapshot_offset,
+            record_range,
+        }
     }
 
     pub(super) fn flush_cold(
@@ -362,6 +397,7 @@ impl StreamStateMachine {
         &mut self,
         stream_id: &BucketStreamId,
         retained_offset: u64,
+        retained_record_index: Option<crate::StreamRecordIndex>,
     ) {
         let frontier = self.cold_frontier_offset(stream_id, retained_offset).max(
             self.stream_slot(stream_id)
@@ -369,16 +405,10 @@ impl StreamStateMachine {
                 .unwrap_or(retained_offset),
         );
         self.compact_message_records_before(stream_id, retained_offset, frontier);
-        let Some(slot) = self.stream_slot_mut(stream_id) else {
-            return;
-        };
-        if let Some(record_index) = slot.record_index.as_mut()
-            && record_index
-                .retain_from_offset(retained_offset, slot.metadata.tail_offset)
-                .is_err()
-        {
-            return;
-        }
+        let slot = self
+            .stream_slot_mut(stream_id)
+            .expect("stream existence checked before retained-prefix compaction");
+        slot.record_index = retained_record_index;
         slot.integrity.evict_before(retained_offset);
         let dropped_cold_paths = slot.cold.compact_before(retained_offset);
         if !dropped_cold_paths.is_empty() {
@@ -398,9 +428,9 @@ impl StreamStateMachine {
         retained_offset: u64,
         frontier: u64,
     ) {
-        let Some(slot) = self.stream_slot_mut(stream_id) else {
-            return;
-        };
+        let slot = self
+            .stream_slot_mut(stream_id)
+            .expect("stream existence checked before message-record compaction");
         let records = std::mem::take(&mut slot.message_records);
         let frontier = frontier.max(retained_offset);
         let mut compacted = Vec::with_capacity(records.len());

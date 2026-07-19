@@ -2627,7 +2627,6 @@ pub(crate) async fn publish_snapshot(
             insert_default_response_headers(&mut headers);
             insert_snapshot_offset(&mut headers, response.snapshot_offset);
             if let Some(record_range) = response.record_range {
-                insert_record_extension(&mut headers);
                 insert_record_head_headers(&mut headers, record_range);
             }
             (StatusCode::NO_CONTENT, headers).into_response()
@@ -2671,7 +2670,6 @@ pub(crate) async fn read_latest_snapshot(
     insert_default_response_headers(&mut response_headers);
     insert_snapshot_offset(&mut response_headers, snapshot_offset);
     if let Some(record_range) = head.record_range {
-        insert_record_extension(&mut response_headers);
         insert_record_head_headers(&mut response_headers, record_range);
     }
     let path = format!("/{bucket}/{stream}/snapshot/{snapshot_offset:020}");
