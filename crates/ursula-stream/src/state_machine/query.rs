@@ -5,6 +5,7 @@ use super::COLD_INDEX_PAGE_SPAN_BYTES;
 use super::ColdChunkRef;
 use super::HotPayloadSegment;
 use super::ObjectPayloadRef;
+use super::ProducerRequest;
 use super::StreamAttrs;
 use super::StreamBootstrapPlan;
 use super::StreamErrorCode;
@@ -49,6 +50,42 @@ impl StreamStateMachine {
         slot.record_index
             .as_ref()
             .map(|index| index.offset_for(record, slot.metadata.tail_offset))
+            .transpose()
+    }
+
+    pub fn record_range_for_append(
+        &self,
+        stream_id: &BucketStreamId,
+        start_offset: u64,
+        next_offset: u64,
+        producer: Option<&ProducerRequest>,
+    ) -> Result<Option<StreamRecordRange>, RecordIndexError> {
+        let Some(slot) = self.stream_slot(stream_id) else {
+            return Ok(None);
+        };
+        if let Some(producer) = producer
+            && let Some(record) = slot.producers.get(&producer.producer_id).and_then(|state| {
+                state.last_items.iter().find(|item| {
+                    item.start_offset == start_offset && item.next_offset == next_offset
+                })
+            })
+            && let (Some(first_record), Some(next_record)) =
+                (record.record_start, record.record_next)
+        {
+            return Ok(Some(StreamRecordRange {
+                first_record,
+                next_record,
+            }));
+        }
+        slot.record_index
+            .as_ref()
+            .map(|index| {
+                Ok(StreamRecordRange {
+                    first_record: index
+                        .record_for_offset(start_offset, slot.metadata.tail_offset)?,
+                    next_record: index.record_for_offset(next_offset, slot.metadata.tail_offset)?,
+                })
+            })
             .transpose()
     }
 
@@ -300,6 +337,8 @@ impl StreamStateMachine {
             segments: segments.into_iter().map(|(_, segment)| segment).collect(),
             up_to_date: next_offset == stream.tail_offset,
             closed: stream.status == StreamStatus::Closed,
+            retained_record_range: None,
+            record_range: None,
         })
     }
 

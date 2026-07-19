@@ -32,6 +32,7 @@ impl StreamStateMachine {
             stream_seq,
             producer,
             now_ms,
+            record_match,
         } = input;
         if let Err(response) = self.validate_stream_scope(&stream_id) {
             return response;
@@ -80,11 +81,15 @@ impl StreamStateMachine {
             };
         }
 
+        if let Err(response) = self.validate_record_match(&stream_id, record_match) {
+            return response;
+        }
+
         let payload_len = u64::try_from(payload.len()).expect("payload len fits u64");
         let record_ends = content_type
             .map(|value| canonical_json_record_ends(value, payload).unwrap_or_default())
             .unwrap_or_default();
-        let prepared_record_index = {
+        let (prepared_record_index, record_range) = {
             let slot = self
                 .stream_slot(&stream_id)
                 .expect("stream existence checked before record validation");
@@ -171,11 +176,15 @@ impl StreamStateMachine {
                     start_offset: offset,
                     next_offset,
                     closed,
+                    record_start: record_range.map(|range| range.first_record),
+                    record_next: record_range.map(|range| range.next_record),
                 },
                 vec![ProducerAppendRecord {
                     start_offset: offset,
                     next_offset,
                     closed,
+                    record_start: record_range.map(|range| range.first_record),
+                    record_next: record_range.map(|range| range.next_record),
                 }],
             );
         }
@@ -218,6 +227,7 @@ impl StreamStateMachine {
             stream_seq,
             producer,
             now_ms,
+            record_match,
         } = input;
         if let Err(response) = validate_external_payload_ref(&payload) {
             return response;
@@ -261,7 +271,11 @@ impl StreamStateMachine {
             };
         }
 
-        let prepared_record_index = {
+        if let Err(response) = self.validate_record_match(&stream_id, record_match) {
+            return response;
+        }
+
+        let (prepared_record_index, record_range) = {
             let slot = self
                 .stream_slot(&stream_id)
                 .expect("stream existence checked before record validation");
@@ -331,11 +345,15 @@ impl StreamStateMachine {
                     start_offset: offset,
                     next_offset,
                     closed,
+                    record_start: record_range.map(|range| range.first_record),
+                    record_next: record_range.map(|range| range.next_record),
                 },
                 vec![ProducerAppendRecord {
                     start_offset: offset,
                     next_offset,
                     closed,
+                    record_start: record_range.map(|range| range.first_record),
+                    record_next: record_range.map(|range| range.next_record),
                 }],
             );
         }
@@ -450,21 +468,24 @@ impl StreamStateMachine {
         }
 
         let mut record_offset = stream.tail_offset;
+        let mut item_record_ranges = Vec::with_capacity(payloads.len());
         for payload in payloads {
             let payload_len = u64::try_from(payload.len()).expect("payload len fits u64");
             let record_ends = canonical_json_record_ends(content_type, payload).unwrap_or_default();
-            prepared_record_index = prepare_record_append(
+            let (updated, range) = prepare_record_append(
                 prepared_record_index.as_ref(),
                 super::is_json_record_content_type(content_type),
                 record_offset,
                 payload_len,
                 &record_ends,
             )?;
+            prepared_record_index = updated;
+            item_record_ranges.push(range);
             record_offset = record_offset.saturating_add(payload_len);
         }
 
         let mut items = Vec::with_capacity(payloads.len());
-        for payload in payloads {
+        for (payload, record_range) in payloads.iter().zip(item_record_ranges) {
             let offset = stream.tail_offset;
             let payload_len = u64::try_from(payload.len()).expect("payload len fits u64");
             stream.tail_offset = stream.tail_offset.saturating_add(payload_len);
@@ -472,6 +493,8 @@ impl StreamStateMachine {
                 start_offset: offset,
                 next_offset: stream.tail_offset,
                 closed: false,
+                record_start: record_range.map(|range| range.first_record),
+                record_next: record_range.map(|range| range.next_record),
             });
         }
         let last = items
@@ -512,6 +535,45 @@ impl StreamStateMachine {
                 .collect(),
             deduplicated: false,
         })
+    }
+
+    fn validate_record_match(
+        &self,
+        stream_id: &BucketStreamId,
+        expected: Option<u64>,
+    ) -> Result<(), StreamResponse> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let Some(slot) = self.stream_slot(stream_id) else {
+            return Ok(());
+        };
+        let Some(index) = slot.record_index.as_ref() else {
+            return Err(StreamResponse::error(
+                StreamErrorCode::InvalidRecordBoundaries,
+                "Stream-Record-Match requires active JSON record coordinates",
+            ));
+        };
+        let current = index
+            .range()
+            .map_err(|_| {
+                StreamResponse::error(
+                    StreamErrorCode::InvalidRecordBoundaries,
+                    "stream record index is invalid",
+                )
+            })?
+            .next_record;
+        if current == expected {
+            return Ok(());
+        }
+        Err(StreamResponse::error_with_next_offset_and_context(
+            StreamErrorCode::RecordPreconditionFailed,
+            format!("record tail is {current}, expected {expected}"),
+            slot.metadata.tail_offset,
+            vec![StreamErrorContext::RecordTailMismatch {
+                current_record: current,
+            }],
+        ))
     }
 
     fn evaluate_producer(

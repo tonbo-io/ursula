@@ -79,6 +79,7 @@ pub(crate) fn group_write_command_from_proto(
             stream_seq: command.stream_seq,
             producer: command.producer,
             now_ms: command.now_ms,
+            record_match: command.record_match,
         }),
         Command::AppendExternal(command) => Ok(GroupWriteCommand::AppendExternal {
             stream_id: stream_id_from_proto(command.stream_id, "append_external.stream_id")?,
@@ -89,6 +90,7 @@ pub(crate) fn group_write_command_from_proto(
             stream_seq: command.stream_seq,
             producer: command.producer,
             now_ms: command.now_ms,
+            record_match: command.record_match,
         }),
         Command::AppendBatch(command) => Ok(GroupWriteCommand::AppendBatch {
             stream_id: stream_id_from_proto(command.stream_id, "append_batch.stream_id")?,
@@ -286,6 +288,8 @@ pub(crate) fn create_stream_response_to_proto(
         closed: response.closed,
         already_exists: response.already_exists,
         group_commit_index: response.group_commit_index,
+        record_start: response.record_range.map(|range| range.first_record),
+        record_next: response.record_range.map(|range| range.next_record),
     }
 }
 
@@ -301,6 +305,8 @@ pub(crate) fn append_response_to_proto(
         closed: response.closed,
         deduplicated: response.deduplicated,
         producer: response.producer,
+        record_start: response.record_range.map(|range| range.first_record),
+        record_next: response.record_range.map(|range| range.next_record),
     }
 }
 
@@ -503,6 +509,7 @@ pub(crate) fn create_stream_response_from_proto(
         closed: response.closed,
         already_exists: response.already_exists,
         group_commit_index: response.group_commit_index,
+        record_range: record_range(response.record_start, response.record_next)?,
     })
 }
 
@@ -518,6 +525,7 @@ pub(crate) fn append_response_from_proto(
         closed: response.closed,
         deduplicated: response.deduplicated,
         producer: response.producer,
+        record_range: record_range(response.record_start, response.record_next)?,
     })
 }
 
@@ -630,6 +638,8 @@ pub(crate) fn head_stream_response_to_proto(
         integrity_evicted_records: response.integrity.evicted_records,
         integrity_total_records: response.integrity.total_records,
         cold_hot_start_offset: response.cold_hot_start_offset,
+        record_first: response.record_range.map(|range| range.first_record),
+        record_next: response.record_range.map(|range| range.next_record),
     }
 }
 
@@ -660,7 +670,24 @@ pub(crate) fn head_stream_response_from_proto(
             evicted_records: response.integrity_evicted_records,
             total_records: response.integrity_total_records,
         },
+        record_range: record_range(response.record_first, response.record_next)?,
     })
+}
+
+fn record_range(
+    first_record: Option<u64>,
+    next_record: Option<u64>,
+) -> Result<Option<ursula_stream::StreamRecordRange>, GroupEngineError> {
+    match (first_record, next_record) {
+        (Some(first_record), Some(next_record)) if first_record <= next_record => {
+            Ok(Some(ursula_stream::StreamRecordRange {
+                first_record,
+                next_record,
+            }))
+        }
+        (None, None) => Ok(None),
+        _ => Err(GroupEngineError::new("incomplete record range")),
+    }
 }
 
 pub(crate) fn read_stream_response_to_proto(
@@ -676,6 +703,14 @@ pub(crate) fn read_stream_response_to_proto(
         payload: response.payload.into(),
         up_to_date: response.up_to_date,
         closed: response.closed,
+        retained_record_first: response
+            .retained_record_range
+            .map(|range| range.first_record),
+        retained_record_next: response
+            .retained_record_range
+            .map(|range| range.next_record),
+        record_start: response.record_range.map(|range| range.first_record),
+        record_next: response.record_range.map(|range| range.next_record),
     }
 }
 
@@ -695,6 +730,11 @@ pub(crate) fn read_stream_response_from_proto(
         payload: response.payload.to_vec(),
         up_to_date: response.up_to_date,
         closed: response.closed,
+        retained_record_range: record_range(
+            response.retained_record_first,
+            response.retained_record_next,
+        )?,
+        record_range: record_range(response.record_start, response.record_next)?,
     })
 }
 
@@ -913,6 +953,9 @@ pub(crate) fn stream_error_context_to_proto(
             expected_seq,
             received_seq,
         }),
+        StreamErrorContext::RecordTailMismatch { current_record } => {
+            Context::RecordCurrentTail(current_record)
+        }
     };
     raft_app_proto::StreamErrorContextV1 {
         context: Some(context),
@@ -936,6 +979,9 @@ pub(crate) fn stream_error_context_from_proto(
                 expected_seq: context.expected_seq,
                 received_seq: context.received_seq,
             })
+        }
+        Some(Context::RecordCurrentTail(current_record)) => {
+            Ok(StreamErrorContext::RecordTailMismatch { current_record })
         }
         None => Err(GroupEngineError::new(
             "protobuf group engine error: missing context",
@@ -1032,6 +1078,9 @@ pub(crate) fn stream_error_code_to_proto(
         StreamErrorCode::InvalidRecordBoundaries => {
             raft_app_proto::StreamErrorCodeV1::StreamErrorCodeInvalidRecordBoundaries
         }
+        StreamErrorCode::RecordPreconditionFailed => {
+            raft_app_proto::StreamErrorCodeV1::StreamErrorCodeRecordPreconditionFailed
+        }
     }
 }
 
@@ -1110,6 +1159,9 @@ pub(crate) fn stream_error_code_from_proto(code: i32) -> Result<StreamErrorCode,
         }
         raft_app_proto::StreamErrorCodeV1::StreamErrorCodeInvalidRecordBoundaries => {
             Ok(StreamErrorCode::InvalidRecordBoundaries)
+        }
+        raft_app_proto::StreamErrorCodeV1::StreamErrorCodeRecordPreconditionFailed => {
+            Ok(StreamErrorCode::RecordPreconditionFailed)
         }
     }
 }

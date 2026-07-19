@@ -464,6 +464,8 @@ fn producer_append_record_to_proto(record: ProducerAppendRecord) -> proto::Produ
         start_offset: record.start_offset,
         next_offset: record.next_offset,
         closed: record.closed,
+        record_start: record.record_start,
+        record_next: record.record_next,
     }
 }
 
@@ -474,6 +476,8 @@ fn producer_append_record_from_proto(
         start_offset: record.start_offset,
         next_offset: record.next_offset,
         closed: record.closed,
+        record_start: record.record_start,
+        record_next: record.record_next,
     }
 }
 

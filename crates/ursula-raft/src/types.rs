@@ -181,6 +181,7 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
                 stream_seq,
                 producer,
                 now_ms,
+                record_match,
             } => Command::Append(raft_app_proto::AppendCommandV1 {
                 stream_id: Some(stream_id.into()),
                 content_type,
@@ -189,6 +190,7 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
                 stream_seq,
                 producer,
                 now_ms,
+                record_match,
             }),
             GroupWriteCommand::AppendExternal {
                 stream_id,
@@ -199,6 +201,7 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
                 stream_seq,
                 producer,
                 now_ms,
+                record_match,
             } => Command::AppendExternal(raft_app_proto::AppendExternalCommandV1 {
                 stream_id: Some(stream_id.into()),
                 content_type,
@@ -207,6 +210,7 @@ impl From<GroupWriteCommand> for RaftGroupCommand {
                 stream_seq,
                 producer,
                 now_ms,
+                record_match,
                 record_ends,
             }),
             GroupWriteCommand::AppendBatch {

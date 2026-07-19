@@ -72,6 +72,7 @@ pub enum GroupWriteCommand {
         stream_seq: Option<String>,
         producer: Option<ProducerRequest>,
         now_ms: u64,
+        record_match: Option<u64>,
     },
     AppendExternal {
         stream_id: BucketStreamId,
@@ -83,6 +84,7 @@ pub enum GroupWriteCommand {
         stream_seq: Option<String>,
         producer: Option<ProducerRequest>,
         now_ms: u64,
+        record_match: Option<u64>,
     },
     AppendBatch {
         stream_id: BucketStreamId,
@@ -229,6 +231,7 @@ impl From<AppendRequest> for GroupWriteCommand {
             stream_seq: request.stream_seq,
             producer: request.producer,
             now_ms: request.now_ms,
+            record_match: request.record_match,
         }
     }
 }
@@ -243,6 +246,7 @@ impl From<&AppendRequest> for GroupWriteCommand {
             stream_seq: request.stream_seq.clone(),
             producer: request.producer.clone(),
             now_ms: request.now_ms,
+            record_match: request.record_match,
         }
     }
 }
@@ -258,6 +262,7 @@ impl From<AppendExternalRequest> for GroupWriteCommand {
             stream_seq: request.stream_seq,
             producer: request.producer,
             now_ms: request.now_ms,
+            record_match: request.record_match,
         }
     }
 }
@@ -273,6 +278,7 @@ impl From<&AppendExternalRequest> for GroupWriteCommand {
             stream_seq: request.stream_seq.clone(),
             producer: request.producer.clone(),
             now_ms: request.now_ms,
+            record_match: request.record_match,
         }
     }
 }

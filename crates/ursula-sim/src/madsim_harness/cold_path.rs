@@ -290,6 +290,8 @@ pub(super) async fn run_cold_read_fault_inner(
                 offset: 0,
                 max_len: 6,
                 now_ms: 0,
+                record: None,
+                max_records: None,
             },
             placement(),
         )
@@ -690,6 +692,8 @@ pub(super) async fn run_cold_delete_fault_inner(
             offset: 0,
             max_len: 32,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read recreated stream after cold cleanup delete fault");
@@ -978,6 +982,8 @@ pub(super) async fn run_cold_read_truncate_inner(
                 offset: 0,
                 max_len: 6,
                 now_ms: 0,
+                record: None,
+                max_records: None,
             },
             placement(),
         )
