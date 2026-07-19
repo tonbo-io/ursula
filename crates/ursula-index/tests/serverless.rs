@@ -88,7 +88,9 @@ async fn concurrent_writers_converge_on_one_checkpoint() -> anyhow::Result<()> {
     first_result?;
     second_result?;
 
-    let gc = first.garbage_collect(1, std::time::Duration::ZERO).await?;
+    let gc = first
+        .garbage_collect(1, std::time::Duration::ZERO, std::time::SystemTime::now())
+        .await?;
     assert!(gc.deleted_manifests >= 1);
 
     let verify_cache = TempDir::new()?;
@@ -385,9 +387,13 @@ async fn garbage_collection_reclaims_unreferenced_parts_and_manifests() -> anyho
     }
     assert!(index.compact_partition_once(3, 3).await?);
 
-    let retained = index.garbage_collect(2, std::time::Duration::ZERO).await?;
+    let retained = index
+        .garbage_collect(2, std::time::Duration::ZERO, std::time::SystemTime::now())
+        .await?;
     assert_eq!(retained.deleted_parts, 0);
-    let reclaimed = index.garbage_collect(1, std::time::Duration::ZERO).await?;
+    let reclaimed = index
+        .garbage_collect(1, std::time::Duration::ZERO, std::time::SystemTime::now())
+        .await?;
     assert_eq!(reclaimed.deleted_parts, 3);
     assert!(reclaimed.deleted_manifests >= 1);
 
@@ -423,7 +429,9 @@ async fn garbage_collection_skips_and_reclaims_incompatible_manifests() -> anyho
         }))?,
     )?;
 
-    let report = index.garbage_collect(8, std::time::Duration::ZERO).await?;
+    let report = index
+        .garbage_collect(8, std::time::Duration::ZERO, std::time::SystemTime::now())
+        .await?;
     assert!(report.deleted_manifests >= 1);
     assert!(!legacy.exists());
     Ok(())
