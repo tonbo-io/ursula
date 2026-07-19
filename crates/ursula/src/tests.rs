@@ -74,6 +74,8 @@ async fn wait_raft_state_machine_payload(
                                     offset: 0,
                                     max_len,
                                     now_ms: 0,
+                                    record: None,
+                                    max_records: None,
                                 },
                                 placement,
                             )
@@ -842,6 +844,7 @@ async fn append_conflict_precedence_reports_closed_header_before_mismatch_or_seq
     );
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -1290,6 +1293,56 @@ async fn append_batch_minimal_ack_skips_success_body_but_keeps_item_errors() {
 }
 
 #[tokio::test]
+async fn json_append_batch_returns_per_frame_record_ranges() {
+    let app = test_router();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/benchcmp/json-batch-records")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/benchcmp/json-batch-records/append-batch")
+                .header(CONTENT_TYPE, "application/json")
+                .header(HEADER_PREFER, "return=minimal")
+                .body(Body::from(batch_body(&[
+                    br#"[{"id":1},{"id":2}]"#.as_slice(),
+                    br#"{"id":3}"#.as_slice(),
+                ])))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_EXTENSIONS).unwrap(),
+        JSON_RECORD_COORDINATES_EXTENSION
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&body).expect("batch ack JSON");
+    assert_eq!(
+        body,
+        serde_json::json!([
+            {"status": 204, "stream_record_start": 0, "stream_record_next": 2},
+            {"status": 204, "stream_record_start": 2, "stream_record_next": 3}
+        ])
+    );
+}
+
+#[tokio::test]
 async fn append_batch_producer_headers_deduplicate_retries() {
     let app = test_router();
 
@@ -1402,6 +1455,18 @@ async fn json_mode_normalizes_appends_and_reads_ndjson() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_EXTENSIONS).unwrap(),
+        JSON_RECORD_COORDINATES_EXTENSION
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
+        "0"
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
+        "0"
+    );
 
     let response = app
         .clone()
@@ -1416,6 +1481,39 @@ async fn json_mode_normalizes_appends_and_reads_ndjson() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_EXTENSIONS).unwrap(),
+        JSON_RECORD_COORDINATES_EXTENSION
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
+        "0"
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
+        "1"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/v1/stream/json-mode")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_FIRST).unwrap(),
+        "0"
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
+        "1"
+    );
 
     let response = app
         .clone()
@@ -1450,6 +1548,167 @@ async fn json_mode_normalizes_appends_and_reads_ndjson() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn json_record_coordinates_read_complete_records() {
+    let app = test_router();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/v1/stream/json-record-read")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/stream/json-record-read")
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"[{"id":1},{"id":2},{"id":3}]"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
+        "0"
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
+        "3"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/stream/json-record-read?record=1&max_records=1")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/x-ndjson"
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_FIRST).unwrap(),
+        "0"
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
+        "1"
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
+        "2"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(&body[..], b"{\"id\":2}\n");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/stream/json-record-read?tail_records=2")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
+        "1"
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
+        "3"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(&body[..], b"{\"id\":2}\n{\"id\":3}\n");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/stream/json-record-read?record=1&max_records=1&record_view=envelope")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/vnd.durable-stream-records+ndjson"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(&body[..], b"{\"record\":1,\"value\":{\"id\":2}}\n");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/stream/json-record-read")
+                .header(CONTENT_TYPE, "application/json")
+                .header(HEADER_STREAM_RECORD_MATCH, "3")
+                .body(Body::from(r#"{"id":4}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
+        "3"
+    );
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
+        "4"
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/stream/json-record-read")
+                .header(CONTENT_TYPE, "application/json")
+                .header(HEADER_STREAM_RECORD_MATCH, "3")
+                .body(Body::from(r#"{"id":5}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(
+        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
+        "4"
+    );
+    assert!(response.headers().get(HEADER_STREAM_NEXT_OFFSET).is_some());
 }
 
 #[tokio::test]

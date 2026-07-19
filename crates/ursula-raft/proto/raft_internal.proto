@@ -71,6 +71,8 @@ message GetStreamAttrsReadV1 {}
 message ReadStreamReadV1 {
   uint64 offset = 1;
   uint64 max_len = 2;
+  optional uint64 record = 3;
+  optional uint64 max_records = 4;
 }
 
 message GroupReadResponseV1 {
@@ -237,6 +239,8 @@ message HeadStreamResponsePayloadV1 {
   uint64 integrity_evicted_records = 15;
   uint64 integrity_total_records = 16;
   uint64 cold_hot_start_offset = 17;
+  optional uint64 record_first = 18;
+  optional uint64 record_next = 19;
 }
 
 message ReadStreamResponsePayloadV1 {
@@ -249,6 +253,10 @@ message ReadStreamResponsePayloadV1 {
   bytes payload = 7;
   bool up_to_date = 8;
   bool closed = 9;
+  optional uint64 retained_record_first = 10;
+  optional uint64 retained_record_next = 11;
+  optional uint64 record_start = 12;
+  optional uint64 record_next = 13;
 }
 
 message GetStreamAttrsResponsePayloadV1 {

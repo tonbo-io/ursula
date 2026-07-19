@@ -281,6 +281,7 @@ fn raft_group_response_uses_shared_protobuf_log_schema() {
             closed: false,
             already_exists: false,
             group_commit_index: 11,
+            record_range: None,
         },
     ));
 
@@ -1076,6 +1077,8 @@ async fn three_node_openraft_group_replicates_group_writes() {
                                 offset: 0,
                                 max_len: 16,
                                 now_ms: 0,
+                                record: None,
+                                max_records: None,
                             },
                             placement(),
                         )
@@ -1226,6 +1229,8 @@ async fn in_process_raft_network_policy_partitions_and_heals_replication() {
                             offset: 0,
                             max_len: 32,
                             now_ms: 0,
+                            record: None,
+                            max_records: None,
                         },
                         placement(),
                     )
@@ -1416,6 +1421,8 @@ async fn in_process_raft_network_minority_leader_append_does_not_ack() {
                                     offset: 0,
                                     max_len: 64,
                                     now_ms: 0,
+                                    record: None,
+                                    max_records: None,
                                 },
                                 placement(),
                             )
@@ -1702,6 +1709,8 @@ fn madsim_three_node_openraft_group_strict_replay_append_leader_read_probe() {
                                     offset: 0,
                                     max_len: 16,
                                     now_ms: 0,
+                                    record: None,
+                                    max_records: None,
                                 },
                                 placement(),
                             )
@@ -1809,6 +1818,8 @@ fn madsim_three_node_openraft_group_strict_replay_follower_read_probe() {
                                     offset: 0,
                                     max_len: 16,
                                     now_ms: 0,
+                                    record: None,
+                                    max_records: None,
                                 },
                                 placement(),
                             )
@@ -1854,6 +1865,8 @@ fn madsim_three_node_openraft_group_strict_replay_append_probe() {
                                         offset: 0,
                                         max_len: 16,
                                         now_ms: 0,
+                                        record: None,
+                                        max_records: None,
                                     },
                                     placement(),
                                 )
@@ -2004,6 +2017,8 @@ fn run_madsim_three_node_raft_with_policy_once(
                                         offset: 0,
                                         max_len: 16,
                                         now_ms: 0,
+                                        record: None,
+                                        max_records: None,
                                     },
                                     placement(),
                                 )
@@ -2101,6 +2116,8 @@ fn run_madsim_three_node_raft_with_fault_script_once(seed: u64) -> (u64, u64, u6
                                     offset: 0,
                                     max_len: 16,
                                     now_ms: 0,
+                                    record: None,
+                                    max_records: None,
                                 },
                                 placement(),
                             )
@@ -2392,6 +2409,8 @@ async fn openraft_installs_snapshot_for_lagging_learner() {
                                 offset: 0,
                                 max_len: 64,
                                 now_ms: 0,
+                                record: None,
+                                max_records: None,
                             },
                             placement(),
                         )
@@ -2458,6 +2477,8 @@ async fn raft_group_engine_implements_runtime_group_engine_over_openraft() {
                 offset: 0,
                 max_len: 16,
                 now_ms: 0,
+                record: None,
+                max_records: None,
             },
             placement(),
         )
@@ -2524,6 +2545,8 @@ async fn raft_group_engine_applies_batched_runtime_writes() {
                 offset: 0,
                 max_len: 16,
                 now_ms: 0,
+                record: None,
+                max_records: None,
             },
             placement(),
         )
@@ -2597,6 +2620,8 @@ async fn raft_group_engine_cold_admission_coalesces_append_batch_many_into_one_r
                 offset: 0,
                 max_len: 16,
                 now_ms: 0,
+                record: None,
+                max_records: None,
             },
             placement(),
         )
@@ -2679,6 +2704,8 @@ async fn raft_metrics_count_logical_commands_inside_coalesced_batches() {
             offset: 0,
             max_len: 16,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read appended batches");
@@ -2773,6 +2800,8 @@ async fn raft_group_engine_recovers_client_writes_from_file_log() {
                 offset: 0,
                 max_len: 16,
                 now_ms: 0,
+                record: None,
+                max_records: None,
             },
             placement(),
         )
@@ -2834,6 +2863,8 @@ async fn shard_runtime_uses_raft_group_engine_factory_for_owned_group() {
             offset: 0,
             max_len: 16,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read through runtime-owned raft group");
@@ -2972,6 +3003,8 @@ async fn durable_raft_group_engine_recovers_from_core_journal() {
                 offset: 0,
                 max_len: 32,
                 now_ms: 0,
+                record: None,
+                max_records: None,
             })
             .await
             .expect("read recovered stream");

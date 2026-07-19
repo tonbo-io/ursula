@@ -305,6 +305,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             closed: false,
             already_exists: false,
             group_commit_index: 1,
+            record_range: None,
         })
     );
 
@@ -318,6 +319,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
                 stream_seq: None,
                 producer: None,
                 now_ms: 0,
+                record_match: None,
             },
             placement,
         )
@@ -333,6 +335,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             closed: false,
             deduplicated: false,
             producer: None,
+            record_range: None,
         })
     );
 
@@ -411,6 +414,7 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
                 stream_seq: None,
                 producer: None,
                 now_ms: 0,
+                record_match: None,
             },
             placement,
         )
@@ -438,6 +442,8 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
                 offset: 2,
                 max_len: 4,
                 now_ms: 0,
+                record: None,
+                max_records: None,
             },
             placement,
         )
@@ -529,6 +535,8 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
                 offset: 0,
                 max_len: 6,
                 now_ms: 0,
+                record: None,
+                max_records: None,
             },
             placement,
         )
@@ -594,6 +602,7 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         })
         .await
         .expect("append external payload");
@@ -604,6 +613,8 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
             offset: 0,
             max_len: 6,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read mixed external and hot payload");
@@ -693,6 +704,8 @@ async fn bootstrap_reads_retained_updates_from_cold_chunk_after_snapshot() {
                 offset: 3,
                 max_len: 2,
                 now_ms: 0,
+                record: None,
+                max_records: None,
             },
             placement,
         )
@@ -812,6 +825,8 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
                 offset: 0,
                 max_len: 16,
                 now_ms: 1_500,
+                record: None,
+                max_records: None,
             },
             placement,
         )
@@ -853,6 +868,8 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
                 offset: 0,
                 max_len: 16,
                 now_ms: 2_500,
+                record: None,
+                max_records: None,
             },
             placement,
         )
@@ -1090,6 +1107,8 @@ async fn append_batch_routes_once_and_applies_each_payload_on_owner_core() {
             offset: 0,
             max_len: 16,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read");
@@ -1131,6 +1150,8 @@ async fn append_batch_reports_item_errors_without_stopping_later_payloads() {
             offset: 0,
             max_len: 16,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read");
@@ -1178,6 +1199,8 @@ async fn producer_duplicate_append_returns_prior_offsets_without_mutating_metric
             offset: 0,
             max_len: 16,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read");
@@ -1254,6 +1277,8 @@ async fn producer_duplicate_append_batch_returns_prior_offsets_without_mutating_
             offset: 0,
             max_len: 16,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read");
@@ -1387,6 +1412,8 @@ async fn install_group_snapshot_restores_group_state_and_append_counts() {
             offset: 0,
             max_len: 16,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read restored stream");
@@ -1528,6 +1555,8 @@ async fn runtime_metrics_track_owner_core_routing_and_mailbox_wait() {
             offset: 0,
             max_len: 16,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read");
@@ -1712,6 +1741,8 @@ async fn group_engine_errors_use_operation_wording_for_non_append_paths() {
             offset: 0,
             max_len: 16,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect_err("missing stream read rejected");
@@ -1816,6 +1847,8 @@ async fn read_stream_returns_payload_slice_from_owner_group() {
             offset: 2,
             max_len: 3,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read stream");
@@ -1832,6 +1865,8 @@ async fn read_stream_returns_payload_slice_from_owner_group() {
             offset: 7,
             max_len: 16,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("tail read");
@@ -1875,6 +1910,8 @@ async fn flush_cold_publishes_chunk_metadata_on_owner_group() {
             offset: 4,
             max_len: 16,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("hot read");
@@ -1886,6 +1923,8 @@ async fn flush_cold_publishes_chunk_metadata_on_owner_group() {
             offset: 0,
             max_len: 16,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect_err("cold read needs store");
@@ -1940,6 +1979,8 @@ async fn flush_cold_once_uploads_outside_group_and_reads_back() {
             offset: 0,
             max_len: 6,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read cold and hot");
@@ -2016,6 +2057,8 @@ async fn flush_cold_group_batch_once_publishes_multiple_chunks() {
             offset: 0,
             max_len: 4,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read cold chunks");
@@ -2160,6 +2203,8 @@ async fn stale_cold_flush_batch_after_delete_recreate_is_classified_for_cleanup(
             offset: 0,
             max_len: 32,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read recreated stream");
@@ -2238,6 +2283,8 @@ async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
             offset: 0,
             max_len: 5,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read cold and hot");
@@ -2447,6 +2494,8 @@ async fn cold_write_admission_rejects_append_batch_without_partial_mutation() {
             offset: 0,
             max_len: 8,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read");
@@ -2522,6 +2571,8 @@ async fn flush_cold_group_once_selects_stream_inside_owner_group() {
             offset: 0,
             max_len: 6,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read cold and hot");
@@ -2636,6 +2687,8 @@ async fn repeated_cold_flush_keeps_hot_bytes_bounded_while_writes_continue() {
                 offset: 0,
                 max_len: expected.len(),
                 now_ms: 0,
+                record: None,
+                max_records: None,
             })
             .await
             .expect("read cold-backed stream");
@@ -2660,6 +2713,8 @@ async fn wait_read_stream_completes_after_owner_append() {
                     offset: 0,
                     max_len: 16,
                     now_ms: 0,
+                    record: None,
+                    max_records: None,
                 })
                 .await
                 .expect("wait read")
@@ -2698,6 +2753,8 @@ async fn wait_read_stream_completes_on_close_at_tail() {
                     offset: 0,
                     max_len: 16,
                     now_ms: 0,
+                    record: None,
+                    max_records: None,
                 })
                 .await
                 .expect("wait read")
@@ -2741,6 +2798,8 @@ async fn canceled_wait_read_stream_removes_owner_waiter() {
                     offset: 0,
                     max_len: 16,
                     now_ms: 0,
+                    record: None,
+                    max_records: None,
                 })
                 .await
         })
@@ -2769,6 +2828,8 @@ async fn live_read_waiter_limit_rejects_excess_waiters_on_owner_core() {
                     offset: 0,
                     max_len: 16,
                     now_ms: 0,
+                    record: None,
+                    max_records: None,
                 })
                 .await
         })
@@ -2781,6 +2842,8 @@ async fn live_read_waiter_limit_rejects_excess_waiters_on_owner_core() {
             offset: 0,
             max_len: 16,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect_err("second waiter should hit owner-core limit");
@@ -2813,6 +2876,8 @@ fn cancel_read_watcher_removes_group_local_waiter() {
                 offset: 0,
                 max_len: 16,
                 now_ms: 0,
+                record: None,
+                max_records: None,
             },
             response_tx: first_tx,
         },
@@ -2823,6 +2888,8 @@ fn cancel_read_watcher_removes_group_local_waiter() {
                 offset: 0,
                 max_len: 16,
                 now_ms: 0,
+                record: None,
+                max_records: None,
             },
             response_tx: second_tx,
         },
@@ -2871,6 +2938,8 @@ async fn notify_read_watchers_shares_identical_reads_across_watchers() {
         offset: 0,
         max_len: 16,
         now_ms: 0,
+        record: None,
+        max_records: None,
     };
     let mut read_watchers = ReadWatchers::new();
     let (first_tx, _first_rx) = oneshot::channel();
@@ -3254,6 +3323,8 @@ async fn runtime_read_uses_group_read_parts_fast_path() {
             offset: 0,
             max_len: 16,
             now_ms: 0,
+            record: None,
+            max_records: None,
         }),
     )
     .await
@@ -3294,6 +3365,8 @@ async fn read_materialization_is_bounded_without_blocking_group_actor() {
                 offset: 0,
                 max_len: 16,
                 now_ms: 0,
+                record: None,
+                max_records: None,
             })
             .await
     });
@@ -3313,6 +3386,8 @@ async fn read_materialization_is_bounded_without_blocking_group_actor() {
                 offset: 0,
                 max_len: 16,
                 now_ms: 0,
+                record: None,
+                max_records: None,
             })
             .await
     });
@@ -3586,6 +3661,8 @@ async fn wal_group_engine_recovers_multiple_groups_from_per_group_logs() {
             offset: 0,
             max_len: 128,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read recovered first stream");
@@ -3598,6 +3675,8 @@ async fn wal_group_engine_recovers_multiple_groups_from_per_group_logs() {
             offset: 0,
             max_len: 128,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read recovered second stream");
@@ -3672,6 +3751,8 @@ async fn wal_group_engine_batches_append_records_and_recovers() {
                 offset: 0,
                 max_len: 16,
                 now_ms: 0,
+                record: None,
+                max_records: None,
             })
             .await
             .expect("read");
@@ -3714,6 +3795,8 @@ async fn wal_group_engine_batches_append_records_and_recovers() {
             offset: 0,
             max_len: 16,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read recovered batch");
@@ -3780,6 +3863,8 @@ async fn wal_group_engine_persists_installed_snapshot() {
             offset: 0,
             max_len: 32,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read recovered snapshot");
@@ -3931,6 +4016,8 @@ async fn wal_group_engine_recovers_producer_dedup_state() {
             offset: 0,
             max_len: 16,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read");
@@ -4026,6 +4113,8 @@ async fn wal_group_engine_recovers_producer_append_batch_dedup_state() {
             offset: 0,
             max_len: 16,
             now_ms: 0,
+            record: None,
+            max_records: None,
         })
         .await
         .expect("read");
@@ -4198,6 +4287,8 @@ impl GroupEngine for BlockingReadEngine {
                 payload: Vec::new(),
                 up_to_date: true,
                 closed: false,
+                retained_record_range: None,
+                record_range: None,
             })
         })
     }
@@ -4222,6 +4313,8 @@ impl GroupEngine for BlockingReadEngine {
                     content_type: DEFAULT_CONTENT_TYPE.to_owned(),
                     up_to_date: true,
                     closed: false,
+                    retained_record_range: None,
+                    record_range: None,
                     body: GroupReadStreamBody::Blocking {
                         entered: self.entered.clone(),
                         materialized: self.materialized.clone(),
@@ -4238,6 +4331,8 @@ impl GroupEngine for BlockingReadEngine {
                 payload: Vec::new(),
                 up_to_date: true,
                 closed: false,
+                retained_record_range: None,
+                record_range: None,
             };
             Ok(GroupReadStreamParts::from_response(response))
         })
@@ -4330,6 +4425,7 @@ impl GroupEngine for RecordingEngine {
                 closed: request.close_after,
                 already_exists: false,
                 group_commit_index: self.commit_index,
+                record_range: None,
             })
         })
     }
@@ -4351,6 +4447,7 @@ impl GroupEngine for RecordingEngine {
                 stream_expires_at_ms: None,
                 snapshot_offset: None,
                 integrity: empty_integrity(),
+                record_range: None,
             })
         })
     }
@@ -4370,6 +4467,8 @@ impl GroupEngine for RecordingEngine {
                 payload: Vec::new(),
                 up_to_date: true,
                 closed: false,
+                retained_record_range: None,
+                record_range: None,
             })
         })
     }
@@ -4443,6 +4542,7 @@ impl GroupEngine for RecordingEngine {
                 closed: request.close_after,
                 deduplicated: false,
                 producer: request.producer,
+                record_range: None,
             })
         })
     }
@@ -4476,6 +4576,7 @@ impl GroupEngine for RecordingEngine {
                     closed: false,
                     deduplicated: false,
                     producer: None,
+                    record_range: None,
                 }));
             }
             Ok(GroupAppendBatchResponse { placement, items })

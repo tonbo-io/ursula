@@ -106,6 +106,7 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 
 use crate::bootstrap::reenable_elections_if_campaign_allowed;
+use crate::render::apply_record_envelope;
 use crate::render::bootstrap_response;
 use crate::render::clamp_sse_text_read;
 use crate::render::http_read_content_type;
@@ -130,6 +131,7 @@ use crate::render::normalize_http_write_payload;
 use crate::render::offset_now_response;
 use crate::render::parse_append_batch;
 use crate::render::read_response;
+use crate::render::record_envelope_response;
 use crate::render::render_batch_results;
 use crate::render::render_metrics;
 use crate::render::render_sse_read;
@@ -145,6 +147,7 @@ const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 const HEADER_STREAM_CLOSED: &str = "stream-closed";
 const HEADER_STREAM_CURSOR: &str = "stream-cursor";
 const HEADER_STREAM_EXPIRES_AT: &str = "stream-expires-at";
+const HEADER_STREAM_EXTENSIONS: &str = "stream-extensions";
 const HEADER_STREAM_INTEGRITY_EVICTED_RECORDS: &str = "stream-integrity-evicted-records";
 const HEADER_STREAM_INTEGRITY_EVICTED_SETSUM: &str = "stream-integrity-evicted-setsum";
 const HEADER_STREAM_INTEGRITY_LIVE_RECORDS: &str = "stream-integrity-live-records";
@@ -155,12 +158,17 @@ const HEADER_STREAM_INTEGRITY_TOTAL_SETSUM: &str = "stream-integrity-total-setsu
 const HEADER_STREAM_COLD_HOT_START_OFFSET: &str = "stream-cold-hot-start-offset";
 const HEADER_STREAM_DATA_CONTENT_TYPE: &str = "stream-data-content-type";
 const HEADER_STREAM_NEXT_OFFSET: &str = "stream-next-offset";
+const HEADER_STREAM_RECORD_FIRST: &str = "stream-record-first";
+const HEADER_STREAM_RECORD_MATCH: &str = "stream-record-match";
+const HEADER_STREAM_RECORD_NEXT: &str = "stream-record-next";
+const HEADER_STREAM_RECORD_START: &str = "stream-record-start";
 const HEADER_STREAM_SNAPSHOT_OFFSET: &str = "stream-snapshot-offset";
 const HEADER_STREAM_SSE_DATA_ENCODING: &str = "stream-sse-data-encoding";
 const HEADER_STREAM_ATTRS: &str = "stream-attrs";
 const HEADER_STREAM_SEQ: &str = "stream-seq";
 const HEADER_STREAM_TTL: &str = "stream-ttl";
 const HEADER_STREAM_UP_TO_DATE: &str = "stream-up-to-date";
+const JSON_RECORD_COORDINATES_EXTENSION: &str = "json-record-coordinates-v1";
 const HEADER_PRODUCER_ID: &str = "producer-id";
 const HEADER_PRODUCER_EPOCH: &str = "producer-epoch";
 const HEADER_PRODUCER_SEQ: &str = "producer-seq";
@@ -1103,6 +1111,9 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
     }
     insert_lifetime_headers(&mut headers, stream_ttl_seconds, stream_expires_at_ms);
     insert_producer_ack(&mut headers, producer);
+    if let Some(record_range) = response.record_range {
+        insert_record_operation_headers(&mut headers, record_range);
+    }
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
     }
@@ -1119,6 +1130,9 @@ pub(crate) fn append_http_response(response: AppendResponse) -> Response {
     insert_default_response_headers(&mut headers);
     insert_offset(&mut headers, response.next_offset);
     insert_producer_ack(&mut headers, response.producer.as_ref());
+    if let Some(record_range) = response.record_range {
+        insert_record_operation_headers(&mut headers, record_range);
+    }
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
     }
@@ -1793,7 +1807,6 @@ pub(crate) async fn create_stream_by_id(
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
     request.producer = producer.clone();
-
     if should_externalize_payload(&state, request.initial_payload.len(), true) {
         return create_stream_external_by_id(
             state,
@@ -1949,6 +1962,10 @@ pub(crate) async fn append_stream_by_id(
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
     request.producer = producer.clone();
+    request.record_match = match stream_record_match(&headers) {
+        Ok(record_match) => record_match,
+        Err(response) => return *response,
+    };
 
     if should_externalize_payload(&state, request.payload.len(), true) {
         return append_stream_external_by_id(state, request_target, request).await;
@@ -2019,6 +2036,14 @@ pub(crate) async fn append_batch(
 
     let stream_id = BucketStreamId::new(bucket, stream);
     let content_type = request_content_type(&headers);
+    let payloads = match payloads
+        .into_iter()
+        .map(|payload| normalize_http_write_payload(&content_type, payload, false))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(payloads) => payloads,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
     let mut request = AppendBatchRequest::new(stream_id, payloads);
     request.content_type = content_type;
     request.producer = producer.clone();
@@ -2034,7 +2059,14 @@ pub(crate) async fn append_batch(
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     insert_producer_ack(&mut headers, producer.as_ref());
-    if minimal_ack && response.items.iter().all(Result::is_ok) {
+    let has_record_ranges = response.items.iter().any(|item| {
+        item.as_ref()
+            .is_ok_and(|response| response.record_range.is_some())
+    });
+    if has_record_ranges {
+        insert_record_extension(&mut headers);
+    }
+    if minimal_ack && response.items.iter().all(Result::is_ok) && !has_record_ranges {
         return (StatusCode::NO_CONTENT, headers).into_response();
     }
 
@@ -2268,6 +2300,9 @@ pub(crate) async fn head_stream_by_id(
             if let Some(snapshot_offset) = response.snapshot_offset {
                 insert_snapshot_offset(&mut headers, snapshot_offset);
             }
+            if let Some(record_range) = response.record_range {
+                insert_record_head_headers(&mut headers, record_range);
+            }
             if response.closed {
                 insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
             }
@@ -2275,6 +2310,40 @@ pub(crate) async fn head_stream_by_id(
         }
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
+}
+
+fn insert_record_extension(headers: &mut HeaderMap) {
+    insert_static(
+        headers,
+        HEADER_STREAM_EXTENSIONS,
+        JSON_RECORD_COORDINATES_EXTENSION,
+    );
+}
+
+fn insert_record_operation_headers(
+    headers: &mut HeaderMap,
+    record_range: ursula_runtime::StreamRecordRange,
+) {
+    insert_record_extension(headers);
+    insert_u64_header(
+        headers,
+        HEADER_STREAM_RECORD_START,
+        record_range.first_record,
+    );
+    insert_u64_header(headers, HEADER_STREAM_RECORD_NEXT, record_range.next_record);
+}
+
+fn insert_record_head_headers(
+    headers: &mut HeaderMap,
+    record_range: ursula_runtime::StreamRecordRange,
+) {
+    insert_record_extension(headers);
+    insert_u64_header(
+        headers,
+        HEADER_STREAM_RECORD_FIRST,
+        record_range.first_record,
+    );
+    insert_u64_header(headers, HEADER_STREAM_RECORD_NEXT, record_range.next_record);
 }
 
 pub(crate) async fn read_stream(
@@ -2320,8 +2389,48 @@ pub(crate) async fn read_stream_by_id(
     };
     let live_mode = query.get("live").map(String::as_str);
     let offset_is_now = query.get("offset").is_some_and(|offset| offset == "now");
-    if live_mode.is_some() && !query.contains_key("offset") {
-        return (StatusCode::BAD_REQUEST, "live reads require offset").into_response();
+    let record_aware = query.contains_key("record") || query.contains_key("tail_records");
+    let envelope_view = match query.get("record_view").map(String::as_str) {
+        None => false,
+        Some("envelope") if record_aware => true,
+        Some("envelope") => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "record_view requires record or tail_records",
+            )
+                .into_response();
+        }
+        Some(_) => return (StatusCode::BAD_REQUEST, "invalid record_view").into_response(),
+    };
+    if query.contains_key("record") && query.contains_key("tail_records")
+        || record_aware && query.contains_key("offset")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "record, tail_records, and offset are mutually exclusive",
+        )
+            .into_response();
+    }
+    if query.contains_key("max_records") && !record_aware {
+        return (
+            StatusCode::BAD_REQUEST,
+            "max_records requires record or tail_records",
+        )
+            .into_response();
+    }
+    if record_aware && query.contains_key("max_bytes") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "record-aware reads do not support max_bytes",
+        )
+            .into_response();
+    }
+    if live_mode.is_some() && !query.contains_key("offset") && !record_aware {
+        return (
+            StatusCode::BAD_REQUEST,
+            "live reads require a start position",
+        )
+            .into_response();
     }
     if matches!(live_mode, Some("sse" | "long-poll"))
         && let Err(err) = state
@@ -2331,16 +2440,37 @@ pub(crate) async fn read_stream_by_id(
     {
         return runtime_error_or_leader_redirect_async(&state, err, &request_target).await;
     }
-    let offset = match read_offset(
-        &state,
-        &stream_id,
-        query.get("offset").map(String::as_str),
-        &request_target,
-    )
-    .await
-    {
-        Ok(offset) => offset,
-        Err(response) => return *response,
+    let record = if record_aware {
+        match read_record_start(&state, &stream_id, &query, &request_target).await {
+            Ok(record) => Some(record),
+            Err(response) => return *response,
+        }
+    } else {
+        None
+    };
+    let max_records = match query.get("max_records") {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(value) if value > 0 => Some(value),
+            _ => {
+                return (StatusCode::BAD_REQUEST, "max_records must be positive").into_response();
+            }
+        },
+        None => None,
+    };
+    let offset = if record_aware {
+        0
+    } else {
+        match read_offset(
+            &state,
+            &stream_id,
+            query.get("offset").map(String::as_str),
+            &request_target,
+        )
+        .await
+        {
+            Ok(offset) => offset,
+            Err(response) => return *response,
+        }
     };
     let max_len = query
         .get("max_bytes")
@@ -2349,7 +2479,18 @@ pub(crate) async fn read_stream_by_id(
 
     match live_mode {
         Some("sse") => {
-            return sse_stream(state, request_target, stream_id, offset, max_len, &query).await;
+            return sse_stream(
+                state,
+                request_target,
+                stream_id,
+                offset,
+                max_len,
+                record,
+                max_records,
+                envelope_view,
+                &query,
+            )
+            .await;
         }
         Some("long-poll") => {
             return long_poll_stream(
@@ -2358,6 +2499,9 @@ pub(crate) async fn read_stream_by_id(
                 stream_id,
                 offset,
                 max_len,
+                record,
+                max_records,
+                envelope_view,
                 &query,
                 headers,
             )
@@ -2374,13 +2518,80 @@ pub(crate) async fn read_stream_by_id(
             offset,
             max_len,
             now_ms: state.unix_time_ms(),
+            record,
+            max_records,
         })
         .await
     {
         Ok(response) if offset_is_now => offset_now_response(response),
+        Ok(response) if envelope_view => record_envelope_response(response, &headers, None),
         Ok(response) => read_response(response, &headers, None),
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
+}
+
+async fn read_record_start(
+    state: &HttpState,
+    stream_id: &BucketStreamId,
+    query: &HashMap<String, String>,
+    request_target: &str,
+) -> Result<u64, BoxResponse> {
+    let head = match state
+        .runtime
+        .head_stream(HeadStreamRequest {
+            stream_id: stream_id.clone(),
+            now_ms: state.unix_time_ms(),
+        })
+        .await
+    {
+        Ok(head) => head,
+        Err(err) => {
+            return Err(Box::new(
+                runtime_error_or_leader_redirect_async(state, err, request_target).await,
+            ));
+        }
+    };
+    let Some(range) = head.record_range else {
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                "record coordinates are inactive for this stream",
+            )
+                .into_response(),
+        ));
+    };
+    let record = if let Some(raw) = query.get("record") {
+        if raw == "now" {
+            range.next_record
+        } else {
+            raw.parse::<u64>().map_err(|_| {
+                Box::new((StatusCode::BAD_REQUEST, "invalid record").into_response())
+            })?
+        }
+    } else {
+        let count = query
+            .get("tail_records")
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .ok_or_else(|| {
+                Box::new((StatusCode::BAD_REQUEST, "invalid tail_records").into_response())
+            })?;
+        range
+            .next_record
+            .saturating_sub(count)
+            .max(range.first_record)
+    };
+    if record < range.first_record || record > range.next_record {
+        let status = if record < range.first_record {
+            StatusCode::GONE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        let mut headers = HeaderMap::new();
+        insert_default_response_headers(&mut headers);
+        insert_record_head_headers(&mut headers, range);
+        return Err(Box::new((status, headers).into_response()));
+    }
+    Ok(record)
 }
 
 #[tracing::instrument(
@@ -2602,6 +2813,9 @@ pub(crate) async fn long_poll_stream(
     stream_id: BucketStreamId,
     offset: u64,
     max_len: usize,
+    record: Option<u64>,
+    max_records: Option<u64>,
+    envelope_view: bool,
     query: &HashMap<String, String>,
     headers: HeaderMap,
 ) -> Response {
@@ -2611,11 +2825,18 @@ pub(crate) async fn long_poll_stream(
         offset,
         max_len: max_len.max(1),
         now_ms: state.unix_time_ms(),
+        record,
+        max_records,
     });
     match http_time::timeout(Duration::from_millis(timeout_ms), read).await {
         Ok(Ok(response)) if response.payload.is_empty() && response.up_to_date => {
             long_poll_no_content_response(&response, query.get("cursor").map(String::as_str))
         }
+        Ok(Ok(response)) if envelope_view => record_envelope_response(
+            response,
+            &headers,
+            Some(query.get("cursor").map(String::as_str).unwrap_or("")),
+        ),
         Ok(Ok(response)) => read_response(
             response,
             &headers,
@@ -2635,6 +2856,16 @@ pub(crate) async fn long_poll_stream(
                 insert_default_response_headers(&mut headers);
                 insert_offset(&mut headers, head.tail_offset);
                 insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
+                if let (Some(record), Some(record_range)) = (record, head.record_range) {
+                    insert_record_head_headers(&mut headers, record_range);
+                    insert_record_operation_headers(
+                        &mut headers,
+                        ursula_runtime::StreamRecordRange {
+                            first_record: record,
+                            next_record: record,
+                        },
+                    );
+                }
                 if head.closed {
                     insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
                 } else {
@@ -2661,6 +2892,9 @@ struct SseState {
     encode_base64: bool,
     cursor: Option<String>,
     initial_read: bool,
+    record: Option<u64>,
+    max_records: Option<u64>,
+    envelope_view: bool,
 }
 
 pub(crate) async fn sse_stream(
@@ -2669,6 +2903,9 @@ pub(crate) async fn sse_stream(
     stream_id: BucketStreamId,
     offset: u64,
     max_len: usize,
+    record: Option<u64>,
+    max_records: Option<u64>,
+    envelope_view: bool,
     query: &HashMap<String, String>,
 ) -> Response {
     let head = match state
@@ -2685,7 +2922,7 @@ pub(crate) async fn sse_stream(
         }
     };
 
-    let encode_base64 = should_base64_encode_sse_data(&head.content_type);
+    let encode_base64 = !envelope_view && should_base64_encode_sse_data(&head.content_type);
     state
         .http_metrics
         .sse_streams_opened
@@ -2705,6 +2942,9 @@ pub(crate) async fn sse_stream(
         encode_base64,
         cursor: query.get("cursor").cloned(),
         initial_read: true,
+        record,
+        max_records,
+        envelope_view,
     };
     let body_stream = stream::unfold(Some(sse_state), |state| async move {
         let mut state = match state {
@@ -2720,6 +2960,12 @@ pub(crate) async fn sse_stream(
             offset: state.offset,
             max_len: state.max_len,
             now_ms: state.wall_clock.unix_time_ms(),
+            record: state.record,
+            max_records: if state.envelope_view {
+                Some(1)
+            } else {
+                state.max_records
+            },
         };
         let read = if state.initial_read {
             state.initial_read = false;
@@ -2738,9 +2984,16 @@ pub(crate) async fn sse_stream(
                 return Some((Ok::<Bytes, Infallible>(Bytes::from(event)), None));
             }
         };
+        if state.envelope_view
+            && let Err(err) = apply_record_envelope(&mut read)
+        {
+            let event = format!("event: error\ndata:{}\n\n", sse_safe_line(&err));
+            return Some((Ok::<Bytes, Infallible>(Bytes::from(event)), None));
+        }
         clamp_sse_text_read(&mut read, state.encode_base64);
 
         state.offset = read.next_offset;
+        state.record = read.record_range.map(|range| range.next_record);
         let done = read.closed && read.up_to_date;
         if !read.payload.is_empty() {
             state
@@ -2763,9 +3016,16 @@ pub(crate) async fn sse_stream(
     insert_header_str(
         &mut headers,
         HEADER_STREAM_DATA_CONTENT_TYPE,
-        http_read_content_type(&head.content_type),
+        if envelope_view {
+            "application/vnd.durable-stream-record+json"
+        } else {
+            http_read_content_type(&head.content_type)
+        },
     );
     insert_cache_control(&mut headers, "no-cache");
+    if head.record_range.is_some() {
+        insert_record_extension(&mut headers);
+    }
     if encode_base64 {
         insert_static(&mut headers, HEADER_STREAM_SSE_DATA_ENCODING, "base64");
     }
@@ -2939,6 +3199,16 @@ pub(crate) fn stream_seq(headers: &HeaderMap) -> Option<String> {
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
+}
+
+fn stream_record_match(headers: &HeaderMap) -> Result<Option<u64>, BoxResponse> {
+    header_value(headers, HEADER_STREAM_RECORD_MATCH)
+        .map(|raw| {
+            raw.parse::<u64>().map_err(|_| {
+                Box::new((StatusCode::BAD_REQUEST, "invalid Stream-Record-Match").into_response())
+            })
+        })
+        .transpose()
 }
 
 pub(crate) fn producer_request(headers: &HeaderMap) -> Result<Option<ProducerRequest>, String> {

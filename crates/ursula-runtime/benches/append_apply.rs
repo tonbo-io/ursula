@@ -215,6 +215,7 @@ fn append(
         stream_seq: None,
         producer,
         now_ms: 0,
+        record_match: None,
     }) {
         StreamResponse::Appended { next_offset, .. } => next_offset,
         response => panic!("append failed: {response:?}"),

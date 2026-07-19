@@ -209,6 +209,7 @@ impl StreamStateMachine {
                 stream_seq,
                 producer,
                 now_ms,
+                record_match,
             } => {
                 let response = self.append_borrowed(AppendStreamInput {
                     stream_id,
@@ -218,6 +219,7 @@ impl StreamStateMachine {
                     stream_seq,
                     producer,
                     now_ms,
+                    record_match,
                 });
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
@@ -231,6 +233,7 @@ impl StreamStateMachine {
                 stream_seq,
                 producer,
                 now_ms,
+                record_match,
             } => {
                 let response = self.append_external(AppendExternalInput {
                     stream_id,
@@ -241,6 +244,7 @@ impl StreamStateMachine {
                     stream_seq,
                     producer,
                     now_ms,
+                    record_match,
                 });
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
@@ -484,20 +488,23 @@ fn prepare_record_append(
     base_offset: u64,
     payload_len: u64,
     record_ends: &[u64],
-) -> Result<Option<StreamRecordIndex>, StreamResponse> {
+) -> Result<(Option<StreamRecordIndex>, Option<crate::StreamRecordRange>), StreamResponse> {
     let Some(current) = current else {
         if json_stream {
-            return Ok(None);
+            return Ok((None, None));
         }
-        return record_ends.is_empty().then_some(None).ok_or_else(|| {
-            StreamResponse::error(
-                StreamErrorCode::InvalidRecordBoundaries,
-                "binary streams cannot carry JSON record boundaries",
-            )
-        });
+        return record_ends
+            .is_empty()
+            .then_some((None, None))
+            .ok_or_else(|| {
+                StreamResponse::error(
+                    StreamErrorCode::InvalidRecordBoundaries,
+                    "binary streams cannot carry JSON record boundaries",
+                )
+            });
     };
     let mut updated = current.clone();
-    updated
+    let range = updated
         .append_relative_ends(base_offset, payload_len, record_ends)
         .map_err(|_| {
             StreamResponse::error(
@@ -505,7 +512,7 @@ fn prepare_record_append(
                 "record boundaries do not match the canonical JSON payload",
             )
         })?;
-    Ok(Some(updated))
+    Ok((Some(updated), Some(range)))
 }
 
 fn compare_stream_ids(left: &BucketStreamId, right: &BucketStreamId) -> std::cmp::Ordering {

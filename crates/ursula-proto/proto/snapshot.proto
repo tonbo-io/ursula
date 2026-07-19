@@ -112,6 +112,8 @@ message ProducerAppendRecordV1 {
   uint64 start_offset = 1;
   uint64 next_offset = 2;
   bool closed = 3;
+  optional uint64 record_start = 4;
+  optional uint64 record_next = 5;
 }
 
 message StreamAppendCountV1 {

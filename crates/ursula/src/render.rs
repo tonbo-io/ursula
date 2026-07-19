@@ -47,6 +47,9 @@ use crate::HEADER_STREAM_TTL;
 use crate::HEADER_STREAM_UP_TO_DATE;
 use crate::HEADER_X_CONTENT_TYPE_OPTIONS;
 use crate::HttpMetricsSnapshot;
+use crate::insert_record_extension;
+use crate::insert_record_head_headers;
+use crate::insert_record_operation_headers;
 
 const JSON_READ_CONTENT_TYPE: &str = "application/x-ndjson";
 
@@ -89,6 +92,7 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         | StreamErrorCode::StreamSeqConflict
         | StreamErrorCode::SnapshotConflict
         | StreamErrorCode::ProducerSeqConflict => StatusCode::CONFLICT,
+        StreamErrorCode::RecordPreconditionFailed => StatusCode::PRECONDITION_FAILED,
         StreamErrorCode::ProducerEpochStale => StatusCode::FORBIDDEN,
         StreamErrorCode::OffsetOutOfRange => StatusCode::RANGE_NOT_SATISFIABLE,
         StreamErrorCode::InvalidBucketId
@@ -193,6 +197,10 @@ pub(crate) fn insert_producer_error_headers(headers: &mut HeaderMap, err: &Runti
                 insert_u64_header(headers, "producer-received-seq", *received_seq);
             }
             StreamErrorContext::StreamClosed | StreamErrorContext::StaleColdFlushCandidate => {}
+            StreamErrorContext::RecordTailMismatch { current_record } => {
+                insert_record_extension(headers);
+                insert_u64_header(headers, crate::HEADER_STREAM_RECORD_NEXT, *current_record);
+            }
         }
     }
 }
@@ -204,6 +212,12 @@ pub(crate) fn insert_stream_error_headers(headers: &mut HeaderMap, err: &Runtime
         .any(|context| matches!(context, StreamErrorContext::StreamClosed))
     {
         insert_static(headers, HEADER_STREAM_CLOSED, "true");
+    }
+    for context in err.stream_error_context() {
+        if let StreamErrorContext::RecordTailMismatch { current_record } = context {
+            insert_record_extension(headers);
+            insert_u64_header(headers, crate::HEADER_STREAM_RECORD_NEXT, *current_record);
+        }
     }
 }
 
@@ -291,7 +305,17 @@ pub(crate) fn render_batch_results(results: &[Result<AppendResponse, RuntimeErro
                 Ok(_) => StatusCode::NO_CONTENT.as_u16(),
                 Err(err) => runtime_error_status(err).as_u16(),
             };
-            json!({ "status": status })
+            match result {
+                Ok(response) => match response.record_range {
+                    Some(range) => json!({
+                        "status": status,
+                        "stream_record_start": range.first_record,
+                        "stream_record_next": range.next_record,
+                    }),
+                    None => json!({ "status": status }),
+                },
+                Err(_) => json!({ "status": status }),
+            }
         })
         .collect::<Vec<Value>>();
     Value::Array(acks).to_string()
@@ -419,11 +443,75 @@ pub(crate) fn read_response(
     request_headers: &HeaderMap,
     request_cursor: Option<&str>,
 ) -> Response {
+    read_response_with_etag(response, request_headers, request_cursor, None)
+}
+
+pub(crate) fn record_envelope_response(
+    mut response: ReadStreamResponse,
+    request_headers: &HeaderMap,
+    request_cursor: Option<&str>,
+) -> Response {
+    let canonical_etag = read_etag(&response);
+    if let Err(message) = apply_record_envelope(&mut response) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
+    }
+    read_response_with_etag(
+        response,
+        request_headers,
+        request_cursor,
+        Some(canonical_etag),
+    )
+}
+
+pub(crate) fn apply_record_envelope(response: &mut ReadStreamResponse) -> Result<(), String> {
+    let Some(record_range) = response.record_range else {
+        return Err("missing record range".to_owned());
+    };
+    let mut record = record_range.first_record;
+    let mut payload = Vec::new();
+    for line in response.payload.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let value = match serde_json::from_slice::<serde_json::Value>(line) {
+            Ok(value) => value,
+            Err(err) => return Err(format!("decode canonical JSON record: {err}")),
+        };
+        let envelope = serde_json::json!({ "record": record, "value": value });
+        let encoded = match serde_json::to_vec(&envelope) {
+            Ok(encoded) => encoded,
+            Err(err) => return Err(format!("encode record envelope: {err}")),
+        };
+        payload.extend_from_slice(&encoded);
+        payload.push(b'\n');
+        record = record.saturating_add(1);
+    }
+    if record != record_range.next_record {
+        return Err("record envelope count does not match coordinate range".to_owned());
+    }
+    response.payload = payload;
+    response.content_type = "application/vnd.durable-stream-records+ndjson".to_owned();
+    Ok(())
+}
+
+fn read_response_with_etag(
+    response: ReadStreamResponse,
+    request_headers: &HeaderMap,
+    request_cursor: Option<&str>,
+    canonical_etag: Option<String>,
+) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     insert_content_type(&mut headers, http_read_content_type(&response.content_type));
     insert_offset(&mut headers, response.next_offset);
-    let etag = read_etag(&response);
+    if let Some(retained_record_range) = response.retained_record_range {
+        insert_record_extension(&mut headers);
+        if let Some(record_range) = response.record_range {
+            insert_record_head_headers(&mut headers, retained_record_range);
+            insert_record_operation_headers(&mut headers, record_range);
+        }
+    }
+    let etag = canonical_etag.unwrap_or_else(|| read_etag(&response));
     if let Ok(value) = HeaderValue::from_str(&etag) {
         headers.insert(ETAG, value);
     }
@@ -539,6 +627,13 @@ pub(crate) fn offset_now_response(response: ReadStreamResponse) -> Response {
     insert_content_type(&mut headers, http_read_content_type(&response.content_type));
     insert_offset(&mut headers, response.next_offset);
     insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
+    if let Some(retained_record_range) = response.retained_record_range {
+        insert_record_extension(&mut headers);
+        if let Some(record_range) = response.record_range {
+            insert_record_head_headers(&mut headers, retained_record_range);
+            insert_record_operation_headers(&mut headers, record_range);
+        }
+    }
     insert_cache_control(&mut headers, "no-store");
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
@@ -667,6 +762,14 @@ pub(crate) fn render_sse_read(
     body.push_str("data:{\"streamNextOffset\":\"");
     body.push_str(&format!("{:020}", read.next_offset));
     body.push('"');
+    if let Some(retained_record_range) = read.retained_record_range {
+        body.push_str(",\"streamFirstRecord\":");
+        body.push_str(&retained_record_range.first_record.to_string());
+    }
+    if let Some(record_range) = read.record_range {
+        body.push_str(",\"streamNextRecord\":");
+        body.push_str(&record_range.next_record.to_string());
+    }
     if !closed_at_tail {
         body.push_str(",\"streamCursor\":\"");
         body.push_str(&format!(

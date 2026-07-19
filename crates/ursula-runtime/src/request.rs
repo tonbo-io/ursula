@@ -12,6 +12,7 @@ use ursula_stream::StreamAttrs;
 use ursula_stream::StreamIntegritySnapshot;
 use ursula_stream::StreamReadPlan;
 use ursula_stream::StreamReadSegment;
+use ursula_stream::StreamRecordRange;
 
 use crate::cold_index::ColdIndexPageCache;
 use crate::cold_index::ColdStoreColdIndexPageStore;
@@ -104,6 +105,7 @@ pub struct CreateStreamResponse {
     pub closed: bool,
     pub already_exists: bool,
     pub group_commit_index: u64,
+    pub record_range: Option<StreamRecordRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +125,7 @@ pub struct HeadStreamResponse {
     pub stream_expires_at_ms: Option<u64>,
     pub snapshot_offset: Option<u64>,
     pub integrity: StreamIntegritySnapshot,
+    pub record_range: Option<StreamRecordRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +160,8 @@ pub struct ReadStreamRequest {
     pub offset: u64,
     pub max_len: usize,
     pub now_ms: u64,
+    pub record: Option<u64>,
+    pub max_records: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +173,8 @@ pub struct ReadStreamResponse {
     pub payload: Vec<u8>,
     pub up_to_date: bool,
     pub closed: bool,
+    pub retained_record_range: Option<StreamRecordRange>,
+    pub record_range: Option<StreamRecordRange>,
 }
 
 pub enum GroupReadStreamBody {
@@ -194,6 +201,8 @@ pub struct GroupReadStreamParts {
     pub content_type: String,
     pub up_to_date: bool,
     pub closed: bool,
+    pub retained_record_range: Option<StreamRecordRange>,
+    pub record_range: Option<StreamRecordRange>,
     pub body: GroupReadStreamBody,
 }
 
@@ -206,6 +215,8 @@ impl GroupReadStreamParts {
             content_type: response.content_type,
             up_to_date: response.up_to_date,
             closed: response.closed,
+            retained_record_range: response.retained_record_range,
+            record_range: response.record_range,
             body: GroupReadStreamBody::Materialized(response.payload),
         }
     }
@@ -224,6 +235,8 @@ impl GroupReadStreamParts {
             content_type: plan.content_type.clone(),
             up_to_date: plan.up_to_date,
             closed: plan.closed,
+            retained_record_range: plan.retained_record_range,
+            record_range: plan.record_range,
             body: GroupReadStreamBody::Planned {
                 stream_id,
                 plan,
@@ -271,6 +284,8 @@ impl GroupReadStreamParts {
             payload,
             up_to_date: self.up_to_date,
             closed: self.closed,
+            retained_record_range: self.retained_record_range,
+            record_range: self.record_range,
         })
     }
 
@@ -451,6 +466,7 @@ pub struct AppendRequest {
     pub stream_seq: Option<String>,
     pub producer: Option<ProducerRequest>,
     pub now_ms: u64,
+    pub record_match: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -464,6 +480,7 @@ pub struct AppendExternalRequest {
     pub stream_seq: Option<String>,
     pub producer: Option<ProducerRequest>,
     pub now_ms: u64,
+    pub record_match: Option<u64>,
 }
 
 impl AppendExternalRequest {
@@ -481,6 +498,7 @@ impl AppendExternalRequest {
             stream_seq: request.stream_seq,
             producer: request.producer,
             now_ms: request.now_ms,
+            record_match: request.record_match,
         }
     }
 }
@@ -504,6 +522,7 @@ impl AppendRequest {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }
     }
 
@@ -516,6 +535,7 @@ impl AppendRequest {
             stream_seq: None,
             producer: None,
             now_ms: 0,
+            record_match: None,
         }
     }
 
@@ -556,6 +576,7 @@ pub struct AppendResponse {
     pub closed: bool,
     pub deduplicated: bool,
     pub producer: Option<ProducerRequest>,
+    pub record_range: Option<StreamRecordRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

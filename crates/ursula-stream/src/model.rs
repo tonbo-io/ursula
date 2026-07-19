@@ -58,6 +58,7 @@ pub struct AppendStreamInput<'a> {
     pub stream_seq: Option<String>,
     pub producer: Option<ProducerRequest>,
     pub now_ms: u64,
+    pub record_match: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -70,6 +71,7 @@ pub(crate) struct AppendExternalInput<'a> {
     pub(crate) stream_seq: Option<String>,
     pub(crate) producer: Option<ProducerRequest>,
     pub(crate) now_ms: u64,
+    pub(crate) record_match: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +90,10 @@ pub struct ProducerAppendRecord {
     pub start_offset: u64,
     pub next_offset: u64,
     pub closed: bool,
+    #[serde(default)]
+    pub record_start: Option<u64>,
+    #[serde(default)]
+    pub record_next: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,6 +225,8 @@ pub struct StreamReadPlan {
     pub segments: Vec<StreamReadSegment>,
     pub up_to_date: bool,
     pub closed: bool,
+    pub retained_record_range: Option<crate::StreamRecordRange>,
+    pub record_range: Option<crate::StreamRecordRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

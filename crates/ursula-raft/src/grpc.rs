@@ -397,6 +397,8 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                                 offset: read.offset,
                                 max_len,
                                 now_ms: request.now_ms,
+                                record: read.record,
+                                max_records: read.max_records,
                             },
                             placement,
                         )

@@ -91,6 +91,7 @@ impl StreamStateMachine {
                 Ok(index) => index,
                 Err(response) => return response,
             };
+        let record_range = record_index.as_ref().and_then(|index| index.range().ok());
         if let Some(producer) = input.producer.as_ref()
             && producer.producer_seq != 0
         {
@@ -169,6 +170,8 @@ impl StreamStateMachine {
                 start_offset: 0,
                 next_offset: initial_len,
                 closed: input.close_after,
+                record_start: record_range.map(|range| range.first_record),
+                record_next: record_range.map(|range| range.next_record),
             };
             producer_states.insert(producer.producer_id, ProducerState {
                 producer_epoch: producer.producer_epoch,
@@ -237,6 +240,7 @@ impl StreamStateMachine {
             Ok(index) => index,
             Err(response) => return response,
         };
+        let record_range = record_index.as_ref().and_then(|index| index.range().ok());
         if let Some(producer) = input.producer.as_ref()
             && producer.producer_seq != 0
         {
@@ -324,6 +328,8 @@ impl StreamStateMachine {
                 start_offset: 0,
                 next_offset: initial_len,
                 closed: input.close_after,
+                record_start: record_range.map(|range| range.first_record),
+                record_next: record_range.map(|range| range.next_record),
             };
             producer_states.insert(producer.producer_id, ProducerState {
                 producer_epoch: producer.producer_epoch,
@@ -377,6 +383,7 @@ impl StreamStateMachine {
             stream_seq,
             producer,
             now_ms,
+            record_match: None,
         })
     }
 

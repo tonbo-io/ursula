@@ -9,7 +9,7 @@ pub struct StreamRecordIndex {
     record_offsets: Vec<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamRecordRange {
     pub first_record: u64,
     pub next_record: u64,
@@ -148,6 +148,25 @@ impl StreamRecordIndex {
             .get(index)
             .copied()
             .ok_or(RecordIndexError::InvalidBoundaries)
+    }
+
+    pub fn record_for_offset(
+        &self,
+        offset: u64,
+        tail_offset: u64,
+    ) -> Result<u64, RecordIndexError> {
+        let range = self.range()?;
+        if offset == tail_offset {
+            return Ok(range.next_record);
+        }
+        let relative = self
+            .record_offsets
+            .binary_search(&offset)
+            .map_err(|_| RecordIndexError::OffsetNotRecordBoundary)?;
+        range
+            .first_record
+            .checked_add(u64::try_from(relative).map_err(|_| RecordIndexError::ArithmeticOverflow)?)
+            .ok_or(RecordIndexError::ArithmeticOverflow)
     }
 
     pub fn retain_from_offset(
