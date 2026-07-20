@@ -138,14 +138,14 @@ wire format. Requires a full DST corpus pass before merge.
 
 Each item deletes a real capability and needs an explicit go/no-go:
 
-| Decision                                             | Est. lines | Cost                                        |
+| Decision                                             | Est. lines | Status / cost                               |
 | ---------------------------------------------------- | ---------- | ------------------------------------------- |
-| Drop WAL persistence backend (`engine/wal.rs`)       | ~1,350     | loses single-node WAL mode (Raft covers it) |
-| Fold meta-Raft into group Raft or drop it            | ~700-1,000 | architectural; migrates control-plane state |
-| Drop `/v1/stream` S2-compat routes + bench `ApiStyle::S2` | ~250  | loses S2-compatible API surface             |
-| Drop `LocalSnapshotStore` backend                    | ~150       | loses `snapshot.backend = local`            |
-| Drop JSON/YAML config formats (keep TOML)            | ~160       | loses two config formats and two deps       |
-| Retire `InProcessRaft` fault-injection network       | ~450       | requires confirming equivalent DST coverage |
+| Drop WAL persistence backend (`engine/wal.rs`)       | ~1,350     | approved; loses single-node WAL mode        |
+| Fold meta-Raft into group Raft or drop it            | —          | **deferred**: meta-Raft + ursula-control are the foundation for dynamic group membership (tracking issue #2, open); keep |
+| Drop `/v1/stream` S2-compat routes + bench `ApiStyle::S2` | ~250  | approved; loses S2-compatible API surface   |
+| Drop `LocalSnapshotStore` backend                    | ~150       | approved; loses `snapshot.backend = local`  |
+| Drop JSON/YAML config formats (keep TOML)            | ~160       | approved; loses two config formats          |
+| Retire `InProcessRaft` fault-injection network       | ~15 + ~350 tests | **revised after scoping**: the network is live DST infrastructure — the madsim harness uses its transport, partition/heal/delay policy, observers, and fault scripts, so it cannot be retired. Only the unused `*_one_way` policy methods (~15 lines) and two tokio fault tests already covered by named DST scenarios (~350 test lines) are removable |
 
 ### Stage 4 — test-surface pruning (coverage judgment, ~4-5k lines)
 
