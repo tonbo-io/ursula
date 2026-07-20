@@ -36,9 +36,6 @@ pub struct FanOutArgs {
     #[arg(long, default_value = "bench-fanout")]
     pub bucket: String,
 
-    #[arg(long, default_value = "benchmark")]
-    pub basin: String,
-
     #[arg(long, default_value = "doc")]
     pub stream: String,
 
@@ -67,7 +64,6 @@ pub struct FanOutResult {
     pub api_style: ApiStyle,
     pub target: String,
     pub bucket: String,
-    pub basin: String,
     pub stream: String,
     pub subscribers: usize,
     pub writer_rate: u64,
@@ -83,13 +79,7 @@ pub struct FanOutResult {
 
 pub async fn run(args: FanOutArgs) -> Result<FanOutResult> {
     let client = build_client(args.request_timeout_secs)?;
-    let backend = Backend::new(
-        args.api_style,
-        &args.target,
-        &args.bucket,
-        &args.basin,
-        client,
-    );
+    let backend = Backend::new(args.api_style, &args.target, &args.bucket, client);
     let stream = args.stream.clone();
 
     backend.ensure_namespace().await?;
@@ -158,7 +148,6 @@ pub async fn run(args: FanOutArgs) -> Result<FanOutResult> {
         api_style: args.api_style,
         target: args.target,
         bucket: args.bucket,
-        basin: args.basin,
         stream: args.stream,
         subscribers: args.subscribers,
         writer_rate: args.writer_rate,
@@ -319,9 +308,7 @@ fn build_payload(seq: u64, size: usize) -> Vec<u8> {
 }
 
 fn extract_send_ns(payload: &[u8]) -> Option<u128> {
-    // Two layouts:
-    //   - Ursula / DS raw text: 48 hex chars at byte 0..48 of the SSE data line.
-    //   - S2 JSON envelope: the 48 hex chars appear inside "body":"<...>".
+    // Ursula / DS raw text: 48 hex chars at byte 0..48 of the SSE data line.
     // Scan for the first run of >=48 consecutive ASCII hex digits and parse
     // bytes 16..48 of that run as a u128 nanos timestamp.
     let mut run_start: Option<usize> = None;

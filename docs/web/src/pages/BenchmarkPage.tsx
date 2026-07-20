@@ -899,9 +899,9 @@ function BenchmarkPage() {
           <p>
             All three systems answered the exact same three workloads from the
             exact same client binary. The bench client picks a backend with{" "}
-            <code>--api-style ursula|durable|s2</code> and switches its HTTP
-            plumbing (URLs, body shape, auth headers) so the workload itself is
-            identical across backends.
+            <code>--api-style</code> and switches its HTTP plumbing (URLs, body
+            shape, auth headers) so the workload itself is identical across
+            backends.
           </p>
           <div className="benchmark-deploy-grid">
             <article>

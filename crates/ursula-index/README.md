@@ -20,7 +20,7 @@ Passing `--stream-url` selects the legacy single-source mode for local developme
 
 ```bash
 cargo run -p ursula-index --bin ursula-indexer -- \
-  --stream-url http://127.0.0.1:4437/v1/stream/browser-telemetry \
+  --stream-url http://127.0.0.1:4437/telemetry/browser-telemetry \
   --s3-bucket my-telemetry-index \
   --s3-region us-east-1 \
   --s3-prefix production/browser-telemetry \

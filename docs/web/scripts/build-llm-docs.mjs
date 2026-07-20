@@ -63,7 +63,6 @@ const PAGE_ORDER = new Map([
   ["api/read-snapshot", ["API Reference", 8]],
   ["api/bootstrap", ["API Reference", 9]],
   ["api/delete-stream", ["API Reference", 10]],
-  ["api/v1-compatibility", ["API Reference", 11]],
 
   ["install", ["Install & Deploy", 1]],
   ["run-locally", ["Install & Deploy", 2]],

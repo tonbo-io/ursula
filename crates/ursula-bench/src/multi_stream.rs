@@ -36,13 +36,9 @@ pub struct MultiStreamArgs {
     #[arg(long, value_enum, default_value_t = ApiStyle::Ursula)]
     pub api_style: ApiStyle,
 
-    /// Bucket name (Ursula only - ignored by Durable / S2).
+    /// Bucket name (Ursula only - ignored by Durable).
     #[arg(long, default_value = "bench-multistream")]
     pub bucket: String,
-
-    /// Basin name (S2 only).
-    #[arg(long, default_value = "benchmark")]
-    pub basin: String,
 
     /// Number of concurrent streams; one writer task per stream.
     #[arg(long, default_value_t = 1000)]
@@ -75,7 +71,6 @@ pub struct MultiStreamResult {
     pub api_style: ApiStyle,
     pub target: String,
     pub bucket: String,
-    pub basin: String,
     pub streams: usize,
     pub duration_secs: u64,
     pub payload_bytes: usize,
@@ -96,13 +91,7 @@ pub struct ErrorCount {
 
 pub async fn run(args: MultiStreamArgs) -> Result<MultiStreamResult> {
     let client = build_client(args.request_timeout_secs)?;
-    let backend = Backend::new(
-        args.api_style,
-        &args.target,
-        &args.bucket,
-        &args.basin,
-        client,
-    );
+    let backend = Backend::new(args.api_style, &args.target, &args.bucket, client);
 
     tracing::info!(
         "creating namespace and streams: api={} streams={} targets={}",
@@ -184,7 +173,6 @@ pub async fn run(args: MultiStreamArgs) -> Result<MultiStreamResult> {
         api_style: args.api_style,
         target: args.target,
         bucket: args.bucket,
-        basin: args.basin,
         streams: args.streams,
         duration_secs: args.duration_secs,
         payload_bytes: args.payload_bytes,
@@ -222,7 +210,6 @@ async fn run_writer(
     };
     let mut next_at = Instant::now();
     let mut local = new_histogram();
-    let use_producer = matches!(backend.kind, ApiStyle::Ursula | ApiStyle::Durable);
     while Instant::now() < deadline {
         if let Some(iv) = interval {
             let now = Instant::now();
@@ -232,15 +219,11 @@ async fn run_writer(
             next_at += iv;
         }
         let started = Instant::now();
-        let producer = if use_producer {
-            Some(Producer {
-                id: &producer_id,
-                epoch,
-                seq,
-            })
-        } else {
-            None
-        };
+        let producer = Some(Producer {
+            id: &producer_id,
+            epoch,
+            seq,
+        });
         let resp = backend
             .append_request(
                 base_idx,

@@ -1136,7 +1136,7 @@ async fn json_mode_normalizes_appends_and_reads_ndjson() {
 
     let response = http_put(
         &app,
-        "/v1/stream/json-mode",
+        "/benchcmp/json-mode",
         &[(CONTENT_TYPE.as_str(), "application/json; charset=utf-8")],
         Body::empty(),
     )
@@ -1151,7 +1151,7 @@ async fn json_mode_normalizes_appends_and_reads_ndjson() {
 
     let response = http_post(
         &app,
-        "/v1/stream/json-mode",
+        "/benchcmp/json-mode",
         &[(CONTENT_TYPE.as_str(), "application/json; charset=utf-8")],
         Body::from(r#"[[1,2,3]]"#),
     )
@@ -1164,12 +1164,12 @@ async fn json_mode_normalizes_appends_and_reads_ndjson() {
     assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "0");
     assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
 
-    let response = http_head(&app, "/v1/stream/json-mode").await;
+    let response = http_head(&app, "/benchcmp/json-mode").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "0");
     assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
 
-    let response = http_get(&app, "/v1/stream/json-mode").await;
+    let response = http_get(&app, "/benchcmp/json-mode").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(header_str(&response, CONTENT_TYPE), "application/x-ndjson");
     let body = body_bytes(response).await;
@@ -1177,7 +1177,7 @@ async fn json_mode_normalizes_appends_and_reads_ndjson() {
 
     let response = http_post(
         &app,
-        "/v1/stream/json-mode",
+        "/benchcmp/json-mode",
         &[(CONTENT_TYPE.as_str(), "application/json")],
         Body::from("[]"),
     )
@@ -1190,7 +1190,7 @@ async fn json_record_coordinates_read_complete_records() {
     let app = test_router();
     let response = http_put(
         &app,
-        "/v1/stream/json-record-read",
+        "/benchcmp/json-record-read",
         &[(CONTENT_TYPE.as_str(), "application/json")],
         Body::empty(),
     )
@@ -1199,7 +1199,7 @@ async fn json_record_coordinates_read_complete_records() {
 
     let response = http_post(
         &app,
-        "/v1/stream/json-record-read",
+        "/benchcmp/json-record-read",
         &[(CONTENT_TYPE.as_str(), "application/json")],
         Body::from(r#"[{"id":1},{"id":2},{"id":3}]"#),
     )
@@ -1208,7 +1208,7 @@ async fn json_record_coordinates_read_complete_records() {
     assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "0");
     assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "3");
 
-    let response = http_get(&app, "/v1/stream/json-record-read?record=1&max_records=1").await;
+    let response = http_get(&app, "/benchcmp/json-record-read?record=1&max_records=1").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(header_str(&response, CONTENT_TYPE), "application/x-ndjson");
     assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "0");
@@ -1217,7 +1217,7 @@ async fn json_record_coordinates_read_complete_records() {
     let body = body_bytes(response).await;
     assert_eq!(&body[..], b"{\"id\":2}\n");
 
-    let response = http_get(&app, "/v1/stream/json-record-read?tail_records=2").await;
+    let response = http_get(&app, "/benchcmp/json-record-read?tail_records=2").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "1");
     assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "3");
@@ -1226,7 +1226,7 @@ async fn json_record_coordinates_read_complete_records() {
 
     let response = http_get(
         &app,
-        "/v1/stream/json-record-read?record=1&max_records=1&record_view=envelope",
+        "/benchcmp/json-record-read?record=1&max_records=1&record_view=envelope",
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -1239,7 +1239,7 @@ async fn json_record_coordinates_read_complete_records() {
 
     let response = http_post(
         &app,
-        "/v1/stream/json-record-read",
+        "/benchcmp/json-record-read",
         &[
             (CONTENT_TYPE.as_str(), "application/json"),
             (HEADER_STREAM_RECORD_MATCH, "3"),
@@ -1253,7 +1253,7 @@ async fn json_record_coordinates_read_complete_records() {
 
     let response = http_post(
         &app,
-        "/v1/stream/json-record-read",
+        "/benchcmp/json-record-read",
         &[
             (CONTENT_TYPE.as_str(), "application/json"),
             (HEADER_STREAM_RECORD_MATCH, "3"),
@@ -1271,7 +1271,7 @@ async fn json_record_coordinates_preserve_deduplicated_and_close_only_ranges() {
     let app = test_router();
     let response = http_put(
         &app,
-        "/v1/stream/json-record-dedup",
+        "/benchcmp/json-record-dedup",
         &[(CONTENT_TYPE.as_str(), "application/json")],
         Body::empty(),
     )
@@ -1281,7 +1281,7 @@ async fn json_record_coordinates_preserve_deduplicated_and_close_only_ranges() {
     for payload in [r#"[{"id":1},{"id":2}]"#, r#"{"ignored":true}"#] {
         let response = http_post(
             &app,
-            "/v1/stream/json-record-dedup",
+            "/benchcmp/json-record-dedup",
             &[
                 (CONTENT_TYPE.as_str(), "application/json"),
                 (HEADER_PRODUCER_ID, "browser-tab"),
@@ -1301,7 +1301,7 @@ async fn json_record_coordinates_preserve_deduplicated_and_close_only_ranges() {
 
     let response = http_post(
         &app,
-        "/v1/stream/json-record-dedup",
+        "/benchcmp/json-record-dedup",
         &[
             (CONTENT_TYPE.as_str(), "application/json"),
             (HEADER_STREAM_CLOSED, "true"),
@@ -1319,7 +1319,7 @@ async fn json_record_coordinates_concurrent_appends_receive_disjoint_commit_rang
     let app = test_router();
     let response = http_put(
         &app,
-        "/v1/stream/json-record-concurrent",
+        "/benchcmp/json-record-concurrent",
         &[(CONTENT_TYPE.as_str(), "application/json")],
         Body::empty(),
     )
@@ -1332,7 +1332,7 @@ async fn json_record_coordinates_concurrent_appends_receive_disjoint_commit_rang
         writes.push(tokio::spawn(async move {
             http_post(
                 &app,
-                "/v1/stream/json-record-concurrent",
+                "/benchcmp/json-record-concurrent",
                 &[(CONTENT_TYPE.as_str(), "application/json")],
                 Body::from(format!(r#"{{"id":{id}}}"#)),
             )
@@ -1366,7 +1366,7 @@ async fn json_record_coordinates_live_reads_resume_by_record() {
     let app = test_router();
     let response = http_put(
         &app,
-        "/v1/stream/json-record-live",
+        "/benchcmp/json-record-live",
         &[(CONTENT_TYPE.as_str(), "application/json")],
         Body::empty(),
     )
@@ -1378,7 +1378,7 @@ async fn json_record_coordinates_live_reads_resume_by_record() {
         tokio::spawn(async move {
             http_get(
                 &app,
-                "/v1/stream/json-record-live?record=now&live=long-poll&timeout_ms=1000",
+                "/benchcmp/json-record-live?record=now&live=long-poll&timeout_ms=1000",
             )
             .await
         })
@@ -1387,7 +1387,7 @@ async fn json_record_coordinates_live_reads_resume_by_record() {
 
     let response = http_post(
         &app,
-        "/v1/stream/json-record-live",
+        "/benchcmp/json-record-live",
         &[(CONTENT_TYPE.as_str(), "application/json")],
         Body::from(r#"[{"id":1},{"id":2}]"#),
     )
@@ -1406,7 +1406,7 @@ async fn json_record_coordinates_live_reads_resume_by_record() {
 
     let response = http_post(
         &app,
-        "/v1/stream/json-record-live",
+        "/benchcmp/json-record-live",
         &[
             (CONTENT_TYPE.as_str(), "application/json"),
             (HEADER_STREAM_CLOSED, "true"),
@@ -1418,7 +1418,7 @@ async fn json_record_coordinates_live_reads_resume_by_record() {
 
     let response = http_get(
         &app,
-        "/v1/stream/json-record-live?record=0&record_view=envelope&live=sse",
+        "/benchcmp/json-record-live?record=0&record_view=envelope&live=sse",
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -1491,7 +1491,7 @@ async fn json_mode_reads_ndjson_bytes_without_message_boundary_projection() {
 
     let response = http_put(
         &app,
-        "/v1/stream/json-window",
+        "/benchcmp/json-window",
         &[(CONTENT_TYPE.as_str(), "application/json")],
         Body::empty(),
     )
@@ -1500,14 +1500,14 @@ async fn json_mode_reads_ndjson_bytes_without_message_boundary_projection() {
 
     let response = http_post(
         &app,
-        "/v1/stream/json-window",
+        "/benchcmp/json-window",
         &[(CONTENT_TYPE.as_str(), "application/json")],
         Body::from(r#"[{"message":"alpha"},{"message":"beta"}]"#),
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = http_get(&app, "/v1/stream/json-window?offset=-1&max_bytes=5").await;
+    let response = http_get(&app, "/benchcmp/json-window?offset=-1&max_bytes=5").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(header_str(&response, CONTENT_TYPE), "application/x-ndjson");
     assert_eq!(

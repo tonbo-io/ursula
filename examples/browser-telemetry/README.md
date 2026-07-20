@@ -19,7 +19,7 @@ telemetry.capture("application_started", { release: "2026.07.18" });
 
 ```bash
 cargo run -p ursula-index --bin ursula-indexer -- \
-  --stream-url http://127.0.0.1:4437/v1/stream/browser-telemetry \
+  --stream-url http://127.0.0.1:4437/telemetry/browser-telemetry \
   --s3-bucket my-telemetry-index \
   --s3-prefix production/browser-telemetry \
   --cache-dir ./target/browser-telemetry-cache
