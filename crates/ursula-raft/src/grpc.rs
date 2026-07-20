@@ -10,6 +10,7 @@ use openraft::BasicNode;
 use openraft::OptionalSend;
 use openraft::RaftNetworkFactory;
 use openraft::RaftNetworkV2;
+use openraft::alias::SnapshotMetaOf;
 use openraft::alias::SnapshotOf;
 use openraft::alias::VoteOf;
 use openraft::error::NetworkError;
@@ -20,6 +21,7 @@ use openraft::error::Unreachable;
 use openraft::network::RPCOption;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
+use serde::de::DeserializeOwned;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 use tracing::Instrument;
@@ -40,24 +42,7 @@ use crate::codec::placement_from_parts;
 use crate::codec::required;
 use crate::engine::RaftGroupEngine;
 use crate::forward::write_commands_on_raft;
-use crate::log_store::append_entries_request_from_proto;
-use crate::log_store::append_entries_request_to_proto;
-use crate::log_store::append_entries_response_from_proto;
-use crate::log_store::append_entries_response_to_proto;
-use crate::log_store::log_id_from_required_proto;
-use crate::log_store::log_id_to_proto;
-use crate::log_store::snapshot_meta_from_required_proto;
-use crate::log_store::snapshot_meta_to_proto;
-use crate::log_store::snapshot_response_from_required_proto;
-use crate::log_store::snapshot_response_to_proto;
-use crate::log_store::vote_from_required_proto;
-use crate::log_store::vote_request_from_proto;
-use crate::log_store::vote_request_to_proto;
-use crate::log_store::vote_response_from_proto;
-use crate::log_store::vote_response_to_proto;
-use crate::log_store::vote_to_proto;
 use crate::raft_internal_proto;
-use crate::raft_internal_proto::raft_rpc_ack_v1::Payload as AckPayload;
 use crate::types::UrsulaAppendEntriesRequest;
 use crate::types::UrsulaAppendEntriesResponse;
 use crate::types::UrsulaRaftTypeConfig;
@@ -166,18 +151,15 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             envelope.protocol_version,
             envelope.raft_group_id,
         )?;
-        let payload = required(envelope.payload, "raft_rpc_envelope.payload")
-            .map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))?;
-        let request = append_entries_request_from_proto(payload)?;
+        let request: UrsulaAppendEntriesRequest =
+            decode_rpc_payload(&envelope.payload, "raft append request")?;
         let response = self
             .registry
             .append_entries(raft_group_id, request)
             .await
             .map_err(|err| tonic::Status::internal(err.to_string()))?;
         Ok(tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
-            payload: Some(AckPayload::AppendEntries(append_entries_response_to_proto(
-                response,
-            ))),
+            payload: encode_wire(&response),
         }))
     }
 
@@ -191,16 +173,15 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             envelope.protocol_version,
             envelope.raft_group_id,
         )?;
-        let payload = required(envelope.payload, "raft_rpc_envelope.payload")
-            .map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))?;
-        let request = vote_request_from_proto(payload)?;
+        let request: UrsulaVoteRequest =
+            decode_rpc_payload(&envelope.payload, "raft vote request")?;
         let response = self
             .registry
             .vote(raft_group_id, request)
             .await
             .map_err(|err| tonic::Status::internal(err.to_string()))?;
         Ok(tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
-            payload: Some(AckPayload::Vote(vote_response_to_proto(response))),
+            payload: encode_wire(&response),
         }))
     }
 
@@ -214,8 +195,10 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             request.protocol_version,
             request.raft_group_id,
         )?;
-        let vote = vote_from_required_proto(request.vote)?;
-        let meta = snapshot_meta_from_required_proto(request.snapshot_meta)?;
+        let vote: VoteOf<UrsulaRaftTypeConfig> =
+            decode_rpc_payload(&request.vote, "full snapshot vote")?;
+        let meta: SnapshotMetaOf<UrsulaRaftTypeConfig> =
+            decode_rpc_payload(&request.snapshot_meta, "full snapshot meta")?;
         let snapshot = SnapshotOf::<UrsulaRaftTypeConfig> {
             meta,
             snapshot: Cursor::new(request.snapshot_payload.to_vec()),
@@ -227,7 +210,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .map_err(|err| tonic::Status::internal(err.to_string()))?;
         Ok(tonic::Response::new(
             raft_internal_proto::RaftFullSnapshotAckV1 {
-                response: Some(snapshot_response_to_proto(response)),
+                response: encode_wire(&response),
             },
         ))
     }
@@ -299,20 +282,8 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             ))
             .into());
         }
-        let from_leader = vote_from_required_proto(request.from_leader)
-            .map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))?;
-        let last_log_id = match request.last_log_id {
-            Some(log_id) => Some(
-                log_id_from_required_proto(Some(log_id), "transfer_leader.last_log_id")
-                    .map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))?,
-            ),
-            None => None,
-        };
-        let openraft_request = openraft::raft::TransferLeaderRequest::<UrsulaRaftTypeConfig>::new(
-            from_leader,
-            request.to_node_id,
-            last_log_id,
-        );
+        let openraft_request: TransferLeaderRequest<UrsulaRaftTypeConfig> =
+            decode_rpc_payload(&request.request, "transfer leader request")?;
         self.registry
             .handle_transfer_leader(raft_group_id, openraft_request)
             .await
@@ -419,6 +390,12 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         .instrument(span)
         .await
     }
+}
+
+/// Decode a MessagePack RPC payload carried inside a proto envelope, mapping
+/// failures to `InvalidArgument`.
+fn decode_rpc_payload<T: DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T, GrpcRpcError> {
+    decode_wire(bytes, what).map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))
 }
 
 /// Validate the shared protocol-version + registered-group preamble carried by
@@ -569,11 +546,7 @@ impl GrpcRaftNetwork {
             raft_group_id: self.raft_group_id.0,
             node_id: self.target,
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-            payload: Some(
-                raft_internal_proto::raft_rpc_envelope_v1::Payload::AppendEntries(
-                    append_entries_request_to_proto(request),
-                ),
-            ),
+            payload: encode_wire(&request),
         }
     }
 
@@ -585,9 +558,7 @@ impl GrpcRaftNetwork {
             raft_group_id: self.raft_group_id.0,
             node_id: self.target,
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-            from_leader: Some(vote_to_proto(*request.from_leader())),
-            to_node_id: *request.to_node_id(),
-            last_log_id: request.last_log_id().cloned().map(log_id_to_proto),
+            request: encode_wire(request),
         }
     }
 
@@ -599,9 +570,7 @@ impl GrpcRaftNetwork {
             raft_group_id: self.raft_group_id.0,
             node_id: self.target,
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-            payload: Some(raft_internal_proto::raft_rpc_envelope_v1::Payload::Vote(
-                vote_request_to_proto(request),
-            )),
+            payload: encode_wire(&request),
         }
     }
 
@@ -659,28 +628,13 @@ impl GrpcRaftNetwork {
         }
     }
 
-    /// Decode an envelope-style ack: require the payload, select the expected
-    /// payload variant via `take`, and convert it with `convert`.
-    fn decode_rpc_ack<P, T, E>(
+    /// Decode the MessagePack payload of an envelope-style ack.
+    fn decode_rpc_ack<T: DeserializeOwned>(
         &self,
         route: &str,
-        ack_name: &str,
-        ack: raft_internal_proto::RaftRpcAckV1,
-        take: impl FnOnce(raft_internal_proto::raft_rpc_ack_v1::Payload) -> Option<P>,
-        convert: impl FnOnce(P) -> Result<T, E>,
-    ) -> Result<T, RPCError<UrsulaRaftTypeConfig>>
-    where
-        E: std::fmt::Display,
-    {
-        let payload = required(ack.payload, ack_name)
-            .map_err(|err| raft_rpc_network_error(err.to_string()))?;
-        let Some(payload) = take(payload) else {
-            return Err(raft_rpc_network_error(format!(
-                "{route} response from node {} at {} had wrong payload type",
-                self.target, self.endpoint
-            )));
-        };
-        convert(payload).map_err(|err| {
+        payload: &[u8],
+    ) -> Result<T, RPCError<UrsulaRaftTypeConfig>> {
+        decode_wire(payload, route).map_err(|err| {
             raft_rpc_network_error(format!(
                 "decode {route} response from node {} at {}: {err}",
                 self.target, self.endpoint
@@ -729,16 +683,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
                 |mut client, request| async move { client.append(request).await },
             )
             .await?;
-        self.decode_rpc_ack(
-            "Append",
-            "raft append ack payload",
-            ack,
-            |payload| match payload {
-                AckPayload::AppendEntries(response) => Some(response),
-                _ => None,
-            },
-            append_entries_response_from_proto,
-        )
+        self.decode_rpc_ack("Append", &ack.payload)
     }
 
     async fn vote(
@@ -752,16 +697,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
                 client.vote(request).await
             })
             .await?;
-        self.decode_rpc_ack(
-            "Vote",
-            "raft vote ack payload",
-            ack,
-            |payload| match payload {
-                AckPayload::Vote(response) => Some(response),
-                _ => None,
-            },
-            vote_response_from_proto,
-        )
+        self.decode_rpc_ack("Vote", &ack.payload)
     }
 
     async fn full_snapshot(
@@ -775,8 +711,8 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
             raft_group_id: self.raft_group_id.0,
             node_id: self.target,
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
-            vote: Some(vote_to_proto(vote)),
-            snapshot_meta: Some(snapshot_meta_to_proto(snapshot.meta)),
+            vote: encode_wire(&vote),
+            snapshot_meta: encode_wire(&snapshot.meta),
             snapshot_payload: snapshot.snapshot.into_inner().into(),
         };
         let ack = self
@@ -788,12 +724,8 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
             )
             .await
             .map_err(StreamingError::from)?;
-        snapshot_response_from_required_proto(ack.response).map_err(|err| {
-            StreamingError::from(raft_rpc_network_error(format!(
-                "decode FullSnapshot response from node {} at {}: {err}",
-                self.target, self.endpoint
-            )))
-        })
+        self.decode_rpc_ack("FullSnapshot", &ack.response)
+            .map_err(StreamingError::from)
     }
 
     async fn transfer_leader(

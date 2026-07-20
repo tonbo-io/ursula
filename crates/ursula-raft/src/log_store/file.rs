@@ -20,7 +20,8 @@ use openraft::storage::IOFlushed;
 use openraft::storage::LogState;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
-use prost::Message;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::journal;
 use ursula_shard::ShardPlacement;
@@ -28,19 +29,10 @@ use ursula_shard::ShardPlacement;
 use super::CoreJournalRecord;
 use super::RaftGroupLogRecord;
 use super::RaftGroupLogStoreInner;
-use super::StoredLogEntry;
-use super::append_record;
 use super::ensure_consecutive_entries;
 use super::ensure_log_append_boundary;
-use super::log_id_from_required_proto;
-use super::purge_record;
-use super::save_committed_record;
-use super::save_vote_record;
-use super::stored_log_entry_into_entry;
-use super::truncate_after_record;
-use super::vote_from_required_proto;
+use crate::codec::encode_wire;
 use crate::engine::invalid_data;
-use crate::raft_internal_proto;
 use crate::rt::time::Instant;
 use crate::types::CORE_LOG_GROUP_COMMIT_DELAY;
 use crate::types::CORE_LOG_GROUP_COMMIT_MAX_BATCH;
@@ -61,7 +53,8 @@ pub(crate) struct RaftGroupFileLogStoreMetrics {
     metrics: GroupEngineMetrics,
 }
 
-/// Raft log writes frame protobuf records into the shared append-only journal.
+/// Raft log writes frame MessagePack records into the shared append-only
+/// journal.
 type RaftGroupFileLogHandle = journal::JournalWriter;
 
 #[derive(Debug)]
@@ -304,9 +297,9 @@ pub(crate) fn write_core_log_batch(
     for request in batch {
         let journal_record = CoreJournalRecord {
             group_id: request.group_id,
-            record: Some(request.record.clone()),
+            record: request.record.clone(),
         };
-        write_protobuf_frame_to_file(journal_path, journal_handle, &journal_record)?;
+        write_wire_frame_to_file(journal_path, journal_handle, &journal_record)?;
     }
     let write_ns = elapsed_ns(write_started_at);
 
@@ -370,7 +363,7 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
             }
             let mut next = inner.clone();
             next.vote = Some(vote);
-            store.append_record_locked(&save_vote_record(vote))?;
+            store.append_record_locked(&RaftGroupLogRecord::SaveVote(vote))?;
             *inner = next;
             Ok(())
         })
@@ -389,7 +382,7 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
             }
             let mut next = inner.clone();
             next.committed = committed;
-            store.append_record_locked(&save_committed_record(committed))?;
+            store.append_record_locked(&RaftGroupLogRecord::SaveCommitted(committed))?;
             *inner = next;
             Ok(())
         })
@@ -417,7 +410,7 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
             let mut inner = store.lock_inner()?;
             ensure_log_append_boundary::<UrsulaRaftTypeConfig>(&inner, &entries)?;
 
-            let record = append_record(entries.iter().map(StoredLogEntry::from).collect());
+            let record = RaftGroupLogRecord::Append(entries.clone());
             if let Err(err) = store.append_record_locked(&record) {
                 callback.io_completed(Err(io::Error::new(err.kind(), err.to_string())));
                 return Err(err);
@@ -441,7 +434,7 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
             let mut inner = store.lock_inner()?;
             let mut next = inner.clone();
             next.entries.retain(|index, _| *index < start_index);
-            store.append_record_locked(&truncate_after_record(last_log_id))?;
+            store.append_record_locked(&RaftGroupLogRecord::TruncateAfter(last_log_id))?;
             *inner = next;
             Ok(())
         })
@@ -465,7 +458,7 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
             let mut next = inner.clone();
             next.last_purged_log_id = Some(log_id);
             next.entries.retain(|index, _| *index > log_id.index);
-            store.append_record_locked(&purge_record(log_id))?;
+            store.append_record_locked(&RaftGroupLogRecord::Purge(log_id))?;
             *inner = next;
             Ok(())
         })
@@ -488,7 +481,7 @@ pub(crate) fn load_log_store_inner(path: &Path) -> Result<RaftGroupLogStoreInner
     }
 
     let mut inner = RaftGroupLogStoreInner::default();
-    for (record_index, record) in read_protobuf_frames_from_file::<RaftGroupLogRecord>(path)?
+    for (record_index, record) in read_wire_frames_from_file::<RaftGroupLogRecord>(path)?
         .into_iter()
         .enumerate()
     {
@@ -515,24 +508,14 @@ pub(crate) fn load_log_store_inner_from_core_journal(
     }
 
     let mut inner = RaftGroupLogStoreInner::default();
-    for (record_index, record) in read_protobuf_frames_from_file::<CoreJournalRecord>(journal_path)?
+    for (record_index, record) in read_wire_frames_from_file::<CoreJournalRecord>(journal_path)?
         .into_iter()
         .enumerate()
     {
         if record.group_id != placement.raft_group_id.0 {
             continue;
         }
-        let record_payload = record.record.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "OpenRaft core journal record '{}' record {} missing payload",
-                    journal_path.display(),
-                    record_index + 1
-                ),
-            )
-        })?;
-        apply_log_store_record(&mut inner, record_payload).map_err(|err| {
+        apply_log_store_record(&mut inner, record.record).map_err(|err| {
             io::Error::new(
                 err.kind(),
                 format!(
@@ -546,25 +529,26 @@ pub(crate) fn load_log_store_inner_from_core_journal(
     Ok(inner)
 }
 
-/// Frames Raft log records as length-delimited protobuf for the shared journal.
-struct ProtobufCodec<M>(PhantomData<M>);
+/// Frames Raft log records as length-delimited MessagePack for the shared
+/// journal (see [`crate::codec::encode_wire`]).
+struct WireCodec<T>(PhantomData<T>);
 
-impl<M: Message + Default> journal::FrameCodec for ProtobufCodec<M> {
-    type Record = M;
+impl<T: Serialize + DeserializeOwned> journal::FrameCodec for WireCodec<T> {
+    type Record = T;
 
-    fn encode(record: &M) -> Vec<u8> {
-        record.encode_to_vec()
+    fn encode(record: &T) -> Vec<u8> {
+        encode_wire(record).into()
     }
 
-    fn decode(payload: &[u8]) -> Result<M, io::Error> {
-        M::decode(payload).map_err(invalid_data)
+    fn decode(payload: &[u8]) -> Result<T, io::Error> {
+        rmp_serde::from_slice(payload).map_err(invalid_data)
     }
 }
 
-pub(crate) fn read_protobuf_frames_from_file<M: Message + Default>(
+pub(crate) fn read_wire_frames_from_file<T: Serialize + DeserializeOwned>(
     path: &Path,
-) -> Result<Vec<M>, io::Error> {
-    journal::replay::<ProtobufCodec<M>>(path)
+) -> Result<Vec<T>, io::Error> {
+    journal::replay::<WireCodec<T>>(path)
 }
 
 pub(crate) fn append_log_store_record(
@@ -573,7 +557,7 @@ pub(crate) fn append_log_store_record(
     record: &RaftGroupLogRecord,
 ) -> Result<(u64, u64), io::Error> {
     let write_started_at = Instant::now();
-    write_protobuf_frame_to_file(path, handle, record)?;
+    write_wire_frame_to_file(path, handle, record)?;
     let write_ns = elapsed_ns(write_started_at);
 
     let sync_started_at = Instant::now();
@@ -581,19 +565,19 @@ pub(crate) fn append_log_store_record(
     Ok((write_ns, elapsed_ns(sync_started_at)))
 }
 
-pub(crate) fn write_protobuf_frame_to_file<M: Message + Default>(
+pub(crate) fn write_wire_frame_to_file<T: Serialize + DeserializeOwned>(
     path: &Path,
     handle: &mut RaftGroupFileLogHandle,
-    value: &M,
+    value: &T,
 ) -> Result<(), io::Error> {
-    handle.append::<ProtobufCodec<M>>(path, value)
+    handle.append::<WireCodec<T>>(path, value)
 }
 
 #[cfg(test)]
-pub(crate) fn read_protobuf_frames<M: Message + Default>(
+pub(crate) fn read_wire_frames<T: Serialize + DeserializeOwned>(
     bytes: &[u8],
-) -> Result<Vec<M>, io::Error> {
-    journal::decode_frames::<ProtobufCodec<M>>(bytes).map(|(records, _)| records)
+) -> Result<Vec<T>, io::Error> {
+    journal::decode_frames::<WireCodec<T>>(bytes).map(|(records, _)| records)
 }
 
 pub(crate) fn sync_file_handle(
@@ -604,12 +588,9 @@ pub(crate) fn sync_file_handle(
 }
 
 pub(crate) fn raft_group_log_record_count(record: &RaftGroupLogRecord) -> usize {
-    match &record.operation {
-        Some(raft_internal_proto::raft_group_log_record_v1::Operation::Append(append)) => {
-            append.entries.len()
-        }
-        Some(_) => 1,
-        None => 0,
+    match record {
+        RaftGroupLogRecord::Append(entries) => entries.len(),
+        _ => 1,
     }
 }
 
@@ -621,48 +602,28 @@ pub(crate) fn apply_log_store_record(
     inner: &mut RaftGroupLogStoreInner,
     record: RaftGroupLogRecord,
 ) -> Result<(), io::Error> {
-    use raft_internal_proto::raft_group_log_record_v1::Operation;
-
-    match record.operation.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "OpenRaft log record missing operation",
-        )
-    })? {
-        Operation::SaveVote(record) => {
-            inner.vote = Some(vote_from_required_proto(record.vote)?);
+    match record {
+        RaftGroupLogRecord::SaveVote(vote) => {
+            inner.vote = Some(vote);
             Ok(())
         }
-        Operation::SaveCommitted(record) => {
-            inner.committed = record
-                .committed
-                .map(|log_id| log_id_from_required_proto(Some(log_id), "committed log id"))
-                .transpose()?;
+        RaftGroupLogRecord::SaveCommitted(committed) => {
+            inner.committed = committed;
             Ok(())
         }
-        Operation::Append(record) => {
-            let entries = record
-                .entries
-                .into_iter()
-                .map(stored_log_entry_into_entry)
-                .collect::<Result<Vec<_>, _>>()?;
+        RaftGroupLogRecord::Append(entries) => {
             ensure_consecutive_entries::<UrsulaRaftTypeConfig>(&entries)?;
             for entry in entries {
                 inner.entries.insert(entry.log_id.index, entry);
             }
             super::ensure_consecutive_log::<UrsulaRaftTypeConfig>(&inner.entries)
         }
-        Operation::TruncateAfter(record) => {
-            let last_log_id = record
-                .last_log_id
-                .map(|log_id| log_id_from_required_proto(Some(log_id), "truncate_after log id"))
-                .transpose()?;
+        RaftGroupLogRecord::TruncateAfter(last_log_id) => {
             let start_index = last_log_id.map_or(0, |log_id| log_id.index + 1);
             inner.entries.retain(|index, _| *index < start_index);
             Ok(())
         }
-        Operation::Purge(record) => {
-            let log_id = log_id_from_required_proto(record.log_id, "purge log id")?;
+        RaftGroupLogRecord::Purge(log_id) => {
             if inner.last_purged_log_id > Some(log_id) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -723,7 +684,7 @@ mod tests {
         let path = temp_journal_path("group-log-torn-tail");
         let vote = committed_vote();
         let mut handle = RaftGroupFileLogHandle::new(true);
-        append_log_store_record(&path, &mut handle, &save_vote_record(vote))
+        append_log_store_record(&path, &mut handle, &RaftGroupLogRecord::SaveVote(vote))
             .expect("write complete vote record");
         drop(handle);
         let valid_len = fs::metadata(&path).expect("journal metadata").len();
@@ -758,9 +719,9 @@ mod tests {
         };
         let vote = committed_vote();
         let mut handle = RaftGroupFileLogHandle::new(true);
-        write_protobuf_frame_to_file(&path, &mut handle, &CoreJournalRecord {
+        write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
             group_id: placement.raft_group_id.0,
-            record: Some(save_vote_record(vote)),
+            record: RaftGroupLogRecord::SaveVote(vote),
         })
         .expect("write complete core journal record");
         sync_file_handle(&path, &mut handle).expect("sync complete core journal record");

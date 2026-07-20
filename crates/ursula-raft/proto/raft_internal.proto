@@ -2,35 +2,51 @@ syntax = "proto3";
 
 package ursula.raft.v1;
 
+// Raft RPC envelopes keep a plain proto preamble (protocol version, group id,
+// target node) so routing and validation never decode the payload. The payload
+// itself is opaque MessagePack produced by the serde derives of openraft's own
+// request/response types (see `codec::encode_wire`).
+
 message RaftRpcEnvelopeV1 {
   uint32 raft_group_id = 1;
   uint64 node_id = 2;
   uint32 protocol_version = 3;
-  oneof payload {
-    RaftAppendEntriesRequestV1 append_entries = 4;
-    RaftVoteRequestV1 vote = 5;
-  }
+  // MessagePack-encoded openraft `AppendEntriesRequest` (Append RPC) or
+  // `VoteRequest` (Vote RPC).
+  bytes payload = 4;
 }
 
 message RaftRpcAckV1 {
-  oneof payload {
-    RaftAppendEntriesResponseV1 append_entries = 1;
-    RaftVoteResponseV1 vote = 2;
-  }
+  // MessagePack-encoded openraft `AppendEntriesResponse` (Append RPC) or
+  // `VoteResponse` (Vote RPC).
+  bytes payload = 1;
 }
 
 message RaftFullSnapshotRequestV1 {
   uint32 raft_group_id = 1;
   uint64 node_id = 2;
   uint32 protocol_version = 3;
-  VoteV1 vote = 4;
-  SnapshotMetaV1 snapshot_meta = 5;
+  // MessagePack-encoded openraft `Vote`.
+  bytes vote = 4;
+  // MessagePack-encoded openraft `SnapshotMeta`.
+  bytes snapshot_meta = 5;
   bytes snapshot_payload = 6;
 }
 
 message RaftFullSnapshotAckV1 {
-  RaftSnapshotResponseV1 response = 1;
+  // MessagePack-encoded openraft `SnapshotResponse`.
+  bytes response = 1;
 }
+
+message RaftTransferLeaderRequestV1 {
+  uint32 raft_group_id = 1;
+  uint64 node_id = 2;
+  uint32 protocol_version = 3;
+  // MessagePack-encoded openraft `TransferLeaderRequest`.
+  bytes request = 4;
+}
+
+message RaftTransferLeaderAckV1 {}
 
 message GroupWriteRequestV1 {
   uint32 raft_group_id = 1;
@@ -77,148 +93,6 @@ message GroupReadResponseV1 {
   bool ok = 1;
   bytes payload = 2;
 }
-
-message LogIdV1 {
-  uint64 term = 1;
-  uint64 node_id = 2;
-  uint64 index = 3;
-}
-
-message VoteV1 {
-  uint64 term = 1;
-  uint64 node_id = 2;
-  bool committed = 3;
-}
-
-message BasicNodeV1 {
-  string addr = 1;
-}
-
-message MembershipConfigV1 {
-  repeated uint64 node_ids = 1;
-}
-
-message MembershipNodeV1 {
-  uint64 node_id = 1;
-  BasicNodeV1 node = 2;
-}
-
-message MembershipEntryV1 {
-  repeated MembershipConfigV1 configs = 1;
-  repeated MembershipNodeV1 nodes = 2;
-}
-
-message StoredMembershipV1 {
-  LogIdV1 log_id = 1;
-  MembershipEntryV1 membership = 2;
-}
-
-message SnapshotMetaV1 {
-  LogIdV1 last_log_id = 1;
-  StoredMembershipV1 last_membership = 2;
-  string snapshot_id = 3;
-}
-
-message BlankEntryV1 {}
-
-message StoredLogEntryV1 {
-  LogIdV1 log_id = 1;
-  oneof payload {
-    BlankEntryV1 blank = 2;
-    // Serde-encoded canonical `GroupWriteCommand` (see `codec::encode_wire`).
-    bytes normal = 3;
-    MembershipEntryV1 membership = 4;
-  }
-}
-
-message SaveVoteRecordV1 {
-  VoteV1 vote = 1;
-}
-
-message SaveCommittedRecordV1 {
-  LogIdV1 committed = 1;
-}
-
-message AppendRecordV1 {
-  repeated StoredLogEntryV1 entries = 1;
-}
-
-message TruncateAfterRecordV1 {
-  LogIdV1 last_log_id = 1;
-}
-
-message PurgeRecordV1 {
-  LogIdV1 log_id = 1;
-}
-
-message RaftGroupLogRecordV1 {
-  oneof operation {
-    SaveVoteRecordV1 save_vote = 1;
-    SaveCommittedRecordV1 save_committed = 2;
-    AppendRecordV1 append = 3;
-    TruncateAfterRecordV1 truncate_after = 4;
-    PurgeRecordV1 purge = 5;
-  }
-}
-
-message CoreJournalRecordV1 {
-  uint32 group_id = 1;
-  RaftGroupLogRecordV1 record = 2;
-}
-
-message RaftAppendEntriesRequestV1 {
-  VoteV1 vote = 1;
-  LogIdV1 prev_log_id = 2;
-  repeated StoredLogEntryV1 entries = 3;
-  LogIdV1 leader_commit = 4;
-}
-
-message RaftAppendEntriesResponseV1 {
-  oneof response {
-    RaftAppendSuccessV1 success = 1;
-    RaftAppendPartialSuccessV1 partial_success = 2;
-    RaftAppendConflictV1 conflict = 3;
-    RaftAppendHigherVoteV1 higher_vote = 4;
-  }
-}
-
-message RaftAppendSuccessV1 {}
-
-message RaftAppendPartialSuccessV1 {
-  LogIdV1 log_id = 1;
-}
-
-message RaftAppendConflictV1 {}
-
-message RaftAppendHigherVoteV1 {
-  VoteV1 vote = 1;
-}
-
-message RaftVoteRequestV1 {
-  VoteV1 vote = 1;
-  LogIdV1 last_log_id = 2;
-}
-
-message RaftVoteResponseV1 {
-  VoteV1 vote = 1;
-  bool vote_granted = 2;
-  LogIdV1 last_log_id = 3;
-}
-
-message RaftSnapshotResponseV1 {
-  VoteV1 vote = 1;
-}
-
-message RaftTransferLeaderRequestV1 {
-  uint32 raft_group_id = 1;
-  uint64 node_id = 2;
-  uint32 protocol_version = 3;
-  VoteV1 from_leader = 4;
-  uint64 to_node_id = 5;
-  LogIdV1 last_log_id = 6;
-}
-
-message RaftTransferLeaderAckV1 {}
 
 service RaftInternal {
   rpc Append(RaftRpcEnvelopeV1) returns (RaftRpcAckV1);

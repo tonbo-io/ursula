@@ -2299,6 +2299,7 @@ dependencies = [
  "openraft-rt-tokio",
  "peel-off",
  "rand 0.10.1",
+ "serde",
  "smallvec",
  "thiserror 2.0.18",
  "tracing",

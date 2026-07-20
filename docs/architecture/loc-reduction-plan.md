@@ -135,6 +135,19 @@ wire format. Requires a full DST corpus pass before merge.
    `log_store/mod.rs:137-465` and the matching `.proto` messages. Trade-off:
    couples the inter-node wire format to Rust type layout, which is
    acceptable while all nodes upgrade together.
+   **Landed (2026-07):** openraft's `serde` feature is enabled and its
+   envelope types (`AppendEntriesRequest`/`Response`, `VoteRequest`/
+   `Response`, `Vote`, `SnapshotMeta`, `SnapshotResponse`,
+   `TransferLeaderRequest`, `Entry`) travel as MessagePack via
+   `codec::encode_wire`; the gRPC envelopes keep only the proto preamble
+   (protocol version, group id, node id) plus opaque `bytes`, so
+   `validate_raft_rpc_preamble` still never decodes payloads. The on-disk
+   raft log journal moved to the same serde records
+   (`RaftGroupLogRecord`/`CoreJournalRecord`); 26 mirror messages were
+   deleted from `raft_internal.proto` and every `*_to_proto`/`*_from_proto`
+   converter in `log_store/mod.rs` is gone (~660 lines net). Byte-stability
+   is asserted by a re-encode round-trip test; the snapshot data frame keeps
+   its proto format (out of scope by design).
 3. **Actor-dispatch macro.** Generate the `GroupCommand` variant, reject arm,
    dispatch arm, and `ShardRuntime` method per operation. Hot-path change;
    gate on DST re-validation and the append/apply benchmarks.

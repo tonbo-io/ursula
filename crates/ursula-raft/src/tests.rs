@@ -28,7 +28,6 @@ use openraft::storage::RaftLogStorage;
 use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
 use openraft::vote::RaftLeaderId;
-use prost::Message;
 use serde_json::json;
 use ursula_control::ControlCommand;
 use ursula_runtime::AppendBatchRequest;
@@ -122,6 +121,49 @@ fn group_engine_error_codec_round_trips_cold_backpressure_kind() {
             ..
         }) if decoded_stream_id == stream_id
     ));
+}
+
+#[test]
+fn raft_wire_encoding_is_byte_stable_across_round_trips() {
+    // The raft RPC envelope and the on-disk log records carry openraft's own
+    // serde types as MessagePack. DST determinism requires the encoding of a
+    // value to be byte-stable, so re-encode a decoded copy and compare bytes.
+    let membership = openraft::Membership::new(
+        vec![BTreeSet::from([1u64, 2, 3])],
+        BTreeMap::from([
+            (1u64, BasicNode {
+                addr: "node-1:4437".to_owned(),
+            }),
+            (2u64, BasicNode {
+                addr: "node-2:4437".to_owned(),
+            }),
+            (3u64, BasicNode {
+                addr: "node-3:4437".to_owned(),
+            }),
+        ]),
+    )
+    .expect("valid membership");
+    let request = UrsulaAppendEntriesRequest {
+        vote: openraft::Vote::new_committed(7, 1),
+        prev_log_id: Some(log_id(3)),
+        entries: vec![
+            Entry::new(log_id(4), EntryPayload::Blank),
+            normal_entry(5, create_stream_command("wire-stable")),
+            Entry::new(log_id(6), EntryPayload::Membership(membership)),
+        ],
+        leader_commit: Some(log_id(4)),
+    };
+
+    let encoded = encode_wire(&request);
+    let decoded: UrsulaAppendEntriesRequest =
+        decode_wire(&encoded, "append request").expect("decode append request");
+    assert_eq!(encode_wire(&decoded), encoded);
+
+    let record = RaftGroupLogRecord::Append(decoded.entries.clone());
+    let encoded_record = encode_wire(&record);
+    let decoded_record: RaftGroupLogRecord =
+        decode_wire(&encoded_record, "raft group log record").expect("decode log record");
+    assert_eq!(encode_wire(&decoded_record), encoded_record);
 }
 
 #[test]
@@ -412,10 +454,10 @@ fn temp_log_path(name: &str) -> PathBuf {
         .join(format!("{name}-{}-{nonce}.bin", std::process::id()))
 }
 
-fn protobuf_frame_count<M: Message + Default>(path: &Path) -> usize {
+fn wire_frame_count<T: serde::Serialize + serde::de::DeserializeOwned>(path: &Path) -> usize {
     let bytes = fs::read(path).expect("read log file");
-    read_protobuf_frames::<M>(&bytes)
-        .expect("decode protobuf frames")
+    read_wire_frames::<T>(&bytes)
+        .expect("decode wire frames")
         .len()
 }
 
@@ -676,7 +718,7 @@ async fn raft_file_log_store_recovers_vote_committed_and_entries() {
             .await
             .expect("save committed");
     }
-    assert_eq!(protobuf_frame_count::<RaftGroupLogRecord>(&path), 3);
+    assert_eq!(wire_frame_count::<RaftGroupLogRecord>(&path), 3);
 
     let mut reopened = RaftGroupFileLogStore::shared(&path).expect("reopen file log store");
     let state = reopened.get_log_state().await.expect("log state");
@@ -717,7 +759,7 @@ async fn raft_file_log_store_skips_duplicate_vote_and_committed_records() {
             .await
             .expect("save duplicate committed");
     }
-    assert_eq!(protobuf_frame_count::<RaftGroupLogRecord>(&path), 2);
+    assert_eq!(wire_frame_count::<RaftGroupLogRecord>(&path), 2);
 
     let mut reopened = RaftGroupFileLogStore::shared(&path).expect("reopen file log store");
     assert_eq!(reopened.read_vote().await.expect("vote"), Some(vote));
@@ -762,7 +804,7 @@ async fn raft_file_log_store_recovers_truncate_and_purge() {
             .expect("append after truncate");
         store.purge(log_id(2)).await.expect("purge file log");
     }
-    assert_eq!(protobuf_frame_count::<RaftGroupLogRecord>(&path), 4);
+    assert_eq!(wire_frame_count::<RaftGroupLogRecord>(&path), 4);
 
     let mut reopened = RaftGroupFileLogStore::shared(&path).expect("reopen file log store");
     let state = reopened.get_log_state().await.expect("log state");
