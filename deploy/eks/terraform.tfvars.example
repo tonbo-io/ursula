@@ -1,8 +1,9 @@
 name       = "ursula-production"
 aws_region = "us-east-1"
+image_tag  = "replace-with-release-or-build-tag"
 
 # Restrict this to the operator or CI network in production.
-cluster_endpoint_public_access_cidrs = ["203.0.113.10/32"]
+cluster_endpoint_public_access_cidrs = ["replace-with-operator-cidr"]
 
 # Optional: the default creates one NAT gateway per AZ. Set true only when the
 # lower cost is worth making private-node internet egress depend on one AZ.
@@ -10,6 +11,16 @@ single_nat_gateway = false
 
 # Optional globally unique name. Empty generates name-account-region.
 s3_bucket_name = ""
+
+# Production capacity baseline. Override these after workload sizing.
+server_core_count     = 4
+server_cpu_request    = "2"
+server_memory_request = "4Gi"
+server_memory_limit   = "8Gi"
+raft_group_count      = 256
+raft_volume_size      = "100Gi"
+gateway_replicas      = 3
+indexer_replicas      = 2
 
 tags = {
   Environment = "production"

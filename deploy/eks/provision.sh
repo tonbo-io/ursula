@@ -7,7 +7,14 @@ cd "$script_dir"
 command -v tofu >/dev/null 2>&1 || { echo "OpenTofu is required: https://opentofu.org/docs/intro/install/" >&2; exit 1; }
 command -v aws >/dev/null 2>&1 || { echo "AWS CLI v2 is required" >&2; exit 1; }
 
-tofu init
+test -f backend.hcl || { echo "Copy backend.hcl.example to backend.hcl and configure the production state bucket" >&2; exit 1; }
+test -f terraform.tfvars || { echo "Copy terraform.tfvars.example to terraform.tfvars and set the required deployment inputs" >&2; exit 1; }
+if grep -q "replace-with" backend.hcl terraform.tfvars; then
+  echo "backend.hcl or terraform.tfvars still contains a replace-with placeholder" >&2
+  exit 1
+fi
+
+tofu init -reconfigure -backend-config=backend.hcl
 tofu apply "$@"
 
 cluster_name="$(tofu output -raw cluster_name)"

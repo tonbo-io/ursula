@@ -47,13 +47,24 @@ variable "kubernetes_version" {
 variable "cluster_endpoint_public_access_cidrs" {
   description = "CIDRs allowed to reach the public EKS API endpoint. Restrict this to operator networks in production."
   type        = list(string)
-  default     = ["0.0.0.0/0"]
+
+  validation {
+    condition = length(var.cluster_endpoint_public_access_cidrs) > 0 && alltrue([
+      for cidr in var.cluster_endpoint_public_access_cidrs : can(cidrhost(cidr, 0)) && !contains(["0.0.0.0/0", "::/0"], cidr)
+    ])
+    error_message = "cluster_endpoint_public_access_cidrs must contain valid restricted CIDRs; world-open CIDRs are not allowed."
+  }
 }
 
 variable "node_instance_types" {
   description = "Allowed instance types for each zonal managed node group."
   type        = list(string)
   default     = ["m6i.xlarge"]
+
+  validation {
+    condition     = length(var.node_instance_types) > 0
+    error_message = "node_instance_types must contain at least one instance type."
+  }
 }
 
 variable "nodes_per_az" {
@@ -109,9 +120,81 @@ variable "image_repository" {
 }
 
 variable "image_tag" {
-  description = "Container image tag used by the generated Helm values."
+  description = "Explicit immutable release or build tag used by the generated Helm values."
   type        = string
-  default     = "0.2.0"
+
+  validation {
+    condition     = trimspace(var.image_tag) != "" && var.image_tag != "latest"
+    error_message = "image_tag must be an explicit non-empty tag and must not be latest."
+  }
+}
+
+variable "server_core_count" {
+  description = "Ursula runtime cores per voter."
+  type        = number
+  default     = 4
+
+  validation {
+    condition     = var.server_core_count >= 1
+    error_message = "server_core_count must be at least 1."
+  }
+}
+
+variable "server_cpu_request" {
+  description = "CPU request for each Ursula voter."
+  type        = string
+  default     = "2"
+}
+
+variable "server_memory_request" {
+  description = "Memory request for each Ursula voter."
+  type        = string
+  default     = "4Gi"
+}
+
+variable "server_memory_limit" {
+  description = "Memory limit for each Ursula voter."
+  type        = string
+  default     = "8Gi"
+}
+
+variable "raft_group_count" {
+  description = "Number of independent Raft groups."
+  type        = number
+  default     = 256
+
+  validation {
+    condition     = var.raft_group_count >= 1
+    error_message = "raft_group_count must be at least 1."
+  }
+}
+
+variable "raft_volume_size" {
+  description = "gp3 PVC size for each voter Raft log."
+  type        = string
+  default     = "100Gi"
+}
+
+variable "gateway_replicas" {
+  description = "Number of stateless gateway replicas."
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = var.gateway_replicas >= 2
+    error_message = "gateway_replicas must be at least 2 for the production topology."
+  }
+}
+
+variable "indexer_replicas" {
+  description = "Number of dynamic event-time indexer workers."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.indexer_replicas >= 2
+    error_message = "indexer_replicas must be at least 2 for the production topology."
+  }
 }
 
 variable "tags" {
