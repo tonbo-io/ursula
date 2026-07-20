@@ -16,15 +16,15 @@ resource "local_file" "helm_values" {
     }
     server = {
       replicaCount = 3
-      coreCount    = 4
+      coreCount    = var.server_core_count
       resources = {
         requests = {
-          cpu                 = "2"
-          memory              = "4Gi"
+          cpu                 = var.server_cpu_request
+          memory              = var.server_memory_request
           "ephemeral-storage" = "2Gi"
         }
         limits = {
-          memory              = "8Gi"
+          memory              = var.server_memory_limit
           "ephemeral-storage" = "4Gi"
         }
       }
@@ -43,14 +43,14 @@ resource "local_file" "helm_values" {
       }
     }
     raft = {
-      groupCount             = 256
+      groupCount             = var.raft_group_count
       initMembershipPerGroup = true
       storageMode            = "logDir"
     }
     persistence = {
       enabled          = true
       storageClassName = kubernetes_storage_class_v1.gp3.metadata[0].name
-      size             = "100Gi"
+      size             = var.raft_volume_size
     }
     s3 = {
       bucket = aws_s3_bucket.ursula.id
@@ -64,14 +64,14 @@ resource "local_file" "helm_values" {
       backend = "s3"
     }
     gateway = {
-      replicaCount = 3
+      replicaCount = var.gateway_replicas
       podDisruptionBudget = {
         enabled = true
       }
     }
     indexer = {
       enabled      = true
-      replicaCount = 2
+      replicaCount = var.indexer_replicas
       s3 = {
         prefix = local.index_prefix
       }

@@ -17,7 +17,7 @@ future Ursula operator workflow.
 
 The repository includes an OpenTofu reference stack under `deploy/eks`. It provisions a three-AZ VPC and EKS cluster, one managed node group per zone, the EBS CSI and Pod Identity add-ons, an encrypted `gp3` StorageClass, a versioned S3 bucket, and separate least-privilege identities for Ursula and the event-time indexer. It writes the complete Helm input to `generated-values.yaml` and configures kubectl.
 
-After copying and editing `deploy/eks/terraform.tfvars.example`, the complete deployment path is:
+Create a versioned, encrypted S3 bucket for OpenTofu state, then copy `backend.hcl.example` to the ignored `backend.hcl` and assign a unique state key. Copy `terraform.tfvars.example` to the ignored `terraform.tfvars`, select an explicit image tag, and restrict the EKS public API to operator or CI CIDRs; the stack rejects `0.0.0.0/0` and `::/0`. After that one-time configuration, the complete deployment path is:
 
 ```bash
 cd deploy/eks

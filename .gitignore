@@ -27,6 +27,8 @@ docs/web/target/
 **/*.tfstate.*
 deploy/eks/generated-values.yaml
 deploy/eks/kubeconfig
+deploy/eks/backend.hcl
+deploy/eks/terraform.tfvars
 
 # Internal migration / architecture / operations notes
 docs/migration/

@@ -1,0 +1,5 @@
+bucket       = "replace-with-opentofu-state-bucket"
+key          = "ursula-production/eks.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true
