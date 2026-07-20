@@ -3,6 +3,8 @@
 //! the right `run_*_inner` scenario function and wraps the outcome into a
 //! `SimReport`.
 
+use std::future::Future;
+
 use super::HttpProtocolSurfacePlan;
 use super::RuntimeInterleavingPlan;
 use super::RuntimeRaftNetworkOptions;
@@ -61,6 +63,18 @@ use super::run_snapshot_catch_up_inner;
 use super::run_with_madsim;
 use super::runtime_interleaving_plan_from_fault_plan;
 use super::runtime_raft_network_workload_plan_from_fault_plan;
+
+/// Runs one scenario workload under a fresh madsim runtime for `seed` and
+/// wraps the outcome into a `SimReport`.
+fn report_of<Fut>(scenario: SimScenario, seed: u64, workload: Fut) -> SimReport
+where Fut: Future<Output = ThreeNodeRaftSimOutcome> {
+    run_with_madsim(seed, async move {
+        SimReport {
+            scenario,
+            outcome: workload.await,
+        }
+    })
+}
 
 impl ThreeNodeRaftSim {
     pub fn run_schedule(schedule: SimSchedule) -> SimReport {
@@ -235,10 +249,6 @@ impl ThreeNodeRaftSim {
         }
     }
 
-    pub fn run_partition_heal(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
-        Self::run_partition_heal_report(config).outcome
-    }
-
     pub fn run_partition_heal_report(config: ThreeNodeRaftSimConfig) -> SimReport {
         Self::run_partition_heal_with_options_report(config, true, true)
     }
@@ -248,69 +258,43 @@ impl ThreeNodeRaftSim {
         partition_before_append: bool,
         heal_after_lag: bool,
     ) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::PartitionHeal,
-                outcome: run_partition_heal_inner(config, partition_before_append, heal_after_lag)
-                    .await,
-            }
-        })
-    }
-
-    pub fn run_leader_failover(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
-        Self::run_leader_failover_report(config).outcome
+        report_of(
+            SimScenario::PartitionHeal,
+            config.seed,
+            run_partition_heal_inner(config, partition_before_append, heal_after_lag),
+        )
     }
 
     pub fn run_leader_failover_report(config: ThreeNodeRaftSimConfig) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::LeaderFailover,
-                outcome: run_leader_failover_inner(config).await,
-            }
-        })
-    }
-
-    pub fn run_no_fault(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
-        Self::run_no_fault_report(config).outcome
+        report_of(
+            SimScenario::LeaderFailover,
+            config.seed,
+            run_leader_failover_inner(config),
+        )
     }
 
     pub fn run_no_fault_report(config: ThreeNodeRaftSimConfig) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::NoFaultBaseline,
-                outcome: run_no_fault_inner(config).await,
-            }
-        })
-    }
-
-    pub fn run_snapshot_catch_up(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
-        Self::run_snapshot_catch_up_report(config).outcome
+        report_of(
+            SimScenario::NoFaultBaseline,
+            config.seed,
+            run_no_fault_inner(config),
+        )
     }
 
     pub fn run_snapshot_catch_up_report(config: ThreeNodeRaftSimConfig) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::SnapshotCatchUp,
-                outcome: run_snapshot_catch_up_inner(config).await,
-            }
-        })
-    }
-
-    pub fn run_restart_follower(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
-        Self::run_restart_follower_report(config).outcome
+        report_of(
+            SimScenario::SnapshotCatchUp,
+            config.seed,
+            run_snapshot_catch_up_inner(config),
+        )
     }
 
     pub fn run_restart_follower_report(config: ThreeNodeRaftSimConfig) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::RestartFollower,
-                outcome: run_restart_follower_inner(config).await,
-            }
-        })
-    }
-
-    pub fn run_cold_live_read(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
-        Self::run_cold_live_read_report(config).outcome
+        report_of(
+            SimScenario::RestartFollower,
+            config.seed,
+            run_restart_follower_inner(config),
+        )
     }
 
     pub fn run_cold_live_read_report(config: ThreeNodeRaftSimConfig) -> SimReport {
@@ -321,16 +305,11 @@ impl ThreeNodeRaftSim {
         config: ThreeNodeRaftSimConfig,
         corrupt_expected_node_id: Option<u64>,
     ) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::ColdLiveRead,
-                outcome: run_cold_live_read_inner(config, corrupt_expected_node_id).await,
-            }
-        })
-    }
-
-    pub fn run_cold_read_fault(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
-        Self::run_cold_read_fault_report(config).outcome
+        report_of(
+            SimScenario::ColdLiveRead,
+            config.seed,
+            run_cold_live_read_inner(config, corrupt_expected_node_id),
+        )
     }
 
     pub fn run_cold_read_fault_report(config: ThreeNodeRaftSimConfig) -> SimReport {
@@ -341,16 +320,11 @@ impl ThreeNodeRaftSim {
         config: ThreeNodeRaftSimConfig,
         inject_read_fault: bool,
     ) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::ColdReadFault,
-                outcome: run_cold_read_fault_inner(config, inject_read_fault).await,
-            }
-        })
-    }
-
-    pub fn run_cold_write_fault(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
-        Self::run_cold_write_fault_report(config).outcome
+        report_of(
+            SimScenario::ColdReadFault,
+            config.seed,
+            run_cold_read_fault_inner(config, inject_read_fault),
+        )
     }
 
     pub fn run_cold_write_fault_report(config: ThreeNodeRaftSimConfig) -> SimReport {
@@ -361,16 +335,11 @@ impl ThreeNodeRaftSim {
         config: ThreeNodeRaftSimConfig,
         inject_write_fault: bool,
     ) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::ColdWriteFault,
-                outcome: run_cold_write_fault_inner(config, inject_write_fault).await,
-            }
-        })
-    }
-
-    pub fn run_cold_write_delay(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
-        Self::run_cold_write_delay_report(config).outcome
+        report_of(
+            SimScenario::ColdWriteFault,
+            config.seed,
+            run_cold_write_fault_inner(config, inject_write_fault),
+        )
     }
 
     pub fn run_cold_write_delay_report(config: ThreeNodeRaftSimConfig) -> SimReport {
@@ -381,16 +350,11 @@ impl ThreeNodeRaftSim {
         config: ThreeNodeRaftSimConfig,
         delay_ms: Option<u64>,
     ) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::ColdWriteDelay,
-                outcome: run_cold_write_delay_inner(config, delay_ms).await,
-            }
-        })
-    }
-
-    pub fn run_cold_delete_fault(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
-        Self::run_cold_delete_fault_report(config).outcome
+        report_of(
+            SimScenario::ColdWriteDelay,
+            config.seed,
+            run_cold_write_delay_inner(config, delay_ms),
+        )
     }
 
     pub fn run_cold_delete_fault_report(config: ThreeNodeRaftSimConfig) -> SimReport {
@@ -401,16 +365,11 @@ impl ThreeNodeRaftSim {
         config: ThreeNodeRaftSimConfig,
         inject_delete_fault: bool,
     ) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::ColdDeleteFault,
-                outcome: run_cold_delete_fault_inner(config, inject_delete_fault).await,
-            }
-        })
-    }
-
-    pub fn run_cold_read_delay(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
-        Self::run_cold_read_delay_report(config).outcome
+        report_of(
+            SimScenario::ColdDeleteFault,
+            config.seed,
+            run_cold_delete_fault_inner(config, inject_delete_fault),
+        )
     }
 
     pub fn run_cold_read_delay_report(config: ThreeNodeRaftSimConfig) -> SimReport {
@@ -421,16 +380,11 @@ impl ThreeNodeRaftSim {
         config: ThreeNodeRaftSimConfig,
         delay_ms: Option<u64>,
     ) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::ColdReadDelay,
-                outcome: run_cold_read_delay_inner(config, delay_ms).await,
-            }
-        })
-    }
-
-    pub fn run_cold_read_truncate(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
-        Self::run_cold_read_truncate_report(config).outcome
+        report_of(
+            SimScenario::ColdReadDelay,
+            config.seed,
+            run_cold_read_delay_inner(config, delay_ms),
+        )
     }
 
     pub fn run_cold_read_truncate_report(config: ThreeNodeRaftSimConfig) -> SimReport {
@@ -441,16 +395,11 @@ impl ThreeNodeRaftSim {
         config: ThreeNodeRaftSimConfig,
         truncate_returned_len: Option<usize>,
     ) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::ColdReadTruncate,
-                outcome: run_cold_read_truncate_inner(config, truncate_returned_len).await,
-            }
-        })
-    }
-
-    pub fn run_http_protocol_surface(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
-        Self::run_http_protocol_surface_report(config).outcome
+        report_of(
+            SimScenario::ColdReadTruncate,
+            config.seed,
+            run_cold_read_truncate_inner(config, truncate_returned_len),
+        )
     }
 
     pub fn run_http_protocol_surface_report(config: ThreeNodeRaftSimConfig) -> SimReport {
@@ -461,19 +410,11 @@ impl ThreeNodeRaftSim {
         config: ThreeNodeRaftSimConfig,
         corrupt_snapshot_body_expectation: bool,
     ) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::HttpProtocolSurface,
-                outcome: run_http_protocol_surface_inner(config, corrupt_snapshot_body_expectation)
-                    .await,
-            }
-        })
-    }
-
-    pub fn run_http_protocol_surface_randomized(
-        config: ThreeNodeRaftSimConfig,
-    ) -> ThreeNodeRaftSimOutcome {
-        Self::run_http_protocol_surface_randomized_report(config).outcome
+        report_of(
+            SimScenario::HttpProtocolSurface,
+            config.seed,
+            run_http_protocol_surface_inner(config, corrupt_snapshot_body_expectation),
+        )
     }
 
     pub fn run_http_protocol_surface_randomized_report(
@@ -487,18 +428,11 @@ impl ThreeNodeRaftSim {
         config: ThreeNodeRaftSimConfig,
         plan: HttpProtocolSurfacePlan,
     ) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::HttpProtocolSurfaceRandomized,
-                outcome: run_http_protocol_surface_randomized_inner(config, plan).await,
-            }
-        })
-    }
-
-    pub fn run_http_live_protocol_surface(
-        config: ThreeNodeRaftSimConfig,
-    ) -> ThreeNodeRaftSimOutcome {
-        Self::run_http_live_protocol_surface_report(config).outcome
+        report_of(
+            SimScenario::HttpProtocolSurfaceRandomized,
+            config.seed,
+            run_http_protocol_surface_randomized_inner(config, plan),
+        )
     }
 
     pub fn run_http_live_protocol_surface_report(config: ThreeNodeRaftSimConfig) -> SimReport {
@@ -509,22 +443,11 @@ impl ThreeNodeRaftSim {
         config: ThreeNodeRaftSimConfig,
         corrupt_sse_next_offset_expectation: bool,
     ) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::HttpLiveProtocolSurface,
-                outcome: run_http_live_protocol_surface_inner(
-                    config,
-                    corrupt_sse_next_offset_expectation,
-                )
-                .await,
-            }
-        })
-    }
-
-    pub fn run_http_live_limit_protocol_surface(
-        config: ThreeNodeRaftSimConfig,
-    ) -> ThreeNodeRaftSimOutcome {
-        Self::run_http_live_limit_protocol_surface_report(config).outcome
+        report_of(
+            SimScenario::HttpLiveProtocolSurface,
+            config.seed,
+            run_http_live_protocol_surface_inner(config, corrupt_sse_next_offset_expectation),
+        )
     }
 
     pub fn run_http_live_limit_protocol_surface_report(
@@ -537,22 +460,11 @@ impl ThreeNodeRaftSim {
         config: ThreeNodeRaftSimConfig,
         corrupt_backpressure_expectation: bool,
     ) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::HttpLiveLimitProtocolSurface,
-                outcome: run_http_live_limit_protocol_surface_inner(
-                    config,
-                    corrupt_backpressure_expectation,
-                )
-                .await,
-            }
-        })
-    }
-
-    pub fn run_http_producer_protocol_surface(
-        config: ThreeNodeRaftSimConfig,
-    ) -> ThreeNodeRaftSimOutcome {
-        Self::run_http_producer_protocol_surface_report(config).outcome
+        report_of(
+            SimScenario::HttpLiveLimitProtocolSurface,
+            config.seed,
+            run_http_live_limit_protocol_surface_inner(config, corrupt_backpressure_expectation),
+        )
     }
 
     pub fn run_http_producer_protocol_surface_report(config: ThreeNodeRaftSimConfig) -> SimReport {
@@ -563,65 +475,35 @@ impl ThreeNodeRaftSim {
         config: ThreeNodeRaftSimConfig,
         corrupt_duplicate_expectation: bool,
     ) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::HttpProducerProtocolSurface,
-                outcome: run_http_producer_protocol_surface_inner(
-                    config,
-                    corrupt_duplicate_expectation,
-                )
-                .await,
-            }
-        })
-    }
-
-    pub fn run_runtime_actor_scheduling(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
-        Self::run_runtime_actor_scheduling_report(config).outcome
+        report_of(
+            SimScenario::HttpProducerProtocolSurface,
+            config.seed,
+            run_http_producer_protocol_surface_inner(config, corrupt_duplicate_expectation),
+        )
     }
 
     pub fn run_runtime_actor_scheduling_report(config: ThreeNodeRaftSimConfig) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::RuntimeActorScheduling,
-                outcome: run_runtime_actor_scheduling_inner(config).await,
-            }
-        })
-    }
-
-    pub fn run_runtime_multi_client_actors(
-        config: ThreeNodeRaftSimConfig,
-    ) -> ThreeNodeRaftSimOutcome {
-        Self::run_runtime_multi_client_actors_report(config).outcome
+        report_of(
+            SimScenario::RuntimeActorScheduling,
+            config.seed,
+            run_runtime_actor_scheduling_inner(config),
+        )
     }
 
     pub fn run_runtime_multi_client_actors_report(config: ThreeNodeRaftSimConfig) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::RuntimeMultiClientActors,
-                outcome: run_runtime_multi_client_actors_inner(config).await,
-            }
-        })
-    }
-
-    pub fn run_runtime_cold_flush_worker(
-        config: ThreeNodeRaftSimConfig,
-    ) -> ThreeNodeRaftSimOutcome {
-        Self::run_runtime_cold_flush_worker_report(config).outcome
+        report_of(
+            SimScenario::RuntimeMultiClientActors,
+            config.seed,
+            run_runtime_multi_client_actors_inner(config),
+        )
     }
 
     pub fn run_runtime_cold_flush_worker_report(config: ThreeNodeRaftSimConfig) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::RuntimeColdFlushWorker,
-                outcome: run_runtime_cold_flush_worker_inner(config).await,
-            }
-        })
-    }
-
-    pub fn run_runtime_seeded_interleaving(
-        config: ThreeNodeRaftSimConfig,
-    ) -> ThreeNodeRaftSimOutcome {
-        Self::run_runtime_seeded_interleaving_report(config).outcome
+        report_of(
+            SimScenario::RuntimeColdFlushWorker,
+            config.seed,
+            run_runtime_cold_flush_worker_inner(config),
+        )
     }
 
     pub fn run_runtime_seeded_interleaving_report(config: ThreeNodeRaftSimConfig) -> SimReport {
@@ -635,31 +517,19 @@ impl ThreeNodeRaftSim {
         config: ThreeNodeRaftSimConfig,
         plan: RuntimeInterleavingPlan,
     ) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::RuntimeSeededInterleaving,
-                outcome: run_runtime_seeded_interleaving_inner(config, plan).await,
-            }
-        })
-    }
-
-    pub fn run_runtime_raft_engine(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
-        Self::run_runtime_raft_engine_report(config).outcome
+        report_of(
+            SimScenario::RuntimeSeededInterleaving,
+            config.seed,
+            run_runtime_seeded_interleaving_inner(config, plan),
+        )
     }
 
     pub fn run_runtime_raft_engine_report(config: ThreeNodeRaftSimConfig) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::RuntimeRaftEngine,
-                outcome: run_runtime_raft_engine_inner(config).await,
-            }
-        })
-    }
-
-    pub fn run_runtime_raft_snapshot_install(
-        config: ThreeNodeRaftSimConfig,
-    ) -> ThreeNodeRaftSimOutcome {
-        Self::run_runtime_raft_snapshot_install_report(config).outcome
+        report_of(
+            SimScenario::RuntimeRaftEngine,
+            config.seed,
+            run_runtime_raft_engine_inner(config),
+        )
     }
 
     pub fn run_runtime_raft_snapshot_install_report(config: ThreeNodeRaftSimConfig) -> SimReport {
@@ -670,17 +540,11 @@ impl ThreeNodeRaftSim {
         config: ThreeNodeRaftSimConfig,
         corrupt_append_counts: bool,
     ) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::RuntimeRaftSnapshotInstall,
-                outcome: run_runtime_raft_snapshot_install_inner(config, corrupt_append_counts)
-                    .await,
-            }
-        })
-    }
-
-    pub fn run_runtime_raft_network(config: ThreeNodeRaftSimConfig) -> ThreeNodeRaftSimOutcome {
-        Self::run_runtime_raft_network_report(config).outcome
+        report_of(
+            SimScenario::RuntimeRaftSnapshotInstall,
+            config.seed,
+            run_runtime_raft_snapshot_install_inner(config, corrupt_append_counts),
+        )
     }
 
     pub fn run_runtime_raft_network_report(config: ThreeNodeRaftSimConfig) -> SimReport {
@@ -694,11 +558,10 @@ impl ThreeNodeRaftSim {
         config: ThreeNodeRaftSimConfig,
         options: RuntimeRaftNetworkOptions,
     ) -> SimReport {
-        run_with_madsim(config.seed, async move {
-            SimReport {
-                scenario: SimScenario::RuntimeRaftNetwork,
-                outcome: run_runtime_raft_network_inner(config, options).await,
-            }
-        })
+        report_of(
+            SimScenario::RuntimeRaftNetwork,
+            config.seed,
+            run_runtime_raft_network_inner(config, options),
+        )
     }
 }

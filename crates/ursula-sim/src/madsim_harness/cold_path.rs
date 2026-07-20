@@ -1,8 +1,13 @@
 //! Cold-path scenarios extracted from `madsim_harness/mod.rs`
 //! (DoD #3 modularity refactor — workloads axis, cold-store-faceted scenarios).
 
+use ursula_runtime::AppendResponse;
+use ursula_runtime::ColdFlushCandidate;
+use ursula_runtime::FlushColdResponse;
+
 use super::AppendRequest;
 use super::Arc;
+use super::ColdStore;
 use super::ColdStoreFaultEffect;
 use super::ColdStoreOperation;
 use super::CreateStreamRequest;
@@ -11,9 +16,11 @@ use super::Duration;
 use super::FlushColdRequest;
 use super::GroupEngine;
 use super::InMemoryGroupEngineFactory;
+use super::InProcessRaftRegistry;
 use super::Mutex;
 use super::PlanColdFlushRequest;
 use super::PlanGroupColdFlushRequest;
+use super::RaftGroupEngine;
 use super::ReadStreamRequest;
 use super::RuntimeConfig;
 use super::RuntimeThreading;
@@ -32,14 +39,37 @@ use super::sim_network_policy;
 use super::verify_all_nodes_can_read_payload;
 use super::wait_all_nodes_applied;
 
-pub(super) async fn run_cold_live_read_inner(
-    config: ThreeNodeRaftSimConfig,
-    corrupt_expected_node_id: Option<u64>,
-) -> ThreeNodeRaftSimOutcome {
+/// Everything the three-node cold-path scenarios share after bring-up: the
+/// fault-injectable cold store, the live cluster handles, and the first
+/// planned cold-flush candidate (`b"abcd"` out of the appended `b"abcdef"`).
+struct ColdPathSetup {
+    trace: SimTrace,
+    cold_store: Arc<ColdStore>,
+    /// Held so the in-process Raft network outlives the scenario body.
+    _registry: InProcessRaftRegistry,
+    engines: Vec<RaftGroupEngine>,
+    leader_id: u64,
+    leader_index: usize,
+    appended: AppendResponse,
+    candidate: ColdFlushCandidate,
+}
+
+/// Shared cold-path prologue: build the three-node cluster with a
+/// fault-injectable cold store, create the stream, append `b"abcdef"`, and
+/// plan the first cold-flush candidate.
+///
+/// `trace_append_commit` additionally records the `AppendCommitted` event
+/// right after the append (the cold-write-fault scenario asserts on it).
+async fn cold_path_setup(
+    config: &ThreeNodeRaftSimConfig,
+    append_expect: &'static str,
+    plan_expect: &'static str,
+    trace_append_commit: bool,
+) -> ColdPathSetup {
     let mut trace = SimTrace::default();
     let cold_store = Arc::new(sim_cold_store());
     let policy = sim_network_policy();
-    let (_registry, mut engines, leader_id) =
+    let (registry, mut engines, leader_id) =
         build_three_node_cluster_with_cold_store(policy, Some(cold_store.clone())).await;
     trace.push(SimEvent::ClusterBuilt { seed: config.seed });
     trace.push(SimEvent::LeaderElected { leader_id });
@@ -57,13 +87,19 @@ pub(super) async fn run_cold_live_read_inner(
         stream: config.stream.clone(),
     });
 
-    engines[leader_index]
+    let appended = engines[leader_index]
         .append(
             AppendRequest::from_bytes(config.stream.clone(), b"abcdef".to_vec()),
             placement(),
         )
         .await
-        .expect("append cold/live payload");
+        .expect(append_expect);
+    if trace_append_commit {
+        trace.push(SimEvent::AppendCommitted {
+            stream: config.stream.clone(),
+            log_index: appended.group_commit_index,
+        });
+    }
 
     let candidate = engines[leader_index]
         .plan_cold_flush(
@@ -75,31 +111,55 @@ pub(super) async fn run_cold_live_read_inner(
             placement(),
         )
         .await
-        .expect("plan cold flush")
+        .expect(plan_expect)
         .expect("cold flush candidate");
     assert_eq!(candidate.payload, b"abcd");
 
+    ColdPathSetup {
+        trace,
+        cold_store,
+        _registry: registry,
+        engines,
+        leader_id,
+        leader_index,
+        appended,
+        candidate,
+    }
+}
+
+/// Shared cold-path publish step: upload the planned chunk (path tagged with
+/// `chunk_tag`), publish the cold flush through Raft, and wait until every
+/// node applied it.
+async fn cold_path_publish(
+    setup: &mut ColdPathSetup,
+    config: &ThreeNodeRaftSimConfig,
+    chunk_tag: &str,
+    write_expect: &'static str,
+    flush_expect: &'static str,
+    applied_description: &'static str,
+) -> FlushColdResponse {
     let chunk_path = format!(
-        "{}/{}/chunks/seed-{}-000000.bin",
-        config.stream.bucket_id, config.stream.stream_id, config.seed
+        "{}/{}/chunks/seed-{}-{}000000.bin",
+        config.stream.bucket_id, config.stream.stream_id, config.seed, chunk_tag
     );
-    let object_size = cold_store
-        .write_chunk(&chunk_path, &candidate.payload)
+    let object_size = setup
+        .cold_store
+        .write_chunk(&chunk_path, &setup.candidate.payload)
         .await
-        .expect("write cold chunk");
-    trace.push(SimEvent::ColdChunkWritten {
+        .expect(write_expect);
+    setup.trace.push(SimEvent::ColdChunkWritten {
         stream: config.stream.clone(),
-        start_offset: candidate.start_offset,
-        end_offset: candidate.end_offset,
+        start_offset: setup.candidate.start_offset,
+        end_offset: setup.candidate.end_offset,
     });
 
-    let flushed = engines[leader_index]
+    let flushed = setup.engines[setup.leader_index]
         .flush_cold(
             FlushColdRequest {
                 stream_id: config.stream.clone(),
                 chunk: ursula_runtime::ColdChunkRef {
-                    start_offset: candidate.start_offset,
-                    end_offset: candidate.end_offset,
+                    start_offset: setup.candidate.start_offset,
+                    end_offset: setup.candidate.end_offset,
                     s3_path: chunk_path,
                     object_size,
                 },
@@ -107,21 +167,44 @@ pub(super) async fn run_cold_live_read_inner(
             placement(),
         )
         .await
-        .expect("publish cold flush");
-    trace.push(SimEvent::ColdFlushed {
+        .expect(flush_expect);
+    setup.trace.push(SimEvent::ColdFlushed {
         stream: config.stream.clone(),
         hot_start_offset: flushed.hot_start_offset,
         log_index: flushed.group_commit_index,
     });
 
     wait_all_nodes_applied(
-        &engines,
+        &setup.engines,
         flushed.group_commit_index,
+        applied_description,
+    )
+    .await;
+    flushed
+}
+
+pub(super) async fn run_cold_live_read_inner(
+    config: ThreeNodeRaftSimConfig,
+    corrupt_expected_node_id: Option<u64>,
+) -> ThreeNodeRaftSimOutcome {
+    let mut setup = cold_path_setup(
+        &config,
+        "append cold/live payload",
+        "plan cold flush",
+        false,
+    )
+    .await;
+    let flushed = cold_path_publish(
+        &mut setup,
+        &config,
+        "",
+        "write cold chunk",
+        "publish cold flush",
         "cold flush applied on all nodes",
     )
     .await;
 
-    for (index, engine) in engines.iter_mut().enumerate() {
+    for (index, engine) in setup.engines.iter_mut().enumerate() {
         let node_id = u64::try_from(index + 1).expect("node index fits u64");
         let mut expected_all = b"abcdef".to_vec();
         if corrupt_expected_node_id == Some(node_id) {
@@ -157,7 +240,7 @@ pub(super) async fn run_cold_live_read_inner(
             "read hot suffix payload",
         )
         .await;
-        trace.push(SimEvent::ColdLiveReadVerified {
+        setup.trace.push(SimEvent::ColdLiveReadVerified {
             node_id,
             stream: config.stream.clone(),
         });
@@ -165,10 +248,10 @@ pub(super) async fn run_cold_live_read_inner(
 
     ThreeNodeRaftSimOutcome {
         seed: config.seed,
-        leader_id,
+        leader_id: setup.leader_id,
         target_node_id: None,
         appended_log_index: flushed.group_commit_index,
-        trace,
+        trace: setup.trace,
     }
 }
 
@@ -176,87 +259,19 @@ pub(super) async fn run_cold_read_fault_inner(
     config: ThreeNodeRaftSimConfig,
     inject_read_fault: bool,
 ) -> ThreeNodeRaftSimOutcome {
-    let mut trace = SimTrace::default();
-    let cold_store = Arc::new(sim_cold_store());
-    let policy = sim_network_policy();
-    let (_registry, mut engines, leader_id) =
-        build_three_node_cluster_with_cold_store(policy, Some(cold_store.clone())).await;
-    trace.push(SimEvent::ClusterBuilt { seed: config.seed });
-    trace.push(SimEvent::LeaderElected { leader_id });
-
-    let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
-
-    engines[leader_index]
-        .create_stream(
-            CreateStreamRequest::new(config.stream.clone(), "application/octet-stream"),
-            placement(),
-        )
-        .await
-        .expect("create stream through simulated leader");
-    trace.push(SimEvent::StreamCreated {
-        stream: config.stream.clone(),
-    });
-
-    engines[leader_index]
-        .append(
-            AppendRequest::from_bytes(config.stream.clone(), b"abcdef".to_vec()),
-            placement(),
-        )
-        .await
-        .expect("append cold/live payload before cold-read fault");
-
-    let candidate = engines[leader_index]
-        .plan_cold_flush(
-            PlanColdFlushRequest {
-                stream_id: config.stream.clone(),
-                min_hot_bytes: 4,
-                max_flush_bytes: 4,
-            },
-            placement(),
-        )
-        .await
-        .expect("plan cold flush")
-        .expect("cold flush candidate");
-    assert_eq!(candidate.payload, b"abcd");
-
-    let chunk_path = format!(
-        "{}/{}/chunks/seed-{}-fault-000000.bin",
-        config.stream.bucket_id, config.stream.stream_id, config.seed
-    );
-    let object_size = cold_store
-        .write_chunk(&chunk_path, &candidate.payload)
-        .await
-        .expect("write cold chunk before injected read fault");
-    trace.push(SimEvent::ColdChunkWritten {
-        stream: config.stream.clone(),
-        start_offset: candidate.start_offset,
-        end_offset: candidate.end_offset,
-    });
-
-    let flushed = engines[leader_index]
-        .flush_cold(
-            FlushColdRequest {
-                stream_id: config.stream.clone(),
-                chunk: ursula_runtime::ColdChunkRef {
-                    start_offset: candidate.start_offset,
-                    end_offset: candidate.end_offset,
-                    s3_path: chunk_path,
-                    object_size,
-                },
-            },
-            placement(),
-        )
-        .await
-        .expect("publish cold flush before injected read fault");
-    trace.push(SimEvent::ColdFlushed {
-        stream: config.stream.clone(),
-        hot_start_offset: flushed.hot_start_offset,
-        log_index: flushed.group_commit_index,
-    });
-
-    wait_all_nodes_applied(
-        &engines,
-        flushed.group_commit_index,
+    let mut setup = cold_path_setup(
+        &config,
+        "append cold/live payload before cold-read fault",
+        "plan cold flush",
+        false,
+    )
+    .await;
+    let flushed = cold_path_publish(
+        &mut setup,
+        &config,
+        "fault-",
+        "write cold chunk before injected read fault",
+        "publish cold flush before injected read fault",
         "cold flush applied on all nodes before read fault",
     )
     .await;
@@ -264,7 +279,7 @@ pub(super) async fn run_cold_read_fault_inner(
     if inject_read_fault {
         let fail_next_read = Arc::new(Mutex::new(true));
         let fail_next_read_policy = Arc::clone(&fail_next_read);
-        cold_store.set_fault_policy(move |context| {
+        setup.cold_store.set_fault_policy(move |context| {
             if context.operation != ColdStoreOperation::ReadObjectRange {
                 return None;
             }
@@ -277,13 +292,13 @@ pub(super) async fn run_cold_read_fault_inner(
             *should_fail = false;
             Some(ColdStoreFaultEffect::fail("seeded cold read fault"))
         });
-        trace.push(SimEvent::FaultApplied {
+        setup.trace.push(SimEvent::FaultApplied {
             phase: "before_cold_read".to_owned(),
         });
     }
 
-    let faulted_node_id = leader_id;
-    let first_read = engines[leader_index]
+    let faulted_node_id = setup.leader_id;
+    let first_read = setup.engines[setup.leader_index]
         .sim_read_local_stream(
             ReadStreamRequest {
                 stream_id: config.stream.clone(),
@@ -300,7 +315,7 @@ pub(super) async fn run_cold_read_fault_inner(
         let fault_message = first_read
             .expect_err("injected cold read fault should fail the first cold read")
             .to_string();
-        trace.push(SimEvent::ColdReadFaultObserved {
+        setup.trace.push(SimEvent::ColdReadFaultObserved {
             node_id: faulted_node_id,
             stream: config.stream.clone(),
             message: fault_message,
@@ -311,7 +326,7 @@ pub(super) async fn run_cold_read_fault_inner(
         assert_eq!(read.next_offset, 6);
     }
 
-    for (index, engine) in engines.iter_mut().enumerate() {
+    for (index, engine) in setup.engines.iter_mut().enumerate() {
         let read_all = read_local_payload_eventually(
             engine,
             u64::try_from(index + 1).expect("node index fits u64"),
@@ -327,10 +342,10 @@ pub(super) async fn run_cold_read_fault_inner(
 
     ThreeNodeRaftSimOutcome {
         seed: config.seed,
-        leader_id,
+        leader_id: setup.leader_id,
         target_node_id: Some(faulted_node_id),
         appended_log_index: flushed.group_commit_index,
-        trace,
+        trace: setup.trace,
     }
 }
 
@@ -338,58 +353,19 @@ pub(super) async fn run_cold_write_fault_inner(
     config: ThreeNodeRaftSimConfig,
     inject_write_fault: bool,
 ) -> ThreeNodeRaftSimOutcome {
-    let mut trace = SimTrace::default();
-    let cold_store = Arc::new(sim_cold_store());
-    let policy = sim_network_policy();
-    let (_registry, mut engines, leader_id) =
-        build_three_node_cluster_with_cold_store(policy, Some(cold_store.clone())).await;
-    trace.push(SimEvent::ClusterBuilt { seed: config.seed });
-    trace.push(SimEvent::LeaderElected { leader_id });
-
-    let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
-
-    engines[leader_index]
-        .create_stream(
-            CreateStreamRequest::new(config.stream.clone(), "application/octet-stream"),
-            placement(),
-        )
-        .await
-        .expect("create stream through simulated leader");
-    trace.push(SimEvent::StreamCreated {
-        stream: config.stream.clone(),
-    });
-
-    let appended = engines[leader_index]
-        .append(
-            AppendRequest::from_bytes(config.stream.clone(), b"abcdef".to_vec()),
-            placement(),
-        )
-        .await
-        .expect("append payload before cold-write fault");
-    let appended_log_index = appended.group_commit_index;
-    trace.push(SimEvent::AppendCommitted {
-        stream: config.stream.clone(),
-        log_index: appended_log_index,
-    });
-
-    let candidate = engines[leader_index]
-        .plan_cold_flush(
-            PlanColdFlushRequest {
-                stream_id: config.stream.clone(),
-                min_hot_bytes: 4,
-                max_flush_bytes: 4,
-            },
-            placement(),
-        )
-        .await
-        .expect("plan cold flush before write fault")
-        .expect("cold flush candidate");
-    assert_eq!(candidate.payload, b"abcd");
+    let mut setup = cold_path_setup(
+        &config,
+        "append payload before cold-write fault",
+        "plan cold flush before write fault",
+        true,
+    )
+    .await;
+    let appended_log_index = setup.appended.group_commit_index;
 
     if inject_write_fault {
         let fail_next_write = Arc::new(Mutex::new(true));
         let fail_next_write_policy = Arc::clone(&fail_next_write);
-        cold_store.set_fault_policy(move |context| {
+        setup.cold_store.set_fault_policy(move |context| {
             if context.operation != ColdStoreOperation::WriteChunk {
                 return None;
             }
@@ -402,7 +378,7 @@ pub(super) async fn run_cold_write_fault_inner(
             *should_fail = false;
             Some(ColdStoreFaultEffect::fail("seeded cold write fault"))
         });
-        trace.push(SimEvent::FaultApplied {
+        setup.trace.push(SimEvent::FaultApplied {
             phase: "before_cold_write".to_owned(),
         });
     }
@@ -411,14 +387,15 @@ pub(super) async fn run_cold_write_fault_inner(
         "{}/{}/chunks/seed-{}-write-fault-000000.bin",
         config.stream.bucket_id, config.stream.stream_id, config.seed
     );
-    let write_result = cold_store
-        .write_chunk(&chunk_path, &candidate.payload)
+    let write_result = setup
+        .cold_store
+        .write_chunk(&chunk_path, &setup.candidate.payload)
         .await;
     if inject_write_fault {
         let fault_message = write_result
             .expect_err("injected cold write fault should fail the cold upload")
             .to_string();
-        trace.push(SimEvent::ColdWriteFaultObserved {
+        setup.trace.push(SimEvent::ColdWriteFaultObserved {
             stream: config.stream.clone(),
             path: chunk_path,
             message: fault_message,
@@ -427,27 +404,29 @@ pub(super) async fn run_cold_write_fault_inner(
         let object_size = write_result.expect("cold write should succeed without write fault");
         assert_eq!(
             object_size,
-            u64::try_from(candidate.payload.len()).expect("payload len fits u64")
+            u64::try_from(setup.candidate.payload.len()).expect("payload len fits u64")
         );
     }
 
     wait_all_nodes_applied(
-        &engines,
+        &setup.engines,
         appended_log_index,
         "append remains applied after failed cold write",
     )
     .await;
-    verify_all_nodes_can_read_payload(&mut engines, &config.stream, b"abcdef").await;
-    trace.push(SimEvent::HotReadAfterColdWriteFailureVerified {
-        stream: config.stream,
-    });
+    verify_all_nodes_can_read_payload(&mut setup.engines, &config.stream, b"abcdef").await;
+    setup
+        .trace
+        .push(SimEvent::HotReadAfterColdWriteFailureVerified {
+            stream: config.stream,
+        });
 
     ThreeNodeRaftSimOutcome {
         seed: config.seed,
-        leader_id,
+        leader_id: setup.leader_id,
         target_node_id: None,
         appended_log_index,
-        trace,
+        trace: setup.trace,
     }
 }
 
@@ -455,54 +434,19 @@ pub(super) async fn run_cold_write_delay_inner(
     config: ThreeNodeRaftSimConfig,
     delay_ms: Option<u64>,
 ) -> ThreeNodeRaftSimOutcome {
-    let mut trace = SimTrace::default();
-    let cold_store = Arc::new(sim_cold_store());
-    let policy = sim_network_policy();
-    let (_registry, mut engines, leader_id) =
-        build_three_node_cluster_with_cold_store(policy, Some(cold_store.clone())).await;
-    trace.push(SimEvent::ClusterBuilt { seed: config.seed });
-    trace.push(SimEvent::LeaderElected { leader_id });
-
-    let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
-
-    engines[leader_index]
-        .create_stream(
-            CreateStreamRequest::new(config.stream.clone(), "application/octet-stream"),
-            placement(),
-        )
-        .await
-        .expect("create stream through simulated leader");
-    trace.push(SimEvent::StreamCreated {
-        stream: config.stream.clone(),
-    });
-
-    engines[leader_index]
-        .append(
-            AppendRequest::from_bytes(config.stream.clone(), b"abcdef".to_vec()),
-            placement(),
-        )
-        .await
-        .expect("append payload before cold-write delay");
-
-    let candidate = engines[leader_index]
-        .plan_cold_flush(
-            PlanColdFlushRequest {
-                stream_id: config.stream.clone(),
-                min_hot_bytes: 4,
-                max_flush_bytes: 4,
-            },
-            placement(),
-        )
-        .await
-        .expect("plan cold flush before write delay")
-        .expect("cold flush candidate");
-    assert_eq!(candidate.payload, b"abcd");
+    let mut setup = cold_path_setup(
+        &config,
+        "append payload before cold-write delay",
+        "plan cold flush before write delay",
+        false,
+    )
+    .await;
 
     let delay = delay_ms.map(Duration::from_millis);
     if let Some(delay) = delay {
         let delay_next_write = Arc::new(Mutex::new(true));
         let delay_next_write_policy = Arc::clone(&delay_next_write);
-        cold_store.set_fault_policy(move |context| {
+        setup.cold_store.set_fault_policy(move |context| {
             if context.operation != ColdStoreOperation::WriteChunk {
                 return None;
             }
@@ -515,7 +459,7 @@ pub(super) async fn run_cold_write_delay_inner(
             *should_delay = false;
             Some(ColdStoreFaultEffect::delay(delay))
         });
-        trace.push(SimEvent::FaultApplied {
+        setup.trace.push(SimEvent::FaultApplied {
             phase: "before_cold_write".to_owned(),
         });
     }
@@ -525,8 +469,9 @@ pub(super) async fn run_cold_write_delay_inner(
         config.stream.bucket_id, config.stream.stream_id, config.seed
     );
     let started = madsim::time::Instant::now();
-    let object_size = cold_store
-        .write_chunk(&chunk_path, &candidate.payload)
+    let object_size = setup
+        .cold_store
+        .write_chunk(&chunk_path, &setup.candidate.payload)
         .await
         .expect("write cold chunk after injected write delay");
     if let Some(delay) = delay {
@@ -534,24 +479,24 @@ pub(super) async fn run_cold_write_delay_inner(
             started.elapsed() >= delay,
             "cold write should observe at least the injected virtual delay"
         );
-        trace.push(SimEvent::ColdWriteDelayVerified {
+        setup.trace.push(SimEvent::ColdWriteDelayVerified {
             stream: config.stream.clone(),
             delay_ms: duration_ms(delay),
         });
     }
-    trace.push(SimEvent::ColdChunkWritten {
+    setup.trace.push(SimEvent::ColdChunkWritten {
         stream: config.stream.clone(),
-        start_offset: candidate.start_offset,
-        end_offset: candidate.end_offset,
+        start_offset: setup.candidate.start_offset,
+        end_offset: setup.candidate.end_offset,
     });
 
-    let flushed = engines[leader_index]
+    let flushed = setup.engines[setup.leader_index]
         .flush_cold(
             FlushColdRequest {
                 stream_id: config.stream.clone(),
                 chunk: ursula_runtime::ColdChunkRef {
-                    start_offset: candidate.start_offset,
-                    end_offset: candidate.end_offset,
+                    start_offset: setup.candidate.start_offset,
+                    end_offset: setup.candidate.end_offset,
                     s3_path: chunk_path,
                     object_size,
                 },
@@ -560,26 +505,26 @@ pub(super) async fn run_cold_write_delay_inner(
         )
         .await
         .expect("publish cold flush after injected write delay");
-    trace.push(SimEvent::ColdFlushed {
+    setup.trace.push(SimEvent::ColdFlushed {
         stream: config.stream.clone(),
         hot_start_offset: flushed.hot_start_offset,
         log_index: flushed.group_commit_index,
     });
 
     wait_all_nodes_applied(
-        &engines,
+        &setup.engines,
         flushed.group_commit_index,
         "cold flush applied on all nodes after write delay",
     )
     .await;
-    verify_all_nodes_can_read_payload(&mut engines, &config.stream, b"abcdef").await;
+    verify_all_nodes_can_read_payload(&mut setup.engines, &config.stream, b"abcdef").await;
 
     ThreeNodeRaftSimOutcome {
         seed: config.seed,
-        leader_id,
-        target_node_id: Some(leader_id),
+        leader_id: setup.leader_id,
+        target_node_id: Some(setup.leader_id),
         appended_log_index: flushed.group_commit_index,
-        trace,
+        trace: setup.trace,
     }
 }
 
@@ -712,87 +657,19 @@ pub(super) async fn run_cold_read_delay_inner(
     config: ThreeNodeRaftSimConfig,
     delay_ms: Option<u64>,
 ) -> ThreeNodeRaftSimOutcome {
-    let mut trace = SimTrace::default();
-    let cold_store = Arc::new(sim_cold_store());
-    let policy = sim_network_policy();
-    let (_registry, mut engines, leader_id) =
-        build_three_node_cluster_with_cold_store(policy, Some(cold_store.clone())).await;
-    trace.push(SimEvent::ClusterBuilt { seed: config.seed });
-    trace.push(SimEvent::LeaderElected { leader_id });
-
-    let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
-
-    engines[leader_index]
-        .create_stream(
-            CreateStreamRequest::new(config.stream.clone(), "application/octet-stream"),
-            placement(),
-        )
-        .await
-        .expect("create stream through simulated leader");
-    trace.push(SimEvent::StreamCreated {
-        stream: config.stream.clone(),
-    });
-
-    engines[leader_index]
-        .append(
-            AppendRequest::from_bytes(config.stream.clone(), b"abcdef".to_vec()),
-            placement(),
-        )
-        .await
-        .expect("append cold/live payload before cold-read delay");
-
-    let candidate = engines[leader_index]
-        .plan_cold_flush(
-            PlanColdFlushRequest {
-                stream_id: config.stream.clone(),
-                min_hot_bytes: 4,
-                max_flush_bytes: 4,
-            },
-            placement(),
-        )
-        .await
-        .expect("plan cold flush before read delay")
-        .expect("cold flush candidate");
-    assert_eq!(candidate.payload, b"abcd");
-
-    let chunk_path = format!(
-        "{}/{}/chunks/seed-{}-delay-000000.bin",
-        config.stream.bucket_id, config.stream.stream_id, config.seed
-    );
-    let object_size = cold_store
-        .write_chunk(&chunk_path, &candidate.payload)
-        .await
-        .expect("write cold chunk before injected read delay");
-    trace.push(SimEvent::ColdChunkWritten {
-        stream: config.stream.clone(),
-        start_offset: candidate.start_offset,
-        end_offset: candidate.end_offset,
-    });
-
-    let flushed = engines[leader_index]
-        .flush_cold(
-            FlushColdRequest {
-                stream_id: config.stream.clone(),
-                chunk: ursula_runtime::ColdChunkRef {
-                    start_offset: candidate.start_offset,
-                    end_offset: candidate.end_offset,
-                    s3_path: chunk_path,
-                    object_size,
-                },
-            },
-            placement(),
-        )
-        .await
-        .expect("publish cold flush before injected read delay");
-    trace.push(SimEvent::ColdFlushed {
-        stream: config.stream.clone(),
-        hot_start_offset: flushed.hot_start_offset,
-        log_index: flushed.group_commit_index,
-    });
-
-    wait_all_nodes_applied(
-        &engines,
-        flushed.group_commit_index,
+    let mut setup = cold_path_setup(
+        &config,
+        "append cold/live payload before cold-read delay",
+        "plan cold flush before read delay",
+        false,
+    )
+    .await;
+    let flushed = cold_path_publish(
+        &mut setup,
+        &config,
+        "delay-",
+        "write cold chunk before injected read delay",
+        "publish cold flush before injected read delay",
         "cold flush applied on all nodes before read delay",
     )
     .await;
@@ -801,7 +678,7 @@ pub(super) async fn run_cold_read_delay_inner(
     if let Some(delay) = delay {
         let delay_next_read = Arc::new(Mutex::new(true));
         let delay_next_read_policy = Arc::clone(&delay_next_read);
-        cold_store.set_fault_policy(move |context| {
+        setup.cold_store.set_fault_policy(move |context| {
             if context.operation != ColdStoreOperation::ReadObjectRange {
                 return None;
             }
@@ -814,15 +691,15 @@ pub(super) async fn run_cold_read_delay_inner(
             *should_delay = false;
             Some(ColdStoreFaultEffect::delay(delay))
         });
-        trace.push(SimEvent::FaultApplied {
+        setup.trace.push(SimEvent::FaultApplied {
             phase: "before_cold_read".to_owned(),
         });
     }
 
     let started = madsim::time::Instant::now();
     let read_all = read_local_payload_eventually(
-        &engines[leader_index],
-        leader_id,
+        &setup.engines[setup.leader_index],
+        setup.leader_id,
         &config.stream,
         0,
         6,
@@ -836,13 +713,13 @@ pub(super) async fn run_cold_read_delay_inner(
             started.elapsed() >= delay,
             "cold read should observe at least the injected virtual delay"
         );
-        trace.push(SimEvent::ColdReadDelayVerified {
+        setup.trace.push(SimEvent::ColdReadDelayVerified {
             stream: config.stream.clone(),
             delay_ms: duration_ms(delay),
         });
     }
 
-    for (index, engine) in engines.iter_mut().enumerate() {
+    for (index, engine) in setup.engines.iter_mut().enumerate() {
         read_local_payload_eventually(
             engine,
             u64::try_from(index + 1).expect("node index fits u64"),
@@ -857,10 +734,10 @@ pub(super) async fn run_cold_read_delay_inner(
 
     ThreeNodeRaftSimOutcome {
         seed: config.seed,
-        leader_id,
-        target_node_id: Some(leader_id),
+        leader_id: setup.leader_id,
+        target_node_id: Some(setup.leader_id),
         appended_log_index: flushed.group_commit_index,
-        trace,
+        trace: setup.trace,
     }
 }
 
@@ -868,87 +745,19 @@ pub(super) async fn run_cold_read_truncate_inner(
     config: ThreeNodeRaftSimConfig,
     truncate_returned_len: Option<usize>,
 ) -> ThreeNodeRaftSimOutcome {
-    let mut trace = SimTrace::default();
-    let cold_store = Arc::new(sim_cold_store());
-    let policy = sim_network_policy();
-    let (_registry, mut engines, leader_id) =
-        build_three_node_cluster_with_cold_store(policy, Some(cold_store.clone())).await;
-    trace.push(SimEvent::ClusterBuilt { seed: config.seed });
-    trace.push(SimEvent::LeaderElected { leader_id });
-
-    let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
-
-    engines[leader_index]
-        .create_stream(
-            CreateStreamRequest::new(config.stream.clone(), "application/octet-stream"),
-            placement(),
-        )
-        .await
-        .expect("create stream through simulated leader");
-    trace.push(SimEvent::StreamCreated {
-        stream: config.stream.clone(),
-    });
-
-    engines[leader_index]
-        .append(
-            AppendRequest::from_bytes(config.stream.clone(), b"abcdef".to_vec()),
-            placement(),
-        )
-        .await
-        .expect("append cold/live payload before cold-read truncation");
-
-    let candidate = engines[leader_index]
-        .plan_cold_flush(
-            PlanColdFlushRequest {
-                stream_id: config.stream.clone(),
-                min_hot_bytes: 4,
-                max_flush_bytes: 4,
-            },
-            placement(),
-        )
-        .await
-        .expect("plan cold flush before read truncation")
-        .expect("cold flush candidate");
-    assert_eq!(candidate.payload, b"abcd");
-
-    let chunk_path = format!(
-        "{}/{}/chunks/seed-{}-truncate-000000.bin",
-        config.stream.bucket_id, config.stream.stream_id, config.seed
-    );
-    let object_size = cold_store
-        .write_chunk(&chunk_path, &candidate.payload)
-        .await
-        .expect("write cold chunk before injected read truncation");
-    trace.push(SimEvent::ColdChunkWritten {
-        stream: config.stream.clone(),
-        start_offset: candidate.start_offset,
-        end_offset: candidate.end_offset,
-    });
-
-    let flushed = engines[leader_index]
-        .flush_cold(
-            FlushColdRequest {
-                stream_id: config.stream.clone(),
-                chunk: ursula_runtime::ColdChunkRef {
-                    start_offset: candidate.start_offset,
-                    end_offset: candidate.end_offset,
-                    s3_path: chunk_path,
-                    object_size,
-                },
-            },
-            placement(),
-        )
-        .await
-        .expect("publish cold flush before injected read truncation");
-    trace.push(SimEvent::ColdFlushed {
-        stream: config.stream.clone(),
-        hot_start_offset: flushed.hot_start_offset,
-        log_index: flushed.group_commit_index,
-    });
-
-    wait_all_nodes_applied(
-        &engines,
-        flushed.group_commit_index,
+    let mut setup = cold_path_setup(
+        &config,
+        "append cold/live payload before cold-read truncation",
+        "plan cold flush before read truncation",
+        false,
+    )
+    .await;
+    let flushed = cold_path_publish(
+        &mut setup,
+        &config,
+        "truncate-",
+        "write cold chunk before injected read truncation",
+        "publish cold flush before injected read truncation",
         "cold flush applied on all nodes before read truncation",
     )
     .await;
@@ -956,7 +765,7 @@ pub(super) async fn run_cold_read_truncate_inner(
     if let Some(returned_len) = truncate_returned_len {
         let truncate_next_read = Arc::new(Mutex::new(true));
         let truncate_next_read_policy = Arc::clone(&truncate_next_read);
-        cold_store.set_fault_policy(move |context| {
+        setup.cold_store.set_fault_policy(move |context| {
             if context.operation != ColdStoreOperation::ReadObjectRange {
                 return None;
             }
@@ -969,13 +778,13 @@ pub(super) async fn run_cold_read_truncate_inner(
             *should_truncate = false;
             Some(ColdStoreFaultEffect::truncate_read_to(returned_len))
         });
-        trace.push(SimEvent::FaultApplied {
+        setup.trace.push(SimEvent::FaultApplied {
             phase: "before_cold_read".to_owned(),
         });
     }
 
-    let faulted_node_id = leader_id;
-    let first_read = engines[leader_index]
+    let faulted_node_id = setup.leader_id;
+    let first_read = setup.engines[setup.leader_index]
         .sim_read_local_stream(
             ReadStreamRequest {
                 stream_id: config.stream.clone(),
@@ -996,7 +805,7 @@ pub(super) async fn run_cold_read_truncate_inner(
             message.contains(&format!("returned {returned_len} bytes")),
             "cold read truncation should surface the short-body length: {message}"
         );
-        trace.push(SimEvent::ColdReadTruncateObserved {
+        setup.trace.push(SimEvent::ColdReadTruncateObserved {
             node_id: faulted_node_id,
             stream: config.stream.clone(),
             requested_len: 4,
@@ -1009,7 +818,7 @@ pub(super) async fn run_cold_read_truncate_inner(
         assert_eq!(read.next_offset, 6);
     }
 
-    for (index, engine) in engines.iter_mut().enumerate() {
+    for (index, engine) in setup.engines.iter_mut().enumerate() {
         let read_all = read_local_payload_eventually(
             engine,
             u64::try_from(index + 1).expect("node index fits u64"),
@@ -1025,9 +834,9 @@ pub(super) async fn run_cold_read_truncate_inner(
 
     ThreeNodeRaftSimOutcome {
         seed: config.seed,
-        leader_id,
+        leader_id: setup.leader_id,
         target_node_id: Some(faulted_node_id),
         appended_log_index: flushed.group_commit_index,
-        trace,
+        trace: setup.trace,
     }
 }
