@@ -574,26 +574,6 @@ impl ShardRuntime {
         self.flush_cold_candidate(candidate).await.map(Some)
     }
 
-    pub async fn plan_next_cold_flush(
-        &self,
-        raft_group_id: RaftGroupId,
-        request: PlanGroupColdFlushRequest,
-    ) -> Result<Option<ColdFlushCandidate>, RuntimeError> {
-        let placement = self.placement_for_group(raft_group_id)?;
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::PlanNextColdFlush {
-                request,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
     pub async fn plan_next_cold_flush_batch(
         &self,
         raft_group_id: RaftGroupId,
@@ -621,7 +601,10 @@ impl ShardRuntime {
         raft_group_id: RaftGroupId,
         request: PlanGroupColdFlushRequest,
     ) -> Result<Option<FlushColdResponse>, RuntimeError> {
-        let Some(candidate) = self.plan_next_cold_flush(raft_group_id, request).await? else {
+        let mut candidates = self
+            .plan_next_cold_flush_batch(raft_group_id, request, 1)
+            .await?;
+        let Some(candidate) = candidates.pop() else {
             return Ok(None);
         };
         match self.flush_cold_candidate(candidate).await {

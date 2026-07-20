@@ -509,6 +509,7 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
         .create_stream(
             CreateStreamRequest::new(stream.clone(), DEFAULT_CONTENT_TYPE),
             placement,
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("create stream");
@@ -516,6 +517,7 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
         .append(
             AppendRequest::from_bytes(stream.clone(), b"abcdef".to_vec()),
             placement,
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("append");
@@ -660,6 +662,7 @@ async fn bootstrap_reads_retained_updates_from_cold_chunk_after_snapshot() {
         .create_stream(
             CreateStreamRequest::new(stream.clone(), DEFAULT_CONTENT_TYPE),
             placement,
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("create stream");
@@ -667,6 +670,7 @@ async fn bootstrap_reads_retained_updates_from_cold_chunk_after_snapshot() {
         .append(
             AppendRequest::from_bytes(stream.clone(), b"abc".to_vec()),
             placement,
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("append first message");
@@ -674,6 +678,7 @@ async fn bootstrap_reads_retained_updates_from_cold_chunk_after_snapshot() {
         .append(
             AppendRequest::from_bytes(stream.clone(), b"de".to_vec()),
             placement,
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("append second message");
@@ -811,7 +816,7 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
     create.stream_ttl_seconds = Some(1);
     create.now_ms = 1_000;
     engine
-        .create_stream(create, placement)
+        .create_stream(create, placement, ColdWriteAdmission::default())
         .await
         .expect("create ttl stream");
 
@@ -885,7 +890,7 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
     let mut recreate = CreateStreamRequest::new(stream, "text/plain");
     recreate.now_ms = 2_501;
     let recreated = engine
-        .create_stream(recreate, placement)
+        .create_stream(recreate, placement, ColdWriteAdmission::default())
         .await
         .expect("recreate expired stream");
     assert!(!recreated.already_exists);
@@ -3246,8 +3251,9 @@ impl GroupEngine for BlockingReadEngine {
         &'a mut self,
         request: CreateStreamRequest,
         placement: ShardPlacement,
+        admission: ColdWriteAdmission,
     ) -> GroupCreateStreamFuture<'a> {
-        self.inner.create_stream(request, placement)
+        self.inner.create_stream(request, placement, admission)
     }
 
     fn head_stream<'a>(
@@ -3361,16 +3367,18 @@ impl GroupEngine for BlockingReadEngine {
         &'a mut self,
         request: AppendRequest,
         placement: ShardPlacement,
+        admission: ColdWriteAdmission,
     ) -> GroupAppendFuture<'a> {
-        self.inner.append(request, placement)
+        self.inner.append(request, placement, admission)
     }
 
     fn append_batch<'a>(
         &'a mut self,
         request: AppendBatchRequest,
         placement: ShardPlacement,
+        admission: ColdWriteAdmission,
     ) -> GroupAppendBatchFuture<'a> {
-        self.inner.append_batch(request, placement)
+        self.inner.append_batch(request, placement, admission)
     }
 
     fn snapshot<'a>(&'a mut self, placement: ShardPlacement) -> GroupSnapshotFuture<'a> {
@@ -3406,6 +3414,7 @@ impl GroupEngine for RecordingEngine {
         &'a mut self,
         request: CreateStreamRequest,
         placement: ShardPlacement,
+        _admission: ColdWriteAdmission,
     ) -> GroupCreateStreamFuture<'a> {
         Box::pin(async move {
             assert_eq!(placement, self.placement);
@@ -3520,6 +3529,7 @@ impl GroupEngine for RecordingEngine {
         &'a mut self,
         request: AppendRequest,
         placement: ShardPlacement,
+        _admission: ColdWriteAdmission,
     ) -> GroupAppendFuture<'a> {
         Box::pin(async move {
             assert_eq!(placement, self.placement);
@@ -3544,6 +3554,7 @@ impl GroupEngine for RecordingEngine {
         &'a mut self,
         request: AppendBatchRequest,
         placement: ShardPlacement,
+        _admission: ColdWriteAdmission,
     ) -> GroupAppendBatchFuture<'a> {
         Box::pin(async move {
             assert_eq!(placement, self.placement);
@@ -3667,6 +3678,7 @@ impl GroupEngine for BlockingFirstCreateEngine {
         &'a mut self,
         request: CreateStreamRequest,
         placement: ShardPlacement,
+        admission: ColdWriteAdmission,
     ) -> GroupCreateStreamFuture<'a> {
         let should_block = self.first_create_blocks.swap(false, Ordering::SeqCst);
         let entered = self.entered.clone();
@@ -3676,7 +3688,9 @@ impl GroupEngine for BlockingFirstCreateEngine {
                 entered.notify_one();
                 release.notified().await;
             }
-            self.inner.create_stream(request, placement).await
+            self.inner
+                .create_stream(request, placement, admission)
+                .await
         })
     }
 
@@ -3727,16 +3741,18 @@ impl GroupEngine for BlockingFirstCreateEngine {
         &'a mut self,
         request: AppendRequest,
         placement: ShardPlacement,
+        admission: ColdWriteAdmission,
     ) -> GroupAppendFuture<'a> {
-        self.inner.append(request, placement)
+        self.inner.append(request, placement, admission)
     }
 
     fn append_batch<'a>(
         &'a mut self,
         request: AppendBatchRequest,
         placement: ShardPlacement,
+        admission: ColdWriteAdmission,
     ) -> GroupAppendBatchFuture<'a> {
-        self.inner.append_batch(request, placement)
+        self.inner.append_batch(request, placement, admission)
     }
 
     fn snapshot<'a>(&'a mut self, placement: ShardPlacement) -> GroupSnapshotFuture<'a> {
@@ -3808,6 +3824,7 @@ impl GroupEngine for FailingEngine {
         &'a mut self,
         _request: CreateStreamRequest,
         _placement: ShardPlacement,
+        _admission: ColdWriteAdmission,
     ) -> GroupCreateStreamFuture<'a> {
         Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
     }
@@ -3858,6 +3875,7 @@ impl GroupEngine for FailingEngine {
         &'a mut self,
         _request: AppendRequest,
         _placement: ShardPlacement,
+        _admission: ColdWriteAdmission,
     ) -> GroupAppendFuture<'a> {
         Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
     }
@@ -3866,6 +3884,7 @@ impl GroupEngine for FailingEngine {
         &'a mut self,
         _request: AppendBatchRequest,
         _placement: ShardPlacement,
+        _admission: ColdWriteAdmission,
     ) -> GroupAppendBatchFuture<'a> {
         Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
     }
