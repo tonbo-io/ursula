@@ -63,8 +63,6 @@ pub type GroupFlushColdFuture<'a> =
     Pin<Box<dyn Future<Output = Result<FlushColdResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupPlanColdFlushFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<ColdFlushCandidate>, GroupEngineError>> + Send + 'a>>;
-pub type GroupPlanNextColdFlushFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Option<ColdFlushCandidate>, GroupEngineError>> + Send + 'a>>;
 pub type GroupPlanNextColdFlushBatchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<ColdFlushCandidate>, GroupEngineError>> + Send + 'a>>;
 pub type GroupColdHotBacklogFuture<'a> =
@@ -151,6 +149,7 @@ pub trait GroupEngine: Send + 'static {
         &'a mut self,
         request: CreateStreamRequest,
         placement: ShardPlacement,
+        admission: ColdWriteAdmission,
     ) -> GroupCreateStreamFuture<'a>;
 
     fn create_stream_external<'a>(
@@ -318,6 +317,7 @@ pub trait GroupEngine: Send + 'static {
         &'a mut self,
         request: AppendRequest,
         placement: ShardPlacement,
+        admission: ColdWriteAdmission,
     ) -> GroupAppendFuture<'a>;
 
     fn append_external<'a>(
@@ -337,36 +337,10 @@ pub trait GroupEngine: Send + 'static {
         &'a mut self,
         request: AppendBatchRequest,
         placement: ShardPlacement,
+        admission: ColdWriteAdmission,
     ) -> GroupAppendBatchFuture<'a>;
 
-    fn create_stream_with_cold_admission<'a>(
-        &'a mut self,
-        request: CreateStreamRequest,
-        placement: ShardPlacement,
-        _admission: ColdWriteAdmission,
-    ) -> GroupCreateStreamFuture<'a> {
-        self.create_stream(request, placement)
-    }
-
-    fn append_with_cold_admission<'a>(
-        &'a mut self,
-        request: AppendRequest,
-        placement: ShardPlacement,
-        _admission: ColdWriteAdmission,
-    ) -> GroupAppendFuture<'a> {
-        self.append(request, placement)
-    }
-
-    fn append_batch_with_cold_admission<'a>(
-        &'a mut self,
-        request: AppendBatchRequest,
-        placement: ShardPlacement,
-        _admission: ColdWriteAdmission,
-    ) -> GroupAppendBatchFuture<'a> {
-        self.append_batch(request, placement)
-    }
-
-    fn append_batch_many_with_cold_admission<'a>(
+    fn append_batch_many<'a>(
         &'a mut self,
         requests: Vec<AppendBatchRequest>,
         placement: ShardPlacement,
@@ -376,7 +350,7 @@ pub trait GroupEngine: Send + 'static {
             let mut responses = Vec::with_capacity(requests.len());
             for request in requests {
                 let response = self
-                    .append_batch_with_cold_admission(request, placement, admission)
+                    .append_batch(request, placement, admission)
                     .await
                     .map(GroupWriteResponse::AppendBatch);
                 responses.push(response);
@@ -411,29 +385,16 @@ pub trait GroupEngine: Send + 'static {
         })
     }
 
-    fn plan_next_cold_flush<'a>(
+    fn plan_next_cold_flush_batch<'a>(
         &'a mut self,
         _request: PlanGroupColdFlushRequest,
         _placement: ShardPlacement,
-    ) -> GroupPlanNextColdFlushFuture<'a> {
+        _max_candidates: usize,
+    ) -> GroupPlanNextColdFlushBatchFuture<'a> {
         Box::pin(async move {
             Err(GroupEngineError::new(
                 "group cold flush planning is not supported",
             ))
-        })
-    }
-
-    fn plan_next_cold_flush_batch<'a>(
-        &'a mut self,
-        request: PlanGroupColdFlushRequest,
-        placement: ShardPlacement,
-        max_candidates: usize,
-    ) -> GroupPlanNextColdFlushBatchFuture<'a> {
-        Box::pin(async move {
-            match self.plan_next_cold_flush(request, placement).await? {
-                Some(candidate) if max_candidates > 0 => Ok(vec![candidate]),
-                _ => Ok(Vec::new()),
-            }
         })
     }
 
@@ -496,6 +457,7 @@ pub trait GroupEngine: Send + 'static {
                                 now_ms,
                             },
                             placement,
+                            ColdWriteAdmission::default(),
                         )
                         .await
                         .map(GroupWriteResponse::CreateStream),
@@ -552,6 +514,7 @@ pub trait GroupEngine: Send + 'static {
                                 record_match,
                             },
                             placement,
+                            ColdWriteAdmission::default(),
                         )
                         .await
                         .map(GroupWriteResponse::Append),
@@ -598,6 +561,7 @@ pub trait GroupEngine: Send + 'static {
                                 now_ms,
                             },
                             placement,
+                            ColdWriteAdmission::default(),
                         )
                         .await
                         .map(GroupWriteResponse::AppendBatch),

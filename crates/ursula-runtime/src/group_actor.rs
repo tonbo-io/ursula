@@ -184,10 +184,6 @@ pub(crate) enum GroupCommand {
         request: PlanColdFlushRequest,
         response_tx: oneshot::Sender<Result<Option<ColdFlushCandidate>, RuntimeError>>,
     },
-    PlanNextColdFlush {
-        request: PlanGroupColdFlushRequest,
-        response_tx: oneshot::Sender<Result<Option<ColdFlushCandidate>, RuntimeError>>,
-    },
     PlanNextColdFlushBatch {
         request: PlanGroupColdFlushRequest,
         max_candidates: usize,
@@ -275,9 +271,6 @@ impl GroupCommand {
                 let _ = response_tx.send(Err(err));
             }
             Self::PlanColdFlush { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
-            }
-            Self::PlanNextColdFlush { response_tx, .. } => {
                 let _ = response_tx.send(Err(err));
             }
             Self::PlanNextColdFlushBatch { response_tx, .. } => {
@@ -580,19 +573,6 @@ impl GroupActor {
                 response_tx,
             } => {
                 let response = CoreWorker::plan_cold_flush(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    request,
-                    self.placement,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::PlanNextColdFlush {
-                request,
-                response_tx,
-            } => {
-                let response = CoreWorker::plan_next_cold_flush(
                     &mut self.engine,
                     self.metrics.clone(),
                     request,

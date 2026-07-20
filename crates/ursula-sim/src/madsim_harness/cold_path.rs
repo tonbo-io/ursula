@@ -10,6 +10,7 @@ use super::Arc;
 use super::ColdStore;
 use super::ColdStoreFaultEffect;
 use super::ColdStoreOperation;
+use super::ColdWriteAdmission;
 use super::CreateStreamRequest;
 use super::DeleteStreamRequest;
 use super::Duration;
@@ -80,6 +81,7 @@ async fn cold_path_setup(
         .create_stream(
             CreateStreamRequest::new(config.stream.clone(), "application/octet-stream"),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("create stream through simulated leader");
@@ -91,6 +93,7 @@ async fn cold_path_setup(
         .append(
             AppendRequest::from_bytes(config.stream.clone(), b"abcdef".to_vec()),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect(append_expect);

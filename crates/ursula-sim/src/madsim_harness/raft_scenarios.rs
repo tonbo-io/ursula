@@ -7,6 +7,7 @@ use openraft::storage::RaftLogStorage;
 
 use super::AppendRequest;
 use super::BasicNode;
+use super::ColdWriteAdmission;
 use super::CreateStreamRequest;
 use super::Duration;
 use super::GroupEngine;
@@ -45,6 +46,7 @@ pub(super) async fn run_no_fault_inner(config: ThreeNodeRaftSimConfig) -> ThreeN
         .create_stream(
             CreateStreamRequest::new(config.stream.clone(), "application/octet-stream"),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("create stream through simulated leader");
@@ -56,6 +58,7 @@ pub(super) async fn run_no_fault_inner(config: ThreeNodeRaftSimConfig) -> ThreeN
         .append(
             AppendRequest::from_bytes(config.stream.clone(), b"simulated".to_vec()),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("append through simulated leader");
@@ -130,6 +133,7 @@ pub(super) async fn run_partition_heal_inner(
         .create_stream(
             CreateStreamRequest::new(config.stream.clone(), "application/octet-stream"),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("create stream through simulated leader");
@@ -141,6 +145,7 @@ pub(super) async fn run_partition_heal_inner(
         .append(
             AppendRequest::from_bytes(config.stream.clone(), b"simulated".to_vec()),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("append through simulated leader");
@@ -249,6 +254,7 @@ pub(super) async fn run_snapshot_catch_up_inner(
         .create_stream(
             CreateStreamRequest::new(config.stream.clone(), "application/octet-stream"),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("create stream through simulated leader");
@@ -260,6 +266,7 @@ pub(super) async fn run_snapshot_catch_up_inner(
         .append(
             AppendRequest::from_bytes(config.stream.clone(), b"snapshot-transfer".to_vec()),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("append through simulated leader");
@@ -418,6 +425,7 @@ pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
         .create_stream(
             CreateStreamRequest::new(config.stream.clone(), "application/octet-stream"),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("create stream through old leader");
@@ -429,6 +437,7 @@ pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
         .append(
             AppendRequest::from_bytes(config.stream.clone(), b"baseline;".to_vec()),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("append baseline through old leader");
@@ -531,6 +540,7 @@ pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
             .append(
                 AppendRequest::from_bytes(config.stream.clone(), payload.clone()),
                 placement(),
+                ColdWriteAdmission::default(),
             )
             .await
             .expect("append through replacement leader");
@@ -709,6 +719,7 @@ pub(super) async fn run_restart_follower_inner(
         .create_stream(
             CreateStreamRequest::new(config.stream.clone(), "application/octet-stream"),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("create stream while follower is stopped");
@@ -720,6 +731,7 @@ pub(super) async fn run_restart_follower_inner(
         .append(
             AppendRequest::from_bytes(config.stream.clone(), b"restart-transfer".to_vec()),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("append while follower is stopped");
@@ -839,6 +851,7 @@ pub(super) async fn run_leader_failover_inner(
         .create_stream(
             CreateStreamRequest::new(config.stream.clone(), "application/octet-stream"),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("create stream before leader failover");
@@ -850,6 +863,7 @@ pub(super) async fn run_leader_failover_inner(
         .append(
             AppendRequest::from_bytes(config.stream.clone(), b"before-".to_vec()),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("append before leader failover");
@@ -914,6 +928,7 @@ pub(super) async fn run_leader_failover_inner(
         .append(
             AppendRequest::from_bytes(config.stream.clone(), b"after".to_vec()),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("append through new leader after failover");

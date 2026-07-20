@@ -171,11 +171,6 @@ pub(crate) enum CoreCommand {
         placement: ShardPlacement,
         response_tx: oneshot::Sender<Result<Option<ColdFlushCandidate>, RuntimeError>>,
     },
-    PlanNextColdFlush {
-        request: PlanGroupColdFlushRequest,
-        placement: ShardPlacement,
-        response_tx: oneshot::Sender<Result<Option<ColdFlushCandidate>, RuntimeError>>,
-    },
     PlanNextColdFlushBatch {
         request: PlanGroupColdFlushRequest,
         placement: ShardPlacement,
@@ -537,18 +532,6 @@ impl CoreWorker {
             } => {
                 debug_assert_eq!(placement.core_id, self.core_id);
                 self.send_group_command(placement, GroupCommand::PlanColdFlush {
-                    request,
-                    response_tx,
-                })
-                .await;
-            }
-            CoreCommand::PlanNextColdFlush {
-                request,
-                placement,
-                response_tx,
-            } => {
-                debug_assert_eq!(placement.core_id, self.core_id);
-                self.send_group_command(placement, GroupCommand::PlanNextColdFlush {
                     request,
                     response_tx,
                 })
@@ -1282,28 +1265,6 @@ impl CoreWorker {
         response
     }
 
-    pub(crate) async fn plan_next_cold_flush(
-        group: &mut Box<dyn GroupEngine>,
-        metrics: Arc<RuntimeMetricsInner>,
-        request: PlanGroupColdFlushRequest,
-        placement: ShardPlacement,
-    ) -> Result<Option<ColdFlushCandidate>, RuntimeError> {
-        if !group.accepts_local_writes() {
-            return Ok(None);
-        }
-        let exec_started_at = Instant::now();
-        let response = group
-            .plan_next_cold_flush(request, placement)
-            .await
-            .map_err(|err| RuntimeError::group_engine(placement, err));
-        metrics.record_group_engine_exec(
-            placement.core_id,
-            placement.raft_group_id,
-            elapsed_ns(exec_started_at),
-        );
-        response
-    }
-
     pub(crate) async fn plan_next_cold_flush_batch(
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,
@@ -1441,7 +1402,7 @@ impl CoreWorker {
         let started_at = Instant::now();
         let exec_started_at = Instant::now();
         let response = group
-            .create_stream_with_cold_admission(request, placement, admission)
+            .create_stream(request, placement, admission)
             .await
             .map_err(|err| {
                 record_cold_backpressure_error(
@@ -1522,7 +1483,7 @@ impl CoreWorker {
         let started_at = Instant::now();
         let exec_started_at = Instant::now();
         let response = group
-            .append_with_cold_admission(request, placement, admission)
+            .append(request, placement, admission)
             .await
             .map_err(|err| {
                 record_cold_backpressure_error(
@@ -1643,7 +1604,7 @@ impl CoreWorker {
     ) {
         let exec_started_at = Instant::now();
         let responses = group
-            .append_batch_many_with_cold_admission(requests, runtime.placement, admission)
+            .append_batch_many(requests, runtime.placement, admission)
             .await
             .map_err(|err| RuntimeError::group_engine(runtime.placement, err));
         runtime.metrics.record_group_engine_exec(
