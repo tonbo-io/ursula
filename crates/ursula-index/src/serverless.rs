@@ -5,6 +5,7 @@ use std::fs;
 use std::fs::File;
 use std::io::Write;
 use std::ops::Deref;
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,9 +14,25 @@ use std::sync::Weak;
 use std::time::Duration;
 use std::time::SystemTime;
 
+use bytes::Bytes;
+use foyer::BlockEngineConfig;
+use foyer::Cache;
+use foyer::CacheBuilder;
+use foyer::DeviceBuilder;
+use foyer::FsDeviceBuilder;
+use foyer::HybridCache;
+use foyer::HybridCacheBuilder;
+use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
+use parquet::arrow::arrow_reader::ArrowReaderOptions;
+use parquet::arrow::async_reader::AsyncFileReader;
+use parquet::errors::ParquetError;
+use parquet::file::metadata::ParquetMetaData;
+use parquet::file::metadata::ParquetMetaDataReader;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::OnceCell;
 
 use crate::EventEntry;
 use crate::EventIndexConfig;
@@ -31,10 +48,11 @@ use crate::object_store::S3ObjectStore;
 use crate::object_store::digest;
 use crate::part;
 
-const FORMAT_VERSION: u32 = 4;
+const FORMAT_VERSION: u32 = 5;
 const CURRENT_KEY: &str = "CURRENT";
 const MAX_PUBLISH_ATTEMPTS: usize = 8;
 const EVENT_TIME_PARTITION_MS: i64 = 24 * 60 * 60 * 1_000;
+const MIN_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CompletedRecordRange {
@@ -55,6 +73,7 @@ pub struct RecordSegmentLease {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PartMeta {
     key: String,
+    layout_key: String,
     level: u8,
     partition_start_ms: i64,
     entries: u64,
@@ -121,6 +140,7 @@ struct PublishedManifest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GarbageCollectionReport {
     pub deleted_parts: usize,
+    pub deleted_layouts: usize,
     pub deleted_manifests: usize,
     pub deleted_claims: usize,
 }
@@ -168,11 +188,277 @@ impl Drop for MaterializedPart {
 }
 
 #[derive(Clone, Debug)]
-pub struct EventIndexCache(LocalCache);
+enum IndexCaches {
+    Serving {
+        parts: LocalCache,
+        ranges: VerifiedRangeCache,
+    },
+    Maintenance {
+        parts: LocalCache,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct VerifiedRangeCache {
+    root: PathBuf,
+    max_bytes: u64,
+    memory_bytes: usize,
+    cache: Arc<OnceCell<HybridCache<String, Bytes>>>,
+    layouts: Cache<String, Arc<part::PartLayout>>,
+}
+
+struct VerifiedParquetReader {
+    store: ObjectStore,
+    cache: VerifiedRangeCache,
+    layout: Arc<part::PartLayout>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct RangeReadError(IndexError);
+
+#[derive(Clone, Debug)]
+pub struct EventIndexCache(IndexCaches);
 
 impl EventIndexCache {
-    pub fn new(root: impl AsRef<Path>, max_bytes: u64) -> Result<Self, IndexError> {
-        Ok(Self(LocalCache::new(root, max_bytes)?))
+    pub fn serving(root: impl AsRef<Path>, max_bytes: u64) -> Result<Self, IndexError> {
+        if max_bytes < MIN_CACHE_BYTES {
+            return Err(IndexError::InvalidConfig(
+                "cache_max_bytes must be at least 16 MiB",
+            ));
+        }
+        let root = root.as_ref();
+        let range_bytes = max_bytes.saturating_mul(3) / 4;
+        let part_bytes = max_bytes.saturating_sub(range_bytes);
+        Ok(Self(IndexCaches::Serving {
+            parts: LocalCache::new(root.join("parts"), part_bytes)?,
+            ranges: VerifiedRangeCache::new(root.join("ranges"), range_bytes)?,
+        }))
+    }
+
+    pub fn maintenance(root: impl AsRef<Path>, max_bytes: u64) -> Result<Self, IndexError> {
+        if max_bytes < MIN_CACHE_BYTES {
+            return Err(IndexError::InvalidConfig(
+                "cache_max_bytes must be at least 16 MiB",
+            ));
+        }
+        Ok(Self(IndexCaches::Maintenance {
+            parts: LocalCache::new(root, max_bytes)?,
+        }))
+    }
+}
+
+impl IndexCaches {
+    fn parts(&self) -> &LocalCache {
+        match self {
+            Self::Serving { parts, .. } | Self::Maintenance { parts } => parts,
+        }
+    }
+
+    fn ranges(&self) -> Result<&VerifiedRangeCache, IndexError> {
+        match self {
+            Self::Serving { ranges, .. } => Ok(ranges),
+            Self::Maintenance { .. } => Err(IndexError::InvalidConfig(
+                "maintenance cache cannot serve queries",
+            )),
+        }
+    }
+}
+
+impl VerifiedRangeCache {
+    fn new(root: PathBuf, max_bytes: u64) -> Result<Self, IndexError> {
+        fs::create_dir_all(&root)?;
+        let total_memory_bytes = max_bytes
+            .saturating_div(8)
+            .clamp(1024 * 1024, 128 * 1024 * 1024);
+        let layout_memory_bytes = total_memory_bytes.saturating_div(8);
+        let range_memory_bytes = total_memory_bytes.saturating_sub(layout_memory_bytes);
+        let layout_memory_bytes = usize::try_from(layout_memory_bytes)
+            .map_err(|_error| IndexError::InvalidConfig("range cache is too large"))?;
+        let memory_bytes = usize::try_from(range_memory_bytes)
+            .map_err(|_error| IndexError::InvalidConfig("range cache is too large"))?;
+        let layouts = CacheBuilder::new(layout_memory_bytes)
+            .with_weighter(|key: &String, layout: &Arc<part::PartLayout>| {
+                key.len().saturating_add(
+                    layout
+                        .units
+                        .len()
+                        .saturating_mul(std::mem::size_of::<part::PartUnit>()),
+                )
+            })
+            .build();
+        Ok(Self {
+            root,
+            max_bytes,
+            memory_bytes,
+            cache: Arc::new(OnceCell::new()),
+            layouts,
+        })
+    }
+
+    async fn cache(&self) -> Result<&HybridCache<String, Bytes>, IndexError> {
+        self.cache
+            .get_or_try_init(|| async {
+                let storage_bytes = usize::try_from(self.max_bytes)
+                    .map_err(|_error| IndexError::InvalidConfig("range cache is too large"))?;
+                let device = FsDeviceBuilder::new(&self.root)
+                    .with_capacity(storage_bytes)
+                    .build()
+                    .map_err(|error| IndexError::ObjectStore(error.to_string()))?;
+                HybridCacheBuilder::new()
+                    .with_name("ursula-index-parquet-ranges")
+                    .with_flush_on_close(false)
+                    .memory(self.memory_bytes)
+                    .with_weighter(|key: &String, value: &Bytes| {
+                        key.len().saturating_add(value.len())
+                    })
+                    .storage()
+                    .with_engine_config(BlockEngineConfig::new(device))
+                    .build()
+                    .await
+                    .map_err(|error| IndexError::ObjectStore(error.to_string()))
+            })
+            .await
+    }
+
+    async fn layout(
+        &self,
+        store: &ObjectStore,
+        meta: &PartMeta,
+    ) -> Result<Arc<part::PartLayout>, IndexError> {
+        if let Some(layout) = self.layouts.get(&meta.layout_key) {
+            return Ok(Arc::clone(layout.value()));
+        }
+        let object = store
+            .get(&meta.layout_key)
+            .await?
+            .ok_or_else(|| IndexError::MissingObject(meta.layout_key.clone()))?;
+        validate_content_addressed_object(&meta.layout_key, "layouts/", ".json", &object.bytes)?;
+        let layout: part::PartLayout = serde_json::from_slice(&object.bytes)?;
+        validate_layout(meta, &layout)?;
+        let layout = Arc::new(layout);
+        Ok(Arc::clone(
+            self.layouts.insert(meta.layout_key.clone(), layout).value(),
+        ))
+    }
+
+    async fn read_unit(
+        &self,
+        store: &ObjectStore,
+        part_key: &str,
+        unit: &part::PartUnit,
+    ) -> Result<Bytes, IndexError> {
+        let cache_key = format!("{}:{}-{}:{}", part_key, unit.start, unit.end, unit.hash);
+        let fetch_store = store.clone();
+        let fetch_key = part_key.to_owned();
+        let fetch_unit = unit.clone();
+        let entry = self
+            .cache()
+            .await?
+            .get_or_fetch(&cache_key, move || async move {
+                let bytes = fetch_store
+                    .get_range(&fetch_key, fetch_unit.start..fetch_unit.end)
+                    .await
+                    .map_err(RangeReadError)?
+                    .ok_or_else(|| RangeReadError(IndexError::MissingObject(fetch_key.clone())))?;
+                if digest(&bytes) != fetch_unit.hash {
+                    return Err(RangeReadError(IndexError::ObjectHashMismatch(fetch_key)));
+                }
+                Ok::<_, RangeReadError>(Bytes::from(bytes))
+            })
+            .await
+            .map_err(|error| IndexError::ObjectStore(error.to_string()))?;
+        let bytes = Bytes::clone(entry.value());
+        if digest(&bytes) != unit.hash {
+            return Err(IndexError::ObjectHashMismatch(part_key.to_owned()));
+        }
+        Ok(bytes)
+    }
+}
+
+impl VerifiedParquetReader {
+    async fn read(&self, range: Range<u64>) -> Result<Bytes, IndexError> {
+        if range.start > range.end || range.end > self.layout.bytes {
+            return Err(IndexError::InvalidPartLayout(self.layout.part_key.clone()));
+        }
+        if range.is_empty() {
+            return Ok(Bytes::new());
+        }
+        let capacity = usize::try_from(range.end.saturating_sub(range.start))
+            .map_err(|_error| IndexError::InvalidPartLayout(self.layout.part_key.clone()))?;
+        let mut result = Vec::with_capacity(capacity);
+        for unit in self
+            .layout
+            .units
+            .iter()
+            .filter(|unit| unit.end > range.start && unit.start < range.end)
+        {
+            let bytes = self
+                .cache
+                .read_unit(&self.store, &self.layout.part_key, unit)
+                .await?;
+            let slice_start = usize::try_from(range.start.saturating_sub(unit.start))
+                .map_err(|_error| IndexError::InvalidPartLayout(self.layout.part_key.clone()))?;
+            let slice_end = usize::try_from(range.end.min(unit.end).saturating_sub(unit.start))
+                .map_err(|_error| IndexError::InvalidPartLayout(self.layout.part_key.clone()))?;
+            let slice = bytes
+                .get(slice_start..slice_end)
+                .ok_or_else(|| IndexError::InvalidPartLayout(self.layout.part_key.clone()))?;
+            result.extend_from_slice(slice);
+        }
+        if result.len() != capacity {
+            return Err(IndexError::InvalidPartLayout(self.layout.part_key.clone()));
+        }
+        Ok(Bytes::from(result))
+    }
+}
+
+impl AsyncFileReader for VerifiedParquetReader {
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
+        async move {
+            self.read(range)
+                .await
+                .map_err(|error| ParquetError::External(Box::new(error)))
+        }
+        .boxed()
+    }
+
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
+        async move {
+            let reader = &*self;
+            futures_util::future::try_join_all(ranges.into_iter().map(|range| async move {
+                reader
+                    .read(range)
+                    .await
+                    .map_err(|error| ParquetError::External(Box::new(error)))
+            }))
+            .await
+        }
+        .boxed()
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+        async move {
+            let metadata_options = options.map(|options| options.metadata_options().clone());
+            let mut reader = ParquetMetaDataReader::new().with_metadata_options(metadata_options);
+            if let Some(options) = options {
+                reader = reader
+                    .with_column_index_policy(options.column_index_policy())
+                    .with_offset_index_policy(options.offset_index_policy());
+            }
+            let file_bytes = self.layout.bytes;
+            reader
+                .load_and_finish(&mut *self, file_bytes)
+                .await
+                .map(Arc::new)
+        }
+        .boxed()
     }
 }
 
@@ -353,6 +639,43 @@ fn validate_downloaded_part(
     Ok(())
 }
 
+fn validate_content_addressed_object(
+    key: &str,
+    prefix: &str,
+    suffix: &str,
+    bytes: &[u8],
+) -> Result<(), IndexError> {
+    let expected_hash = key
+        .strip_prefix(prefix)
+        .and_then(|value| value.strip_suffix(suffix))
+        .ok_or_else(|| IndexError::InvalidObjectKey(key.to_owned()))?;
+    if digest(bytes) != expected_hash {
+        return Err(IndexError::ObjectHashMismatch(key.to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_layout(meta: &PartMeta, layout: &part::PartLayout) -> Result<(), IndexError> {
+    if layout.version != 1
+        || layout.part_key != meta.key
+        || layout.bytes != meta.bytes
+        || layout.units.is_empty()
+    {
+        return Err(IndexError::InvalidPartLayout(meta.key.clone()));
+    }
+    let mut cursor = 0_u64;
+    for unit in &layout.units {
+        if unit.start != cursor || unit.start >= unit.end || unit.end > layout.bytes {
+            return Err(IndexError::InvalidPartLayout(meta.key.clone()));
+        }
+        cursor = unit.end;
+    }
+    if cursor != layout.bytes {
+        return Err(IndexError::InvalidPartLayout(meta.key.clone()));
+    }
+    Ok(())
+}
+
 fn make_cache_room(
     root: &Path,
     max_bytes: u64,
@@ -432,7 +755,7 @@ fn pin_locked(
 
 pub struct ServerlessEventIndex {
     store: ObjectStore,
-    cache: LocalCache,
+    cache: IndexCaches,
     config: EventIndexConfig,
     published: PublishedManifest,
     active: Vec<EventEntry>,
@@ -445,7 +768,7 @@ impl ServerlessEventIndex {
         cache_max_bytes: u64,
         config: EventIndexConfig,
     ) -> Result<Self, IndexError> {
-        let cache = EventIndexCache::new(cache_dir, cache_max_bytes)?;
+        let cache = EventIndexCache::serving(cache_dir, cache_max_bytes)?;
         Self::open(store.into(), cache, config, 0).await
     }
 
@@ -463,7 +786,7 @@ impl ServerlessEventIndex {
         cache_max_bytes: u64,
         config: EventIndexConfig,
     ) -> Result<Self, IndexError> {
-        let cache = EventIndexCache::new(cache_dir, cache_max_bytes)?;
+        let cache = EventIndexCache::serving(cache_dir, cache_max_bytes)?;
         Self::open(store.into(), cache, config, 0).await
     }
 
@@ -680,7 +1003,7 @@ impl ServerlessEventIndex {
             .iter()
             .filter(|meta| meta.max_record >= first_record && meta.min_record < checkpoint)
         {
-            let path = self.cache.materialize(&self.store, meta).await?;
+            let path = self.cache.parts().materialize(&self.store, meta).await?;
             committed.extend(part::read_all(&path)?);
         }
         for active in self.active.iter().filter(|entry| entry.record < checkpoint) {
@@ -877,7 +1200,7 @@ impl ServerlessEventIndex {
             .iter()
             .filter(|meta| meta.max_record >= first.record && meta.min_record <= last.record)
         {
-            let path = self.cache.materialize(&self.store, meta).await?;
+            let path = self.cache.parts().materialize(&self.store, meta).await?;
             committed.extend(part::read_all(&path)?);
         }
         for entry in expected {
@@ -982,8 +1305,14 @@ impl ServerlessEventIndex {
             .iter()
             .filter(|meta| meta.overlaps(from_ms, until_ms))
         {
-            let path = self.cache.materialize(&self.store, meta).await?;
-            entries.extend(part::read_part_range(&path, from_ms, until_ms)?);
+            let ranges = self.cache.ranges()?;
+            let layout = ranges.layout(&self.store, meta).await?;
+            let reader = VerifiedParquetReader {
+                store: self.store.clone(),
+                cache: ranges.clone(),
+                layout,
+            };
+            entries.extend(part::read_part_range_async(reader, from_ms, until_ms).await?);
         }
         entries.extend(
             self.active
@@ -1055,7 +1384,7 @@ impl ServerlessEventIndex {
                 .map(|meta| meta.key.as_str())
                 .collect::<HashSet<_>>();
             for meta in &candidate {
-                let path = self.cache.materialize(&self.store, meta).await?;
+                let path = self.cache.parts().materialize(&self.store, meta).await?;
                 entries.extend(part::read_all(&path)?);
             }
             entries.sort_unstable();
@@ -1111,6 +1440,7 @@ impl ServerlessEventIndex {
             }
         }
         let mut retained_parts = HashSet::new();
+        let mut retained_layouts = HashSet::new();
         let retained_manifest_keys = retained_manifests.iter().cloned().collect::<Vec<_>>();
         for key in &retained_manifest_keys {
             let object = self
@@ -1130,13 +1460,20 @@ impl ServerlessEventIndex {
                 continue;
             }
             let manifest: Manifest = serde_json::from_slice(&object.bytes)?;
-            retained_parts.extend(manifest.parts.into_iter().map(|part| part.key));
+            for part in manifest.parts {
+                retained_parts.insert(part.key);
+                retained_layouts.insert(part.layout_key);
+            }
         }
         let part_objects = self.store.list("parts/").await?;
+        let layout_objects = self.store.list("layouts/").await?;
         let latest = load_published(&self.store, &self.config.source_id).await?;
         let durable_through_record = latest.manifest.durable_through_record;
         retained_manifests.insert(latest.manifest_key);
-        retained_parts.extend(latest.manifest.parts.into_iter().map(|part| part.key));
+        for part in latest.manifest.parts {
+            retained_parts.insert(part.key);
+            retained_layouts.insert(part.layout_key);
+        }
         let stale_manifests = manifest_objects
             .into_iter()
             .filter(|object| object.key.ends_with(".json"))
@@ -1149,6 +1486,13 @@ impl ServerlessEventIndex {
             .filter(|object| object.key.ends_with(".parquet"))
             .filter(|object| eligible_for_gc(object.modified, cutoff))
             .filter(|object| !retained_parts.contains(&object.key))
+            .map(|object| object.key)
+            .collect::<Vec<_>>();
+        let stale_layouts = layout_objects
+            .into_iter()
+            .filter(|object| object.key.ends_with(".json"))
+            .filter(|object| eligible_for_gc(object.modified, cutoff))
+            .filter(|object| !retained_layouts.contains(&object.key))
             .map(|object| object.key)
             .collect::<Vec<_>>();
         let now_ms = now
@@ -1176,12 +1520,16 @@ impl ServerlessEventIndex {
         for key in &stale_parts {
             self.store.delete(key).await?;
         }
+        for key in &stale_layouts {
+            self.store.delete(key).await?;
+        }
         for key in &stale_claims {
             self.store.delete(key).await?;
         }
         self.refresh().await?;
         Ok(GarbageCollectionReport {
             deleted_parts: stale_parts.len(),
+            deleted_layouts: stale_layouts.len(),
             deleted_manifests: stale_manifests.len(),
             deleted_claims: stale_claims.len(),
         })
@@ -1214,16 +1562,21 @@ impl ServerlessEventIndex {
                 "part entries cross an event-time partition boundary",
             ));
         }
-        let temporary = tempfile::NamedTempFile::new_in(&self.cache.root)?;
+        let temporary = tempfile::NamedTempFile::new_in(&self.cache.parts().root)?;
         part::write_part(temporary.path(), entries, self.config.row_group_entries)?;
         let bytes = fs::read(temporary.path())?;
         let hash = digest(&bytes);
         let key = format!("parts/{hash}.parquet");
+        let layout = part::build_layout(temporary.path(), key.clone(), &bytes)?;
+        let layout_bytes = serde_json::to_vec(&layout)?;
+        let layout_key = format!("layouts/{}.json", digest(&layout_bytes));
         let _write = self.store.put_if_absent(&key, &bytes).await?;
+        let _layout_write = self.store.put_if_absent(&layout_key, &layout_bytes).await?;
         let first = entries.first().ok_or(IndexError::InvalidQuery)?;
         let last = entries.last().ok_or(IndexError::InvalidQuery)?;
         Ok(PartMeta {
             key,
+            layout_key,
             level,
             partition_start_ms,
             entries: u64::try_from(entries.len())
@@ -1547,11 +1900,21 @@ mod tests {
     use std::fs;
     use std::time::SystemTime;
 
+    use super::EventIndexCache;
     use super::LocalCache;
+    use super::ServerlessEventIndex;
+    use super::VerifiedRangeCache;
     use super::eligible_for_gc;
     use super::pin_locked;
     use super::remove_cache_file_if_unpinned;
+    use crate::EventEntry;
+    use crate::EventIndexConfig;
     use crate::IndexError;
+    use crate::object_store::ConditionalWrite;
+    use crate::object_store::FsObjectStore;
+    use crate::object_store::ObjectStore;
+    use crate::object_store::digest;
+    use crate::part::PartUnit;
 
     #[test]
     fn missing_modification_time_is_not_eligible_for_gc() {
@@ -1607,6 +1970,125 @@ mod tests {
         drop(guard);
         assert!(remove_cache_file_if_unpinned(&path, &cache.pins)?);
         assert!(!path.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "the test combines fallible setup with assertions"
+    )]
+    async fn verified_range_cache_deduplicates_fetches_and_rejects_corruption() -> anyhow::Result<()>
+    {
+        let objects = tempfile::TempDir::new()?;
+        let cache_dir = tempfile::TempDir::new()?;
+        let fs_store = FsObjectStore::new(objects.path())?;
+        let store = ObjectStore::from(fs_store.clone());
+        let cache = VerifiedRangeCache::new(cache_dir.path().to_path_buf(), 16 * 1024 * 1024)?;
+        let bytes = b"one verified parquet-native unit".to_vec();
+        let key = format!("parts/{}.parquet", digest(&bytes));
+        assert_eq!(
+            store.put_if_absent(&key, &bytes).await?,
+            ConditionalWrite::Written
+        );
+        let unit = PartUnit {
+            start: 0,
+            end: u64::try_from(bytes.len())?,
+            hash: digest(&bytes),
+        };
+        let (left, right) = tokio::join!(
+            cache.read_unit(&store, &key, &unit),
+            cache.read_unit(&store, &key, &unit)
+        );
+        let left = left?;
+        assert_eq!(left, bytes);
+        let right = right?;
+        assert_eq!(right, bytes);
+        assert!(std::ptr::eq(left.as_ptr(), right.as_ptr()));
+        assert_eq!(fs_store.range_read_count(), 1);
+
+        let corrupt_key = "parts/corrupt.parquet";
+        assert_eq!(
+            store.put_if_absent(corrupt_key, b"corrupt").await?,
+            ConditionalWrite::Written
+        );
+        let corrupt_unit = PartUnit {
+            start: 0,
+            end: 7,
+            hash: digest(b"expected"),
+        };
+        let _first_error = cache
+            .read_unit(&store, corrupt_key, &corrupt_unit)
+            .await
+            .expect_err("corrupt bytes must not enter the range cache");
+        let _second_error = cache
+            .read_unit(&store, corrupt_key, &corrupt_unit)
+            .await
+            .expect_err("a corrupt failed fetch must not become a cache hit");
+        assert_eq!(fs_store.range_read_count(), 3);
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "the test combines fallible setup with assertions"
+    )]
+    fn cache_roles_assign_the_full_maintenance_budget_to_parts() -> anyhow::Result<()> {
+        let serving_dir = tempfile::TempDir::new()?;
+        let maintenance_dir = tempfile::TempDir::new()?;
+        let serving = EventIndexCache::serving(serving_dir.path(), 16 * 1024 * 1024)?;
+        let maintenance = EventIndexCache::maintenance(maintenance_dir.path(), 16 * 1024 * 1024)?;
+        assert_eq!(serving.0.parts().max_bytes, 4 * 1024 * 1024);
+        assert_eq!(maintenance.0.parts().max_bytes, 16 * 1024 * 1024);
+        let _ranges = serving.0.ranges()?;
+        let _error = maintenance
+            .0
+            .ranges()
+            .expect_err("maintenance caches must not carry a range cache");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "the test combines fallible setup with assertions"
+    )]
+    async fn narrow_query_reads_verified_parquet_pages_instead_of_the_whole_part()
+    -> anyhow::Result<()> {
+        let objects = tempfile::TempDir::new()?;
+        let cache = tempfile::TempDir::new()?;
+        let store = FsObjectStore::new(objects.path())?;
+        let mut index = ServerlessEventIndex::open_fs(
+            store.clone(),
+            cache.path(),
+            16 * 1024 * 1024,
+            EventIndexConfig {
+                source_id: "narrow-range-test".to_owned(),
+                flush_entries: 10_000,
+                row_group_entries: 1_000,
+                timestamp_field: "captured_at".to_owned(),
+            },
+        )
+        .await?;
+        for record in 0..10_000_u64 {
+            index
+                .ingest(EventEntry {
+                    captured_at_ms: i64::try_from(record)?,
+                    record,
+                })
+                .await?;
+        }
+        let part_bytes = index
+            .published
+            .manifest
+            .parts
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("flush did not publish a part"))?
+            .bytes;
+        let result = index.query(4_500, 4_510, None, None, 100).await?;
+        assert_eq!(result.records.len(), 10);
+        assert!(store.range_read_bytes() < part_bytes);
         Ok(())
     }
 }

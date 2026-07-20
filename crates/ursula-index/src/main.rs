@@ -270,10 +270,9 @@ async fn run_single(args: Args, stream_url: Url) -> anyhow::Result<()> {
             config.clone(),
         )
         .await?;
-        let maintenance = ServerlessEventIndex::open_fs(
+        let maintenance = ServerlessEventIndex::open_fs_with_cache(
             store,
-            &maintenance_cache_dir,
-            args.maintenance_cache_max_bytes,
+            EventIndexCache::maintenance(&maintenance_cache_dir, args.maintenance_cache_max_bytes)?,
             config,
         )
         .await?;
@@ -297,10 +296,9 @@ async fn run_single(args: Args, stream_url: Url) -> anyhow::Result<()> {
             config.clone(),
         )
         .await?;
-        let maintenance = ServerlessEventIndex::open_s3(
+        let maintenance = ServerlessEventIndex::open_s3_with_cache(
             store,
-            &maintenance_cache_dir,
-            args.maintenance_cache_max_bytes,
+            EventIndexCache::maintenance(&maintenance_cache_dir, args.maintenance_cache_max_bytes)?,
             config,
         )
         .await?;
@@ -487,11 +485,11 @@ async fn run_pool(args: Args) -> anyhow::Result<()> {
         catalog,
         backend,
         settings: PoolIndexSettings {
-            serving_cache: EventIndexCache::new(
+            serving_cache: EventIndexCache::serving(
                 args.cache_dir.join("serving"),
                 args.cache_max_bytes,
             )?,
-            maintenance_cache: EventIndexCache::new(
+            maintenance_cache: EventIndexCache::maintenance(
                 args.cache_dir.join("maintenance"),
                 args.maintenance_cache_max_bytes,
             )?,
@@ -896,6 +894,7 @@ async fn maintenance_loop(
                     {
                         Ok(report) => tracing::info!(
                             deleted_parts = report.deleted_parts,
+                            deleted_layouts = report.deleted_layouts,
                             deleted_manifests = report.deleted_manifests,
                             deleted_claims = report.deleted_claims,
                             "event index garbage collection completed"
@@ -1435,11 +1434,11 @@ mod tests {
                 object_root: objects.path().to_path_buf(),
             },
             settings: PoolIndexSettings {
-                serving_cache: EventIndexCache::new(
+                serving_cache: EventIndexCache::serving(
                     cache.path().join("serving"),
                     16 * 1024 * 1024,
                 )?,
-                maintenance_cache: EventIndexCache::new(
+                maintenance_cache: EventIndexCache::maintenance(
                     cache.path().join("maintenance"),
                     16 * 1024 * 1024,
                 )?,
@@ -1498,11 +1497,11 @@ mod tests {
                 object_root: objects.path().to_path_buf(),
             },
             settings: PoolIndexSettings {
-                serving_cache: EventIndexCache::new(
+                serving_cache: EventIndexCache::serving(
                     cache.path().join("serving"),
                     16 * 1024 * 1024,
                 )?,
-                maintenance_cache: EventIndexCache::new(
+                maintenance_cache: EventIndexCache::maintenance(
                     cache.path().join("maintenance"),
                     16 * 1024 * 1024,
                 )?,

@@ -9,7 +9,6 @@ use tempfile::TempDir;
 use ursula_index::EventEntry;
 use ursula_index::EventIndexConfig;
 use ursula_index::FsObjectStore;
-use ursula_index::LocalEventIndex as EventIndex;
 use ursula_index::ServerlessEventIndex;
 
 const RECORDS: u64 = 100_000;
@@ -17,40 +16,47 @@ const COMPACTION_PARTS: usize = 8;
 const COMPACTION_PART_ENTRIES: usize = 10_000;
 
 fn event_time_query(criterion: &mut Criterion) {
-    let directory = TempDir::new().expect("create benchmark directory");
-    let mut index = EventIndex::open(directory.path(), EventIndexConfig {
-        source_id: "benchmark".to_owned(),
-        flush_entries: 10_000,
-        row_group_entries: 2_000,
-        timestamp_field: "captured_at".to_owned(),
-    })
-    .expect("open benchmark index");
-    for record in 0..RECORDS {
-        let captured_at_ms = i64::try_from(record.wrapping_mul(7_919) % RECORDS)
-            .expect("benchmark timestamp fits i64");
-        index
-            .ingest(EventEntry {
-                captured_at_ms,
-                record,
-            })
-            .expect("ingest benchmark event");
-    }
+    let runtime = tokio::runtime::Runtime::new().expect("create benchmark runtime");
+    let objects = TempDir::new().expect("create object directory");
+    let cache = TempDir::new().expect("create cache directory");
+    let mut index = runtime
+        .block_on(async {
+            let mut index = ServerlessEventIndex::open_fs(
+                FsObjectStore::new(objects.path())?,
+                cache.path(),
+                64 * 1024 * 1024,
+                EventIndexConfig {
+                    source_id: "benchmark".to_owned(),
+                    flush_entries: 10_000,
+                    row_group_entries: 2_000,
+                    timestamp_field: "captured_at".to_owned(),
+                },
+            )
+            .await?;
+            for record in 0..RECORDS {
+                let captured_at_ms = i64::try_from(record.wrapping_mul(7_919) % RECORDS)?;
+                index
+                    .ingest(EventEntry {
+                        captured_at_ms,
+                        record,
+                    })
+                    .await?;
+            }
+            Ok::<_, anyhow::Error>(index)
+        })
+        .expect("build query benchmark index");
 
     let mut group = criterion.benchmark_group("event_time_query");
     group.throughput(Throughput::Elements(100));
-    group.bench_with_input(
-        BenchmarkId::new("100_record_window", RECORDS),
-        &index,
-        |bencher, index| {
-            bencher.iter(|| {
-                black_box(
-                    index
-                        .query(50_000, 50_100, None, None, 1_000)
-                        .expect("query benchmark index"),
-                );
-            });
-        },
-    );
+    group.bench_function(BenchmarkId::new("100_record_window", RECORDS), |bencher| {
+        bencher.iter(|| {
+            black_box(
+                runtime
+                    .block_on(index.query(50_000, 50_100, None, None, 1_000))
+                    .expect("query benchmark index"),
+            );
+        });
+    });
     group.finish();
 }
 

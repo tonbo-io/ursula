@@ -68,6 +68,7 @@ async fn real_s3_conditional_publish_and_cache_recovery() -> anyhow::Result<()> 
         .garbage_collect(1, std::time::Duration::ZERO, SystemTime::now())
         .await?;
     assert_eq!(gc.deleted_parts, 2);
+    assert_eq!(gc.deleted_layouts, 2);
     drop(writer);
     drop(first_cache);
 
