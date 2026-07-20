@@ -11,7 +11,6 @@ use ursula_runtime::RuntimeConfig;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::SharedSnapshotStore;
-use ursula_runtime::WalGroupEngineFactory;
 use ursula_runtime::snapshot_store_from_config;
 use ursula_runtime::spawn_cold_flush_worker_if_configured;
 use ursula_runtime::spawn_cold_gc_worker_if_configured;
@@ -188,14 +187,6 @@ fn spawn_singleton(
     let runtime = match persistence {
         Persistence::InMemory => {
             let factory = InMemoryGroupEngineFactory::with_cold_store(cold_store.clone());
-            ShardRuntime::spawn_with_engine_factory_and_cold_store(
-                runtime_config,
-                factory,
-                cold_store,
-            )?
-        }
-        Persistence::Wal { wal_dir } => {
-            let factory = WalGroupEngineFactory::with_cold_store(wal_dir, cold_store.clone());
             ShardRuntime::spawn_with_engine_factory_and_cold_store(
                 runtime_config,
                 factory,

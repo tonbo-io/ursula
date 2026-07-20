@@ -8,8 +8,7 @@
 //!
 //! Default backend [`InlineSnapshotStore`] keeps bytes inside the pointer
 //! itself, preserving today's "snapshot rides through openraft" behavior.
-//! [`LocalSnapshotStore`] persists to the filesystem. The S3 backend is added
-//! in a follow-up PR and reuses the cold-store opendal client.
+//! The S3 backend reuses the cold-store opendal client.
 
 use std::fmt::Debug;
 use std::future::Future;
@@ -668,183 +667,17 @@ pub fn snapshot_store_from_config(
     match cfg.backend {
         ursula_config::RaftSnapshotBackend::Inline => Ok(None),
         #[cfg(not(madsim))]
-        ursula_config::RaftSnapshotBackend::Local => {
-            let root = cfg.local_root.as_ref().ok_or_else(|| {
-                SnapshotStoreError::Backend("snapshot local_root required for local backend".into())
-            })?;
-            let root_str = root.to_string_lossy();
-            if root_str.trim().is_empty() {
-                return Err(SnapshotStoreError::Backend(
-                    "snapshot local_root must not be empty".into(),
-                ));
-            }
-            Ok(Some(Arc::new(LocalSnapshotStore::new(root))))
-        }
-        #[cfg(not(madsim))]
         ursula_config::RaftSnapshotBackend::S3 => {
             let prefix = cfg.s3_prefix.as_deref().unwrap_or("snapshots");
             Ok(Some(Arc::new(S3SnapshotStore::try_new(cold_cfg, prefix)?)))
         }
         #[cfg(madsim)]
-        ursula_config::RaftSnapshotBackend::Local | ursula_config::RaftSnapshotBackend::S3 => {
-            Err(SnapshotStoreError::Backend(format!(
-                "snapshot backend {:?} has no I/O under madsim; use 'inline'",
-                cfg.backend
-            )))
-        }
+        ursula_config::RaftSnapshotBackend::S3 => Err(SnapshotStoreError::Backend(format!(
+            "snapshot backend {:?} has no I/O under madsim; use 'inline'",
+            cfg.backend
+        ))),
     }
 }
-
-#[cfg(not(madsim))]
-mod local {
-    use std::io;
-    use std::path::PathBuf;
-
-    use bytes::Bytes;
-    use tokio::io::AsyncWriteExt;
-
-    use super::SnapshotBytesIterator;
-    use super::SnapshotKey;
-    use super::SnapshotLocation;
-    use super::SnapshotStore;
-    use super::SnapshotStoreError;
-    use super::SnapshotStoreFuture;
-    use super::unique_snapshot_leaf;
-
-    /// Bytes live on the local filesystem under a root directory.
-    #[derive(Debug, Clone)]
-    pub struct LocalSnapshotStore {
-        root: PathBuf,
-    }
-
-    impl LocalSnapshotStore {
-        pub fn new(root: impl Into<PathBuf>) -> Self {
-            Self { root: root.into() }
-        }
-
-        fn path_for(&self, key: SnapshotKey) -> PathBuf {
-            self.root
-                .join(format!("group-{}", key.raft_group_id))
-                .join(unique_snapshot_leaf(&key.snapshot_id))
-        }
-    }
-
-    impl SnapshotStore for LocalSnapshotStore {
-        fn upload<'a>(
-            &'a self,
-            key: SnapshotKey,
-            bytes: Bytes,
-        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-            Box::pin(async move {
-                let path = self.path_for(key);
-                if let Some(parent) = path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-                let size_bytes = bytes.len() as u64;
-                tokio::fs::write(&path, bytes.as_ref()).await?;
-                Ok(SnapshotLocation::Local { path, size_bytes })
-            })
-        }
-
-        fn upload_iter<'a>(
-            &'a self,
-            key: SnapshotKey,
-            chunks: SnapshotBytesIterator,
-        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-            Box::pin(async move {
-                let path = self.path_for(key);
-                if let Some(parent) = path.parent() {
-                    tokio::fs::create_dir_all(parent).await?;
-                }
-                let mut size_bytes = 0u64;
-                let mut file = tokio::fs::File::create(&path).await?;
-                for chunk in chunks {
-                    let chunk = chunk?;
-                    size_bytes = size_bytes.checked_add(chunk.len() as u64).ok_or_else(|| {
-                        SnapshotStoreError::Integrity(format!(
-                            "local snapshot at {} size overflows u64",
-                            path.display()
-                        ))
-                    })?;
-                    file.write_all(chunk.as_ref()).await?;
-                }
-                file.sync_all().await?;
-                Ok(SnapshotLocation::Local { path, size_bytes })
-            })
-        }
-
-        fn download<'a>(
-            &'a self,
-            location: &'a SnapshotLocation,
-        ) -> SnapshotStoreFuture<'a, Vec<u8>> {
-            Box::pin(async move {
-                let SnapshotLocation::Local { path, size_bytes } = location else {
-                    return Err(SnapshotStoreError::Backend(format!(
-                        "local snapshot store cannot download {location:?}"
-                    )));
-                };
-                let bytes = tokio::fs::read(path).await.map_err(|err| {
-                    if err.kind() == io::ErrorKind::NotFound {
-                        SnapshotStoreError::NotFound(format!(
-                            "local snapshot missing at {}",
-                            path.display()
-                        ))
-                    } else {
-                        SnapshotStoreError::Io(err)
-                    }
-                })?;
-                if bytes.len() as u64 != *size_bytes {
-                    return Err(SnapshotStoreError::Integrity(format!(
-                        "local snapshot at {} size {} != expected {}",
-                        path.display(),
-                        bytes.len(),
-                        size_bytes
-                    )));
-                }
-                Ok(bytes)
-            })
-        }
-
-        fn delete<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
-            Box::pin(async move {
-                let SnapshotLocation::Local { path, .. } = location else {
-                    return Ok(());
-                };
-                match tokio::fs::remove_file(path).await {
-                    Ok(()) => Ok(()),
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-                    Err(err) => Err(SnapshotStoreError::Io(err)),
-                }
-            })
-        }
-
-        fn prune_retired<'a>(
-            &'a self,
-            raft_group_id: u32,
-            current: &'a SnapshotLocation,
-            retain_latest: usize,
-        ) -> SnapshotStoreFuture<'a, ()> {
-            Box::pin(async move {
-                let SnapshotLocation::Local {
-                    path: current_path, ..
-                } = current
-                else {
-                    return Ok(());
-                };
-                tracing::debug!(
-                    raft_group_id,
-                    current_path = %current_path.display(),
-                    retain_latest,
-                    "skipping local snapshot pruning until published OpenRaft pointers can be proven unreachable"
-                );
-                Ok(())
-            })
-        }
-    }
-}
-
-#[cfg(not(madsim))]
-pub use local::LocalSnapshotStore;
 
 #[cfg(test)]
 mod tests {
@@ -914,74 +747,6 @@ mod tests {
         let back = SnapshotPointer::decode(&bytes).unwrap();
         assert_eq!(back.snapshot_id, pointer.snapshot_id);
         assert_eq!(back.location.size_hint(), 12345);
-    }
-
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn local_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalSnapshotStore::new(dir.path());
-        let key = test_key(7, "group-7-T2-N1-500");
-        let loc = store
-            .upload(key, b"some snapshot bytes".to_vec().into())
-            .await
-            .unwrap();
-        let bytes = store.download(&loc).await.unwrap();
-        assert_eq!(bytes, b"some snapshot bytes");
-        store.delete(&loc).await.unwrap();
-        let again = store.download(&loc).await;
-        assert!(matches!(again, Err(SnapshotStoreError::NotFound(_))));
-        // Second delete is a no-op.
-        store.delete(&loc).await.unwrap();
-    }
-
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn local_two_uploads_with_same_snapshot_id_get_different_paths() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalSnapshotStore::new(dir.path());
-        let key1 = test_key(4, "group-4-T18-N3-264150");
-        let key2 = test_key(4, "group-4-T18-N3-264150");
-        let loc1 = store.upload(key1, b"body1".to_vec().into()).await.unwrap();
-        let loc2 = store.upload(key2, b"body2".to_vec().into()).await.unwrap();
-        let (path1, path2) = match (&loc1, &loc2) {
-            (
-                SnapshotLocation::Local { path: path1, .. },
-                SnapshotLocation::Local { path: path2, .. },
-            ) => (path1.clone(), path2.clone()),
-            _ => panic!("expected local locations"),
-        };
-        assert_ne!(
-            path1, path2,
-            "same snapshot_id must yield distinct local paths"
-        );
-        assert_eq!(store.download(&loc1).await.unwrap(), b"body1");
-        assert_eq!(store.download(&loc2).await.unwrap(), b"body2");
-    }
-
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn local_prune_retired_keeps_published_snapshot_locations_readable() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalSnapshotStore::new(dir.path());
-        let loc1 = store
-            .upload(test_key(7, "group-7-T1-N1-1"), b"one".to_vec().into())
-            .await
-            .unwrap();
-        let loc2 = store
-            .upload(test_key(7, "group-7-T1-N1-2"), b"two".to_vec().into())
-            .await
-            .unwrap();
-        let loc3 = store
-            .upload(test_key(7, "group-7-T1-N1-3"), b"three".to_vec().into())
-            .await
-            .unwrap();
-
-        store.prune_retired(7, &loc3, 1).await.unwrap();
-
-        assert_eq!(store.download(&loc1).await.unwrap(), b"one");
-        assert_eq!(store.download(&loc2).await.unwrap(), b"two");
-        assert_eq!(store.download(&loc3).await.unwrap(), b"three");
     }
 
     #[cfg(not(madsim))]
@@ -1090,20 +855,5 @@ mod tests {
             matches!(err, SnapshotStoreError::NotFound(_)),
             "expected NotFound after delete, got {err:?}"
         );
-    }
-
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn local_integrity_detects_size_mismatch() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalSnapshotStore::new(dir.path());
-        let key = test_key(1, "group-1-T1-N1-1");
-        let loc = store.upload(key, b"abcd".to_vec().into()).await.unwrap();
-        let SnapshotLocation::Local { path, .. } = &loc else {
-            unreachable!()
-        };
-        tokio::fs::write(path, b"abcde").await.unwrap();
-        let result = store.download(&loc).await;
-        assert!(matches!(result, Err(SnapshotStoreError::Integrity(_))));
     }
 }

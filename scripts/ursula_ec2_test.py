@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json
+import tomllib
 import unittest
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -45,7 +45,7 @@ def ops(cold_env: dict[str, str]) -> Iterator[Ec2Ops]:
 
 
 class Ec2ConfigMappingTest(unittest.TestCase):
-    def test_known_legacy_keys_map_into_generated_json_config(self) -> None:
+    def test_known_legacy_keys_map_into_generated_toml_config(self) -> None:
         with ops(
             {
                 "URSULA_COLD_BACKEND": "s3",
@@ -60,7 +60,7 @@ class Ec2ConfigMappingTest(unittest.TestCase):
             }
         ) as op:
             generated = op.generate_config(op.config.nodes[0])
-        config = json.loads(generated)
+        config = tomllib.loads(generated)
 
         self.assertEqual(config["storage"]["cold"]["gc_max_entries"], 77)
         self.assertEqual(config["storage"]["cold"]["flush_size"], "12MiB")

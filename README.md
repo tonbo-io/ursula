@@ -32,7 +32,7 @@ Run a single in-memory node (no persistence, good for kicking the tires):
 cargo run --bin ursula -- --preset default
 ```
 
-It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses an in-memory engine. Use `--config` to load a TOML/JSON/YAML config file, or `--preset` to choose a built-in resource preset.
+It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses an in-memory engine. Use `--config` to load a TOML config file, or `--preset` to choose a built-in resource preset.
 
 Create a bucket and stream, append bytes, read them back:
 

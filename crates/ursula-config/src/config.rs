@@ -34,14 +34,12 @@ pub enum RaftSnapshotBackend {
     #[default]
     #[serde(alias = "default", alias = "")]
     Inline,
-    Local,
     S3,
 }
 
 /// Top-level Ursula server configuration.
 ///
-/// Populated from a config file (TOML/JSON/YAML), an optional preset, and
-/// CLI overrides.
+/// Populated from a TOML config file, an optional preset, and CLI overrides.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UrsulaConfig {
@@ -404,9 +402,6 @@ impl Default for ColdCacheConfig {
 pub struct RaftSnapshotConfig {
     /// Snapshot store backend.
     pub backend: RaftSnapshotBackend,
-    /// Root directory for local snapshot storage.
-    /// Required when `backend` is `Local`.
-    pub local_root: Option<PathBuf>,
     /// S3 prefix for snapshot objects. Used only when `backend` is `S3`.
     pub s3_prefix: Option<String>,
     /// Interval for the manual snapshot driver.
@@ -423,7 +418,6 @@ impl Default for RaftSnapshotConfig {
     fn default() -> Self {
         Self {
             backend: RaftSnapshotBackend::Inline,
-            local_root: None,
             s3_prefix: None,
             drive_interval: None,
             drive_flush_concurrency: 4,

@@ -14,10 +14,6 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error("TOML parse error: {0}")]
     TomlParse(#[from] toml::de::Error),
-    #[error("YAML parse error: {0}")]
-    YamlParse(#[from] yaml_serde::Error),
-    #[error("JSON parse error: {0}")]
-    JsonParse(#[from] serde_json::Error),
     #[error("validation error: {0}")]
     Validation(#[from] ValidationError),
     #[error("{0}")]
@@ -26,22 +22,14 @@ pub enum ConfigError {
 
 /// Search for a default config file when `--config` is not given.
 ///
-/// Searches for TOML files first, then JSON, then YAML, in order of specificity.
+/// Searches TOML candidates in order of specificity.
 pub fn find_default_config() -> Option<std::path::PathBuf> {
     let mut candidates = vec![
         std::path::PathBuf::from("./ursula.toml"),
-        std::path::PathBuf::from("./ursula.json"),
-        std::path::PathBuf::from("./ursula.yaml"),
-        std::path::PathBuf::from("./ursula.yml"),
         std::path::PathBuf::from("/etc/ursula/ursula.toml"),
-        std::path::PathBuf::from("/etc/ursula/ursula.json"),
-        std::path::PathBuf::from("/etc/ursula/ursula.yaml"),
-        std::path::PathBuf::from("/etc/ursula/ursula.yml"),
     ];
     if let Some(config_dir) = dirs::config_dir() {
         candidates.push(config_dir.join("ursula").join("config.toml"));
-        candidates.push(config_dir.join("ursula").join("config.json"));
-        candidates.push(config_dir.join("ursula").join("config.yaml"));
     }
     for path in &candidates {
         if path.exists() {
@@ -49,34 +37,6 @@ pub fn find_default_config() -> Option<std::path::PathBuf> {
         }
     }
     None
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConfigFormat {
-    Toml,
-    Json,
-    Yaml,
-}
-
-/// Parse raw config text into a `toml::Table` according to the given format.
-fn parse_raw(raw: &str, format: ConfigFormat) -> Result<toml::Table, ConfigError> {
-    match format {
-        ConfigFormat::Toml => Ok(raw.parse()?),
-        ConfigFormat::Json => {
-            let value: toml::Value = serde_json::from_str(raw)?;
-            value
-                .as_table()
-                .cloned()
-                .ok_or_else(|| ConfigError::Other("top-level config value is not a mapping".into()))
-        }
-        ConfigFormat::Yaml => {
-            let value: toml::Value = yaml_serde::from_str(raw)?;
-            value
-                .as_table()
-                .cloned()
-                .ok_or_else(|| ConfigError::Other("top-level config value is not a mapping".into()))
-        }
-    }
 }
 
 /// Load config from an optional file path with optional preset and node_id override.
@@ -89,11 +49,8 @@ fn parse_raw(raw: &str, format: ConfigFormat) -> Result<toml::Table, ConfigError
 /// plus `UrsulaConfig` defaults.  This allows `--preset tiny` to work without
 /// a config file.
 ///
-/// The file format is detected from the extension:
-/// * `.toml`  → TOML
-/// * `.json`  → JSON
-/// * `.yaml` / `.yml` → YAML
-/// * anything else → error
+/// Only TOML config files (`.toml`) are supported; any other extension is an
+/// error.
 pub fn load_config(
     path: Option<&Path>,
     preset: Option<Preset>,
@@ -101,19 +58,14 @@ pub fn load_config(
 ) -> Result<UrsulaConfig, ConfigError> {
     let user_table = match path {
         Some(path) => {
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                return Err(ConfigError::Other(format!(
+                    "unsupported config file extension for '{}': only TOML is supported",
+                    path.display()
+                )));
+            }
             let raw = std::fs::read_to_string(path)?;
-            let format = match path.extension().and_then(|e| e.to_str()) {
-                Some("yaml") | Some("yml") => ConfigFormat::Yaml,
-                Some("json") => ConfigFormat::Json,
-                Some("toml") => ConfigFormat::Toml,
-                _ => {
-                    return Err(ConfigError::Other(format!(
-                        "unsupported config file extension for '{}'",
-                        path.display()
-                    )));
-                }
-            };
-            parse_raw(&raw, format)?
+            raw.parse::<toml::Table>()?
         }
         None => toml::Table::new(),
     };
