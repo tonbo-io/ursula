@@ -28,7 +28,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[derive(Parser, Debug)]
 #[command(version, about = "Ursula durable-stream server")]
 struct Cli {
-    /// Path to the TOML, JSON, or YAML configuration file.
+    /// Path to the TOML configuration file.
     #[arg(short, long)]
     config: Option<PathBuf>,
 

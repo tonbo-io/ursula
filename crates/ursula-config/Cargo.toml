@@ -11,9 +11,7 @@ description = "Ursula configuration types and TOML loading."
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
 toml = { workspace = true }
-yaml_serde = { workspace = true }
 thiserror = { workspace = true }
 dirs = { workspace = true }
 

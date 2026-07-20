@@ -1,5 +1,4 @@
 pub mod in_memory;
-pub mod wal;
 
 use std::borrow::Cow;
 use std::future::Future;
