@@ -15,6 +15,8 @@ use openraft::raft::SnapshotResponse;
 use openraft::rt::WatchReceiver;
 use serde_json::json;
 use tower::ServiceExt;
+use ursula_raft::RaftGroupMetricsSnapshot;
+use ursula_raft::RaftLogProgressSnapshot;
 use ursula_raft::StaticGrpcRaftGroupEngineFactory;
 use ursula_raft::StaticGrpcRaftMembershipConfig;
 use ursula_raft::UrsulaRaftTypeConfig;
@@ -30,6 +32,66 @@ use ursula_runtime::StreamErrorContext;
 use ursula_shard::RaftGroupId;
 
 use super::*;
+
+/// Sends one HTTP request through a cloned `Router` and returns the response.
+///
+/// The status and header expectations stay at the call site; this only folds
+/// the `Request::builder()` / `oneshot` / double-`expect` plumbing.
+async fn send(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: Body,
+) -> Response {
+    let mut request = Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    app.clone()
+        .oneshot(request.body(body).expect("request"))
+        .await
+        .expect("response")
+}
+
+async fn http_get(app: &Router, uri: &str) -> Response {
+    send(app, "GET", uri, &[], Body::empty()).await
+}
+
+async fn http_head(app: &Router, uri: &str) -> Response {
+    send(app, "HEAD", uri, &[], Body::empty()).await
+}
+
+async fn http_delete(app: &Router, uri: &str) -> Response {
+    send(app, "DELETE", uri, &[], Body::empty()).await
+}
+
+async fn http_put(app: &Router, uri: &str, headers: &[(&str, &str)], body: Body) -> Response {
+    send(app, "PUT", uri, headers, body).await
+}
+
+async fn http_post(app: &Router, uri: &str, headers: &[(&str, &str)], body: Body) -> Response {
+    send(app, "POST", uri, headers, body).await
+}
+
+/// Returns the named response header as `&str`, panicking when absent.
+#[track_caller]
+fn header_str<B, K>(response: &axum::http::Response<B>, name: K) -> &str
+where K: axum::http::header::AsHeaderName + std::fmt::Display {
+    let label = name.to_string();
+    response
+        .headers()
+        .get(name)
+        .unwrap_or_else(|| panic!("missing header {label}"))
+        .to_str()
+        .expect("header value is valid utf-8")
+}
+
+async fn body_bytes(response: Response) -> Bytes {
+    to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body")
+}
 
 fn test_config(core_count: usize, group_count: usize) -> ursula_config::UrsulaConfig {
     let mut config = ursula_config::UrsulaConfig::default();
@@ -303,79 +365,6 @@ async fn spawn_static_grpc_test_node(
     router_peers: Vec<(u64, String)>,
     initialize_membership: bool,
     raft_group_count: usize,
-) -> StaticGrpcTestNode {
-    spawn_static_grpc_test_node_with_log_dir(
-        node_id,
-        listener,
-        factory_peers,
-        router_peers,
-        initialize_membership,
-        raft_group_count,
-        None,
-    )
-    .await
-}
-
-async fn spawn_static_grpc_test_node_with_log_dir(
-    node_id: u64,
-    listener: tokio::net::TcpListener,
-    factory_peers: Vec<(u64, String)>,
-    router_peers: Vec<(u64, String)>,
-    initialize_membership: bool,
-    raft_group_count: usize,
-    raft_log_dir: Option<PathBuf>,
-) -> StaticGrpcTestNode {
-    spawn_static_grpc_test_node_with_storage(
-        node_id,
-        listener,
-        factory_peers,
-        router_peers,
-        initialize_membership,
-        raft_group_count,
-        StaticGrpcTestNodeStorage {
-            raft_log_dir,
-            cold_store: None,
-            engine_config: None,
-            per_group_initializers: false,
-            per_group_voters: BTreeMap::new(),
-        },
-    )
-    .await
-}
-
-async fn spawn_static_grpc_test_node_with_per_group_initializers(
-    node_id: u64,
-    listener: tokio::net::TcpListener,
-    factory_peers: Vec<(u64, String)>,
-    router_peers: Vec<(u64, String)>,
-    initialize_membership: bool,
-    raft_group_count: usize,
-) -> StaticGrpcTestNode {
-    spawn_static_grpc_test_node_with_storage(
-        node_id,
-        listener,
-        factory_peers,
-        router_peers,
-        initialize_membership,
-        raft_group_count,
-        StaticGrpcTestNodeStorage {
-            raft_log_dir: None,
-            cold_store: None,
-            engine_config: None,
-            per_group_initializers: true,
-            per_group_voters: BTreeMap::new(),
-        },
-    )
-    .await
-}
-
-async fn spawn_static_grpc_test_node_with_storage(
-    node_id: u64,
-    listener: tokio::net::TcpListener,
-    factory_peers: Vec<(u64, String)>,
-    router_peers: Vec<(u64, String)>,
-    initialize_membership: bool,
-    raft_group_count: usize,
     storage: StaticGrpcTestNodeStorage,
 ) -> StaticGrpcTestNode {
     let registry = RaftGroupHandleRegistry::default();
@@ -427,97 +416,56 @@ async fn spawn_static_grpc_test_node_with_storage(
 async fn create_append_read_and_head_match_perf_compare_subset() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/stream-1")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/stream-1",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
-    assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "text/plain");
+    assert_eq!(header_str(&response, CONTENT_TYPE), "text/plain");
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/stream-1")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::from("abcdefg"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/stream-1",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("abcdefg"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        response.headers().get(HEADER_STREAM_NEXT_OFFSET).unwrap(),
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         "00000000000000000007"
     );
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/stream-1?offset=2&max_bytes=3")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/stream-1?offset=2&max_bytes=3").await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "text/plain");
+    assert_eq!(header_str(&response, CONTENT_TYPE), "text/plain");
     assert_eq!(
-        response.headers().get(HEADER_STREAM_NEXT_OFFSET).unwrap(),
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         "00000000000000000005"
     );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], b"cde");
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("HEAD")
-                .uri("/benchcmp/stream-1")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_head(&app, "/benchcmp/stream-1").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response.headers().get(HEADER_STREAM_NEXT_OFFSET).unwrap(),
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         "00000000000000000007"
     );
-    assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "text/plain");
+    assert_eq!(header_str(&response, CONTENT_TYPE), "text/plain");
     assert_eq!(
-        response
-            .headers()
-            .get(HEADER_STREAM_INTEGRITY_LIVE_RECORDS)
-            .unwrap(),
+        header_str(&response, HEADER_STREAM_INTEGRITY_LIVE_RECORDS),
         "1"
     );
     assert_eq!(
-        response
-            .headers()
-            .get(HEADER_STREAM_INTEGRITY_TOTAL_RECORDS)
-            .unwrap(),
+        header_str(&response, HEADER_STREAM_INTEGRITY_TOTAL_RECORDS),
         "1"
     );
     assert_eq!(
-        response
-            .headers()
-            .get(HEADER_STREAM_INTEGRITY_EVICTED_RECORDS)
-            .unwrap(),
+        header_str(&response, HEADER_STREAM_INTEGRITY_EVICTED_RECORDS),
         "0"
     );
     assert!(
@@ -532,18 +480,13 @@ async fn create_append_read_and_head_match_perf_compare_subset() {
 async fn stream_attrs_can_be_updated_and_read_over_http() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/attrs-http")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/attrs-http",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
     let attrs = json!({
@@ -553,86 +496,44 @@ async fn stream_attrs_can_be_updated_and_read_over_http() {
             "purpose": "customer-support"
         }
     });
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/attrs-http/attrs")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(attrs.to_string()))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/attrs-http/attrs",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(attrs.to_string()),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/attrs-http/attrs")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/attrs-http/attrs").await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "application/json"
-    );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    assert_eq!(header_str(&response, CONTENT_TYPE), "application/json");
+    let body = body_bytes(response).await;
     let actual: serde_json::Value = serde_json::from_slice(&body).expect("attrs json");
     assert_eq!(actual, attrs);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/attrs-http/attrs")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from("{}"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/attrs-http/attrs",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from("{}"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/attrs-http/attrs")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/attrs-http/attrs").await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     let actual: serde_json::Value = serde_json::from_slice(&body).expect("attrs json");
     assert_eq!(actual, json!({}));
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/attrs-http")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/attrs-http",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
 }
 
@@ -647,36 +548,21 @@ async fn stream_attrs_can_be_set_when_creating_stream_over_http() {
         }
     });
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/attrs-create-http")
-                .header(CONTENT_TYPE, "text/plain")
-                .header("stream-attrs", attrs.to_string())
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/attrs-create-http",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            ("stream-attrs", &attrs.to_string()),
+        ],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/attrs-create-http/attrs")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/attrs-create-http/attrs").await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     let actual: serde_json::Value = serde_json::from_slice(&body).expect("attrs json");
     assert_eq!(actual, attrs);
 }
@@ -685,31 +571,16 @@ async fn stream_attrs_can_be_set_when_creating_stream_over_http() {
 async fn stream_attrs_endpoints_return_not_found_for_missing_stream() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/attrs-missing/attrs")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/attrs-missing/attrs").await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/attrs-missing/attrs")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"title":"missing"}"#))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/attrs-missing/attrs",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"title":"missing"}"#),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
@@ -717,33 +588,25 @@ async fn stream_attrs_endpoints_return_not_found_for_missing_stream() {
 async fn create_stream_rejects_invalid_stream_attrs_header() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/attrs-bad-header")
-                .header(CONTENT_TYPE, "text/plain")
-                .header("stream-attrs", "{not json")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/attrs-bad-header",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            ("stream-attrs", "{not json"),
+        ],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/attrs-bad-header/attrs")
-                .header(CONTENT_TYPE, "application/json5")
-                .body(Body::from(r#"{"title":"json5"}"#))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/attrs-bad-header/attrs",
+        &[(CONTENT_TYPE.as_str(), "application/json5")],
+        Body::from(r#"{"title":"json5"}"#),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -751,21 +614,9 @@ async fn create_stream_rejects_invalid_stream_attrs_header() {
 async fn close_only_post_sets_closed_state_and_rejects_later_append() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/closing")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(&app, "/benchcmp/closing", &[], Body::empty()).await;
     let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(
         status,
         StatusCode::CREATED,
@@ -773,36 +624,23 @@ async fn close_only_post_sets_closed_state_and_rejects_later_append() {
         std::str::from_utf8(&body).unwrap_or("<non-utf8>")
     );
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/closing")
-                .header(HEADER_STREAM_CLOSED, "true")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/closing",
+        &[(HEADER_STREAM_CLOSED, "true")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_CLOSED).unwrap(),
-        "true"
-    );
+    assert_eq!(header_str(&response, HEADER_STREAM_CLOSED), "true");
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/closing")
-                .header(CONTENT_TYPE, DEFAULT_CONTENT_TYPE)
-                .body(Body::from("x"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/closing",
+        &[(CONTENT_TYPE.as_str(), DEFAULT_CONTENT_TYPE)],
+        Body::from("x"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
@@ -810,59 +648,45 @@ async fn close_only_post_sets_closed_state_and_rejects_later_append() {
 async fn append_conflict_precedence_reports_closed_header_before_mismatch_or_seq() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/closed-precedence")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/closed-precedence",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/closed-precedence")
-                .header(CONTENT_TYPE, "text/plain")
-                .header(HEADER_STREAM_CLOSED, "true")
-                .body(Body::from("final"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/closed-precedence",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_STREAM_CLOSED, "true"),
+        ],
+        Body::from("final"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        response.headers().get(HEADER_STREAM_NEXT_OFFSET).unwrap(),
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         "00000000000000000005"
     );
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/closed-precedence")
-                .header(CONTENT_TYPE, "application/octet-stream")
-                .header(HEADER_STREAM_SEQ, "0001")
-                .body(Body::from("too-late"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/closed-precedence",
+        &[
+            (CONTENT_TYPE.as_str(), "application/octet-stream"),
+            (HEADER_STREAM_SEQ, "0001"),
+        ],
+        Body::from("too-late"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(header_str(&response, HEADER_STREAM_CLOSED), "true");
     assert_eq!(
-        response.headers().get(HEADER_STREAM_CLOSED).unwrap(),
-        "true"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_NEXT_OFFSET).unwrap(),
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         "00000000000000000005"
     );
 }
@@ -871,63 +695,49 @@ async fn append_conflict_precedence_reports_closed_header_before_mismatch_or_seq
 async fn stream_seq_header_rejects_regressing_appends() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/seq-stream")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/seq-stream",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/seq-stream")
-                .header(CONTENT_TYPE, "text/plain")
-                .header(HEADER_STREAM_SEQ, "0002")
-                .body(Body::from("a"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/seq-stream",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_STREAM_SEQ, "0002"),
+        ],
+        Body::from("a"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/seq-stream")
-                .header(CONTENT_TYPE, "text/plain")
-                .header(HEADER_STREAM_SEQ, "0002")
-                .body(Body::from("b"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/seq-stream",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_STREAM_SEQ, "0002"),
+        ],
+        Body::from("b"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/seq-stream")
-                .header(CONTENT_TYPE, "text/plain")
-                .header(HEADER_STREAM_SEQ, "0003")
-                .body(Body::from("c"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/seq-stream",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_STREAM_SEQ, "0003"),
+        ],
+        Body::from("c"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }
 
@@ -935,210 +745,139 @@ async fn stream_seq_header_rejects_regressing_appends() {
 async fn producer_headers_deduplicate_retries_and_fence_stale_epochs() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/producer-http")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/producer-http",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/producer-http")
-                .header(CONTENT_TYPE, "text/plain")
-                .header(HEADER_PRODUCER_ID, "writer-1")
-                .header(HEADER_PRODUCER_EPOCH, "0")
-                .header(HEADER_PRODUCER_SEQ, "0")
-                .body(Body::from("a"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/producer-http",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_PRODUCER_ID, "writer-1"),
+            (HEADER_PRODUCER_EPOCH, "0"),
+            (HEADER_PRODUCER_SEQ, "0"),
+        ],
+        Body::from("a"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers().get(HEADER_PRODUCER_EPOCH).unwrap(), "0");
-    assert_eq!(response.headers().get(HEADER_PRODUCER_SEQ).unwrap(), "0");
+    assert_eq!(header_str(&response, HEADER_PRODUCER_EPOCH), "0");
+    assert_eq!(header_str(&response, HEADER_PRODUCER_SEQ), "0");
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/producer-http")
-                .header(CONTENT_TYPE, "text/plain")
-                .header(HEADER_PRODUCER_ID, "writer-1")
-                .header(HEADER_PRODUCER_EPOCH, "0")
-                .header(HEADER_PRODUCER_SEQ, "0")
-                .body(Body::from("ignored"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/producer-http",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_PRODUCER_ID, "writer-1"),
+            (HEADER_PRODUCER_EPOCH, "0"),
+            (HEADER_PRODUCER_SEQ, "0"),
+        ],
+        Body::from("ignored"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        response.headers().get(HEADER_STREAM_NEXT_OFFSET).unwrap(),
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         "00000000000000000001"
     );
-    assert_eq!(response.headers().get(HEADER_PRODUCER_EPOCH).unwrap(), "0");
-    assert_eq!(response.headers().get(HEADER_PRODUCER_SEQ).unwrap(), "0");
+    assert_eq!(header_str(&response, HEADER_PRODUCER_EPOCH), "0");
+    assert_eq!(header_str(&response, HEADER_PRODUCER_SEQ), "0");
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/producer-http?offset=0&max_bytes=16")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/producer-http?offset=0&max_bytes=16").await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], b"a");
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/producer-http")
-                .header(CONTENT_TYPE, "text/plain")
-                .header(HEADER_PRODUCER_ID, "writer-1")
-                .header(HEADER_PRODUCER_EPOCH, "0")
-                .header(HEADER_PRODUCER_SEQ, "2")
-                .body(Body::from("gap"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/producer-http",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_PRODUCER_ID, "writer-1"),
+            (HEADER_PRODUCER_EPOCH, "0"),
+            (HEADER_PRODUCER_SEQ, "2"),
+        ],
+        Body::from("gap"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        response.headers().get("producer-expected-seq").unwrap(),
-        "1"
-    );
-    assert_eq!(
-        response.headers().get("producer-received-seq").unwrap(),
-        "2"
-    );
+    assert_eq!(header_str(&response, "producer-expected-seq"), "1");
+    assert_eq!(header_str(&response, "producer-received-seq"), "2");
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/producer-http")
-                .header(CONTENT_TYPE, "text/plain")
-                .header(HEADER_PRODUCER_ID, "writer-1")
-                .header(HEADER_PRODUCER_EPOCH, "1")
-                .header(HEADER_PRODUCER_SEQ, "0")
-                .body(Body::from("b"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/producer-http",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_PRODUCER_ID, "writer-1"),
+            (HEADER_PRODUCER_EPOCH, "1"),
+            (HEADER_PRODUCER_SEQ, "0"),
+        ],
+        Body::from("b"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers().get(HEADER_PRODUCER_EPOCH).unwrap(), "1");
-    assert_eq!(response.headers().get(HEADER_PRODUCER_SEQ).unwrap(), "0");
+    assert_eq!(header_str(&response, HEADER_PRODUCER_EPOCH), "1");
+    assert_eq!(header_str(&response, HEADER_PRODUCER_SEQ), "0");
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/producer-http")
-                .header(CONTENT_TYPE, "text/plain")
-                .header(HEADER_PRODUCER_ID, "writer-1")
-                .header(HEADER_PRODUCER_EPOCH, "0")
-                .header(HEADER_PRODUCER_SEQ, "1")
-                .body(Body::from("stale"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/producer-http",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_PRODUCER_ID, "writer-1"),
+            (HEADER_PRODUCER_EPOCH, "0"),
+            (HEADER_PRODUCER_SEQ, "1"),
+        ],
+        Body::from("stale"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(response.headers().get(HEADER_PRODUCER_EPOCH).unwrap(), "1");
+    assert_eq!(header_str(&response, HEADER_PRODUCER_EPOCH), "1");
 }
 
 #[tokio::test]
 async fn delete_stream_removes_http_visible_state() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/delete-http")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/delete-http",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/delete-http")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::from("payload"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/delete-http",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("payload"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri("/benchcmp/delete-http")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_delete(&app, "/benchcmp/delete-http").await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("HEAD")
-                .uri("/benchcmp/delete-http")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_head(&app, "/benchcmp/delete-http").await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/delete-http")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::from("x"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/delete-http",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("x"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
@@ -1146,77 +885,44 @@ async fn delete_stream_removes_http_visible_state() {
 async fn append_batch_matches_perf_compare_frame_format() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/batch-stream")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/batch-stream",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/batch-stream/append-batch")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::from(batch_body(&[
-                    b"abc".as_slice(),
-                    b"de".as_slice(),
-                ])))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/batch-stream/append-batch",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from(batch_body(&[b"abc".as_slice(), b"de".as_slice()])),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], br#"[{"status":204},{"status":204}]"#);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/batch-stream/append-batch")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::from(batch_body(&[b"".as_slice(), b"f".as_slice()])))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/batch-stream/append-batch",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from(batch_body(&[b"".as_slice(), b"f".as_slice()])),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], br#"[{"status":400},{"status":204}]"#);
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/batch-stream?offset=0&max_bytes=8")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/batch-stream?offset=0&max_bytes=8").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response.headers().get(HEADER_STREAM_NEXT_OFFSET).unwrap(),
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         "00000000000000000006"
     );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], b"abcdef");
 }
 
@@ -1224,119 +930,83 @@ async fn append_batch_matches_perf_compare_frame_format() {
 async fn append_batch_minimal_ack_skips_success_body_but_keeps_item_errors() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/batch-minimal")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/batch-minimal",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/batch-minimal/append-batch")
-                .header(CONTENT_TYPE, "text/plain")
-                .header(HEADER_PREFER, "return=minimal")
-                .body(Body::from(batch_body(&[b"a".as_slice(), b"b".as_slice()])))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/batch-minimal/append-batch",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_PREFER, "return=minimal"),
+        ],
+        Body::from(batch_body(&[b"a".as_slice(), b"b".as_slice()])),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert!(body.is_empty());
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/batch-minimal/append-batch")
-                .header(CONTENT_TYPE, "text/plain")
-                .header(HEADER_PREFER, "return=minimal")
-                .body(Body::from(batch_body(&[b"".as_slice(), b"c".as_slice()])))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/batch-minimal/append-batch",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_PREFER, "return=minimal"),
+        ],
+        Body::from(batch_body(&[b"".as_slice(), b"c".as_slice()])),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], br#"[{"status":400},{"status":204}]"#);
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/batch-minimal?offset=0&max_bytes=16")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/batch-minimal?offset=0&max_bytes=16").await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], b"abc");
 }
 
 #[tokio::test]
 async fn json_append_batch_returns_per_frame_record_ranges() {
     let app = test_router();
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/json-batch-records")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/json-batch-records",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/json-batch-records/append-batch")
-                .header(CONTENT_TYPE, "application/json")
-                .header(HEADER_PREFER, "return=minimal")
-                .header(HEADER_PRODUCER_ID, "json-writer")
-                .header(HEADER_PRODUCER_EPOCH, "0")
-                .header(HEADER_PRODUCER_SEQ, "0")
-                .body(Body::from(batch_body(&[
-                    br#"[{"id":1},{"id":2}]"#.as_slice(),
-                    br#"{"id":3}"#.as_slice(),
-                ])))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/json-batch-records/append-batch",
+        &[
+            (CONTENT_TYPE.as_str(), "application/json"),
+            (HEADER_PREFER, "return=minimal"),
+            (HEADER_PRODUCER_ID, "json-writer"),
+            (HEADER_PRODUCER_EPOCH, "0"),
+            (HEADER_PRODUCER_SEQ, "0"),
+        ],
+        Body::from(batch_body(&[
+            br#"[{"id":1},{"id":2}]"#.as_slice(),
+            br#"{"id":3}"#.as_slice(),
+        ])),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response.headers().get(HEADER_STREAM_EXTENSIONS).unwrap(),
+        header_str(&response, HEADER_STREAM_EXTENSIONS),
         JSON_RECORD_COORDINATES_EXTENSION
     );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     let body: serde_json::Value = serde_json::from_slice(&body).expect("batch ack JSON");
     assert_eq!(
         body,
@@ -1346,29 +1016,25 @@ async fn json_append_batch_returns_per_frame_record_ranges() {
         ])
     );
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/json-batch-records/append-batch")
-                .header(CONTENT_TYPE, "application/json")
-                .header(HEADER_PREFER, "return=minimal")
-                .header(HEADER_PRODUCER_ID, "json-writer")
-                .header(HEADER_PRODUCER_EPOCH, "0")
-                .header(HEADER_PRODUCER_SEQ, "0")
-                .body(Body::from(batch_body(&[br#"{"ignored":true}"#.as_slice()])))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/json-batch-records/append-batch",
+        &[
+            (CONTENT_TYPE.as_str(), "application/json"),
+            (HEADER_PREFER, "return=minimal"),
+            (HEADER_PRODUCER_ID, "json-writer"),
+            (HEADER_PRODUCER_EPOCH, "0"),
+            (HEADER_PRODUCER_SEQ, "0"),
+        ],
+        Body::from(batch_body(&[br#"{"ignored":true}"#.as_slice()])),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response.headers().get(HEADER_STREAM_EXTENSIONS).unwrap(),
+        header_str(&response, HEADER_STREAM_EXTENSIONS),
         JSON_RECORD_COORDINATES_EXTENSION
     );
-    let retry_body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let retry_body = body_bytes(response).await;
     let retry_body: serde_json::Value =
         serde_json::from_slice(&retry_body).expect("deduplicated batch ack JSON");
     assert_eq!(retry_body, body);
@@ -1377,145 +1043,90 @@ async fn json_append_batch_returns_per_frame_record_ranges() {
 #[tokio::test]
 async fn closed_record_long_poll_empty_response_includes_record_headers() {
     let app = test_router();
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/json-record-closed-long-poll")
-                .header(CONTENT_TYPE, "application/json")
-                .header(HEADER_STREAM_CLOSED, "true")
-                .body(Body::from(r#"{"id":1}"#))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/json-record-closed-long-poll",
+        &[
+            (CONTENT_TYPE.as_str(), "application/json"),
+            (HEADER_STREAM_CLOSED, "true"),
+        ],
+        Body::from(r#"{"id":1}"#),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(
-                    "/benchcmp/json-record-closed-long-poll?record=1&live=long-poll&timeout_ms=1000",
-                )
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(
+        &app,
+        "/benchcmp/json-record-closed-long-poll?record=1&live=long-poll&timeout_ms=1000",
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        response.headers().get(HEADER_STREAM_EXTENSIONS).unwrap(),
+        header_str(&response, HEADER_STREAM_EXTENSIONS),
         JSON_RECORD_COORDINATES_EXTENSION
     );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_FIRST).unwrap(),
-        "0"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
-        "1"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
-        "1"
-    );
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "0");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "1");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
 }
 
 #[tokio::test]
 async fn append_batch_producer_headers_deduplicate_retries() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/batch-producer")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(&app, "/benchcmp/batch-producer", &[], Body::empty()).await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/batch-producer/append-batch")
-                .header(HEADER_PRODUCER_ID, "writer-1")
-                .header(HEADER_PRODUCER_EPOCH, "0")
-                .header(HEADER_PRODUCER_SEQ, "0")
-                .body(Body::from(batch_body(&[b"ab".as_slice(), b"c".as_slice()])))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/batch-producer/append-batch",
+        &[
+            (HEADER_PRODUCER_ID, "writer-1"),
+            (HEADER_PRODUCER_EPOCH, "0"),
+            (HEADER_PRODUCER_SEQ, "0"),
+        ],
+        Body::from(batch_body(&[b"ab".as_slice(), b"c".as_slice()])),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers().get(HEADER_PRODUCER_EPOCH).unwrap(), "0");
-    assert_eq!(response.headers().get(HEADER_PRODUCER_SEQ).unwrap(), "0");
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    assert_eq!(header_str(&response, HEADER_PRODUCER_EPOCH), "0");
+    assert_eq!(header_str(&response, HEADER_PRODUCER_SEQ), "0");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], br#"[{"status":204},{"status":204}]"#);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/batch-producer/append-batch")
-                .header(HEADER_PRODUCER_ID, "writer-1")
-                .header(HEADER_PRODUCER_EPOCH, "0")
-                .header(HEADER_PRODUCER_SEQ, "0")
-                .body(Body::from(batch_body(&[b"ignored".as_slice()])))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/batch-producer/append-batch",
+        &[
+            (HEADER_PRODUCER_ID, "writer-1"),
+            (HEADER_PRODUCER_EPOCH, "0"),
+            (HEADER_PRODUCER_SEQ, "0"),
+        ],
+        Body::from(batch_body(&[b"ignored".as_slice()])),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], br#"[{"status":204},{"status":204}]"#);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/batch-producer/append-batch")
-                .header(HEADER_PRODUCER_ID, "writer-1")
-                .header(HEADER_PRODUCER_EPOCH, "0")
-                .header(HEADER_PRODUCER_SEQ, "1")
-                .body(Body::from(batch_body(&[b"d".as_slice()])))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/batch-producer/append-batch",
+        &[
+            (HEADER_PRODUCER_ID, "writer-1"),
+            (HEADER_PRODUCER_EPOCH, "0"),
+            (HEADER_PRODUCER_SEQ, "1"),
+        ],
+        Body::from(batch_body(&[b"d".as_slice()])),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], br#"[{"status":204}]"#);
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/batch-producer?offset=0&max_bytes=16")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/batch-producer?offset=0&max_bytes=16").await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], b"abcd");
 }
 
@@ -1523,377 +1134,209 @@ async fn append_batch_producer_headers_deduplicate_retries() {
 async fn json_mode_normalizes_appends_and_reads_ndjson() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/v1/stream/json-mode")
-                .header(CONTENT_TYPE, "application/json; charset=utf-8")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/v1/stream/json-mode",
+        &[(CONTENT_TYPE.as_str(), "application/json; charset=utf-8")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
     assert_eq!(
-        response.headers().get(HEADER_STREAM_EXTENSIONS).unwrap(),
+        header_str(&response, HEADER_STREAM_EXTENSIONS),
         JSON_RECORD_COORDINATES_EXTENSION
     );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
-        "0"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
-        "0"
-    );
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "0");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "0");
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/stream/json-mode")
-                .header(CONTENT_TYPE, "application/json; charset=utf-8")
-                .body(Body::from(r#"[[1,2,3]]"#))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/v1/stream/json-mode",
+        &[(CONTENT_TYPE.as_str(), "application/json; charset=utf-8")],
+        Body::from(r#"[[1,2,3]]"#),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        response.headers().get(HEADER_STREAM_EXTENSIONS).unwrap(),
+        header_str(&response, HEADER_STREAM_EXTENSIONS),
         JSON_RECORD_COORDINATES_EXTENSION
     );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
-        "0"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
-        "1"
-    );
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "0");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("HEAD")
-                .uri("/v1/stream/json-mode")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_head(&app, "/v1/stream/json-mode").await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_FIRST).unwrap(),
-        "0"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
-        "1"
-    );
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "0");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/v1/stream/json-mode")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/v1/stream/json-mode").await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "application/x-ndjson"
-    );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    assert_eq!(header_str(&response, CONTENT_TYPE), "application/x-ndjson");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], b"[1,2,3]\n");
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/stream/json-mode")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from("[]"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/v1/stream/json-mode",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from("[]"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn json_record_coordinates_read_complete_records() {
     let app = test_router();
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/v1/stream/json-record-read")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/v1/stream/json-record-read",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/stream/json-record-read")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"[{"id":1},{"id":2},{"id":3}]"#))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/v1/stream/json-record-read",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"[{"id":1},{"id":2},{"id":3}]"#),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
-        "0"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
-        "3"
-    );
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "0");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "3");
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/v1/stream/json-record-read?record=1&max_records=1")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/v1/stream/json-record-read?record=1&max_records=1").await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "application/x-ndjson"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_FIRST).unwrap(),
-        "0"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
-        "1"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
-        "2"
-    );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    assert_eq!(header_str(&response, CONTENT_TYPE), "application/x-ndjson");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "0");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "1");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], b"{\"id\":2}\n");
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/v1/stream/json-record-read?tail_records=2")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/v1/stream/json-record-read?tail_records=2").await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
-        "1"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
-        "3"
-    );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "1");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "3");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], b"{\"id\":2}\n{\"id\":3}\n");
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/v1/stream/json-record-read?record=1&max_records=1&record_view=envelope")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(
+        &app,
+        "/v1/stream/json-record-read?record=1&max_records=1&record_view=envelope",
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
+        header_str(&response, CONTENT_TYPE),
         "application/vnd.durable-stream-records+ndjson"
     );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], b"{\"record\":1,\"value\":{\"id\":2}}\n");
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/stream/json-record-read")
-                .header(CONTENT_TYPE, "application/json")
-                .header(HEADER_STREAM_RECORD_MATCH, "3")
-                .body(Body::from(r#"{"id":4}"#))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/v1/stream/json-record-read",
+        &[
+            (CONTENT_TYPE.as_str(), "application/json"),
+            (HEADER_STREAM_RECORD_MATCH, "3"),
+        ],
+        Body::from(r#"{"id":4}"#),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
-        "3"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
-        "4"
-    );
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "3");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "4");
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/stream/json-record-read")
-                .header(CONTENT_TYPE, "application/json")
-                .header(HEADER_STREAM_RECORD_MATCH, "3")
-                .body(Body::from(r#"{"id":5}"#))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/v1/stream/json-record-read",
+        &[
+            (CONTENT_TYPE.as_str(), "application/json"),
+            (HEADER_STREAM_RECORD_MATCH, "3"),
+        ],
+        Body::from(r#"{"id":5}"#),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
-        "4"
-    );
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "4");
     assert!(response.headers().get(HEADER_STREAM_NEXT_OFFSET).is_some());
 }
 
 #[tokio::test]
 async fn json_record_coordinates_preserve_deduplicated_and_close_only_ranges() {
     let app = test_router();
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/v1/stream/json-record-dedup")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/v1/stream/json-record-dedup",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
     for payload in [r#"[{"id":1},{"id":2}]"#, r#"{"ignored":true}"#] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/stream/json-record-dedup")
-                    .header(CONTENT_TYPE, "application/json")
-                    .header(HEADER_PRODUCER_ID, "browser-tab")
-                    .header(HEADER_PRODUCER_EPOCH, "0")
-                    .header(HEADER_PRODUCER_SEQ, "0")
-                    .body(Body::from(payload))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
+        let response = http_post(
+            &app,
+            "/v1/stream/json-record-dedup",
+            &[
+                (CONTENT_TYPE.as_str(), "application/json"),
+                (HEADER_PRODUCER_ID, "browser-tab"),
+                (HEADER_PRODUCER_EPOCH, "0"),
+                (HEADER_PRODUCER_SEQ, "0"),
+            ],
+            Body::from(payload),
+        )
+        .await;
         assert!(matches!(
             response.status(),
             StatusCode::OK | StatusCode::NO_CONTENT
         ));
-        assert_eq!(
-            response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
-            "0"
-        );
-        assert_eq!(
-            response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
-            "2"
-        );
+        assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "0");
+        assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
     }
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/stream/json-record-dedup")
-                .header(CONTENT_TYPE, "application/json")
-                .header(HEADER_STREAM_CLOSED, "true")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/v1/stream/json-record-dedup",
+        &[
+            (CONTENT_TYPE.as_str(), "application/json"),
+            (HEADER_STREAM_CLOSED, "true"),
+        ],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
-        "2"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
-        "2"
-    );
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "2");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
 }
 
 #[tokio::test]
 async fn json_record_coordinates_concurrent_appends_receive_disjoint_commit_ranges() {
     let app = test_router();
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/v1/stream/json-record-concurrent")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/v1/stream/json-record-concurrent",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
     let mut writes = Vec::new();
     for id in 0..16 {
         let app = app.clone();
         writes.push(tokio::spawn(async move {
-            app.oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/stream/json-record-concurrent")
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(format!(r#"{{"id":{id}}}"#)))
-                    .expect("request"),
+            http_post(
+                &app,
+                "/v1/stream/json-record-concurrent",
+                &[(CONTENT_TYPE.as_str(), "application/json")],
+                Body::from(format!(r#"{{"id":{id}}}"#)),
             )
             .await
-            .expect("response")
         }));
     }
 
@@ -1901,20 +1344,10 @@ async fn json_record_coordinates_concurrent_appends_receive_disjoint_commit_rang
     for write in writes {
         let response = write.await.expect("write task");
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let start = response
-            .headers()
-            .get(HEADER_STREAM_RECORD_START)
-            .expect("record start")
-            .to_str()
-            .expect("record start text")
+        let start = header_str(&response, HEADER_STREAM_RECORD_START)
             .parse::<u64>()
             .expect("record start integer");
-        let next = response
-            .headers()
-            .get(HEADER_STREAM_RECORD_NEXT)
-            .expect("record next")
-            .to_str()
-            .expect("record next text")
+        let next = header_str(&response, HEADER_STREAM_RECORD_NEXT)
             .parse::<u64>()
             .expect("record next integer");
         ranges.push((start, next));
@@ -1931,48 +1364,34 @@ async fn json_record_coordinates_concurrent_appends_receive_disjoint_commit_rang
 #[tokio::test]
 async fn json_record_coordinates_live_reads_resume_by_record() {
     let app = test_router();
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/v1/stream/json-record-live")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/v1/stream/json-record-live",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
     let read = {
         let app = app.clone();
         tokio::spawn(async move {
-            app.oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/v1/stream/json-record-live?record=now&live=long-poll&timeout_ms=1000")
-                    .body(Body::empty())
-                    .expect("request"),
+            http_get(
+                &app,
+                "/v1/stream/json-record-live?record=now&live=long-poll&timeout_ms=1000",
             )
             .await
-            .expect("response")
         })
     };
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/stream/json-record-live")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"[{"id":1},{"id":2}]"#))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/v1/stream/json-record-live",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"[{"id":1},{"id":2}]"#),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     let response = tokio::time::timeout(std::time::Duration::from_secs(1), read)
@@ -1980,52 +1399,34 @@ async fn json_record_coordinates_live_reads_resume_by_record() {
         .expect("long poll completed")
         .expect("read task");
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_START).unwrap(),
-        "0"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
-        "2"
-    );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "0");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], b"{\"id\":1}\n{\"id\":2}\n");
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/stream/json-record-live")
-                .header(CONTENT_TYPE, "application/json")
-                .header(HEADER_STREAM_CLOSED, "true")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/v1/stream/json-record-live",
+        &[
+            (CONTENT_TYPE.as_str(), "application/json"),
+            (HEADER_STREAM_CLOSED, "true"),
+        ],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/v1/stream/json-record-live?record=0&record_view=envelope&live=sse")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(
+        &app,
+        "/v1/stream/json-record-live?record=0&record_view=envelope&live=sse",
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response.headers().get("stream-data-content-type").unwrap(),
+        header_str(&response, "stream-data-content-type"),
         "application/vnd.durable-stream-record+json"
     );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("sse body");
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 sse body");
     assert_eq!(body.matches("event: data").count(), 2);
     assert!(body.contains("data:{\"record\":0,\"value\":{\"id\":1}}"));
@@ -2037,101 +1438,50 @@ async fn json_record_coordinates_live_reads_resume_by_record() {
 #[tokio::test]
 async fn json_record_coordinates_snapshot_and_bootstrap_headers_are_aligned() {
     let app = test_router();
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/json-record-snapshot")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"[{"id":1},{"id":2}]"#))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/json-record-snapshot",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"[{"id":1},{"id":2}]"#),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/json-record-snapshot/snapshot/1")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"count":0}"#))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/json-record-snapshot/snapshot/1",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"count":0}"#),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/json-record-snapshot?record=0&max_records=1")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    let snapshot_offset = response
-        .headers()
-        .get(HEADER_STREAM_NEXT_OFFSET)
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_owned();
+    let response = http_get(
+        &app,
+        "/benchcmp/json-record-snapshot?record=0&max_records=1",
+    )
+    .await;
+    let snapshot_offset = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri(format!(
-                    "/benchcmp/json-record-snapshot/snapshot/{snapshot_offset}"
-                ))
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"count":1}"#))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        &format!("/benchcmp/json-record-snapshot/snapshot/{snapshot_offset}"),
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"count":1}"#),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_FIRST).unwrap(),
-        "1"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
-        "2"
-    );
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "1");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
 
     for uri in [
         format!("/benchcmp/json-record-snapshot/snapshot/{snapshot_offset}"),
         "/benchcmp/json-record-snapshot/bootstrap".to_owned(),
     ] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(uri)
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
+        let response = http_get(&app, &uri).await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(HEADER_STREAM_RECORD_FIRST).unwrap(),
-            "1"
-        );
-        assert_eq!(
-            response.headers().get(HEADER_STREAM_RECORD_NEXT).unwrap(),
-            "2"
-        );
+        assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "1");
+        assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
     }
 }
 
@@ -2139,56 +1489,32 @@ async fn json_record_coordinates_snapshot_and_bootstrap_headers_are_aligned() {
 async fn json_mode_reads_ndjson_bytes_without_message_boundary_projection() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/v1/stream/json-window")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/v1/stream/json-window",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/stream/json-window")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"[{"message":"alpha"},{"message":"beta"}]"#))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/v1/stream/json-window",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"[{"message":"alpha"},{"message":"beta"}]"#),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/v1/stream/json-window?offset=-1&max_bytes=5")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/v1/stream/json-window?offset=-1&max_bytes=5").await;
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_str(&response, CONTENT_TYPE), "application/x-ndjson");
     assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "application/x-ndjson"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_NEXT_OFFSET).unwrap(),
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         "00000000000000000005"
     );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], b"{\"mes");
 }
 
@@ -2209,54 +1535,23 @@ fn append_batch_parser_returns_body_slices() {
 async fn metrics_expose_per_core_and_group_append_distribution() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/metrics-stream")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(&app, "/benchcmp/metrics-stream", &[], Body::empty()).await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/metrics-stream/append-batch")
-                .body(Body::from(batch_body(&[
-                    b"abc".as_slice(),
-                    b"de".as_slice(),
-                ])))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/metrics-stream/append-batch",
+        &[],
+        Body::from(batch_body(&[b"abc".as_slice(), b"de".as_slice()])),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/__ursula/metrics")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/__ursula/metrics").await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "application/json"
-    );
+    assert_eq!(header_str(&response, CONTENT_TYPE), "application/json");
 
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 body");
     assert!(body.contains("\"accepted_appends\":2"));
     assert!(body.contains("\"applied_mutations\":3"));
@@ -2361,58 +1656,33 @@ async fn metrics_expose_per_core_and_group_append_distribution() {
 async fn long_poll_times_out_with_no_content_and_cleans_waiter() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/long-poll-timeout")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/long-poll-timeout",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/long-poll-timeout?offset=now&live=long-poll&timeout_ms=10")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(
+        &app,
+        "/benchcmp/long-poll-timeout?offset=now&live=long-poll&timeout_ms=10",
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        response.headers().get(HEADER_STREAM_NEXT_OFFSET).unwrap(),
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         "00000000000000000000"
     );
+    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
     assert_eq!(
-        response.headers().get(HEADER_STREAM_UP_TO_DATE).unwrap(),
-        "true"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_CURSOR).unwrap(),
+        header_str(&response, HEADER_STREAM_CURSOR),
         "00000000000000000000"
     );
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/__ursula/metrics")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let response = http_get(&app, "/__ursula/metrics").await;
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 body");
     assert!(body.contains("\"live_read_waiters\":0"));
 }
@@ -2424,55 +1694,38 @@ async fn long_poll_returns_service_unavailable_when_live_waiters_are_full() {
             .expect("runtime");
     let app = router(runtime);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/long-poll-limit")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/long-poll-limit",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
     let first = {
         let app = app.clone();
         tokio::spawn(async move {
-            app.oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/benchcmp/long-poll-limit?offset=now&live=long-poll&timeout_ms=1000")
-                    .body(Body::empty())
-                    .expect("request"),
+            http_get(
+                &app,
+                "/benchcmp/long-poll-limit?offset=now&live=long-poll&timeout_ms=1000",
             )
             .await
-            .expect("response")
         })
     };
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/long-poll-limit?offset=now&live=long-poll&timeout_ms=1000")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(
+        &app,
+        "/benchcmp/long-poll-limit?offset=now&live=long-poll&timeout_ms=1000",
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         response.headers().get(axum::http::header::RETRY_AFTER),
         Some(&axum::http::HeaderValue::from_static("1"))
     );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert!(
         std::str::from_utf8(&body)
             .expect("utf8 body")
@@ -2482,19 +1735,8 @@ async fn long_poll_returns_service_unavailable_when_live_waiters_are_full() {
     first.abort();
     let _ = first.await;
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/__ursula/metrics")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let response = http_get(&app, "/__ursula/metrics").await;
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 body");
     assert!(body.contains("\"live_read_backpressure_events\":1"));
     assert!(body.contains("\"per_core_live_read_backpressure_events\":[1]"));
@@ -2504,48 +1746,34 @@ async fn long_poll_returns_service_unavailable_when_live_waiters_are_full() {
 async fn long_poll_returns_append_from_owner_waiter() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/long-poll-wake")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/long-poll-wake",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
     let read = {
         let app = app.clone();
         tokio::spawn(async move {
-            app.oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/benchcmp/long-poll-wake?offset=now&live=long-poll&timeout_ms=1000")
-                    .body(Body::empty())
-                    .expect("request"),
+            http_get(
+                &app,
+                "/benchcmp/long-poll-wake?offset=now&live=long-poll&timeout_ms=1000",
             )
             .await
-            .expect("response")
         })
     };
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/long-poll-wake")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::from("wake"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/long-poll-wake",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("wake"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     let response = tokio::time::timeout(std::time::Duration::from_secs(1), read)
@@ -2554,16 +1782,14 @@ async fn long_poll_returns_append_from_owner_waiter() {
         .expect("read task");
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response.headers().get(HEADER_STREAM_NEXT_OFFSET).unwrap(),
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         "00000000000000000004"
     );
     assert_eq!(
-        response.headers().get(HEADER_STREAM_CURSOR).unwrap(),
+        header_str(&response, HEADER_STREAM_CURSOR),
         "00000000000000000004"
     );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], b"wake");
 }
 
@@ -2571,63 +1797,35 @@ async fn long_poll_returns_append_from_owner_waiter() {
 async fn sse_live_tail_delivers_appended_text_and_closed_control() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/sse-stream")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/sse-stream",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/sse-stream?offset=now&live=sse")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/sse-stream?offset=now&live=sse").await;
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_str(&response, CONTENT_TYPE), "text/event-stream");
     assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "text/event-stream"
-    );
-    assert_eq!(
-        response
-            .headers()
-            .get("stream-data-content-type")
-            .expect("stream data content type"),
+        header_str(&response, "stream-data-content-type"),
         "text/plain"
     );
 
-    let body_task = tokio::spawn(async move {
-        to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("sse body")
-    });
+    let body_task = tokio::spawn(async move { body_bytes(response).await });
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/sse-stream")
-                .header(CONTENT_TYPE, "text/plain")
-                .header(HEADER_STREAM_CLOSED, "true")
-                .body(Body::from("sse-token"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/sse-stream",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_STREAM_CLOSED, "true"),
+        ],
+        Body::from("sse-token"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     let body = tokio::time::timeout(std::time::Duration::from_secs(1), body_task)
@@ -2640,20 +1838,9 @@ async fn sse_live_tail_delivers_appended_text_and_closed_control() {
     assert!(body.contains("\"streamNextOffset\":\"00000000000000000009\""));
     assert!(body.contains("\"streamClosed\":true"));
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/__ursula/metrics")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/__ursula/metrics").await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("metrics body");
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 metrics body");
     assert!(body.contains("\"sse_streams_opened\":1"));
     assert!(body.contains("\"sse_read_iterations\":"));
@@ -2666,55 +1853,32 @@ async fn sse_live_tail_delivers_appended_text_and_closed_control() {
 async fn sse_exposes_ndjson_data_content_type_for_json_streams() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/sse-json")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/sse-json",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/sse-json")
-                .header(CONTENT_TYPE, "application/json")
-                .header(HEADER_STREAM_CLOSED, "true")
-                .body(Body::from(r#"{"event":"done"}"#))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/sse-json",
+        &[
+            (CONTENT_TYPE.as_str(), "application/json"),
+            (HEADER_STREAM_CLOSED, "true"),
+        ],
+        Body::from(r#"{"event":"done"}"#),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/sse-json?offset=-1&live=sse")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/sse-json?offset=-1&live=sse").await;
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_str(&response, CONTENT_TYPE), "text/event-stream");
     assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "text/event-stream"
-    );
-    assert_eq!(
-        response
-            .headers()
-            .get("stream-data-content-type")
-            .expect("stream data content type"),
+        header_str(&response, "stream-data-content-type"),
         "application/x-ndjson"
     );
     assert!(
@@ -2723,9 +1887,7 @@ async fn sse_exposes_ndjson_data_content_type_for_json_streams() {
             .get(HEADER_STREAM_SSE_DATA_ENCODING)
             .is_none()
     );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("sse body");
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 sse body");
     assert!(body.contains("event: data"));
     assert!(body.contains("data:{\"event\":\"done\"}"));
@@ -2737,57 +1899,39 @@ async fn sse_exposes_ndjson_data_content_type_for_json_streams() {
 async fn sse_json_max_bytes_does_not_split_utf8_codepoints() {
     let app = test_router();
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/sse-json-utf8")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/sse-json-utf8",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/sse-json-utf8")
-                .header(CONTENT_TYPE, "application/json")
-                .header(HEADER_STREAM_CLOSED, "true")
-                .body(Body::from(r#"{"m":"\u00e9"}"#))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/sse-json-utf8",
+        &[
+            (CONTENT_TYPE.as_str(), "application/json"),
+            (HEADER_STREAM_CLOSED, "true"),
+        ],
+        Body::from(r#"{"m":"\u00e9"}"#),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/sse-json-utf8?offset=-1&live=sse&max_bytes=7")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(
+        &app,
+        "/benchcmp/sse-json-utf8?offset=-1&live=sse&max_bytes=7",
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response
-            .headers()
-            .get("stream-data-content-type")
-            .expect("stream data content type"),
+        header_str(&response, "stream-data-content-type"),
         "application/x-ndjson"
     );
 
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("sse body");
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 sse body");
     assert!(!body.contains('\u{fffd}'), "{body}");
     assert!(body.contains("\"streamNextOffset\":\"00000000000000000006\""));
@@ -2822,51 +1966,27 @@ async fn wal_runtime_recovers_http_stream_after_restart() {
             .expect("runtime")
             .runtime,
         );
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/benchcmp/wal-http")
-                    .header(CONTENT_TYPE, "text/plain")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
+        let response = http_put(
+            &app,
+            "/benchcmp/wal-http",
+            &[(CONTENT_TYPE.as_str(), "text/plain")],
+            Body::empty(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::CREATED);
 
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/benchcmp/wal-http/append-batch")
-                    .header(CONTENT_TYPE, "text/plain")
-                    .body(Body::from(batch_body(&[
-                        b"persisted".as_slice(),
-                        b"-batch".as_slice(),
-                    ])))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
+        let response = http_post(
+            &app,
+            "/benchcmp/wal-http/append-batch",
+            &[(CONTENT_TYPE.as_str(), "text/plain")],
+            Body::from(batch_body(&[b"persisted".as_slice(), b"-batch".as_slice()])),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/__ursula/metrics")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
+        let response = http_get(&app, "/__ursula/metrics").await;
         assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("metrics body");
+        let body = body_bytes(response).await;
         let body = std::str::from_utf8(&body).expect("utf8 body");
         assert!(body.contains("\"wal_batches\":2"));
         assert!(body.contains("\"wal_records\":2"));
@@ -2887,20 +2007,9 @@ async fn wal_runtime_recovers_http_stream_after_restart() {
         .expect("recovered runtime")
         .runtime,
     );
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/wal-http?offset=0&max_bytes=32")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/wal-http?offset=0&max_bytes=32").await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], b"persisted-batch");
 
     std::fs::remove_dir_all(&wal_root).expect("remove WAL root");
@@ -2931,65 +2040,32 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
         .expect("runtime")
         .runtime,
     );
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/raft-http")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/raft-http",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/raft-http")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::from("raft-payload"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/raft-http",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("raft-payload"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/raft-http?offset=0&max_bytes=32")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/raft-http?offset=0&max_bytes=32").await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], b"raft-payload");
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/__ursula/metrics")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/__ursula/metrics").await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("metrics body");
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 body");
     assert!(body.contains("\"wal_batches\":"));
     assert!(!body.contains("\"wal_batches\":0"));
@@ -3052,22 +2128,15 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
         "http://127.0.0.1:4477".to_owned(),
     )]);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/static-raft-log")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/static-raft-log",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(
         status,
         StatusCode::CREATED,
@@ -3075,50 +2144,22 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
         std::str::from_utf8(&body).unwrap_or("<non-utf8>")
     );
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/static-raft-log")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::from("static-raft-payload"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/static-raft-log",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("static-raft-payload"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/static-raft-log?offset=0&max_bytes=64")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/static-raft-log?offset=0&max_bytes=64").await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], b"static-raft-payload");
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/__ursula/metrics")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("metrics body");
+    let response = http_get(&app, "/__ursula/metrics").await;
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 body");
     assert!(body.contains("\"wal_batches\":"));
     assert!(body.contains("\"wal_records\":"));
@@ -3171,31 +2212,22 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .expect("wait for leader");
         let app = router_with_static_raft_cluster(runtime, registry, peers.clone());
 
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri("/benchcmp/static-raft-log-restart")
-                    .header(CONTENT_TYPE, "text/plain")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
+        let response = http_put(
+            &app,
+            "/benchcmp/static-raft-log-restart",
+            &[(CONTENT_TYPE.as_str(), "text/plain")],
+            Body::empty(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::CREATED);
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/benchcmp/static-raft-log-restart")
-                    .header(CONTENT_TYPE, "text/plain")
-                    .body(Body::from("restart-payload"))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
+        let response = http_post(
+            &app,
+            "/benchcmp/static-raft-log-restart",
+            &[(CONTENT_TYPE.as_str(), "text/plain")],
+            Body::from("restart-payload"),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
@@ -3234,20 +2266,13 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .expect("wait for restarted leader");
         let app = router_with_static_raft_cluster(runtime, registry, peers);
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/benchcmp/static-raft-log-restart?offset=0&max_bytes=64")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
+        let response = http_get(
+            &app,
+            "/benchcmp/static-raft-log-restart?offset=0&max_bytes=64",
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body");
+        let body = body_bytes(response).await;
         assert_eq!(&body[..], b"restart-payload");
     }
 
@@ -3267,101 +2292,51 @@ async fn raft_memory_runtime_serves_http_subset_without_wal_metrics() {
         .expect("runtime")
         .runtime,
     );
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/raft-memory-http")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/raft-memory-http",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/raft-memory-http")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::from("raft-memory-payload"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/raft-memory-http",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("raft-memory-payload"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/raft-memory-http?offset=0&max_bytes=64")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/raft-memory-http?offset=0&max_bytes=64").await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], b"raft-memory-payload");
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/raft-memory-http/snapshot/00000000000000000019")
-                .header(CONTENT_TYPE, "application/octet-stream")
-                .body(Body::from("raft-state"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/raft-memory-http/snapshot/00000000000000000019",
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::from("raft-state"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/raft-memory-http/bootstrap")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/raft-memory-http/bootstrap").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response.headers().get(HEADER_STREAM_NEXT_OFFSET).unwrap(),
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         "00000000000000000019"
     );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("bootstrap body");
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 body");
     assert!(body.contains("raft-state"));
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/__ursula/metrics")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/__ursula/metrics").await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("metrics body");
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 body");
     assert!(body.contains("\"accepted_appends\":1"));
     assert!(body.contains("\"wal_batches\":0"));
@@ -3453,13 +2428,17 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
     for (index, listener) in listeners.into_iter().enumerate() {
         let node_id = u64::try_from(index + 1).expect("node id fits u64");
         nodes.push(
-            spawn_static_grpc_test_node_with_per_group_initializers(
+            spawn_static_grpc_test_node(
                 node_id,
                 listener,
                 peers.clone(),
                 peers.clone(),
                 true,
                 6,
+                StaticGrpcTestNodeStorage {
+                    per_group_initializers: true,
+                    ..Default::default()
+                },
             )
             .await,
         );
@@ -3513,7 +2492,7 @@ async fn static_grpc_per_group_voters_create_distinct_initial_memberships() {
     for (index, listener) in listeners.into_iter().enumerate() {
         let node_id = u64::try_from(index + 1).expect("node id fits u64");
         nodes.push(
-            spawn_static_grpc_test_node_with_storage(
+            spawn_static_grpc_test_node(
                 node_id,
                 listener,
                 peers.clone(),
@@ -3521,11 +2500,9 @@ async fn static_grpc_per_group_voters_create_distinct_initial_memberships() {
                 true,
                 2,
                 StaticGrpcTestNodeStorage {
-                    raft_log_dir: None,
-                    cold_store: None,
-                    engine_config: None,
                     per_group_initializers: true,
                     per_group_voters: group_voters.clone(),
+                    ..Default::default()
                 },
             )
             .await,
@@ -3605,7 +2582,7 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
     for (index, listener) in listeners.into_iter().enumerate() {
         let node_id = u64::try_from(index + 1).expect("node id fits u64");
         nodes.push(
-            spawn_static_grpc_test_node_with_storage(
+            spawn_static_grpc_test_node(
                 node_id,
                 listener,
                 peers.clone(),
@@ -3613,11 +2590,9 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
                 true,
                 2,
                 StaticGrpcTestNodeStorage {
-                    raft_log_dir: None,
-                    cold_store: None,
-                    engine_config: None,
                     per_group_initializers: true,
                     per_group_voters: group_voters.clone(),
+                    ..Default::default()
                 },
             )
             .await,
@@ -3705,6 +2680,7 @@ async fn static_grpc_follower_serves_replicated_catch_up_read_without_leader_pro
                 peers.clone(),
                 node_id == 1,
                 1,
+                StaticGrpcTestNodeStorage::default(),
             )
             .await,
         );
@@ -3810,6 +2786,7 @@ async fn static_grpc_memory_node_rejoins_empty_after_allowed_log_revert() {
                 peers.clone(),
                 node_id == 1,
                 1,
+                StaticGrpcTestNodeStorage::default(),
             )
             .await,
         );
@@ -3944,6 +2921,7 @@ async fn static_grpc_memory_node_rejoins_empty_after_allowed_log_revert() {
         peers.clone(),
         false,
         1,
+        StaticGrpcTestNodeStorage::default(),
     )
     .await;
     restarted
@@ -4019,13 +2997,17 @@ async fn static_grpc_memory_node_rejoins_all_groups_after_allowed_log_revert() {
     for (index, listener) in listeners.into_iter().enumerate() {
         let node_id = u64::try_from(index + 1).expect("node id fits u64");
         nodes.push(
-            spawn_static_grpc_test_node_with_per_group_initializers(
+            spawn_static_grpc_test_node(
                 node_id,
                 listener,
                 peers.clone(),
                 peers.clone(),
                 true,
                 6,
+                StaticGrpcTestNodeStorage {
+                    per_group_initializers: true,
+                    ..Default::default()
+                },
             )
             .await,
         );
@@ -4224,13 +3206,17 @@ async fn static_grpc_memory_node_rejoins_all_groups_after_allowed_log_revert() {
     let restarted_listener = tokio::net::TcpListener::bind(addrs[2])
         .await
         .expect("rebind node 3 listener");
-    let restarted = spawn_static_grpc_test_node_with_per_group_initializers(
+    let restarted = spawn_static_grpc_test_node(
         3,
         restarted_listener,
         peers.clone(),
         peers.clone(),
         true,
         6,
+        StaticGrpcTestNodeStorage {
+            per_group_initializers: true,
+            ..Default::default()
+        },
     )
     .await;
     restarted
@@ -4297,7 +3283,7 @@ async fn static_grpc_memory_restart_with_bootstrap_marker_fails_fast() {
     for (index, listener) in listeners.into_iter().enumerate() {
         let node_id = u64::try_from(index + 1).expect("node id fits u64");
         nodes.push(
-            spawn_static_grpc_test_node_with_storage(
+            spawn_static_grpc_test_node(
                 node_id,
                 listener,
                 peers.clone(),
@@ -4305,11 +3291,9 @@ async fn static_grpc_memory_restart_with_bootstrap_marker_fails_fast() {
                 true,
                 6,
                 StaticGrpcTestNodeStorage {
-                    raft_log_dir: None,
-                    cold_store: None,
                     engine_config: Some(engine_config.clone()),
                     per_group_initializers: true,
-                    per_group_voters: BTreeMap::new(),
+                    ..Default::default()
                 },
             )
             .await,
@@ -4345,7 +3329,7 @@ async fn static_grpc_memory_restart_with_bootstrap_marker_fails_fast() {
             .await
             .expect("rebind listener");
         restarted_nodes.push(
-            spawn_static_grpc_test_node_with_storage(
+            spawn_static_grpc_test_node(
                 node_id,
                 listener,
                 peers.clone(),
@@ -4353,11 +3337,9 @@ async fn static_grpc_memory_restart_with_bootstrap_marker_fails_fast() {
                 true,
                 6,
                 StaticGrpcTestNodeStorage {
-                    raft_log_dir: None,
-                    cold_store: None,
                     engine_config: Some(engine_config.clone()),
                     per_group_initializers: true,
-                    per_group_voters: BTreeMap::new(),
+                    ..Default::default()
                 },
             )
             .await,
@@ -4406,6 +3388,7 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
                 peers.clone(),
                 node_id == 1,
                 4,
+                StaticGrpcTestNodeStorage::default(),
             )
             .await,
         );
@@ -4696,14 +3679,17 @@ async fn static_grpc_raft_group_engine_replicates_with_core_journals() {
         let node_id = u64::try_from(index + 1).expect("node id fits u64");
         let node_root = raft_root.join(format!("node-{node_id}"));
         nodes.push(
-            spawn_static_grpc_test_node_with_log_dir(
+            spawn_static_grpc_test_node(
                 node_id,
                 listener,
                 peers.clone(),
                 peers.clone(),
                 node_id == 1,
                 2,
-                Some(node_root),
+                StaticGrpcTestNodeStorage {
+                    raft_log_dir: Some(node_root),
+                    ..Default::default()
+                },
             )
             .await,
         );
@@ -4841,7 +3827,7 @@ async fn static_grpc_raft_durable_cold_flush_replicates_manifest() {
         let node_id = u64::try_from(index + 1).expect("node id fits u64");
         let node_root = raft_root.join(format!("node-{node_id}"));
         nodes.push(
-            spawn_static_grpc_test_node_with_storage(
+            spawn_static_grpc_test_node(
                 node_id,
                 listener,
                 peers.clone(),
@@ -4851,9 +3837,7 @@ async fn static_grpc_raft_durable_cold_flush_replicates_manifest() {
                 StaticGrpcTestNodeStorage {
                     raft_log_dir: Some(node_root),
                     cold_store: Some(cold_store.clone()),
-                    engine_config: None,
-                    per_group_initializers: false,
-                    per_group_voters: BTreeMap::new(),
+                    ..Default::default()
                 },
             )
             .await,
@@ -5046,24 +4030,30 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
     ];
     let initial_peers = peers[..2].to_vec();
     let mut nodes = vec![
-        spawn_static_grpc_test_node_with_log_dir(
+        spawn_static_grpc_test_node(
             1,
             listener1,
             initial_peers.clone(),
             peers.clone(),
             true,
             1,
-            raft_root.as_ref().map(|root| root.join("node-1")),
+            StaticGrpcTestNodeStorage {
+                raft_log_dir: raft_root.as_ref().map(|root| root.join("node-1")),
+                ..Default::default()
+            },
         )
         .await,
-        spawn_static_grpc_test_node_with_log_dir(
+        spawn_static_grpc_test_node(
             2,
             listener2,
             initial_peers.clone(),
             peers.clone(),
             false,
             1,
-            raft_root.as_ref().map(|root| root.join("node-2")),
+            StaticGrpcTestNodeStorage {
+                raft_log_dir: raft_root.as_ref().map(|root| root.join("node-2")),
+                ..Default::default()
+            },
         )
         .await,
     ];
@@ -5157,14 +4147,17 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
         .expect("wait for leader purge");
 
     nodes.push(
-        spawn_static_grpc_test_node_with_log_dir(
+        spawn_static_grpc_test_node(
             3,
             listener3,
             peers.clone(),
             peers.clone(),
             false,
             1,
-            raft_root.as_ref().map(|root| root.join("node-3")),
+            StaticGrpcTestNodeStorage {
+                raft_log_dir: raft_root.as_ref().map(|root| root.join("node-3")),
+                ..Default::default()
+            },
         )
         .await,
     );
@@ -5337,60 +4330,35 @@ async fn flush_cold_endpoint_uploads_and_reads_back_segments() {
     .expect("runtime");
     let app = router(runtime);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/http-cold")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/http-cold",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/http-cold")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::from("abcdef"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/http-cold",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("abcdef"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/__ursula/flush-cold/benchcmp/http-cold?min_hot_bytes=4&max_bytes=4")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/__ursula/flush-cold/benchcmp/http-cold?min_hot_bytes=4&max_bytes=4",
+        &[],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/http-cold?offset=0&max_bytes=6")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/http-cold?offset=0&max_bytes=6").await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], b"abcdef");
 }
 
@@ -5405,70 +4373,42 @@ async fn cold_backpressure_returns_service_unavailable_and_metrics() {
     .expect("runtime");
     let app = router(runtime);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/http-cold-backpressure")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/http-cold-backpressure",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/http-cold-backpressure")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::from("abcd"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/http-cold-backpressure",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("abcd"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/benchcmp/http-cold-backpressure")
-                .header(CONTENT_TYPE, "text/plain")
-                .body(Body::from("e"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/benchcmp/http-cold-backpressure",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("e"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("error body");
+    let body = body_bytes(response).await;
     assert!(
         std::str::from_utf8(&body)
             .expect("utf8 body")
             .contains("ColdBackpressure")
     );
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/__ursula/metrics")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/__ursula/metrics").await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("metrics body");
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 body");
     assert!(body.contains("\"cold_hot_bytes\":4"));
     assert!(body.contains("\"cold_backpressure_events\":1"));
@@ -5481,179 +4421,94 @@ async fn snapshot_and_bootstrap_routes_follow_extension_semantics() {
     let app = test_router();
     let stream_uri = "/benchcmp/snapshot-http";
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri(stream_uri)
-                .header(CONTENT_TYPE, "application/octet-stream")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        stream_uri,
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
     for payload in ["abc", "de"] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(stream_uri)
-                    .header(CONTENT_TYPE, "application/octet-stream")
-                    .body(Body::from(payload))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
+        let response = http_post(
+            &app,
+            stream_uri,
+            &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+            Body::from(payload),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/snapshot-http/snapshot/00000000000000000003")
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"state":"abc"}"#))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/snapshot-http/snapshot/00000000000000000003",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"state":"abc"}"#),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(
-        response
-            .headers()
-            .get(HEADER_STREAM_SNAPSHOT_OFFSET)
-            .unwrap(),
+        header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET),
         "00000000000000000003"
     );
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("HEAD")
-                .uri(stream_uri)
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_head(&app, stream_uri).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response
-            .headers()
-            .get(HEADER_STREAM_SNAPSHOT_OFFSET)
-            .unwrap(),
+        header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET),
         "00000000000000000003"
     );
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/snapshot-http/snapshot")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/snapshot-http/snapshot").await;
     assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
     assert_eq!(
-        response.headers().get(LOCATION).unwrap(),
+        header_str(&response, LOCATION),
         "/benchcmp/snapshot-http/snapshot/00000000000000000003"
     );
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/snapshot-http/snapshot/00000000000000000003")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(
+        &app,
+        "/benchcmp/snapshot-http/snapshot/00000000000000000003",
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_str(&response, CONTENT_TYPE), "application/json");
     assert_eq!(
-        response.headers().get(CONTENT_TYPE).unwrap(),
-        "application/json"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_NEXT_OFFSET).unwrap(),
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         "00000000000000000003"
     );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     assert_eq!(&body[..], br#"{"state":"abc"}"#);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/snapshot-http?offset=0&max_bytes=1")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/snapshot-http?offset=0&max_bytes=1").await;
     assert_eq!(response.status(), StatusCode::GONE);
     assert_eq!(
-        response.headers().get(HEADER_STREAM_NEXT_OFFSET).unwrap(),
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         "00000000000000000003"
     );
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/snapshot-http/bootstrap")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/snapshot-http/bootstrap").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(
-        response
-            .headers()
-            .get(CONTENT_TYPE)
-            .unwrap()
-            .to_str()
-            .unwrap()
+        header_str(&response, CONTENT_TYPE)
             .starts_with("multipart/mixed; boundary=ursula-bootstrap-")
     );
     assert_eq!(
-        response.headers().get(HEADER_STREAM_NEXT_OFFSET).unwrap(),
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         "00000000000000000005"
     );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("multipart utf8");
     assert!(body.contains(r#"{"state":"abc"}"#));
     assert!(body.contains("de"));
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri("/benchcmp/snapshot-http/snapshot/00000000000000000003")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_delete(
+        &app,
+        "/benchcmp/snapshot-http/snapshot/00000000000000000003",
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
@@ -5662,58 +4517,28 @@ async fn bootstrap_without_snapshot_emits_empty_snapshot_part_and_rejects_live()
     let app = test_router();
     let stream_uri = "/benchcmp/bootstrap-nosnapshot";
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri(stream_uri)
-                .header(CONTENT_TYPE, "application/octet-stream")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        stream_uri,
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(stream_uri)
-                .header(CONTENT_TYPE, "application/octet-stream")
-                .body(Body::from("one"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        stream_uri,
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::from("one"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/bootstrap-nosnapshot/snapshot")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/bootstrap-nosnapshot/snapshot").await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("HEAD")
-                .uri(stream_uri)
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_head(&app, stream_uri).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(
         response
@@ -5722,45 +4547,17 @@ async fn bootstrap_without_snapshot_emits_empty_snapshot_part_and_rejects_live()
             .is_none()
     );
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/bootstrap-nosnapshot/bootstrap?live=sse")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/bootstrap-nosnapshot/bootstrap?live=sse").await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/bootstrap-nosnapshot/bootstrap")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/bootstrap-nosnapshot/bootstrap").await;
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET), "-1");
     assert_eq!(
-        response
-            .headers()
-            .get(HEADER_STREAM_SNAPSHOT_OFFSET)
-            .unwrap(),
-        "-1"
-    );
-    assert_eq!(
-        response.headers().get(HEADER_STREAM_NEXT_OFFSET).unwrap(),
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
         "00000000000000000003"
     );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("multipart utf8");
     assert!(body.contains("Content-Type: application/octet-stream\r\n\r\n\r\n--"));
     assert!(body.contains("one"));
@@ -5771,175 +4568,104 @@ async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
     let app = test_router();
     let stream_uri = "/benchcmp/snapshot-errors";
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri(stream_uri)
-                .header(CONTENT_TYPE, "application/octet-stream")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        stream_uri,
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
     for payload in ["abc", "de"] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(stream_uri)
-                    .header(CONTENT_TYPE, "application/octet-stream")
-                    .body(Body::from(payload))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
+        let response = http_post(
+            &app,
+            stream_uri,
+            &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+            Body::from(payload),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/snapshot-errors/snapshot/-1")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/snapshot-errors/snapshot/-1",
+        &[],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/snapshot-errors/snapshot/00000000000000000002")
-                .body(Body::from("ab-state"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/snapshot-errors/snapshot/00000000000000000002",
+        &[],
+        Body::from("ab-state"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/snapshot-errors/snapshot/00000000000000000006")
-                .body(Body::from("too-far"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/snapshot-errors/snapshot/00000000000000000006",
+        &[],
+        Body::from("too-far"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/snapshot-errors/snapshot/00000000000000000003")
-                .body(Body::from("abc-state"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/snapshot-errors/snapshot/00000000000000000003",
+        &[],
+        Body::from("abc-state"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/snapshot-errors/snapshot/00000000000000000002")
-                .body(Body::from("old-state"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/snapshot-errors/snapshot/00000000000000000002",
+        &[],
+        Body::from("old-state"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::GONE);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/snapshot-errors/snapshot/00000000000000000005")
-                .body(Body::from("abcde-state"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/snapshot-errors/snapshot/00000000000000000005",
+        &[],
+        Body::from("abcde-state"),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/snapshot-errors/snapshot/00000000000000000003")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(
+        &app,
+        "/benchcmp/snapshot-errors/snapshot/00000000000000000003",
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri("/benchcmp/snapshot-errors/snapshot/00000000000000000003")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_delete(
+        &app,
+        "/benchcmp/snapshot-errors/snapshot/00000000000000000003",
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/snapshot-errors?offset=3&max_bytes=2")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/snapshot-errors?offset=3&max_bytes=2").await;
     assert_eq!(response.status(), StatusCode::GONE);
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/benchcmp/snapshot-errors/bootstrap")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_get(&app, "/benchcmp/snapshot-errors/bootstrap").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response
-            .headers()
-            .get(HEADER_STREAM_SNAPSHOT_OFFSET)
-            .unwrap(),
+        header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET),
         "00000000000000000005"
     );
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("multipart utf8");
     assert!(body.contains("abcde-state"));
     assert!(!body.contains("abc-state\r\n"));
@@ -5982,16 +4708,7 @@ async fn client_router_does_not_serve_cluster_plane_via_grpc_service() {
         .runtime,
     );
     let client = client_router_with_admission(state.clone(), IngressAdmission::default());
-    let response = client
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(RAFT_GRPC_APPEND_PATH)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = http_post(&client, RAFT_GRPC_APPEND_PATH, &[], Body::empty()).await;
     let status = response.status().as_u16();
     assert!(
         (400..500).contains(&status),
@@ -6023,17 +4740,13 @@ async fn cluster_router_does_not_expose_client_plane_routes() {
     );
     let cluster = cluster_router_from_state(state.clone());
     // A normal client append must be 404 on the cluster router.
-    let response = cluster
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/some-bucket/some-stream")
-                .header("content-type", "application/octet-stream")
-                .body(Body::from(b"payload".to_vec()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = http_post(
+        &cluster,
+        "/some-bucket/some-stream",
+        &[("content-type", "application/octet-stream")],
+        Body::from(b"payload".to_vec()),
+    )
+    .await;
     assert_eq!(
         response.status().as_u16(),
         404,
@@ -6058,20 +4771,9 @@ async fn cluster_router_reports_leadership_shed_policy() {
         registry,
     );
     let cluster = cluster_router_from_state(state);
-    let response = cluster
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri(LEADERSHIP_SHED_PATH)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = http_get(&cluster, LEADERSHIP_SHED_PATH).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("status utf8");
     assert!(body.contains("\"state\":\"cold-health\""), "{body}");
     assert!(body.contains("\"should_accept_transfer\":true"), "{body}");
@@ -6104,40 +4806,23 @@ async fn maintenance_drain_endpoint_marks_and_clears_leadership_shed() {
             IngressAdmission::default(),
         ));
 
-    let response = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/__ursula/leadership-shed/maintenance")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = http_post(
+        &router,
+        "/__ursula/leadership-shed/maintenance",
+        &[],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("status utf8");
     assert!(body.contains("\"state\":\"maintenance-drain\""), "{body}");
     assert!(body.contains("\"should_accept_transfer\":false"), "{body}");
     assert!(body.contains("\"should_campaign\":false"), "{body}");
 
-    let response = router
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri("/__ursula/leadership-shed/maintenance")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let response = http_delete(&router, "/__ursula/leadership-shed/maintenance").await;
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body");
+    let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("status utf8");
     assert!(body.contains("\"state\":\"none\""), "{body}");
     assert!(body.contains("\"should_accept_transfer\":true"), "{body}");
@@ -6165,33 +4850,14 @@ async fn merged_router_serves_both_planes() {
             state,
             IngressAdmission::default(),
         ));
-    let merged_for_cluster = merged.clone();
 
     // Client-plane: HEAD on an unknown stream returns 404 (route mounted).
-    let head = merged
-        .oneshot(
-            Request::builder()
-                .method("HEAD")
-                .uri("/some-bucket/unknown-stream")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let head = http_head(&merged, "/some-bucket/unknown-stream").await;
     assert_ne!(head.status().as_u16(), 405, "client HEAD route missing");
 
     // Cluster-plane: the gRPC path is reachable (not 404). It will fail later
     // due to missing protobuf headers, but the route itself must be mounted.
-    let grpc = merged_for_cluster
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(RAFT_GRPC_APPEND_PATH)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let grpc = http_post(&merged, RAFT_GRPC_APPEND_PATH, &[], Body::empty()).await;
     assert_ne!(
         grpc.status().as_u16(),
         404,
@@ -6221,46 +4887,24 @@ async fn http_state_wall_clock_drives_protocol_now_ms() {
         IngressAdmission::default(),
     ));
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/benchcmp/clocked-stream")
-                .header(CONTENT_TYPE, "text/plain")
-                .header(HEADER_STREAM_TTL, "1")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_put(
+        &app,
+        "/benchcmp/clocked-stream",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_STREAM_TTL, "1"),
+        ],
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 
     now_ms.store(1_999, Ordering::Relaxed);
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("HEAD")
-                .uri("/benchcmp/clocked-stream")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_head(&app, "/benchcmp/clocked-stream").await;
     assert_eq!(response.status(), StatusCode::OK);
 
     now_ms.store(2_000, Ordering::Relaxed);
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("HEAD")
-                .uri("/benchcmp/clocked-stream")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_head(&app, "/benchcmp/clocked-stream").await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
@@ -6287,28 +4931,16 @@ async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
             ingress_admission_middleware,
         ));
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/write")
-                .header(CONTENT_LENGTH, "5")
-                .body(Body::from("abcde"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let response = http_post(
+        &app,
+        "/write",
+        &[(CONTENT_LENGTH.as_str(), "5")],
+        Body::from("abcde"),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        response
-            .headers()
-            .get(axum::http::header::RETRY_AFTER)
-            .expect("retry-after")
-            .to_str()
-            .expect("ascii retry-after"),
-        "1"
-    );
+    assert_eq!(header_str(&response, axum::http::header::RETRY_AFTER), "1");
     let body = to_bytes(response.into_body(), MAX_HTTP_BODY_BYTES)
         .await
         .expect("body");
@@ -6350,31 +4982,24 @@ async fn ingress_body_budget_holds_credit_until_response_finishes() {
     let first = tokio::spawn({
         let app = app.clone();
         async move {
-            app.oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/write")
-                    .header(CONTENT_LENGTH, "4")
-                    .body(Body::from("abcd"))
-                    .expect("request"),
+            http_post(
+                &app,
+                "/write",
+                &[(CONTENT_LENGTH.as_str(), "4")],
+                Body::from("abcd"),
             )
             .await
-            .expect("response")
         }
     });
     entered.wait().await;
 
-    let second = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/write")
-                .header(CONTENT_LENGTH, "1")
-                .body(Body::from("e"))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
+    let second = http_post(
+        &app,
+        "/write",
+        &[(CONTENT_LENGTH.as_str(), "1")],
+        Body::from("e"),
+    )
+    .await;
     assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     release.notify_one();
@@ -6382,6 +5007,34 @@ async fn ingress_body_budget_holds_credit_until_response_finishes() {
         first.await.expect("first join").status(),
         StatusCode::NO_CONTENT
     );
+}
+
+/// Shared fixture for the governance unit-test modules below: one
+/// [`RaftGroupMetricsSnapshot`] builder covering every per-module `snap`
+/// variant (term is always 1; `last_applied` mirrors `committed`).
+fn raft_metrics_snapshot(
+    group_id: u32,
+    node_id: u64,
+    leader: Option<u64>,
+    last_log: Option<u64>,
+    committed: Option<u64>,
+    snapshot: Option<u64>,
+    voters: Vec<u64>,
+) -> RaftGroupMetricsSnapshot {
+    let progress = |index: u64| RaftLogProgressSnapshot { term: 1, index };
+    RaftGroupMetricsSnapshot {
+        raft_group_id: group_id,
+        node_id,
+        current_term: 1,
+        current_leader: leader,
+        last_log_index: last_log,
+        committed: committed.map(progress),
+        last_applied: committed.map(progress),
+        snapshot: snapshot.map(progress),
+        purged: None,
+        voter_ids: voters,
+        learner_ids: vec![],
+    }
 }
 
 mod cold_health {
@@ -6528,7 +5181,6 @@ mod cold_health {
 
 mod snapshot_driver {
     use ursula_raft::RaftGroupMetricsSnapshot;
-    use ursula_raft::RaftLogProgressSnapshot;
 
     use crate::bootstrap::next_snapshot_to_drive;
     use crate::bootstrap::resolve_snapshot_drive_interval_ms;
@@ -6539,19 +5191,15 @@ mod snapshot_driver {
         last_applied: Option<u64>,
         snapshot_index: Option<u64>,
     ) -> RaftGroupMetricsSnapshot {
-        RaftGroupMetricsSnapshot {
+        super::raft_metrics_snapshot(
             raft_group_id,
-            node_id: 1,
-            current_term: 1,
-            current_leader: Some(1),
-            last_log_index: last_applied,
-            committed: last_applied.map(|index| RaftLogProgressSnapshot { term: 1, index }),
-            last_applied: last_applied.map(|index| RaftLogProgressSnapshot { term: 1, index }),
-            snapshot: snapshot_index.map(|index| RaftLogProgressSnapshot { term: 1, index }),
-            purged: None,
-            voter_ids: vec![1, 2, 3],
-            learner_ids: vec![],
-        }
+            1,
+            Some(1),
+            last_applied,
+            last_applied,
+            snapshot_index,
+            vec![1, 2, 3],
+        )
     }
 
     fn snap(last_applied: Option<u64>, snapshot_index: Option<u64>) -> RaftGroupMetricsSnapshot {
@@ -6609,7 +5257,6 @@ mod leadership_balance {
     use std::collections::HashSet;
 
     use ursula_raft::RaftGroupMetricsSnapshot;
-    use ursula_raft::RaftLogProgressSnapshot;
 
     use crate::bootstrap::leader_counts;
     use crate::bootstrap::plan_leadership_balance;
@@ -6617,25 +5264,9 @@ mod leadership_balance {
     use crate::bootstrap::prioritized_transfer_targets;
 
     fn snap(group_id: u32, leader: Option<u64>) -> RaftGroupMetricsSnapshot {
-        RaftGroupMetricsSnapshot {
-            raft_group_id: group_id,
-            node_id: 1,
-            current_term: 1,
-            current_leader: leader,
-            last_log_index: Some(100),
-            committed: Some(RaftLogProgressSnapshot {
-                term: 1,
-                index: 100,
-            }),
-            last_applied: Some(RaftLogProgressSnapshot {
-                term: 1,
-                index: 100,
-            }),
-            snapshot: None,
-            purged: None,
-            voter_ids: vec![1, 2, 3],
-            learner_ids: vec![],
-        }
+        super::raft_metrics_snapshot(group_id, 1, leader, Some(100), Some(100), None, vec![
+            1, 2, 3,
+        ])
     }
 
     #[test]
@@ -6847,7 +5478,6 @@ mod cluster_egress {
     use axum::routing::post;
     use ursula_raft::RaftGroupHandleRegistry;
     use ursula_raft::RaftGroupMetricsSnapshot;
-    use ursula_raft::RaftLogProgressSnapshot;
     use ursula_shard::RaftGroupId;
 
     use crate::bootstrap::ClusterEgressProbeScope;
@@ -6865,25 +5495,15 @@ mod cluster_egress {
         leader: Option<u64>,
         voters: Vec<u64>,
     ) -> RaftGroupMetricsSnapshot {
-        RaftGroupMetricsSnapshot {
-            raft_group_id: group_id,
+        super::raft_metrics_snapshot(
+            group_id,
             node_id,
-            current_term: 1,
-            current_leader: leader,
-            last_log_index: Some(100),
-            committed: Some(RaftLogProgressSnapshot {
-                term: 1,
-                index: 100,
-            }),
-            last_applied: Some(RaftLogProgressSnapshot {
-                term: 1,
-                index: 100,
-            }),
-            snapshot: None,
-            purged: None,
-            voter_ids: voters,
-            learner_ids: vec![],
-        }
+            leader,
+            Some(100),
+            Some(100),
+            None,
+            voters,
+        )
     }
 
     fn peers() -> Vec<(u64, String)> {
@@ -7034,7 +5654,6 @@ mod commit_stall {
 
     use tokio::time::Instant;
     use ursula_raft::RaftGroupMetricsSnapshot;
-    use ursula_raft::RaftLogProgressSnapshot;
 
     use crate::bootstrap::CommitStallAction;
     use crate::bootstrap::CommitStallTracker;
@@ -7046,19 +5665,9 @@ mod commit_stall {
         last_log: Option<u64>,
         committed: Option<u64>,
     ) -> RaftGroupMetricsSnapshot {
-        RaftGroupMetricsSnapshot {
-            raft_group_id: group_id,
-            node_id,
-            current_term: 1,
-            current_leader: leader,
-            last_log_index: last_log,
-            committed: committed.map(|index| RaftLogProgressSnapshot { term: 1, index }),
-            last_applied: committed.map(|index| RaftLogProgressSnapshot { term: 1, index }),
-            snapshot: None,
-            purged: None,
-            voter_ids: vec![1, 2, 3],
-            learner_ids: vec![],
-        }
+        super::raft_metrics_snapshot(group_id, node_id, leader, last_log, committed, None, vec![
+            1, 2, 3,
+        ])
     }
 
     #[test]
