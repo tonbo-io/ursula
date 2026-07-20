@@ -74,7 +74,6 @@ use ursula_runtime::GroupHeadStreamFuture;
 use ursula_runtime::GroupInstallSnapshotFuture;
 use ursula_runtime::GroupPlanColdFlushFuture;
 use ursula_runtime::GroupPlanNextColdFlushBatchFuture;
-use ursula_runtime::GroupPlanNextColdFlushFuture;
 use ursula_runtime::GroupPublishSnapshotFuture;
 use ursula_runtime::GroupReadSnapshotFuture;
 use ursula_runtime::GroupReadStreamFuture;
@@ -1115,9 +1114,12 @@ impl GroupEngine for MadsimScopedGroupEngine {
         &'a mut self,
         request: CreateStreamRequest,
         placement: ShardPlacement,
+        admission: ColdWriteAdmission,
     ) -> GroupCreateStreamFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner.create_stream(request, placement).await
+            self.inner
+                .create_stream(request, placement, admission)
+                .await
         }))
     }
 
@@ -1268,9 +1270,10 @@ impl GroupEngine for MadsimScopedGroupEngine {
         &'a mut self,
         request: AppendRequest,
         placement: ShardPlacement,
+        admission: ColdWriteAdmission,
     ) -> GroupAppendFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner.append(request, placement).await
+            self.inner.append(request, placement, admission).await
         }))
     }
 
@@ -1288,52 +1291,14 @@ impl GroupEngine for MadsimScopedGroupEngine {
         &'a mut self,
         request: AppendBatchRequest,
         placement: ShardPlacement,
-    ) -> GroupAppendBatchFuture<'a> {
-        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner.append_batch(request, placement).await
-        }))
-    }
-
-    fn create_stream_with_cold_admission<'a>(
-        &'a mut self,
-        request: CreateStreamRequest,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> GroupCreateStreamFuture<'a> {
-        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner
-                .create_stream_with_cold_admission(request, placement, admission)
-                .await
-        }))
-    }
-
-    fn append_with_cold_admission<'a>(
-        &'a mut self,
-        request: AppendRequest,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> GroupAppendFuture<'a> {
-        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner
-                .append_with_cold_admission(request, placement, admission)
-                .await
-        }))
-    }
-
-    fn append_batch_with_cold_admission<'a>(
-        &'a mut self,
-        request: AppendBatchRequest,
-        placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> GroupAppendBatchFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner
-                .append_batch_with_cold_admission(request, placement, admission)
-                .await
+            self.inner.append_batch(request, placement, admission).await
         }))
     }
 
-    fn append_batch_many_with_cold_admission<'a>(
+    fn append_batch_many<'a>(
         &'a mut self,
         requests: Vec<AppendBatchRequest>,
         placement: ShardPlacement,
@@ -1341,7 +1306,7 @@ impl GroupEngine for MadsimScopedGroupEngine {
     ) -> GroupWriteBatchFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
             self.inner
-                .append_batch_many_with_cold_admission(requests, placement, admission)
+                .append_batch_many(requests, placement, admission)
                 .await
         }))
     }
@@ -1363,16 +1328,6 @@ impl GroupEngine for MadsimScopedGroupEngine {
     ) -> GroupPlanColdFlushFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
             self.inner.plan_cold_flush(request, placement).await
-        }))
-    }
-
-    fn plan_next_cold_flush<'a>(
-        &'a mut self,
-        request: PlanGroupColdFlushRequest,
-        placement: ShardPlacement,
-    ) -> GroupPlanNextColdFlushFuture<'a> {
-        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
-            self.inner.plan_next_cold_flush(request, placement).await
         }))
     }
 

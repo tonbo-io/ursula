@@ -1855,6 +1855,7 @@ async fn raft_group_engine_implements_runtime_group_engine_over_openraft() {
         .create_stream(
             CreateStreamRequest::new(stream_id.clone(), "application/octet-stream"),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("create through group engine");
@@ -1865,6 +1866,7 @@ async fn raft_group_engine_implements_runtime_group_engine_over_openraft() {
         .append(
             AppendRequest::from_bytes(stream_id.clone(), b"payload".to_vec()),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("append through group engine");
@@ -1957,6 +1959,7 @@ async fn raft_group_engine_cold_admission_coalesces_append_batch_many_into_one_r
         .create_stream(
             CreateStreamRequest::new(stream_id.clone(), "application/octet-stream"),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("create stream");
@@ -1968,7 +1971,7 @@ async fn raft_group_engine_cold_admission_coalesces_append_batch_many_into_one_r
         .expect("create stream should append a raft log entry");
 
     let responses = engine
-        .append_batch_many_with_cold_admission(
+        .append_batch_many(
             vec![
                 AppendBatchRequest::new(stream_id.clone(), vec![b"ab".to_vec()]),
                 AppendBatchRequest::new(stream_id.clone(), vec![b"cd".to_vec()]),
@@ -2098,6 +2101,7 @@ async fn raft_group_engine_preserves_stream_error_next_offset() {
         .create_stream(
             CreateStreamRequest::new(stream_id.clone(), "application/octet-stream"),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("create through group engine");
@@ -2105,6 +2109,7 @@ async fn raft_group_engine_preserves_stream_error_next_offset() {
         .append(
             AppendRequest::from_bytes(stream_id.clone(), b"payload".to_vec()),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect("append through group engine");
@@ -2125,6 +2130,7 @@ async fn raft_group_engine_preserves_stream_error_next_offset() {
         .append(
             AppendRequest::from_bytes(stream_id, b"after-close".to_vec()),
             placement(),
+            ColdWriteAdmission::default(),
         )
         .await
         .expect_err("append to closed stream should fail");
@@ -2146,6 +2152,7 @@ async fn raft_group_engine_recovers_client_writes_from_file_log() {
             .create_stream(
                 CreateStreamRequest::new(stream_id.clone(), "application/octet-stream"),
                 placement(),
+                ColdWriteAdmission::default(),
             )
             .await
             .expect("create through durable raft group engine");
@@ -2153,6 +2160,7 @@ async fn raft_group_engine_recovers_client_writes_from_file_log() {
             .append(
                 AppendRequest::from_bytes(stream_id.clone(), b"payload".to_vec()),
                 placement(),
+                ColdWriteAdmission::default(),
             )
             .await
             .expect("append through durable raft group engine");
