@@ -1,11 +1,13 @@
-//! Serde wire codec for replicated commands, responses, and forwarded reads.
+//! Serde wire codec for replicated commands, responses, forwarded reads, and
+//! the openraft envelope types.
 //!
 //! The canonical types ([`GroupWriteCommand`], [`ursula_runtime::GroupWriteResponse`],
-//! [`GroupEngineError`], and the forwarded read responses) travel as
-//! self-describing MessagePack produced directly by their serde derives —
-//! there are no hand-written per-field proto mirrors. MessagePack (with named
-//! struct fields) is used instead of a positional format because stream attrs
-//! embed `serde_json::Value`, which requires a self-describing wire.
+//! [`GroupEngineError`], the forwarded read responses) and openraft's own
+//! serde-capable RPC/log types travel as self-describing MessagePack produced
+//! directly by their serde derives — there are no hand-written per-field proto
+//! mirrors. MessagePack (with named struct fields) is used instead of a
+//! positional format because stream attrs embed `serde_json::Value`, which
+//! requires a self-describing wire.
 
 use bytes::Bytes;
 use serde::Serialize;
