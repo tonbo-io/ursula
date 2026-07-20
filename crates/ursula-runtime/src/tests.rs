@@ -34,16 +34,77 @@ use crate::error::ErrorStatus;
 use crate::metrics::RuntimeMetricsInner;
 
 fn runtime(core_count: usize, group_count: usize) -> ShardRuntime {
-    ShardRuntime::spawn(RuntimeConfig {
+    ShardRuntime::spawn(test_config(core_count, group_count, 128)).expect("spawn runtime")
+}
+
+/// The shared hosted-tokio test config; only the knobs that vary across
+/// tests are parameters.
+fn test_config(
+    core_count: usize,
+    raft_group_count: usize,
+    mailbox_capacity: usize,
+) -> RuntimeConfig {
+    RuntimeConfig {
         core_count,
-        raft_group_count: group_count,
-        mailbox_capacity: 128,
+        raft_group_count,
+        mailbox_capacity,
         threading: RuntimeThreading::HostedTokio,
         cold_max_hot_bytes_per_group: None,
         raft_max_uncommitted_bytes_per_group: None,
         live_read_max_waiters_per_core: Some(65_536),
-    })
+    }
+}
+
+async fn append_bytes(runtime: &ShardRuntime, stream: &BucketStreamId, payload: &[u8]) {
+    runtime
+        .append(AppendRequest::from_bytes(stream.clone(), payload.to_vec()))
+        .await
+        .expect("append");
+}
+
+fn memory_cold_store() -> ColdStore {
+    ColdStore::memory().expect("memory cold store")
+}
+
+fn read_req(stream_id: BucketStreamId, offset: u64, max_len: usize) -> ReadStreamRequest {
+    ReadStreamRequest {
+        stream_id,
+        offset,
+        max_len,
+        now_ms: 0,
+        record: None,
+        max_records: None,
+    }
+}
+
+fn temp_wal_root(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_nanos()
+    ))
+}
+
+fn spawn_with_cold_store(config: RuntimeConfig, cold_store: Arc<ColdStore>) -> ShardRuntime {
+    ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        config,
+        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
+        Some(cold_store),
+    )
     .expect("spawn runtime")
+}
+
+fn spawn_in_memory(config: RuntimeConfig) -> ShardRuntime {
+    ShardRuntime::spawn_with_engine_factory(config, InMemoryGroupEngineFactory::default())
+        .expect("spawn runtime")
+}
+
+fn spawn_wal_runtime(config: RuntimeConfig, wal_root: &std::path::Path) -> ShardRuntime {
+    ShardRuntime::spawn_with_engine_factory(config, WalGroupEngineFactory::new(wal_root))
+        .expect("spawn runtime")
 }
 
 fn stream_on_group(runtime: &ShardRuntime, group_id: RaftGroupId, prefix: &str) -> BucketStreamId {
@@ -380,7 +441,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
 async fn cold_store_read_reassembles_cold_and_hot_segments() {
     let placement = placement();
     let stream = BucketStreamId::new("benchcmp", "cold-read");
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let cold_store = Arc::new(memory_cold_store());
     cold_store
         .write_chunk("benchcmp/cold-read/chunks/000000.bin", b"abcd")
         .await
@@ -436,17 +497,7 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
         .expect("flush cold");
 
     let read = engine
-        .read_stream(
-            ReadStreamRequest {
-                stream_id: stream,
-                offset: 2,
-                max_len: 4,
-                now_ms: 0,
-                record: None,
-                max_records: None,
-            },
-            placement,
-        )
+        .read_stream(read_req(stream, 2, 4), placement)
         .await
         .expect("read cold and hot segments");
     assert_eq!(read.payload, b"cdef");
@@ -460,7 +511,7 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
     let stream = BucketStreamId::new("benchcmp", "stale-cold-index");
     let live_path = "benchcmp/stale-cold-index/chunks/live.bin";
     let stale_path = "benchcmp/stale-cold-index/chunks/stale.bin";
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let cold_store = Arc::new(memory_cold_store());
     cold_store
         .write_chunk(live_path, b"abcd")
         .await
@@ -529,17 +580,7 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
         .expect("delete stale cold object");
 
     let read = engine
-        .read_stream(
-            ReadStreamRequest {
-                stream_id: stream,
-                offset: 0,
-                max_len: 6,
-                now_ms: 0,
-                record: None,
-                max_records: None,
-            },
-            placement,
-        )
+        .read_stream(read_req(stream, 0, 6), placement)
         .await
         .expect("read should still use live cold index entry");
     assert_eq!(read.payload, b"abcdef");
@@ -547,13 +588,8 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
 
 #[tokio::test]
 async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        RuntimeConfig::new(1, 1),
-        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
-        Some(cold_store.clone()),
-    )
-    .expect("spawn runtime");
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(RuntimeConfig::new(1, 1), cold_store.clone());
     let stream = BucketStreamId::new("benchcmp", "external-index");
 
     cold_store
@@ -580,10 +616,7 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
         })
         .await
         .expect("create external stream");
-    runtime
-        .append(AppendRequest::from_bytes(stream.clone(), b"cd".to_vec()))
-        .await
-        .expect("append hot");
+    append_bytes(&runtime, &stream, b"cd").await;
     cold_store
         .write_chunk("benchcmp/external-index/external/tail.bin", b"ef")
         .await
@@ -608,14 +641,7 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
         .expect("append external payload");
 
     let read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream.clone(),
-            offset: 0,
-            max_len: 6,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream.clone(), 0, 6))
         .await
         .expect("read mixed external and hot payload");
     assert_eq!(read.payload, b"abcdef");
@@ -640,7 +666,7 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
 async fn bootstrap_reads_retained_updates_from_cold_chunk_after_snapshot() {
     let placement = placement();
     let stream = BucketStreamId::new("benchcmp", "cold-bootstrap");
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let cold_store = Arc::new(memory_cold_store());
     cold_store
         .write_chunk("benchcmp/cold-bootstrap/chunks/000000.bin", b"abcde")
         .await
@@ -698,17 +724,7 @@ async fn bootstrap_reads_retained_updates_from_cold_chunk_after_snapshot() {
         .expect("publish snapshot");
 
     let read = engine
-        .read_stream(
-            ReadStreamRequest {
-                stream_id: stream.clone(),
-                offset: 3,
-                max_len: 2,
-                now_ms: 0,
-                record: None,
-                max_records: None,
-            },
-            placement,
-        )
+        .read_stream(read_req(stream.clone(), 3, 2), placement)
         .await
         .expect("read retained update from cold chunk");
     assert_eq!(read.payload, b"de");
@@ -734,7 +750,7 @@ async fn bootstrap_reads_retained_updates_from_cold_chunk_after_snapshot() {
 
 #[tokio::test]
 async fn cold_store_reads_only_requested_range() {
-    let cold_store = ColdStore::memory().expect("memory cold store");
+    let cold_store = memory_cold_store();
     cold_store
         .write_chunk("benchcmp/cold-range/chunks/000000.bin", b"abcdefgh")
         .await
@@ -757,13 +773,11 @@ async fn cold_store_reads_only_requested_range() {
 
 #[tokio::test]
 async fn cold_store_prefetches_sequential_stream_blocks() {
-    let cold_store = ColdStore::memory()
-        .expect("memory cold store")
-        .with_read_cache(ColdReadCacheParams {
-            max_bytes: 32,
-            block_bytes: 4,
-            max_readahead_blocks: 2,
-        });
+    let cold_store = memory_cold_store().with_read_cache(ColdReadCacheParams {
+        max_bytes: 32,
+        block_bytes: 4,
+        max_readahead_blocks: 2,
+    });
     let path = "benchcmp/cold-cache/chunks/000000.bin";
     cold_store
         .write_chunk(path, b"abcdefghijklmnop")
@@ -961,56 +975,50 @@ fn committed_write_batch_preserves_logical_command_responses() {
     assert_eq!(read.payload, b"abcd");
 }
 
-async fn wait_for_live_waiters(runtime: &ShardRuntime, expected: u64) {
+/// Poll `current` until it equals `expected` (up to ~1s), then panic with
+/// `what` in the message if it never converges.
+async fn wait_for_eq<T, F>(what: &str, expected: T, current: F)
+where
+    T: PartialEq + std::fmt::Display + Copy,
+    F: Fn() -> T,
+{
     for _ in 0..100 {
-        if runtime.metrics().snapshot().live_read_waiters == expected {
+        if current() == expected {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!(
-        "expected {expected} live waiters, got {}",
+    panic!("expected {what} {expected}, got {}", current());
+}
+
+async fn wait_for_live_waiters(runtime: &ShardRuntime, expected: u64) {
+    wait_for_eq("live waiters", expected, || {
         runtime.metrics().snapshot().live_read_waiters
-    );
+    })
+    .await;
 }
 
 async fn wait_for_mailbox_depth(runtime: &ShardRuntime, core_index: usize, expected: usize) {
-    for _ in 0..100 {
-        if runtime.mailbox_snapshot().depths[core_index] == expected {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!(
-        "expected core {core_index} mailbox depth {expected}, got {}",
-        runtime.mailbox_snapshot().depths[core_index]
-    );
+    wait_for_eq(
+        &format!("core {core_index} mailbox depth"),
+        expected,
+        || runtime.mailbox_snapshot().depths[core_index],
+    )
+    .await;
 }
 
 async fn wait_for_mailbox_full_events(runtime: &ShardRuntime, expected: u64) {
-    for _ in 0..100 {
-        if runtime.metrics().snapshot().mailbox_full_events == expected {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!(
-        "expected {expected} mailbox full events, got {}",
+    wait_for_eq("mailbox full events", expected, || {
         runtime.metrics().snapshot().mailbox_full_events
-    );
+    })
+    .await;
 }
 
 async fn wait_for_group_mailbox_full_events(runtime: &ShardRuntime, expected: u64) {
-    for _ in 0..100 {
-        if runtime.metrics().snapshot().group_mailbox_full_events == expected {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!(
-        "expected {expected} group mailbox full events, got {}",
+    wait_for_eq("group mailbox full events", expected, || {
         runtime.metrics().snapshot().group_mailbox_full_events
-    );
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1102,14 +1110,7 @@ async fn append_batch_routes_once_and_applies_each_payload_on_owner_core() {
     assert_eq!(response.items[2].as_ref().expect("third").start_offset, 3);
 
     let read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream.clone(),
-            offset: 0,
-            max_len: 16,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream.clone(), 0, 16))
         .await
         .expect("read");
     assert_eq!(read.payload, b"abcdef");
@@ -1145,14 +1146,7 @@ async fn append_batch_reports_item_errors_without_stopping_later_payloads() {
     assert_eq!(response.items[2].as_ref().expect("third").start_offset, 1);
 
     let read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream,
-            offset: 0,
-            max_len: 16,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream, 0, 16))
         .await
         .expect("read");
     assert_eq!(read.payload, b"ab");
@@ -1194,14 +1188,7 @@ async fn producer_duplicate_append_returns_prior_offsets_without_mutating_metric
     assert!(!next.deduplicated);
 
     let read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream,
-            offset: 0,
-            max_len: 16,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream, 0, 16))
         .await
         .expect("read");
     assert_eq!(read.payload, b"ab");
@@ -1272,14 +1259,7 @@ async fn producer_duplicate_append_batch_returns_prior_offsets_without_mutating_
     assert!(!next_item.deduplicated);
 
     let read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream,
-            offset: 0,
-            max_len: 16,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream, 0, 16))
         .await
         .expect("read");
     assert_eq!(read.payload, b"abcd");
@@ -1301,21 +1281,9 @@ async fn snapshot_group_routes_to_owner_core_and_captures_only_group_state() {
         .expect("stream on another core");
 
     create_stream(&runtime, &first_stream).await;
-    runtime
-        .append(AppendRequest::from_bytes(
-            first_stream.clone(),
-            b"first".to_vec(),
-        ))
-        .await
-        .expect("append first stream");
+    append_bytes(&runtime, &first_stream, b"first").await;
     create_stream(&runtime, &second_stream).await;
-    runtime
-        .append(AppendRequest::from_bytes(
-            second_stream.clone(),
-            b"second".to_vec(),
-        ))
-        .await
-        .expect("append second stream");
+    append_bytes(&runtime, &second_stream, b"second").await;
 
     let snapshot = runtime
         .snapshot_group(first_placement.raft_group_id)
@@ -1380,14 +1348,8 @@ async fn install_group_snapshot_restores_group_state_and_append_counts() {
         })
         .await
         .expect("update attrs before snapshot");
-    source
-        .append(AppendRequest::from_bytes(stream.clone(), b"ab".to_vec()))
-        .await
-        .expect("append first");
-    source
-        .append(AppendRequest::from_bytes(stream.clone(), b"cd".to_vec()))
-        .await
-        .expect("append second");
+    append_bytes(&source, &stream, b"ab").await;
+    append_bytes(&source, &stream, b"cd").await;
 
     let snapshot = source
         .snapshot_group(placement.raft_group_id)
@@ -1407,14 +1369,7 @@ async fn install_group_snapshot_restores_group_state_and_append_counts() {
         .expect("install snapshot");
 
     let read = target
-        .read_stream(ReadStreamRequest {
-            stream_id: stream.clone(),
-            offset: 0,
-            max_len: 16,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream.clone(), 0, 16))
         .await
         .expect("read restored stream");
     assert_eq!(read.placement, placement);
@@ -1450,10 +1405,7 @@ async fn snapshot_after_stream_delete_installs_without_dangling_append_count() {
     let stream = BucketStreamId::new("benchcmp", "churn-delete");
     let placement = source.locate(&stream);
     create_stream(&source, &stream).await;
-    source
-        .append(AppendRequest::from_bytes(stream.clone(), b"ab".to_vec()))
-        .await
-        .expect("append");
+    append_bytes(&source, &stream, b"ab").await;
     source
         .delete_stream(DeleteStreamRequest {
             stream_id: stream.clone(),
@@ -1522,16 +1474,7 @@ async fn install_group_snapshot_rejects_mismatched_placement_before_routing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mailbox_snapshot_reports_per_core_depths_and_capacities() {
-    let runtime = ShardRuntime::spawn(RuntimeConfig {
-        core_count: 3,
-        raft_group_count: 9,
-        mailbox_capacity: 7,
-        threading: RuntimeThreading::HostedTokio,
-        cold_max_hot_bytes_per_group: None,
-        raft_max_uncommitted_bytes_per_group: None,
-        live_read_max_waiters_per_core: Some(65_536),
-    })
-    .expect("spawn runtime");
+    let runtime = ShardRuntime::spawn(test_config(3, 9, 7)).expect("spawn runtime");
 
     let snapshot = runtime.mailbox_snapshot();
     assert_eq!(snapshot.depths, vec![0, 0, 0]);
@@ -1545,19 +1488,9 @@ async fn runtime_metrics_track_owner_core_routing_and_mailbox_wait() {
     let owner_core = usize::from(runtime.locate(&stream).core_id.0);
 
     create_stream(&runtime, &stream).await;
+    append_bytes(&runtime, &stream, b"hello").await;
     runtime
-        .append(AppendRequest::from_bytes(stream.clone(), b"hello".to_vec()))
-        .await
-        .expect("append");
-    runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream.clone(),
-            offset: 0,
-            max_len: 16,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream.clone(), 0, 16))
         .await
         .expect("read");
 
@@ -1736,14 +1669,7 @@ async fn group_engine_errors_use_operation_wording_for_non_append_paths() {
     let runtime = runtime(2, 8);
     let stream = BucketStreamId::new("benchcmp", "missing-read-stream");
     let err = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream,
-            offset: 0,
-            max_len: 16,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream, 0, 16))
         .await
         .expect_err("missing stream read rejected");
     let message = err.to_string();
@@ -1833,23 +1759,10 @@ async fn read_stream_returns_payload_slice_from_owner_group() {
     let stream = BucketStreamId::new("benchcmp", "read-stream");
     let placement = runtime.locate(&stream);
     create_stream(&runtime, &stream).await;
-    runtime
-        .append(AppendRequest::from_bytes(
-            stream.clone(),
-            b"abcdefg".to_vec(),
-        ))
-        .await
-        .expect("append");
+    append_bytes(&runtime, &stream, b"abcdefg").await;
 
     let read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream.clone(),
-            offset: 2,
-            max_len: 3,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream.clone(), 2, 3))
         .await
         .expect("read stream");
     assert_eq!(read.placement, placement);
@@ -1860,14 +1773,7 @@ async fn read_stream_returns_payload_slice_from_owner_group() {
     assert!(!read.closed);
 
     let tail = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream,
-            offset: 7,
-            max_len: 16,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream, 7, 16))
         .await
         .expect("tail read");
     assert_eq!(tail.next_offset, 7);
@@ -1881,13 +1787,7 @@ async fn flush_cold_publishes_chunk_metadata_on_owner_group() {
     let stream = BucketStreamId::new("benchcmp", "cold-runtime");
     let placement = runtime.locate(&stream);
     create_stream(&runtime, &stream).await;
-    runtime
-        .append(AppendRequest::from_bytes(
-            stream.clone(),
-            b"abcdef".to_vec(),
-        ))
-        .await
-        .expect("append");
+    append_bytes(&runtime, &stream, b"abcdef").await;
 
     let flushed = runtime
         .flush_cold(FlushColdRequest {
@@ -1905,27 +1805,13 @@ async fn flush_cold_publishes_chunk_metadata_on_owner_group() {
     assert_eq!(flushed.hot_start_offset, 4);
 
     let hot = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream.clone(),
-            offset: 4,
-            max_len: 16,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream.clone(), 4, 16))
         .await
         .expect("hot read");
     assert_eq!(hot.payload, b"ef");
 
     let err = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream,
-            offset: 0,
-            max_len: 16,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream, 0, 16))
         .await
         .expect_err("cold read needs store");
     match err {
@@ -1939,22 +1825,11 @@ async fn flush_cold_publishes_chunk_metadata_on_owner_group() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flush_cold_once_uploads_outside_group_and_reads_back() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        RuntimeConfig::new(2, 8),
-        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
-        Some(cold_store),
-    )
-    .expect("spawn runtime");
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(RuntimeConfig::new(2, 8), cold_store);
     let stream = BucketStreamId::new("benchcmp", "cold-once");
     create_stream(&runtime, &stream).await;
-    runtime
-        .append(AppendRequest::from_bytes(
-            stream.clone(),
-            b"abcdef".to_vec(),
-        ))
-        .await
-        .expect("append");
+    append_bytes(&runtime, &stream, b"abcdef").await;
 
     let flushed = runtime
         .flush_cold_once(PlanColdFlushRequest {
@@ -1974,14 +1849,7 @@ async fn flush_cold_once_uploads_outside_group_and_reads_back() {
     assert_eq!(metrics.cold_orphan_cleanup_attempts, 0);
 
     let read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream,
-            offset: 0,
-            max_len: 6,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream, 0, 6))
         .await
         .expect("read cold and hot");
     assert_eq!(read.payload, b"abcdef");
@@ -1990,20 +1858,12 @@ async fn flush_cold_once_uploads_outside_group_and_reads_back() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flush_cold_group_batch_once_publishes_multiple_chunks() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        RuntimeConfig::new(2, 8),
-        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
-        Some(cold_store),
-    )
-    .expect("spawn runtime");
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(RuntimeConfig::new(2, 8), cold_store);
     let stream = BucketStreamId::new("benchcmp", "cold-batch");
     let placement = runtime.locate(&stream);
     create_stream(&runtime, &stream).await;
-    runtime
-        .append(AppendRequest::from_bytes(stream.clone(), b"abcd".to_vec()))
-        .await
-        .expect("append");
+    append_bytes(&runtime, &stream, b"abcd").await;
 
     let flushed = runtime
         .flush_cold_group_batch_once(
@@ -2052,14 +1912,7 @@ async fn flush_cold_group_batch_once_publishes_multiple_chunks() {
     assert!(entry.payload.is_empty());
 
     let read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream,
-            offset: 0,
-            max_len: 4,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream, 0, 4))
         .await
         .expect("read cold chunks");
     assert_eq!(read.payload, b"abcd");
@@ -2068,19 +1921,11 @@ async fn flush_cold_group_batch_once_publishes_multiple_chunks() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_gc_worker_physically_reclaims_deleted_stream_chunks() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        RuntimeConfig::new(2, 8),
-        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
-        Some(cold_store.clone()),
-    )
-    .expect("spawn runtime");
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(RuntimeConfig::new(2, 8), cold_store.clone());
     let stream = BucketStreamId::new("benchcmp", "cold-gc");
     create_stream(&runtime, &stream).await;
-    runtime
-        .append(AppendRequest::from_bytes(stream.clone(), b"abcd".to_vec()))
-        .await
-        .expect("append");
+    append_bytes(&runtime, &stream, b"abcd").await;
     let chunk = ColdChunkRef {
         start_offset: 0,
         end_offset: 4,
@@ -2141,23 +1986,12 @@ async fn cold_gc_worker_physically_reclaims_deleted_stream_chunks() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_cold_flush_batch_after_delete_recreate_is_classified_for_cleanup() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        RuntimeConfig::new(2, 8),
-        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
-        Some(cold_store),
-    )
-    .expect("spawn runtime");
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(RuntimeConfig::new(2, 8), cold_store);
     let stream = BucketStreamId::new("benchcmp", "stale-cold-runtime");
     let placement = runtime.locate(&stream);
     create_stream(&runtime, &stream).await;
-    runtime
-        .append(AppendRequest::from_bytes(
-            stream.clone(),
-            b"abcdefghijklmnopqr".to_vec(),
-        ))
-        .await
-        .expect("append old stream");
+    append_bytes(&runtime, &stream, b"abcdefghijklmnopqr").await;
     let candidates = runtime
         .plan_next_cold_flush_batch(
             placement.raft_group_id,
@@ -2178,13 +2012,7 @@ async fn stale_cold_flush_batch_after_delete_recreate_is_classified_for_cleanup(
         .await
         .expect("delete old stream");
     create_stream(&runtime, &stream).await;
-    runtime
-        .append(AppendRequest::from_bytes(
-            stream.clone(),
-            b"abcdefghijklmnopq".to_vec(),
-        ))
-        .await
-        .expect("append recreated stream");
+    append_bytes(&runtime, &stream, b"abcdefghijklmnopq").await;
 
     let flushed = runtime
         .flush_cold_candidates_batch(candidates)
@@ -2198,14 +2026,7 @@ async fn stale_cold_flush_batch_after_delete_recreate_is_classified_for_cleanup(
     assert_eq!(metrics.cold_orphan_cleanup_errors, 0);
 
     let read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream,
-            offset: 0,
-            max_len: 32,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream, 0, 32))
         .await
         .expect("read recreated stream");
     assert_eq!(read.payload, b"abcdefghijklmnopq");
@@ -2214,19 +2035,14 @@ async fn stale_cold_flush_batch_after_delete_recreate_is_classified_for_cleanup(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(
         RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
-        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
-        Some(cold_store),
-    )
-    .expect("spawn runtime");
+        cold_store,
+    );
     let stream = BucketStreamId::new("benchcmp", "cold-admission");
     create_stream(&runtime, &stream).await;
-    runtime
-        .append(AppendRequest::from_bytes(stream.clone(), b"abcd".to_vec()))
-        .await
-        .expect("append below limit");
+    append_bytes(&runtime, &stream, b"abcd").await;
 
     let err = runtime
         .append(AppendRequest::from_bytes(stream.clone(), b"e".to_vec()))
@@ -2273,19 +2089,9 @@ async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
         .expect("candidate flushed");
     assert_eq!(runtime.metrics().snapshot().cold_hot_bytes, 0);
 
-    runtime
-        .append(AppendRequest::from_bytes(stream.clone(), b"e".to_vec()))
-        .await
-        .expect("append after flush");
+    append_bytes(&runtime, &stream, b"e").await;
     let read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream,
-            offset: 0,
-            max_len: 5,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream, 0, 5))
         .await
         .expect("read cold and hot");
     assert_eq!(read.payload, b"abcde");
@@ -2293,13 +2099,11 @@ async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_write_admission_allows_deduplicated_append_retry_at_hot_limit() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(
         RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
-        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
-        Some(cold_store),
-    )
-    .expect("spawn runtime");
+        cold_store,
+    );
     let stream = BucketStreamId::new("benchcmp", "cold-admission-dedup-append");
     create_stream(&runtime, &stream).await;
 
@@ -2320,13 +2124,11 @@ async fn cold_write_admission_allows_deduplicated_append_retry_at_hot_limit() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_write_admission_allows_deduplicated_append_batch_retry_at_hot_limit() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(
         RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
-        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
-        Some(cold_store),
-    )
-    .expect("spawn runtime");
+        cold_store,
+    );
     let stream = BucketStreamId::new("benchcmp", "cold-admission-dedup-batch");
     create_stream(&runtime, &stream).await;
 
@@ -2358,13 +2160,11 @@ async fn cold_write_admission_allows_deduplicated_append_batch_retry_at_hot_limi
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_write_admission_allows_existing_create_retry_at_hot_limit() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(
         RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
-        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
-        Some(cold_store),
-    )
-    .expect("spawn runtime");
+        cold_store,
+    );
     let stream = BucketStreamId::new("benchcmp", "cold-admission-existing-create");
     let mut request = CreateStreamRequest::new(stream.clone(), DEFAULT_CONTENT_TYPE);
     request.initial_payload = Bytes::from_static(b"abcd");
@@ -2386,21 +2186,12 @@ async fn raft_uncommitted_admission_disabled_by_default_lets_writes_through() {
     // Disabled admission must not interfere with the existing accept path
     // (acceptance criterion 6: existing cold behaviour unchanged when the
     // raft admission is disabled).
-    let runtime = ShardRuntime::spawn_with_engine_factory(
-        RuntimeConfig::new(2, 4).with_raft_max_uncommitted_bytes_per_group(None),
-        InMemoryGroupEngineFactory::default(),
-    )
-    .expect("spawn runtime");
+    let runtime =
+        spawn_in_memory(RuntimeConfig::new(2, 4).with_raft_max_uncommitted_bytes_per_group(None));
     let stream = BucketStreamId::new("benchcmp", "raft-uncommitted-disabled");
     create_stream(&runtime, &stream).await;
     for _ in 0..4 {
-        runtime
-            .append(AppendRequest::from_bytes(
-                stream.clone(),
-                b"payload".to_vec(),
-            ))
-            .await
-            .expect("append succeeds with admission disabled");
+        append_bytes(&runtime, &stream, b"payload").await;
     }
 }
 
@@ -2409,11 +2200,9 @@ async fn raft_uncommitted_admission_rejects_when_incoming_would_exceed_limit() {
     // With a 4-byte cap and a 5-byte append on an empty stream, the
     // CoreWorker-level admission rejects the request before reaching the
     // actor since `current (0) + incoming (5) > limit (4)`.
-    let runtime = ShardRuntime::spawn_with_engine_factory(
+    let runtime = spawn_in_memory(
         RuntimeConfig::new(2, 4).with_raft_max_uncommitted_bytes_per_group(Some(4)),
-        InMemoryGroupEngineFactory::default(),
-    )
-    .expect("spawn runtime");
+    );
     let stream = BucketStreamId::new("benchcmp", "raft-uncommitted-trip");
     create_stream(&runtime, &stream).await;
 
@@ -2440,27 +2229,19 @@ async fn raft_uncommitted_admission_rejects_when_incoming_would_exceed_limit() {
     }
 
     // A within-budget append still succeeds.
-    runtime
-        .append(AppendRequest::from_bytes(stream.clone(), b"abcd".to_vec()))
-        .await
-        .expect("append at the limit succeeds");
+    append_bytes(&runtime, &stream, b"abcd").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_write_admission_rejects_append_batch_without_partial_mutation() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(
         RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(4)),
-        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
-        Some(cold_store),
-    )
-    .expect("spawn runtime");
+        cold_store,
+    );
     let stream = BucketStreamId::new("benchcmp", "cold-admission-batch");
     create_stream(&runtime, &stream).await;
-    runtime
-        .append(AppendRequest::from_bytes(stream.clone(), b"abc".to_vec()))
-        .await
-        .expect("append below limit");
+    append_bytes(&runtime, &stream, b"abc").await;
 
     let err = runtime
         .append_batch(AppendBatchRequest::new(stream.clone(), vec![
@@ -2489,14 +2270,7 @@ async fn cold_write_admission_rejects_append_batch_without_partial_mutation() {
         other => panic!("expected cold backpressure, got {other:?}"),
     }
     let read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream.clone(),
-            offset: 0,
-            max_len: 8,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream.clone(), 0, 8))
         .await
         .expect("read");
     assert_eq!(read.payload, b"abc");
@@ -2537,23 +2311,12 @@ async fn cold_write_admission_does_not_preempt_non_local_write_engine() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flush_cold_group_once_selects_stream_inside_owner_group() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        RuntimeConfig::new(2, 8),
-        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
-        Some(cold_store),
-    )
-    .expect("spawn runtime");
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(RuntimeConfig::new(2, 8), cold_store);
     let group_id = RaftGroupId(3);
     let stream = stream_on_group(&runtime, group_id, "cold-group");
     create_stream(&runtime, &stream).await;
-    runtime
-        .append(AppendRequest::from_bytes(
-            stream.clone(),
-            b"abcdef".to_vec(),
-        ))
-        .await
-        .expect("append");
+    append_bytes(&runtime, &stream, b"abcdef").await;
 
     let flushed = runtime
         .flush_cold_group_once(group_id, PlanGroupColdFlushRequest {
@@ -2566,14 +2329,7 @@ async fn flush_cold_group_once_selects_stream_inside_owner_group() {
     assert_eq!(flushed.hot_start_offset, 4);
 
     let read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id: stream,
-            offset: 0,
-            max_len: 6,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream, 0, 6))
         .await
         .expect("read cold and hot");
     assert_eq!(read.payload, b"abcdef");
@@ -2581,24 +2337,13 @@ async fn flush_cold_group_once_selects_stream_inside_owner_group() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn flush_cold_all_groups_once_bounded_flushes_multiple_groups() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        RuntimeConfig::new(2, 8),
-        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
-        Some(cold_store),
-    )
-    .expect("spawn runtime");
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(RuntimeConfig::new(2, 8), cold_store);
     let first = stream_on_group(&runtime, RaftGroupId(1), "cold-bounded-a");
     let second = stream_on_group(&runtime, RaftGroupId(6), "cold-bounded-b");
     for stream in [&first, &second] {
         create_stream(&runtime, stream).await;
-        runtime
-            .append(AppendRequest::from_bytes(
-                stream.clone(),
-                b"abcdef".to_vec(),
-            ))
-            .await
-            .expect("append");
+        append_bytes(&runtime, stream, b"abcdef").await;
     }
 
     let flushed = runtime
@@ -2621,13 +2366,11 @@ async fn flush_cold_all_groups_once_bounded_flushes_multiple_groups() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repeated_cold_flush_keeps_hot_bytes_bounded_while_writes_continue() {
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(
         RuntimeConfig::new(2, 8).with_cold_max_hot_bytes_per_group(Some(16)),
-        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
-        Some(cold_store),
-    )
-    .expect("spawn runtime");
+        cold_store,
+    );
     let streams = [
         stream_on_group(&runtime, RaftGroupId(0), "cold-steady-a"),
         stream_on_group(&runtime, RaftGroupId(3), "cold-steady-b"),
@@ -2682,14 +2425,7 @@ async fn repeated_cold_flush_keeps_hot_bytes_bounded_while_writes_continue() {
 
     for stream in streams {
         let read = runtime
-            .read_stream(ReadStreamRequest {
-                stream_id: stream,
-                offset: 0,
-                max_len: expected.len(),
-                now_ms: 0,
-                record: None,
-                max_records: None,
-            })
+            .read_stream(read_req(stream, 0, expected.len()))
             .await
             .expect("read cold-backed stream");
         assert_eq!(read.payload, expected);
@@ -2708,23 +2444,13 @@ async fn wait_read_stream_completes_after_owner_append() {
         let stream = stream.clone();
         tokio::spawn(async move {
             runtime
-                .wait_read_stream(ReadStreamRequest {
-                    stream_id: stream,
-                    offset: 0,
-                    max_len: 16,
-                    now_ms: 0,
-                    record: None,
-                    max_records: None,
-                })
+                .wait_read_stream(read_req(stream, 0, 16))
                 .await
                 .expect("wait read")
         })
     };
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    runtime
-        .append(AppendRequest::from_bytes(stream.clone(), b"hello".to_vec()))
-        .await
-        .expect("append");
+    append_bytes(&runtime, &stream, b"hello").await;
 
     let read = tokio::time::timeout(std::time::Duration::from_secs(1), wait)
         .await
@@ -2748,14 +2474,7 @@ async fn wait_read_stream_completes_on_close_at_tail() {
         let stream = stream.clone();
         tokio::spawn(async move {
             runtime
-                .wait_read_stream(ReadStreamRequest {
-                    stream_id: stream,
-                    offset: 0,
-                    max_len: 16,
-                    now_ms: 0,
-                    record: None,
-                    max_records: None,
-                })
+                .wait_read_stream(read_req(stream, 0, 16))
                 .await
                 .expect("wait read")
         })
@@ -2791,18 +2510,7 @@ async fn canceled_wait_read_stream_removes_owner_waiter() {
     let wait = {
         let runtime = runtime.clone();
         let stream = stream.clone();
-        tokio::spawn(async move {
-            runtime
-                .wait_read_stream(ReadStreamRequest {
-                    stream_id: stream,
-                    offset: 0,
-                    max_len: 16,
-                    now_ms: 0,
-                    record: None,
-                    max_records: None,
-                })
-                .await
-        })
+        tokio::spawn(async move { runtime.wait_read_stream(read_req(stream, 0, 16)).await })
     };
     wait_for_live_waiters(&runtime, 1).await;
     wait.abort();
@@ -2821,30 +2529,12 @@ async fn live_read_waiter_limit_rejects_excess_waiters_on_owner_core() {
     let first = {
         let runtime = runtime.clone();
         let stream = stream.clone();
-        tokio::spawn(async move {
-            runtime
-                .wait_read_stream(ReadStreamRequest {
-                    stream_id: stream,
-                    offset: 0,
-                    max_len: 16,
-                    now_ms: 0,
-                    record: None,
-                    max_records: None,
-                })
-                .await
-        })
+        tokio::spawn(async move { runtime.wait_read_stream(read_req(stream, 0, 16)).await })
     };
     wait_for_live_waiters(&runtime, 1).await;
 
     let err = runtime
-        .wait_read_stream(ReadStreamRequest {
-            stream_id: stream.clone(),
-            offset: 0,
-            max_len: 16,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .wait_read_stream(read_req(stream.clone(), 0, 16))
         .await
         .expect_err("second waiter should hit owner-core limit");
     assert_eq!(err, RuntimeError::LiveReadBackpressure {
@@ -2871,26 +2561,12 @@ fn cancel_read_watcher_removes_group_local_waiter() {
     read_watchers.insert(stream.clone(), vec![
         ReadWatcher {
             waiter_id: 1,
-            request: ReadStreamRequest {
-                stream_id: stream.clone(),
-                offset: 0,
-                max_len: 16,
-                now_ms: 0,
-                record: None,
-                max_records: None,
-            },
+            request: read_req(stream.clone(), 0, 16),
             response_tx: first_tx,
         },
         ReadWatcher {
             waiter_id: 2,
-            request: ReadStreamRequest {
-                stream_id: stream.clone(),
-                offset: 0,
-                max_len: 16,
-                now_ms: 0,
-                record: None,
-                max_records: None,
-            },
+            request: read_req(stream.clone(), 0, 16),
             response_tx: second_tx,
         },
     ]);
@@ -2918,29 +2594,11 @@ fn cancel_read_watcher_removes_group_local_waiter() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn notify_read_watchers_shares_identical_reads_across_watchers() {
     let factory = BlockingReadFactory::default();
-    let runtime = ShardRuntime::spawn_with_engine_factory(
-        RuntimeConfig {
-            core_count: 1,
-            raft_group_count: 1,
-            mailbox_capacity: 8,
-            threading: RuntimeThreading::HostedTokio,
-            cold_max_hot_bytes_per_group: None,
-            raft_max_uncommitted_bytes_per_group: None,
-            live_read_max_waiters_per_core: Some(65_536),
-        },
-        factory.clone(),
-    )
-    .expect("spawn runtime");
+    let runtime = ShardRuntime::spawn_with_engine_factory(test_config(1, 1, 8), factory.clone())
+        .expect("spawn runtime");
     let stream = BucketStreamId::new("benchcmp", "watcher-shared-read");
     let placement = runtime.locate(&stream);
-    let request = ReadStreamRequest {
-        stream_id: stream.clone(),
-        offset: 0,
-        max_len: 16,
-        now_ms: 0,
-        record: None,
-        max_records: None,
-    };
+    let request = read_req(stream.clone(), 0, 16);
     let mut read_watchers = ReadWatchers::new();
     let (first_tx, _first_rx) = oneshot::channel();
     let (second_tx, _second_rx) = oneshot::channel();
@@ -3050,13 +2708,7 @@ async fn delete_stream_removes_state_on_owner_group() {
     let stream = BucketStreamId::new("benchcmp", "delete-stream");
     let placement = runtime.locate(&stream);
     create_stream(&runtime, &stream).await;
-    runtime
-        .append(AppendRequest::from_bytes(
-            stream.clone(),
-            b"payload".to_vec(),
-        ))
-        .await
-        .expect("append");
+    append_bytes(&runtime, &stream, b"payload").await;
 
     let deleted = runtime
         .delete_stream(DeleteStreamRequest {
@@ -3127,19 +2779,8 @@ async fn thread_per_core_runtime_reaches_all_configured_cores() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn custom_group_engine_is_created_once_per_touched_group_on_owner_core() {
     let factory = RecordingFactory::default();
-    let runtime = ShardRuntime::spawn_with_engine_factory(
-        RuntimeConfig {
-            core_count: 4,
-            raft_group_count: 32,
-            mailbox_capacity: 128,
-            threading: RuntimeThreading::HostedTokio,
-            cold_max_hot_bytes_per_group: None,
-            raft_max_uncommitted_bytes_per_group: None,
-            live_read_max_waiters_per_core: Some(65_536),
-        },
-        factory.clone(),
-    )
-    .expect("spawn runtime");
+    let runtime = ShardRuntime::spawn_with_engine_factory(test_config(4, 32, 128), factory.clone())
+        .expect("spawn runtime");
 
     let mut touched_groups = HashSet::new();
     for index in 0..4096 {
@@ -3172,17 +2813,9 @@ async fn custom_group_engine_is_created_once_per_touched_group_on_owner_core() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn background_cold_flush_skips_groups_that_cannot_accept_local_writes() {
     let factory = RecordingFactory::without_local_writes();
-    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let cold_store = Arc::new(memory_cold_store());
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        RuntimeConfig {
-            core_count: 2,
-            raft_group_count: 4,
-            mailbox_capacity: 128,
-            threading: RuntimeThreading::HostedTokio,
-            cold_max_hot_bytes_per_group: None,
-            raft_max_uncommitted_bytes_per_group: None,
-            live_read_max_waiters_per_core: Some(65_536),
-        },
+        test_config(2, 4, 128),
         factory.clone(),
         Some(cold_store),
     )
@@ -3209,19 +2842,8 @@ async fn background_cold_flush_skips_groups_that_cannot_accept_local_writes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn warm_group_instantiates_engine_on_owner_core_without_stream_mutation() {
     let factory = RecordingFactory::default();
-    let runtime = ShardRuntime::spawn_with_engine_factory(
-        RuntimeConfig {
-            core_count: 2,
-            raft_group_count: 4,
-            mailbox_capacity: 128,
-            threading: RuntimeThreading::HostedTokio,
-            cold_max_hot_bytes_per_group: None,
-            raft_max_uncommitted_bytes_per_group: None,
-            live_read_max_waiters_per_core: Some(65_536),
-        },
-        factory.clone(),
-    )
-    .expect("spawn runtime");
+    let runtime = ShardRuntime::spawn_with_engine_factory(test_config(2, 4, 128), factory.clone())
+        .expect("spawn runtime");
 
     let warmed = runtime
         .warm_group(RaftGroupId(3))
@@ -3260,19 +2882,8 @@ async fn warm_group_instantiates_engine_on_owner_core_without_stream_mutation() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn core_worker_dispatches_other_groups_while_one_group_waits() {
     let factory = BlockingFirstCreateEngineFactory::default();
-    let runtime = ShardRuntime::spawn_with_engine_factory(
-        RuntimeConfig {
-            core_count: 1,
-            raft_group_count: 2,
-            mailbox_capacity: 128,
-            threading: RuntimeThreading::HostedTokio,
-            cold_max_hot_bytes_per_group: None,
-            raft_max_uncommitted_bytes_per_group: None,
-            live_read_max_waiters_per_core: Some(65_536),
-        },
-        factory.clone(),
-    )
-    .expect("spawn runtime");
+    let runtime = ShardRuntime::spawn_with_engine_factory(test_config(1, 2, 128), factory.clone())
+        .expect("spawn runtime");
 
     let blocked_stream = stream_on_group(&runtime, RaftGroupId(0), "blocked-group");
     let free_stream = stream_on_group(&runtime, RaftGroupId(1), "free-group");
@@ -3300,32 +2911,14 @@ async fn core_worker_dispatches_other_groups_while_one_group_waits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_read_uses_group_read_parts_fast_path() {
     let factory = BlockingReadFactory::default();
-    let runtime = ShardRuntime::spawn_with_engine_factory(
-        RuntimeConfig {
-            core_count: 1,
-            raft_group_count: 1,
-            mailbox_capacity: 128,
-            threading: RuntimeThreading::HostedTokio,
-            cold_max_hot_bytes_per_group: None,
-            raft_max_uncommitted_bytes_per_group: None,
-            live_read_max_waiters_per_core: Some(65_536),
-        },
-        factory.clone(),
-    )
-    .expect("spawn runtime");
+    let runtime = ShardRuntime::spawn_with_engine_factory(test_config(1, 1, 128), factory.clone())
+        .expect("spawn runtime");
     let stream = BucketStreamId::new("benchcmp", "read-offload");
     create_stream(&runtime, &stream).await;
 
     let read = tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        runtime.read_stream(ReadStreamRequest {
-            stream_id: stream.clone(),
-            offset: 0,
-            max_len: 16,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        }),
+        runtime.read_stream(read_req(stream.clone(), 0, 16)),
     )
     .await
     .expect("runtime read should not use blocking legacy read_stream")
@@ -3360,14 +2953,7 @@ async fn read_materialization_is_bounded_without_blocking_group_actor() {
     let first_stream_for_read = first_stream.clone();
     let first_read = tokio::spawn(async move {
         first_runtime
-            .read_stream(ReadStreamRequest {
-                stream_id: first_stream_for_read,
-                offset: 0,
-                max_len: 16,
-                now_ms: 0,
-                record: None,
-                max_records: None,
-            })
+            .read_stream(read_req(first_stream_for_read, 0, 16))
             .await
     });
     tokio::time::timeout(
@@ -3381,14 +2967,7 @@ async fn read_materialization_is_bounded_without_blocking_group_actor() {
     let second_stream_for_read = second_stream.clone();
     let second_read = tokio::spawn(async move {
         second_runtime
-            .read_stream(ReadStreamRequest {
-                stream_id: second_stream_for_read,
-                offset: 0,
-                max_len: 16,
-                now_ms: 0,
-                record: None,
-                max_records: None,
-            })
+            .read_stream(read_req(second_stream_for_read, 0, 16))
             .await
     });
 
@@ -3427,19 +3006,8 @@ async fn read_materialization_is_bounded_without_blocking_group_actor() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_engine_errors_include_group_context_and_do_not_record_success_metrics() {
-    let runtime = ShardRuntime::spawn_with_engine_factory(
-        RuntimeConfig {
-            core_count: 2,
-            raft_group_count: 8,
-            mailbox_capacity: 128,
-            threading: RuntimeThreading::HostedTokio,
-            cold_max_hot_bytes_per_group: None,
-            raft_max_uncommitted_bytes_per_group: None,
-            live_read_max_waiters_per_core: Some(65_536),
-        },
-        FailingFactory,
-    )
-    .expect("spawn runtime");
+    let runtime = ShardRuntime::spawn_with_engine_factory(test_config(2, 8, 128), FailingFactory)
+        .expect("spawn runtime");
 
     let stream = BucketStreamId::new("benchcmp", "failing-stream");
     let placement = runtime.locate(&stream);
@@ -3459,19 +3027,8 @@ async fn group_engine_errors_include_group_context_and_do_not_record_success_met
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mailbox_full_events_record_owner_core_backpressure() {
     let factory = BlockingOnceFactory::default();
-    let runtime = ShardRuntime::spawn_with_engine_factory(
-        RuntimeConfig {
-            core_count: 1,
-            raft_group_count: 1,
-            mailbox_capacity: 1,
-            threading: RuntimeThreading::HostedTokio,
-            cold_max_hot_bytes_per_group: None,
-            raft_max_uncommitted_bytes_per_group: None,
-            live_read_max_waiters_per_core: Some(65_536),
-        },
-        factory.clone(),
-    )
-    .expect("spawn runtime");
+    let runtime = ShardRuntime::spawn_with_engine_factory(test_config(1, 1, 1), factory.clone())
+        .expect("spawn runtime");
 
     let entered = factory.entered.clone();
     let entered_wait = entered.notified();
@@ -3520,19 +3077,8 @@ async fn mailbox_full_events_record_owner_core_backpressure() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_mailbox_full_events_record_inner_actor_backpressure() {
     let factory = BlockingFirstCreateEngineFactory::default();
-    let runtime = ShardRuntime::spawn_with_engine_factory(
-        RuntimeConfig {
-            core_count: 1,
-            raft_group_count: 1,
-            mailbox_capacity: 1,
-            threading: RuntimeThreading::HostedTokio,
-            cold_max_hot_bytes_per_group: None,
-            raft_max_uncommitted_bytes_per_group: None,
-            live_read_max_waiters_per_core: Some(65_536),
-        },
-        factory.clone(),
-    )
-    .expect("spawn runtime");
+    let runtime = ShardRuntime::spawn_with_engine_factory(test_config(1, 1, 1), factory.clone())
+        .expect("spawn runtime");
 
     let first_runtime = runtime.clone();
     let first = tokio::spawn(async move {
@@ -3589,31 +3135,12 @@ async fn group_mailbox_full_events_record_inner_actor_backpressure() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wal_group_engine_recovers_multiple_groups_from_per_group_logs() {
-    let wal_root = std::env::temp_dir().join(format!(
-        "ursula-wal-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time after unix epoch")
-            .as_nanos()
-    ));
+    let wal_root = temp_wal_root("ursula-wal-test");
     let _ = std::fs::remove_dir_all(&wal_root);
-    let config = RuntimeConfig {
-        core_count: 2,
-        raft_group_count: 8,
-        mailbox_capacity: 128,
-        threading: RuntimeThreading::HostedTokio,
-        cold_max_hot_bytes_per_group: None,
-        raft_max_uncommitted_bytes_per_group: None,
-        live_read_max_waiters_per_core: Some(65_536),
-    };
+    let config = test_config(2, 8, 128);
 
     let (first_stream, second_stream) = {
-        let runtime = ShardRuntime::spawn_with_engine_factory(
-            config.clone(),
-            WalGroupEngineFactory::new(&wal_root),
-        )
-        .expect("spawn runtime");
+        let runtime = spawn_wal_runtime(config.clone(), &wal_root);
 
         let mut seen_groups = HashSet::new();
         let mut streams = Vec::new();
@@ -3631,13 +3158,7 @@ async fn wal_group_engine_recovers_multiple_groups_from_per_group_logs() {
         let second_stream = streams[1].clone();
 
         create_stream(&runtime, &first_stream).await;
-        runtime
-            .append(AppendRequest::from_bytes(
-                first_stream.clone(),
-                b"first-payload".to_vec(),
-            ))
-            .await
-            .expect("append first stream");
+        append_bytes(&runtime, &first_stream, b"first-payload").await;
 
         create_stream(&runtime, &second_stream).await;
         let mut append_second =
@@ -3651,33 +3172,17 @@ async fn wal_group_engine_recovers_multiple_groups_from_per_group_logs() {
         (first_stream, second_stream)
     };
 
-    let recovered =
-        ShardRuntime::spawn_with_engine_factory(config, WalGroupEngineFactory::new(&wal_root))
-            .expect("spawn recovered runtime");
+    let recovered = spawn_wal_runtime(config, &wal_root);
 
     let first_read = recovered
-        .read_stream(ReadStreamRequest {
-            stream_id: first_stream.clone(),
-            offset: 0,
-            max_len: 128,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(first_stream.clone(), 0, 128))
         .await
         .expect("read recovered first stream");
     assert_eq!(first_read.payload, b"first-payload");
     assert!(!first_read.closed);
 
     let second_read = recovered
-        .read_stream(ReadStreamRequest {
-            stream_id: second_stream.clone(),
-            offset: 0,
-            max_len: 128,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(second_stream.clone(), 0, 128))
         .await
         .expect("read recovered second stream");
     assert_eq!(second_read.payload, b"second-payload");
@@ -3705,32 +3210,13 @@ async fn wal_group_engine_recovers_multiple_groups_from_per_group_logs() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wal_group_engine_recovers_json_records_after_retention() {
-    let wal_root = std::env::temp_dir().join(format!(
-        "ursula-wal-record-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time after unix epoch")
-            .as_nanos()
-    ));
+    let wal_root = temp_wal_root("ursula-wal-record-test");
     let _ = std::fs::remove_dir_all(&wal_root);
-    let config = RuntimeConfig {
-        core_count: 2,
-        raft_group_count: 8,
-        mailbox_capacity: 128,
-        threading: RuntimeThreading::HostedTokio,
-        cold_max_hot_bytes_per_group: None,
-        raft_max_uncommitted_bytes_per_group: None,
-        live_read_max_waiters_per_core: Some(65_536),
-    };
+    let config = test_config(2, 8, 128);
     let stream = BucketStreamId::new("benchcmp", "wal-record-coordinates");
 
     {
-        let runtime = ShardRuntime::spawn_with_engine_factory(
-            config.clone(),
-            WalGroupEngineFactory::new(&wal_root),
-        )
-        .expect("spawn WAL runtime");
+        let runtime = spawn_wal_runtime(config.clone(), &wal_root);
         runtime
             .create_stream(CreateStreamRequest::new(stream.clone(), "application/json"))
             .await
@@ -3764,9 +3250,7 @@ async fn wal_group_engine_recovers_json_records_after_retention() {
             .expect("publish record-aligned snapshot");
     }
 
-    let recovered =
-        ShardRuntime::spawn_with_engine_factory(config, WalGroupEngineFactory::new(&wal_root))
-            .expect("spawn recovered runtime");
+    let recovered = spawn_wal_runtime(config, &wal_root);
     let head = recovered
         .head_stream(HeadStreamRequest {
             stream_id: stream.clone(),
@@ -3849,33 +3333,14 @@ async fn wal_group_engine_recovers_json_records_after_retention() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wal_group_engine_batches_append_records_and_recovers() {
-    let wal_root = std::env::temp_dir().join(format!(
-        "ursula-wal-batch-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time after unix epoch")
-            .as_nanos()
-    ));
+    let wal_root = temp_wal_root("ursula-wal-batch-test");
     let _ = std::fs::remove_dir_all(&wal_root);
-    let config = RuntimeConfig {
-        core_count: 2,
-        raft_group_count: 8,
-        mailbox_capacity: 128,
-        threading: RuntimeThreading::HostedTokio,
-        cold_max_hot_bytes_per_group: None,
-        raft_max_uncommitted_bytes_per_group: None,
-        live_read_max_waiters_per_core: Some(65_536),
-    };
+    let config = test_config(2, 8, 128);
     let stream = BucketStreamId::new("benchcmp", "wal-batch");
     let placement;
 
     {
-        let runtime = ShardRuntime::spawn_with_engine_factory(
-            config.clone(),
-            WalGroupEngineFactory::new(&wal_root),
-        )
-        .expect("spawn runtime");
+        let runtime = spawn_wal_runtime(config.clone(), &wal_root);
         placement = runtime.locate(&stream);
         create_stream(&runtime, &stream).await;
         let response = runtime
@@ -3890,14 +3355,7 @@ async fn wal_group_engine_batches_append_records_and_recovers() {
         assert!(response.items.iter().all(Result::is_ok));
 
         let read = runtime
-            .read_stream(ReadStreamRequest {
-                stream_id: stream.clone(),
-                offset: 0,
-                max_len: 16,
-                now_ms: 0,
-                record: None,
-                max_records: None,
-            })
+            .read_stream(read_req(stream.clone(), 0, 16))
             .await
             .expect("read");
         assert_eq!(read.payload, b"abcdef");
@@ -3930,18 +3388,9 @@ async fn wal_group_engine_batches_append_records_and_recovers() {
             .expect("decode WAL frames");
     assert_eq!(wal_records.len(), 2);
 
-    let recovered =
-        ShardRuntime::spawn_with_engine_factory(config, WalGroupEngineFactory::new(&wal_root))
-            .expect("spawn recovered runtime");
+    let recovered = spawn_wal_runtime(config, &wal_root);
     let read = recovered
-        .read_stream(ReadStreamRequest {
-            stream_id: stream,
-            offset: 0,
-            max_len: 16,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream, 0, 16))
         .await
         .expect("read recovered batch");
     assert_eq!(read.payload, b"abcdef");
@@ -3952,64 +3401,30 @@ async fn wal_group_engine_batches_append_records_and_recovers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wal_group_engine_persists_installed_snapshot() {
-    let wal_root = std::env::temp_dir().join(format!(
-        "ursula-wal-install-snapshot-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time after unix epoch")
-            .as_nanos()
-    ));
+    let wal_root = temp_wal_root("ursula-wal-install-snapshot-test");
     let _ = std::fs::remove_dir_all(&wal_root);
-    let config = RuntimeConfig {
-        core_count: 2,
-        raft_group_count: 8,
-        mailbox_capacity: 128,
-        threading: RuntimeThreading::HostedTokio,
-        cold_max_hot_bytes_per_group: None,
-        raft_max_uncommitted_bytes_per_group: None,
-        live_read_max_waiters_per_core: Some(65_536),
-    };
+    let config = test_config(2, 8, 128);
     let stream = BucketStreamId::new("benchcmp", "wal-installed-snapshot");
     let source = runtime(2, 8);
     let placement = source.locate(&stream);
     create_stream(&source, &stream).await;
-    source
-        .append(AppendRequest::from_bytes(
-            stream.clone(),
-            b"snapshot-payload".to_vec(),
-        ))
-        .await
-        .expect("append source");
+    append_bytes(&source, &stream, b"snapshot-payload").await;
     let snapshot = source
         .snapshot_group(placement.raft_group_id)
         .await
         .expect("snapshot source");
 
     {
-        let target = ShardRuntime::spawn_with_engine_factory(
-            config.clone(),
-            WalGroupEngineFactory::new(&wal_root),
-        )
-        .expect("spawn WAL runtime");
+        let target = spawn_wal_runtime(config.clone(), &wal_root);
         target
             .install_group_snapshot(snapshot)
             .await
             .expect("install snapshot");
     }
 
-    let recovered =
-        ShardRuntime::spawn_with_engine_factory(config, WalGroupEngineFactory::new(&wal_root))
-            .expect("spawn recovered WAL runtime");
+    let recovered = spawn_wal_runtime(config, &wal_root);
     let read = recovered
-        .read_stream(ReadStreamRequest {
-            stream_id: stream.clone(),
-            offset: 0,
-            max_len: 32,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream.clone(), 0, 32))
         .await
         .expect("read recovered snapshot");
     assert_eq!(read.payload, b"snapshot-payload");
@@ -4027,35 +3442,16 @@ async fn wal_group_engine_persists_installed_snapshot() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wal_group_engine_recovers_stream_attrs_after_restart() {
-    let wal_root = std::env::temp_dir().join(format!(
-        "ursula-wal-attrs-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time after unix epoch")
-            .as_nanos()
-    ));
+    let wal_root = temp_wal_root("ursula-wal-attrs-test");
     let _ = std::fs::remove_dir_all(&wal_root);
-    let config = RuntimeConfig {
-        core_count: 2,
-        raft_group_count: 8,
-        mailbox_capacity: 128,
-        threading: RuntimeThreading::HostedTokio,
-        cold_max_hot_bytes_per_group: None,
-        raft_max_uncommitted_bytes_per_group: None,
-        live_read_max_waiters_per_core: Some(65_536),
-    };
+    let config = test_config(2, 8, 128);
     let created_stream = BucketStreamId::new("benchcmp", "wal-created-attrs");
     let updated_stream = BucketStreamId::new("benchcmp", "wal-updated-attrs");
     let created_attrs = stream_attrs("Created attrs", "create-replay");
     let updated_attrs = stream_attrs("Updated attrs", "update-replay");
 
     {
-        let runtime = ShardRuntime::spawn_with_engine_factory(
-            config.clone(),
-            WalGroupEngineFactory::new(&wal_root),
-        )
-        .expect("spawn WAL runtime");
+        let runtime = spawn_wal_runtime(config.clone(), &wal_root);
         let mut create_request =
             CreateStreamRequest::new(created_stream.clone(), DEFAULT_CONTENT_TYPE);
         create_request.attrs = Some(created_attrs.clone());
@@ -4075,9 +3471,7 @@ async fn wal_group_engine_recovers_stream_attrs_after_restart() {
             .expect("update stream attrs");
     }
 
-    let recovered =
-        ShardRuntime::spawn_with_engine_factory(config, WalGroupEngineFactory::new(&wal_root))
-            .expect("spawn recovered runtime");
+    let recovered = spawn_wal_runtime(config, &wal_root);
     let recovered_created = recovered
         .get_stream_attrs(GetStreamAttrsRequest {
             stream_id: created_stream,
@@ -4101,41 +3495,20 @@ async fn wal_group_engine_recovers_stream_attrs_after_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wal_group_engine_recovers_producer_dedup_state() {
-    let wal_root = std::env::temp_dir().join(format!(
-        "ursula-wal-producer-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time after unix epoch")
-            .as_nanos()
-    ));
+    let wal_root = temp_wal_root("ursula-wal-producer-test");
     let _ = std::fs::remove_dir_all(&wal_root);
-    let config = RuntimeConfig {
-        core_count: 2,
-        raft_group_count: 8,
-        mailbox_capacity: 128,
-        threading: RuntimeThreading::HostedTokio,
-        cold_max_hot_bytes_per_group: None,
-        raft_max_uncommitted_bytes_per_group: None,
-        live_read_max_waiters_per_core: Some(65_536),
-    };
+    let config = test_config(2, 8, 128);
     let stream = BucketStreamId::new("benchcmp", "wal-producer");
 
     {
-        let runtime = ShardRuntime::spawn_with_engine_factory(
-            config.clone(),
-            WalGroupEngineFactory::new(&wal_root),
-        )
-        .expect("spawn WAL runtime");
+        let runtime = spawn_wal_runtime(config.clone(), &wal_root);
         create_stream(&runtime, &stream).await;
         let mut append = AppendRequest::from_bytes(stream.clone(), b"a".to_vec());
         append.producer = Some(producer("writer-1", 0, 0));
         runtime.append(append).await.expect("append");
     }
 
-    let recovered =
-        ShardRuntime::spawn_with_engine_factory(config, WalGroupEngineFactory::new(&wal_root))
-            .expect("spawn recovered runtime");
+    let recovered = spawn_wal_runtime(config, &wal_root);
     let mut duplicate = AppendRequest::from_bytes(stream.clone(), b"ignored".to_vec());
     duplicate.producer = Some(producer("writer-1", 0, 0));
     let duplicate = recovered
@@ -4155,14 +3528,7 @@ async fn wal_group_engine_recovers_producer_dedup_state() {
     assert_eq!(next.stream_append_count, 2);
 
     let read = recovered
-        .read_stream(ReadStreamRequest {
-            stream_id: stream,
-            offset: 0,
-            max_len: 16,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream, 0, 16))
         .await
         .expect("read");
     assert_eq!(read.payload, b"ab");
@@ -4173,33 +3539,14 @@ async fn wal_group_engine_recovers_producer_dedup_state() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wal_group_engine_recovers_producer_append_batch_dedup_state() {
-    let wal_root = std::env::temp_dir().join(format!(
-        "ursula-wal-producer-batch-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time after unix epoch")
-            .as_nanos()
-    ));
+    let wal_root = temp_wal_root("ursula-wal-producer-batch-test");
     let _ = std::fs::remove_dir_all(&wal_root);
-    let config = RuntimeConfig {
-        core_count: 2,
-        raft_group_count: 8,
-        mailbox_capacity: 128,
-        threading: RuntimeThreading::HostedTokio,
-        cold_max_hot_bytes_per_group: None,
-        raft_max_uncommitted_bytes_per_group: None,
-        live_read_max_waiters_per_core: Some(65_536),
-    };
+    let config = test_config(2, 8, 128);
     let stream = BucketStreamId::new("benchcmp", "wal-producer-batch");
     let placement;
 
     {
-        let runtime = ShardRuntime::spawn_with_engine_factory(
-            config.clone(),
-            WalGroupEngineFactory::new(&wal_root),
-        )
-        .expect("spawn WAL runtime");
+        let runtime = spawn_wal_runtime(config.clone(), &wal_root);
         placement = runtime.locate(&stream);
         create_stream(&runtime, &stream).await;
 
@@ -4229,9 +3576,7 @@ async fn wal_group_engine_recovers_producer_append_batch_dedup_state() {
             .expect("decode WAL frames");
     assert_eq!(wal_records.len(), 2);
 
-    let recovered =
-        ShardRuntime::spawn_with_engine_factory(config, WalGroupEngineFactory::new(&wal_root))
-            .expect("spawn recovered runtime");
+    let recovered = spawn_wal_runtime(config, &wal_root);
     let mut duplicate = AppendBatchRequest::new(stream.clone(), vec![b"retry".to_vec()]);
     duplicate.producer = Some(producer("writer-1", 0, 0));
     let duplicate = recovered
@@ -4252,14 +3597,7 @@ async fn wal_group_engine_recovers_producer_append_batch_dedup_state() {
     assert_eq!(next.items[0].as_ref().expect("next item").start_offset, 2);
 
     let read = recovered
-        .read_stream(ReadStreamRequest {
-            stream_id: stream,
-            offset: 0,
-            max_len: 16,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream, 0, 16))
         .await
         .expect("read");
     assert_eq!(read.payload, b"abc");
