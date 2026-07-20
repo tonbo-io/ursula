@@ -18,7 +18,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["The Ursula contributors"]
@@ -81,16 +81,16 @@ tracing = "0.1"
 tracing-opentelemetry = "0.31"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
-ursula = { path = "crates/ursula", version = "0.2.0" }
-ursula-config = { path = "crates/ursula-config", version = "0.2.0" }
-ursula-control = { path = "crates/ursula-control", version = "0.2.0" }
-ursula-ctl = { path = "crates/ursula-ctl", version = "0.2.0" }
-ursula-proto = { path = "crates/ursula-proto", version = "0.2.0" }
-ursula-raft = { path = "crates/ursula-raft", version = "0.2.0" }
-ursula-runtime = { path = "crates/ursula-runtime", version = "0.2.0" }
-ursula-shard = { path = "crates/ursula-shard", version = "0.2.0" }
-ursula-stream = { path = "crates/ursula-stream", version = "0.2.0" }
-ursula-observability = { path = "crates/ursula-observability", version = "0.2.0" }
+ursula = { path = "crates/ursula", version = "0.3.0" }
+ursula-config = { path = "crates/ursula-config", version = "0.3.0" }
+ursula-control = { path = "crates/ursula-control", version = "0.3.0" }
+ursula-ctl = { path = "crates/ursula-ctl", version = "0.3.0" }
+ursula-proto = { path = "crates/ursula-proto", version = "0.3.0" }
+ursula-raft = { path = "crates/ursula-raft", version = "0.3.0" }
+ursula-runtime = { path = "crates/ursula-runtime", version = "0.3.0" }
+ursula-shard = { path = "crates/ursula-shard", version = "0.3.0" }
+ursula-stream = { path = "crates/ursula-stream", version = "0.3.0" }
+ursula-observability = { path = "crates/ursula-observability", version = "0.3.0" }
 yaml_serde = "0.10"
 zstd = "0.13"
 
