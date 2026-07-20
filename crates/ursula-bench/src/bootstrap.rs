@@ -33,9 +33,6 @@ pub struct BootstrapArgs {
     #[arg(long, default_value = "bench-bootstrap")]
     pub bucket: String,
 
-    #[arg(long, default_value = "benchmark")]
-    pub basin: String,
-
     #[arg(long, default_value = "doc")]
     pub stream: String,
 
@@ -67,7 +64,6 @@ pub struct BootstrapResult {
     pub api_style: ApiStyle,
     pub target: String,
     pub bucket: String,
-    pub basin: String,
     pub stream: String,
     pub per_client_stream: bool,
     pub clients: usize,
@@ -83,13 +79,7 @@ pub struct BootstrapResult {
 
 pub async fn run(args: BootstrapArgs) -> Result<BootstrapResult> {
     let client = build_client(args.request_timeout_secs)?;
-    let backend = Backend::new(
-        args.api_style,
-        &args.target,
-        &args.bucket,
-        &args.basin,
-        client,
-    );
+    let backend = Backend::new(args.api_style, &args.target, &args.bucket, client);
 
     backend.ensure_namespace().await?;
 
@@ -135,7 +125,7 @@ pub async fn run(args: BootstrapArgs) -> Result<BootstrapResult> {
         let _ = j.await;
     }
 
-    if args.snapshot_bytes > 0 && backend.publishable_snapshot() {
+    if args.snapshot_bytes > 0 {
         let snap = Bytes::from(fill_payload(args.snapshot_bytes, 0x5A5A));
         for stream in &stream_names {
             backend
@@ -153,7 +143,6 @@ pub async fn run(args: BootstrapArgs) -> Result<BootstrapResult> {
     let bytes_total = Arc::new(AtomicU64::new(0));
     let hist = Arc::new(Mutex::new(new_histogram()));
 
-    let pre_bytes = (event_count as u64) * (args.event_bytes as u64);
     let mut handles = Vec::with_capacity(args.clients);
     for idx in 0..args.clients {
         let backend = backend.clone();
@@ -170,18 +159,7 @@ pub async fn run(args: BootstrapArgs) -> Result<BootstrapResult> {
         let hist = hist.clone();
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
-            run_client(
-                &backend,
-                idx,
-                &stream,
-                pre_bytes,
-                ok,
-                bp,
-                err,
-                bytes_total,
-                hist,
-            )
-            .await;
+            run_client(&backend, idx, &stream, ok, bp, err, bytes_total, hist).await;
         }));
     }
 
@@ -199,7 +177,6 @@ pub async fn run(args: BootstrapArgs) -> Result<BootstrapResult> {
         api_style: args.api_style,
         target: args.target,
         bucket: args.bucket,
-        basin: args.basin,
         stream: args.stream,
         per_client_stream: args.per_client_stream,
         clients: args.clients,
@@ -223,7 +200,6 @@ async fn run_client(
     backend: &Backend,
     base_idx: usize,
     stream: &str,
-    pre_bytes: u64,
     ok: Arc<AtomicU64>,
     bp: Arc<AtomicU64>,
     err: Arc<AtomicU64>,
@@ -231,17 +207,7 @@ async fn run_client(
     hist: Arc<Mutex<Histogram<u64>>>,
 ) {
     let started = Instant::now();
-    let req = match backend.replay_request_for(
-        base_idx,
-        stream,
-        pre_bytes.saturating_mul(2).max(64 * 1024),
-    ) {
-        Ok(r) => r,
-        Err(_) => {
-            err.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-    };
+    let req = backend.replay_request_for(base_idx, stream);
     let resp = match req.send().await {
         Ok(r) => r,
         Err(_) => {
