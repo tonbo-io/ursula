@@ -43,7 +43,7 @@ async fn retained_stream_starts_at_an_explicit_record_base() -> anyhow::Result<(
     let store = FsObjectStore::new(object_dir.path())?;
     let mut index = ServerlessEventIndex::open_fs_with_cache_from_record(
         store.clone(),
-        EventIndexCache::new(cache.path(), 16 * 1024 * 1024)?,
+        EventIndexCache::serving(cache.path(), 16 * 1024 * 1024)?,
         config(),
         41,
     )
@@ -63,11 +63,16 @@ async fn retained_stream_starts_at_an_explicit_record_base() -> anyhow::Result<(
     let result = index.query(0, 3_000, None, None, 10).await?;
     assert_eq!(result.indexed_from_record, 41);
     assert_eq!(result.records.len(), 2);
+    let error = index
+        .query(0, 3_000, None, Some(40), 10)
+        .await
+        .expect_err("a query watermark cannot precede indexed_from_record");
+    assert!(matches!(error, ursula_index::IndexError::InvalidQuery));
 
     let fresh_cache = TempDir::new()?;
     let reopened = ServerlessEventIndex::open_fs_with_cache_from_record(
         store,
-        EventIndexCache::new(fresh_cache.path(), 16 * 1024 * 1024)?,
+        EventIndexCache::serving(fresh_cache.path(), 16 * 1024 * 1024)?,
         config(),
         41,
     )
@@ -666,10 +671,12 @@ async fn garbage_collection_reclaims_unreferenced_parts_and_manifests() -> anyho
         .garbage_collect(2, std::time::Duration::ZERO, std::time::SystemTime::now())
         .await?;
     assert_eq!(retained.deleted_parts, 0);
+    assert_eq!(retained.deleted_layouts, 0);
     let reclaimed = index
         .garbage_collect(1, std::time::Duration::ZERO, std::time::SystemTime::now())
         .await?;
     assert_eq!(reclaimed.deleted_parts, 3);
+    assert_eq!(reclaimed.deleted_layouts, 3);
     assert!(reclaimed.deleted_manifests >= 1);
 
     drop(index);
