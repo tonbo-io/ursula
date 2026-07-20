@@ -10,20 +10,40 @@ use arrow_schema::ArrowError;
 use arrow_schema::DataType;
 use arrow_schema::Field;
 use arrow_schema::Schema;
+use futures_util::TryStreamExt;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ArrowPredicateFn;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::arrow_reader::RowFilter;
+use parquet::arrow::async_reader::AsyncFileReader;
+use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::basic::Compression;
 use parquet::basic::ZstdLevel;
 use parquet::file::metadata::PageIndexPolicy;
 use parquet::file::properties::EnabledStatistics;
 use parquet::file::properties::WriterProperties;
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::EventEntry;
 use crate::IndexError;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct PartUnit {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    pub(crate) hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct PartLayout {
+    pub(crate) version: u32,
+    pub(crate) part_key: String,
+    pub(crate) bytes: u64,
+    pub(crate) units: Vec<PartUnit>,
+}
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -54,14 +74,16 @@ pub(crate) fn write_part(
     Ok(())
 }
 
-pub(crate) fn read_part_range(
-    path: &Path,
+pub(crate) async fn read_part_range_async<T>(
+    reader: T,
     from_ms: i64,
     until_ms: i64,
-) -> Result<Vec<EventEntry>, IndexError> {
-    let file = File::open(path)?;
+) -> Result<Vec<EventEntry>, IndexError>
+where
+    T: AsyncFileReader + Send + Unpin + 'static,
+{
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
-    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options)?;
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options).await?;
     let descriptor = builder.metadata().file_metadata().schema_descr_ptr();
     let projection = ProjectionMask::leaves(&descriptor, [0]);
     let predicate = ArrowPredicateFn::new(projection, move |batch| {
@@ -75,28 +97,109 @@ pub(crate) fn read_part_range(
         })))
     });
     let filter = RowFilter::new(vec![Box::new(predicate)]);
-    let reader = builder.with_row_filter(filter).build()?;
+    let batches = builder
+        .with_row_filter(filter)
+        .build()?
+        .try_collect::<Vec<_>>()
+        .await?;
     let mut entries = Vec::new();
-    for batch in reader {
-        let batch = batch?;
-        let captured_at = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| ArrowError::CastError("captured_at_ms is not int64".to_owned()))?;
-        let records = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| ArrowError::CastError("record is not uint64".to_owned()))?;
-        entries.extend(captured_at.values().iter().zip(records.values()).map(
-            |(&captured_at_ms, &record)| EventEntry {
-                captured_at_ms,
-                record,
-            },
-        ));
+    for batch in &batches {
+        append_batch(&mut entries, batch)?;
     }
     Ok(entries)
+}
+
+pub(crate) fn build_layout(
+    path: &Path,
+    part_key: String,
+    bytes: &[u8],
+) -> Result<PartLayout, IndexError> {
+    let file = File::open(path)?;
+    let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
+    let builder = ParquetRecordBatchReaderBuilder::try_new_with_options(file, options)?;
+    let file_bytes = u64::try_from(bytes.len())
+        .map_err(|_error| IndexError::InvalidConfig("part is too large"))?;
+    let metadata = builder.metadata();
+    let offset_index = metadata
+        .offset_index()
+        .ok_or_else(|| IndexError::InvalidPartLayout(part_key.clone()))?;
+    let mut native_units = Vec::new();
+    for (row_group_index, group) in metadata.row_groups().iter().enumerate() {
+        for (column_index, column) in group.columns().iter().enumerate() {
+            let (chunk_start, chunk_length) = column.byte_range();
+            let chunk_end = chunk_start
+                .checked_add(chunk_length)
+                .ok_or_else(|| IndexError::InvalidPartLayout(part_key.clone()))?;
+            let pages = offset_index
+                .get(row_group_index)
+                .and_then(|indexes| indexes.get(column_index))
+                .filter(|pages| !pages.page_locations().is_empty())
+                .ok_or_else(|| IndexError::InvalidPartLayout(part_key.clone()))?;
+            let mut cursor = chunk_start;
+            for page in pages.page_locations() {
+                let page_start = u64::try_from(page.offset)
+                    .map_err(|_error| IndexError::InvalidPartLayout(part_key.clone()))?;
+                let page_size = u64::try_from(page.compressed_page_size)
+                    .map_err(|_error| IndexError::InvalidPartLayout(part_key.clone()))?;
+                let page_end = page_start
+                    .checked_add(page_size)
+                    .ok_or_else(|| IndexError::InvalidPartLayout(part_key.clone()))?;
+                if page_start < cursor || page_end > chunk_end || page_start >= page_end {
+                    return Err(IndexError::InvalidPartLayout(part_key));
+                }
+                if cursor < page_start {
+                    native_units.push(cursor..page_start);
+                }
+                native_units.push(page_start..page_end);
+                cursor = page_end;
+            }
+            if cursor < chunk_end {
+                native_units.push(cursor..chunk_end);
+            }
+        }
+    }
+    native_units.sort_unstable_by_key(|range| (range.start, range.end));
+    let mut boundaries = Vec::new();
+    let mut cursor = 0_u64;
+    for unit in native_units {
+        if unit.start < cursor || unit.start >= unit.end || unit.end > file_bytes {
+            return Err(IndexError::InvalidPartLayout(part_key));
+        }
+        if cursor < unit.start {
+            boundaries.push(cursor..unit.start);
+        }
+        boundaries.push(unit.clone());
+        cursor = unit.end;
+    }
+    if cursor < file_bytes {
+        boundaries.push(cursor..file_bytes);
+    }
+    if boundaries.is_empty() {
+        return Err(IndexError::InvalidPartLayout(part_key));
+    }
+    let units = boundaries
+        .into_iter()
+        .map(|range| {
+            let start = usize::try_from(range.start)
+                .map_err(|_error| IndexError::InvalidPartLayout(part_key.clone()))?;
+            let end = usize::try_from(range.end)
+                .map_err(|_error| IndexError::InvalidPartLayout(part_key.clone()))?;
+            let unit = bytes
+                .get(start..end)
+                .ok_or_else(|| IndexError::InvalidPartLayout(part_key.clone()))?;
+            Ok(PartUnit {
+                start: range.start,
+                end: range.end,
+                hash: crate::object_store::digest(unit),
+            })
+        })
+        .collect::<Result<Vec<_>, IndexError>>()?;
+    Ok(PartLayout {
+        version: 1,
+        part_key,
+        bytes: file_bytes,
+        units,
+    })
 }
 
 pub(crate) fn read_all(path: &Path) -> Result<Vec<EventEntry>, IndexError> {
