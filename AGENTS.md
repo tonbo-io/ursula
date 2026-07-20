@@ -42,7 +42,7 @@ The server uses a thread-per-core, multi-Raft architecture: each stream hashes t
 | `ursula-raft`          | OpenRaft-backed group engine: network, log store, snapshot handling, gRPC Raft plumbing.                                                      |
 | `ursula-stream`        | Deterministic stream state machine: bucket/stream commands, responses, snapshots, payload metadata, validation.                               |
 | `ursula-shard`         | Bucket/stream routing, core ownership, Raft group placement, shared shard identifiers (`CoreId`, `ShardId`, `RaftGroupId`, `BucketStreamId`). |
-| `ursula-proto`         | Shared protobuf schemas and generated types used by Raft logs, requests, and persisted metadata.                                              |
+| `ursula-proto`         | Shared protobuf schemas (model value types and snapshot frames) reused across crates; replicated commands/responses travel as serde MessagePack. |
 | `ursula-config`        | Configuration types and TOML loading for Ursula server.                                                                                       |
 | `ursula-observability` | Shared tracing/OpenTelemetry initialization for Ursula binaries.                                                                              |
 | `ursula-gateway`       | Gateway binary (`ursulagw`) that routes client HTTP traffic while hiding internal leader redirects.                                           |

@@ -3184,6 +3184,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmp"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ba8be72d372b2c9b35542551678538b562e7cf86c3315773cae48dfbfe7790c"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "rmp-serde"
+version = "1.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72f81bee8c8ef9b577d1681a70ebbc962c232461e397b22c208c43c04b67a155"
+dependencies = [
+ "rmp",
+ "serde",
+]
+
+[[package]]
 name = "rust-ini"
 version = "0.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3315,6 +3334,16 @@ checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -4316,6 +4345,7 @@ dependencies = [
  "prost 0.13.5",
  "protoc-bin-vendored",
  "rand 0.10.1",
+ "rmp-serde",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -4342,6 +4372,7 @@ dependencies = [
  "madsim-tokio",
  "opendal",
  "serde",
+ "serde_bytes",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
@@ -4385,6 +4416,7 @@ dependencies = [
 name = "ursula-stream"
 version = "0.3.0"
 dependencies = [
+ "bytes",
  "criterion",
  "proptest",
  "serde",

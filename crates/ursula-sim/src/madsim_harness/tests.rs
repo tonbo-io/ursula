@@ -861,12 +861,10 @@ fn runtime_raft_network_delay_snapshot_purge_probe() {
                     .expect("diagnostic current leader raft handle");
                 let probe_payload = format!("after-delay-{sim_seed}-{delay_ms};").into_bytes();
                 let probe = leader_raft
-                    .client_write(
-                        GroupWriteCommand::from(AppendBatchRequest::new(stream, vec![
-                            probe_payload,
-                        ]))
-                        .into(),
-                    )
+                    .client_write(GroupWriteCommand::from(AppendBatchRequest::new(
+                        stream,
+                        vec![probe_payload],
+                    )))
                     .await;
                 if let Err(err) = probe {
                     let err = format!("{err:?}");

@@ -98,7 +98,7 @@ fn record_coordinate_benches(c: &mut Criterion) {
                     let response = machine.apply(StreamCommand::Append {
                         stream_id: stream_id.clone(),
                         content_type: Some("application/json".to_owned()),
-                        payload: JSON_RECORD.to_vec(),
+                        payload: bytes::Bytes::from_static(JSON_RECORD),
                         close_after: false,
                         stream_seq: None,
                         producer: None,
@@ -121,7 +121,7 @@ fn record_coordinate_benches(c: &mut Criterion) {
                 let response = machine.apply(StreamCommand::Append {
                     stream_id,
                     content_type: Some("application/json".to_owned()),
-                    payload: JSON_RECORD.to_vec(),
+                    payload: bytes::Bytes::from_static(JSON_RECORD),
                     close_after: false,
                     stream_seq: None,
                     producer: None,
@@ -150,7 +150,7 @@ fn setup_record_machine(record_count: usize) -> (StreamStateMachine, BucketStrea
         machine.apply(StreamCommand::CreateStream {
             stream_id: stream_id.clone(),
             content_type: "application/json".to_owned(),
-            initial_payload: JSON_RECORD.repeat(record_count),
+            initial_payload: bytes::Bytes::from(JSON_RECORD.repeat(record_count)),
             close_after: false,
             stream_seq: None,
             producer: None,
@@ -206,7 +206,7 @@ fn setup_machine(scenario: &AppendScenario) -> StreamStateMachine {
             machine.apply(StreamCommand::CreateStream {
                 stream_id,
                 content_type: CONTENT_TYPE.to_owned(),
-                initial_payload: Vec::new(),
+                initial_payload: bytes::Bytes::new(),
                 close_after: false,
                 stream_seq: None,
                 producer: None,
@@ -235,7 +235,12 @@ fn append_single_stream(machine: &mut StreamStateMachine, payload: &[u8]) -> u64
     let stream_id = stream_id(0);
     let mut tail = 0u64;
     for _ in 0..APPENDS_PER_ITER {
-        tail = append(machine, stream_id.clone(), payload.to_vec(), None);
+        tail = append(
+            machine,
+            stream_id.clone(),
+            bytes::Bytes::copy_from_slice(payload),
+            None,
+        );
     }
     tail
 }
@@ -246,7 +251,7 @@ fn append_many_streams(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 
         tail = append(
             machine,
             stream_id(index % STREAM_COUNT),
-            payload.to_vec(),
+            bytes::Bytes::copy_from_slice(payload),
             None,
         );
     }
@@ -255,7 +260,7 @@ fn append_many_streams(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 
 
 fn append_batch(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 {
     let stream_id = stream_id(0);
-    let payloads = vec![payload.to_vec(); 16];
+    let payloads = vec![bytes::Bytes::copy_from_slice(payload); 16];
     let mut tail = 0u64;
     for _ in 0..(APPENDS_PER_ITER / payloads.len()) {
         tail = match machine.apply(StreamCommand::AppendBatch {
@@ -282,7 +287,7 @@ fn producer_dedup(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 {
     let first_tail = append(
         machine,
         stream_id.clone(),
-        payload.to_vec(),
+        bytes::Bytes::copy_from_slice(payload),
         Some(producer.clone()),
     );
     let mut tail = first_tail;
@@ -290,7 +295,7 @@ fn producer_dedup(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 {
         tail = append(
             machine,
             stream_id.clone(),
-            payload.to_vec(),
+            bytes::Bytes::copy_from_slice(payload),
             Some(producer.clone()),
         );
     }
@@ -300,7 +305,12 @@ fn producer_dedup(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 {
 fn snapshot_compaction(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 {
     let stream_id = stream_id(0);
     for _ in 0..APPENDS_PER_ITER {
-        append(machine, stream_id.clone(), payload.to_vec(), None);
+        append(
+            machine,
+            stream_id.clone(),
+            bytes::Bytes::copy_from_slice(payload),
+            None,
+        );
     }
     let snapshot_offset =
         u64::try_from(APPENDS_PER_ITER / 2 * payload.len()).expect("snapshot offset fits u64");
@@ -308,7 +318,7 @@ fn snapshot_compaction(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 
         stream_id,
         snapshot_offset,
         content_type: "application/json".to_owned(),
-        payload: b"{}".to_vec(),
+        payload: bytes::Bytes::from_static(b"{}"),
         now_ms: 0,
     }) {
         StreamResponse::SnapshotPublished {
@@ -321,7 +331,7 @@ fn snapshot_compaction(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 
 fn append(
     machine: &mut StreamStateMachine,
     stream_id: BucketStreamId,
-    payload: Vec<u8>,
+    payload: bytes::Bytes,
     producer: Option<ProducerRequest>,
 ) -> u64 {
     match machine.apply(StreamCommand::Append {

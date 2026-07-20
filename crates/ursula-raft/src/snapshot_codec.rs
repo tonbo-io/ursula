@@ -27,7 +27,13 @@ use ursula_stream::StreamSnapshotEntry;
 use ursula_stream::StreamStatus;
 use ursula_stream::StreamVisibleSnapshot;
 
-use crate::codec::placement_to_proto;
+fn placement_to_proto(placement: ShardPlacement) -> proto::ShardPlacementV1 {
+    proto::ShardPlacementV1 {
+        core_id: u32::from(placement.core_id.0),
+        shard_id: placement.shard_id.0,
+        raft_group_id: placement.raft_group_id.0,
+    }
+}
 
 pub(crate) fn group_snapshot_frames(snapshot: GroupSnapshot) -> SnapshotBytesIterator {
     Box::new(GroupSnapshotFrameIter::new(snapshot))

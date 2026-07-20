@@ -4,8 +4,9 @@
 //!
 //! - [`cold_store`]: opendal-backed cold tier handle and object path helpers.
 //! - [`request`]: HTTP/gRPC request and response value types for each engine op.
-//! - [`command`]: the replicated [`GroupWriteCommand`] and `From` conversions from
-//!   request values into the wire command consumed by `GroupEngine`.
+//! - [`command`]: the replicated [`GroupWriteCommand`] envelope around the
+//!   canonical [`ursula_stream::StreamCommand`], plus `From` conversions from
+//!   request values into that command.
 //! - [`error`]: runtime-level error type [`RuntimeError`].
 //! - [`engine`]: the `GroupEngine` trait, factory, metrics, and the boxed-future
 //!   type aliases that form the replaceable per-group engine boundary, plus the
@@ -92,6 +93,7 @@ pub use engine::GroupSnapshotFuture;
 pub use engine::GroupTouchStreamAccessFuture;
 pub use engine::GroupUpdateStreamAttrsFuture;
 pub use engine::GroupWriteBatchFuture;
+pub use engine::GroupWriteFuture;
 pub use engine::GroupWriteResponse;
 pub use engine::in_memory::InMemoryGroupEngine;
 pub use engine::in_memory::InMemoryGroupEngineFactory;

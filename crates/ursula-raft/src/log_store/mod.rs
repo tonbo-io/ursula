@@ -29,10 +29,11 @@ use openraft::raft::AppendEntriesResponse;
 use openraft::raft::SnapshotResponse;
 use openraft::vote::RaftLeaderId;
 
+use crate::codec::decode_wire;
+use crate::codec::encode_wire;
 use crate::engine::invalid_data;
 use crate::grpc::GrpcRpcError;
 use crate::raft_internal_proto;
-use crate::types::RaftGroupCommand;
 use crate::types::UrsulaAppendEntriesRequest;
 use crate::types::UrsulaAppendEntriesResponse;
 use crate::types::UrsulaRaftTypeConfig;
@@ -63,7 +64,7 @@ impl From<&EntryOf<UrsulaRaftTypeConfig>> for raft_internal_proto::StoredLogEntr
 
         let payload = match &entry.payload {
             EntryPayload::Blank => Payload::Blank(raft_internal_proto::BlankEntryV1 {}),
-            EntryPayload::Normal(command) => Payload::Normal(Box::new(command.0.clone())),
+            EntryPayload::Normal(command) => Payload::Normal(encode_wire(command)),
             EntryPayload::Membership(membership) => {
                 Payload::Membership(raft_internal_proto::MembershipEntryV1 {
                     configs: membership
@@ -105,7 +106,10 @@ pub(crate) fn stored_log_entry_into_entry(
         )
     })? {
         Payload::Blank(_) => EntryPayload::Blank,
-        Payload::Normal(command) => EntryPayload::Normal(RaftGroupCommand(*command)),
+        Payload::Normal(command) => EntryPayload::Normal(
+            decode_wire(&command, "stored log entry command")
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?,
+        ),
         Payload::Membership(membership) => {
             let configs = membership
                 .configs
