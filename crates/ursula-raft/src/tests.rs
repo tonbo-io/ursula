@@ -47,6 +47,7 @@ use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ProducerRequest;
 use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::ReadStreamResponse;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::RuntimeThreading;
 use ursula_runtime::ShardRuntime;
@@ -104,7 +105,7 @@ fn group_engine_error_codec_round_trips_stale_cold_flush_context() {
 
 #[test]
 fn group_engine_error_codec_round_trips_cold_backpressure_kind() {
-    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "cold-backpressure-codec");
+    let stream_id = bsid("cold-backpressure-codec");
     let err = GroupEngineError::cold_backpressure(stream_id.clone(), 4, 5, 4);
 
     let proto = group_engine_error_to_proto(err.clone());
@@ -158,6 +159,127 @@ fn placement() -> ShardPlacement {
     }
 }
 
+fn bsid(name: &str) -> ursula_shard::BucketStreamId {
+    ursula_shard::BucketStreamId::new("benchcmp", name)
+}
+
+fn read_req(stream_id: ursula_shard::BucketStreamId, max_len: usize) -> ReadStreamRequest {
+    ReadStreamRequest {
+        stream_id,
+        offset: 0,
+        max_len,
+        now_ms: 0,
+        record: None,
+        max_records: None,
+    }
+}
+
+fn raft_config(cluster_name: &str, election_min: u64, election_max: u64) -> Arc<Config> {
+    Arc::new(
+        Config {
+            cluster_name: cluster_name.to_owned(),
+            heartbeat_interval: 10,
+            election_timeout_min: election_min,
+            election_timeout_max: election_max,
+            ..Default::default()
+        }
+        .validate()
+        .expect("valid raft config"),
+    )
+}
+
+fn create_req(stream_id: ursula_shard::BucketStreamId) -> CreateStreamRequest {
+    CreateStreamRequest::new(stream_id, "application/octet-stream")
+}
+
+fn create_command(stream_id: ursula_shard::BucketStreamId) -> GroupWriteCommand {
+    GroupWriteCommand::from(create_req(stream_id))
+}
+
+fn append_command(stream_id: ursula_shard::BucketStreamId, payload: &[u8]) -> GroupWriteCommand {
+    GroupWriteCommand::from(AppendRequest::from_bytes(stream_id, payload.to_vec()))
+}
+
+fn hosted_config(core_count: usize, raft_group_count: usize) -> RuntimeConfig {
+    let mut config = RuntimeConfig::new(core_count, raft_group_count);
+    config.threading = RuntimeThreading::HostedTokio;
+    config
+}
+
+async fn shutdown_all(engines: &[RaftGroupEngine]) {
+    for engine in engines {
+        engine.shutdown().await.expect("shutdown raft group node");
+    }
+}
+
+/// Build a three-node in-process cluster, initialize it, and wait for a
+/// leader. Returns the registry, the engines (index = node id - 1), and the
+/// elected leader id.
+async fn build_three_node_cluster(
+    cluster_name: &str,
+    policy: Option<InProcessRaftNetworkPolicy>,
+) -> (InProcessRaftRegistry, Vec<RaftGroupEngine>, u64) {
+    let registry = InProcessRaftRegistry::default();
+    let config = raft_config(cluster_name, 50, 100);
+    let mut nodes = BTreeMap::new();
+    for node_id in 1..=3 {
+        nodes.insert(node_id, BasicNode::new(format!("node-{node_id}")));
+    }
+
+    let mut engines = Vec::new();
+    for node_id in 1..=3 {
+        let mut network = InProcessRaftNetworkFactory::new(registry.clone()).with_source(node_id);
+        if let Some(policy) = &policy {
+            network = network.with_policy(policy.clone());
+        }
+        let engine = RaftGroupEngine::new_node_with_log_store_and_network(
+            placement(),
+            node_id,
+            config.clone(),
+            network,
+            RaftGroupLogStore::shared(),
+            None,
+            None,
+        )
+        .await
+        .expect("create cluster raft group node");
+        registry.register(node_id, engine.raft.clone());
+        engines.push(engine);
+    }
+
+    engines[0]
+        .raft
+        .initialize(nodes)
+        .await
+        .expect("initialize raft group");
+    let leader_metrics = engines[0]
+        .raft
+        .wait(Some(Duration::from_secs(5)))
+        .metrics(|metrics| metrics.current_leader.is_some(), "leader elected")
+        .await
+        .expect("wait for leader");
+    let leader_id = leader_metrics.current_leader.expect("leader id");
+    (registry, engines, leader_id)
+}
+
+/// Read a stream through the engine's state machine; the outer result is the
+/// state-machine access, the inner one the read itself.
+async fn read_stream_via_state_machine(
+    engine: &RaftGroupEngine,
+    stream_id: ursula_shard::BucketStreamId,
+    max_len: usize,
+) -> Result<Result<ReadStreamResponse, GroupEngineError>, GroupEngineError> {
+    engine
+        .with_state_machine(move |state_machine| {
+            Box::pin(async move {
+                state_machine
+                    .read_stream(read_req(stream_id, max_len), placement())
+                    .await
+            })
+        })
+        .await
+}
+
 fn log_id(index: u64) -> LogId<CommittedLeaderId> {
     LogId {
         leader_id: CommittedLeaderId::new(1, 1),
@@ -200,10 +322,7 @@ fn register_node_command(node_id: u64) -> ControlCommand {
 }
 
 fn create_stream_command(name: &str) -> GroupWriteCommand {
-    GroupWriteCommand::from(CreateStreamRequest::new(
-        ursula_shard::BucketStreamId::new("benchcmp", name),
-        "application/octet-stream",
-    ))
+    create_command(bsid(name))
 }
 
 fn stream_attrs(title: &str, purpose: &str) -> StreamAttrs {
@@ -222,7 +341,7 @@ fn stream_attrs(title: &str, purpose: &str) -> StreamAttrs {
 #[test]
 fn raft_group_command_uses_shared_protobuf_log_schema() {
     let command = GroupWriteCommand::AppendBatch {
-        stream_id: ursula_shard::BucketStreamId::new("benchcmp", "shared-proto-log"),
+        stream_id: bsid("shared-proto-log"),
         content_type: "application/octet-stream".to_owned(),
         payloads: vec![b"ab".to_vec().into(), b"cd".to_vec().into()],
         producer: Some(ProducerRequest {
@@ -252,7 +371,7 @@ fn raft_group_command_uses_shared_protobuf_log_schema() {
 #[test]
 fn stream_attrs_update_command_round_trips_through_protobuf() {
     let command = GroupWriteCommand::from(UpdateStreamAttrsRequest {
-        stream_id: ursula_shard::BucketStreamId::new("benchcmp", "attrs-proto"),
+        stream_id: bsid("attrs-proto"),
         attrs: Some(stream_attrs("Support session", "customer-support")),
         now_ms: 123,
     });
@@ -686,17 +805,7 @@ async fn raft_file_log_store_recovers_truncate_and_purge() {
 
 #[tokio::test]
 async fn single_node_meta_raft_applies_node_registration() {
-    let config = Arc::new(
-        Config {
-            cluster_name: "ursula-meta-single-node-test".to_owned(),
-            heartbeat_interval: 10,
-            election_timeout_min: 30,
-            election_timeout_max: 60,
-            ..Default::default()
-        }
-        .validate()
-        .expect("valid raft config"),
-    );
+    let config = raft_config("ursula-meta-single-node-test", 30, 60);
     let mut log_store = MetaRaftLogStore::shared();
     let handle = MetaRaftHandle::new_single_node_with_log_store(
         1,
@@ -759,17 +868,7 @@ async fn single_node_meta_raft_applies_node_registration() {
 
 #[tokio::test]
 async fn meta_raft_handle_registers_initial_data_nodes() {
-    let config = Arc::new(
-        Config {
-            cluster_name: "ursula-meta-initial-data-nodes-test".to_owned(),
-            heartbeat_interval: 10,
-            election_timeout_min: 30,
-            election_timeout_max: 60,
-            ..Default::default()
-        }
-        .validate()
-        .expect("valid raft config"),
-    );
+    let config = raft_config("ursula-meta-initial-data-nodes-test", 30, 60);
     let handle = MetaRaftHandle::new_single_node_with_log_store(
         1,
         BasicNode::new("meta-local"),
@@ -817,17 +916,7 @@ async fn meta_raft_handle_registers_initial_data_nodes() {
 
 #[tokio::test]
 async fn meta_raft_handle_rejects_invalid_initial_data_nodes() {
-    let config = Arc::new(
-        Config {
-            cluster_name: "ursula-meta-invalid-initial-data-nodes-test".to_owned(),
-            heartbeat_interval: 10,
-            election_timeout_min: 30,
-            election_timeout_max: 60,
-            ..Default::default()
-        }
-        .validate()
-        .expect("valid raft config"),
-    );
+    let config = raft_config("ursula-meta-invalid-initial-data-nodes-test", 30, 60);
     let handle = MetaRaftHandle::new_single_node_with_log_store(
         1,
         BasicNode::new("meta-local"),
@@ -890,17 +979,7 @@ fn dynamic_group_hosting_allows_non_voter_warmup() {
 
 #[tokio::test]
 async fn single_node_openraft_group_applies_client_writes() {
-    let config = Arc::new(
-        Config {
-            cluster_name: "ursula-single-node-test".to_owned(),
-            heartbeat_interval: 10,
-            election_timeout_min: 30,
-            election_timeout_max: 60,
-            ..Default::default()
-        }
-        .validate()
-        .expect("valid raft config"),
-    );
+    let config = raft_config("ursula-single-node-test", 30, 60);
     let mut log_store = RaftGroupLogStore::shared();
     let state_machine = RaftGroupStateMachine::new(placement());
     let raft = Raft::<UrsulaRaftTypeConfig, RaftGroupStateMachine>::new(
@@ -923,15 +1002,9 @@ async fn single_node_openraft_group_applies_client_writes() {
         .await
         .expect("wait for leadership");
 
-    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "raft-client-write");
+    let stream_id = bsid("raft-client-write");
     let created = raft
-        .client_write(
-            GroupWriteCommand::from(CreateStreamRequest::new(
-                stream_id.clone(),
-                "application/octet-stream",
-            ))
-            .into(),
-        )
+        .client_write(create_command(stream_id.clone()).into())
         .await
         .expect("create stream through openraft");
     assert!(matches!(
@@ -940,10 +1013,7 @@ async fn single_node_openraft_group_applies_client_writes() {
     ));
 
     let appended = raft
-        .client_write(
-            GroupWriteCommand::from(AppendRequest::from_bytes(stream_id, b"payload".to_vec()))
-                .into(),
-        )
+        .client_write(append_command(stream_id, b"payload").into())
         .await
         .expect("append through openraft");
     match group_write_result_from_raft_response(appended.data).expect("decode append response") {
@@ -961,52 +1031,8 @@ async fn single_node_openraft_group_applies_client_writes() {
 
 #[tokio::test]
 async fn three_node_openraft_group_replicates_group_writes() {
-    let registry = InProcessRaftRegistry::default();
-    let config = Arc::new(
-        Config {
-            cluster_name: "ursula-three-node-test".to_owned(),
-            heartbeat_interval: 10,
-            election_timeout_min: 50,
-            election_timeout_max: 100,
-            ..Default::default()
-        }
-        .validate()
-        .expect("valid raft config"),
-    );
-    let mut nodes = BTreeMap::new();
-    for node_id in 1..=3 {
-        nodes.insert(node_id, BasicNode::new(format!("node-{node_id}")));
-    }
-
-    let mut engines = Vec::new();
-    for node_id in 1..=3 {
-        let engine = RaftGroupEngine::new_node_with_log_store_and_network(
-            placement(),
-            node_id,
-            config.clone(),
-            InProcessRaftNetworkFactory::new(registry.clone()).with_source(node_id),
-            RaftGroupLogStore::shared(),
-            None,
-            None,
-        )
-        .await
-        .expect("create cluster raft group node");
-        registry.register(node_id, engine.raft.clone());
-        engines.push(engine);
-    }
-
-    engines[0]
-        .raft
-        .initialize(nodes)
-        .await
-        .expect("initialize three-node raft group");
-    let leader_metrics = engines[0]
-        .raft
-        .wait(Some(Duration::from_secs(5)))
-        .metrics(|metrics| metrics.current_leader.is_some(), "leader elected")
-        .await
-        .expect("wait for leader");
-    let leader_id = leader_metrics.current_leader.expect("leader id");
+    let (_registry, engines, leader_id) =
+        build_three_node_cluster("ursula-three-node-test", None).await;
     for engine in &engines {
         engine
             .raft
@@ -1021,32 +1047,12 @@ async fn three_node_openraft_group_replicates_group_writes() {
     }
 
     let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
-    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "three-node-raft-group-engine");
-    let created = engines[leader_index]
-        .raft
-        .client_write(
-            GroupWriteCommand::from(CreateStreamRequest::new(
-                stream_id.clone(),
-                "application/octet-stream",
-            ))
-            .into(),
-        )
-        .await
-        .expect("create stream through elected leader");
-    assert!(matches!(
-        group_write_result_from_raft_response(created.data).expect("decode create response"),
-        Ok(GroupWriteResponse::CreateStream(_))
-    ));
+    let stream_id = bsid("three-node-raft-group-engine");
+    create_stream_via_raft(&engines[leader_index], stream_id.clone()).await;
 
     let appended = engines[leader_index]
         .raft
-        .client_write(
-            GroupWriteCommand::from(AppendRequest::from_bytes(
-                stream_id.clone(),
-                b"replicated".to_vec(),
-            ))
-            .into(),
-        )
+        .client_write(append_command(stream_id.clone(), b"replicated").into())
         .await
         .expect("append through elected leader");
     let appended_log_index = appended.log_id.index();
@@ -1067,89 +1073,21 @@ async fn three_node_openraft_group_replicates_group_writes() {
             .expect("wait for append replication");
 
         let stream_id = stream_id.clone();
-        let read = engine
-            .with_state_machine(move |state_machine| {
-                Box::pin(async move {
-                    state_machine
-                        .read_stream(
-                            ReadStreamRequest {
-                                stream_id,
-                                offset: 0,
-                                max_len: 16,
-                                now_ms: 0,
-                                record: None,
-                                max_records: None,
-                            },
-                            placement(),
-                        )
-                        .await
-                })
-            })
+        let read = read_stream_via_state_machine(engine, stream_id, 16)
             .await
             .expect("read follower state machine")
             .expect("replicated stream is readable");
         assert_eq!(read.payload, b"replicated");
     }
 
-    for engine in &engines {
-        engine
-            .shutdown()
-            .await
-            .expect("shutdown cluster raft group node");
-    }
+    shutdown_all(&engines).await;
 }
 
 #[tokio::test]
 async fn in_process_raft_network_policy_partitions_and_heals_replication() {
-    let registry = InProcessRaftRegistry::default();
     let policy = InProcessRaftNetworkPolicy::default();
-    let config = Arc::new(
-        Config {
-            cluster_name: "ursula-three-node-policy-test".to_owned(),
-            heartbeat_interval: 10,
-            election_timeout_min: 50,
-            election_timeout_max: 100,
-            ..Default::default()
-        }
-        .validate()
-        .expect("valid raft config"),
-    );
-    let mut nodes = BTreeMap::new();
-    for node_id in 1..=3 {
-        nodes.insert(node_id, BasicNode::new(format!("node-{node_id}")));
-    }
-
-    let mut engines = Vec::new();
-    for node_id in 1..=3 {
-        let engine = RaftGroupEngine::new_node_with_log_store_and_network(
-            placement(),
-            node_id,
-            config.clone(),
-            InProcessRaftNetworkFactory::new(registry.clone())
-                .with_source(node_id)
-                .with_policy(policy.clone()),
-            RaftGroupLogStore::shared(),
-            None,
-            None,
-        )
-        .await
-        .expect("create policy raft group node");
-        registry.register(node_id, engine.raft.clone());
-        engines.push(engine);
-    }
-
-    engines[0]
-        .raft
-        .initialize(nodes)
-        .await
-        .expect("initialize policy raft group");
-    let leader_metrics = engines[0]
-        .raft
-        .wait(Some(Duration::from_secs(5)))
-        .metrics(|metrics| metrics.current_leader.is_some(), "leader elected")
-        .await
-        .expect("wait for leader");
-    let leader_id = leader_metrics.current_leader.expect("leader id");
+    let (_registry, engines, leader_id) =
+        build_three_node_cluster("ursula-three-node-policy-test", Some(policy.clone())).await;
     let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
     let isolated_id = (1..=3)
         .find(|node_id| *node_id != leader_id)
@@ -1162,32 +1100,12 @@ async fn in_process_raft_network_policy_partitions_and_heals_replication() {
 
     policy.partition_bidirectional(leader_id, isolated_id);
 
-    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "policy-partition-heal");
-    let created = engines[leader_index]
-        .raft
-        .client_write(
-            GroupWriteCommand::from(CreateStreamRequest::new(
-                stream_id.clone(),
-                "application/octet-stream",
-            ))
-            .into(),
-        )
-        .await
-        .expect("create stream through elected leader");
-    assert!(matches!(
-        group_write_result_from_raft_response(created.data).expect("decode create response"),
-        Ok(GroupWriteResponse::CreateStream(_))
-    ));
+    let stream_id = bsid("policy-partition-heal");
+    create_stream_via_raft(&engines[leader_index], stream_id.clone()).await;
 
     let appended = engines[leader_index]
         .raft
-        .client_write(
-            GroupWriteCommand::from(AppendRequest::from_bytes(
-                stream_id.clone(),
-                b"partitioned".to_vec(),
-            ))
-            .into(),
-        )
+        .client_write(append_command(stream_id.clone(), b"partitioned").into())
         .await
         .expect("append through elected leader");
     let appended_log_index = appended.log_id.index();
@@ -1219,32 +1137,13 @@ async fn in_process_raft_network_policy_partitions_and_heals_replication() {
         .await
         .expect("wait for healed follower apply");
 
-    let read = engines[isolated_index]
-        .with_state_machine(move |state_machine| {
-            Box::pin(async move {
-                state_machine
-                    .read_stream(
-                        ReadStreamRequest {
-                            stream_id,
-                            offset: 0,
-                            max_len: 32,
-                            now_ms: 0,
-                            record: None,
-                            max_records: None,
-                        },
-                        placement(),
-                    )
-                    .await
-            })
-        })
+    let read = read_stream_via_state_machine(&engines[isolated_index], stream_id, 32)
         .await
         .expect("read healed follower state machine")
         .expect("healed follower has append");
     assert_eq!(read.payload, b"partitioned");
 
-    for engine in &engines {
-        engine.shutdown().await.expect("shutdown policy raft node");
-    }
+    shutdown_all(&engines).await;
 }
 
 /// DoD #5 invariant #6: a leader stranded in a minority partition must
@@ -1260,82 +1159,24 @@ async fn in_process_raft_network_policy_partitions_and_heals_replication() {
 /// stranded leader).
 #[tokio::test]
 async fn in_process_raft_network_minority_leader_append_does_not_ack() {
-    let registry = InProcessRaftRegistry::default();
     let policy = InProcessRaftNetworkPolicy::default();
-    let config = Arc::new(
-        Config {
-            cluster_name: "ursula-three-node-minority-leader".to_owned(),
-            heartbeat_interval: 10,
-            election_timeout_min: 50,
-            election_timeout_max: 100,
-            ..Default::default()
-        }
-        .validate()
-        .expect("valid raft config"),
-    );
-    let mut nodes = BTreeMap::new();
-    for node_id in 1..=3 {
-        nodes.insert(node_id, BasicNode::new(format!("node-{node_id}")));
-    }
-
-    let mut engines = Vec::new();
-    for node_id in 1..=3 {
-        let engine = RaftGroupEngine::new_node_with_log_store_and_network(
-            placement(),
-            node_id,
-            config.clone(),
-            InProcessRaftNetworkFactory::new(registry.clone())
-                .with_source(node_id)
-                .with_policy(policy.clone()),
-            RaftGroupLogStore::shared(),
-            None,
-            None,
-        )
-        .await
-        .expect("create minority-leader raft group node");
-        registry.register(node_id, engine.raft.clone());
-        engines.push(engine);
-    }
-
-    engines[0]
-        .raft
-        .initialize(nodes)
-        .await
-        .expect("initialize minority-leader raft group");
-    let leader_metrics = engines[0]
-        .raft
-        .wait(Some(Duration::from_secs(5)))
-        .metrics(|metrics| metrics.current_leader.is_some(), "leader elected")
-        .await
-        .expect("wait for leader");
-    let leader_id = leader_metrics.current_leader.expect("leader id");
+    let (_registry, engines, leader_id) =
+        build_three_node_cluster("ursula-three-node-minority-leader", Some(policy.clone())).await;
     let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
 
     // Create a stream + a baseline "good" append BEFORE stranding the
     // leader. After the partition + heal we'll read the stream and
     // assert the "good" bytes are still present and the "must-not-ack"
     // bytes never appear, regardless of who ends up leader post-heal.
-    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "minority-leader-append");
+    let stream_id = bsid("minority-leader-append");
     engines[leader_index]
         .raft
-        .client_write(
-            GroupWriteCommand::from(CreateStreamRequest::new(
-                stream_id.clone(),
-                "application/octet-stream",
-            ))
-            .into(),
-        )
+        .client_write(create_command(stream_id.clone()).into())
         .await
         .expect("create stream through elected leader (pre-partition)");
     let good = engines[leader_index]
         .raft
-        .client_write(
-            GroupWriteCommand::from(AppendRequest::from_bytes(
-                stream_id.clone(),
-                b"good".to_vec(),
-            ))
-            .into(),
-        )
+        .client_write(append_command(stream_id.clone(), b"good").into())
         .await
         .expect("good append through leader (pre-partition)");
     let good_index = good.log_id.index();
@@ -1364,13 +1205,9 @@ async fn in_process_raft_network_minority_leader_append_does_not_ack() {
     // commit response.
     let stranded_append = tokio::time::timeout(
         Duration::from_millis(800),
-        engines[leader_index].raft.client_write(
-            GroupWriteCommand::from(AppendRequest::from_bytes(
-                stream_id.clone(),
-                b"must-not-ack".to_vec(),
-            ))
-            .into(),
-        ),
+        engines[leader_index]
+            .raft
+            .client_write(append_command(stream_id.clone(), b"must-not-ack").into()),
     )
     .await;
     match &stranded_append {
@@ -1409,27 +1246,7 @@ async fn in_process_raft_network_minority_leader_append_does_not_ack() {
     }
 
     for (i, engine) in engines.iter().enumerate() {
-        let read = engine
-            .with_state_machine({
-                let stream_id = stream_id.clone();
-                move |state_machine| {
-                    Box::pin(async move {
-                        state_machine
-                            .read_stream(
-                                ReadStreamRequest {
-                                    stream_id,
-                                    offset: 0,
-                                    max_len: 64,
-                                    now_ms: 0,
-                                    record: None,
-                                    max_records: None,
-                                },
-                                placement(),
-                            )
-                            .await
-                    })
-                }
-            })
+        let read = read_stream_via_state_machine(engine, stream_id.clone(), 64)
             .await
             .unwrap_or_else(|err| panic!("read node {}: {err:?}", i + 1))
             .unwrap_or_else(|err| panic!("node {} state machine read: {err:?}", i + 1));
@@ -1443,12 +1260,7 @@ async fn in_process_raft_network_minority_leader_append_does_not_ack() {
         );
     }
 
-    for engine in &engines {
-        engine
-            .shutdown()
-            .await
-            .expect("shutdown minority-leader node");
-    }
+    shutdown_all(&engines).await;
 }
 
 #[cfg(madsim)]
@@ -1506,30 +1318,9 @@ fn madsim_three_node_openraft_group_strict_replay_probe() {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, async {
             let (_, engines, leader_id) = build_madsim_three_node_raft_cluster(7).await;
             let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
-            let stream_id =
-                ursula_shard::BucketStreamId::new("benchcmp", "madsim-strict-replay-probe");
-            let created = engines[leader_index]
-                .raft
-                .client_write(
-                    GroupWriteCommand::from(CreateStreamRequest::new(
-                        stream_id.clone(),
-                        "application/octet-stream",
-                    ))
-                    .into(),
-                )
-                .await
-                .expect("create stream through simulated leader");
-            assert!(matches!(
-                group_write_result_from_raft_response(created.data)
-                    .expect("decode create response"),
-                Ok(GroupWriteResponse::CreateStream(_))
-            ));
-            for engine in &engines {
-                engine
-                    .shutdown()
-                    .await
-                    .expect("shutdown simulated raft node");
-            }
+            let stream_id = bsid("madsim-strict-replay-probe");
+            create_stream_via_raft(&engines[leader_index], stream_id.clone()).await;
+            shutdown_all(&engines).await;
             assert!((1..=3).contains(&leader_id));
         })
         .await;
@@ -1544,19 +1335,11 @@ fn madsim_three_node_openraft_group_strict_replay_append_enqueue_probe() {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, async {
             let (_, engines, leader_id) = build_madsim_three_node_raft_cluster(7).await;
             let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
-            let stream_id =
-                ursula_shard::BucketStreamId::new("benchcmp", "madsim-strict-replay-enqueue");
-            create_madsim_stream(&engines[leader_index], stream_id.clone()).await;
+            let stream_id = bsid("madsim-strict-replay-enqueue");
+            create_stream_via_raft(&engines[leader_index], stream_id.clone()).await;
             engines[leader_index]
                 .raft
-                .client_write_ff(
-                    GroupWriteCommand::from(AppendRequest::from_bytes(
-                        stream_id,
-                        b"simulated".to_vec(),
-                    ))
-                    .into(),
-                    None,
-                )
+                .client_write_ff(append_command(stream_id, b"simulated").into(), None)
                 .await
                 .expect("enqueue append through simulated leader");
             assert!((1..=3).contains(&leader_id));
@@ -1573,9 +1356,8 @@ fn madsim_three_node_openraft_group_strict_replay_append_commit_probe() {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, async {
             let (_, engines, leader_id) = build_madsim_three_node_raft_cluster(7).await;
             let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
-            let stream_id =
-                ursula_shard::BucketStreamId::new("benchcmp", "madsim-strict-replay-commit");
-            create_madsim_stream(&engines[leader_index], stream_id.clone()).await;
+            let stream_id = bsid("madsim-strict-replay-commit");
+            create_stream_via_raft(&engines[leader_index], stream_id.clone()).await;
             let (responder, commit_rx, _complete_rx) = openraft::impls::ProgressResponder::<
                 UrsulaRaftTypeConfig,
                 openraft::raft::ClientWriteResult<UrsulaRaftTypeConfig>,
@@ -1583,11 +1365,7 @@ fn madsim_three_node_openraft_group_strict_replay_append_commit_probe() {
             engines[leader_index]
                 .raft
                 .client_write_ff(
-                    GroupWriteCommand::from(AppendRequest::from_bytes(
-                        stream_id,
-                        b"simulated".to_vec(),
-                    ))
-                    .into(),
+                    append_command(stream_id, b"simulated").into(),
                     Some(responder),
                 )
                 .await
@@ -1608,9 +1386,8 @@ fn madsim_three_node_openraft_group_strict_replay_append_complete_probe() {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, async {
             let (_, engines, leader_id) = build_madsim_three_node_raft_cluster(7).await;
             let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
-            let stream_id =
-                ursula_shard::BucketStreamId::new("benchcmp", "madsim-strict-replay-complete");
-            create_madsim_stream(&engines[leader_index], stream_id.clone()).await;
+            let stream_id = bsid("madsim-strict-replay-complete");
+            create_stream_via_raft(&engines[leader_index], stream_id.clone()).await;
             let (responder, commit_rx, complete_rx) = openraft::impls::ProgressResponder::<
                 UrsulaRaftTypeConfig,
                 openraft::raft::ClientWriteResult<UrsulaRaftTypeConfig>,
@@ -1618,11 +1395,7 @@ fn madsim_three_node_openraft_group_strict_replay_append_complete_probe() {
             engines[leader_index]
                 .raft
                 .client_write_ff(
-                    GroupWriteCommand::from(AppendRequest::from_bytes(
-                        stream_id,
-                        b"simulated".to_vec(),
-                    ))
-                    .into(),
+                    append_command(stream_id, b"simulated").into(),
                     Some(responder),
                 )
                 .await
@@ -1646,18 +1419,11 @@ fn madsim_three_node_openraft_group_strict_replay_append_response_probe() {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, async {
             let (_, engines, leader_id) = build_madsim_three_node_raft_cluster(7).await;
             let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
-            let stream_id =
-                ursula_shard::BucketStreamId::new("benchcmp", "madsim-strict-replay-response");
-            create_madsim_stream(&engines[leader_index], stream_id.clone()).await;
+            let stream_id = bsid("madsim-strict-replay-response");
+            create_stream_via_raft(&engines[leader_index], stream_id.clone()).await;
             let appended = engines[leader_index]
                 .raft
-                .client_write(
-                    GroupWriteCommand::from(AppendRequest::from_bytes(
-                        stream_id,
-                        b"simulated".to_vec(),
-                    ))
-                    .into(),
-                )
+                .client_write(append_command(stream_id, b"simulated").into())
                 .await
                 .expect("append through simulated leader");
             match group_write_result_from_raft_response(appended.data)
@@ -1684,39 +1450,15 @@ fn madsim_three_node_openraft_group_strict_replay_append_leader_read_probe() {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(7, async {
             let (_, engines, leader_id) = build_madsim_three_node_raft_cluster(7).await;
             let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
-            let stream_id =
-                ursula_shard::BucketStreamId::new("benchcmp", "madsim-strict-replay-leader-read");
-            create_madsim_stream(&engines[leader_index], stream_id.clone()).await;
+            let stream_id = bsid("madsim-strict-replay-leader-read");
+            create_stream_via_raft(&engines[leader_index], stream_id.clone()).await;
             let appended = engines[leader_index]
                 .raft
-                .client_write(
-                    GroupWriteCommand::from(AppendRequest::from_bytes(
-                        stream_id.clone(),
-                        b"simulated".to_vec(),
-                    ))
-                    .into(),
-                )
+                .client_write(append_command(stream_id.clone(), b"simulated").into())
                 .await
                 .expect("append through simulated leader");
             assert!(appended.log_id.index() > 0);
-            let read = engines[leader_index]
-                .with_state_machine(move |state_machine| {
-                    Box::pin(async move {
-                        state_machine
-                            .read_stream(
-                                ReadStreamRequest {
-                                    stream_id,
-                                    offset: 0,
-                                    max_len: 16,
-                                    now_ms: 0,
-                                    record: None,
-                                    max_records: None,
-                                },
-                                placement(),
-                            )
-                            .await
-                    })
-                })
+            let read = read_stream_via_state_machine(&engines[leader_index], stream_id, 16)
                 .await
                 .expect("read simulated leader state machine")
                 .expect("simulated append is readable on leader");
@@ -1808,24 +1550,7 @@ fn madsim_three_node_openraft_group_strict_replay_follower_read_probe() {
                 .applied_index_at_least(Some(appended_log_index), "append applied on follower")
                 .await
                 .expect("wait for simulated follower apply");
-            let read = engines[follower_index]
-                .with_state_machine(move |state_machine| {
-                    Box::pin(async move {
-                        state_machine
-                            .read_stream(
-                                ReadStreamRequest {
-                                    stream_id,
-                                    offset: 0,
-                                    max_len: 16,
-                                    now_ms: 0,
-                                    record: None,
-                                    max_records: None,
-                                },
-                                placement(),
-                            )
-                            .await
-                    })
-                })
+            let read = read_stream_via_state_machine(&engines[follower_index], stream_id, 16)
                 .await
                 .expect("read simulated follower state machine")
                 .expect("simulated append is readable on follower");
@@ -1855,24 +1580,7 @@ fn madsim_three_node_openraft_group_strict_replay_append_probe() {
                     .expect("wait for simulated append replication");
 
                 let stream_id = stream_id.clone();
-                let read = engine
-                    .with_state_machine(move |state_machine| {
-                        Box::pin(async move {
-                            state_machine
-                                .read_stream(
-                                    ReadStreamRequest {
-                                        stream_id,
-                                        offset: 0,
-                                        max_len: 16,
-                                        now_ms: 0,
-                                        record: None,
-                                        max_records: None,
-                                    },
-                                    placement(),
-                                )
-                                .await
-                        })
-                    })
+                let read = read_stream_via_state_machine(engine, stream_id, 16)
                     .await
                     .expect("read simulated follower state machine")
                     .expect("simulated replicated stream is readable");
@@ -1889,17 +1597,11 @@ async fn append_madsim_stream(
     engine: &RaftGroupEngine,
     name: &str,
 ) -> (ursula_shard::BucketStreamId, u64) {
-    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", name);
-    create_madsim_stream(engine, stream_id.clone()).await;
+    let stream_id = bsid(name);
+    create_stream_via_raft(engine, stream_id.clone()).await;
     let appended = engine
         .raft
-        .client_write(
-            GroupWriteCommand::from(AppendRequest::from_bytes(
-                stream_id.clone(),
-                b"simulated".to_vec(),
-            ))
-            .into(),
-        )
+        .client_write(append_command(stream_id.clone(), b"simulated").into())
         .await
         .expect("append through simulated leader");
     match group_write_result_from_raft_response(appended.data).expect("decode append response") {
@@ -1912,19 +1614,12 @@ async fn append_madsim_stream(
     (stream_id, appended.log_id.index())
 }
 
-#[cfg(madsim)]
-async fn create_madsim_stream(engine: &RaftGroupEngine, stream_id: ursula_shard::BucketStreamId) {
+async fn create_stream_via_raft(engine: &RaftGroupEngine, stream_id: ursula_shard::BucketStreamId) {
     let created = engine
         .raft
-        .client_write(
-            GroupWriteCommand::from(CreateStreamRequest::new(
-                stream_id,
-                "application/octet-stream",
-            ))
-            .into(),
-        )
+        .client_write(create_command(stream_id).into())
         .await
-        .expect("create stream through simulated leader");
+        .expect("create stream through leader");
     assert!(matches!(
         group_write_result_from_raft_response(created.data).expect("decode create response"),
         Ok(GroupWriteResponse::CreateStream(_))
@@ -1958,33 +1653,12 @@ fn run_madsim_three_node_raft_with_policy_once(
                 build_madsim_three_node_raft_cluster_with_policy(seed, policy).await;
             let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
 
-            let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "madsim-three-node-raft");
-            let created = engines[leader_index]
-                .raft
-                .client_write(
-                    GroupWriteCommand::from(CreateStreamRequest::new(
-                        stream_id.clone(),
-                        "application/octet-stream",
-                    ))
-                    .into(),
-                )
-                .await
-                .expect("create stream through simulated leader");
-            assert!(matches!(
-                group_write_result_from_raft_response(created.data)
-                    .expect("decode create response"),
-                Ok(GroupWriteResponse::CreateStream(_))
-            ));
+            let stream_id = bsid("madsim-three-node-raft");
+            create_stream_via_raft(&engines[leader_index], stream_id.clone()).await;
 
             let appended = engines[leader_index]
                 .raft
-                .client_write(
-                    GroupWriteCommand::from(AppendRequest::from_bytes(
-                        stream_id.clone(),
-                        b"simulated".to_vec(),
-                    ))
-                    .into(),
-                )
+                .client_write(append_command(stream_id.clone(), b"simulated").into())
                 .await
                 .expect("append through simulated leader");
             let appended_log_index = appended.log_id.index();
@@ -2007,24 +1681,7 @@ fn run_madsim_three_node_raft_with_policy_once(
                     .expect("wait for simulated append replication");
 
                 let stream_id = stream_id.clone();
-                let read = engine
-                    .with_state_machine(move |state_machine| {
-                        Box::pin(async move {
-                            state_machine
-                                .read_stream(
-                                    ReadStreamRequest {
-                                        stream_id,
-                                        offset: 0,
-                                        max_len: 16,
-                                        now_ms: 0,
-                                        record: None,
-                                        max_records: None,
-                                    },
-                                    placement(),
-                                )
-                                .await
-                        })
-                    })
+                let read = read_stream_via_state_machine(engine, stream_id, 16)
                     .await
                     .expect("read simulated follower state machine")
                     .expect("simulated replicated stream is readable");
@@ -2032,12 +1689,7 @@ fn run_madsim_three_node_raft_with_policy_once(
             }
 
             let result = (leader_id, appended_log_index);
-            for engine in &engines {
-                engine
-                    .shutdown()
-                    .await
-                    .expect("shutdown simulated raft node");
-            }
+            shutdown_all(&engines).await;
             result
         },
     ))
@@ -2106,24 +1758,7 @@ fn run_madsim_three_node_raft_with_fault_script_once(seed: u64) -> (u64, u64, u6
                 .applied_index_at_least(Some(appended_log_index), "healed follower catches up")
                 .await
                 .expect("wait for healed follower apply");
-            let read = engines[isolated_index]
-                .with_state_machine(move |state_machine| {
-                    Box::pin(async move {
-                        state_machine
-                            .read_stream(
-                                ReadStreamRequest {
-                                    stream_id,
-                                    offset: 0,
-                                    max_len: 16,
-                                    now_ms: 0,
-                                    record: None,
-                                    max_records: None,
-                                },
-                                placement(),
-                            )
-                            .await
-                    })
-                })
+            let read = read_stream_via_state_machine(&engines[isolated_index], stream_id, 16)
                 .await
                 .expect("read healed follower state machine")
                 .expect("simulated append is readable on healed follower");
@@ -2156,17 +1791,7 @@ async fn build_madsim_three_node_raft_cluster_with_policy(
     policy: InProcessRaftNetworkPolicy,
 ) -> (InProcessRaftRegistry, Vec<RaftGroupEngine>, u64) {
     let registry = InProcessRaftRegistry::default();
-    let config = Arc::new(
-        Config {
-            cluster_name: "ursula-madsim-three-node-test".to_owned(),
-            heartbeat_interval: 10,
-            election_timeout_min: 50,
-            election_timeout_max: 100,
-            ..Default::default()
-        }
-        .validate()
-        .expect("valid raft config"),
-    );
+    let config = raft_config("ursula-madsim-three-node-test", 50, 100);
     let mut nodes = BTreeMap::new();
     for node_id in 1..=3 {
         nodes.insert(node_id, BasicNode::new(format!("node-{node_id}")));
@@ -2286,27 +1911,15 @@ async fn openraft_installs_snapshot_for_lagging_learner() {
     }
 
     let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
-    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "lagging-learner-snapshot");
+    let stream_id = bsid("lagging-learner-snapshot");
     let _created = engines[leader_index]
         .raft
-        .client_write(
-            GroupWriteCommand::from(CreateStreamRequest::new(
-                stream_id.clone(),
-                "application/octet-stream",
-            ))
-            .into(),
-        )
+        .client_write(create_command(stream_id.clone()).into())
         .await
         .expect("create stream through elected leader");
     let appended = engines[leader_index]
         .raft
-        .client_write(
-            GroupWriteCommand::from(AppendRequest::from_bytes(
-                stream_id.clone(),
-                b"snapshot-transfer".to_vec(),
-            ))
-            .into(),
-        )
+        .client_write(append_command(stream_id.clone(), b"snapshot-transfer").into())
         .await
         .expect("append through elected leader");
     let appended_log_id = appended.log_id;
@@ -2397,38 +2010,13 @@ async fn openraft_installs_snapshot_for_lagging_learner() {
         .expect("inspect lagging learner state machine");
     assert_eq!(installed_snapshot_log_id, Some(appended_log_id));
 
-    let read = engines[2]
-        .with_state_machine({
-            let stream_id = stream_id.clone();
-            move |state_machine| {
-                Box::pin(async move {
-                    state_machine
-                        .read_stream(
-                            ReadStreamRequest {
-                                stream_id,
-                                offset: 0,
-                                max_len: 64,
-                                now_ms: 0,
-                                record: None,
-                                max_records: None,
-                            },
-                            placement(),
-                        )
-                        .await
-                })
-            }
-        })
+    let read = read_stream_via_state_machine(&engines[2], stream_id.clone(), 64)
         .await
         .expect("read lagging learner state machine")
         .expect("stream restored from snapshot is readable");
     assert_eq!(read.payload, b"snapshot-transfer");
 
-    for engine in &engines {
-        engine
-            .shutdown()
-            .await
-            .expect("shutdown cluster raft group node");
-    }
+    shutdown_all(&engines).await;
 }
 
 #[tokio::test]
@@ -2436,7 +2024,7 @@ async fn raft_group_engine_implements_runtime_group_engine_over_openraft() {
     let mut engine = RaftGroupEngine::new_single_node(placement())
         .await
         .expect("create raft group engine");
-    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "raft-group-engine");
+    let stream_id = bsid("raft-group-engine");
 
     let created = engine
         .create_stream(
@@ -2471,17 +2059,7 @@ async fn raft_group_engine_implements_runtime_group_engine_over_openraft() {
     assert_eq!(head.tail_offset, 7);
 
     let read = engine
-        .read_stream(
-            ReadStreamRequest {
-                stream_id,
-                offset: 0,
-                max_len: 16,
-                now_ms: 0,
-                record: None,
-                max_records: None,
-            },
-            placement(),
-        )
+        .read_stream(read_req(stream_id, 16), placement())
         .await
         .expect("read through group engine");
     assert_eq!(read.payload, b"payload");
@@ -2496,15 +2074,12 @@ async fn raft_group_engine_applies_batched_runtime_writes() {
     let mut engine = RaftGroupEngine::new_single_node(placement())
         .await
         .expect("create raft group engine");
-    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "raft-group-engine-batch");
+    let stream_id = bsid("raft-group-engine-batch");
 
     let responses = engine
         .write_batch(
             vec![
-                GroupWriteCommand::from(CreateStreamRequest::new(
-                    stream_id.clone(),
-                    "application/octet-stream",
-                )),
+                create_command(stream_id.clone()),
                 GroupWriteCommand::from(AppendBatchRequest::new(stream_id.clone(), vec![
                     b"ab".to_vec(),
                     b"cd".to_vec(),
@@ -2539,17 +2114,7 @@ async fn raft_group_engine_applies_batched_runtime_writes() {
     }
 
     let read = engine
-        .read_stream(
-            ReadStreamRequest {
-                stream_id,
-                offset: 0,
-                max_len: 16,
-                now_ms: 0,
-                record: None,
-                max_records: None,
-            },
-            placement(),
-        )
+        .read_stream(read_req(stream_id, 16), placement())
         .await
         .expect("read batched write");
     assert_eq!(read.payload, b"abcd");
@@ -2561,8 +2126,7 @@ async fn raft_group_engine_cold_admission_coalesces_append_batch_many_into_one_r
     let mut engine = RaftGroupEngine::new_single_node(placement())
         .await
         .expect("create raft group engine");
-    let stream_id =
-        ursula_shard::BucketStreamId::new("benchcmp", "raft-group-engine-cold-batch-many");
+    let stream_id = bsid("raft-group-engine-cold-batch-many");
 
     engine
         .create_stream(
@@ -2614,17 +2178,7 @@ async fn raft_group_engine_cold_admission_coalesces_append_batch_many_into_one_r
     assert_eq!(after_batch_log_index, before_batch_log_index + 1);
 
     let read = engine
-        .read_stream(
-            ReadStreamRequest {
-                stream_id,
-                offset: 0,
-                max_len: 16,
-                now_ms: 0,
-                record: None,
-                max_records: None,
-            },
-            placement(),
-        )
+        .read_stream(read_req(stream_id, 16), placement())
         .await
         .expect("read coalesced append batches");
     assert_eq!(read.payload, b"abcdef");
@@ -2638,13 +2192,10 @@ async fn raft_metrics_count_logical_commands_inside_coalesced_batches() {
         RaftGroupEngineFactory,
     )
     .expect("spawn raft runtime");
-    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "raft-logical-command-metrics");
+    let stream_id = bsid("raft-logical-command-metrics");
 
     runtime
-        .create_stream(CreateStreamRequest::new(
-            stream_id.clone(),
-            "application/octet-stream",
-        ))
+        .create_stream(create_req(stream_id.clone()))
         .await
         .expect("create stream");
     let before = runtime.metrics().snapshot();
@@ -2699,14 +2250,7 @@ async fn raft_metrics_count_logical_commands_inside_coalesced_batches() {
     );
 
     let read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id,
-            offset: 0,
-            max_len: 16,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream_id, 16))
         .await
         .expect("read appended batches");
     let mut chunks = read
@@ -2723,7 +2267,7 @@ async fn raft_group_engine_preserves_stream_error_next_offset() {
     let mut engine = RaftGroupEngine::new_single_node(placement())
         .await
         .expect("create raft group engine");
-    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "raft-stream-error-offset");
+    let stream_id = bsid("raft-stream-error-offset");
 
     engine
         .create_stream(
@@ -2767,7 +2311,7 @@ async fn raft_group_engine_preserves_stream_error_next_offset() {
 #[tokio::test]
 async fn raft_group_engine_recovers_client_writes_from_file_log() {
     let path = temp_log_path("raft-group-engine-recover");
-    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "raft-engine-recover");
+    let stream_id = bsid("raft-engine-recover");
 
     {
         let mut engine = RaftGroupEngine::new_single_node_with_file_log(placement(), &path)
@@ -2794,17 +2338,7 @@ async fn raft_group_engine_recovers_client_writes_from_file_log() {
         .await
         .expect("reopen durable raft group engine");
     let read = recovered
-        .read_stream(
-            ReadStreamRequest {
-                stream_id,
-                offset: 0,
-                max_len: 16,
-                now_ms: 0,
-                record: None,
-                max_records: None,
-            },
-            placement(),
-        )
+        .read_stream(read_req(stream_id, 16), placement())
         .await
         .expect("read recovered payload");
     assert_eq!(read.payload, b"payload");
@@ -2818,17 +2352,13 @@ async fn raft_group_engine_recovers_client_writes_from_file_log() {
 
 #[tokio::test]
 async fn shard_runtime_uses_raft_group_engine_factory_for_owned_group() {
-    let mut config = RuntimeConfig::new(1, 1);
-    config.threading = RuntimeThreading::HostedTokio;
+    let config = hosted_config(1, 1);
     let runtime = ShardRuntime::spawn_with_engine_factory(config, RaftGroupEngineFactory)
         .expect("spawn runtime with raft group engine factory");
-    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "runtime-raft-engine");
+    let stream_id = bsid("runtime-raft-engine");
 
     runtime
-        .create_stream(CreateStreamRequest::new(
-            stream_id.clone(),
-            "application/octet-stream",
-        ))
+        .create_stream(create_req(stream_id.clone()))
         .await
         .expect("create through runtime-owned raft group");
     runtime
@@ -2858,14 +2388,7 @@ async fn shard_runtime_uses_raft_group_engine_factory_for_owned_group() {
     assert_eq!(current_attrs.attrs, Some(attrs));
 
     let read = runtime
-        .read_stream(ReadStreamRequest {
-            stream_id,
-            offset: 0,
-            max_len: 16,
-            now_ms: 0,
-            record: None,
-            max_records: None,
-        })
+        .read_stream(read_req(stream_id, 16))
         .await
         .expect("read through runtime-owned raft group");
     assert_eq!(read.payload, b"payload");
@@ -2874,8 +2397,7 @@ async fn shard_runtime_uses_raft_group_engine_factory_for_owned_group() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn warm_group_registers_runtime_owned_raft_handle() {
     let registry = RaftGroupHandleRegistry::default();
-    let mut config = RuntimeConfig::new(2, 4);
-    config.threading = RuntimeThreading::HostedTokio;
+    let config = hosted_config(2, 4);
     let runtime = ShardRuntime::spawn_with_engine_factory(
         config,
         RegisteredRaftGroupEngineFactory::new(registry.clone()),
@@ -2906,19 +2428,15 @@ async fn durable_raft_group_engine_records_file_log_metrics() {
     let root = temp_log_path("raft-file-log-metrics-root").with_extension("");
     let _ = fs::remove_dir_all(&root);
 
-    let mut config = RuntimeConfig::new(1, 1);
-    config.threading = RuntimeThreading::HostedTokio;
+    let config = hosted_config(1, 1);
     let runtime =
         ShardRuntime::spawn_with_engine_factory(config, DurableRaftGroupEngineFactory::new(&root))
             .expect("spawn runtime with durable raft group engine factory");
     let placement = placement();
-    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "runtime-raft-file-metrics");
+    let stream_id = bsid("runtime-raft-file-metrics");
 
     runtime
-        .create_stream(CreateStreamRequest::new(
-            stream_id.clone(),
-            "application/octet-stream",
-        ))
+        .create_stream(create_req(stream_id.clone()))
         .await
         .expect("create through durable runtime-owned raft group");
     runtime
@@ -2953,21 +2471,17 @@ async fn durable_raft_group_engine_records_file_log_metrics() {
 async fn durable_raft_group_engine_recovers_from_core_journal() {
     let root = temp_log_path("raft-core-journal-recover-root").with_extension("");
     let _ = fs::remove_dir_all(&root);
-    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "raft-core-journal-recover");
+    let stream_id = bsid("raft-core-journal-recover");
 
     {
-        let mut config = RuntimeConfig::new(1, 1);
-        config.threading = RuntimeThreading::HostedTokio;
+        let config = hosted_config(1, 1);
         let runtime = ShardRuntime::spawn_with_engine_factory(
             config,
             DurableRaftGroupEngineFactory::new(&root),
         )
         .expect("spawn durable runtime");
         runtime
-            .create_stream(CreateStreamRequest::new(
-                stream_id.clone(),
-                "application/octet-stream",
-            ))
+            .create_stream(create_req(stream_id.clone()))
             .await
             .expect("create stream");
         runtime
@@ -2990,22 +2504,14 @@ async fn durable_raft_group_engine_recovers_from_core_journal() {
     );
 
     {
-        let mut config = RuntimeConfig::new(1, 1);
-        config.threading = RuntimeThreading::HostedTokio;
+        let config = hosted_config(1, 1);
         let recovered = ShardRuntime::spawn_with_engine_factory(
             config,
             DurableRaftGroupEngineFactory::new(&root),
         )
         .expect("spawn recovered durable runtime");
         let read = recovered
-            .read_stream(ReadStreamRequest {
-                stream_id,
-                offset: 0,
-                max_len: 32,
-                now_ms: 0,
-                record: None,
-                max_records: None,
-            })
+            .read_stream(read_req(stream_id, 32))
             .await
             .expect("read recovered stream");
         assert_eq!(read.payload, b"journal-payload");
@@ -3016,23 +2522,11 @@ async fn durable_raft_group_engine_recovers_from_core_journal() {
 
 #[tokio::test]
 async fn openraft_state_machine_applies_group_write_commands() {
-    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "raft-apply");
+    let stream_id = bsid("raft-apply");
     let mut sm = RaftGroupStateMachine::new(placement());
     let entries = vec![
-        normal_entry(
-            1,
-            GroupWriteCommand::from(CreateStreamRequest::new(
-                stream_id.clone(),
-                "application/octet-stream",
-            )),
-        ),
-        normal_entry(
-            2,
-            GroupWriteCommand::from(AppendRequest::from_bytes(
-                stream_id.clone(),
-                b"abc".to_vec(),
-            )),
-        ),
+        normal_entry(1, create_command(stream_id.clone())),
+        normal_entry(2, append_command(stream_id.clone(), b"abc")),
     ];
 
     sm.apply(stream::iter(
@@ -3049,20 +2543,11 @@ async fn openraft_state_machine_applies_group_write_commands() {
 
 #[tokio::test]
 async fn openraft_snapshot_round_trips_group_state() {
-    let stream_id = ursula_shard::BucketStreamId::new("benchcmp", "raft-snapshot");
+    let stream_id = bsid("raft-snapshot");
     let mut source = RaftGroupStateMachine::new(placement());
     let entries = vec![
-        normal_entry(
-            1,
-            GroupWriteCommand::from(CreateStreamRequest::new(
-                stream_id.clone(),
-                "application/octet-stream",
-            )),
-        ),
-        normal_entry(
-            2,
-            GroupWriteCommand::from(AppendRequest::from_bytes(stream_id, b"payload".to_vec())),
-        ),
+        normal_entry(1, create_command(stream_id.clone())),
+        normal_entry(2, append_command(stream_id, b"payload")),
     ];
     source
         .apply(stream::iter(
@@ -3082,13 +2567,7 @@ async fn openraft_snapshot_round_trips_group_state() {
 
     let appended = target
         .engine
-        .apply_committed_write(
-            GroupWriteCommand::from(AppendRequest::from_bytes(
-                ursula_shard::BucketStreamId::new("benchcmp", "raft-snapshot"),
-                b"-next".to_vec(),
-            )),
-            placement(),
-        )
+        .apply_committed_write(append_command(bsid("raft-snapshot"), b"-next"), placement())
         .expect("append after install");
     match appended {
         GroupWriteResponse::Append(response) => {

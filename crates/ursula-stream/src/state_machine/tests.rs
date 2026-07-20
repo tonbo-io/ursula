@@ -10,8 +10,17 @@ use crate::RecordIndexError;
 use crate::StreamRecordRange;
 use crate::integrity::StreamIntegritySnapshot;
 
+const OCTET: &str = "application/octet-stream";
+
 fn stream(id: &str) -> BucketStreamId {
     BucketStreamId::new("benchcmp", id)
+}
+
+/// A fresh state machine with the shared `benchcmp` bucket created.
+fn machine() -> StreamStateMachine {
+    let mut machine = StreamStateMachine::new();
+    create_bucket(&mut machine);
+    machine
 }
 
 fn create_bucket(machine: &mut StreamStateMachine) {
@@ -25,25 +34,249 @@ fn create_bucket(machine: &mut StreamStateMachine) {
     );
 }
 
-fn create_stream(machine: &mut StreamStateMachine, id: &str) {
-    assert_eq!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream(id),
-            content_type: "application/octet-stream".to_owned(),
-            initial_payload: Vec::new(),
+/// Overridable arguments for [`create_cmd`]; defaults mirror the most common
+/// inline literal (octet-stream, empty payload, no TTL/attrs, `now_ms: 0`).
+#[derive(Clone)]
+struct Create {
+    content_type: &'static str,
+    payload: Vec<u8>,
+    close_after: bool,
+    stream_seq: Option<String>,
+    ttl_seconds: Option<u64>,
+    expires_at_ms: Option<u64>,
+    attrs: Option<StreamAttrs>,
+    now_ms: u64,
+}
+
+impl Default for Create {
+    fn default() -> Self {
+        Self {
+            content_type: OCTET,
+            payload: Vec::new(),
+            close_after: false,
+            stream_seq: None,
+            ttl_seconds: None,
+            expires_at_ms: None,
+            attrs: None,
+            now_ms: 0,
+        }
+    }
+}
+
+fn create_cmd(stream_id: BucketStreamId, args: Create) -> StreamCommand {
+    StreamCommand::CreateStream {
+        stream_id,
+        content_type: args.content_type.to_owned(),
+        initial_payload: args.payload,
+        close_after: args.close_after,
+        stream_seq: args.stream_seq,
+        producer: None,
+        stream_ttl_seconds: args.ttl_seconds,
+        stream_expires_at_ms: args.expires_at_ms,
+        attrs: args.attrs,
+        now_ms: args.now_ms,
+    }
+}
+
+/// Overridable arguments for [`append_cmd`]; defaults mirror the most common
+/// inline literal (octet-stream, open append, no seq/producer, `now_ms: 0`).
+#[derive(Clone)]
+struct Append {
+    content_type: Option<&'static str>,
+    close_after: bool,
+    stream_seq: Option<String>,
+    producer: Option<ProducerRequest>,
+    now_ms: u64,
+}
+
+impl Default for Append {
+    fn default() -> Self {
+        Self {
+            content_type: Some(OCTET),
             close_after: false,
             stream_seq: None,
             producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
-            attrs: None,
             now_ms: 0,
-        }),
-        StreamResponse::Created {
-            stream_id: stream(id),
-            next_offset: 0,
-            closed: false,
         }
+    }
+}
+
+fn append_cmd(stream_id: BucketStreamId, payload: &[u8], args: Append) -> StreamCommand {
+    StreamCommand::Append {
+        stream_id,
+        content_type: args.content_type.map(str::to_owned),
+        payload: payload.to_vec(),
+        close_after: args.close_after,
+        stream_seq: args.stream_seq,
+        producer: args.producer,
+        now_ms: args.now_ms,
+        record_match: None,
+    }
+}
+
+fn close_cmd(stream_id: BucketStreamId) -> StreamCommand {
+    StreamCommand::Close {
+        stream_id,
+        stream_seq: None,
+        producer: None,
+        now_ms: 0,
+    }
+}
+
+fn delete_cmd(stream_id: BucketStreamId) -> StreamCommand {
+    StreamCommand::DeleteStream { stream_id }
+}
+
+fn update_attrs_cmd(stream_id: BucketStreamId, attrs: Option<StreamAttrs>) -> StreamCommand {
+    StreamCommand::UpdateStreamAttrs {
+        stream_id,
+        attrs,
+        now_ms: 0,
+    }
+}
+
+fn touch_cmd(stream_id: BucketStreamId, now_ms: u64) -> StreamCommand {
+    StreamCommand::TouchStreamAccess {
+        stream_id,
+        now_ms,
+        renew_ttl: true,
+    }
+}
+
+fn publish_snapshot_cmd(
+    stream_id: BucketStreamId,
+    snapshot_offset: u64,
+    content_type: &str,
+    payload: &[u8],
+    now_ms: u64,
+) -> StreamCommand {
+    StreamCommand::PublishSnapshot {
+        stream_id,
+        snapshot_offset,
+        content_type: content_type.to_owned(),
+        payload: payload.to_vec(),
+        now_ms,
+    }
+}
+
+fn flush_cold_cmd(
+    stream_id: BucketStreamId,
+    start_offset: u64,
+    end_offset: u64,
+    s3_path: &str,
+    object_size: u64,
+) -> StreamCommand {
+    StreamCommand::FlushCold {
+        stream_id,
+        chunk: ColdChunkRef {
+            start_offset,
+            end_offset,
+            s3_path: s3_path.to_owned(),
+            object_size,
+        },
+    }
+}
+
+fn flush_candidate_cmd(
+    stream_id: BucketStreamId,
+    candidate: &ColdFlushCandidate,
+    s3_path: &str,
+) -> StreamCommand {
+    flush_cold_cmd(
+        stream_id,
+        candidate.start_offset,
+        candidate.end_offset,
+        s3_path,
+        u64::try_from(candidate.payload.len()).expect("payload len fits u64"),
+    )
+}
+
+/// The default successful `Created` response (open stream).
+fn created(stream_id: BucketStreamId, next_offset: u64) -> StreamResponse {
+    StreamResponse::Created {
+        stream_id,
+        next_offset,
+        closed: false,
+    }
+}
+
+/// The default successful `Appended` response (open, not deduplicated,
+/// no producer).
+fn appended(offset: u64, next_offset: u64) -> StreamResponse {
+    StreamResponse::Appended {
+        offset,
+        next_offset,
+        closed: false,
+        deduplicated: false,
+        producer: None,
+    }
+}
+
+/// An `Appended` response acknowledged for `producer`.
+fn appended_by(
+    producer: ProducerRequest,
+    offset: u64,
+    next_offset: u64,
+    closed: bool,
+    deduplicated: bool,
+) -> StreamResponse {
+    StreamResponse::Appended {
+        offset,
+        next_offset,
+        closed,
+        deduplicated,
+        producer: Some(producer),
+    }
+}
+
+#[track_caller]
+fn assert_error_code(response: StreamResponse, code: StreamErrorCode) {
+    match &response {
+        StreamResponse::Error { code: actual, .. } if *actual == code => {}
+        other => panic!("expected {code:?} error, got {other:?}"),
+    }
+}
+
+#[track_caller]
+fn assert_error_at(response: StreamResponse, code: StreamErrorCode, next_offset: u64) {
+    match &response {
+        StreamResponse::Error {
+            code: actual,
+            next_offset: actual_next,
+            ..
+        } if *actual == code && *actual_next == Some(next_offset) => {}
+        other => panic!("expected {code:?} error at next_offset {next_offset}, got {other:?}"),
+    }
+}
+
+#[track_caller]
+fn assert_err_code<T: std::fmt::Debug>(result: Result<T, StreamResponse>, code: StreamErrorCode) {
+    match &result {
+        Err(StreamResponse::Error { code: actual, .. }) if *actual == code => {}
+        other => panic!("expected {code:?} error, got {other:?}"),
+    }
+}
+
+#[track_caller]
+fn assert_err_at<T: std::fmt::Debug>(
+    result: Result<T, StreamResponse>,
+    code: StreamErrorCode,
+    next_offset: u64,
+) {
+    match &result {
+        Err(StreamResponse::Error {
+            code: actual,
+            next_offset: actual_next,
+            ..
+        }) if *actual == code && *actual_next == Some(next_offset) => {}
+        other => panic!("expected {code:?} error at next_offset {next_offset}, got {other:?}"),
+    }
+}
+
+fn create_stream(machine: &mut StreamStateMachine, id: &str) {
+    assert_eq!(
+        machine.apply(create_cmd(stream(id), Create::default())),
+        created(stream(id), 0)
     );
 }
 
@@ -63,46 +296,23 @@ fn attrs(title: &str, purpose: &str) -> StreamAttrs {
 
 #[test]
 fn json_record_coordinates_survive_flush_restore_and_retention() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     let stream_id = stream("json-records");
     assert_eq!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream_id.clone(),
-            content_type: "application/json".to_owned(),
-            initial_payload: b"{\"a\":1}\n{\"b\":2}\n".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
-            attrs: None,
-            now_ms: 0,
-        }),
-        StreamResponse::Created {
-            stream_id: stream_id.clone(),
-            next_offset: 16,
-            closed: false,
-        }
+        machine.apply(create_cmd(stream_id.clone(), Create {
+            content_type: "application/json",
+            payload: b"{\"a\":1}\n{\"b\":2}\n".to_vec(),
+            ..Create::default()
+        })),
+        created(stream_id.clone(), 16)
     );
     assert_eq!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream_id.clone(),
-            content_type: Some("application/json".to_owned()),
-            payload: b"{\"c\":3}\n".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
+        machine.apply(append_cmd(stream_id.clone(), b"{\"c\":3}\n", Append {
+            content_type: Some("application/json"),
             now_ms: 1,
-            record_match: None,
-        }),
-        StreamResponse::Appended {
-            offset: 16,
-            next_offset: 24,
-            closed: false,
-            deduplicated: false,
-            producer: None,
-        }
+            ..Append::default()
+        })),
+        appended(16, 24)
     );
     assert_eq!(
         machine.record_range(&stream_id),
@@ -118,15 +328,11 @@ fn json_record_coordinates_survive_flush_restore_and_retention() {
         .expect("plan cold flush")
         .expect("flush candidate");
     assert_eq!(
-        machine.apply(StreamCommand::FlushCold {
-            stream_id: stream_id.clone(),
-            chunk: ColdChunkRef {
-                start_offset: candidate.start_offset,
-                end_offset: candidate.end_offset,
-                s3_path: "s3://bucket/json-records".to_owned(),
-                object_size: u64::try_from(candidate.payload.len()).expect("payload len fits u64"),
-            },
-        }),
+        machine.apply(flush_candidate_cmd(
+            stream_id.clone(),
+            &candidate,
+            "s3://bucket/json-records"
+        )),
         StreamResponse::ColdFlushed {
             hot_start_offset: candidate.end_offset,
         }
@@ -134,13 +340,13 @@ fn json_record_coordinates_survive_flush_restore_and_retention() {
     let mut restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
     assert_eq!(restored.offset_for_record(&stream_id, 1), Ok(Some(8)));
     assert_eq!(
-        restored.apply(StreamCommand::PublishSnapshot {
-            stream_id: stream_id.clone(),
-            snapshot_offset: 16,
-            content_type: "application/json".to_owned(),
-            payload: b"{\"state\":2}".to_vec(),
-            now_ms: 2,
-        }),
+        restored.apply(publish_snapshot_cmd(
+            stream_id.clone(),
+            16,
+            "application/json",
+            b"{\"state\":2}",
+            2
+        )),
         StreamResponse::SnapshotPublished {
             snapshot_offset: 16,
             record_range: Some(StreamRecordRange {
@@ -168,22 +374,14 @@ fn json_record_coordinates_survive_flush_restore_and_retention() {
 
 #[test]
 fn snapshot_record_trim_failure_does_not_mutate_stream_state() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     let stream_id = stream("snapshot-record-atomicity");
     assert!(matches!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream_id.clone(),
-            content_type: "application/json".to_owned(),
-            initial_payload: b"{\"a\":1}\n{\"b\":2}\n".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
-            attrs: None,
-            now_ms: 0,
-        }),
+        machine.apply(create_cmd(stream_id.clone(), Create {
+            content_type: "application/json",
+            payload: b"{\"a\":1}\n{\"b\":2}\n".to_vec(),
+            ..Create::default()
+        })),
         StreamResponse::Created { .. }
     ));
 
@@ -199,72 +397,50 @@ fn snapshot_record_trim_failure_does_not_mutate_stream_state() {
         .expect("advance test index");
     let before = machine.snapshot();
 
-    assert!(matches!(
-        machine.apply(StreamCommand::PublishSnapshot {
+    assert_error_code(
+        machine.apply(publish_snapshot_cmd(
             stream_id,
-            snapshot_offset: 0,
-            content_type: "application/json".to_owned(),
-            payload: br#"{"state":0}"#.to_vec(),
-            now_ms: 1,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::InvalidRecordBoundaries,
-            ..
-        }
-    ));
+            0,
+            "application/json",
+            br#"{"state":0}"#,
+            1,
+        )),
+        StreamErrorCode::InvalidRecordBoundaries,
+    );
     assert_eq!(machine.snapshot(), before);
 }
 
 #[test]
 fn inline_json_create_rejects_noncanonical_initial_payload() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     let stream_id = stream("invalid-inline-json");
 
-    assert!(matches!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream_id.clone(),
-            content_type: "application/json".to_owned(),
-            initial_payload: br#"{"missing":"newline"}"#.to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
-            attrs: None,
-            now_ms: 0,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::InvalidRecordBoundaries,
-            ..
-        }
-    ));
+    assert_error_code(
+        machine.apply(create_cmd(stream_id.clone(), Create {
+            content_type: "application/json",
+            payload: br#"{"missing":"newline"}"#.to_vec(),
+            ..Create::default()
+        })),
+        StreamErrorCode::InvalidRecordBoundaries,
+    );
     assert!(machine.stream_metadata(&stream_id).is_none());
 }
 
 #[test]
 fn legacy_external_json_append_without_boundaries_is_rejected_atomically() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     let stream_id = stream("legacy-external-json");
     assert!(matches!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream_id.clone(),
-            content_type: "application/json".to_owned(),
-            initial_payload: b"{\"id\":1}\n".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
-            attrs: None,
-            now_ms: 0,
-        }),
+        machine.apply(create_cmd(stream_id.clone(), Create {
+            content_type: "application/json",
+            payload: b"{\"id\":1}\n".to_vec(),
+            ..Create::default()
+        })),
         StreamResponse::Created { .. }
     ));
     let before = machine.snapshot();
 
-    assert!(matches!(
+    assert_error_code(
         machine.apply(StreamCommand::AppendExternal {
             stream_id,
             content_type: Some("application/json".to_owned()),
@@ -280,11 +456,8 @@ fn legacy_external_json_append_without_boundaries_is_rejected_atomically() {
             now_ms: 1,
             record_match: None,
         }),
-        StreamResponse::Error {
-            code: StreamErrorCode::InvalidRecordBoundaries,
-            ..
-        }
-    ));
+        StreamErrorCode::InvalidRecordBoundaries,
+    );
     assert_eq!(machine.snapshot(), before);
 }
 
@@ -312,28 +485,15 @@ fn empty_integrity() -> StreamIntegritySnapshot {
 
 #[test]
 fn create_stream_stores_stream_attrs_separately() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     let attrs = attrs("Support session", "customer-support");
 
     assert_eq!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream("attrs"),
-            content_type: "application/octet-stream".to_owned(),
-            initial_payload: Vec::new(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
+        machine.apply(create_cmd(stream("attrs"), Create {
             attrs: Some(attrs.clone()),
-            now_ms: 0,
-        }),
-        StreamResponse::Created {
-            stream_id: stream("attrs"),
-            next_offset: 0,
-            closed: false,
-        }
+            ..Create::default()
+        })),
+        created(stream("attrs"), 0)
     );
 
     assert_eq!(machine.stream_attrs(&stream("attrs")), Some(&attrs));
@@ -342,28 +502,19 @@ fn create_stream_stores_stream_attrs_separately() {
 
 #[test]
 fn update_stream_attrs_replaces_existing_attrs() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "attrs");
     let first = attrs("Support session", "customer-support");
     let second = attrs("Escalated session", "incident-review");
 
     assert_eq!(
-        machine.apply(StreamCommand::UpdateStreamAttrs {
-            stream_id: stream("attrs"),
-            attrs: Some(first.clone()),
-            now_ms: 0,
-        }),
+        machine.apply(update_attrs_cmd(stream("attrs"), Some(first.clone()))),
         StreamResponse::AttrsUpdated { changed: true }
     );
     assert_eq!(machine.stream_attrs(&stream("attrs")), Some(&first));
 
     assert_eq!(
-        machine.apply(StreamCommand::UpdateStreamAttrs {
-            stream_id: stream("attrs"),
-            attrs: Some(second.clone()),
-            now_ms: 0,
-        }),
+        machine.apply(update_attrs_cmd(stream("attrs"), Some(second.clone()))),
         StreamResponse::AttrsUpdated { changed: true }
     );
 
@@ -372,18 +523,12 @@ fn update_stream_attrs_replaces_existing_attrs() {
 
 #[test]
 fn update_stream_attrs_is_allowed_after_stream_is_closed() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "attrs-closed");
     let attrs = attrs("Closed session", "post-close-metadata");
 
     assert_eq!(
-        machine.apply(StreamCommand::Close {
-            stream_id: stream("attrs-closed"),
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-        }),
+        machine.apply(close_cmd(stream("attrs-closed"))),
         StreamResponse::Closed {
             next_offset: 0,
             deduplicated: false,
@@ -391,11 +536,10 @@ fn update_stream_attrs_is_allowed_after_stream_is_closed() {
         }
     );
     assert_eq!(
-        machine.apply(StreamCommand::UpdateStreamAttrs {
-            stream_id: stream("attrs-closed"),
-            attrs: Some(attrs.clone()),
-            now_ms: 0,
-        }),
+        machine.apply(update_attrs_cmd(
+            stream("attrs-closed"),
+            Some(attrs.clone())
+        )),
         StreamResponse::AttrsUpdated { changed: true }
     );
 
@@ -413,64 +557,40 @@ fn oversized_attrs() -> StreamAttrs {
 
 #[test]
 fn create_stream_rejects_oversized_attrs() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
 
-    assert!(matches!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream("attrs-too-big"),
-            content_type: "application/octet-stream".to_owned(),
-            initial_payload: Vec::new(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
+    assert_error_code(
+        machine.apply(create_cmd(stream("attrs-too-big"), Create {
             attrs: Some(oversized_attrs()),
-            now_ms: 0,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::InvalidStreamAttrs,
-            ..
-        }
-    ));
+            ..Create::default()
+        })),
+        StreamErrorCode::InvalidStreamAttrs,
+    );
     assert!(machine.head(&stream("attrs-too-big")).is_none());
 }
 
 #[test]
 fn update_stream_attrs_rejects_oversized_attrs() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "attrs-cap");
 
-    assert!(matches!(
-        machine.apply(StreamCommand::UpdateStreamAttrs {
-            stream_id: stream("attrs-cap"),
-            attrs: Some(oversized_attrs()),
-            now_ms: 0,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::InvalidStreamAttrs,
-            ..
-        }
-    ));
+    assert_error_code(
+        machine.apply(update_attrs_cmd(
+            stream("attrs-cap"),
+            Some(oversized_attrs()),
+        )),
+        StreamErrorCode::InvalidStreamAttrs,
+    );
     assert_eq!(machine.stream_attrs(&stream("attrs-cap")), None);
 }
 
 #[test]
 fn stream_command_decodes_pre_attrs_wal_records() {
-    let command = StreamCommand::CreateStream {
-        stream_id: stream("legacy-wal"),
-        content_type: "application/octet-stream".to_owned(),
-        initial_payload: b"abc".to_vec(),
-        close_after: false,
-        stream_seq: None,
-        producer: None,
-        stream_ttl_seconds: None,
-        stream_expires_at_ms: None,
-        attrs: None,
+    let command = create_cmd(stream("legacy-wal"), Create {
+        payload: b"abc".to_vec(),
         now_ms: 7,
-    };
+        ..Create::default()
+    });
     let mut value = serde_json::to_value(&command).expect("encode command");
     let fields = value
         .get_mut("CreateStream")
@@ -488,214 +608,106 @@ fn stream_command_decodes_pre_attrs_wal_records() {
 fn stream_create_requires_existing_bucket_and_valid_ids() {
     let mut machine = StreamStateMachine::new();
 
-    assert!(matches!(
+    assert_error_code(
         machine.apply(StreamCommand::CreateBucket {
             bucket_id: "Bad".to_owned(),
         }),
-        StreamResponse::Error {
-            code: StreamErrorCode::InvalidBucketId,
-            ..
-        }
-    ));
-    assert!(matches!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream("s-1"),
-            content_type: "application/octet-stream".to_owned(),
-            initial_payload: Vec::new(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
-            attrs: None,
-            now_ms: 0,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::BucketNotFound,
-            ..
-        }
-    ));
+        StreamErrorCode::InvalidBucketId,
+    );
+    assert_error_code(
+        machine.apply(create_cmd(stream("s-1"), Create::default())),
+        StreamErrorCode::BucketNotFound,
+    );
 
     create_bucket(&mut machine);
-    assert!(matches!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream("streams"),
-            content_type: "application/octet-stream".to_owned(),
-            initial_payload: Vec::new(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
-            attrs: None,
-            now_ms: 0,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::InvalidStreamId,
-            ..
-        }
-    ));
+    assert_error_code(
+        machine.apply(create_cmd(stream("streams"), Create::default())),
+        StreamErrorCode::InvalidStreamId,
+    );
 }
 
 #[test]
 fn create_stream_is_idempotent_only_when_metadata_matches() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "s-1");
 
     assert_eq!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream("s-1"),
-            content_type: "application/octet-stream".to_owned(),
-            initial_payload: vec![0; 99],
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
-            attrs: None,
-            now_ms: 0,
-        }),
+        machine.apply(create_cmd(stream("s-1"), Create {
+            payload: vec![0; 99],
+            ..Create::default()
+        })),
         StreamResponse::AlreadyExists {
             next_offset: 0,
             closed: false,
-            content_type: "application/octet-stream".to_owned(),
+            content_type: OCTET.to_owned(),
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
         }
     );
 
-    assert!(matches!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream("s-1"),
-            content_type: "text/plain".to_owned(),
-            initial_payload: Vec::new(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
-            attrs: None,
-            now_ms: 0,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::StreamAlreadyExistsConflict,
-            ..
-        }
-    ));
+    assert_error_code(
+        machine.apply(create_cmd(stream("s-1"), Create {
+            content_type: "text/plain",
+            ..Create::default()
+        })),
+        StreamErrorCode::StreamAlreadyExistsConflict,
+    );
 }
 
 #[test]
 fn create_stream_is_idempotent_only_when_attrs_match() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     let first = attrs("Support session", "customer-support");
     let second = attrs("Escalated session", "incident-review");
 
     assert_eq!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream("attrs-idempotent"),
-            content_type: "application/octet-stream".to_owned(),
-            initial_payload: Vec::new(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
+        machine.apply(create_cmd(stream("attrs-idempotent"), Create {
             attrs: Some(first.clone()),
-            now_ms: 0,
-        }),
-        StreamResponse::Created {
-            stream_id: stream("attrs-idempotent"),
-            next_offset: 0,
-            closed: false,
-        }
+            ..Create::default()
+        })),
+        created(stream("attrs-idempotent"), 0)
     );
 
     assert_eq!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream("attrs-idempotent"),
-            content_type: "application/octet-stream".to_owned(),
-            initial_payload: Vec::new(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
+        machine.apply(create_cmd(stream("attrs-idempotent"), Create {
             attrs: Some(first),
-            now_ms: 0,
-        }),
+            ..Create::default()
+        })),
         StreamResponse::AlreadyExists {
             next_offset: 0,
             closed: false,
-            content_type: "application/octet-stream".to_owned(),
+            content_type: OCTET.to_owned(),
             stream_ttl_seconds: None,
             stream_expires_at_ms: None,
         }
     );
 
-    assert!(matches!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream("attrs-idempotent"),
-            content_type: "application/octet-stream".to_owned(),
-            initial_payload: Vec::new(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
+    assert_error_code(
+        machine.apply(create_cmd(stream("attrs-idempotent"), Create {
             attrs: Some(second),
-            now_ms: 0,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::StreamAlreadyExistsConflict,
-            ..
-        }
-    ));
+            ..Create::default()
+        })),
+        StreamErrorCode::StreamAlreadyExistsConflict,
+    );
 }
 
 #[test]
 fn append_advances_offsets_and_checks_content_type() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "s-1");
 
     assert_eq!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("s-1"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"abcdefg".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
-        StreamResponse::Appended {
-            offset: 0,
-            next_offset: 7,
-            closed: false,
-            deduplicated: false,
-            producer: None,
-        }
+        machine.apply(append_cmd(stream("s-1"), b"abcdefg", Append::default())),
+        appended(0, 7)
     );
-    assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("s-1"),
-            content_type: Some("text/plain".to_owned()),
-            payload: b"x".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::ContentTypeMismatch,
-            next_offset: Some(7),
-            ..
-        }
-    ));
+    assert_error_at(
+        machine.apply(append_cmd(stream("s-1"), b"x", Append {
+            content_type: Some("text/plain"),
+            ..Append::default()
+        })),
+        StreamErrorCode::ContentTypeMismatch,
+        7,
+    );
     assert_eq!(machine.head(&stream("s-1")).expect("stream").tail_offset, 7);
     let integrity = machine
         .integrity_snapshot(&stream("s-1"))
@@ -710,20 +722,10 @@ fn append_advances_offsets_and_checks_content_type() {
 
 #[test]
 fn catch_up_read_returns_payload_slice_and_bounds_errors() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "s-1");
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("s-1"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"abcdefg".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+        machine.apply(append_cmd(stream("s-1"), b"abcdefg", Append::default())),
         StreamResponse::Appended { .. }
     ));
 
@@ -732,7 +734,7 @@ fn catch_up_read_returns_payload_slice_and_bounds_errors() {
         StreamRead {
             offset: 2,
             next_offset: 5,
-            content_type: "application/octet-stream".to_owned(),
+            content_type: OCTET.to_owned(),
             payload: b"cde".to_vec(),
             up_to_date: false,
             closed: false,
@@ -743,38 +745,25 @@ fn catch_up_read_returns_payload_slice_and_bounds_errors() {
         StreamRead {
             offset: 7,
             next_offset: 7,
-            content_type: "application/octet-stream".to_owned(),
+            content_type: OCTET.to_owned(),
             payload: Vec::new(),
             up_to_date: true,
             closed: false,
         }
     );
-    assert!(matches!(
+    assert_err_at(
         machine.read(&stream("s-1"), 8, 1),
-        Err(StreamResponse::Error {
-            code: StreamErrorCode::OffsetOutOfRange,
-            next_offset: Some(7),
-            ..
-        })
-    ));
+        StreamErrorCode::OffsetOutOfRange,
+        7,
+    );
 }
 
 #[test]
 fn flush_cold_moves_hot_prefix_to_manifest_and_read_plan_splits() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "cold");
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("cold"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"abcdef".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+        machine.apply(append_cmd(stream("cold"), b"abcdef", Append::default())),
         StreamResponse::Appended {
             offset: 0,
             next_offset: 6,
@@ -790,15 +779,11 @@ fn flush_cold_moves_hot_prefix_to_manifest_and_read_plan_splits() {
     assert_eq!(candidate.end_offset, 4);
     assert_eq!(candidate.payload, b"abcd");
     assert_eq!(
-        machine.apply(StreamCommand::FlushCold {
-            stream_id: stream("cold"),
-            chunk: ColdChunkRef {
-                start_offset: candidate.start_offset,
-                end_offset: candidate.end_offset,
-                s3_path: "s3://bucket/cold/000000".to_owned(),
-                object_size: u64::try_from(candidate.payload.len()).unwrap(),
-            },
-        }),
+        machine.apply(flush_candidate_cmd(
+            stream("cold"),
+            &candidate,
+            "s3://bucket/cold/000000"
+        )),
         StreamResponse::ColdFlushed {
             hot_start_offset: 4,
         }
@@ -834,7 +819,7 @@ fn flush_cold_moves_hot_prefix_to_manifest_and_read_plan_splits() {
         StreamRead {
             offset: 4,
             next_offset: 6,
-            content_type: "application/octet-stream".to_owned(),
+            content_type: OCTET.to_owned(),
             payload: b"ef".to_vec(),
             up_to_date: true,
             closed: false,
@@ -849,7 +834,7 @@ fn flush_cold_moves_hot_prefix_to_manifest_and_read_plan_splits() {
         StreamRead {
             offset: 4,
             next_offset: 6,
-            content_type: "application/octet-stream".to_owned(),
+            content_type: OCTET.to_owned(),
             payload: b"ef".to_vec(),
             up_to_date: true,
             closed: false,
@@ -859,35 +844,27 @@ fn flush_cold_moves_hot_prefix_to_manifest_and_read_plan_splits() {
 
 #[test]
 fn flush_cold_compacts_message_records_to_cold_prefix() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "cold-records");
     for payload in [b"ab".as_slice(), b"cd".as_slice(), b"ef".as_slice()] {
         assert!(matches!(
-            machine.apply(StreamCommand::Append {
-                stream_id: stream("cold-records"),
-                content_type: Some("application/octet-stream".to_owned()),
-                payload: payload.to_vec(),
-                close_after: false,
-                stream_seq: None,
-                producer: None,
-                now_ms: 0,
-                record_match: None,
-            }),
+            machine.apply(append_cmd(
+                stream("cold-records"),
+                payload,
+                Append::default()
+            )),
             StreamResponse::Appended { .. }
         ));
     }
 
     assert_eq!(
-        machine.apply(StreamCommand::FlushCold {
-            stream_id: stream("cold-records"),
-            chunk: ColdChunkRef {
-                start_offset: 0,
-                end_offset: 4,
-                s3_path: "s3://bucket/cold-records/000000".to_owned(),
-                object_size: 4,
-            },
-        }),
+        machine.apply(flush_cold_cmd(
+            stream("cold-records"),
+            0,
+            4,
+            "s3://bucket/cold-records/000000",
+            4
+        )),
         StreamResponse::ColdFlushed {
             hot_start_offset: 4,
         }
@@ -910,15 +887,13 @@ fn flush_cold_compacts_message_records_to_cold_prefix() {
     );
 
     assert_eq!(
-        machine.apply(StreamCommand::FlushCold {
-            stream_id: stream("cold-records"),
-            chunk: ColdChunkRef {
-                start_offset: 4,
-                end_offset: 6,
-                s3_path: "s3://bucket/cold-records/000001".to_owned(),
-                object_size: 2,
-            },
-        }),
+        machine.apply(flush_cold_cmd(
+            stream("cold-records"),
+            4,
+            6,
+            "s3://bucket/cold-records/000001",
+            2
+        )),
         StreamResponse::ColdFlushed {
             hot_start_offset: 6,
         }
@@ -944,13 +919,13 @@ fn flush_cold_compacts_message_records_to_cold_prefix() {
         end_offset: 6,
     }]);
     assert_eq!(
-        machine.apply(StreamCommand::PublishSnapshot {
-            stream_id: stream("cold-records"),
-            snapshot_offset: 3,
-            content_type: "application/octet-stream".to_owned(),
-            payload: b"abc-state".to_vec(),
-            now_ms: 0,
-        }),
+        machine.apply(publish_snapshot_cmd(
+            stream("cold-records"),
+            3,
+            OCTET,
+            b"abc-state",
+            0
+        )),
         StreamResponse::SnapshotPublished {
             snapshot_offset: 3,
             record_range: None,
@@ -959,35 +934,21 @@ fn flush_cold_compacts_message_records_to_cold_prefix() {
 }
 
 fn flush_one_cold_chunk(machine: &mut StreamStateMachine, id: &str) {
-    machine.apply(StreamCommand::Append {
-        stream_id: stream(id),
-        content_type: Some("application/octet-stream".to_owned()),
-        payload: b"abcd".to_vec(),
-        close_after: false,
-        stream_seq: None,
-        producer: None,
-        now_ms: 0,
-        record_match: None,
-    });
+    machine.apply(append_cmd(stream(id), b"abcd", Append::default()));
     let candidate = machine
         .plan_cold_flush(&stream(id), 4, 4)
         .expect("plan cold flush")
         .expect("cold flush candidate");
-    machine.apply(StreamCommand::FlushCold {
-        stream_id: stream(id),
-        chunk: ColdChunkRef {
-            start_offset: candidate.start_offset,
-            end_offset: candidate.end_offset,
-            s3_path: format!("s3://bucket/{id}/000000"),
-            object_size: u64::try_from(candidate.payload.len()).unwrap(),
-        },
-    });
+    machine.apply(flush_candidate_cmd(
+        stream(id),
+        &candidate,
+        &format!("s3://bucket/{id}/000000"),
+    ));
 }
 
 #[test]
 fn delete_stream_enqueues_cold_gc_then_ack_drains_it() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "cold-a");
     create_stream(&mut machine, "cold-b");
     flush_one_cold_chunk(&mut machine, "cold-a");
@@ -995,9 +956,7 @@ fn delete_stream_enqueues_cold_gc_then_ack_drains_it() {
 
     for id in ["cold-a", "cold-b"] {
         assert!(matches!(
-            machine.apply(StreamCommand::DeleteStream {
-                stream_id: stream(id)
-            }),
+            machine.apply(delete_cmd(stream(id))),
             StreamResponse::Deleted
         ));
     }
@@ -1040,20 +999,11 @@ fn delete_stream_enqueues_cold_gc_then_ack_drains_it() {
 
 #[test]
 fn expired_stream_with_cold_chunks_enqueues_cold_gc() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
-    machine.apply(StreamCommand::CreateStream {
-        stream_id: stream("ttl"),
-        content_type: "application/octet-stream".to_owned(),
-        initial_payload: Vec::new(),
-        close_after: false,
-        stream_seq: None,
-        producer: None,
-        stream_ttl_seconds: None,
-        stream_expires_at_ms: Some(1_000),
-        attrs: None,
-        now_ms: 0,
-    });
+    let mut machine = machine();
+    machine.apply(create_cmd(stream("ttl"), Create {
+        expires_at_ms: Some(1_000),
+        ..Create::default()
+    }));
     flush_one_cold_chunk(&mut machine, "ttl");
 
     // A lazy access past the expiry removes the stream and queues its cold prefix.
@@ -1065,42 +1015,27 @@ fn expired_stream_with_cold_chunks_enqueues_cold_gc() {
 
 #[test]
 fn writes_sweep_expired_streams_in_bounded_deterministic_batches() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "active");
 
     let expired_count = TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE + 6;
     for index in 0..expired_count {
         let id = format!("old-{index:04}");
         assert!(matches!(
-            machine.apply(StreamCommand::CreateStream {
-                stream_id: stream(&id),
-                content_type: "application/octet-stream".to_owned(),
-                initial_payload: Vec::new(),
-                close_after: false,
-                stream_seq: None,
-                producer: None,
-                stream_ttl_seconds: None,
-                stream_expires_at_ms: Some(1_000),
-                attrs: None,
-                now_ms: 0,
-            }),
+            machine.apply(create_cmd(stream(&id), Create {
+                expires_at_ms: Some(1_000),
+                ..Create::default()
+            })),
             StreamResponse::Created { .. }
         ));
     }
     assert_eq!(machine.snapshot().streams.len(), expired_count + 1);
 
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("active"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"x".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
+        machine.apply(append_cmd(stream("active"), b"x", Append {
             now_ms: 2_000,
-            record_match: None,
-        }),
+            ..Append::default()
+        })),
         StreamResponse::Appended { .. }
     ));
 
@@ -1123,31 +1058,22 @@ fn writes_sweep_expired_streams_in_bounded_deterministic_batches() {
 
 #[test]
 fn stream_without_cold_chunks_enqueues_nothing_on_delete() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "hot-only");
-    machine.apply(StreamCommand::DeleteStream {
-        stream_id: stream("hot-only"),
-    });
+    machine.apply(delete_cmd(stream("hot-only")));
     assert_eq!(machine.pending_cold_gc_len(), 0);
 }
 
 #[test]
 fn flush_cold_can_coalesce_contiguous_hot_segments() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "cold-coalesced");
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("cold-coalesced"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"abc".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+        machine.apply(append_cmd(
+            stream("cold-coalesced"),
+            b"abc",
+            Append::default()
+        )),
         StreamResponse::Appended {
             offset: 0,
             next_offset: 3,
@@ -1155,16 +1081,11 @@ fn flush_cold_can_coalesce_contiguous_hot_segments() {
         }
     ));
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("cold-coalesced"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"de".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+        machine.apply(append_cmd(
+            stream("cold-coalesced"),
+            b"de",
+            Append::default()
+        )),
         StreamResponse::Appended {
             offset: 3,
             next_offset: 5,
@@ -1173,15 +1094,13 @@ fn flush_cold_can_coalesce_contiguous_hot_segments() {
     ));
 
     assert_eq!(
-        machine.apply(StreamCommand::FlushCold {
-            stream_id: stream("cold-coalesced"),
-            chunk: ColdChunkRef {
-                start_offset: 0,
-                end_offset: 5,
-                s3_path: "s3://bucket/cold-coalesced/000000".to_owned(),
-                object_size: 5,
-            },
-        }),
+        machine.apply(flush_cold_cmd(
+            stream("cold-coalesced"),
+            0,
+            5,
+            "s3://bucket/cold-coalesced/000000",
+            5
+        )),
         StreamResponse::ColdFlushed {
             hot_start_offset: 5,
         }
@@ -1206,21 +1125,15 @@ fn flush_cold_can_coalesce_contiguous_hot_segments() {
 
 #[test]
 fn plan_cold_flush_coalesces_contiguous_hot_segments() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "cold-planned-coalesced");
     for payload in [b"ab".as_slice(), b"cd".as_slice(), b"ef".as_slice()] {
         assert!(matches!(
-            machine.apply(StreamCommand::Append {
-                stream_id: stream("cold-planned-coalesced"),
-                content_type: Some("application/octet-stream".to_owned()),
-                payload: payload.to_vec(),
-                close_after: false,
-                stream_seq: None,
-                producer: None,
-                now_ms: 0,
-                record_match: None,
-            }),
+            machine.apply(append_cmd(
+                stream("cold-planned-coalesced"),
+                payload,
+                Append::default()
+            )),
             StreamResponse::Appended { .. }
         ));
     }
@@ -1243,34 +1156,15 @@ fn plan_cold_flush_coalesces_contiguous_hot_segments() {
 
 #[test]
 fn plan_next_cold_flush_selects_deterministic_eligible_stream() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "z-cold");
     create_stream(&mut machine, "a-cold");
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("z-cold"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"zzzz".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+        machine.apply(append_cmd(stream("z-cold"), b"zzzz", Append::default())),
         StreamResponse::Appended { .. }
     ));
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("a-cold"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"aaaa".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+        machine.apply(append_cmd(stream("a-cold"), b"aaaa", Append::default())),
         StreamResponse::Appended { .. }
     ));
 
@@ -1286,22 +1180,12 @@ fn plan_next_cold_flush_selects_deterministic_eligible_stream() {
 
 #[test]
 fn plan_next_cold_flush_drains_distributed_group_hot_bytes() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "z-cold");
     create_stream(&mut machine, "a-cold");
     for stream_name in ["z-cold", "a-cold"] {
         assert!(matches!(
-            machine.apply(StreamCommand::Append {
-                stream_id: stream(stream_name),
-                content_type: Some("application/octet-stream".to_owned()),
-                payload: b"aa".to_vec(),
-                close_after: false,
-                stream_seq: None,
-                producer: None,
-                now_ms: 0,
-                record_match: None,
-            }),
+            machine.apply(append_cmd(stream(stream_name), b"aa", Append::default())),
             StreamResponse::Appended { .. }
         ));
     }
@@ -1329,20 +1213,14 @@ fn plan_next_cold_flush_drains_distributed_group_hot_bytes() {
 
 #[test]
 fn plan_next_cold_flush_batch_advances() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "batched-cold");
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("batched-cold"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"abcd".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+        machine.apply(append_cmd(
+            stream("batched-cold"),
+            b"abcd",
+            Append::default()
+        )),
         StreamResponse::Appended { .. }
     ));
 
@@ -1376,20 +1254,14 @@ fn plan_next_cold_flush_batch_advances() {
 
 #[test]
 fn stale_cold_flush_candidate_after_delete_recreate_is_invalid_without_mutation() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "stale-cold");
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("stale-cold"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"abcdefghijklmnopqr".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+        machine.apply(append_cmd(
+            stream("stale-cold"),
+            b"abcdefghijklmnopqr",
+            Append::default()
+        )),
         StreamResponse::Appended {
             next_offset: 18,
             ..
@@ -1401,38 +1273,27 @@ fn stale_cold_flush_candidate_after_delete_recreate_is_invalid_without_mutation(
         .expect("candidate");
 
     assert!(matches!(
-        machine.apply(StreamCommand::DeleteStream {
-            stream_id: stream("stale-cold")
-        }),
+        machine.apply(delete_cmd(stream("stale-cold"))),
         StreamResponse::Deleted
     ));
     create_stream(&mut machine, "stale-cold");
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("stale-cold"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"abcdefghijklmnopq".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+        machine.apply(append_cmd(
+            stream("stale-cold"),
+            b"abcdefghijklmnopq",
+            Append::default()
+        )),
         StreamResponse::Appended {
             next_offset: 17,
             ..
         }
     ));
 
-    match machine.apply(StreamCommand::FlushCold {
-        stream_id: stream("stale-cold"),
-        chunk: ColdChunkRef {
-            start_offset: candidate.start_offset,
-            end_offset: candidate.end_offset,
-            s3_path: "s3://bucket/stale-cold/old-candidate".to_owned(),
-            object_size: u64::try_from(candidate.payload.len()).unwrap(),
-        },
-    }) {
+    match machine.apply(flush_candidate_cmd(
+        stream("stale-cold"),
+        &candidate,
+        "s3://bucket/stale-cold/old-candidate",
+    )) {
         StreamResponse::Error {
             code: StreamErrorCode::InvalidColdFlush,
             message,
@@ -1451,7 +1312,7 @@ fn stale_cold_flush_candidate_after_delete_recreate_is_invalid_without_mutation(
         StreamRead {
             offset: 0,
             next_offset: 17,
-            content_type: "application/octet-stream".to_owned(),
+            content_type: OCTET.to_owned(),
             payload: b"abcdefghijklmnopq".to_vec(),
             up_to_date: true,
             closed: false,
@@ -1461,40 +1322,19 @@ fn stale_cold_flush_candidate_after_delete_recreate_is_invalid_without_mutation(
 
 #[test]
 fn plan_next_cold_flush_skips_deleted_streams() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "a-gone");
     create_stream(&mut machine, "b-live");
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("a-gone"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"gone".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+        machine.apply(append_cmd(stream("a-gone"), b"gone", Append::default())),
         StreamResponse::Appended { .. }
     ));
     assert_eq!(
-        machine.apply(StreamCommand::DeleteStream {
-            stream_id: stream("a-gone"),
-        }),
+        machine.apply(delete_cmd(stream("a-gone"))),
         StreamResponse::Deleted
     );
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("b-live"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"live".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+        machine.apply(append_cmd(stream("b-live"), b"live", Append::default())),
         StreamResponse::Appended { .. }
     ));
 
@@ -1510,22 +1350,12 @@ fn plan_next_cold_flush_skips_deleted_streams() {
 
 #[test]
 fn hot_payload_byte_metrics_follow_cold_flush() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "hot-a");
     create_stream(&mut machine, "hot-b");
     for (stream_name, payload) in [("hot-a", b"abcd".as_slice()), ("hot-b", b"xy".as_slice())] {
         assert!(matches!(
-            machine.apply(StreamCommand::Append {
-                stream_id: stream(stream_name),
-                content_type: Some("application/octet-stream".to_owned()),
-                payload: payload.to_vec(),
-                close_after: false,
-                stream_seq: None,
-                producer: None,
-                now_ms: 0,
-                record_match: None,
-            }),
+            machine.apply(append_cmd(stream(stream_name), payload, Append::default())),
             StreamResponse::Appended { .. }
         ));
     }
@@ -1535,15 +1365,13 @@ fn hot_payload_byte_metrics_follow_cold_flush() {
     assert_eq!(machine.total_hot_payload_bytes(), 6);
 
     assert_eq!(
-        machine.apply(StreamCommand::FlushCold {
-            stream_id: stream("hot-a"),
-            chunk: ColdChunkRef {
-                start_offset: 0,
-                end_offset: 3,
-                s3_path: "s3://bucket/hot-a/000000".to_owned(),
-                object_size: 3,
-            },
-        }),
+        machine.apply(flush_cold_cmd(
+            stream("hot-a"),
+            0,
+            3,
+            "s3://bucket/hot-a/000000",
+            3
+        )),
         StreamResponse::ColdFlushed {
             hot_start_offset: 3,
         }
@@ -1554,33 +1382,21 @@ fn hot_payload_byte_metrics_follow_cold_flush() {
 
 #[test]
 fn hot_start_offset_advances_to_tail_after_full_cold_flush() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "hot-start");
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("hot-start"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"abcd".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+        machine.apply(append_cmd(stream("hot-start"), b"abcd", Append::default())),
         StreamResponse::Appended { .. }
     ));
 
     assert_eq!(
-        machine.apply(StreamCommand::FlushCold {
-            stream_id: stream("hot-start"),
-            chunk: ColdChunkRef {
-                start_offset: 0,
-                end_offset: 4,
-                s3_path: "s3://bucket/hot-start/000000".to_owned(),
-                object_size: 4,
-            },
-        }),
+        machine.apply(flush_cold_cmd(
+            stream("hot-start"),
+            0,
+            4,
+            "s3://bucket/hot-start/000000",
+            4
+        )),
         StreamResponse::ColdFlushed {
             hot_start_offset: 4,
         }
@@ -1591,39 +1407,23 @@ fn hot_start_offset_advances_to_tail_after_full_cold_flush() {
 
 #[test]
 fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     let attrs = attrs("Snapshot session", "snapshot-restore");
     assert_eq!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream("snap-open"),
-            content_type: "application/octet-stream".to_owned(),
-            initial_payload: b"hi".to_vec(),
-            close_after: false,
+        machine.apply(create_cmd(stream("snap-open"), Create {
+            payload: b"hi".to_vec(),
             stream_seq: Some("0001".to_owned()),
-            producer: None,
-            stream_ttl_seconds: Some(60),
-            stream_expires_at_ms: None,
+            ttl_seconds: Some(60),
             attrs: Some(attrs.clone()),
-            now_ms: 0,
-        }),
-        StreamResponse::Created {
-            stream_id: stream("snap-open"),
-            next_offset: 2,
-            closed: false,
-        }
+            ..Create::default()
+        })),
+        created(stream("snap-open"), 2)
     );
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("snap-open"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"abc".to_vec(),
-            close_after: false,
+        machine.apply(append_cmd(stream("snap-open"), b"abc", Append {
             stream_seq: Some("0002".to_owned()),
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+            ..Append::default()
+        })),
         StreamResponse::Appended {
             offset: 2,
             next_offset: 5,
@@ -1631,18 +1431,11 @@ fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
         }
     ));
     assert_eq!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream("snap-closed"),
-            content_type: "application/octet-stream".to_owned(),
-            initial_payload: b"x".to_vec(),
+        machine.apply(create_cmd(stream("snap-closed"), Create {
+            payload: b"x".to_vec(),
             close_after: true,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
-            attrs: None,
-            now_ms: 0,
-        }),
+            ..Create::default()
+        })),
         StreamResponse::Created {
             stream_id: stream("snap-closed"),
             next_offset: 1,
@@ -1659,7 +1452,7 @@ fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
         StreamRead {
             offset: 0,
             next_offset: 5,
-            content_type: "application/octet-stream".to_owned(),
+            content_type: OCTET.to_owned(),
             payload: b"hiabc".to_vec(),
             up_to_date: true,
             closed: false,
@@ -1671,59 +1464,26 @@ fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
     assert_eq!(metadata.stream_expires_at_ms, None);
     assert_eq!(restored.stream_attrs(&stream("snap-open")), Some(&attrs));
 
-    assert!(matches!(
-        restored.apply(StreamCommand::Append {
-            stream_id: stream("snap-open"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"bad".to_vec(),
-            close_after: false,
+    assert_error_at(
+        restored.apply(append_cmd(stream("snap-open"), b"bad", Append {
             stream_seq: Some("0002".to_owned()),
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::StreamSeqConflict,
-            next_offset: Some(5),
-            ..
-        }
-    ));
-    assert_eq!(
-        restored.apply(StreamCommand::Append {
-            stream_id: stream("snap-open"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"!".to_vec(),
-            close_after: false,
-            stream_seq: Some("0003".to_owned()),
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
-        StreamResponse::Appended {
-            offset: 5,
-            next_offset: 6,
-            closed: false,
-            deduplicated: false,
-            producer: None,
-        }
+            ..Append::default()
+        })),
+        StreamErrorCode::StreamSeqConflict,
+        5,
     );
-    assert!(matches!(
-        restored.apply(StreamCommand::Append {
-            stream_id: stream("snap-closed"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"!".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::StreamClosed,
-            next_offset: Some(1),
-            ..
-        }
-    ));
+    assert_eq!(
+        restored.apply(append_cmd(stream("snap-open"), b"!", Append {
+            stream_seq: Some("0003".to_owned()),
+            ..Append::default()
+        })),
+        appended(5, 6)
+    );
+    assert_error_at(
+        restored.apply(append_cmd(stream("snap-closed"), b"!", Append::default())),
+        StreamErrorCode::StreamClosed,
+        1,
+    );
 }
 
 #[test]
@@ -1741,18 +1501,7 @@ fn snapshot_order_is_deterministic() {
         BucketStreamId::new("aaaa", "stream-z"),
     ] {
         assert!(matches!(
-            machine.apply(StreamCommand::CreateStream {
-                stream_id,
-                content_type: "application/octet-stream".to_owned(),
-                initial_payload: Vec::new(),
-                close_after: false,
-                stream_seq: None,
-                producer: None,
-                stream_ttl_seconds: None,
-                stream_expires_at_ms: None,
-                attrs: None,
-                now_ms: 0,
-            }),
+            machine.apply(create_cmd(stream_id, Create::default())),
             StreamResponse::Created { .. }
         ));
     }
@@ -1774,6 +1523,54 @@ fn snapshot_order_is_deterministic() {
     );
 }
 
+/// A snapshot entry with the given identity and payload; every other field is
+/// the empty default.
+fn snapshot_entry(
+    stream_id: BucketStreamId,
+    tail_offset: u64,
+    payload: Vec<u8>,
+    producer_states: Vec<ProducerSnapshot>,
+) -> StreamSnapshotEntry {
+    StreamSnapshotEntry {
+        metadata: StreamMetadata {
+            stream_id,
+            content_type: OCTET.to_owned(),
+            status: StreamStatus::Open,
+            tail_offset,
+            last_stream_seq: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            created_at_ms: 0,
+            last_ttl_touch_at_ms: 0,
+        },
+        attrs: None,
+        hot_start_offset: 0,
+        payload,
+        hot_segments: Vec::new(),
+        cold_frontier_offset: 0,
+        cold_index_generation: 0,
+        cold_chunks: Vec::new(),
+        external_segments: Vec::new(),
+        message_records: Vec::new(),
+        record_index: None,
+        integrity: empty_integrity(),
+        visible_snapshot: None,
+        producer_states,
+    }
+}
+
+fn producer_snapshot(epoch: u64) -> ProducerSnapshot {
+    ProducerSnapshot {
+        producer_id: "writer-1".to_owned(),
+        producer_epoch: epoch,
+        producer_seq: 0,
+        last_start_offset: 0,
+        last_next_offset: 0,
+        last_closed: false,
+        last_items: Vec::new(),
+    }
+}
+
 #[test]
 fn snapshot_restore_rejects_invalid_entries() {
     assert_eq!(
@@ -1787,148 +1584,56 @@ fn snapshot_restore_rejects_invalid_entries() {
         StreamSnapshotError::DuplicateBucket("benchcmp".to_owned())
     );
 
-    assert!(matches!(
+    let restore_with = |entry: StreamSnapshotEntry| {
         StreamStateMachine::restore(StreamSnapshot {
             pending_cold_gc: Vec::new(),
             next_cold_gc_seq: 0,
             buckets: vec!["benchcmp".to_owned()],
-            streams: vec![StreamSnapshotEntry {
-                metadata: StreamMetadata {
-                    stream_id: BucketStreamId::new("missing", "stream"),
-                    content_type: "application/octet-stream".to_owned(),
-                    status: StreamStatus::Open,
-                    tail_offset: 0,
-                    last_stream_seq: None,
-                    stream_ttl_seconds: None,
-                    stream_expires_at_ms: None,
-                    created_at_ms: 0,
-                    last_ttl_touch_at_ms: 0,
-                },
-                attrs: None,
-                hot_start_offset: 0,
-                payload: Vec::new(),
-                hot_segments: Vec::new(),
-                cold_frontier_offset: 0,
-                cold_index_generation: 0,
-                cold_chunks: Vec::new(),
-                external_segments: Vec::new(),
-                message_records: Vec::new(),
-                record_index: None,
-                integrity: empty_integrity(),
-                visible_snapshot: None,
-                producer_states: Vec::new(),
-            }],
-        }),
+            streams: vec![entry],
+        })
+    };
+
+    assert!(matches!(
+        restore_with(snapshot_entry(
+            BucketStreamId::new("missing", "stream"),
+            0,
+            Vec::new(),
+            Vec::new(),
+        )),
         Err(StreamSnapshotError::MissingBucket(_))
     ));
 
     assert!(matches!(
-        StreamStateMachine::restore(StreamSnapshot {
-            pending_cold_gc: Vec::new(),
-            next_cold_gc_seq: 0,
-            buckets: vec!["benchcmp".to_owned()],
-            streams: vec![StreamSnapshotEntry {
-                metadata: StreamMetadata {
-                    stream_id: stream("bad-len"),
-                    content_type: "application/octet-stream".to_owned(),
-                    status: StreamStatus::Open,
-                    tail_offset: 2,
-                    last_stream_seq: None,
-                    stream_ttl_seconds: None,
-                    stream_expires_at_ms: None,
-                    created_at_ms: 0,
-                    last_ttl_touch_at_ms: 0,
-                },
-                attrs: None,
-                hot_start_offset: 0,
-                payload: b"x".to_vec(),
-                hot_segments: Vec::new(),
-                cold_frontier_offset: 0,
-                cold_index_generation: 0,
-                cold_chunks: Vec::new(),
-                external_segments: Vec::new(),
-                message_records: Vec::new(),
-                record_index: None,
-                integrity: empty_integrity(),
-                visible_snapshot: None,
-                producer_states: Vec::new(),
-            }],
-        }),
+        restore_with(snapshot_entry(
+            stream("bad-len"),
+            2,
+            b"x".to_vec(),
+            Vec::new()
+        )),
         Err(StreamSnapshotError::PayloadLengthMismatch { .. })
     ));
 
     assert!(matches!(
-        StreamStateMachine::restore(StreamSnapshot {
-            pending_cold_gc: Vec::new(),
-            next_cold_gc_seq: 0,
-            buckets: vec!["benchcmp".to_owned()],
-            streams: vec![StreamSnapshotEntry {
-                metadata: StreamMetadata {
-                    stream_id: stream("duplicate-producer"),
-                    content_type: "application/octet-stream".to_owned(),
-                    status: StreamStatus::Open,
-                    tail_offset: 0,
-                    last_stream_seq: None,
-                    stream_ttl_seconds: None,
-                    stream_expires_at_ms: None,
-                    created_at_ms: 0,
-                    last_ttl_touch_at_ms: 0,
-                },
-                attrs: None,
-                hot_start_offset: 0,
-                payload: Vec::new(),
-                hot_segments: Vec::new(),
-                cold_frontier_offset: 0,
-                cold_index_generation: 0,
-                cold_chunks: Vec::new(),
-                external_segments: Vec::new(),
-                message_records: Vec::new(),
-                record_index: None,
-                integrity: empty_integrity(),
-                visible_snapshot: None,
-                producer_states: vec![
-                    ProducerSnapshot {
-                        producer_id: "writer-1".to_owned(),
-                        producer_epoch: 0,
-                        producer_seq: 0,
-                        last_start_offset: 0,
-                        last_next_offset: 0,
-                        last_closed: false,
-                        last_items: Vec::new(),
-                    },
-                    ProducerSnapshot {
-                        producer_id: "writer-1".to_owned(),
-                        producer_epoch: 1,
-                        producer_seq: 0,
-                        last_start_offset: 0,
-                        last_next_offset: 0,
-                        last_closed: false,
-                        last_items: Vec::new(),
-                    },
-                ],
-            }],
-        }),
+        restore_with(snapshot_entry(
+            stream("duplicate-producer"),
+            0,
+            Vec::new(),
+            vec![producer_snapshot(0), producer_snapshot(1),]
+        )),
         Err(StreamSnapshotError::DuplicateProducer { .. })
     ));
 }
 
 #[test]
 fn close_is_monotonic_and_close_only_is_idempotent() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "s-1");
 
     assert_eq!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("s-1"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"abc".to_vec(),
+        machine.apply(append_cmd(stream("s-1"), b"abc", Append {
             close_after: true,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+            ..Append::default()
+        })),
         StreamResponse::Appended {
             offset: 0,
             next_offset: 3,
@@ -1938,84 +1643,45 @@ fn close_is_monotonic_and_close_only_is_idempotent() {
         }
     );
     assert_eq!(
-        machine.apply(StreamCommand::Close {
-            stream_id: stream("s-1"),
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-        }),
+        machine.apply(close_cmd(stream("s-1"))),
         StreamResponse::Closed {
             next_offset: 3,
             deduplicated: false,
             producer: None,
         }
     );
-    assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("s-1"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"x".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::StreamClosed,
-            next_offset: Some(3),
-            ..
-        }
-    ));
+    assert_error_at(
+        machine.apply(append_cmd(stream("s-1"), b"x", Append::default())),
+        StreamErrorCode::StreamClosed,
+        3,
+    );
 }
 
 #[test]
 fn stream_seq_must_strictly_increase() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "s-1");
 
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("s-1"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"a".to_vec(),
-            close_after: false,
+        machine.apply(append_cmd(stream("s-1"), b"a", Append {
             stream_seq: Some("0002".to_owned()),
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+            ..Append::default()
+        })),
         StreamResponse::Appended { .. }
     ));
-    assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("s-1"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"b".to_vec(),
-            close_after: false,
+    assert_error_at(
+        machine.apply(append_cmd(stream("s-1"), b"b", Append {
             stream_seq: Some("0002".to_owned()),
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::StreamSeqConflict,
-            next_offset: Some(1),
-            ..
-        }
-    ));
+            ..Append::default()
+        })),
+        StreamErrorCode::StreamSeqConflict,
+        1,
+    );
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("s-1"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"c".to_vec(),
-            close_after: false,
+        machine.apply(append_cmd(stream("s-1"), b"c", Append {
             stream_seq: Some("0003".to_owned()),
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+            ..Append::default()
+        })),
         StreamResponse::Appended {
             offset: 1,
             next_offset: 2,
@@ -2026,47 +1692,26 @@ fn stream_seq_must_strictly_increase() {
 
 #[test]
 fn producer_headers_deduplicate_retries_and_fence_stale_epochs() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "producer-stream");
 
     assert_eq!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("producer-stream"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"a".to_vec(),
-            close_after: false,
-            stream_seq: None,
+        machine.apply(append_cmd(stream("producer-stream"), b"a", Append {
             producer: Some(producer("writer-1", 0, 0)),
-            now_ms: 0,
-            record_match: None,
-        }),
-        StreamResponse::Appended {
-            offset: 0,
-            next_offset: 1,
-            closed: false,
-            deduplicated: false,
-            producer: Some(producer("writer-1", 0, 0)),
-        }
+            ..Append::default()
+        })),
+        appended_by(producer("writer-1", 0, 0), 0, 1, false, false)
     );
     assert_eq!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("producer-stream"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"ignored-retry-body".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: Some(producer("writer-1", 0, 0)),
-            now_ms: 0,
-            record_match: None,
-        }),
-        StreamResponse::Appended {
-            offset: 0,
-            next_offset: 1,
-            closed: false,
-            deduplicated: true,
-            producer: Some(producer("writer-1", 0, 0)),
-        }
+        machine.apply(append_cmd(
+            stream("producer-stream"),
+            b"ignored-retry-body",
+            Append {
+                producer: Some(producer("writer-1", 0, 0)),
+                ..Append::default()
+            }
+        )),
+        appended_by(producer("writer-1", 0, 0), 0, 1, false, true)
     );
     assert_eq!(
         machine
@@ -2076,71 +1721,40 @@ fn producer_headers_deduplicate_retries_and_fence_stale_epochs() {
         b"a"
     );
 
-    assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("producer-stream"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"gap".to_vec(),
-            close_after: false,
-            stream_seq: None,
+    assert_error_code(
+        machine.apply(append_cmd(stream("producer-stream"), b"gap", Append {
             producer: Some(producer("writer-1", 0, 2)),
-            now_ms: 0,
-            record_match: None,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::ProducerSeqConflict,
-            ..
-        }
-    ));
+            ..Append::default()
+        })),
+        StreamErrorCode::ProducerSeqConflict,
+    );
 
     assert_eq!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("producer-stream"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"b".to_vec(),
-            close_after: false,
-            stream_seq: None,
+        machine.apply(append_cmd(stream("producer-stream"), b"b", Append {
             producer: Some(producer("writer-1", 1, 0)),
-            now_ms: 0,
-            record_match: None,
-        }),
-        StreamResponse::Appended {
-            offset: 1,
-            next_offset: 2,
-            closed: false,
-            deduplicated: false,
-            producer: Some(producer("writer-1", 1, 0)),
-        }
+            ..Append::default()
+        })),
+        appended_by(producer("writer-1", 1, 0), 1, 2, false, false)
     );
-    assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("producer-stream"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"stale".to_vec(),
-            close_after: false,
-            stream_seq: None,
+    assert_error_code(
+        machine.apply(append_cmd(stream("producer-stream"), b"stale", Append {
             producer: Some(producer("writer-1", 0, 1)),
-            now_ms: 0,
-            record_match: None,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::ProducerEpochStale,
-            ..
-        }
-    ));
+            ..Append::default()
+        })),
+        StreamErrorCode::ProducerEpochStale,
+    );
 }
 
 #[test]
 fn producer_append_batch_deduplicates_retries_without_partial_mutation() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "producer-batch");
 
     let first_payloads = [b"ab".as_slice(), b"c".as_slice()];
     let first = machine
         .append_batch_borrowed(
             stream("producer-batch"),
-            Some("application/octet-stream"),
+            Some(OCTET),
             &first_payloads,
             Some(producer("writer-1", 0, 0)),
             0,
@@ -2165,7 +1779,7 @@ fn producer_append_batch_deduplicates_retries_without_partial_mutation() {
     let duplicate = machine
         .append_batch_borrowed(
             stream("producer-batch"),
-            Some("application/octet-stream"),
+            Some(OCTET),
             &first_payloads,
             Some(producer("writer-1", 0, 0)),
             0,
@@ -2184,25 +1798,22 @@ fn producer_append_batch_deduplicates_retries_without_partial_mutation() {
     );
 
     let invalid_payloads = [b"".as_slice()];
-    assert!(matches!(
+    assert_err_code(
         machine.append_batch_borrowed(
             stream("producer-batch"),
-            Some("application/octet-stream"),
+            Some(OCTET),
             &invalid_payloads,
             Some(producer("writer-1", 0, 1)),
             0,
         ),
-        Err(StreamResponse::Error {
-            code: StreamErrorCode::EmptyAppend,
-            ..
-        })
-    ));
+        StreamErrorCode::EmptyAppend,
+    );
 
     let next_payloads = [b"d".as_slice()];
     let next = machine
         .append_batch_borrowed(
             stream("producer-batch"),
-            Some("application/octet-stream"),
+            Some(OCTET),
             &next_payloads,
             Some(producer("writer-1", 0, 1)),
             0,
@@ -2220,20 +1831,13 @@ fn producer_append_batch_deduplicates_retries_without_partial_mutation() {
 
 #[test]
 fn producer_state_survives_snapshot_restore() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "producer-snapshot");
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("producer-snapshot"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"a".to_vec(),
-            close_after: false,
-            stream_seq: None,
+        machine.apply(append_cmd(stream("producer-snapshot"), b"a", Append {
             producer: Some(producer("writer-1", 0, 0)),
-            now_ms: 0,
-            record_match: None,
-        }),
+            ..Append::default()
+        })),
         StreamResponse::Appended {
             deduplicated: false,
             ..
@@ -2254,16 +1858,10 @@ fn producer_state_survives_snapshot_restore() {
     let mut restored = StreamStateMachine::restore(snapshot).expect("restore snapshot");
 
     assert!(matches!(
-        restored.apply(StreamCommand::Append {
-            stream_id: stream("producer-snapshot"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"retry".to_vec(),
-            close_after: false,
-            stream_seq: None,
+        restored.apply(append_cmd(stream("producer-snapshot"), b"retry", Append {
             producer: Some(producer("writer-1", 0, 0)),
-            now_ms: 0,
-            record_match: None,
-        }),
+            ..Append::default()
+        })),
         StreamResponse::Appended {
             offset: 0,
             next_offset: 1,
@@ -2272,50 +1870,27 @@ fn producer_state_survives_snapshot_restore() {
         }
     ));
     assert_eq!(
-        restored.apply(StreamCommand::Append {
-            stream_id: stream("producer-snapshot"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"b".to_vec(),
-            close_after: false,
-            stream_seq: None,
+        restored.apply(append_cmd(stream("producer-snapshot"), b"b", Append {
             producer: Some(producer("writer-1", 0, 1)),
-            now_ms: 0,
-            record_match: None,
-        }),
-        StreamResponse::Appended {
-            offset: 1,
-            next_offset: 2,
-            closed: false,
-            deduplicated: false,
-            producer: Some(producer("writer-1", 0, 1)),
-        }
+            ..Append::default()
+        })),
+        appended_by(producer("writer-1", 0, 1), 1, 2, false, false)
     );
 }
 
 #[test]
 fn stream_ttl_uses_sliding_access_window() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     let stream_id = stream("ttl-window");
 
     assert_eq!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream_id.clone(),
-            content_type: "application/octet-stream".to_owned(),
-            initial_payload: b"hi".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: Some(1),
-            stream_expires_at_ms: None,
-            attrs: None,
+        machine.apply(create_cmd(stream_id.clone(), Create {
+            payload: b"hi".to_vec(),
+            ttl_seconds: Some(1),
             now_ms: 1_000,
-        }),
-        StreamResponse::Created {
-            stream_id: stream_id.clone(),
-            next_offset: 2,
-            closed: false,
-        }
+            ..Create::default()
+        })),
+        created(stream_id.clone(), 2)
     );
 
     assert_eq!(
@@ -2334,11 +1909,7 @@ fn stream_ttl_uses_sliding_access_window() {
         Ok(true)
     );
     assert_eq!(
-        machine.apply(StreamCommand::TouchStreamAccess {
-            stream_id: stream_id.clone(),
-            now_ms: 1_500,
-            renew_ttl: true,
-        }),
+        machine.apply(touch_cmd(stream_id.clone(), 1_500)),
         StreamResponse::Accessed {
             changed: true,
             expired: false,
@@ -2347,89 +1918,49 @@ fn stream_ttl_uses_sliding_access_window() {
 
     assert!(machine.read_plan_at(&stream_id, 2, 16, 2_400).is_ok());
     assert_eq!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream_id.clone(),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"!".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
+        machine.apply(append_cmd(stream_id.clone(), b"!", Append {
             now_ms: 2_400,
-            record_match: None,
-        }),
-        StreamResponse::Appended {
-            offset: 2,
-            next_offset: 3,
-            closed: false,
-            deduplicated: false,
-            producer: None,
-        }
+            ..Append::default()
+        })),
+        appended(2, 3)
     );
     assert!(machine.head_at(&stream_id, 3_399).is_some());
     assert!(machine.head_at(&stream_id, 3_400).is_none());
-    assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream_id.clone(),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"late".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
+    assert_error_code(
+        machine.apply(append_cmd(stream_id.clone(), b"late", Append {
             now_ms: 3_401,
-            record_match: None,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::StreamNotFound,
-            ..
-        }
-    ));
+            ..Append::default()
+        })),
+        StreamErrorCode::StreamNotFound,
+    );
 }
 
 #[test]
 fn renewed_ttl_ignores_stale_expiry_index_entry() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     let stream_id = stream("ttl-renew-stale");
 
     assert!(matches!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream_id.clone(),
-            content_type: "application/octet-stream".to_owned(),
-            initial_payload: b"hi".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: Some(1),
-            stream_expires_at_ms: None,
-            attrs: None,
+        machine.apply(create_cmd(stream_id.clone(), Create {
+            payload: b"hi".to_vec(),
+            ttl_seconds: Some(1),
             now_ms: 1_000,
-        }),
+            ..Create::default()
+        })),
         StreamResponse::Created { .. }
     ));
     assert_eq!(
-        machine.apply(StreamCommand::TouchStreamAccess {
-            stream_id: stream_id.clone(),
-            now_ms: 1_500,
-            renew_ttl: true,
-        }),
+        machine.apply(touch_cmd(stream_id.clone(), 1_500)),
         StreamResponse::Accessed {
             changed: true,
             expired: false,
         }
     );
     assert!(matches!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream("sweep-trigger"),
-            content_type: "application/octet-stream".to_owned(),
-            initial_payload: Vec::new(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
-            attrs: None,
+        machine.apply(create_cmd(stream("sweep-trigger"), Create {
             now_ms: 2_100,
-        }),
+            ..Create::default()
+        })),
         StreamResponse::Created { .. }
     ));
 
@@ -2439,40 +1970,24 @@ fn renewed_ttl_ignores_stale_expiry_index_entry() {
 
 #[test]
 fn restore_rebuilds_ttl_index_from_stream_metadata() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     let stream_id = stream("ttl-restored");
 
     assert!(matches!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream_id.clone(),
-            content_type: "application/octet-stream".to_owned(),
-            initial_payload: Vec::new(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: Some(2_000),
-            attrs: None,
+        machine.apply(create_cmd(stream_id.clone(), Create {
+            expires_at_ms: Some(2_000),
             now_ms: 1_000,
-        }),
+            ..Create::default()
+        })),
         StreamResponse::Created { .. }
     ));
 
     let mut restored = StreamStateMachine::restore(machine.snapshot()).expect("restore");
     assert!(matches!(
-        restored.apply(StreamCommand::CreateStream {
-            stream_id: stream("restore-sweep-trigger"),
-            content_type: "application/octet-stream".to_owned(),
-            initial_payload: Vec::new(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
-            attrs: None,
+        restored.apply(create_cmd(stream("restore-sweep-trigger"), Create {
             now_ms: 2_100,
-        }),
+            ..Create::default()
+        })),
         StreamResponse::Created { .. }
     ));
     assert!(restored.head(&stream_id).is_none());
@@ -2480,158 +1995,88 @@ fn restore_rebuilds_ttl_index_from_stream_metadata() {
 
 #[test]
 fn stream_expires_at_is_absolute_and_recreate_after_expiry() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     let stream_id = stream("absolute-expiry");
 
     assert!(matches!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream_id.clone(),
-            content_type: "application/octet-stream".to_owned(),
-            initial_payload: Vec::new(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: Some(2_000),
-            attrs: None,
+        machine.apply(create_cmd(stream_id.clone(), Create {
+            expires_at_ms: Some(2_000),
             now_ms: 1_000,
-        }),
+            ..Create::default()
+        })),
         StreamResponse::Created { .. }
     ));
     assert_eq!(
-        machine.apply(StreamCommand::TouchStreamAccess {
-            stream_id: stream_id.clone(),
-            now_ms: 1_500,
-            renew_ttl: true,
-        }),
+        machine.apply(touch_cmd(stream_id.clone(), 1_500)),
         StreamResponse::Accessed {
             changed: false,
             expired: false,
         }
     );
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream_id.clone(),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"body".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
+        machine.apply(append_cmd(stream_id.clone(), b"body", Append {
             now_ms: 1_600,
-            record_match: None,
-        }),
+            ..Append::default()
+        })),
         StreamResponse::Appended { .. }
     ));
     assert!(machine.read_plan_at(&stream_id, 0, 16, 1_999).is_ok());
-    assert!(matches!(
+    assert_err_code(
         machine.read_plan_at(&stream_id, 0, 16, 2_000),
-        Err(StreamResponse::Error {
-            code: StreamErrorCode::StreamNotFound,
-            ..
-        })
-    ));
+        StreamErrorCode::StreamNotFound,
+    );
     assert_eq!(
-        machine.apply(StreamCommand::CreateStream {
-            stream_id: stream_id.clone(),
-            content_type: "text/plain".to_owned(),
-            initial_payload: Vec::new(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            stream_ttl_seconds: None,
-            stream_expires_at_ms: None,
-            attrs: None,
+        machine.apply(create_cmd(stream_id.clone(), Create {
+            content_type: "text/plain",
             now_ms: 2_001,
-        }),
-        StreamResponse::Created {
-            stream_id,
-            next_offset: 0,
-            closed: false,
-        }
+            ..Create::default()
+        })),
+        created(stream_id, 0)
     );
 }
 
 #[test]
 fn producer_duplicate_final_append_remains_idempotent_after_close() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "producer-close");
 
     assert_eq!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("producer-close"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"final".to_vec(),
+        machine.apply(append_cmd(stream("producer-close"), b"final", Append {
             close_after: true,
-            stream_seq: None,
             producer: Some(producer("writer-1", 0, 0)),
-            now_ms: 0,
-            record_match: None,
-        }),
-        StreamResponse::Appended {
-            offset: 0,
-            next_offset: 5,
-            closed: true,
-            deduplicated: false,
-            producer: Some(producer("writer-1", 0, 0)),
-        }
+            ..Append::default()
+        })),
+        appended_by(producer("writer-1", 0, 0), 0, 5, true, false)
     );
     assert_eq!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("producer-close"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"final".to_vec(),
+        machine.apply(append_cmd(stream("producer-close"), b"final", Append {
             close_after: true,
-            stream_seq: None,
             producer: Some(producer("writer-1", 0, 0)),
-            now_ms: 0,
-            record_match: None,
-        }),
-        StreamResponse::Appended {
-            offset: 0,
-            next_offset: 5,
-            closed: true,
-            deduplicated: true,
-            producer: Some(producer("writer-1", 0, 0)),
-        }
+            ..Append::default()
+        })),
+        appended_by(producer("writer-1", 0, 0), 0, 5, true, true)
     );
-    assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("producer-close"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"too-late".to_vec(),
-            close_after: false,
-            stream_seq: None,
+    assert_error_at(
+        machine.apply(append_cmd(stream("producer-close"), b"too-late", Append {
             producer: Some(producer("writer-1", 0, 1)),
-            now_ms: 0,
-            record_match: None,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::StreamClosed,
-            next_offset: Some(5),
-            ..
-        }
-    ));
+            ..Append::default()
+        })),
+        StreamErrorCode::StreamClosed,
+        5,
+    );
 }
 
 #[test]
 fn append_conflict_precedence_reports_closed_before_mismatch_or_seq() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "closed-precedence");
 
     assert_eq!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("closed-precedence"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"final".to_vec(),
+        machine.apply(append_cmd(stream("closed-precedence"), b"final", Append {
             close_after: true,
             stream_seq: Some("0002".to_owned()),
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+            ..Append::default()
+        })),
         StreamResponse::Appended {
             offset: 0,
             next_offset: 5,
@@ -2641,44 +2086,34 @@ fn append_conflict_precedence_reports_closed_before_mismatch_or_seq() {
         }
     );
 
-    assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("closed-precedence"),
-            content_type: Some("text/plain".to_owned()),
-            payload: b"too-late".to_vec(),
-            close_after: false,
-            stream_seq: Some("0001".to_owned()),
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::StreamClosed,
-            next_offset: Some(5),
-            ..
-        }
-    ));
+    assert_error_at(
+        machine.apply(append_cmd(
+            stream("closed-precedence"),
+            b"too-late",
+            Append {
+                content_type: Some("text/plain"),
+                stream_seq: Some("0001".to_owned()),
+                ..Append::default()
+            },
+        )),
+        StreamErrorCode::StreamClosed,
+        5,
+    );
 }
 
 #[test]
 fn bucket_delete_requires_empty_bucket() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "s-1");
 
-    assert!(matches!(
+    assert_error_code(
         machine.apply(StreamCommand::DeleteBucket {
             bucket_id: "benchcmp".to_owned(),
         }),
-        StreamResponse::Error {
-            code: StreamErrorCode::BucketNotEmpty,
-            ..
-        }
-    ));
+        StreamErrorCode::BucketNotEmpty,
+    );
     assert_eq!(
-        machine.apply(StreamCommand::DeleteStream {
-            stream_id: stream("s-1"),
-        }),
+        machine.apply(delete_cmd(stream("s-1"))),
         StreamResponse::Deleted
     );
     assert_eq!(
@@ -2693,20 +2128,10 @@ fn bucket_delete_requires_empty_bucket() {
 
 #[test]
 fn publish_snapshot_advances_retention_on_message_boundary() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "snap");
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("snap"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"abc".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+        machine.apply(append_cmd(stream("snap"), b"abc", Append::default())),
         StreamResponse::Appended {
             offset: 0,
             next_offset: 3,
@@ -2714,16 +2139,7 @@ fn publish_snapshot_advances_retention_on_message_boundary() {
         }
     ));
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("snap"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"de".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+        machine.apply(append_cmd(stream("snap"), b"de", Append::default())),
         StreamResponse::Appended {
             offset: 3,
             next_offset: 5,
@@ -2732,26 +2148,23 @@ fn publish_snapshot_advances_retention_on_message_boundary() {
     ));
 
     assert_eq!(
-        machine.apply(StreamCommand::PublishSnapshot {
-            stream_id: stream("snap"),
-            snapshot_offset: 3,
-            content_type: "application/json".to_owned(),
-            payload: br#"{"state":"abc"}"#.to_vec(),
-            now_ms: 0,
-        }),
+        machine.apply(publish_snapshot_cmd(
+            stream("snap"),
+            3,
+            "application/json",
+            br#"{"state":"abc"}"#,
+            0
+        )),
         StreamResponse::SnapshotPublished {
             snapshot_offset: 3,
             record_range: None,
         }
     );
-    assert!(matches!(
+    assert_err_at(
         machine.read_plan(&stream("snap"), 0, 1),
-        Err(StreamResponse::Error {
-            code: StreamErrorCode::StreamGone,
-            next_offset: Some(3),
-            ..
-        })
-    ));
+        StreamErrorCode::StreamGone,
+        3,
+    );
     let read = machine.read(&stream("snap"), 3, 2).expect("retained read");
     assert_eq!(read.payload, b"de");
     let integrity = machine
@@ -2788,70 +2201,42 @@ fn publish_snapshot_advances_retention_on_message_boundary() {
 
 #[test]
 fn publish_snapshot_rejects_unaligned_offset() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "unaligned");
     assert!(matches!(
-        machine.apply(StreamCommand::Append {
-            stream_id: stream("unaligned"),
-            content_type: Some("application/octet-stream".to_owned()),
-            payload: b"abc".to_vec(),
-            close_after: false,
-            stream_seq: None,
-            producer: None,
-            now_ms: 0,
-            record_match: None,
-        }),
+        machine.apply(append_cmd(stream("unaligned"), b"abc", Append::default())),
         StreamResponse::Appended { .. }
     ));
-    assert!(matches!(
-        machine.apply(StreamCommand::PublishSnapshot {
-            stream_id: stream("unaligned"),
-            snapshot_offset: 2,
-            content_type: "application/octet-stream".to_owned(),
-            payload: b"ab".to_vec(),
-            now_ms: 0,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::InvalidSnapshot,
-            next_offset: Some(3),
-            ..
-        }
-    ));
+    assert_error_at(
+        machine.apply(publish_snapshot_cmd(
+            stream("unaligned"),
+            2,
+            OCTET,
+            b"ab",
+            0,
+        )),
+        StreamErrorCode::InvalidSnapshot,
+        3,
+    );
 }
 
 #[test]
 fn snapshot_restore_preserves_visible_snapshot_and_message_records() {
-    let mut machine = StreamStateMachine::new();
-    create_bucket(&mut machine);
+    let mut machine = machine();
     create_stream(&mut machine, "restore-snap");
-    let _ = machine.apply(StreamCommand::Append {
-        stream_id: stream("restore-snap"),
-        content_type: Some("application/octet-stream".to_owned()),
-        payload: b"abc".to_vec(),
-        close_after: false,
-        stream_seq: None,
-        producer: None,
-        now_ms: 0,
-        record_match: None,
-    });
-    let _ = machine.apply(StreamCommand::Append {
-        stream_id: stream("restore-snap"),
-        content_type: Some("application/octet-stream".to_owned()),
-        payload: b"de".to_vec(),
-        close_after: false,
-        stream_seq: None,
-        producer: None,
-        now_ms: 0,
-        record_match: None,
-    });
-    let _ = machine.apply(StreamCommand::PublishSnapshot {
-        stream_id: stream("restore-snap"),
-        snapshot_offset: 3,
-        content_type: "application/octet-stream".to_owned(),
-        payload: b"abc-state".to_vec(),
-        now_ms: 0,
-    });
+    let _ = machine.apply(append_cmd(
+        stream("restore-snap"),
+        b"abc",
+        Append::default(),
+    ));
+    let _ = machine.apply(append_cmd(stream("restore-snap"), b"de", Append::default()));
+    let _ = machine.apply(publish_snapshot_cmd(
+        stream("restore-snap"),
+        3,
+        OCTET,
+        b"abc-state",
+        0,
+    ));
 
     let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore");
     assert_eq!(
@@ -2888,16 +2273,11 @@ fn append_payload(
     close_after: bool,
     producer: Option<ProducerRequest>,
 ) -> StreamResponse {
-    machine.apply(StreamCommand::Append {
-        stream_id: stream(stream_name),
-        content_type: Some("application/octet-stream".to_owned()),
-        payload,
+    machine.apply(append_cmd(stream(stream_name), &payload, Append {
         close_after,
-        stream_seq: None,
         producer,
-        now_ms: 0,
-        record_match: None,
-    })
+        ..Append::default()
+    }))
 }
 
 proptest! {
@@ -2908,27 +2288,14 @@ proptest! {
         initial in vec(any::<u8>(), 0..=16),
         payloads in payloads_strategy(),
     ) {
-        let mut machine = StreamStateMachine::new();
-        create_bucket(&mut machine);
+        let mut machine = machine();
         let stream_id = stream("prop-offsets");
         prop_assert_eq!(
-            machine.apply(StreamCommand::CreateStream {
-                stream_id: stream_id.clone(),
-                content_type: "application/octet-stream".to_owned(),
-                initial_payload: initial.clone(),
-                close_after: false,
-                stream_seq: None,
-                producer: None,
-                stream_ttl_seconds: None,
-                stream_expires_at_ms: None,
-                attrs: None,
-                now_ms: 0,
-            }),
-            StreamResponse::Created {
-                stream_id: stream_id.clone(),
-                next_offset: u64::try_from(initial.len()).unwrap(),
-                closed: false,
-            }
+            machine.apply(create_cmd(stream_id.clone(), Create {
+                payload: initial.clone(),
+                ..Create::default()
+            })),
+            created(stream_id.clone(), u64::try_from(initial.len()).unwrap())
         );
 
         let mut expected = initial;
@@ -2937,13 +2304,7 @@ proptest! {
             let payload_len = u64::try_from(payload.len()).unwrap();
             prop_assert_eq!(
                 append_payload(&mut machine, "prop-offsets", payload.clone(), false, None),
-                StreamResponse::Appended {
-                    offset: expected_tail,
-                    next_offset: expected_tail + payload_len,
-                    closed: false,
-                    deduplicated: false,
-                    producer: None,
-                }
+                appended(expected_tail, expected_tail + payload_len)
             );
             expected_tail += payload_len;
             expected.extend_from_slice(&payload);
@@ -2980,8 +2341,7 @@ proptest! {
         retry_payload in payload_strategy(),
         next_payload in payload_strategy(),
     ) {
-        let mut machine = StreamStateMachine::new();
-        create_bucket(&mut machine);
+        let mut machine = machine();
         create_stream(&mut machine, "prop-producer");
         let stream_id = stream("prop-producer");
 
@@ -2994,13 +2354,7 @@ proptest! {
                 false,
                 Some(producer("writer-1", 0, 0)),
             ),
-            StreamResponse::Appended {
-                offset: 0,
-                next_offset: first_len,
-                closed: false,
-                deduplicated: false,
-                producer: Some(producer("writer-1", 0, 0)),
-            }
+            appended_by(producer("writer-1", 0, 0), 0, first_len, false, false)
         );
 
         prop_assert_eq!(
@@ -3011,13 +2365,7 @@ proptest! {
                 false,
                 Some(producer("writer-1", 0, 0)),
             ),
-            StreamResponse::Appended {
-                offset: 0,
-                next_offset: first_len,
-                closed: false,
-                deduplicated: true,
-                producer: Some(producer("writer-1", 0, 0)),
-            }
+            appended_by(producer("writer-1", 0, 0), 0, first_len, false, true)
         );
         prop_assert_eq!(
             machine
@@ -3036,13 +2384,7 @@ proptest! {
                 false,
                 Some(producer("writer-1", 1, 0)),
             ),
-            StreamResponse::Appended {
-                offset: first_len,
-                next_offset: first_len + next_len,
-                closed: false,
-                deduplicated: false,
-                producer: Some(producer("writer-1", 1, 0)),
-            }
+            appended_by(producer("writer-1", 1, 0), first_len, first_len + next_len, false, false)
         );
         let stale_response = append_payload(
             &mut machine,
@@ -3075,8 +2417,7 @@ proptest! {
         next_payloads in vec(payload_strategy(), 1..=8),
         duplicate_epoch_payloads in vec(payload_strategy(), 1..=8),
     ) {
-        let mut machine = StreamStateMachine::new();
-        create_bucket(&mut machine);
+        let mut machine = machine();
         create_stream(&mut machine, "prop-producer-batch");
         let stream_id = stream("prop-producer-batch");
 
@@ -3087,7 +2428,7 @@ proptest! {
         let first = machine
             .append_batch_borrowed(
                 stream_id.clone(),
-                Some("application/octet-stream"),
+                Some(OCTET),
                 &first_refs,
                 Some(producer("writer-1", 0, 0)),
                 0,
@@ -3130,7 +2471,7 @@ proptest! {
         let duplicate = restored
             .append_batch_borrowed(
                 stream_id.clone(),
-                Some("application/octet-stream"),
+                Some(OCTET),
                 &retry_refs,
                 Some(producer("writer-1", 0, 0)),
                 0,
@@ -3153,7 +2494,7 @@ proptest! {
         let next = restored
             .append_batch_borrowed(
                 stream_id.clone(),
-                Some("application/octet-stream"),
+                Some(OCTET),
                 &next_refs,
                 Some(producer("writer-1", 1, 0)),
                 0,
@@ -3180,7 +2521,7 @@ proptest! {
         let duplicate_epoch = restored
             .append_batch_borrowed(
                 stream_id.clone(),
-                Some("application/octet-stream"),
+                Some(OCTET),
                 &duplicate_epoch_refs,
                 Some(producer("writer-1", 1, 0)),
                 0,
@@ -3197,7 +2538,7 @@ proptest! {
 
         let stale_response = restored.append_batch_borrowed(
             stream_id.clone(),
-            Some("application/octet-stream"),
+            Some(OCTET),
             &duplicate_epoch_refs,
             Some(producer("writer-1", 0, 1)),
             0,
@@ -3233,25 +2574,18 @@ proptest! {
         touch_delta_ms in 0_u64..1_000,
         payload in payload_strategy(),
     ) {
-        let mut machine = StreamStateMachine::new();
-        create_bucket(&mut machine);
+        let mut machine = machine();
         let stream_id = stream("prop-ttl");
         let ttl_ms = ttl_seconds * 1_000;
         let touch_ms = start_ms + touch_delta_ms.min(ttl_ms - 1);
         let expire_ms = touch_ms + ttl_ms;
 
-        let create_response = machine.apply(StreamCommand::CreateStream {
-                stream_id: stream_id.clone(),
-                content_type: "application/octet-stream".to_owned(),
-                initial_payload: payload,
-                close_after: false,
-                stream_seq: None,
-                producer: None,
-                stream_ttl_seconds: Some(ttl_seconds),
-                stream_expires_at_ms: None,
-                attrs: None,
-                now_ms: start_ms,
-            });
+        let create_response = machine.apply(create_cmd(stream_id.clone(), Create {
+            payload,
+            ttl_seconds: Some(ttl_seconds),
+            now_ms: start_ms,
+            ..Create::default()
+        }));
         prop_assert!(
             matches!(create_response, StreamResponse::Created { .. }),
             "unexpected create response: {:?}",
@@ -3259,11 +2593,7 @@ proptest! {
         );
         prop_assert!(machine.read_plan_at(&stream_id, 0, 16, touch_ms).is_ok());
         prop_assert_eq!(
-            machine.apply(StreamCommand::TouchStreamAccess {
-                stream_id: stream_id.clone(),
-                now_ms: touch_ms,
-                renew_ttl: true,
-            }),
+            machine.apply(touch_cmd(stream_id.clone(), touch_ms)),
             StreamResponse::Accessed {
                 changed: touch_ms != start_ms,
                 expired: false,
@@ -3283,11 +2613,7 @@ proptest! {
             expired_read
         );
         prop_assert_eq!(
-            machine.apply(StreamCommand::TouchStreamAccess {
-                stream_id,
-                now_ms: expire_ms,
-                renew_ttl: true,
-            }),
+            machine.apply(touch_cmd(stream_id, expire_ms)),
             StreamResponse::Accessed {
                 changed: true,
                 expired: true,
@@ -3300,8 +2626,7 @@ proptest! {
         payloads in payloads_strategy(),
         max_flush_bytes in 1_usize..=64,
     ) {
-        let mut machine = StreamStateMachine::new();
-        create_bucket(&mut machine);
+        let mut machine = machine();
         create_stream(&mut machine, "prop-cold");
         let stream_id = stream("prop-cold");
         let mut expected = Vec::new();
@@ -3333,15 +2658,11 @@ proptest! {
 
         let flush_len = candidate.payload.len();
         prop_assert_eq!(
-            machine.apply(StreamCommand::FlushCold {
-                stream_id: stream_id.clone(),
-                chunk: ColdChunkRef {
-                    start_offset: candidate.start_offset,
-                    end_offset: candidate.end_offset,
-                    s3_path: "s3://bucket/prop-cold/000000".to_owned(),
-                    object_size: u64::try_from(candidate.payload.len()).unwrap(),
-                },
-            }),
+            machine.apply(flush_candidate_cmd(
+                stream_id.clone(),
+                &candidate,
+                "s3://bucket/prop-cold/000000"
+            )),
             StreamResponse::ColdFlushed {
                 hot_start_offset: candidate.end_offset,
             }
@@ -3378,8 +2699,7 @@ proptest! {
         max_flush_bytes in 1_usize..=64,
         snapshot_payload in vec(any::<u8>(), 0..=32),
     ) {
-        let mut machine = StreamStateMachine::new();
-        create_bucket(&mut machine);
+        let mut machine = machine();
         create_stream(&mut machine, "prop-snapshot-cold");
         let stream_id = stream("prop-snapshot-cold");
 
@@ -3410,13 +2730,13 @@ proptest! {
         let snapshot_message_count = 1 + (snapshot_index_seed % (payloads.len() - 1));
         let snapshot_offset = boundaries[snapshot_message_count - 1].end_offset;
         prop_assert_eq!(
-            machine.apply(StreamCommand::PublishSnapshot {
-                stream_id: stream_id.clone(),
+            machine.apply(publish_snapshot_cmd(
+                stream_id.clone(),
                 snapshot_offset,
-                content_type: "application/octet-stream".to_owned(),
-                payload: snapshot_payload.clone(),
-                now_ms: 0,
-            }),
+                OCTET,
+                &snapshot_payload,
+                0
+            )),
             StreamResponse::SnapshotPublished {
                 snapshot_offset,
                 record_range: None,
@@ -3450,15 +2770,11 @@ proptest! {
         prop_assert_eq!(candidate.payload.as_slice(), &expected[candidate_start..candidate_end]);
 
         prop_assert_eq!(
-            machine.apply(StreamCommand::FlushCold {
-                stream_id: stream_id.clone(),
-                chunk: ColdChunkRef {
-                    start_offset: candidate.start_offset,
-                    end_offset: candidate.end_offset,
-                    s3_path: "s3://bucket/prop-snapshot-cold/000000".to_owned(),
-                    object_size: u64::try_from(candidate.payload.len()).expect("payload len fits u64"),
-                },
-            }),
+            machine.apply(flush_candidate_cmd(
+                stream_id.clone(),
+                &candidate,
+                "s3://bucket/prop-snapshot-cold/000000"
+            )),
             StreamResponse::ColdFlushed {
                 hot_start_offset: candidate.end_offset,
             }
@@ -3485,7 +2801,7 @@ proptest! {
         let bootstrap = machine.bootstrap_plan(&stream_id).expect("bootstrap plan");
         let expected_snapshot = Some(StreamVisibleSnapshot {
             offset: snapshot_offset,
-            content_type: "application/octet-stream".to_owned(),
+            content_type: OCTET.to_owned(),
             payload: snapshot_payload.clone(),
         });
         prop_assert_eq!(
@@ -3521,8 +2837,7 @@ proptest! {
         new_payload in vec(any::<u8>(), 1..=32),
         old_extra in vec(any::<u8>(), 1..=32),
     ) {
-        let mut machine = StreamStateMachine::new();
-        create_bucket(&mut machine);
+        let mut machine = machine();
         create_stream(&mut machine, "prop-stale-cold");
         let stream_id = stream("prop-stale-cold");
 
@@ -3551,9 +2866,7 @@ proptest! {
         prop_assert_eq!(candidate.end_offset, old_tail);
         prop_assert_eq!(candidate.payload.as_slice(), old_payload.as_slice());
 
-        let delete_response = machine.apply(StreamCommand::DeleteStream {
-            stream_id: stream_id.clone(),
-        });
+        let delete_response = machine.apply(delete_cmd(stream_id.clone()));
         prop_assert!(
             matches!(
                 delete_response,
@@ -3576,15 +2889,11 @@ proptest! {
             append_response
         );
 
-        let stale_flush = machine.apply(StreamCommand::FlushCold {
-            stream_id: stream_id.clone(),
-            chunk: ColdChunkRef {
-                start_offset: candidate.start_offset,
-                end_offset: candidate.end_offset,
-                s3_path: "s3://bucket/prop-stale-cold/old-candidate".to_owned(),
-                object_size: u64::try_from(candidate.payload.len()).expect("payload len fits u64"),
-            },
-        });
+        let stale_flush = machine.apply(flush_candidate_cmd(
+            stream_id.clone(),
+            &candidate,
+            "s3://bucket/prop-stale-cold/old-candidate",
+        ));
         prop_assert!(
             matches!(
                 stale_flush,
@@ -3628,8 +2937,7 @@ proptest! {
         max_flush_bytes in 1_usize..=32,
         max_candidates in 1_usize..=24,
     ) {
-        let mut machine = StreamStateMachine::new();
-        create_bucket(&mut machine);
+        let mut machine = machine();
 
         let streams = [
             ("z-prop-batch", z_payloads),
@@ -3694,16 +3002,11 @@ proptest! {
 
         for (index, candidate) in candidates.iter().enumerate() {
             prop_assert_eq!(
-                machine.apply(StreamCommand::FlushCold {
-                    stream_id: candidate.stream_id.clone(),
-                    chunk: ColdChunkRef {
-                        start_offset: candidate.start_offset,
-                        end_offset: candidate.end_offset,
-                        s3_path: format!("s3://bucket/prop-batch/{index:06}"),
-                        object_size: u64::try_from(candidate.payload.len())
-                            .expect("payload len fits u64"),
-                    },
-                }),
+                machine.apply(flush_candidate_cmd(
+                    candidate.stream_id.clone(),
+                    candidate,
+                    &format!("s3://bucket/prop-batch/{index:06}")
+                )),
                 StreamResponse::ColdFlushed {
                     hot_start_offset: candidate.end_offset,
                 }
