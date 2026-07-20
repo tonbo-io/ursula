@@ -21,5 +21,12 @@ docs/web/target/
 # Local benchmark output
 .bench-results/
 
+# OpenTofu working data and generated deployment values
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+deploy/eks/generated-values.yaml
+deploy/eks/kubeconfig
+
 # Internal migration / architecture / operations notes
 docs/migration/
