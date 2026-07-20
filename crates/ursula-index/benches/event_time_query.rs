@@ -7,9 +7,10 @@ use criterion::criterion_group;
 use criterion::criterion_main;
 use tempfile::TempDir;
 use ursula_index::EventEntry;
+use ursula_index::EventIndex;
+use ursula_index::EventIndexCache;
 use ursula_index::EventIndexConfig;
 use ursula_index::FsObjectStore;
-use ursula_index::ServerlessEventIndex;
 
 const RECORDS: u64 = 100_000;
 const COMPACTION_PARTS: usize = 8;
@@ -21,10 +22,9 @@ fn event_time_query(criterion: &mut Criterion) {
     let cache = TempDir::new().expect("create cache directory");
     let mut index = runtime
         .block_on(async {
-            let mut index = ServerlessEventIndex::open_fs(
+            let mut index = EventIndex::open(
                 FsObjectStore::new(objects.path())?,
-                cache.path(),
-                64 * 1024 * 1024,
+                EventIndexCache::serving(cache.path(), 64 * 1024 * 1024)?,
                 EventIndexConfig {
                     source_id: "benchmark".to_owned(),
                     flush_entries: 10_000,
@@ -74,10 +74,9 @@ fn bounded_partition_compaction(criterion: &mut Criterion) {
                 let cache = TempDir::new().expect("create cache directory");
                 let index = runtime
                     .block_on(async {
-                        let mut index = ServerlessEventIndex::open_fs(
+                        let mut index = EventIndex::open(
                             FsObjectStore::new(objects.path())?,
-                            cache.path(),
-                            64 * 1024 * 1024,
+                            EventIndexCache::serving(cache.path(), 64 * 1024 * 1024)?,
                             EventIndexConfig {
                                 source_id: "compaction-benchmark".to_owned(),
                                 flush_entries: COMPACTION_PART_ENTRIES,

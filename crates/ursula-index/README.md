@@ -36,7 +36,7 @@ The object layout is `parts/<content-hash>.parquet`, `layouts/<content-hash>.jso
 
 Garbage collection runs every `--gc-interval-seconds` and retains objects reachable from `CURRENT` plus `--gc-retain-generations` recent compatible manifest generations. Objects with a missing modification time and objects newer than `--gc-grace-seconds` are protected so ambiguous metadata or an in-flight competing indexer cannot cause deletion. Incompatible manifests from an older format or source are warned, skipped, and reclaimed after grace rather than blocking every GC pass. Older unreferenced parts, verified-range layouts, and manifests, including failed-CAS outputs and superseded compaction inputs, are deleted. Expired claims left by crashed workers and claims already covered by the durable watermark are also removed. GC reloads `CURRENT` immediately before deletion and protects that manifest too, so ordinary concurrent publication does not starve reclamation; the grace period must exceed the maximum allowed index publication attempt duration.
 
-Source ingestion and HTTP queries share the serving index and cache. Compaction and GC run on a second serverless index instance with a separate bounded maintenance cache, so Parquet rewrite, S3 upload, full-prefix listing, and retained-manifest reads never hold the query mutex.
+Source ingestion and HTTP queries share the serving index and cache. Compaction and GC run on a second index instance with a separate bounded maintenance cache, so Parquet rewrite, S3 upload, full-prefix listing, and retained-manifest reads never hold the query mutex.
 
 Single-source mode exposes:
 

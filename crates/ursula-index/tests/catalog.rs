@@ -10,7 +10,7 @@ use ursula_index::IndexRegistration;
 )]
 async fn catalog_registration_is_dynamic_durable_and_idempotent() -> anyhow::Result<()> {
     let object_dir = TempDir::new()?;
-    let catalog = IndexCatalog::open_fs(FsObjectStore::new(object_dir.path())?);
+    let catalog = IndexCatalog::new(FsObjectStore::new(object_dir.path())?);
     let registration = IndexRegistration {
         id: "browser-session-42".to_owned(),
         stream_url: "https://example.test/sessions/42".to_owned(),
@@ -69,7 +69,7 @@ async fn catalog_registration_is_dynamic_durable_and_idempotent() -> anyhow::Res
 )]
 async fn concurrent_catalog_updates_do_not_lose_registrations() -> anyhow::Result<()> {
     let object_dir = TempDir::new()?;
-    let catalog = IndexCatalog::open_fs(FsObjectStore::new(object_dir.path())?);
+    let catalog = IndexCatalog::new(FsObjectStore::new(object_dir.path())?);
     let mut tasks = tokio::task::JoinSet::new();
     for index in 0..8 {
         let catalog = catalog.clone();
@@ -94,7 +94,7 @@ async fn concurrent_catalog_updates_do_not_lose_registrations() -> anyhow::Resul
 #[tokio::test]
 async fn corrupt_catalog_fails_closed_instead_of_appearing_empty() -> anyhow::Result<()> {
     let object_dir = TempDir::new()?;
-    let catalog = IndexCatalog::open_fs(FsObjectStore::new(object_dir.path())?);
+    let catalog = IndexCatalog::new(FsObjectStore::new(object_dir.path())?);
     catalog
         .register(&IndexRegistration {
             id: "protected-stream".to_owned(),
