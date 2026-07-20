@@ -64,6 +64,7 @@ use crate::log_store::vote_response_from_proto;
 use crate::log_store::vote_response_to_proto;
 use crate::log_store::vote_to_proto;
 use crate::raft_internal_proto;
+use crate::raft_internal_proto::raft_rpc_ack_v1::Payload as AckPayload;
 use crate::types::RaftGroupCommand;
 use crate::types::UrsulaAppendEntriesRequest;
 use crate::types::UrsulaAppendEntriesResponse;
@@ -76,6 +77,8 @@ pub(crate) static GRPC_LEADER_CHANNELS: OnceLock<Mutex<BTreeMap<String, Channel>
 use crate::registry::LeadershipShedFlag;
 use crate::registry::LeadershipShedState;
 use crate::registry::RaftGroupHandleRegistry;
+
+pub(crate) type RaftClient = raft_internal_proto::raft_internal_client::RaftInternalClient<Channel>;
 
 pub const RAFT_GRPC_APPEND_PATH: &str = "/ursula.raft.v1.RaftInternal/Append";
 pub const RAFT_GRPC_VOTE_PATH: &str = "/ursula.raft.v1.RaftInternal/Vote";
@@ -166,7 +169,11 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RaftRpcEnvelopeV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftRpcAckV1>, tonic::Status> {
         let envelope = request.into_inner();
-        let raft_group_id = validate_raft_rpc_envelope(&self.registry, &envelope)?;
+        let raft_group_id = validate_raft_rpc_preamble(
+            &self.registry,
+            envelope.protocol_version,
+            envelope.raft_group_id,
+        )?;
         let payload = required(envelope.payload, "raft_rpc_envelope.payload")
             .map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))?;
         let request = append_entries_request_from_proto(payload)?;
@@ -176,11 +183,9 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .await
             .map_err(|err| tonic::Status::internal(err.to_string()))?;
         Ok(tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
-            payload: Some(
-                raft_internal_proto::raft_rpc_ack_v1::Payload::AppendEntries(
-                    append_entries_response_to_proto(response),
-                ),
-            ),
+            payload: Some(AckPayload::AppendEntries(append_entries_response_to_proto(
+                response,
+            ))),
         }))
     }
 
@@ -189,7 +194,11 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RaftRpcEnvelopeV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftRpcAckV1>, tonic::Status> {
         let envelope = request.into_inner();
-        let raft_group_id = validate_raft_rpc_envelope(&self.registry, &envelope)?;
+        let raft_group_id = validate_raft_rpc_preamble(
+            &self.registry,
+            envelope.protocol_version,
+            envelope.raft_group_id,
+        )?;
         let payload = required(envelope.payload, "raft_rpc_envelope.payload")
             .map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))?;
         let request = vote_request_from_proto(payload)?;
@@ -199,9 +208,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .await
             .map_err(|err| tonic::Status::internal(err.to_string()))?;
         Ok(tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
-            payload: Some(raft_internal_proto::raft_rpc_ack_v1::Payload::Vote(
-                vote_response_to_proto(response),
-            )),
+            payload: Some(AckPayload::Vote(vote_response_to_proto(response))),
         }))
     }
 
@@ -210,7 +217,11 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RaftFullSnapshotRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftFullSnapshotAckV1>, tonic::Status> {
         let request = request.into_inner();
-        let raft_group_id = validate_raft_snapshot_request(&self.registry, &request)?;
+        let raft_group_id = validate_raft_rpc_preamble(
+            &self.registry,
+            request.protocol_version,
+            request.raft_group_id,
+        )?;
         let vote = vote_from_required_proto(request.vote)?;
         let meta = snapshot_meta_from_required_proto(request.snapshot_meta)?;
         let snapshot = SnapshotOf::<UrsulaRaftTypeConfig> {
@@ -280,15 +291,11 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RaftTransferLeaderRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftTransferLeaderAckV1>, tonic::Status> {
         let request = request.into_inner();
-        validate_grpc_metadata(request.protocol_version)?;
-        let raft_group_id = RaftGroupId(request.raft_group_id);
-        if !self.registry.contains_group(raft_group_id) {
-            return Err(GrpcRpcError::not_found(format!(
-                "raft group {} is not registered on this node",
-                raft_group_id.0
-            ))
-            .into());
-        }
+        let raft_group_id = validate_raft_rpc_preamble(
+            &self.registry,
+            request.protocol_version,
+            request.raft_group_id,
+        )?;
         let shed_state = LeadershipShedState::load(&self.leadership_shed);
         if let Some(reason) = shed_state.transfer_rejection_reason() {
             return Err(GrpcRpcError::failed_precondition(format!(
@@ -425,27 +432,15 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
     }
 }
 
-pub(crate) fn validate_raft_rpc_envelope(
+/// Validate the shared protocol-version + registered-group preamble carried by
+/// every inbound raft RPC (envelope, snapshot, and transfer-leader requests).
+pub(crate) fn validate_raft_rpc_preamble(
     registry: &RaftGroupHandleRegistry,
-    envelope: &raft_internal_proto::RaftRpcEnvelopeV1,
+    protocol_version: u32,
+    raft_group_id: u32,
 ) -> Result<RaftGroupId, GrpcRpcError> {
-    validate_grpc_metadata(envelope.protocol_version)?;
-    let raft_group_id = RaftGroupId(envelope.raft_group_id);
-    if !registry.contains_group(raft_group_id) {
-        return Err(GrpcRpcError::not_found(format!(
-            "raft group {} is not registered on this node",
-            raft_group_id.0
-        )));
-    }
-    Ok(raft_group_id)
-}
-
-pub(crate) fn validate_raft_snapshot_request(
-    registry: &RaftGroupHandleRegistry,
-    request: &raft_internal_proto::RaftFullSnapshotRequestV1,
-) -> Result<RaftGroupId, GrpcRpcError> {
-    validate_grpc_metadata(request.protocol_version)?;
-    let raft_group_id = RaftGroupId(request.raft_group_id);
+    validate_grpc_metadata(protocol_version)?;
+    let raft_group_id = RaftGroupId(raft_group_id);
     if !registry.contains_group(raft_group_id) {
         return Err(GrpcRpcError::not_found(format!(
             "raft group {} is not registered on this node",
@@ -503,7 +498,7 @@ pub struct GrpcRaftNetwork {
     raft_group_id: RaftGroupId,
     target: u64,
     endpoint: String,
-    client: Result<raft_internal_proto::raft_internal_client::RaftInternalClient<Channel>, String>,
+    client: Result<RaftClient, String>,
     /// Streak of consecutive RPC failures on this channel. Reset to 0 on the
     /// next successful RPC. When it crosses `reconnect_threshold` we drop the
     /// underlying HTTP/2 channel and rebuild a fresh one — tonic's
@@ -548,12 +543,7 @@ impl GrpcRaftNetwork {
         }
     }
 
-    pub(crate) fn client(
-        &self,
-    ) -> Result<
-        raft_internal_proto::raft_internal_client::RaftInternalClient<Channel>,
-        RPCError<UrsulaRaftTypeConfig>,
-    > {
+    pub(crate) fn client(&self) -> Result<RaftClient, RPCError<UrsulaRaftTypeConfig>> {
         self.client
             .clone()
             .map_err(|err| RPCError::Unreachable(Unreachable::from_string(err)))
@@ -651,16 +641,71 @@ impl GrpcRaftNetwork {
             _ => raft_rpc_network_error(message),
         }
     }
+
+    /// Shared client-call path for every outbound raft RPC: build the tonic
+    /// request, apply the RPC timeout, send via `send`, and track the
+    /// success/failure streak for channel rebuilds.
+    async fn call<Req, Resp, Fut>(
+        &mut self,
+        route: &'static str,
+        request: Req,
+        option: RPCOption,
+        send: impl FnOnce(RaftClient, tonic::Request<Req>) -> Fut,
+    ) -> Result<Resp, RPCError<UrsulaRaftTypeConfig>>
+    where
+        Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
+    {
+        let mut request = tonic::Request::new(request);
+        self.apply_rpc_timeout(&mut request, option);
+        match send(self.client()?, request).await {
+            Ok(response) => {
+                self.note_success();
+                Ok(response.into_inner())
+            }
+            Err(err) => {
+                let mapped = self.map_tonic_status(route, err);
+                self.note_failure(route);
+                Err(mapped)
+            }
+        }
+    }
+
+    /// Decode an envelope-style ack: require the payload, select the expected
+    /// payload variant via `take`, and convert it with `convert`.
+    fn decode_rpc_ack<P, T, E>(
+        &self,
+        route: &str,
+        ack_name: &str,
+        ack: raft_internal_proto::RaftRpcAckV1,
+        take: impl FnOnce(raft_internal_proto::raft_rpc_ack_v1::Payload) -> Option<P>,
+        convert: impl FnOnce(P) -> Result<T, E>,
+    ) -> Result<T, RPCError<UrsulaRaftTypeConfig>>
+    where
+        E: std::fmt::Display,
+    {
+        let payload = required(ack.payload, ack_name)
+            .map_err(|err| raft_rpc_network_error(err.to_string()))?;
+        let Some(payload) = take(payload) else {
+            return Err(raft_rpc_network_error(format!(
+                "{route} response from node {} at {} had wrong payload type",
+                self.target, self.endpoint
+            )));
+        };
+        convert(payload).map_err(|err| {
+            raft_rpc_network_error(format!(
+                "decode {route} response from node {} at {}: {err}",
+                self.target, self.endpoint
+            ))
+        })
+    }
 }
 
 /// Construct a fresh tonic client over a lazy channel. Called both during
 /// initial `new` and during reconnect when the channel is detected stuck.
-fn build_client(
-    endpoint: &str,
-) -> Result<raft_internal_proto::raft_internal_client::RaftInternalClient<Channel>, String> {
+fn build_client(endpoint: &str) -> Result<RaftClient, String> {
     Endpoint::from_shared(endpoint.to_owned())
         .map(|ep| {
-            raft_internal_proto::raft_internal_client::RaftInternalClient::new(ep.connect_lazy())
+            RaftClient::new(ep.connect_lazy())
                 .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
         })
@@ -686,35 +731,25 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
         rpc: UrsulaAppendEntriesRequest,
         option: RPCOption,
     ) -> Result<UrsulaAppendEntriesResponse, RPCError<UrsulaRaftTypeConfig>> {
-        let mut request = tonic::Request::new(self.append_envelope(rpc));
-        self.apply_rpc_timeout(&mut request, option);
-        let response = match self.client()?.append(request).await {
-            Ok(response) => {
-                self.note_success();
-                response.into_inner()
-            }
-            Err(err) => {
-                let mapped = self.map_tonic_status("Append", err);
-                self.note_failure("Append");
-                return Err(mapped);
-            }
-        };
-        match required(response.payload, "raft append ack payload")
-            .map_err(|err| raft_rpc_network_error(err.to_string()))?
-        {
-            raft_internal_proto::raft_rpc_ack_v1::Payload::AppendEntries(response) => {
-                append_entries_response_from_proto(response).map_err(|err| {
-                    raft_rpc_network_error(format!(
-                        "decode Append response from node {} at {}: {err}",
-                        self.target, self.endpoint
-                    ))
-                })
-            }
-            _ => Err(raft_rpc_network_error(format!(
-                "Append response from node {} at {} had wrong payload type",
-                self.target, self.endpoint
-            ))),
-        }
+        let envelope = self.append_envelope(rpc);
+        let ack = self
+            .call(
+                "Append",
+                envelope,
+                option,
+                |mut client, request| async move { client.append(request).await },
+            )
+            .await?;
+        self.decode_rpc_ack(
+            "Append",
+            "raft append ack payload",
+            ack,
+            |payload| match payload {
+                AckPayload::AppendEntries(response) => Some(response),
+                _ => None,
+            },
+            append_entries_response_from_proto,
+        )
     }
 
     async fn vote(
@@ -722,35 +757,22 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
         rpc: UrsulaVoteRequest,
         option: RPCOption,
     ) -> Result<UrsulaVoteResponse, RPCError<UrsulaRaftTypeConfig>> {
-        let mut request = tonic::Request::new(self.vote_envelope(rpc));
-        self.apply_rpc_timeout(&mut request, option);
-        let response = match self.client()?.vote(request).await {
-            Ok(response) => {
-                self.note_success();
-                response.into_inner()
-            }
-            Err(err) => {
-                let mapped = self.map_tonic_status("Vote", err);
-                self.note_failure("Vote");
-                return Err(mapped);
-            }
-        };
-        match required(response.payload, "raft vote ack payload")
-            .map_err(|err| raft_rpc_network_error(err.to_string()))?
-        {
-            raft_internal_proto::raft_rpc_ack_v1::Payload::Vote(response) => {
-                vote_response_from_proto(response).map_err(|err| {
-                    raft_rpc_network_error(format!(
-                        "decode Vote response from node {} at {}: {err}",
-                        self.target, self.endpoint
-                    ))
-                })
-            }
-            _ => Err(raft_rpc_network_error(format!(
-                "Vote response from node {} at {} had wrong payload type",
-                self.target, self.endpoint
-            ))),
-        }
+        let envelope = self.vote_envelope(rpc);
+        let ack = self
+            .call("Vote", envelope, option, |mut client, request| async move {
+                client.vote(request).await
+            })
+            .await?;
+        self.decode_rpc_ack(
+            "Vote",
+            "raft vote ack payload",
+            ack,
+            |payload| match payload {
+                AckPayload::Vote(response) => Some(response),
+                _ => None,
+            },
+            vote_response_from_proto,
+        )
     }
 
     async fn full_snapshot(
@@ -768,21 +790,16 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
             snapshot_meta: Some(snapshot_meta_to_proto(snapshot.meta)),
             snapshot_payload: snapshot.snapshot.into_inner().into(),
         };
-        let mut request = tonic::Request::new(request);
-        self.apply_rpc_timeout(&mut request, option);
-        let mut client = self.client().map_err(StreamingError::from)?;
-        let response = match client.full_snapshot(request).await {
-            Ok(response) => {
-                self.note_success();
-                response.into_inner()
-            }
-            Err(err) => {
-                let mapped = self.map_tonic_status("FullSnapshot", err);
-                self.note_failure("FullSnapshot");
-                return Err(StreamingError::from(mapped));
-            }
-        };
-        snapshot_response_from_required_proto(response.response).map_err(|err| {
+        let ack = self
+            .call(
+                "FullSnapshot",
+                request,
+                option,
+                |mut client, request| async move { client.full_snapshot(request).await },
+            )
+            .await
+            .map_err(StreamingError::from)?;
+        snapshot_response_from_required_proto(ack.response).map_err(|err| {
             StreamingError::from(raft_rpc_network_error(format!(
                 "decode FullSnapshot response from node {} at {}: {err}",
                 self.target, self.endpoint
@@ -795,19 +812,15 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
         req: TransferLeaderRequest<UrsulaRaftTypeConfig>,
         option: RPCOption,
     ) -> Result<(), RPCError<UrsulaRaftTypeConfig>> {
-        let mut request = tonic::Request::new(self.transfer_leader_envelope(&req));
-        self.apply_rpc_timeout(&mut request, option);
-        match self.client()?.transfer_leader(request).await {
-            Ok(_response) => {
-                self.note_success();
-                Ok(())
-            }
-            Err(err) => {
-                let mapped = self.map_tonic_status("TransferLeader", err);
-                self.note_failure("TransferLeader");
-                Err(mapped)
-            }
-        }
+        let envelope = self.transfer_leader_envelope(&req);
+        self.call(
+            "TransferLeader",
+            envelope,
+            option,
+            |mut client, request| async move { client.transfer_leader(request).await },
+        )
+        .await
+        .map(|_ack| ())
     }
 }
 
