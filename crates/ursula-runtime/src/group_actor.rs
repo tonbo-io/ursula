@@ -114,196 +114,428 @@ pub(crate) struct PendingAppendBatch {
     pub(crate) raft_uncommitted: Option<UncommittedBytesGuard>,
 }
 
-pub(crate) enum GroupCommand {
-    CreateStream {
-        request: CreateStreamRequest,
-        response_tx: oneshot::Sender<Result<CreateStreamResponse, RuntimeError>>,
-        raft_uncommitted: Option<UncommittedBytesGuard>,
-    },
-    CreateExternal {
-        request: CreateStreamExternalRequest,
-        response_tx: oneshot::Sender<Result<CreateStreamResponse, RuntimeError>>,
-    },
-    HeadStream {
-        request: HeadStreamRequest,
-        response_tx: oneshot::Sender<Result<HeadStreamResponse, RuntimeError>>,
-    },
-    GetStreamAttrs {
-        request: GetStreamAttrsRequest,
-        response_tx: oneshot::Sender<Result<GetStreamAttrsResponse, RuntimeError>>,
-    },
-    ReadStream {
-        request: ReadStreamRequest,
-        response_tx: oneshot::Sender<Result<ReadStreamResponse, RuntimeError>>,
-    },
-    PublishSnapshot {
-        request: PublishSnapshotRequest,
-        response_tx: oneshot::Sender<Result<PublishSnapshotResponse, RuntimeError>>,
-    },
-    ReadSnapshot {
-        request: ReadSnapshotRequest,
-        response_tx: oneshot::Sender<Result<ReadSnapshotResponse, RuntimeError>>,
-    },
-    DeleteSnapshot {
-        request: DeleteSnapshotRequest,
-        response_tx: oneshot::Sender<Result<(), RuntimeError>>,
-    },
-    BootstrapStream {
-        request: BootstrapStreamRequest,
-        response_tx: oneshot::Sender<Result<BootstrapStreamResponse, RuntimeError>>,
-    },
-    WaitRead {
-        request: ReadStreamRequest,
-        waiter_id: u64,
-        response_tx: oneshot::Sender<Result<ReadStreamResponse, RuntimeError>>,
-    },
-    CancelWaitRead {
-        stream_id: BucketStreamId,
-        waiter_id: u64,
-    },
-    RequireLiveReadOwner {
-        response_tx: oneshot::Sender<Result<(), RuntimeError>>,
-    },
-    CloseStream {
-        request: CloseStreamRequest,
-        response_tx: oneshot::Sender<Result<CloseStreamResponse, RuntimeError>>,
-    },
-    UpdateStreamAttrs {
-        request: UpdateStreamAttrsRequest,
-        response_tx: oneshot::Sender<Result<UpdateStreamAttrsResponse, RuntimeError>>,
-    },
-    DeleteStream {
-        request: DeleteStreamRequest,
-        response_tx: oneshot::Sender<Result<DeleteStreamResponse, RuntimeError>>,
-    },
-    FlushCold {
-        request: FlushColdRequest,
-        response_tx: oneshot::Sender<Result<FlushColdResponse, RuntimeError>>,
-    },
-    PlanColdFlush {
-        request: PlanColdFlushRequest,
-        response_tx: oneshot::Sender<Result<Option<ColdFlushCandidate>, RuntimeError>>,
-    },
-    PlanNextColdFlushBatch {
-        request: PlanGroupColdFlushRequest,
-        max_candidates: usize,
-        response_tx: oneshot::Sender<Result<Vec<ColdFlushCandidate>, RuntimeError>>,
-    },
-    PlanColdGc {
-        max: usize,
-        response_tx: oneshot::Sender<Result<Vec<ColdGcEntry>, RuntimeError>>,
-    },
-    AckColdGc {
-        up_to_seq: u64,
-        response_tx: oneshot::Sender<Result<AckColdGcResponse, RuntimeError>>,
-    },
-    Append {
-        request: AppendRequest,
-        response_tx: oneshot::Sender<Result<AppendResponse, RuntimeError>>,
-        raft_uncommitted: Option<UncommittedBytesGuard>,
-    },
-    AppendExternal {
-        request: AppendExternalRequest,
-        response_tx: oneshot::Sender<Result<AppendResponse, RuntimeError>>,
-    },
-    AppendBatch {
-        request: AppendBatchRequest,
-        response_tx: oneshot::Sender<Result<AppendBatchResponse, RuntimeError>>,
-        raft_uncommitted: Option<UncommittedBytesGuard>,
-    },
-    SnapshotGroup {
-        response_tx: oneshot::Sender<Result<GroupSnapshot, RuntimeError>>,
-    },
-    InstallGroupSnapshot {
-        snapshot: GroupSnapshot,
-        response_tx: oneshot::Sender<Result<(), RuntimeError>>,
-    },
-    #[cfg(madsim)]
-    ShutdownEngine {
-        response_tx: oneshot::Sender<Result<(), RuntimeError>>,
-    },
+/// Resolves a `handle { ... }` argument keyword from the operation manifest
+/// ([`crate::ops::runtime_operations`]) to the matching group-actor
+/// expression. Any identifier that is not a context keyword falls through to
+/// the like-named binding destructured from the command variant.
+macro_rules! group_op_arg {
+    ($actor:ident, $pending:ident, engine) => {
+        &mut $actor.engine
+    };
+    ($actor:ident, $pending:ident, metrics) => {
+        $actor.metrics.clone()
+    };
+    ($actor:ident, $pending:ident, read_materialization) => {
+        $actor.read_materialization.clone()
+    };
+    ($actor:ident, $pending:ident, read_watchers) => {
+        &mut $actor.read_watchers
+    };
+    ($actor:ident, $pending:ident, placement) => {
+        $actor.placement
+    };
+    ($actor:ident, $pending:ident, core_id) => {
+        $actor.placement.core_id
+    };
+    ($actor:ident, $pending:ident, cold_admission) => {
+        $actor.cold_write_admission
+    };
+    ($actor:ident, $pending:ident, pending) => {
+        $pending
+    };
+    ($actor:ident, $pending:ident, $field:ident) => {
+        $field
+    };
 }
 
-impl GroupCommand {
-    pub(crate) fn send_error(self, err: RuntimeError) {
-        match self {
-            Self::CreateStream { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+/// Expands the operation manifest into the group-actor plumbing: the
+/// [`GroupCommand`] enum, `GroupCommand::send_error` /
+/// `GroupCommand::with_raft_uncommitted`, and `GroupActor::handle`. One
+/// `@munch` rule exists per dispatch-arm shape (see the manifest grammar in
+/// [`crate::ops`]); `ctx` threads the actor/queue/error/guard identifiers so
+/// arms accumulated across expansion steps resolve hygienically.
+macro_rules! group_operations {
+    // `call` without an admission guard: await the worker, send the result.
+    (@munch
+        ctx { $actor:ident $pending:ident $err:ident $guard:ident }
+        variants { $($variants:tt)* }
+        rejects { $($rejects:tt)* }
+        attach { $($attach:tt)* }
+        handles { $($handles:tt)* }
+        rest {
+            $(#[$attr:meta])*
+            op $Variant:ident {
+                fields { $($field:ident: $field_ty:ty),* $(,)? }
+                reply { $tx:ident: $Resp:ty }
+                guard { none }
+                handle { call $worker:ident($($arg:ident),* $(,)?) }
+                client { $($client:tt)* }
             }
-            Self::CreateExternal { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            $($rest:tt)*
+        }
+    ) => {
+        group_operations! {
+            @munch
+            ctx { $actor $pending $err $guard }
+            variants {
+                $($variants)*
+                $(#[$attr])*
+                $Variant {
+                    $($field: $field_ty,)*
+                    $tx: oneshot::Sender<Result<$Resp, RuntimeError>>,
+                },
             }
-            Self::HeadStream { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            rejects {
+                $($rejects)*
+                $(#[$attr])*
+                GroupCommand::$Variant { $tx, .. } => {
+                    let _ = $tx.send(Err($err));
+                }
             }
-            Self::GetStreamAttrs { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            attach { $($attach)* }
+            handles {
+                $($handles)*
+                $(#[$attr])*
+                GroupCommand::$Variant { $($field,)* $tx } => {
+                    let response =
+                        CoreWorker::$worker($(group_op_arg!($actor, $pending, $arg)),*).await;
+                    let _ = $tx.send(response);
+                    ControlFlow::Continue(())
+                }
             }
-            Self::ReadStream { response_tx, .. } | Self::WaitRead { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            rest { $($rest)* }
+        }
+    };
+    // `call` with an admission guard: hold the guard across apply, drop it
+    // before sending the result.
+    (@munch
+        ctx { $actor:ident $pending:ident $err:ident $guard:ident }
+        variants { $($variants:tt)* }
+        rejects { $($rejects:tt)* }
+        attach { $($attach:tt)* }
+        handles { $($handles:tt)* }
+        rest {
+            $(#[$attr:meta])*
+            op $Variant:ident {
+                fields { $($field:ident: $field_ty:ty),* $(,)? }
+                reply { $tx:ident: $Resp:ty }
+                guard { $g:ident }
+                handle { call $worker:ident($($arg:ident),* $(,)?) }
+                client { $($client:tt)* }
             }
-            Self::CancelWaitRead { .. } => {}
-            Self::RequireLiveReadOwner { response_tx } => {
-                let _ = response_tx.send(Err(err));
+            $($rest:tt)*
+        }
+    ) => {
+        group_operations! {
+            @munch
+            ctx { $actor $pending $err $guard }
+            variants {
+                $($variants)*
+                $(#[$attr])*
+                $Variant {
+                    $($field: $field_ty,)*
+                    $tx: oneshot::Sender<Result<$Resp, RuntimeError>>,
+                    $g: Option<UncommittedBytesGuard>,
+                },
             }
-            Self::PublishSnapshot { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            rejects {
+                $($rejects)*
+                $(#[$attr])*
+                GroupCommand::$Variant { $tx, .. } => {
+                    let _ = $tx.send(Err($err));
+                }
             }
-            Self::ReadSnapshot { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            attach {
+                $($attach)*
+                $(#[$attr])*
+                GroupCommand::$Variant { $($field,)* $tx, $g: _ } => GroupCommand::$Variant {
+                    $($field,)*
+                    $tx,
+                    $g: $guard,
+                },
             }
-            Self::DeleteSnapshot { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            handles {
+                $($handles)*
+                $(#[$attr])*
+                GroupCommand::$Variant { $($field,)* $tx, $g } => {
+                    let response =
+                        CoreWorker::$worker($(group_op_arg!($actor, $pending, $arg)),*).await;
+                    drop($g);
+                    let _ = $tx.send(response);
+                    ControlFlow::Continue(())
+                }
             }
-            Self::BootstrapStream { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            rest { $($rest)* }
+        }
+    };
+    // `tail`: the worker consumes the reply channel itself.
+    (@munch
+        ctx { $actor:ident $pending:ident $err:ident $guard:ident }
+        variants { $($variants:tt)* }
+        rejects { $($rejects:tt)* }
+        attach { $($attach:tt)* }
+        handles { $($handles:tt)* }
+        rest {
+            $(#[$attr:meta])*
+            op $Variant:ident {
+                fields { $($field:ident: $field_ty:ty),* $(,)? }
+                reply { $tx:ident: $Resp:ty }
+                guard { none }
+                handle { tail $worker:ident($($arg:ident),* $(,)?) }
+                client { $($client:tt)* }
             }
-            Self::CloseStream { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            $($rest:tt)*
+        }
+    ) => {
+        group_operations! {
+            @munch
+            ctx { $actor $pending $err $guard }
+            variants {
+                $($variants)*
+                $(#[$attr])*
+                $Variant {
+                    $($field: $field_ty,)*
+                    $tx: oneshot::Sender<Result<$Resp, RuntimeError>>,
+                },
             }
-            Self::UpdateStreamAttrs { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            rejects {
+                $($rejects)*
+                $(#[$attr])*
+                GroupCommand::$Variant { $tx, .. } => {
+                    let _ = $tx.send(Err($err));
+                }
             }
-            Self::DeleteStream { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            attach { $($attach)* }
+            handles {
+                $($handles)*
+                $(#[$attr])*
+                GroupCommand::$Variant { $($field,)* $tx } => {
+                    CoreWorker::$worker($(group_op_arg!($actor, $pending, $arg)),*).await;
+                    ControlFlow::Continue(())
+                }
             }
-            Self::FlushCold { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            rest { $($rest)* }
+        }
+    };
+    // `sync`: synchronous worker call, no reply channel to reject on error.
+    (@munch
+        ctx { $actor:ident $pending:ident $err:ident $guard:ident }
+        variants { $($variants:tt)* }
+        rejects { $($rejects:tt)* }
+        attach { $($attach:tt)* }
+        handles { $($handles:tt)* }
+        rest {
+            $(#[$attr:meta])*
+            op $Variant:ident {
+                fields { $($field:ident: $field_ty:ty),* $(,)? }
+                reply { none }
+                guard { none }
+                handle { sync $worker:ident($($arg:ident),* $(,)?) }
+                client { $($client:tt)* }
             }
-            Self::PlanColdFlush { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            $($rest:tt)*
+        }
+    ) => {
+        group_operations! {
+            @munch
+            ctx { $actor $pending $err $guard }
+            variants {
+                $($variants)*
+                $(#[$attr])*
+                $Variant {
+                    $($field: $field_ty,)*
+                },
             }
-            Self::PlanNextColdFlushBatch { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            rejects {
+                $($rejects)*
+                $(#[$attr])*
+                GroupCommand::$Variant { .. } => {}
             }
-            Self::PlanColdGc { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            attach { $($attach)* }
+            handles {
+                $($handles)*
+                $(#[$attr])*
+                GroupCommand::$Variant { $($field),* } => {
+                    CoreWorker::$worker($(group_op_arg!($actor, $pending, $arg)),*);
+                    ControlFlow::Continue(())
+                }
             }
-            Self::AckColdGc { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            rest { $($rest)* }
+        }
+    };
+    // `actor` without a guard: delegate to a hand-written `GroupActor`
+    // method returning the loop `ControlFlow`. Must precede the guarded
+    // `actor` rule so `guard { none }` is not captured as a guard name.
+    (@munch
+        ctx { $actor:ident $pending:ident $err:ident $guard:ident }
+        variants { $($variants:tt)* }
+        rejects { $($rejects:tt)* }
+        attach { $($attach:tt)* }
+        handles { $($handles:tt)* }
+        rest {
+            $(#[$attr:meta])*
+            op $Variant:ident {
+                fields { $($field:ident: $field_ty:ty),* $(,)? }
+                reply { $tx:ident: $Resp:ty }
+                guard { none }
+                handle { actor $method:ident($($arg:ident),* $(,)?) }
+                client { $($client:tt)* }
             }
-            Self::Append { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            $($rest:tt)*
+        }
+    ) => {
+        group_operations! {
+            @munch
+            ctx { $actor $pending $err $guard }
+            variants {
+                $($variants)*
+                $(#[$attr])*
+                $Variant {
+                    $($field: $field_ty,)*
+                    $tx: oneshot::Sender<Result<$Resp, RuntimeError>>,
+                },
             }
-            Self::AppendExternal { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            rejects {
+                $($rejects)*
+                $(#[$attr])*
+                GroupCommand::$Variant { $tx, .. } => {
+                    let _ = $tx.send(Err($err));
+                }
             }
-            Self::AppendBatch { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            attach { $($attach)* }
+            handles {
+                $($handles)*
+                $(#[$attr])*
+                GroupCommand::$Variant { $($field,)* $tx } => {
+                    $actor.$method($(group_op_arg!($actor, $pending, $arg)),*).await
+                }
             }
-            Self::SnapshotGroup { response_tx } => {
-                let _ = response_tx.send(Err(err));
+            rest { $($rest)* }
+        }
+    };
+    // `actor` with an admission guard: delegate to a hand-written
+    // `GroupActor` method that owns the guard (append-batch coalescing).
+    (@munch
+        ctx { $actor:ident $pending:ident $err:ident $guard:ident }
+        variants { $($variants:tt)* }
+        rejects { $($rejects:tt)* }
+        attach { $($attach:tt)* }
+        handles { $($handles:tt)* }
+        rest {
+            $(#[$attr:meta])*
+            op $Variant:ident {
+                fields { $($field:ident: $field_ty:ty),* $(,)? }
+                reply { $tx:ident: $Resp:ty }
+                guard { $g:ident }
+                handle { actor $method:ident($($arg:ident),* $(,)?) }
+                client { $($client:tt)* }
             }
-            Self::InstallGroupSnapshot { response_tx, .. } => {
-                let _ = response_tx.send(Err(err));
+            $($rest:tt)*
+        }
+    ) => {
+        group_operations! {
+            @munch
+            ctx { $actor $pending $err $guard }
+            variants {
+                $($variants)*
+                $(#[$attr])*
+                $Variant {
+                    $($field: $field_ty,)*
+                    $tx: oneshot::Sender<Result<$Resp, RuntimeError>>,
+                    $g: Option<UncommittedBytesGuard>,
+                },
             }
-            #[cfg(madsim)]
-            Self::ShutdownEngine { response_tx } => {
-                let _ = response_tx.send(Err(err));
+            rejects {
+                $($rejects)*
+                $(#[$attr])*
+                GroupCommand::$Variant { $tx, .. } => {
+                    let _ = $tx.send(Err($err));
+                }
+            }
+            attach {
+                $($attach)*
+                $(#[$attr])*
+                GroupCommand::$Variant { $($field,)* $tx, $g: _ } => GroupCommand::$Variant {
+                    $($field,)*
+                    $tx,
+                    $g: $guard,
+                },
+            }
+            handles {
+                $($handles)*
+                $(#[$attr])*
+                GroupCommand::$Variant { $($field,)* $tx, $g } => {
+                    $actor.$method($(group_op_arg!($actor, $pending, $arg)),*).await
+                }
+            }
+            rest { $($rest)* }
+        }
+    };
+    (@munch
+        ctx { $actor:ident $pending:ident $err:ident $guard:ident }
+        variants { $($variants:tt)* }
+        rejects { $($rejects:tt)* }
+        attach { $($attach:tt)* }
+        handles { $($handles:tt)* }
+        rest {}
+    ) => {
+        pub(crate) enum GroupCommand {
+            $($variants)*
+        }
+
+        impl GroupCommand {
+            /// Resolves the command with `err` without running it, so a
+            /// rejected or undeliverable command never leaves its caller
+            /// waiting on the reply channel.
+            pub(crate) fn send_error(self, $err: RuntimeError) {
+                match self {
+                    $($rejects)*
+                }
+            }
+
+            /// Attaches the raft-uncommitted admission credit acquired on the
+            /// owning core. Commands without a guard slot pass through
+            /// unchanged (the dispatcher only calls this for admission-guarded
+            /// submissions).
+            pub(crate) fn with_raft_uncommitted(
+                self,
+                $guard: Option<UncommittedBytesGuard>,
+            ) -> Self {
+                match self {
+                    $($attach)*
+                    other => other,
+                }
             }
         }
-    }
+
+        impl GroupActor {
+            pub(crate) async fn handle(
+                &mut self,
+                command: GroupCommand,
+                pending: &mut VecDeque<Traced<GroupCommand>>,
+            ) -> ControlFlow<()> {
+                let $actor = self;
+                let $pending = pending;
+                match command {
+                    $($handles)*
+                }
+            }
+        }
+    };
+    ($($manifest:tt)*) => {
+        group_operations! {
+            @munch
+            ctx { actor pending err raft_uncommitted }
+            variants {}
+            rejects {}
+            attach {}
+            handles {}
+            rest { $($manifest)* }
+        }
+    };
 }
+
+crate::ops::runtime_operations!(group_operations);
 
 pub(crate) struct GroupActor {
     pub(crate) placement: ShardPlacement,
@@ -340,378 +572,83 @@ impl GroupActor {
         }
     }
 
-    async fn handle(
+    async fn handle_wait_read(
         &mut self,
-        command: GroupCommand,
+        request: ReadStreamRequest,
+        waiter_id: u64,
+        response_tx: oneshot::Sender<Result<ReadStreamResponse, RuntimeError>>,
+    ) -> ControlFlow<()> {
+        let watcher = ReadWatcher {
+            waiter_id,
+            request,
+            response_tx,
+        };
+        CoreWorker::wait_read_stream(
+            &mut self.engine,
+            self.metrics.clone(),
+            self.read_materialization.clone(),
+            &mut self.read_watchers,
+            self.placement,
+            watcher,
+            self.live_read_max_waiters_per_core,
+        )
+        .await;
+        ControlFlow::Continue(())
+    }
+
+    async fn handle_append_batch(
+        &mut self,
+        request: AppendBatchRequest,
+        response_tx: oneshot::Sender<Result<AppendBatchResponse, RuntimeError>>,
+        raft_uncommitted: Option<UncommittedBytesGuard>,
         pending: &mut VecDeque<Traced<GroupCommand>>,
     ) -> ControlFlow<()> {
-        match command {
-            GroupCommand::CreateStream {
-                request,
-                response_tx,
-                raft_uncommitted,
-            } => {
-                let response = CoreWorker::create_stream(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    request,
-                    self.placement,
-                    self.cold_write_admission,
-                )
-                .await;
-                drop(raft_uncommitted);
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::CreateExternal {
-                request,
-                response_tx,
-            } => {
-                let response = CoreWorker::create_stream_external(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    request,
-                    self.placement,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::HeadStream {
-                request,
-                response_tx,
-            } => {
-                let response = CoreWorker::head_stream(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    request,
-                    self.placement,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::GetStreamAttrs {
-                request,
-                response_tx,
-            } => {
-                let response = CoreWorker::get_stream_attrs(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    request,
-                    self.placement,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::ReadStream {
-                request,
-                response_tx,
-            } => {
-                CoreWorker::read_stream(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    self.read_materialization.clone(),
-                    request,
-                    self.placement,
-                    response_tx,
-                )
-                .await;
-            }
-            GroupCommand::PublishSnapshot {
-                request,
-                response_tx,
-            } => {
-                let response = CoreWorker::publish_snapshot(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    self.read_materialization.clone(),
-                    &mut self.read_watchers,
-                    request,
-                    self.placement,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::ReadSnapshot {
-                request,
-                response_tx,
-            } => {
-                let response = CoreWorker::read_snapshot(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    request,
-                    self.placement,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::DeleteSnapshot {
-                request,
-                response_tx,
-            } => {
-                let response = CoreWorker::delete_snapshot(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    request,
-                    self.placement,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::BootstrapStream {
-                request,
-                response_tx,
-            } => {
-                let response = CoreWorker::bootstrap_stream(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    request,
-                    self.placement,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::WaitRead {
-                request,
-                waiter_id,
-                response_tx,
-            } => {
-                let watcher = ReadWatcher {
-                    waiter_id,
-                    request,
-                    response_tx,
-                };
-                CoreWorker::wait_read_stream(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    self.read_materialization.clone(),
-                    &mut self.read_watchers,
-                    self.placement,
-                    watcher,
-                    self.live_read_max_waiters_per_core,
-                )
-                .await;
-            }
-            GroupCommand::CancelWaitRead {
-                stream_id,
-                waiter_id,
-            } => {
-                CoreWorker::cancel_read_watcher(
-                    &mut self.read_watchers,
-                    self.metrics.clone(),
-                    self.placement.core_id,
-                    stream_id,
-                    waiter_id,
-                );
-            }
-            GroupCommand::RequireLiveReadOwner { response_tx } => {
-                let response = self
-                    .engine
-                    .require_local_live_read_owner(self.placement)
-                    .await
-                    .map_err(|err| RuntimeError::group_engine(self.placement, err));
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::CloseStream {
-                request,
-                response_tx,
-            } => {
-                let response = CoreWorker::close_stream(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    self.read_materialization.clone(),
-                    &mut self.read_watchers,
-                    request,
-                    self.placement,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::UpdateStreamAttrs {
-                request,
-                response_tx,
-            } => {
-                let response = CoreWorker::update_stream_attrs(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    request,
-                    self.placement,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::DeleteStream {
-                request,
-                response_tx,
-            } => {
-                let response = CoreWorker::delete_stream(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    self.read_materialization.clone(),
-                    &mut self.read_watchers,
-                    request,
-                    self.placement,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::FlushCold {
-                request,
-                response_tx,
-            } => {
-                let response = CoreWorker::flush_cold(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    self.read_materialization.clone(),
-                    &mut self.read_watchers,
-                    request,
-                    self.placement,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::PlanColdFlush {
-                request,
-                response_tx,
-            } => {
-                let response = CoreWorker::plan_cold_flush(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    request,
-                    self.placement,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::PlanNextColdFlushBatch {
-                request,
-                max_candidates,
-                response_tx,
-            } => {
-                let response = CoreWorker::plan_next_cold_flush_batch(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    request,
-                    self.placement,
-                    max_candidates,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::PlanColdGc { max, response_tx } => {
-                let response =
-                    CoreWorker::plan_cold_gc(&mut self.engine, max, self.placement).await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::AckColdGc {
-                up_to_seq,
-                response_tx,
-            } => {
-                let response =
-                    CoreWorker::ack_cold_gc(&mut self.engine, up_to_seq, self.placement).await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::Append {
-                request,
-                response_tx,
-                raft_uncommitted,
-            } => {
-                let response = CoreWorker::apply_append(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    self.read_materialization.clone(),
-                    &mut self.read_watchers,
-                    request,
-                    self.placement,
-                    self.cold_write_admission,
-                )
-                .await;
-                drop(raft_uncommitted);
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::AppendExternal {
-                request,
-                response_tx,
-            } => {
-                let response = CoreWorker::apply_append_external(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    self.read_materialization.clone(),
-                    &mut self.read_watchers,
-                    request,
-                    self.placement,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::AppendBatch {
-                request,
-                response_tx,
-                raft_uncommitted,
-            } => {
-                let mut batch = vec![(request, response_tx, raft_uncommitted)];
-                let mut coalesced_parents = Vec::new();
-                self.collect_append_batch_commands(pending, &mut batch, &mut coalesced_parents);
-                // One apply span for the coalesced batch: a child of the
-                // triggering request (the current span), linked via
-                // follows_from to every other coalesced request so their
-                // traces show the shared apply instead of being silently
-                // attributed to the triggering request alone.
-                let span = tracing::debug_span!(
-                    "core.append_batch",
-                    group = self.placement.raft_group_id.0,
-                    batch = batch.len(),
-                );
-                for parent in &coalesced_parents {
-                    span.follows_from(parent);
-                }
-                let (requests, pending_batch) = CoreWorker::prepare_append_batch_requests(batch);
-                CoreWorker::apply_prepared_append_batch_requests(
-                    &mut self.engine,
-                    AppendBatchRuntime {
-                        metrics: self.metrics.clone(),
-                        read_materialization: self.read_materialization.clone(),
-                        placement: self.placement,
-                    },
-                    &mut self.read_watchers,
-                    pending_batch,
-                    requests,
-                    self.cold_write_admission,
-                )
-                .instrument(span)
-                .await;
-            }
-            GroupCommand::SnapshotGroup { response_tx } => {
-                let response = CoreWorker::snapshot_group(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    self.placement,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            GroupCommand::InstallGroupSnapshot {
-                snapshot,
-                response_tx,
-            } => {
-                let response = CoreWorker::install_group_snapshot(
-                    &mut self.engine,
-                    self.metrics.clone(),
-                    snapshot,
-                )
-                .await;
-                let _ = response_tx.send(response);
-            }
-            #[cfg(madsim)]
-            GroupCommand::ShutdownEngine { response_tx } => {
-                let response = self
-                    .engine
-                    .shutdown()
-                    .await
-                    .map_err(|err| RuntimeError::group_engine(self.placement, err));
-                let _ = response_tx.send(response);
-                return ControlFlow::Break(());
-            }
+        let mut batch = vec![(request, response_tx, raft_uncommitted)];
+        let mut coalesced_parents = Vec::new();
+        self.collect_append_batch_commands(pending, &mut batch, &mut coalesced_parents);
+        // One apply span for the coalesced batch: a child of the
+        // triggering request (the current span), linked via
+        // follows_from to every other coalesced request so their
+        // traces show the shared apply instead of being silently
+        // attributed to the triggering request alone.
+        let span = tracing::debug_span!(
+            "core.append_batch",
+            group = self.placement.raft_group_id.0,
+            batch = batch.len(),
+        );
+        for parent in &coalesced_parents {
+            span.follows_from(parent);
         }
+        let (requests, pending_batch) = CoreWorker::prepare_append_batch_requests(batch);
+        CoreWorker::apply_prepared_append_batch_requests(
+            &mut self.engine,
+            AppendBatchRuntime {
+                metrics: self.metrics.clone(),
+                read_materialization: self.read_materialization.clone(),
+                placement: self.placement,
+            },
+            &mut self.read_watchers,
+            pending_batch,
+            requests,
+            self.cold_write_admission,
+        )
+        .instrument(span)
+        .await;
         ControlFlow::Continue(())
+    }
+
+    #[cfg(madsim)]
+    async fn handle_shutdown_engine(
+        &mut self,
+        response_tx: oneshot::Sender<Result<(), RuntimeError>>,
+    ) -> ControlFlow<()> {
+        let response = self
+            .engine
+            .shutdown()
+            .await
+            .map_err(|err| RuntimeError::group_engine(self.placement, err));
+        let _ = response_tx.send(response);
+        ControlFlow::Break(())
     }
 
     pub(crate) async fn next_command(
