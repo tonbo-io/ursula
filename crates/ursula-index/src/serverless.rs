@@ -9,11 +9,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use std::time::Duration;
 use std::time::SystemTime;
 
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::EventEntry;
 use crate::EventIndexConfig;
@@ -29,7 +31,7 @@ use crate::object_store::S3ObjectStore;
 use crate::object_store::digest;
 use crate::part;
 
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 const CURRENT_KEY: &str = "CURRENT";
 const MAX_PUBLISH_ATTEMPTS: usize = 8;
 const EVENT_TIME_PARTITION_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -74,6 +76,7 @@ struct Manifest {
     version: u32,
     source_id: String,
     generation: u64,
+    indexed_from_record: u64,
     durable_through_record: u64,
     completed_record_ranges: Vec<CompletedRecordRange>,
     status: IndexStatus,
@@ -87,12 +90,13 @@ struct ManifestIdentity {
 }
 
 impl Manifest {
-    fn new(source_id: String) -> Self {
+    fn new(source_id: String, indexed_from_record: u64) -> Self {
         Self {
             version: FORMAT_VERSION,
             source_id,
             generation: 0,
-            durable_through_record: 0,
+            indexed_from_record,
+            durable_through_record: indexed_from_record,
             completed_record_ranges: Vec::new(),
             status: IndexStatus::Ready,
             parts: Vec::new(),
@@ -118,6 +122,7 @@ struct PublishedManifest {
 pub struct GarbageCollectionReport {
     pub deleted_parts: usize,
     pub deleted_manifests: usize,
+    pub deleted_claims: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +130,13 @@ struct LocalCache {
     root: PathBuf,
     max_bytes: u64,
     pins: Arc<Mutex<HashMap<PathBuf, usize>>>,
+    budget: Arc<AsyncMutex<CacheBudget>>,
+    installs: Arc<AsyncMutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>>,
+}
+
+#[derive(Debug, Default)]
+struct CacheBudget {
+    reserved_bytes: u64,
 }
 
 struct MaterializedPart {
@@ -177,6 +189,8 @@ impl LocalCache {
             root,
             max_bytes,
             pins: Arc::new(Mutex::new(HashMap::new())),
+            budget: Arc::new(AsyncMutex::new(CacheBudget::default())),
+            installs: Arc::new(AsyncMutex::new(HashMap::new())),
         })
     }
 
@@ -189,101 +203,205 @@ impl LocalCache {
         let path = self
             .root
             .join(format!("{}.parquet", digest(meta.key.as_bytes())));
-        {
-            let mut pins = self
-                .pins
-                .lock()
-                .map_err(|_error| IndexError::LockPoisoned)?;
-            if valid_cached_part(&path, meta)? {
-                return Ok(pin_locked(&mut pins, path, &self.pins));
-            }
+        let pinned = self.pin(path.clone())?;
+        if validate_cached_part(path.clone(), meta.clone()).await? {
+            return Ok(pinned);
         }
+        drop(pinned);
+        let install_lock = self.install_lock(&path).await;
+        let _install_guard = install_lock.lock().await;
+        let pinned = self.pin(path.clone())?;
+        if validate_cached_part(path.clone(), meta.clone()).await? {
+            return Ok(pinned);
+        }
+        drop(pinned);
         let object = store
             .get(&meta.key)
             .await?
             .ok_or_else(|| IndexError::MissingObject(meta.key.clone()))?;
-        if u64::try_from(object.bytes.len()).ok() != Some(meta.bytes) {
-            return Err(IndexError::PartSizeMismatch {
-                file: meta.key.clone(),
-                expected: meta.bytes,
-                actual: u64::try_from(object.bytes.len()).unwrap_or(u64::MAX),
-            });
+        let object_key = meta.key.clone();
+        let expected_bytes = meta.bytes;
+        let bytes = tokio::task::spawn_blocking(move || {
+            validate_downloaded_part(&object_key, expected_bytes, &object.bytes)?;
+            Ok::<_, IndexError>(object.bytes)
+        })
+        .await
+        .map_err(|_error| IndexError::WorkerFailed)??;
+        self.reserve(meta.bytes, &path).await?;
+        let installation_pin = match self.pin(path.clone()) {
+            Ok(pin) => pin,
+            Err(error) => {
+                self.release_reservation(meta.bytes).await;
+                return Err(error);
+            }
+        };
+        let root = self.root.clone();
+        let install_path = path.clone();
+        let install = match tokio::task::spawn_blocking(move || {
+            let temporary = root.join(format!("{}.tmp", digest(&bytes)));
+            let result = (|| -> Result<(), IndexError> {
+                let mut file = File::create(&temporary)?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                fs::rename(&temporary, &install_path)?;
+                part::validate(&install_path)?;
+                Ok(())
+            })();
+            if result.is_err() {
+                let _remove = fs::remove_file(&temporary);
+                let _remove = fs::remove_file(&install_path);
+            }
+            result
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_error) => Err(IndexError::WorkerFailed),
+        };
+        match install {
+            Ok(()) => {
+                self.release_reservation(meta.bytes).await;
+                Ok(installation_pin)
+            }
+            Err(error) => {
+                drop(installation_pin);
+                self.release_reservation(meta.bytes).await;
+                Err(error)
+            }
         }
-        let expected_hash = meta
-            .key
-            .strip_prefix("parts/")
-            .and_then(|value| value.strip_suffix(".parquet"))
-            .ok_or_else(|| IndexError::InvalidObjectKey(meta.key.clone()))?;
-        if digest(&object.bytes) != expected_hash {
-            return Err(IndexError::ObjectHashMismatch(meta.key.clone()));
-        }
+    }
+
+    fn pin(&self, path: PathBuf) -> Result<MaterializedPart, IndexError> {
         let mut pins = self
             .pins
             .lock()
             .map_err(|_error| IndexError::LockPoisoned)?;
-        if valid_cached_part(&path, meta)? {
-            return Ok(pin_locked(&mut pins, path, &self.pins));
-        }
-        self.make_room(meta.bytes, Some(&path), &pins)?;
-        let temporary = self.root.join(format!("{}.tmp", digest(&object.bytes)));
-        let mut file = File::create(&temporary)?;
-        file.write_all(&object.bytes)?;
-        file.sync_all()?;
-        fs::rename(&temporary, &path)?;
-        part::validate(&path)?;
         Ok(pin_locked(&mut pins, path, &self.pins))
     }
 
-    fn make_room(
-        &self,
-        incoming: u64,
-        protected: Option<&Path>,
-        pins: &HashMap<PathBuf, usize>,
-    ) -> Result<(), IndexError> {
+    async fn install_lock(&self, path: &Path) -> Arc<AsyncMutex<()>> {
+        let mut installs = self.installs.lock().await;
+        installs.retain(|_path, install| install.strong_count() > 0);
+        if let Some(install) = installs.get(path).and_then(Weak::upgrade) {
+            return install;
+        }
+        let install = Arc::new(AsyncMutex::new(()));
+        installs.insert(path.to_path_buf(), Arc::downgrade(&install));
+        install
+    }
+
+    async fn reserve(&self, incoming: u64, protected: &Path) -> Result<(), IndexError> {
         if incoming > self.max_bytes {
             return Err(IndexError::CacheCapacity {
                 capacity: self.max_bytes,
                 object_size: incoming,
             });
         }
-        let mut files = Vec::new();
-        let mut total = 0_u64;
-        for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_file() || protected.is_some_and(|protected| protected == path) {
-                continue;
-            }
-            let metadata = entry.metadata()?;
-            total = total.saturating_add(metadata.len());
-            if pins.contains_key(&path) {
-                continue;
-            }
-            files.push((
-                metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                metadata.len(),
-                path,
-            ));
-        }
-        files.sort_unstable_by_key(|(modified, _, _)| *modified);
-        for (_, bytes, path) in files {
-            if total.saturating_add(incoming) <= self.max_bytes {
-                break;
-            }
-            match fs::remove_file(path) {
-                Ok(()) => total = total.saturating_sub(bytes),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        if total.saturating_add(incoming) > self.max_bytes {
-            return Err(IndexError::CacheCapacity {
-                capacity: self.max_bytes,
-                object_size: incoming,
-            });
-        }
+        let mut budget = self.budget.lock().await;
+        let pins = self
+            .pins
+            .lock()
+            .map_err(|_error| IndexError::LockPoisoned)?
+            .clone();
+        let root = self.root.clone();
+        let max_bytes = self.max_bytes;
+        let reserved_bytes = budget.reserved_bytes;
+        let protected = protected.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            make_cache_room(
+                &root,
+                max_bytes,
+                incoming,
+                reserved_bytes,
+                Some(&protected),
+                &pins,
+            )
+        })
+        .await
+        .map_err(|_error| IndexError::WorkerFailed)??;
+        budget.reserved_bytes = budget.reserved_bytes.saturating_add(incoming);
         Ok(())
     }
+
+    async fn release_reservation(&self, bytes: u64) {
+        let mut budget = self.budget.lock().await;
+        budget.reserved_bytes = budget.reserved_bytes.saturating_sub(bytes);
+    }
+}
+
+async fn validate_cached_part(path: PathBuf, meta: PartMeta) -> Result<bool, IndexError> {
+    tokio::task::spawn_blocking(move || valid_cached_part(&path, &meta))
+        .await
+        .map_err(|_error| IndexError::WorkerFailed)?
+}
+
+fn validate_downloaded_part(
+    key: &str,
+    expected_bytes: u64,
+    bytes: &[u8],
+) -> Result<(), IndexError> {
+    if u64::try_from(bytes.len()).ok() != Some(expected_bytes) {
+        return Err(IndexError::PartSizeMismatch {
+            file: key.to_owned(),
+            expected: expected_bytes,
+            actual: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        });
+    }
+    let expected_hash = key
+        .strip_prefix("parts/")
+        .and_then(|value| value.strip_suffix(".parquet"))
+        .ok_or_else(|| IndexError::InvalidObjectKey(key.to_owned()))?;
+    if digest(bytes) != expected_hash {
+        return Err(IndexError::ObjectHashMismatch(key.to_owned()));
+    }
+    Ok(())
+}
+
+fn make_cache_room(
+    root: &Path,
+    max_bytes: u64,
+    incoming: u64,
+    reserved: u64,
+    protected: Option<&Path>,
+    pins: &HashMap<PathBuf, usize>,
+) -> Result<(), IndexError> {
+    let mut files = Vec::new();
+    let mut total = 0_u64;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() || protected.is_some_and(|protected| protected == path) {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        total = total.saturating_add(metadata.len());
+        if pins.contains_key(&path) {
+            continue;
+        }
+        files.push((
+            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            metadata.len(),
+            path,
+        ));
+    }
+    files.sort_unstable_by_key(|(modified, _, _)| *modified);
+    for (_, bytes, path) in files {
+        if total.saturating_add(reserved).saturating_add(incoming) <= max_bytes {
+            break;
+        }
+        match fs::remove_file(path) {
+            Ok(()) => total = total.saturating_sub(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if total.saturating_add(reserved).saturating_add(incoming) > max_bytes {
+        return Err(IndexError::CacheCapacity {
+            capacity: max_bytes,
+            object_size: incoming,
+        });
+    }
+    Ok(())
 }
 
 fn pin_locked(
@@ -315,7 +433,7 @@ impl ServerlessEventIndex {
         config: EventIndexConfig,
     ) -> Result<Self, IndexError> {
         let cache = EventIndexCache::new(cache_dir, cache_max_bytes)?;
-        Self::open(store.into(), cache, config).await
+        Self::open(store.into(), cache, config, 0).await
     }
 
     pub async fn open_fs_with_cache(
@@ -323,7 +441,7 @@ impl ServerlessEventIndex {
         cache: EventIndexCache,
         config: EventIndexConfig,
     ) -> Result<Self, IndexError> {
-        Self::open(store.into(), cache, config).await
+        Self::open(store.into(), cache, config, 0).await
     }
 
     pub async fn open_s3(
@@ -333,7 +451,7 @@ impl ServerlessEventIndex {
         config: EventIndexConfig,
     ) -> Result<Self, IndexError> {
         let cache = EventIndexCache::new(cache_dir, cache_max_bytes)?;
-        Self::open(store.into(), cache, config).await
+        Self::open(store.into(), cache, config, 0).await
     }
 
     pub async fn open_s3_with_cache(
@@ -341,17 +459,42 @@ impl ServerlessEventIndex {
         cache: EventIndexCache,
         config: EventIndexConfig,
     ) -> Result<Self, IndexError> {
-        Self::open(store.into(), cache, config).await
+        Self::open(store.into(), cache, config, 0).await
+    }
+
+    pub async fn open_fs_with_cache_from_record(
+        store: FsObjectStore,
+        cache: EventIndexCache,
+        config: EventIndexConfig,
+        indexed_from_record: u64,
+    ) -> Result<Self, IndexError> {
+        Self::open(store.into(), cache, config, indexed_from_record).await
+    }
+
+    pub async fn open_s3_with_cache_from_record(
+        store: S3ObjectStore,
+        cache: EventIndexCache,
+        config: EventIndexConfig,
+        indexed_from_record: u64,
+    ) -> Result<Self, IndexError> {
+        Self::open(store.into(), cache, config, indexed_from_record).await
     }
 
     async fn open(
         store: ObjectStore,
         cache: EventIndexCache,
         config: EventIndexConfig,
+        indexed_from_record: u64,
     ) -> Result<Self, IndexError> {
         validate_config(&config)?;
-        initialize(&store, &config.source_id).await?;
+        initialize(&store, &config.source_id, indexed_from_record).await?;
         let published = load_published(&store, &config.source_id).await?;
+        if published.manifest.indexed_from_record != indexed_from_record {
+            return Err(IndexError::IndexBaseMismatch {
+                stored: published.manifest.indexed_from_record,
+                configured: indexed_from_record,
+            });
+        }
         Ok(Self {
             store,
             cache: cache.0,
@@ -367,6 +510,10 @@ impl ServerlessEventIndex {
 
     pub fn durable_through_record(&self) -> u64 {
         self.published.manifest.durable_through_record
+    }
+
+    pub fn indexed_from_record(&self) -> u64 {
+        self.published.manifest.indexed_from_record
     }
 
     pub fn indexed_through_record(&self) -> u64 {
@@ -421,13 +568,22 @@ impl ServerlessEventIndex {
                 }
             }
             normalize_completed_ranges(&mut covered);
-            let start_record = first_uncovered_record(&covered, tail_record);
+            let start_record = first_uncovered_record(
+                &covered,
+                self.published.manifest.indexed_from_record,
+                tail_record,
+            );
             if start_record >= tail_record {
                 return Ok(None);
             }
+            let next_covered_record = covered
+                .iter()
+                .find(|range| range.start_record > start_record)
+                .map_or(tail_record, |range| range.start_record);
             let end_record = start_record
                 .saturating_add(segment_records)
-                .min(tail_record);
+                .min(tail_record)
+                .min(next_covered_record);
             let key = format!("claims/{start_record:020}.json");
             let claim = RecordSegmentLease {
                 start_record,
@@ -568,11 +724,9 @@ impl ServerlessEventIndex {
                 return Ok(());
             }
             ensure_ready(&self.published.manifest.status)?;
-            let start_record = self
-                .active
-                .first()
-                .map(|entry| entry.record)
-                .ok_or(IndexError::InvalidQuery)?;
+            let start_record = self.active.first().map(|entry| entry.record).ok_or(
+                IndexError::InvalidSourceResponse("active event buffer unexpectedly became empty"),
+            )?;
             let checkpoint = self.indexed_through_record();
             let mut partitions = BTreeMap::<i64, Vec<EventEntry>>::new();
             for entry in self.active.iter().copied() {
@@ -596,7 +750,8 @@ impl ServerlessEventIndex {
                 end_record: checkpoint,
             });
             normalize_completed_ranges(&mut next.completed_record_ranges);
-            next.durable_through_record = contiguous_watermark(&next.completed_record_ranges);
+            next.durable_through_record =
+                contiguous_watermark(&next.completed_record_ranges, next.indexed_from_record);
             next.parts.extend(metas);
             if self.publish(next).await? {
                 self.active.clear();
@@ -614,6 +769,11 @@ impl ServerlessEventIndex {
         start_record: u64,
         envelopes: Vec<SourceEnvelope>,
     ) -> Result<(), IndexError> {
+        if start_record < self.published.manifest.indexed_from_record {
+            return Err(IndexError::InvalidSourceResponse(
+                "record segment starts before the index base",
+            ));
+        }
         if envelopes.is_empty() {
             return Err(IndexError::InvalidSourceResponse(
                 "record segment must not be empty",
@@ -679,7 +839,8 @@ impl ServerlessEventIndex {
             next.generation = next.generation.saturating_add(1);
             next.completed_record_ranges.extend(new_ranges);
             normalize_completed_ranges(&mut next.completed_record_ranges);
-            next.durable_through_record = contiguous_watermark(&next.completed_record_ranges);
+            next.durable_through_record =
+                contiguous_watermark(&next.completed_record_ranges, next.indexed_from_record);
             next.parts.extend(uploaded_parts);
             if self.publish(next).await? {
                 return Ok(());
@@ -795,7 +956,9 @@ impl ServerlessEventIndex {
         }
         let indexed_through_record = self.indexed_through_record();
         let through_record = through_record.unwrap_or(indexed_through_record);
-        if through_record > indexed_through_record {
+        if through_record < self.published.manifest.indexed_from_record
+            || through_record > indexed_through_record
+        {
             return Err(IndexError::InvalidQuery);
         }
         let mut entries = Vec::new();
@@ -829,6 +992,7 @@ impl ServerlessEventIndex {
             .then(|| entries.last().copied().map(QueryCursor::from))
             .flatten();
         Ok(QueryResult {
+            indexed_from_record: self.published.manifest.indexed_from_record,
             indexed_through_record,
             durable_through_record: self.published.manifest.durable_through_record,
             through_record,
@@ -957,6 +1121,7 @@ impl ServerlessEventIndex {
         }
         let part_objects = self.store.list("parts/").await?;
         let latest = load_published(&self.store, &self.config.source_id).await?;
+        let durable_through_record = latest.manifest.durable_through_record;
         retained_manifests.insert(latest.manifest_key);
         retained_parts.extend(latest.manifest.parts.into_iter().map(|part| part.key));
         let stale_manifests = manifest_objects
@@ -973,16 +1138,39 @@ impl ServerlessEventIndex {
             .filter(|object| !retained_parts.contains(&object.key))
             .map(|object| object.key)
             .collect::<Vec<_>>();
+        let now_ms = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+        let mut stale_claims = Vec::new();
+        for object in self.store.list("claims/").await? {
+            if !object.key.ends_with(".json") {
+                continue;
+            }
+            let Some(stored) = self.store.get(&object.key).await? else {
+                continue;
+            };
+            let claim: RecordSegmentLease = serde_json::from_slice(&stored.bytes)?;
+            if claim.end_record <= durable_through_record
+                || now_ms.is_some_and(|now_ms| claim.expires_at_ms <= now_ms)
+            {
+                stale_claims.push(object.key);
+            }
+        }
         for key in &stale_manifests {
             self.store.delete(key).await?;
         }
         for key in &stale_parts {
             self.store.delete(key).await?;
         }
+        for key in &stale_claims {
+            self.store.delete(key).await?;
+        }
         self.refresh().await?;
         Ok(GarbageCollectionReport {
             deleted_parts: stale_parts.len(),
             deleted_manifests: stale_manifests.len(),
+            deleted_claims: stale_claims.len(),
         })
     }
 
@@ -1071,11 +1259,15 @@ impl ServerlessEventIndex {
     }
 }
 
-async fn initialize(store: &ObjectStore, source_id: &str) -> Result<(), IndexError> {
+async fn initialize(
+    store: &ObjectStore,
+    source_id: &str,
+    indexed_from_record: u64,
+) -> Result<(), IndexError> {
     if store.get(CURRENT_KEY).await?.is_some() {
         return Ok(());
     }
-    let manifest = Manifest::new(source_id.to_owned());
+    let manifest = Manifest::new(source_id.to_owned(), indexed_from_record);
     let bytes = serde_json::to_vec(&manifest)?;
     let manifest_key = format!("manifests/{:020}-{}.json", 0, digest(&bytes));
     let _manifest_write = store.put_if_absent(&manifest_key, &bytes).await?;
@@ -1129,6 +1321,16 @@ async fn load_published(
             stored: manifest.source_id,
             configured: configured_source.to_owned(),
         });
+    }
+    if manifest.durable_through_record < manifest.indexed_from_record
+        || manifest
+            .completed_record_ranges
+            .iter()
+            .any(|range| range.start_record < manifest.indexed_from_record)
+    {
+        return Err(IndexError::InvalidSourceResponse(
+            "manifest record ranges precede the index base",
+        ));
     }
     Ok(PublishedManifest {
         pointer_etag: current.etag,
@@ -1190,8 +1392,8 @@ fn normalize_completed_ranges(ranges: &mut Vec<CompletedRecordRange>) {
     *ranges = normalized;
 }
 
-fn contiguous_watermark(ranges: &[CompletedRecordRange]) -> u64 {
-    let mut watermark = 0_u64;
+fn contiguous_watermark(ranges: &[CompletedRecordRange], indexed_from_record: u64) -> u64 {
+    let mut watermark = indexed_from_record;
     for range in ranges {
         if range.start_record > watermark {
             break;
@@ -1201,8 +1403,12 @@ fn contiguous_watermark(ranges: &[CompletedRecordRange]) -> u64 {
     watermark
 }
 
-fn first_uncovered_record(ranges: &[CompletedRecordRange], tail_record: u64) -> u64 {
-    let mut next = 0_u64;
+fn first_uncovered_record(
+    ranges: &[CompletedRecordRange],
+    indexed_from_record: u64,
+    tail_record: u64,
+) -> u64 {
+    let mut next = indexed_from_record;
     for range in ranges {
         if range.start_record > next {
             break;
@@ -1338,12 +1544,12 @@ mod tests {
         assert!(!eligible_for_gc(None, SystemTime::UNIX_EPOCH));
     }
 
-    #[test]
+    #[tokio::test]
     #[expect(
         clippy::panic_in_result_fn,
         reason = "the test combines fallible setup with assertions"
     )]
-    fn shared_cache_never_evicts_a_pinned_part_or_exceeds_its_budget() -> anyhow::Result<()> {
+    async fn shared_cache_never_evicts_a_pinned_part_or_exceeds_its_budget() -> anyhow::Result<()> {
         let directory = tempfile::TempDir::new()?;
         let cache = LocalCache::new(directory.path(), 10)?;
         let path = directory.path().join("part.parquet");
@@ -1355,23 +1561,17 @@ mod tests {
                 .map_err(|_error| anyhow::anyhow!("cache pin lock poisoned"))?;
             pin_locked(&mut pins, path.clone(), &cache.pins)
         };
-        let pins = cache
-            .pins
-            .lock()
-            .map_err(|_error| anyhow::anyhow!("cache pin lock poisoned"))?;
+        let incoming = directory.path().join("incoming.parquet");
         let error = cache
-            .make_room(6, None, &pins)
+            .reserve(6, &incoming)
+            .await
             .expect_err("a pinned part must not be evicted to exceed the cache bound");
         assert!(matches!(error, IndexError::CacheCapacity { .. }));
-        drop(pins);
         assert!(path.exists());
 
         drop(guard);
-        let pins = cache
-            .pins
-            .lock()
-            .map_err(|_error| anyhow::anyhow!("cache pin lock poisoned"))?;
-        cache.make_room(6, None, &pins)?;
+        cache.reserve(6, &incoming).await?;
+        cache.release_reservation(6).await;
         assert!(!path.exists());
         Ok(())
     }

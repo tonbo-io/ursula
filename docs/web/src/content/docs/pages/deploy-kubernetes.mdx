@@ -147,7 +147,7 @@ indexer:
       eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-index
 ```
 
-After creating an `application/json` source, dynamically register it with `PUT /v1/indexes/{id}` on the internal indexer Service. Registration verifies `json-record-coordinates-v1`; no Helm upgrade is needed. Workers claim `(stream, record range)` tasks across all registrations, so multiple pods can process a hot stream while one pod can share time across small streams. Range completion may be out of order, but the durable watermark advances only across a gap-free prefix. Expiring S3 claims reduce duplicate work while immutable parts and manifest CAS provide correctness.
+After creating an `application/json` source, dynamically register it with `PUT /v1/indexes/{id}` on the internal indexer Service. Registration verifies `json-record-coordinates-v1` and stores the current retained boundary as `indexed_from_record`; existing streams do not need to retain record 0. No Helm upgrade is needed. Workers claim `(stream, record range)` tasks across all registrations, so multiple pods can process a hot stream while one pod can share time across small streams. Range completion may be out of order, but the durable watermark advances only across a gap-free prefix starting at `indexed_from_record`. Expiring S3 claims reduce duplicate work while immutable parts and manifest CAS provide correctness.
 
 The indexer Service is an internal ClusterIP. If remote applications need `/v1/indexes/{id}/events`, put an authenticated, path-aware proxy in front of it and do not expose registration, deletion, or `POST /v1/indexes/{id}/status/resume` administration routes.
 

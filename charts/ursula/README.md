@@ -241,7 +241,7 @@ disable the cache explicitly.
 
 ## Event-Time Indexer
 
-The optional `ursula-indexer` runs as a fixed, cluster-level worker Deployment because it is a rebuildable projection, not part of the Raft write path. Pod count is independent of stream count. Registrations are durable in S3 and each registered source receives its own manifest, checkpoint, parts, claims, and error status below the pool prefix.
+The optional `ursula-indexer` runs as a fixed, cluster-level worker Deployment because it is a rebuildable projection, not part of the Raft write path. Pod count is independent of stream count. Registrations are stored in one conditionally updated S3 catalog object, and each registered source receives its own manifest, retained-record base, checkpoint, parts, claims, and error status below the pool prefix.
 
 On EKS, prefer a separate IRSA or Pod Identity role for the indexer:
 

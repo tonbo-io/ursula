@@ -5,6 +5,7 @@
 
 use tempfile::TempDir;
 use ursula_index::EventEntry;
+use ursula_index::EventIndexCache;
 use ursula_index::EventIndexConfig;
 use ursula_index::FsObjectStore;
 use ursula_index::IndexStatus;
@@ -33,6 +34,47 @@ fn envelopes(start: u64, timestamps: &[i64]) -> Vec<SourceEnvelope> {
             }),
         })
         .collect()
+}
+
+#[tokio::test]
+async fn retained_stream_starts_at_an_explicit_record_base() -> anyhow::Result<()> {
+    let object_dir = TempDir::new()?;
+    let cache = TempDir::new()?;
+    let store = FsObjectStore::new(object_dir.path())?;
+    let mut index = ServerlessEventIndex::open_fs_with_cache_from_record(
+        store.clone(),
+        EventIndexCache::new(cache.path(), 16 * 1024 * 1024)?,
+        config(),
+        41,
+    )
+    .await?;
+
+    assert_eq!(index.indexed_from_record(), 41);
+    assert_eq!(index.durable_through_record(), 41);
+    let claim = index
+        .claim_next_segment(45, 2, "worker-a", 1_000, 60_000)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("retained range was not claimed"))?;
+    assert_eq!((claim.start_record, claim.end_record), (41, 43));
+    index
+        .finish_segment(&claim, envelopes(41, &[1_000, 2_000]))
+        .await?;
+    assert_eq!(index.durable_through_record(), 43);
+    let result = index.query(0, 3_000, None, None, 10).await?;
+    assert_eq!(result.indexed_from_record, 41);
+    assert_eq!(result.records.len(), 2);
+
+    let fresh_cache = TempDir::new()?;
+    let reopened = ServerlessEventIndex::open_fs_with_cache_from_record(
+        store,
+        EventIndexCache::new(fresh_cache.path(), 16 * 1024 * 1024)?,
+        config(),
+        41,
+    )
+    .await?;
+    assert_eq!(reopened.indexed_from_record(), 41);
+    assert_eq!(reopened.durable_through_record(), 43);
+    Ok(())
 }
 
 #[tokio::test]
@@ -114,6 +156,61 @@ async fn workers_claim_distinct_ranges_and_publish_out_of_order() -> anyhow::Res
         .await?
         .ok_or_else(|| anyhow::anyhow!("third range was not claimed"))?;
     assert_eq!((third_claim.start_record, third_claim.end_record), (4, 6));
+    Ok(())
+}
+
+#[tokio::test]
+async fn claims_stop_before_the_next_completed_range() -> anyhow::Result<()> {
+    let object_dir = TempDir::new()?;
+    let cache = TempDir::new()?;
+    let store = FsObjectStore::new(object_dir.path())?;
+    let mut index =
+        ServerlessEventIndex::open_fs(store, cache.path(), 16 * 1024 * 1024, config()).await?;
+    index
+        .commit_envelopes(4, envelopes(4, &[4_000, 5_000]))
+        .await?;
+
+    let claim = index
+        .claim_next_segment(10, 10, "worker-a", 1_000, 60_000)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("gap before completed range was not claimed"))?;
+    assert_eq!((claim.start_record, claim.end_record), (0, 4));
+    Ok(())
+}
+
+#[tokio::test]
+async fn garbage_collection_removes_expired_crashed_worker_claims() -> anyhow::Result<()> {
+    let object_dir = TempDir::new()?;
+    let cache = TempDir::new()?;
+    let store = FsObjectStore::new(object_dir.path())?;
+    let mut index =
+        ServerlessEventIndex::open_fs(store, cache.path(), 16 * 1024 * 1024, config()).await?;
+    let claim = index
+        .claim_next_segment(4, 2, "crashed-worker", 1_000, 100)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("range was not claimed"))?;
+    assert!(
+        object_dir
+            .path()
+            .join(format!("claims/{:020}.json", claim.start_record))
+            .exists()
+    );
+
+    let report = index
+        .garbage_collect(
+            1,
+            std::time::Duration::ZERO,
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(2_000),
+        )
+        .await?;
+    assert_eq!(report.deleted_claims, 1);
+    assert!(
+        !object_dir
+            .path()
+            .join("claims")
+            .join("00000000000000000000.json")
+            .exists()
+    );
     Ok(())
 }
 

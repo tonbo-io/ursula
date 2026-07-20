@@ -130,6 +130,7 @@ A query returns records sorted by `(captured_at_ms, record)`, plus a cursor and 
 
 ```json
 {
+  "indexed_from_record": 40,
   "indexed_through_record": 1200,
   "durable_through_record": 1152,
   "through_record": 1200,
@@ -149,4 +150,4 @@ GET /v1/indexes/browser-session-42/events?from=2026-07-18T10:00:00Z&until=2026-0
 
 `through_record` prevents newly indexed source records from appearing halfway through one paginated query. In worker-pool mode, the visible and durable watermarks are the same contiguous S3-published prefix; completed ranges beyond a gap remain invisible until the missing range commits. Resolve returned record ordinals through Ursula to fetch the canonical event values.
 
-An invalid query returns `400`. A deterministically invalid source record or conflicting event time blocks further advancement for that registration; its existing durable prefix remains queryable and `/status` reports the blocked record until an operator repairs the source and calls `POST /v1/indexes/{id}/status/resume`. A source retention gap returns `409` and requires rebuilding the derived namespace because the missing source prefix can no longer be recovered.
+Registration captures the source's current retained boundary as `indexed_from_record`, so browser telemetry can be enabled for an existing stream after record 0 has been trimmed. The registration response, `/status`, query JSON, and the `indexed-from-record` query header make that lower bound explicit. An invalid query returns `400`. A deterministically invalid source record or conflicting event time blocks further advancement for that registration; its existing durable prefix remains queryable and `/status` reports the blocked record until an operator repairs the source and calls `POST /v1/indexes/{id}/status/resume`. If retention later advances past an unfinished registered range, the resulting `409` cannot be resumed because those records are no longer recoverable.

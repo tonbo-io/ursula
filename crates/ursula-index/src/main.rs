@@ -1,10 +1,9 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::SystemTime;
 
@@ -109,7 +108,6 @@ struct Args {
 #[derive(Clone)]
 struct SingleAppState {
     index: Arc<Mutex<ServerlessEventIndex>>,
-    source_healthy: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -175,6 +173,7 @@ fn default_limit() -> usize {
 #[derive(Debug, Serialize)]
 struct StatusBody {
     status: IndexStatus,
+    indexed_from_record: u64,
     indexed_through_record: u64,
     durable_through_record: u64,
     parts: usize,
@@ -195,7 +194,8 @@ impl IntoResponse for ApiError {
             IndexError::RetentionGap { .. }
             | IndexError::Blocked { .. }
             | IndexError::CannotResume(_)
-            | IndexError::RegistrationConflict(_) => StatusCode::CONFLICT,
+            | IndexError::RegistrationConflict(_)
+            | IndexError::IndexBaseMismatch { .. } => StatusCode::CONFLICT,
             IndexError::UnknownIndex(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -314,12 +314,10 @@ async fn run_single(args: Args, stream_url: Url) -> anyhow::Result<()> {
         .probe()
         .await
         .context("source stream must be application/json with json-record-coordinates-v1")?;
-    let source_healthy = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let sync_task = tokio::spawn(sync_loop(
         source,
         Arc::clone(&index),
-        Arc::clone(&source_healthy),
         Duration::from_millis(args.poll_interval_ms),
         shutdown_rx.clone(),
     ));
@@ -334,7 +332,7 @@ async fn run_single(args: Args, stream_url: Url) -> anyhow::Result<()> {
         shutdown_rx,
     ));
 
-    let app = build_router(Arc::clone(&index), source_healthy);
+    let app = build_router(Arc::clone(&index));
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!(
         listen = %args.listen,
@@ -387,16 +385,18 @@ impl PoolState {
             PoolBackend::Fs { object_root } => {
                 let store = FsObjectStore::new(object_root.join("indexes").join(&namespace))?;
                 (
-                    ServerlessEventIndex::open_fs_with_cache(
+                    ServerlessEventIndex::open_fs_with_cache_from_record(
                         store.clone(),
                         self.settings.serving_cache.clone(),
                         config.clone(),
+                        registration.indexed_from_record,
                     )
                     .await?,
-                    ServerlessEventIndex::open_fs_with_cache(
+                    ServerlessEventIndex::open_fs_with_cache_from_record(
                         store,
                         self.settings.maintenance_cache.clone(),
                         config,
+                        registration.indexed_from_record,
                     )
                     .await?,
                 )
@@ -414,16 +414,18 @@ impl PoolState {
                     endpoint: endpoint.clone(),
                 })?;
                 (
-                    ServerlessEventIndex::open_s3_with_cache(
+                    ServerlessEventIndex::open_s3_with_cache_from_record(
                         store.clone(),
                         self.settings.serving_cache.clone(),
                         config.clone(),
+                        registration.indexed_from_record,
                     )
                     .await?,
-                    ServerlessEventIndex::open_s3_with_cache(
+                    ServerlessEventIndex::open_s3_with_cache_from_record(
                         store,
                         self.settings.maintenance_cache.clone(),
                         config,
+                        registration.indexed_from_record,
                     )
                     .await?,
                 )
@@ -705,6 +707,13 @@ async fn pool_maintenance_loop(
         if *shutdown.borrow() {
             return Ok(());
         }
+        if let Err(error) = reconcile_pool_indexes(&state).await {
+            tracing::warn!(%error, "event-index maintenance catalog refresh failed");
+            if wait_or_shutdown(interval, &mut shutdown).await {
+                return Ok(());
+            }
+            continue;
+        }
         let indexes = state
             .indexes
             .read()
@@ -745,6 +754,20 @@ async fn pool_maintenance_loop(
     }
 }
 
+async fn reconcile_pool_indexes(state: &PoolState) -> Result<(), IndexError> {
+    let registrations = state.catalog.list().await?;
+    let registered_ids = registrations
+        .into_iter()
+        .map(|registration| registration.id)
+        .collect::<HashSet<_>>();
+    state
+        .indexes
+        .write()
+        .await
+        .retain(|id, _index| registered_ids.contains(id));
+    Ok(())
+}
+
 fn wall_clock_millis() -> Result<u64, IndexError> {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -758,7 +781,6 @@ fn wall_clock_millis() -> Result<u64, IndexError> {
 async fn sync_loop(
     source: SourceClient,
     index: Arc<Mutex<ServerlessEventIndex>>,
-    source_healthy: Arc<AtomicBool>,
     poll_interval: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -781,11 +803,8 @@ async fn sync_loop(
             continue;
         }
         match source.read_from(from_record).await {
-            Ok(SourceBatch::Records(records)) if records.is_empty() => {
-                source_healthy.store(true, Ordering::Relaxed);
-            }
+            Ok(SourceBatch::Records(records)) if records.is_empty() => {}
             Ok(SourceBatch::Records(records)) => {
-                source_healthy.store(true, Ordering::Relaxed);
                 let update = async {
                     let mut index = index.lock().await;
                     for envelope in records {
@@ -819,7 +838,6 @@ async fn sync_loop(
             Ok(SourceBatch::RetentionGap {
                 first_available_record,
             }) => {
-                source_healthy.store(true, Ordering::Relaxed);
                 let result = index
                     .lock()
                     .await
@@ -830,7 +848,6 @@ async fn sync_loop(
                 }
             }
             Err(error) => {
-                source_healthy.store(false, Ordering::Relaxed);
                 tracing::warn!(%error, from_record, "source read failed; retrying");
             }
         }
@@ -880,6 +897,7 @@ async fn maintenance_loop(
                         Ok(report) => tracing::info!(
                             deleted_parts = report.deleted_parts,
                             deleted_manifests = report.deleted_manifests,
+                            deleted_claims = report.deleted_claims,
                             "event index garbage collection completed"
                         ),
                         Err(error) => tracing::warn!(
@@ -920,20 +938,14 @@ fn gc_wall_clock_now() -> SystemTime {
     SystemTime::UNIX_EPOCH
 }
 
-fn build_router(
-    index: Arc<Mutex<ServerlessEventIndex>>,
-    source_healthy: Arc<AtomicBool>,
-) -> Router {
+fn build_router(index: Arc<Mutex<ServerlessEventIndex>>) -> Router {
     Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/v1/events", get(query_events))
         .route("/v1/status", get(index_status))
         .route("/v1/status/resume", post(resume_index))
-        .with_state(SingleAppState {
-            index,
-            source_healthy,
-        })
+        .with_state(SingleAppState { index })
 }
 
 fn pool_router(state: PoolState) -> Router {
@@ -975,19 +987,26 @@ async fn register_pool_index(
             "stream URL must be credential-free HTTP(S) without a fragment",
         )));
     }
-    SourceClient::new(stream_url, 1)
+    let canonical_stream_url = stream_url.to_string();
+    let source_range = SourceClient::new(stream_url, 1)
         .map_err(ApiError)?
-        .probe()
+        .record_range()
         .await
         .map_err(ApiError)?;
     let registration = IndexRegistration {
         id,
-        stream_url: request.stream_url,
+        stream_url: canonical_stream_url,
         timestamp_field: request.timestamp_field,
+        indexed_from_record: source_range.first_record,
     };
     state
         .catalog
         .register(&registration)
+        .await
+        .map_err(ApiError)?;
+    let registration = state
+        .catalog
+        .get(&registration.id)
         .await
         .map_err(ApiError)?;
     state.ensure_index(&registration).await.map_err(ApiError)?;
@@ -1027,6 +1046,7 @@ async fn pool_index_status(
     index.refresh().await.map_err(ApiError)?;
     Ok(Json(StatusBody {
         status: index.status().clone(),
+        indexed_from_record: index.indexed_from_record(),
         indexed_through_record: index.indexed_through_record(),
         durable_through_record: index.durable_through_record(),
         parts: index.part_count(),
@@ -1042,6 +1062,7 @@ async fn resume_pool_index(
     index.clear_blocked().await.map_err(ApiError)?;
     Ok(Json(StatusBody {
         status: index.status().clone(),
+        indexed_from_record: index.indexed_from_record(),
         indexed_through_record: index.indexed_through_record(),
         durable_through_record: index.durable_through_record(),
         parts: index.part_count(),
@@ -1062,9 +1083,6 @@ async fn livez() -> StatusCode {
 }
 
 async fn readyz(State(state): State<SingleAppState>) -> StatusCode {
-    if !state.source_healthy.load(Ordering::Relaxed) {
-        return StatusCode::SERVICE_UNAVAILABLE;
-    }
     let mut index = state.index.lock().await;
     match index.refresh().await {
         Ok(()) if matches!(index.status(), IndexStatus::Ready) => StatusCode::NO_CONTENT,
@@ -1086,6 +1104,7 @@ async fn resume_index(State(state): State<SingleAppState>) -> Result<impl IntoRe
     index.clear_blocked().await.map_err(ApiError)?;
     Ok(Json(StatusBody {
         status: index.status().clone(),
+        indexed_from_record: index.indexed_from_record(),
         indexed_through_record: index.indexed_through_record(),
         durable_through_record: index.durable_through_record(),
         parts: index.part_count(),
@@ -1097,6 +1116,7 @@ async fn index_status(State(state): State<SingleAppState>) -> Result<impl IntoRe
     index.refresh().await.map_err(ApiError)?;
     Ok(Json(StatusBody {
         status: index.status().clone(),
+        indexed_from_record: index.indexed_from_record(),
         indexed_through_record: index.indexed_through_record(),
         durable_through_record: index.durable_through_record(),
         parts: index.part_count(),
@@ -1134,6 +1154,11 @@ async fn query_index(
         .await
         .map_err(ApiError)?;
     let mut headers = HeaderMap::new();
+    insert_u64_header(
+        &mut headers,
+        "indexed-from-record",
+        result.indexed_from_record,
+    )?;
     insert_u64_header(
         &mut headers,
         "indexed-through-record",
@@ -1197,8 +1222,6 @@ mod tests {
     )]
 
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::Ordering;
 
     use axum::body::Body;
     use axum::body::to_bytes;
@@ -1215,6 +1238,7 @@ mod tests {
     use ursula_index::FsObjectStore;
     use ursula_index::IndexCatalog;
     use ursula_index::IndexError;
+    use ursula_index::IndexRegistration;
     use ursula_index::ServerlessEventIndex;
 
     use super::PoolBackend;
@@ -1224,6 +1248,7 @@ mod tests {
     use super::is_deterministic_data_error;
     use super::pool_router;
     use super::process_pool_source;
+    use super::reconcile_pool_indexes;
 
     #[test]
     fn only_deterministic_source_data_errors_block_the_index() {
@@ -1272,7 +1297,7 @@ mod tests {
                 record: 1,
             })
             .await?;
-        let app = build_router(Arc::new(Mutex::new(index)), Arc::new(AtomicBool::new(true)));
+        let app = build_router(Arc::new(Mutex::new(index)));
         let response = app
             .oneshot(
                 Request::builder()
@@ -1291,8 +1316,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_endpoints_separate_process_liveness_from_source_readiness() -> anyhow::Result<()>
-    {
+    async fn health_endpoints_keep_query_readiness_independent_from_source_health()
+    -> anyhow::Result<()> {
         let objects = TempDir::new()?;
         let cache = TempDir::new()?;
         let index = ServerlessEventIndex::open_fs(
@@ -1307,8 +1332,7 @@ mod tests {
             },
         )
         .await?;
-        let source_healthy = Arc::new(AtomicBool::new(true));
-        let app = build_router(Arc::new(Mutex::new(index)), Arc::clone(&source_healthy));
+        let app = build_router(Arc::new(Mutex::new(index)));
 
         let response = app
             .clone()
@@ -1321,11 +1345,10 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-        source_healthy.store(false, Ordering::Relaxed);
         let response = app
             .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
             .await?;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
         Ok(())
     }
 
@@ -1337,16 +1360,16 @@ mod tests {
                 "/stream",
                 get(|request: axum::extract::Request| async move {
                     let query = request.uri().query().unwrap_or_default();
-                    let start = if query.contains("record=2") { 2 } else { 0 };
-                    let body = if start == 0 {
+                    let start = if query.contains("record=7") { 7 } else { 5 };
+                    let body = if start == 5 {
                         concat!(
-                            "{\"record\":0,\"value\":{\"captured_at\":\"2026-07-18T10:00:00Z\"}}\n",
-                            "{\"record\":1,\"value\":{\"captured_at\":\"2026-07-18T09:00:00Z\"}}\n"
+                            "{\"record\":5,\"value\":{\"captured_at\":\"2026-07-18T10:00:00Z\"}}\n",
+                            "{\"record\":6,\"value\":{\"captured_at\":\"2026-07-18T09:00:00Z\"}}\n"
                         )
                     } else {
                         concat!(
-                            "{\"record\":2,\"value\":{\"captured_at\":\"2026-07-18T11:00:00Z\"}}\n",
-                            "{\"record\":3,\"value\":{\"captured_at\":\"2026-07-18T08:00:00Z\"}}\n"
+                            "{\"record\":7,\"value\":{\"captured_at\":\"2026-07-18T11:00:00Z\"}}\n",
+                            "{\"record\":8,\"value\":{\"captured_at\":\"2026-07-18T08:00:00Z\"}}\n"
                         )
                     };
                     (
@@ -1363,8 +1386,8 @@ mod tests {
                         return (StatusCode::OK, [
                             ("content-type", "application/json"),
                             ("stream-extensions", "json-record-coordinates-v1"),
-                            ("stream-record-first", "0"),
-                            ("stream-record-next", "4"),
+                            ("stream-record-first", "5"),
+                            ("stream-record-next", "9"),
                         ])
                             .into_response();
                     }
@@ -1410,7 +1433,11 @@ mod tests {
             )
             .await?;
         assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 64 * 1024).await?;
+        let body: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(body["indexed_from_record"], 5);
         let registration = state.catalog.get("session-42").await?;
+        assert_eq!(registration.indexed_from_record, 5);
 
         process_pool_source(&state, &registration, "worker-a", 2, 60_000, 2).await?;
         process_pool_source(&state, &registration, "worker-b", 2, 60_000, 2).await?;
@@ -1422,12 +1449,52 @@ mod tests {
             )
             .await?;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["durable-through-record"], "4");
+        assert_eq!(response.headers()["indexed-from-record"], "5");
+        assert_eq!(response.headers()["durable-through-record"], "9");
         let body = to_bytes(response.into_body(), 64 * 1024).await?;
         let body: serde_json::Value = serde_json::from_slice(&body)?;
         assert_eq!(body["records"].as_array().map(Vec::len), Some(4));
 
         source_server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_unregistration_is_reconciled_in_every_pool_pod() -> anyhow::Result<()> {
+        let objects = TempDir::new()?;
+        let cache = TempDir::new()?;
+        let state = PoolState {
+            catalog: IndexCatalog::open_fs(FsObjectStore::new(objects.path())?),
+            backend: PoolBackend::Fs {
+                object_root: objects.path().to_path_buf(),
+            },
+            settings: PoolIndexSettings {
+                serving_cache: EventIndexCache::new(
+                    cache.path().join("serving"),
+                    16 * 1024 * 1024,
+                )?,
+                maintenance_cache: EventIndexCache::new(
+                    cache.path().join("maintenance"),
+                    16 * 1024 * 1024,
+                )?,
+                flush_entries: 2,
+                row_group_entries: 2,
+            },
+            indexes: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        };
+        let registration = IndexRegistration {
+            id: "removed-stream".to_owned(),
+            stream_url: "https://example.test/removed".to_owned(),
+            timestamp_field: "captured_at".to_owned(),
+            indexed_from_record: 0,
+        };
+        state.catalog.register(&registration).await?;
+        state.ensure_index(&registration).await?;
+        assert_eq!(state.indexes.read().await.len(), 1);
+
+        state.catalog.unregister(&registration.id).await?;
+        reconcile_pool_indexes(&state).await?;
+        assert!(state.indexes.read().await.is_empty());
         Ok(())
     }
 }
