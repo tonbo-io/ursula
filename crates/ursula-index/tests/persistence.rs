@@ -3,53 +3,25 @@
     reason = "integration tests combine fallible setup with assertions"
 )]
 
-use tempfile::TempDir;
-use ursula_index::EventEntry;
 use ursula_index::EventIndexConfig;
-use ursula_index::FsObjectStore;
 use ursula_index::IndexError;
 use ursula_index::IndexStatus;
 use ursula_index::QueryCursor;
-use ursula_index::ServerlessEventIndex;
 use ursula_index::SourceEnvelope;
 
-const CACHE_BYTES: u64 = 16 * 1024 * 1024;
+mod common;
+
+use common::entry;
+use common::open;
 
 fn config(flush_entries: usize) -> EventIndexConfig {
-    EventIndexConfig {
-        source_id: "persistence-test".to_owned(),
-        flush_entries,
-        row_group_entries: 2,
-        timestamp_field: "captured_at".to_owned(),
-    }
-}
-
-fn entry(record: u64, captured_at_ms: i64) -> EventEntry {
-    EventEntry {
-        captured_at_ms,
-        record,
-    }
-}
-
-async fn open(
-    objects: &TempDir,
-    cache: &TempDir,
-    config: EventIndexConfig,
-) -> Result<ServerlessEventIndex, IndexError> {
-    ServerlessEventIndex::open_fs(
-        FsObjectStore::new(objects.path())?,
-        cache.path(),
-        CACHE_BYTES,
-        config,
-    )
-    .await
+    common::config("persistence-test", flush_entries, 2)
 }
 
 #[tokio::test]
 async fn out_of_order_time_is_queryable_before_and_after_restart() -> anyhow::Result<()> {
-    let objects = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let mut index = open(&objects, &cache, config(3)).await?;
+    let (_objects, store) = common::fs_store()?;
+    let (_cache, mut index) = open(&store, config(3), 0).await?;
     index.ingest(entry(0, 300)).await?;
     index.ingest(entry(1, 100)).await?;
     index.ingest(entry(2, 100)).await?;
@@ -62,8 +34,7 @@ async fn out_of_order_time_is_queryable_before_and_after_restart() -> anyhow::Re
     ]);
     drop(index);
 
-    let fresh_cache = TempDir::new()?;
-    let mut reopened = open(&objects, &fresh_cache, config(3)).await?;
+    let (_fresh_cache, mut reopened) = open(&store, config(3), 0).await?;
     assert_eq!(reopened.query(0, 400, None, None, 10).await?.records, vec![
         entry(1, 100),
         entry(2, 100),
@@ -74,17 +45,15 @@ async fn out_of_order_time_is_queryable_before_and_after_restart() -> anyhow::Re
 
 #[tokio::test]
 async fn unflushed_entries_replay_from_the_durable_checkpoint() -> anyhow::Result<()> {
-    let objects = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let mut index = open(&objects, &cache, config(10)).await?;
+    let (_objects, store) = common::fs_store()?;
+    let (_cache, mut index) = open(&store, config(10), 0).await?;
     index.ingest(entry(0, 200)).await?;
     index.ingest(entry(1, 100)).await?;
     assert_eq!(index.indexed_through_record(), 2);
     assert_eq!(index.durable_through_record(), 0);
     drop(index);
 
-    let fresh_cache = TempDir::new()?;
-    let mut reopened = open(&objects, &fresh_cache, config(10)).await?;
+    let (_fresh_cache, mut reopened) = open(&store, config(10), 0).await?;
     assert_eq!(reopened.indexed_through_record(), 0);
     assert!(
         reopened
@@ -102,9 +71,8 @@ async fn unflushed_entries_replay_from_the_durable_checkpoint() -> anyhow::Resul
 
 #[tokio::test]
 async fn pagination_pins_a_record_watermark() -> anyhow::Result<()> {
-    let objects = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let mut index = open(&objects, &cache, config(10)).await?;
+    let (_objects, store) = common::fs_store()?;
+    let (_cache, mut index) = open(&store, config(10), 0).await?;
     index.ingest(entry(0, 100)).await?;
     index.ingest(entry(1, 200)).await?;
     let first = index.query(0, 1_000, None, None, 1).await?;
@@ -128,9 +96,8 @@ async fn pagination_pins_a_record_watermark() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn compaction_preserves_order_and_checkpoint() -> anyhow::Result<()> {
-    let objects = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let mut index = open(&objects, &cache, config(2)).await?;
+    let (_objects, store) = common::fs_store()?;
+    let (_cache, mut index) = open(&store, config(2), 0).await?;
     for (record, captured_at_ms) in [(0, 400), (1, 100), (2, 300), (3, 200)] {
         index.ingest(entry(record, captured_at_ms)).await?;
     }
@@ -148,9 +115,8 @@ async fn compaction_preserves_order_and_checkpoint() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn retention_gap_flushes_prefix_and_survives_restart() -> anyhow::Result<()> {
-    let objects = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let mut index = open(&objects, &cache, config(10)).await?;
+    let (_objects, store) = common::fs_store()?;
+    let (_cache, mut index) = open(&store, config(10), 0).await?;
     index.ingest(entry(0, 100)).await?;
     assert!(matches!(
         index.mark_retention_gap(5).await,
@@ -162,8 +128,7 @@ async fn retention_gap_flushes_prefix_and_survives_restart() -> anyhow::Result<(
     assert_eq!(index.durable_through_record(), 1);
     drop(index);
 
-    let fresh_cache = TempDir::new()?;
-    let mut reopened = open(&objects, &fresh_cache, config(10)).await?;
+    let (_fresh_cache, mut reopened) = open(&store, config(10), 0).await?;
     assert_eq!(reopened.status(), &IndexStatus::RetentionGap {
         expected_record: 1,
         first_available_record: 5,
@@ -177,9 +142,8 @@ async fn retention_gap_flushes_prefix_and_survives_restart() -> anyhow::Result<(
 
 #[tokio::test]
 async fn invalid_timestamp_does_not_advance_the_source_record() -> anyhow::Result<()> {
-    let objects = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let mut index = open(&objects, &cache, config(10)).await?;
+    let (_objects, store) = common::fs_store()?;
+    let (_cache, mut index) = open(&store, config(10), 0).await?;
     let result = index
         .ingest_envelope(SourceEnvelope {
             record: 0,
@@ -196,16 +160,14 @@ async fn invalid_timestamp_does_not_advance_the_source_record() -> anyhow::Resul
 
 #[tokio::test]
 async fn deterministic_source_error_can_be_persisted_as_blocked() -> anyhow::Result<()> {
-    let objects = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let mut index = open(&objects, &cache, config(10)).await?;
+    let (_objects, store) = common::fs_store()?;
+    let (_cache, mut index) = open(&store, config(10), 0).await?;
     index
         .mark_blocked(0, "invalid captured_at".to_owned())
         .await?;
     drop(index);
 
-    let fresh_cache = TempDir::new()?;
-    let mut reopened = open(&objects, &fresh_cache, config(10)).await?;
+    let (_fresh_cache, mut reopened) = open(&store, config(10), 0).await?;
     assert_eq!(reopened.status(), &IndexStatus::Blocked {
         record: 0,
         reason: "invalid captured_at".to_owned(),
@@ -219,27 +181,29 @@ async fn deterministic_source_error_can_be_persisted_as_blocked() -> anyhow::Res
 
 #[tokio::test]
 async fn manifest_is_bound_to_one_source_stream() -> anyhow::Result<()> {
-    let objects = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let mut index = open(&objects, &cache, config(1)).await?;
+    let (_objects, store) = common::fs_store()?;
+    let (_cache, mut index) = open(&store, config(1), 0).await?;
     index.ingest(entry(0, 100)).await?;
     drop(index);
 
-    let other_cache = TempDir::new()?;
     let mut other = config(1);
     other.source_id = "another-stream".to_owned();
-    assert!(matches!(
-        open(&objects, &other_cache, other).await,
-        Err(IndexError::SourceMismatch { .. })
-    ));
+    let error = open(&store, other, 0)
+        .await
+        .err()
+        .ok_or_else(|| anyhow::anyhow!("expected source mismatch"))?;
+    assert!(
+        error
+            .downcast_ref::<IndexError>()
+            .is_some_and(|error| matches!(error, IndexError::SourceMismatch { .. }))
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn corrupt_referenced_part_is_rejected_on_query() -> anyhow::Result<()> {
-    let objects = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let mut index = open(&objects, &cache, config(1)).await?;
+    let (objects, store) = common::fs_store()?;
+    let (_cache, mut index) = open(&store, config(1), 0).await?;
     index.ingest(entry(0, 100)).await?;
     drop(index);
 
@@ -256,8 +220,7 @@ async fn corrupt_referenced_part_is_rejected_on_query() -> anyhow::Result<()> {
         .open(part)?
         .set_len(8)?;
 
-    let fresh_cache = TempDir::new()?;
-    let mut reopened = open(&objects, &fresh_cache, config(1)).await?;
+    let (_fresh_cache, mut reopened) = open(&store, config(1), 0).await?;
     let _error = reopened
         .query(0, 200, None, None, 10)
         .await
