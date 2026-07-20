@@ -39,7 +39,7 @@ OpenTofu loads the ignored `backend.tf` and `terraform.tfvars` automatically. `t
 
 OpenTofu exposes the small set of capacity decisions that affect AWS or the production baseline: node instance types and counts, voter cores and memory, Raft group count and PVC size, and gateway/indexer replicas. Keep workload-specific or experimental tuning in a second Helm values file passed after `generated-values.yaml`.
 
-For a published chart, replace `../../charts/ursula` with `oci://ghcr.io/tonbo-io/charts/ursula --version 0.2.0`.
+For a published chart, replace `../../charts/ursula` with `oci://ghcr.io/tonbo-io/charts/ursula --version 0.3.0`.
 
 ## Destroy
 
