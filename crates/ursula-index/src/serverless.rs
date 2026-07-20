@@ -298,11 +298,7 @@ impl LocalCache {
             });
         }
         let mut budget = self.budget.lock().await;
-        let pins = self
-            .pins
-            .lock()
-            .map_err(|_error| IndexError::LockPoisoned)?
-            .clone();
+        let pins = Arc::clone(&self.pins);
         let root = self.root.clone();
         let max_bytes = self.max_bytes;
         let reserved_bytes = budget.reserved_bytes;
@@ -363,7 +359,7 @@ fn make_cache_room(
     incoming: u64,
     reserved: u64,
     protected: Option<&Path>,
-    pins: &HashMap<PathBuf, usize>,
+    pins: &Arc<Mutex<HashMap<PathBuf, usize>>>,
 ) -> Result<(), IndexError> {
     let mut files = Vec::new();
     let mut total = 0_u64;
@@ -375,7 +371,11 @@ fn make_cache_room(
         }
         let metadata = entry.metadata()?;
         total = total.saturating_add(metadata.len());
-        if pins.contains_key(&path) {
+        if pins
+            .lock()
+            .map_err(|_error| IndexError::LockPoisoned)?
+            .contains_key(&path)
+        {
             continue;
         }
         files.push((
@@ -389,10 +389,8 @@ fn make_cache_room(
         if total.saturating_add(reserved).saturating_add(incoming) <= max_bytes {
             break;
         }
-        match fs::remove_file(path) {
-            Ok(()) => total = total.saturating_sub(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        if remove_cache_file_if_unpinned(&path, pins)? {
+            total = total.saturating_sub(bytes);
         }
     }
     if total.saturating_add(reserved).saturating_add(incoming) > max_bytes {
@@ -402,6 +400,21 @@ fn make_cache_room(
         });
     }
     Ok(())
+}
+
+fn remove_cache_file_if_unpinned(
+    path: &Path,
+    pins: &Arc<Mutex<HashMap<PathBuf, usize>>>,
+) -> Result<bool, IndexError> {
+    let pins = pins.lock().map_err(|_error| IndexError::LockPoisoned)?;
+    if pins.contains_key(path) {
+        return Ok(false);
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn pin_locked(
@@ -1537,6 +1550,7 @@ mod tests {
     use super::LocalCache;
     use super::eligible_for_gc;
     use super::pin_locked;
+    use super::remove_cache_file_if_unpinned;
     use crate::IndexError;
 
     #[test]
@@ -1572,6 +1586,26 @@ mod tests {
         drop(guard);
         cache.reserve(6, &incoming).await?;
         cache.release_reservation(6).await;
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "the test combines fallible setup with assertions"
+    )]
+    fn eviction_rechecks_a_new_pin_immediately_before_unlink() -> anyhow::Result<()> {
+        let directory = tempfile::TempDir::new()?;
+        let cache = LocalCache::new(directory.path(), 10)?;
+        let path = directory.path().join("part.parquet");
+        fs::write(&path, [0_u8; 6])?;
+        let guard = cache.pin(path.clone())?;
+
+        assert!(!remove_cache_file_if_unpinned(&path, &cache.pins)?);
+        assert!(path.exists());
+        drop(guard);
+        assert!(remove_cache_file_if_unpinned(&path, &cache.pins)?);
         assert!(!path.exists());
         Ok(())
     }
