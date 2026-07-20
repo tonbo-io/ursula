@@ -6,49 +6,41 @@ mod human_tests {
     use crate::human::HumanSize;
 
     #[test]
-    fn human_duration_from_str_seconds() {
-        assert_eq!(
-            "30s".parse::<HumanDuration>().unwrap().as_duration(),
-            Duration::from_secs(30)
-        );
+    fn human_duration_parses_valid_inputs() {
+        let cases: &[(&str, Duration)] = &[
+            ("30s", Duration::from_secs(30)),
+            ("250ms", Duration::from_millis(250)),
+            ("2h", Duration::from_secs(7200)),
+            ("1d", Duration::from_secs(86400)),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                input.parse::<HumanDuration>().unwrap().as_duration(),
+                *expected,
+                "input {input:?}"
+            );
+        }
     }
 
     #[test]
-    fn human_duration_from_str_milliseconds() {
-        assert_eq!(
-            "250ms".parse::<HumanDuration>().unwrap().as_duration(),
-            Duration::from_millis(250)
-        );
+    fn human_duration_rejects_invalid_inputs() {
+        for input in ["1.5ms", "30x", "-1s"] {
+            assert!(
+                input.parse::<HumanDuration>().is_err(),
+                "input {input:?} should be rejected"
+            );
+        }
     }
 
     #[test]
-    fn human_duration_from_integer() {
+    fn human_duration_from_toml_values() {
         let raw: toml::Value = toml::Value::Integer(30000);
         let dur: HumanDuration = raw.try_into().unwrap();
         assert_eq!(dur.as_duration(), Duration::from_millis(30000));
-    }
 
-    #[test]
-    fn human_size_from_str_mib() {
-        assert_eq!(
-            "256MiB".parse::<HumanSize>().unwrap().as_bytes(),
-            256 * 1024 * 1024
-        );
-    }
-
-    #[test]
-    fn human_size_from_str_gib() {
-        assert_eq!(
-            "1.5GiB".parse::<HumanSize>().unwrap().as_bytes(),
-            (1.5 * 1024.0 * 1024.0 * 1024.0) as u64
-        );
-    }
-
-    #[test]
-    fn human_size_from_integer() {
-        let raw: toml::Value = toml::Value::Integer(67108864);
-        let size: HumanSize = raw.try_into().unwrap();
-        assert_eq!(size.as_bytes(), 67108864);
+        let raw: toml::Value = toml::Value::String("5m".into());
+        let dur: HumanDuration = raw.try_into().unwrap();
+        assert_eq!(dur.as_duration(), Duration::from_secs(300));
     }
 
     #[test]
@@ -65,34 +57,43 @@ mod human_tests {
     }
 
     #[test]
-    fn human_duration_rejects_decimal_ms() {
-        assert!("1.5ms".parse::<HumanDuration>().is_err());
+    fn human_size_parses_valid_inputs() {
+        let cases: &[(&str, u64)] = &[
+            ("100B", 100),
+            ("1KiB", 1024),
+            ("1MiB", 1024 * 1024),
+            ("1GiB", 1024 * 1024 * 1024),
+            ("256MiB", 256 * 1024 * 1024),
+            ("1.5GiB", (1.5 * 1024.0 * 1024.0 * 1024.0) as u64),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                input.parse::<HumanSize>().unwrap().as_bytes(),
+                *expected,
+                "input {input:?}"
+            );
+        }
     }
 
     #[test]
-    fn human_duration_rejects_invalid_unit() {
-        assert!("30x".parse::<HumanDuration>().is_err());
+    fn human_size_rejects_invalid_inputs() {
+        for input in ["30x", "-1MiB", "99999999999999999999GiB"] {
+            assert!(
+                input.parse::<HumanSize>().is_err(),
+                "input {input:?} should be rejected"
+            );
+        }
     }
 
     #[test]
-    fn human_duration_rejects_negative() {
-        assert!("-1s".parse::<HumanDuration>().is_err());
-    }
+    fn human_size_from_toml_values() {
+        let raw: toml::Value = toml::Value::Integer(67108864);
+        let size: HumanSize = raw.try_into().unwrap();
+        assert_eq!(size.as_bytes(), 67108864);
 
-    #[test]
-    fn human_duration_parses_hours() {
-        assert_eq!(
-            "2h".parse::<HumanDuration>().unwrap().as_duration(),
-            Duration::from_secs(7200)
-        );
-    }
-
-    #[test]
-    fn human_duration_parses_days() {
-        assert_eq!(
-            "1d".parse::<HumanDuration>().unwrap().as_duration(),
-            Duration::from_secs(86400)
-        );
+        let raw: toml::Value = toml::Value::String("128MiB".into());
+        let size: HumanSize = raw.try_into().unwrap();
+        assert_eq!(size.as_bytes(), 128 * 1024 * 1024);
     }
 
     #[test]
@@ -103,46 +104,6 @@ mod human_tests {
             size.to_string().parse::<HumanSize>().unwrap().as_bytes(),
             1024 * 1024 * 1024
         );
-    }
-
-    #[test]
-    fn human_size_rejects_invalid_unit() {
-        assert!("30x".parse::<HumanSize>().is_err());
-    }
-
-    #[test]
-    fn human_size_rejects_negative() {
-        assert!("-1MiB".parse::<HumanSize>().is_err());
-    }
-
-    #[test]
-    fn human_size_parses_all_units() {
-        assert_eq!("100B".parse::<HumanSize>().unwrap().as_bytes(), 100);
-        assert_eq!("1KiB".parse::<HumanSize>().unwrap().as_bytes(), 1024);
-        assert_eq!("1MiB".parse::<HumanSize>().unwrap().as_bytes(), 1024 * 1024);
-        assert_eq!(
-            "1GiB".parse::<HumanSize>().unwrap().as_bytes(),
-            1024 * 1024 * 1024
-        );
-    }
-
-    #[test]
-    fn human_size_rejects_overflow() {
-        assert!("99999999999999999999GiB".parse::<HumanSize>().is_err());
-    }
-
-    #[test]
-    fn human_duration_from_toml_string() {
-        let raw: toml::Value = toml::Value::String("5m".into());
-        let dur: HumanDuration = raw.try_into().unwrap();
-        assert_eq!(dur.as_duration(), Duration::from_secs(300));
-    }
-
-    #[test]
-    fn human_size_from_toml_string() {
-        let raw: toml::Value = toml::Value::String("128MiB".into());
-        let size: HumanSize = raw.try_into().unwrap();
-        assert_eq!(size.as_bytes(), 128 * 1024 * 1024);
     }
 }
 
@@ -309,11 +270,23 @@ mod load_tests {
     use crate::load::load_config;
     use crate::preset::Preset;
 
+    /// Write `contents` to a fresh temp file with the given suffix.
+    fn temp_config(suffix: &str, contents: &str) -> tempfile::NamedTempFile {
+        let mut tmp = tempfile::NamedTempFile::with_suffix(suffix).unwrap();
+        write!(tmp, "{contents}").unwrap();
+        tmp
+    }
+
+    fn available_cores() -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    }
+
     #[test]
     fn load_minimal_config_without_preset() {
-        let mut tmp = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
-        write!(
-            tmp,
+        let tmp = temp_config(
+            ".toml",
             r#"
 [server]
 listen = "127.0.0.1:4437"
@@ -326,9 +299,8 @@ group_count = 16
 
 [raft.wal]
 backend = "memory"
-"#
-        )
-        .unwrap();
+"#,
+        );
         let config = load_config(Some(tmp.path()), None, Some(1)).unwrap();
         assert_eq!(config.runtime.core_count, 4);
         assert_eq!(config.raft.node_id, 1);
@@ -337,37 +309,29 @@ backend = "memory"
 
     #[test]
     fn preset_tiny_overrides_defaults() {
-        let mut tmp = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
-        write!(
-            tmp,
+        let tmp = temp_config(
+            ".toml",
             r#"
 [server]
 listen = "127.0.0.1:4437"
-"#
-        )
-        .unwrap();
+"#,
+        );
         let config = load_config(Some(tmp.path()), Some(Preset::Tiny), Some(1)).unwrap();
-        assert_eq!(
-            config.runtime.core_count,
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-        ); // preset no longer overrides core_count
+        // preset no longer overrides core_count
+        assert_eq!(config.runtime.core_count, available_cores());
         assert_eq!(config.raft.group_count, 64); // from tiny preset
         assert_eq!(config.raft.wal.backend, WalBackend::Memory); // from tiny preset
     }
 
     #[test]
     fn user_config_overrides_preset() {
-        let mut tmp = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
-        write!(
-            tmp,
+        let tmp = temp_config(
+            ".toml",
             r#"
 [runtime]
 core_count = 2
-"#
-        )
-        .unwrap();
+"#,
+        );
         let config = load_config(Some(tmp.path()), Some(Preset::Tiny), Some(1)).unwrap();
         assert_eq!(config.runtime.core_count, 2); // user overrides preset's 4
         assert_eq!(config.raft.group_count, 64); // preset still applies
@@ -375,15 +339,13 @@ core_count = 2
 
     #[test]
     fn validation_rejects_disk_without_path() {
-        let mut tmp = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
-        write!(
-            tmp,
+        let tmp = temp_config(
+            ".toml",
             r#"
 [raft.wal]
 backend = "disk"
-"#
-        )
-        .unwrap();
+"#,
+        );
         let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -394,15 +356,13 @@ backend = "disk"
 
     #[test]
     fn validation_rejects_s3_without_bucket() {
-        let mut tmp = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
-        write!(
-            tmp,
+        let tmp = temp_config(
+            ".toml",
             r#"
 [storage.cold]
 backend = "s3"
-"#
-        )
-        .unwrap();
+"#,
+        );
         let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("bucket"), "error should mention bucket: {msg}");
@@ -410,15 +370,13 @@ backend = "s3"
 
     #[test]
     fn nested_table_merge() {
-        let mut tmp = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
-        write!(
-            tmp,
+        let tmp = temp_config(
+            ".toml",
             r#"
 [storage.cold.cache]
 max_size = "128MiB"
-"#
-        )
-        .unwrap();
+"#,
+        );
         let config = load_config(Some(tmp.path()), Some(Preset::Tiny), Some(1)).unwrap();
         // tiny preset sets cache.max_size = "64MiB", user overrides to "128MiB"
         assert_eq!(
@@ -438,9 +396,8 @@ max_size = "128MiB"
 
     #[test]
     fn array_replacement_not_append() {
-        let mut tmp = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
-        write!(
-            tmp,
+        let tmp = temp_config(
+            ".toml",
             r#"
 [[raft.peers]]
 node_id = 1
@@ -449,9 +406,8 @@ url = "http://10.0.0.1:4437"
 [[raft.peers]]
 node_id = 2
 url = "http://10.0.0.2:4437"
-"#
-        )
-        .unwrap();
+"#,
+        );
         let config = load_config(Some(tmp.path()), None, Some(1)).unwrap();
         assert_eq!(config.raft.peers.len(), 2);
         assert_eq!(config.raft.peers[0].node_id, 1);
@@ -460,15 +416,13 @@ url = "http://10.0.0.2:4437"
 
     #[test]
     fn node_id_from_cli_overrides_file() {
-        let mut tmp = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
-        write!(
-            tmp,
+        let tmp = temp_config(
+            ".toml",
             r#"
 [raft]
 node_id = 1
-"#
-        )
-        .unwrap();
+"#,
+        );
         // CLI --node-id 42 overrides file's node_id = 1
         let config = load_config(Some(tmp.path()), None, Some(42)).unwrap();
         assert_eq!(config.raft.node_id, 42);
@@ -476,15 +430,13 @@ node_id = 1
 
     #[test]
     fn validation_rejects_missing_node_id() {
-        let mut tmp = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
-        write!(
-            tmp,
+        let tmp = temp_config(
+            ".toml",
             r#"
 [server]
 listen = "127.0.0.1:4437"
-"#
-        )
-        .unwrap();
+"#,
+        );
         let err = load_config(Some(tmp.path()), None, None).unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -550,9 +502,8 @@ listen = "127.0.0.1:4437"
 
     #[test]
     fn load_yaml_config() {
-        let mut tmp = tempfile::NamedTempFile::with_suffix(".yaml").unwrap();
-        write!(
-            tmp,
+        let tmp = temp_config(
+            ".yaml",
             r#"
 server:
   listen: "127.0.0.1:4437"
@@ -565,9 +516,8 @@ raft:
   init_membership: false
   wal:
     backend: "memory"
-"#
-        )
-        .unwrap();
+"#,
+        );
         let config = load_config(Some(tmp.path()), None, Some(1)).unwrap();
         assert_eq!(config.server.listen, "127.0.0.1:4437");
         assert_eq!(config.runtime.core_count, 8);
@@ -577,18 +527,16 @@ raft:
 
     #[test]
     fn yaml_preset_merge() {
-        let mut tmp = tempfile::NamedTempFile::with_suffix(".yml").unwrap();
-        write!(
-            tmp,
+        let tmp = temp_config(
+            ".yml",
             r#"
 server:
   listen: "0.0.0.0:4437"
 
 runtime:
   core_count: 2
-"#
-        )
-        .unwrap();
+"#,
+        );
         let config = load_config(Some(tmp.path()), Some(Preset::Standard), Some(1)).unwrap();
         // user overrides
         assert_eq!(config.server.listen, "0.0.0.0:4437");
@@ -600,8 +548,7 @@ runtime:
 
     #[test]
     fn yaml_rejects_non_mapping_top_level() {
-        let mut tmp = tempfile::NamedTempFile::with_suffix(".yaml").unwrap();
-        writeln!(tmp, "42").unwrap();
+        let tmp = temp_config(".yaml", "42\n");
         let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -612,28 +559,26 @@ runtime:
 
     #[test]
     fn load_json_config() {
-        let mut tmp = tempfile::NamedTempFile::with_suffix(".json").unwrap();
-        write!(
-            tmp,
-            r#"{{
-  "server": {{ "listen": "127.0.0.1:4437" }},
-  "runtime": {{ "core_count": 8 }},
-  "raft": {{
+        let tmp = temp_config(
+            ".json",
+            r#"{
+  "server": { "listen": "127.0.0.1:4437" },
+  "runtime": { "core_count": 8 },
+  "raft": {
     "group_count": 128,
     "init_membership_per_group": false,
     "peers": [
-      {{ "node_id": 1, "url": "http://10.0.0.1:4437" }},
-      {{ "node_id": 2, "url": "http://10.0.0.2:4437" }}
+      { "node_id": 1, "url": "http://10.0.0.1:4437" },
+      { "node_id": 2, "url": "http://10.0.0.2:4437" }
     ],
-    "wal": {{ "backend": "memory" }}
-  }},
-  "storage": {{
-    "cold": {{ "backend": "none" }},
-    "snapshot": {{ "backend": "inline" }}
-  }}
-}}"#
-        )
-        .unwrap();
+    "wal": { "backend": "memory" }
+  },
+  "storage": {
+    "cold": { "backend": "none" },
+    "snapshot": { "backend": "inline" }
+  }
+}"#,
+        );
         let config = load_config(Some(tmp.path()), None, Some(1)).unwrap();
         assert_eq!(config.server.listen, "127.0.0.1:4437");
         assert_eq!(config.runtime.core_count, 8);
@@ -644,23 +589,21 @@ runtime:
 
     #[test]
     fn json_preset_merge() {
-        let mut tmp = tempfile::NamedTempFile::with_suffix(".json").unwrap();
-        write!(
-            tmp,
-            r#"{{
-  "server": {{ "listen": "0.0.0.0:4437" }},
-  "runtime": {{ "core_count": 2 }},
-  "raft": {{
-    "peers": [{{ "node_id": 1, "url": "http://10.0.0.1:4437" }}],
-    "wal": {{ "backend": "memory" }}
-  }},
-  "storage": {{
-    "cold": {{ "backend": "none" }},
-    "snapshot": {{ "backend": "inline" }}
-  }}
-}}"#
-        )
-        .unwrap();
+        let tmp = temp_config(
+            ".json",
+            r#"{
+  "server": { "listen": "0.0.0.0:4437" },
+  "runtime": { "core_count": 2 },
+  "raft": {
+    "peers": [{ "node_id": 1, "url": "http://10.0.0.1:4437" }],
+    "wal": { "backend": "memory" }
+  },
+  "storage": {
+    "cold": { "backend": "none" },
+    "snapshot": { "backend": "inline" }
+  }
+}"#,
+        );
         let config = load_config(Some(tmp.path()), Some(Preset::Standard), Some(1)).unwrap();
         // user overrides
         assert_eq!(config.server.listen, "0.0.0.0:4437");
@@ -673,12 +616,7 @@ runtime:
     #[test]
     fn preset_alone_without_config_file() {
         let config = load_config(None, Some(Preset::Tiny), Some(1)).unwrap();
-        assert_eq!(
-            config.runtime.core_count,
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-        );
+        assert_eq!(config.runtime.core_count, available_cores());
         assert_eq!(config.raft.group_count, 64);
         assert_eq!(config.raft.node_id, 1);
         assert_eq!(
@@ -695,74 +633,50 @@ runtime:
     }
 
     #[test]
-    fn preset_tiny_matches_legacy_profile() {
-        let config = load_config(None, Some(Preset::Tiny), Some(1)).unwrap();
-        assert_eq!(
-            config.runtime.core_count,
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-        );
-        assert_eq!(config.runtime.live_read_max_waiters_per_core, Some(8_192));
-        assert_eq!(config.raft.group_count, 64);
-        assert_eq!(
-            config
-                .raft
-                .max_uncommitted_size_per_group
-                .unwrap()
-                .as_bytes(),
-            8 * 1024 * 1024
-        );
-        assert_eq!(
-            config.server.http_inflight_body_size.as_bytes(),
-            64 * 1024 * 1024
-        );
-        assert_eq!(config.storage.cold.flush_size.as_bytes(), 4 * 1024 * 1024);
-        assert_eq!(config.storage.cold.flush_max_concurrency, 2);
-        assert_eq!(
-            config
-                .storage
-                .cold
-                .max_hot_size_per_group
-                .unwrap()
-                .as_bytes(),
-            8 * 1024 * 1024
-        );
-    }
-
-    #[test]
-    fn preset_standard_matches_legacy_profile() {
-        let config = load_config(None, Some(Preset::Standard), Some(1)).unwrap();
-        assert_eq!(
-            config.runtime.core_count,
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-        );
-        assert_eq!(config.runtime.live_read_max_waiters_per_core, Some(65_536));
-        assert_eq!(config.raft.group_count, 256);
-        assert_eq!(
-            config
-                .raft
-                .max_uncommitted_size_per_group
-                .unwrap()
-                .as_bytes(),
-            64 * 1024 * 1024
-        );
-        assert_eq!(
-            config.server.http_inflight_body_size.as_bytes(),
-            256 * 1024 * 1024
-        );
-        assert_eq!(config.storage.cold.flush_size.as_bytes(), 8 * 1024 * 1024);
-        assert_eq!(config.storage.cold.flush_max_concurrency, 4);
-        assert_eq!(
-            config
-                .storage
-                .cold
-                .max_hot_size_per_group
-                .unwrap()
-                .as_bytes(),
-            64 * 1024 * 1024
-        );
+    fn presets_match_legacy_profiles() {
+        let mib = |n: u64| n * 1024 * 1024;
+        // (preset, name, (live_read_waiters, group_count, uncommitted_bytes,
+        //  http_inflight_bytes, flush_bytes, flush_concurrency, hot_bytes))
+        let cases = [
+            (
+                Preset::Tiny,
+                "tiny",
+                (Some(8_192), 64, mib(8), mib(64), mib(4), 2, mib(8)),
+            ),
+            (
+                Preset::Standard,
+                "standard",
+                (Some(65_536), 256, mib(64), mib(256), mib(8), 4, mib(64)),
+            ),
+        ];
+        for (preset, name, expected) in cases {
+            let config = load_config(None, Some(preset), Some(1)).unwrap();
+            assert_eq!(
+                config.runtime.core_count,
+                available_cores(),
+                "preset {name}: core_count"
+            );
+            let actual = (
+                config.runtime.live_read_max_waiters_per_core,
+                config.raft.group_count,
+                config
+                    .raft
+                    .max_uncommitted_size_per_group
+                    .unwrap()
+                    .as_bytes(),
+                config.server.http_inflight_body_size.as_bytes(),
+                config.storage.cold.flush_size.as_bytes(),
+                config.storage.cold.flush_max_concurrency,
+                config
+                    .storage
+                    .cold
+                    .max_hot_size_per_group
+                    .unwrap()
+                    .as_bytes(),
+            );
+            // Tuple order: (live_read_waiters, group_count, uncommitted,
+            // http_inflight, flush_size, flush_concurrency, max_hot_size).
+            assert_eq!(actual, expected, "preset {name}");
+        }
     }
 }
