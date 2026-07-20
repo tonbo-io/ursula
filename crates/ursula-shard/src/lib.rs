@@ -67,28 +67,17 @@ pub struct ShardPlacement {
     pub raft_group_id: RaftGroupId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ShardMapError {
+    #[error("core_count must be greater than zero")]
     ZeroCores,
+    #[error("raft_group_count must be greater than zero")]
     ZeroRaftGroups,
+    #[error("core_count {0} does not fit into u16")]
     TooManyCores(usize),
+    #[error("raft_group_count {0} does not fit into u32")]
     TooManyRaftGroups(usize),
 }
-
-impl fmt::Display for ShardMapError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ZeroCores => f.write_str("core_count must be greater than zero"),
-            Self::ZeroRaftGroups => f.write_str("raft_group_count must be greater than zero"),
-            Self::TooManyCores(value) => write!(f, "core_count {value} does not fit into u16"),
-            Self::TooManyRaftGroups(value) => {
-                write!(f, "raft_group_count {value} does not fit into u32")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ShardMapError {}
 
 #[derive(Debug, Clone)]
 pub struct StaticShardMap {

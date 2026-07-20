@@ -17,51 +17,64 @@ pub enum ErrorStatus {
     Persistent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeError {
-    InvalidConfig(ShardMapError),
+    #[error("invalid shard runtime config: {0}")]
+    InvalidConfig(#[from] ShardMapError),
+    #[error("raft group {} is outside configured range 0..{raft_group_count}", .raft_group_id.0)]
     InvalidRaftGroup {
         raft_group_id: RaftGroupId,
         raft_group_count: u32,
     },
+    #[error(
+        "snapshot placement for raft group {} is core {}, expected core {}",
+        .actual.raft_group_id.0,
+        .actual.core_id.0,
+        .expected.core_id.0
+    )]
     SnapshotPlacementMismatch {
         expected: ShardPlacement,
         actual: ShardPlacement,
     },
+    #[error("append payload must be non-empty")]
     EmptyAppend,
-    ColdStoreConfig {
-        message: String,
-    },
-    StaticMembershipConfig {
-        message: String,
-    },
-    ColdStoreIo {
-        message: String,
-    },
+    #[error("invalid cold store config: {message}")]
+    ColdStoreConfig { message: String },
+    #[error("invalid static Raft membership config: {message}")]
+    StaticMembershipConfig { message: String },
+    #[error("cold store IO error: {message}")]
+    ColdStoreIo { message: String },
+    #[error(
+        "core {} live read waiters at {current_waiters} would exceed limit {limit}",
+        .core_id.0
+    )]
     LiveReadBackpressure {
         core_id: CoreId,
         current_waiters: u64,
         limit: u64,
     },
+    #[error("core {} does not host raft group {}", .core_id.0, .raft_group_id.0)]
     GroupNotHosted {
         core_id: CoreId,
         raft_group_id: RaftGroupId,
     },
+    #[error(
+        "core {} raft group {} operation failed: {}",
+        .core_id.0,
+        .raft_group_id.0,
+        .error.message()
+    )]
     GroupEngine {
         core_id: CoreId,
         raft_group_id: RaftGroupId,
         error: GroupEngineError,
     },
-    MailboxClosed {
-        core_id: CoreId,
-    },
-    ResponseDropped {
-        core_id: CoreId,
-    },
-    SpawnCoreThread {
-        core_id: CoreId,
-        message: String,
-    },
+    #[error("core {} mailbox is closed", .core_id.0)]
+    MailboxClosed { core_id: CoreId },
+    #[error("core {} dropped append response", .core_id.0)]
+    ResponseDropped { core_id: CoreId },
+    #[error("failed to spawn core {} thread: {message}", .core_id.0)]
+    SpawnCoreThread { core_id: CoreId, message: String },
 }
 
 impl RuntimeError {
@@ -114,80 +127,5 @@ impl RuntimeError {
             Self::GroupEngine { .. } => ErrorStatus::Persistent,
             _ => ErrorStatus::Permanent,
         }
-    }
-}
-
-impl std::fmt::Display for RuntimeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidConfig(err) => write!(f, "invalid shard runtime config: {err}"),
-            Self::InvalidRaftGroup {
-                raft_group_id,
-                raft_group_count,
-            } => write!(
-                f,
-                "raft group {} is outside configured range 0..{}",
-                raft_group_id.0, raft_group_count
-            ),
-            Self::SnapshotPlacementMismatch { expected, actual } => write!(
-                f,
-                "snapshot placement for raft group {} is core {}, expected core {}",
-                actual.raft_group_id.0, actual.core_id.0, expected.core_id.0
-            ),
-            Self::EmptyAppend => f.write_str("append payload must be non-empty"),
-            Self::ColdStoreConfig { message } => {
-                write!(f, "invalid cold store config: {message}")
-            }
-            Self::StaticMembershipConfig { message } => {
-                write!(f, "invalid static Raft membership config: {message}")
-            }
-            Self::ColdStoreIo { message } => write!(f, "cold store IO error: {message}"),
-            Self::LiveReadBackpressure {
-                core_id,
-                current_waiters,
-                limit,
-            } => write!(
-                f,
-                "core {} live read waiters at {} would exceed limit {}",
-                core_id.0, current_waiters, limit
-            ),
-            Self::GroupNotHosted {
-                core_id,
-                raft_group_id,
-            } => write!(
-                f,
-                "core {} does not host raft group {}",
-                core_id.0, raft_group_id.0
-            ),
-            Self::GroupEngine {
-                core_id,
-                raft_group_id,
-                error,
-                ..
-            } => write!(
-                f,
-                "core {} raft group {} operation failed: {}",
-                core_id.0,
-                raft_group_id.0,
-                error.message()
-            ),
-            Self::MailboxClosed { core_id } => {
-                write!(f, "core {} mailbox is closed", core_id.0)
-            }
-            Self::ResponseDropped { core_id } => {
-                write!(f, "core {} dropped append response", core_id.0)
-            }
-            Self::SpawnCoreThread { core_id, message } => {
-                write!(f, "failed to spawn core {} thread: {message}", core_id.0)
-            }
-        }
-    }
-}
-
-impl std::error::Error for RuntimeError {}
-
-impl From<ShardMapError> for RuntimeError {
-    fn from(value: ShardMapError) -> Self {
-        Self::InvalidConfig(value)
     }
 }

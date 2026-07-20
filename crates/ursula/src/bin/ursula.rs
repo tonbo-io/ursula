@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use tokio::sync::Notify;
 use ursula::HttpState;
 use ursula::Persistence;
 use ursula::Topology;
@@ -15,6 +16,8 @@ use ursula::spawn_runtime;
 use ursula_config::Preset;
 use ursula_config::find_default_config;
 use ursula_config::load_config;
+use ursula_observability::serve::serve_until_shutdown;
+use ursula_observability::serve::shutdown_signal;
 use ursula_shard::RaftGroupId;
 
 #[cfg(not(feature = "jemalloc-prof"))]
@@ -225,7 +228,7 @@ async fn serve(
         .transpose()?;
     let admin_listen: SocketAddr = config.server.admin_listen.parse()?;
 
-    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown = Arc::new(Notify::new());
     spawn_shutdown_signal_task(shutdown.clone());
 
     let admin_app = ursula::admin_router(state.clone());
@@ -233,7 +236,8 @@ async fn serve(
     let admin_task = tokio::spawn(serve_until_shutdown(
         admin_listener,
         admin_app,
-        shutdown.clone(),
+        notified(shutdown.clone()),
+        None,
     ));
 
     if let Some(cluster_addr) = cluster_listen {
@@ -247,12 +251,14 @@ async fn serve(
         let client_task = tokio::spawn(serve_until_shutdown(
             client_listener,
             client_app,
-            shutdown.clone(),
+            notified(shutdown.clone()),
+            None,
         ));
         let cluster_task = tokio::spawn(serve_until_shutdown(
             cluster_listener,
             cluster_app,
-            shutdown,
+            notified(shutdown),
+            None,
         ));
         let (client_res, cluster_res, admin_res) =
             tokio::try_join!(client_task, cluster_task, admin_task)?;
@@ -265,7 +271,12 @@ async fn serve(
             ursula::IngressAdmission::new(&config.server),
         ));
         let listener = tokio::net::TcpListener::bind(listen).await?;
-        let serve_task = tokio::spawn(serve_until_shutdown(listener, app, shutdown));
+        let serve_task = tokio::spawn(serve_until_shutdown(
+            listener,
+            app,
+            notified(shutdown),
+            None,
+        ));
         let (serve_res, admin_res) = tokio::try_join!(serve_task, admin_task)?;
         serve_res?;
         admin_res?;
@@ -274,16 +285,10 @@ async fn serve(
     Ok(())
 }
 
-/// Serve one listener until the shared shutdown notification fires, then stop
-/// accepting and drain in-flight requests before returning.
-async fn serve_until_shutdown(
-    listener: tokio::net::TcpListener,
-    app: axum::Router,
-    shutdown: Arc<tokio::sync::Notify>,
-) -> Result<(), std::io::Error> {
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move { shutdown.notified().await })
-        .await
+/// Adapt the shared shutdown [`Notify`] into an owned future for
+/// [`serve_until_shutdown`].
+async fn notified(shutdown: Arc<Notify>) {
+    shutdown.notified().await;
 }
 
 /// Grace period between the first shutdown signal and a forced exit, so a hung
@@ -295,15 +300,15 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 /// into one graceful-shutdown notification. A second signal, or the grace
 /// deadline expiring, exits immediately: quorum replication and the WAL make
 /// abrupt exit safe for acknowledged data, so the escape hatch stays cheap.
-fn spawn_shutdown_signal_task(shutdown: Arc<tokio::sync::Notify>) {
+fn spawn_shutdown_signal_task(shutdown: Arc<Notify>) {
     tokio::spawn(async move {
-        wait_for_termination_signal().await;
+        shutdown_signal().await;
         tracing::info!(
             "received shutdown signal; draining listeners (forced exit after {SHUTDOWN_GRACE:?})"
         );
         shutdown.notify_waiters();
         tokio::select! {
-            () = wait_for_termination_signal() => {
+            () = shutdown_signal() => {
                 tracing::warn!("second shutdown signal; exiting immediately");
             }
             () = tokio::time::sleep(SHUTDOWN_GRACE) => {
@@ -312,29 +317,6 @@ fn spawn_shutdown_signal_task(shutdown: Arc<tokio::sync::Notify>) {
         }
         std::process::exit(0);
     });
-}
-
-async fn wait_for_termination_signal() {
-    #[cfg(unix)]
-    {
-        let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
-        match sigterm {
-            Ok(mut sigterm) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = sigterm.recv() => {}
-                }
-            }
-            Err(err) => {
-                tracing::error!("install SIGTERM handler: {err}; falling back to Ctrl-C only");
-                let _ = tokio::signal::ctrl_c().await;
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
 }
 
 #[cfg(test)]

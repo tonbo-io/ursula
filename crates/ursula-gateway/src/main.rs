@@ -1,5 +1,3 @@
-use std::future::Future;
-use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,12 +8,11 @@ use axum::extract::State;
 use axum::http::Request;
 use axum::routing::any;
 use clap::Parser;
-use tokio::signal;
-use tokio::sync::oneshot;
-use tracing_subscriber::EnvFilter;
 use ursula_gateway::DEFAULT_MAX_REQUEST_BODY_BYTES;
 use ursula_gateway::Gateway;
 use ursula_gateway::GatewayConfig;
+use ursula_observability::serve::serve_until_shutdown;
+use ursula_observability::serve::shutdown_signal;
 
 const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 3600;
 
@@ -25,7 +22,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    init_tracing();
+    let mut init_options = ursula_observability::InitOptions::new("ursula-gateway");
+    init_options.default_directives = "ursula_gateway=info";
+    let _observability = ursula_observability::init(init_options);
 
     let args = Args::parse();
     let config = GatewayConfig {
@@ -55,53 +54,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "ursulagw starting"
     );
 
-    serve_with_shutdown(
+    serve_until_shutdown(
         listener,
         app,
         shutdown_signal(),
-        Duration::from_secs(args.graceful_shutdown_timeout),
+        Some(Duration::from_secs(args.graceful_shutdown_timeout)),
     )
     .await?;
 
     Ok(())
-}
-
-async fn serve_with_shutdown(
-    listener: tokio::net::TcpListener,
-    app: Router,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-    drain_timeout: Duration,
-) -> io::Result<()> {
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let server = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            drop(shutdown_rx.await);
-        })
-        .into_future();
-    tokio::pin!(server);
-
-    tokio::select! {
-        result = &mut server => result,
-        _ = shutdown => {
-            tracing::info!(
-                drain_timeout_secs = drain_timeout.as_secs(),
-                "graceful shutdown initiated"
-            );
-            if shutdown_tx.send(()).is_err() {
-                tracing::debug!("graceful shutdown receiver already dropped");
-            }
-            match tokio::time::timeout(drain_timeout, &mut server).await {
-                Ok(result) => result,
-                Err(_) => {
-                    tracing::warn!(
-                        drain_timeout_secs = drain_timeout.as_secs(),
-                        "graceful shutdown timeout elapsed; exiting"
-                    );
-                    Ok(())
-                }
-            }
-        }
-    }
 }
 
 #[derive(Parser, Debug)]
@@ -133,101 +94,13 @@ struct Args {
     graceful_shutdown_timeout: u64,
 }
 
-fn init_tracing() {
-    let _result = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("ursula_gateway=info")),
-        )
-        .with_target(true)
-        .try_init();
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {
-            tracing::info!("received Ctrl+C, starting graceful shutdown");
-        }
-        _ = terminate => {
-            tracing::info!("received SIGTERM, starting graceful shutdown");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use axum::Router;
     use tokio::sync::oneshot;
-
-    use super::serve_with_shutdown;
-
-    /// A version of shutdown_signal that can be triggered by a channel instead
-    /// of a real OS signal, so tests don't need unsafe code or libc.
-    async fn shutdown_signal_for_test(rx: oneshot::Receiver<()>) {
-        let ctrl_c = async {
-            drop(rx.await);
-        };
-
-        let terminate = std::future::pending::<()>();
-
-        tokio::select! {
-            _ = ctrl_c => {
-                tracing::info!("received test signal, starting graceful shutdown");
-            }
-            _ = terminate => {}
-        }
-    }
-
-    #[tokio::test]
-    async fn shutdown_signal_returns_when_triggered() {
-        let (tx, rx) = oneshot::channel();
-
-        let handle = tokio::spawn(shutdown_signal_for_test(rx));
-
-        // Trigger the "signal".
-        tx.send(()).unwrap();
-
-        // shutdown_signal should return promptly.
-        tokio::time::timeout(Duration::from_secs(5), handle)
-            .await
-            .expect("shutdown_signal should return within 5s")
-            .expect("shutdown_signal task should not panic");
-    }
-
-    #[tokio::test]
-    async fn shutdown_signal_does_not_return_without_trigger() {
-        let (_tx, rx) = oneshot::channel::<()>();
-
-        let handle = tokio::spawn(shutdown_signal_for_test(rx));
-
-        // Give it a moment to start.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // The task should still be running since no signal was sent.
-        assert!(!handle.is_finished());
-
-        // Clean up.
-        handle.abort();
-    }
+    use ursula_observability::serve::serve_until_shutdown;
 
     #[tokio::test]
     async fn serve_with_shutdown_does_not_return_before_shutdown_signal() {
@@ -237,13 +110,13 @@ mod tests {
         let app = Router::new();
         let (_tx, rx) = oneshot::channel::<()>();
 
-        let handle = tokio::spawn(serve_with_shutdown(
+        let handle = tokio::spawn(serve_until_shutdown(
             listener,
             app,
             async move {
                 drop(rx.await);
             },
-            Duration::from_secs(60),
+            Some(Duration::from_secs(60)),
         ));
 
         // Give the server a moment to start.
@@ -264,13 +137,13 @@ mod tests {
         let app = Router::new();
         let (tx, rx) = oneshot::channel();
 
-        let handle = tokio::spawn(serve_with_shutdown(
+        let handle = tokio::spawn(serve_until_shutdown(
             listener,
             app,
             async move {
                 drop(rx.await);
             },
-            Duration::from_secs(60),
+            Some(Duration::from_secs(60)),
         ));
 
         tx.send(()).expect("send shutdown signal");
@@ -302,13 +175,13 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        let handle = tokio::spawn(serve_with_shutdown(
+        let handle = tokio::spawn(serve_until_shutdown(
             listener,
             app,
             async move {
                 drop(shutdown_rx.await);
             },
-            Duration::from_millis(100), // short drain timeout
+            Some(Duration::from_millis(100)), // short drain timeout
         ));
 
         // Start a slow request so the server has an active connection.
