@@ -14,6 +14,8 @@
 //! - [`runtime`]: `ShardRuntime`, `RuntimeConfig`, and per-core worker spawn.
 //! - [`core_worker`]: single-thread actor that owns groups for one core.
 //! - [`group_actor`]: per-group mailbox actor running inside a core worker.
+//! - [`ops`]: declarative manifest of the uniform runtime operations; expands
+//!   into the per-operation actor and client plumbing.
 //! - [`metrics`]: runtime metrics shared across cores; lock-free counters.
 
 mod admission;
@@ -28,6 +30,7 @@ mod error;
 mod group_actor;
 pub mod journal;
 mod metrics;
+mod ops;
 mod request;
 mod rt;
 mod runtime;

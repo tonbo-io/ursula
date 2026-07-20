@@ -151,6 +151,19 @@ wire format. Requires a full DST corpus pass before merge.
 3. **Actor-dispatch macro.** Generate the `GroupCommand` variant, reject arm,
    dispatch arm, and `ShardRuntime` method per operation. Hot-path change;
    gate on DST re-validation and the append/apply benchmarks.
+   **Landed (2026-07):** the per-operation `CoreCommand` mirror collapsed to
+   a single `Group { placement, admission, command }` envelope (plus warm-up
+   and the madsim engine-swap variants), and a declarative operation manifest
+   in `ursula-runtime/src/ops.rs` now expands the `GroupCommand` variant,
+   `send_error` reject arm, `GroupActor::handle` dispatch arm, and public
+   `ShardRuntime` client method per operation via the `group_operations!` /
+   `shard_runtime_operations!` generators. Per-operation differences (worker
+   argument lists, admission byte accounting, empty-payload prechecks,
+   reply-less cancels) are spelled in the manifest, not normalized; the
+   genuinely non-uniform arms (wait-read registration/cancel client paths,
+   append-batch coalescing, snapshot-install placement check, group warm-up,
+   madsim engine swap) stay hand-written. ~300 lines net; smoke corpus
+   replays byte-identical and `append_apply` benchmarks unchanged.
 4. **Cold-flush API trim.** Remove single-candidate `plan_next_cold_flush`
    (batch with `max = 1` subsumes it) and fold the `*_with_cold_admission`
    variants into an `Option` parameter.

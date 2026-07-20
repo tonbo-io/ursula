@@ -31,10 +31,12 @@ use crate::core_worker::WaitReadCancel;
 use crate::engine::GroupEngineFactory;
 use crate::engine::in_memory::InMemoryGroupEngineFactory;
 use crate::error::RuntimeError;
+use crate::group_actor::GroupCommand;
 use crate::metrics::COLD_FLUSH_GROUP_BATCH_MAX_CHUNKS;
 use crate::metrics::RuntimeMailboxSnapshot;
 use crate::metrics::RuntimeMetrics;
 use crate::metrics::RuntimeMetricsInner;
+use crate::metrics::append_batch_payload_bytes;
 use crate::metrics::elapsed_ns;
 use crate::metrics::is_stale_cold_flush_candidate_error;
 use crate::request::AckColdGcResponse;
@@ -228,203 +230,6 @@ impl ShardRuntime {
             .map(|cold_store| cold_store.info().clone())
     }
 
-    pub async fn create_stream(
-        &self,
-        request: CreateStreamRequest,
-    ) -> Result<CreateStreamResponse, RuntimeError> {
-        self.create_stream_on_owner(request).await
-    }
-
-    pub async fn create_stream_external(
-        &self,
-        request: CreateStreamExternalRequest,
-    ) -> Result<CreateStreamResponse, RuntimeError> {
-        let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::CreateExternal {
-                request,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    async fn create_stream_on_owner(
-        &self,
-        request: CreateStreamRequest,
-    ) -> Result<CreateStreamResponse, RuntimeError> {
-        let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::CreateStream {
-                request,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    pub async fn head_stream(
-        &self,
-        request: HeadStreamRequest,
-    ) -> Result<HeadStreamResponse, RuntimeError> {
-        let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::HeadStream {
-                request,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    pub async fn get_stream_attrs(
-        &self,
-        request: GetStreamAttrsRequest,
-    ) -> Result<GetStreamAttrsResponse, RuntimeError> {
-        let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::GetStreamAttrs {
-                request,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    pub async fn update_stream_attrs(
-        &self,
-        request: UpdateStreamAttrsRequest,
-    ) -> Result<UpdateStreamAttrsResponse, RuntimeError> {
-        let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::UpdateStreamAttrs {
-                request,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    pub async fn read_stream(
-        &self,
-        request: ReadStreamRequest,
-    ) -> Result<ReadStreamResponse, RuntimeError> {
-        let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::ReadStream {
-                request,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    pub async fn publish_snapshot(
-        &self,
-        request: PublishSnapshotRequest,
-    ) -> Result<PublishSnapshotResponse, RuntimeError> {
-        let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::PublishSnapshot {
-                request,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    pub async fn read_snapshot(
-        &self,
-        request: ReadSnapshotRequest,
-    ) -> Result<ReadSnapshotResponse, RuntimeError> {
-        let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::ReadSnapshot {
-                request,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    pub async fn delete_snapshot(
-        &self,
-        request: DeleteSnapshotRequest,
-    ) -> Result<(), RuntimeError> {
-        let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::DeleteSnapshot {
-                request,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    pub async fn bootstrap_stream(
-        &self,
-        request: BootstrapStreamRequest,
-    ) -> Result<BootstrapStreamResponse, RuntimeError> {
-        let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::BootstrapStream {
-                request,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
     pub async fn wait_read_stream(
         &self,
         request: ReadStreamRequest,
@@ -434,11 +239,14 @@ impl ShardRuntime {
         let waiter_id = self.next_waiter_id.fetch_add(1, Ordering::Relaxed);
         let stream_id = request.stream_id.clone();
         let (response_tx, response_rx) = oneshot::channel();
-        self.enqueue_core_command(mailbox, CoreCommand::WaitRead {
-            request,
+        self.enqueue_core_command(mailbox, CoreCommand::Group {
             placement,
-            waiter_id,
-            response_tx,
+            admission: None,
+            command: GroupCommand::WaitRead {
+                request,
+                waiter_id,
+                response_tx,
+            },
         })
         .await?;
         let mut cancel = WaitReadCancel::new(mailbox.tx.clone(), stream_id, placement, waiter_id);
@@ -456,109 +264,11 @@ impl ShardRuntime {
         stream_id: &BucketStreamId,
     ) -> Result<(), RuntimeError> {
         let placement = self.shard_map.locate(stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
         let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::RequireLiveReadOwner {
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    pub async fn close_stream(
-        &self,
-        request: CloseStreamRequest,
-    ) -> Result<CloseStreamResponse, RuntimeError> {
-        let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::CloseStream {
-                request,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    pub async fn delete_stream(
-        &self,
-        request: DeleteStreamRequest,
-    ) -> Result<DeleteStreamResponse, RuntimeError> {
-        let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::DeleteStream {
-                request,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    pub async fn flush_cold(
-        &self,
-        request: FlushColdRequest,
-    ) -> Result<FlushColdResponse, RuntimeError> {
-        let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::FlushCold {
-                request,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    pub async fn append_external(
-        &self,
-        request: AppendExternalRequest,
-    ) -> Result<AppendResponse, RuntimeError> {
-        let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::AppendExternal {
-                request,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    pub async fn plan_cold_flush(
-        &self,
-        request: PlanColdFlushRequest,
-    ) -> Result<Option<ColdFlushCandidate>, RuntimeError> {
-        let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::PlanColdFlush {
-                request,
-                placement,
-                response_tx,
-            },
+        self.group_rpc(
+            placement,
+            None,
+            GroupCommand::RequireLiveReadOwner { response_tx },
             response_rx,
         )
         .await
@@ -572,28 +282,6 @@ impl ShardRuntime {
             return Ok(None);
         };
         self.flush_cold_candidate(candidate).await.map(Some)
-    }
-
-    pub async fn plan_next_cold_flush_batch(
-        &self,
-        raft_group_id: RaftGroupId,
-        request: PlanGroupColdFlushRequest,
-        max_candidates: usize,
-    ) -> Result<Vec<ColdFlushCandidate>, RuntimeError> {
-        let placement = self.placement_for_group(raft_group_id)?;
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::PlanNextColdFlushBatch {
-                request,
-                placement,
-                max_candidates,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
     }
 
     pub async fn flush_cold_group_once(
@@ -783,46 +471,6 @@ impl ShardRuntime {
         Ok(flushed)
     }
 
-    async fn plan_cold_gc(
-        &self,
-        raft_group_id: RaftGroupId,
-        max: usize,
-    ) -> Result<Vec<ColdGcEntry>, RuntimeError> {
-        let placement = self.placement_for_group(raft_group_id)?;
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::PlanColdGc {
-                max,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    async fn ack_cold_gc(
-        &self,
-        raft_group_id: RaftGroupId,
-        up_to_seq: u64,
-    ) -> Result<AckColdGcResponse, RuntimeError> {
-        let placement = self.placement_for_group(raft_group_id)?;
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::AckColdGc {
-                up_to_seq,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
     /// Drains the leader-side cold-GC queue for one group: physically reclaims
     /// each queued target from cold storage, then replicates an ack that pops
     /// the reclaimed entries. Deletions are idempotent, so a crash or leader
@@ -902,65 +550,6 @@ impl ShardRuntime {
         Ok(reclaimed)
     }
 
-    pub async fn append(&self, request: AppendRequest) -> Result<AppendResponse, RuntimeError> {
-        if request.payload.is_empty() {
-            return Err(RuntimeError::EmptyAppend);
-        }
-        let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::Append {
-                request,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    pub async fn append_batch(
-        &self,
-        request: AppendBatchRequest,
-    ) -> Result<AppendBatchResponse, RuntimeError> {
-        if request.payloads.is_empty() {
-            return Err(RuntimeError::EmptyAppend);
-        }
-        let placement = self.shard_map.locate(&request.stream_id);
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::AppendBatch {
-                request,
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
-    pub async fn snapshot_group(
-        &self,
-        raft_group_id: RaftGroupId,
-    ) -> Result<GroupSnapshot, RuntimeError> {
-        let placement = self.placement_for_group(raft_group_id)?;
-        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
-        let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::SnapshotGroup {
-                placement,
-                response_tx,
-            },
-            response_rx,
-        )
-        .await
-    }
-
     pub async fn install_group_snapshot(
         &self,
         snapshot: GroupSnapshot,
@@ -972,11 +561,11 @@ impl ShardRuntime {
                 actual: snapshot.placement,
             });
         }
-        let mailbox = &self.mailboxes[usize::from(expected.core_id.0)];
         let (response_tx, response_rx) = oneshot::channel();
-        self.send_core_command(
-            mailbox,
-            CoreCommand::InstallGroupSnapshot {
+        self.group_rpc(
+            expected,
+            None,
+            GroupCommand::InstallGroupSnapshot {
                 snapshot,
                 response_tx,
             },
@@ -1083,6 +672,30 @@ impl ShardRuntime {
         })
     }
 
+    /// Routes a group command to its owning core and awaits the reply.
+    /// `admission` carries the incoming payload bytes for
+    /// raft-uncommitted-backpressure-guarded writes; the check itself runs on
+    /// the owning core.
+    async fn group_rpc<T>(
+        &self,
+        placement: ShardPlacement,
+        admission: Option<u64>,
+        command: GroupCommand,
+        response_rx: oneshot::Receiver<Result<T, RuntimeError>>,
+    ) -> Result<T, RuntimeError> {
+        let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
+        self.send_core_command(
+            mailbox,
+            CoreCommand::Group {
+                placement,
+                admission,
+                command,
+            },
+            response_rx,
+        )
+        .await
+    }
+
     async fn send_core_command<T>(
         &self,
         mailbox: &CoreMailbox,
@@ -1138,6 +751,220 @@ impl ShardRuntime {
         RuntimeMailboxSnapshot { depths, capacities }
     }
 }
+
+/// Expands the operation manifest into the uniform `ShardRuntime` client
+/// methods: locate the placement (by stream id or raft group id), open the
+/// reply channel, and submit the `GroupCommand` through [`ShardRuntime::
+/// group_rpc`]. Entries with `client { none }` keep hand-written methods; see
+/// the manifest grammar in [`crate::ops`].
+macro_rules! shard_runtime_operations {
+    // Stream-routed write with admission and an emptiness precheck.
+    (@munch
+        methods { $($methods:tt)* }
+        rest {
+            $(#[$attr:meta])*
+            op $Variant:ident {
+                fields { $req:ident: $Req:ty $(,)? }
+                reply { $tx:ident: $Resp:ty }
+                guard { $g:ident }
+                handle { $($handle:tt)* }
+                client {
+                    $vis:vis stream fn $method:ident,
+                    non_empty: $ne:ident,
+                    admit: $incoming:expr
+                }
+            }
+            $($rest:tt)*
+        }
+    ) => {
+        shard_runtime_operations! {
+            @munch
+            methods {
+                $($methods)*
+                $(#[$attr])*
+                $vis async fn $method(&self, $req: $Req) -> Result<$Resp, RuntimeError> {
+                    if $req.$ne.is_empty() {
+                        return Err(RuntimeError::EmptyAppend);
+                    }
+                    let placement = self.shard_map.locate(&$req.stream_id);
+                    let incoming_bytes = $incoming;
+                    let (response_tx, response_rx) = oneshot::channel();
+                    self.group_rpc(
+                        placement,
+                        Some(incoming_bytes),
+                        GroupCommand::$Variant {
+                            $req,
+                            $tx: response_tx,
+                            $g: None,
+                        },
+                        response_rx,
+                    )
+                    .await
+                }
+            }
+            rest { $($rest)* }
+        }
+    };
+    // Stream-routed write with admission.
+    (@munch
+        methods { $($methods:tt)* }
+        rest {
+            $(#[$attr:meta])*
+            op $Variant:ident {
+                fields { $req:ident: $Req:ty $(,)? }
+                reply { $tx:ident: $Resp:ty }
+                guard { $g:ident }
+                handle { $($handle:tt)* }
+                client { $vis:vis stream fn $method:ident, admit: $incoming:expr }
+            }
+            $($rest:tt)*
+        }
+    ) => {
+        shard_runtime_operations! {
+            @munch
+            methods {
+                $($methods)*
+                $(#[$attr])*
+                $vis async fn $method(&self, $req: $Req) -> Result<$Resp, RuntimeError> {
+                    let placement = self.shard_map.locate(&$req.stream_id);
+                    let incoming_bytes = $incoming;
+                    let (response_tx, response_rx) = oneshot::channel();
+                    self.group_rpc(
+                        placement,
+                        Some(incoming_bytes),
+                        GroupCommand::$Variant {
+                            $req,
+                            $tx: response_tx,
+                            $g: None,
+                        },
+                        response_rx,
+                    )
+                    .await
+                }
+            }
+            rest { $($rest)* }
+        }
+    };
+    // Stream-routed operation without admission.
+    (@munch
+        methods { $($methods:tt)* }
+        rest {
+            $(#[$attr:meta])*
+            op $Variant:ident {
+                fields { $req:ident: $Req:ty $(,)? }
+                reply { $tx:ident: $Resp:ty }
+                guard { none }
+                handle { $($handle:tt)* }
+                client { $vis:vis stream fn $method:ident }
+            }
+            $($rest:tt)*
+        }
+    ) => {
+        shard_runtime_operations! {
+            @munch
+            methods {
+                $($methods)*
+                $(#[$attr])*
+                $vis async fn $method(&self, $req: $Req) -> Result<$Resp, RuntimeError> {
+                    let placement = self.shard_map.locate(&$req.stream_id);
+                    let (response_tx, response_rx) = oneshot::channel();
+                    self.group_rpc(
+                        placement,
+                        None,
+                        GroupCommand::$Variant {
+                            $req,
+                            $tx: response_tx,
+                        },
+                        response_rx,
+                    )
+                    .await
+                }
+            }
+            rest { $($rest)* }
+        }
+    };
+    // Group-routed operation: an explicit `RaftGroupId` followed by the
+    // manifest fields in declaration order.
+    (@munch
+        methods { $($methods:tt)* }
+        rest {
+            $(#[$attr:meta])*
+            op $Variant:ident {
+                fields { $($field:ident: $field_ty:ty),* $(,)? }
+                reply { $tx:ident: $Resp:ty }
+                guard { none }
+                handle { $($handle:tt)* }
+                client { $vis:vis group fn $method:ident }
+            }
+            $($rest:tt)*
+        }
+    ) => {
+        shard_runtime_operations! {
+            @munch
+            methods {
+                $($methods)*
+                $(#[$attr])*
+                $vis async fn $method(
+                    &self,
+                    raft_group_id: RaftGroupId,
+                    $($field: $field_ty),*
+                ) -> Result<$Resp, RuntimeError> {
+                    let placement = self.placement_for_group(raft_group_id)?;
+                    let (response_tx, response_rx) = oneshot::channel();
+                    self.group_rpc(
+                        placement,
+                        None,
+                        GroupCommand::$Variant {
+                            $($field,)*
+                            $tx: response_tx,
+                        },
+                        response_rx,
+                    )
+                    .await
+                }
+            }
+            rest { $($rest)* }
+        }
+    };
+    // Hand-written client method: nothing to generate.
+    (@munch
+        methods { $($methods:tt)* }
+        rest {
+            $(#[$attr:meta])*
+            op $Variant:ident {
+                fields { $($fields:tt)* }
+                reply { $($reply:tt)* }
+                guard { $($guard:tt)* }
+                handle { $($handle:tt)* }
+                client { none }
+            }
+            $($rest:tt)*
+        }
+    ) => {
+        shard_runtime_operations! {
+            @munch
+            methods { $($methods)* }
+            rest { $($rest)* }
+        }
+    };
+    (@munch
+        methods { $($methods:tt)* }
+        rest {}
+    ) => {
+        impl ShardRuntime {
+            $($methods)*
+        }
+    };
+    ($($manifest:tt)*) => {
+        shard_runtime_operations! {
+            @munch
+            methods {}
+            rest { $($manifest)* }
+        }
+    };
+}
+
+crate::ops::runtime_operations!(shard_runtime_operations);
 
 fn spawn_core_worker(threading: RuntimeThreading, worker: CoreWorker) -> Result<(), RuntimeError> {
     match threading {
