@@ -36,10 +36,6 @@ Bucket-level `GET` (metadata), `DELETE`, and `GET /{bucket}/streams` (list) are 
 | `GET` | `/{bucket}/{stream}/snapshot/{offset}` | [Read snapshot at offset](/docs/api/read-snapshot) |
 | `PUT` | `/{bucket}/{stream}/snapshot/{offset}` | [Publish a snapshot](/docs/api/publish-snapshot) |
 
-## v1 compatibility
-
-A flat [v1 compatibility layer](/docs/api/v1-compatibility) is also available under `/v1/stream/{path}` for simpler integrations that don't need explicit bucket management.
-
 ## Common request patterns
 
 ### Create a bucket and stream

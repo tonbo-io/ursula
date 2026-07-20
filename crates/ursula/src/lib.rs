@@ -192,7 +192,6 @@ const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_HTTP_INFLIGHT_BODY_BYTES: usize = MAX_HTTP_BODY_BYTES * 8;
 const DEFAULT_LONG_POLL_TIMEOUT_MS: u64 = 1_000;
 const MAX_LONG_POLL_TIMEOUT_MS: u64 = 60_000;
-const V1_DEFAULT_BUCKET: &str = "_default";
 
 struct CreateStreamHttpResponseInput<'a> {
     response: CreateStreamResponse,
@@ -201,8 +200,6 @@ struct CreateStreamHttpResponseInput<'a> {
     stream_ttl_seconds: Option<u64>,
     stream_expires_at_ms: Option<u64>,
     producer: Option<&'a ProducerRequest>,
-    public_path: Option<&'a str>,
-    request_headers: &'a HeaderMap,
 }
 
 pub trait WallClock: Send + Sync + 'static {
@@ -1003,14 +1000,6 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
     Router::new()
         .route("/__ursula/metrics", get(metrics))
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
-        .route(
-            "/v1/stream/{*path}",
-            put(create_stream_v1)
-                .post(append_stream_v1)
-                .get(read_stream_v1)
-                .delete(delete_stream_v1)
-                .head(head_stream_v1),
-        )
         .route("/{bucket}", put(create_bucket))
         .route("/{bucket}/{stream}/snapshot", get(read_latest_snapshot))
         .route(
@@ -1097,18 +1086,12 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
         stream_ttl_seconds,
         stream_expires_at_ms,
         producer,
-        public_path,
-        request_headers,
     } = input;
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
     insert_content_type(&mut headers, content_type);
     insert_offset(&mut headers, response.next_offset);
-    if let Some(public_path) = public_path {
-        insert_public_location(&mut headers, request_headers, public_path);
-    } else {
-        insert_location(&mut headers, stream_id);
-    }
+    insert_location(&mut headers, stream_id);
     insert_lifetime_headers(&mut headers, stream_ttl_seconds, stream_expires_at_ms);
     insert_producer_ack(&mut headers, producer);
     if let Some(record_range) = response.record_range {
@@ -1746,36 +1729,13 @@ pub(crate) async fn create_stream(
     body: Bytes,
 ) -> Response {
     let stream_id = BucketStreamId::new(bucket, stream);
-    create_stream_by_id(state, request_target(&uri), stream_id, None, headers, body).await
-}
-
-pub(crate) async fn create_stream_v1(
-    State(state): State<HttpState>,
-    OriginalUri(uri): OriginalUri,
-    Path(path): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let stream_id = match v1_stream_id(&path) {
-        Ok(stream_id) => stream_id,
-        Err(response) => return *response,
-    };
-    create_stream_by_id(
-        state,
-        request_target(&uri),
-        stream_id,
-        Some(format!("/v1/stream/{path}")),
-        headers,
-        body,
-    )
-    .await
+    create_stream_by_id(state, request_target(&uri), stream_id, headers, body).await
 }
 
 pub(crate) async fn create_stream_by_id(
     state: HttpState,
     request_target: String,
     stream_id: BucketStreamId,
-    public_path: Option<String>,
     request_headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -1808,15 +1768,7 @@ pub(crate) async fn create_stream_by_id(
     };
     request.producer = producer.clone();
     if should_externalize_payload(&state, request.initial_payload.len(), true) {
-        return create_stream_external_by_id(
-            state,
-            request_target,
-            request,
-            public_path,
-            request_headers,
-            producer,
-        )
-        .await;
+        return create_stream_external_by_id(state, request_target, request, producer).await;
     }
 
     match state.runtime.create_stream(request).await {
@@ -1827,8 +1779,6 @@ pub(crate) async fn create_stream_by_id(
             stream_ttl_seconds,
             stream_expires_at_ms,
             producer: producer.as_ref(),
-            public_path: public_path.as_deref(),
-            request_headers: &request_headers,
         }),
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
@@ -1838,8 +1788,6 @@ pub(crate) async fn create_stream_external_by_id(
     state: HttpState,
     request_target: String,
     mut request: CreateStreamRequest,
-    public_path: Option<String>,
-    request_headers: HeaderMap,
     producer: Option<ProducerRequest>,
 ) -> Response {
     let stream_id = request.stream_id.clone();
@@ -1864,8 +1812,6 @@ pub(crate) async fn create_stream_external_by_id(
             stream_ttl_seconds,
             stream_expires_at_ms,
             producer: producer.as_ref(),
-            public_path: public_path.as_deref(),
-            request_headers: &request_headers,
         }),
         Err(err) => {
             cleanup_external_payload(&state, &external_path).await;
@@ -1882,20 +1828,6 @@ pub(crate) async fn append_stream(
     body: Bytes,
 ) -> Response {
     let stream_id = BucketStreamId::new(bucket, stream);
-    append_stream_by_id(state, request_target(&uri), stream_id, headers, body).await
-}
-
-pub(crate) async fn append_stream_v1(
-    State(state): State<HttpState>,
-    OriginalUri(uri): OriginalUri,
-    Path(path): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let stream_id = match v1_stream_id(&path) {
-        Ok(stream_id) => stream_id,
-        Err(response) => return *response,
-    };
     append_stream_by_id(state, request_target(&uri), stream_id, headers, body).await
 }
 
@@ -2087,18 +2019,6 @@ pub(crate) async fn delete_stream(
     delete_stream_by_id(state, request_target(&uri), stream_id).await
 }
 
-pub(crate) async fn delete_stream_v1(
-    State(state): State<HttpState>,
-    OriginalUri(uri): OriginalUri,
-    Path(path): Path<String>,
-) -> Response {
-    let stream_id = match v1_stream_id(&path) {
-        Ok(stream_id) => stream_id,
-        Err(response) => return *response,
-    };
-    delete_stream_by_id(state, request_target(&uri), stream_id).await
-}
-
 pub(crate) async fn delete_stream_by_id(
     state: HttpState,
     request_target: String,
@@ -2215,18 +2135,6 @@ pub(crate) async fn head_stream(
     Path((bucket, stream)): Path<(String, String)>,
 ) -> Response {
     let stream_id = BucketStreamId::new(bucket, stream);
-    head_stream_by_id(state, request_target(&uri), stream_id).await
-}
-
-pub(crate) async fn head_stream_v1(
-    State(state): State<HttpState>,
-    OriginalUri(uri): OriginalUri,
-    Path(path): Path<String>,
-) -> Response {
-    let stream_id = match v1_stream_id(&path) {
-        Ok(stream_id) => stream_id,
-        Err(response) => return *response,
-    };
     head_stream_by_id(state, request_target(&uri), stream_id).await
 }
 
@@ -2357,20 +2265,6 @@ pub(crate) async fn read_stream(
     RawQuery(raw_query): RawQuery,
 ) -> Response {
     let stream_id = BucketStreamId::new(bucket, stream);
-    read_stream_by_id(state, request_target(&uri), stream_id, headers, raw_query).await
-}
-
-pub(crate) async fn read_stream_v1(
-    State(state): State<HttpState>,
-    OriginalUri(uri): OriginalUri,
-    Path(path): Path<String>,
-    headers: HeaderMap,
-    RawQuery(raw_query): RawQuery,
-) -> Response {
-    let stream_id = match v1_stream_id(&path) {
-        Ok(stream_id) => stream_id,
-        Err(response) => return *response,
-    };
     read_stream_by_id(state, request_target(&uri), stream_id, headers, raw_query).await
 }
 
@@ -3063,29 +2957,6 @@ pub(crate) fn unix_time_ms() -> u64 {
         "unix_time_ms() / SystemWallClock is non-deterministic under cfg(madsim); \
          inject a deterministic WallClock via HttpState::with_wall_clock (or _handle)"
     );
-}
-
-pub(crate) fn v1_stream_id(path: &str) -> Result<BucketStreamId, BoxResponse> {
-    if path.is_empty() {
-        return Err(Box::new(
-            (StatusCode::BAD_REQUEST, "stream path must not be empty").into_response(),
-        ));
-    }
-    if path.contains('\0')
-        || path
-            .split('/')
-            .any(|segment| segment == ".." || segment.is_empty())
-    {
-        return Err(Box::new(
-            (
-                StatusCode::BAD_REQUEST,
-                "stream path contains invalid characters",
-            )
-                .into_response(),
-        ));
-    }
-    let (bucket, stream) = path.split_once('/').unwrap_or((V1_DEFAULT_BUCKET, path));
-    Ok(BucketStreamId::new(bucket, stream))
 }
 
 pub(crate) fn parse_query(raw: Option<&str>) -> Result<HashMap<String, String>, BoxResponse> {

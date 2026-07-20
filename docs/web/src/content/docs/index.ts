@@ -66,7 +66,6 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   "api/read-snapshot": { group: "API Reference", order: 9 },
   "api/bootstrap": { group: "API Reference", order: 10 },
   "api/delete-stream": { group: "API Reference", order: 11 },
-  "api/v1-compatibility": { group: "API Reference", order: 12 },
 
   // Install & Deploy - get the binaries, get the cluster running.
   install: { group: "Install & Deploy", order: 1 },

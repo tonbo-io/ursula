@@ -342,12 +342,6 @@ Bucketed Ursula route:
 POST /{bucket_id}/{stream_id}/append-batch
 ```
 
-Flat v1 compatibility route:
-
-```
-POST /v1/append-batch/{stream_path}
-```
-
 The request `Content-Type` applies to every frame and MUST match the stream's configured content type.
 
 The request body is a sequence of binary frames:
