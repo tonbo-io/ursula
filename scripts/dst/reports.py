@@ -179,7 +179,7 @@ WORKFLOWS = {"pr": PR_WORKFLOW, "nightly": NIGHTLY_WORKFLOW}
 def _parse_smoke_commands(workflow: str) -> list[dict]:
     commands: list[dict] = []
     pattern = re.compile(
-        r"cargo run -p ursula-sim --bin ursula-sim-smoke -- \\(?P<body>.*?)"
+        r"cargo run -p ursula-sim --bin ursula-sim -- smoke \\(?P<body>.*?)"
         r"(?=\n\s*RUSTFLAGS=|\n\s*-\s+name:|\Z)",
         re.DOTALL,
     )

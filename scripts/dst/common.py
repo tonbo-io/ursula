@@ -20,7 +20,7 @@ COVERAGE_BASELINE = CORPUS_DIR / "coverage-baseline.json"
 
 PR_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 NIGHTLY_WORKFLOW = ROOT / ".github/workflows/dst-nightly.yml"
-SMOKE_RS = ROOT / "crates/ursula-sim/src/bin/ursula-sim-smoke.rs"
+SMOKE_RS = ROOT / "crates/ursula-sim/src/bin/ursula-sim/smoke.rs"
 HARNESS_ROOT = ROOT / "crates/ursula-sim/src/madsim_harness"
 DST_DOC = ROOT / "docs/architecture/deterministic-simulation-testing.md"
 

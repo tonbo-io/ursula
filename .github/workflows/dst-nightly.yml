@@ -38,7 +38,7 @@ jobs:
 
       - name: Run nightly madsim seed sweep
         run: |
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --failure-dir target/ursula-sim-failures \
             --write-artifacts \
             --seed-range 60..=199 \
@@ -46,79 +46,79 @@ jobs:
             --seed-family runtime-raft-network-randomized-extended \
             --seed-family runtime-raft-network-cold-live-write-recovery \
             --seed-family runtime-interleaving
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-runtime-raft-network-randomized-read-corruption \
             --expect-failures \
             --failure-dir target/ursula-sim-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-runtime-raft-network-partial-read-corruption \
             --expect-failures \
             --failure-dir target/ursula-sim-partial-read-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-runtime-raft-network-tail-read-corruption \
             --expect-failures \
             --failure-dir target/ursula-sim-tail-read-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-runtime-raft-network-close-state-corruption \
             --expect-failures \
             --failure-dir target/ursula-sim-close-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-runtime-raft-network-snapshot-corruption \
             --expect-failures \
             --failure-dir target/ursula-sim-snapshot-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-runtime-raft-network-leader-failover-read-corruption \
             --expect-failures \
             --failure-dir target/ursula-sim-leader-failover-read-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family runtime-raft-network-leader-failover-cold-live-read-failures \
             --expect-failures \
             --failure-dir target/ursula-sim-leader-failover-cold-live-read-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family runtime-raft-network-cold-live-truncate-failures \
             --expect-failures \
             --failure-dir target/ursula-sim-cold-live-truncate-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family runtime-raft-network-randomized-cold-read-failures \
             --expect-failures \
             --failure-dir target/ursula-sim-randomized-cold-read-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family runtime-raft-snapshot-install-failures \
             --expect-failures \
             --failure-dir target/ursula-sim-snapshot-install-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family runtime-interleaving-write-failures \
             --expect-failures \
             --failure-dir target/ursula-sim-runtime-interleaving-write-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-http-producer-retry-corruption \
             --expect-failures \
             --failure-dir target/ursula-sim-http-producer-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-http-live-sse-corruption \
             --expect-failures \
             --failure-dir target/ursula-sim-http-live-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-http-live-waiter-corruption \
             --expect-failures \
             --failure-dir target/ursula-sim-http-live-limit-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-http-snapshot-body-corruption \
             --expect-failures \
             --failure-dir target/ursula-sim-http-snapshot-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-http-protocol-surface-randomized-corruption \
             --expect-failures \
             --failure-dir target/ursula-sim-http-protocol-randomized-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-http-protocol-surface-randomized-sse-corruption \
             --expect-failures \
             --failure-dir target/ursula-sim-http-protocol-randomized-sse-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-http-protocol-surface-randomized-backpressure-corruption \
             --expect-failures \
             --failure-dir target/ursula-sim-http-protocol-randomized-backpressure-expected-failures
-          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family runtime-raft-network-cold-live-write-failures \
             --expect-failures \
             --failure-dir target/ursula-sim-runtime-raft-cold-live-write-failures
