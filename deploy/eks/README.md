@@ -2,7 +2,7 @@
 
 This reference stack provisions the AWS prerequisites for a production-shaped Ursula cluster and writes `generated-values.yaml` for the repository Helm chart. OpenTofu owns the VPC, three private and three public subnets, one managed node group per availability zone, EKS control plane and add-ons, encrypted gp3 storage class, versioned S3 bucket, least-privilege Pod Identity roles, and the Pod Identity associations for Ursula and the event-time indexer.
 
-The default topology uses three `m6i.xlarge` on-demand nodes across three availability zones and one NAT gateway per zone. It creates billable AWS resources. Review `tofu plan`, use a remote state backend for a shared production environment, and keep `s3_force_destroy=false`.
+The default topology uses three `m6i.xlarge` on-demand nodes across three availability zones and one NAT gateway per zone. It creates billable AWS resources. Review `tofu plan` and keep `s3_force_destroy=false`.
 
 ## Prerequisites
 
@@ -11,10 +11,16 @@ The default topology uses three `m6i.xlarge` on-demand nodes across three availa
 - Helm 3 or newer
 - kubectl
 
-Copy the example inputs and replace the public API CIDR with the operator or CI network:
+Create a versioned, encrypted S3 bucket for OpenTofu state. The state bucket is deliberately outside this stack so destroying an Ursula cluster cannot destroy its own recovery state. Copy the backend example and give every cluster a unique key:
 
 ```bash
 cd deploy/eks
+cp backend.hcl.example backend.hcl
+```
+
+The S3 backend uses OpenTofu native lockfiles, so it does not require a DynamoDB lock table. Copy the deployment inputs, set an explicit image tag, and replace the public API CIDR with the operator or CI network. World-open API CIDRs are rejected:
+
+```bash
 cp terraform.tfvars.example terraform.tfvars
 ```
 
@@ -28,7 +34,9 @@ helm install ursula ../../charts/ursula --namespace ursula --create-namespace -f
 helm test ursula --namespace ursula
 ```
 
-`provision.sh` runs `tofu init`, applies the stack, writes `generated-values.yaml`, and updates the current kubeconfig through `aws eks update-kubeconfig`. The generated values use fixed ServiceAccount names that match the EKS Pod Identity associations, enable S3 cold storage and snapshots, create three gateways and two dynamic indexer workers, and use the generated gp3 StorageClass for voter PVCs.
+`provision.sh` refuses missing or placeholder backend configuration, initializes the remote S3 backend, applies the stack, writes `generated-values.yaml`, and updates the current kubeconfig through `aws eks update-kubeconfig`. The generated values use fixed ServiceAccount names that match the EKS Pod Identity associations, enable S3 cold storage and snapshots, create the configured gateway and dynamic indexer worker counts, and use the generated gp3 StorageClass for voter PVCs.
+
+OpenTofu exposes the small set of capacity decisions that affect AWS or the production baseline: node instance types and counts, voter cores and memory, Raft group count and PVC size, and gateway/indexer replicas. Keep workload-specific or experimental tuning in a second Helm values file passed after `generated-values.yaml`.
 
 For a published chart, replace `../../charts/ursula` with `oci://ghcr.io/tonbo-io/charts/ursula --version 0.2.0`.
 
