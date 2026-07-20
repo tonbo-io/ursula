@@ -4196,11 +4196,9 @@ version = "0.3.0"
 dependencies = [
  "dirs",
  "serde",
- "serde_json",
  "tempfile",
  "thiserror 1.0.69",
  "toml",
- "yaml_serde",
 ]
 
 [[package]]

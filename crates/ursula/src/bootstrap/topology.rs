@@ -9,7 +9,6 @@ use ursula_shard::RaftGroupId;
 #[derive(Debug, Clone)]
 pub enum Persistence {
     InMemory,
-    Wal { wal_dir: PathBuf },
     Raft { log_dir: Option<PathBuf> },
 }
 

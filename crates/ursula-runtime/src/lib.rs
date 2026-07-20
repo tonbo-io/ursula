@@ -9,8 +9,7 @@
 //! - [`error`]: runtime-level error type [`RuntimeError`].
 //! - [`engine`]: the `GroupEngine` trait, factory, metrics, and the boxed-future
 //!   type aliases that form the replaceable per-group engine boundary, plus the
-//!   in-memory and WAL implementations under [`engine::in_memory`] and
-//!   [`engine::wal`].
+//!   in-memory implementation under [`engine::in_memory`].
 //! - [`runtime`]: `ShardRuntime`, `RuntimeConfig`, and per-core worker spawn.
 //! - [`core_worker`]: single-thread actor that owns groups for one core.
 //! - [`group_actor`]: per-group mailbox actor running inside a core worker.
@@ -97,8 +96,6 @@ pub use engine::GroupWriteBatchFuture;
 pub use engine::GroupWriteResponse;
 pub use engine::in_memory::InMemoryGroupEngine;
 pub use engine::in_memory::InMemoryGroupEngineFactory;
-pub use engine::wal::WalGroupEngine;
-pub use engine::wal::WalGroupEngineFactory;
 pub use error::ErrorStatus;
 pub use error::RuntimeError;
 pub use metrics::RuntimeMailboxSnapshot;
@@ -147,8 +144,6 @@ pub use runtime::RuntimeConfig;
 pub use runtime::RuntimeThreading;
 pub use runtime::ShardRuntime;
 pub use snapshot_store::InlineSnapshotStore;
-#[cfg(not(madsim))]
-pub use snapshot_store::LocalSnapshotStore;
 #[cfg(not(madsim))]
 pub use snapshot_store::S3SnapshotStore;
 pub use snapshot_store::SharedSnapshotStore;

@@ -38,7 +38,7 @@ The server uses a thread-per-core, multi-Raft architecture: each stream hashes t
 | Crate                  | Description                                                                                                                                   |
 | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | `ursula`               | HTTP server, CLI binaries (`ursula`, `ursulagw`), bootstrap wiring, and end-to-end protocol tests.                                            |
-| `ursula-runtime`       | Per-core actor runtime: hot ring, cold-tier flush, group engine boundary, WAL engine, cold store integration, and runtime benchmarks.         |
+| `ursula-runtime`       | Per-core actor runtime: hot ring, cold-tier flush, group engine boundary, cold store integration, and runtime benchmarks.                   |
 | `ursula-raft`          | OpenRaft-backed group engine: network, log store, snapshot handling, gRPC Raft plumbing.                                                      |
 | `ursula-stream`        | Deterministic stream state machine: bucket/stream commands, responses, snapshots, payload metadata, validation.                               |
 | `ursula-shard`         | Bucket/stream routing, core ownership, Raft group placement, shared shard identifiers (`CoreId`, `ShardId`, `RaftGroupId`, `BucketStreamId`). |
