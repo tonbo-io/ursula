@@ -16,7 +16,7 @@ The chart is designed for fresh static-membership clusters. It does not perform 
 
 This topology removes single-pod compute failures from the normal request path, but it does not make chart upgrades an automated Raft operation. Persistent Raft groups make membership initialization idempotent across restarts, but voter count must not be changed in place and server rollouts must be performed deliberately with health checks between pods.
 
-[`examples/production-eks.yaml`](examples/production-eks.yaml) is a concrete three-AZ starting point with durable gp3 volumes, S3 cold storage and snapshots, three gateways, separate workload identities, and a two-replica indexer worker pool. For a complete AWS prerequisite flow, use [`deploy/eks`](../../deploy/eks): `./provision.sh` produces `generated-values.yaml`, after which deployment is one `helm install` and one `helm test`.
+[`examples/production-eks.yaml`](examples/production-eks.yaml) is a concrete three-AZ starting point with durable gp3 volumes, S3 cold storage and snapshots, three gateways, separate workload identities, and a two-replica indexer worker pool. For a complete AWS prerequisite flow, use [`deploy/eks`](../../deploy/eks): `tofu apply` produces `generated-values.yaml` and a dedicated kubeconfig, after which deployment is one `helm install` and one `helm test`.
 
 ## Build A Local Image
 
