@@ -24,694 +24,365 @@ pub struct RuntimeMetrics {
     pub(crate) inner: Arc<RuntimeMetricsInner>,
 }
 
-impl RuntimeMetrics {
-    pub fn snapshot(&self) -> RuntimeMetricsSnapshot {
-        let per_core_appends = self
-            .inner
-            .per_core_appends
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let accepted_appends = per_core_appends.iter().sum();
-        let per_group_appends = self
-            .inner
-            .per_group_appends
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let per_core_applied_mutations = self
-            .inner
-            .per_core_applied_mutations
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let applied_mutations = per_core_applied_mutations.iter().sum();
-        let per_group_applied_mutations = self
-            .inner
-            .per_group_applied_mutations
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let per_core_mutation_apply_ns = self
-            .inner
-            .per_core_mutation_apply_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let mutation_apply_ns = per_core_mutation_apply_ns.iter().sum();
-        let per_group_mutation_apply_ns = self
-            .inner
-            .per_group_mutation_apply_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let per_core_group_lock_wait_ns = self
-            .inner
-            .per_core_group_lock_wait_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let group_lock_wait_ns = per_core_group_lock_wait_ns.iter().sum();
-        let per_group_group_lock_wait_ns = self
-            .inner
-            .per_group_group_lock_wait_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let per_core_group_engine_exec_ns = self
-            .inner
-            .per_core_group_engine_exec_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let group_engine_exec_ns = per_core_group_engine_exec_ns.iter().sum();
-        let per_group_group_engine_exec_ns = self
-            .inner
-            .per_group_group_engine_exec_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let per_group_group_mailbox_depth = self
-            .inner
-            .per_group_group_mailbox_depth
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let group_mailbox_depth = per_group_group_mailbox_depth.iter().sum();
-        let per_group_group_mailbox_max_depth = self
-            .inner
-            .per_group_group_mailbox_max_depth
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let group_mailbox_max_depth = per_group_group_mailbox_max_depth
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0);
-        let per_group_group_mailbox_full_events = self
-            .inner
-            .per_group_group_mailbox_full_events
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let group_mailbox_full_events = per_group_group_mailbox_full_events.iter().sum();
-        let per_core_raft_write_many_batches = self
-            .inner
-            .per_core_raft_write_many_batches
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let raft_write_many_batches = per_core_raft_write_many_batches.iter().sum();
-        let per_group_raft_write_many_batches = self
-            .inner
-            .per_group_raft_write_many_batches
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let per_core_raft_write_many_commands = self
-            .inner
-            .per_core_raft_write_many_commands
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let raft_write_many_commands = per_core_raft_write_many_commands.iter().sum();
-        let per_group_raft_write_many_commands = self
-            .inner
-            .per_group_raft_write_many_commands
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let per_core_raft_write_many_logical_commands = self
-            .inner
-            .per_core_raft_write_many_logical_commands
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let raft_write_many_logical_commands =
-            per_core_raft_write_many_logical_commands.iter().sum();
-        let per_group_raft_write_many_logical_commands = self
-            .inner
-            .per_group_raft_write_many_logical_commands
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let per_core_raft_write_many_responses = self
-            .inner
-            .per_core_raft_write_many_responses
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let raft_write_many_responses = per_core_raft_write_many_responses.iter().sum();
-        let per_group_raft_write_many_responses = self
-            .inner
-            .per_group_raft_write_many_responses
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let per_core_raft_write_many_submit_ns = self
-            .inner
-            .per_core_raft_write_many_submit_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let raft_write_many_submit_ns = per_core_raft_write_many_submit_ns.iter().sum();
-        let per_group_raft_write_many_submit_ns = self
-            .inner
-            .per_group_raft_write_many_submit_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let per_core_raft_write_many_response_ns = self
-            .inner
-            .per_core_raft_write_many_response_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let raft_write_many_response_ns = per_core_raft_write_many_response_ns.iter().sum();
-        let per_group_raft_write_many_response_ns = self
-            .inner
-            .per_group_raft_write_many_response_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let per_core_raft_apply_entries = self
-            .inner
-            .per_core_raft_apply_entries
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let raft_apply_entries = per_core_raft_apply_entries.iter().sum();
-        let per_group_raft_apply_entries = self
-            .inner
-            .per_group_raft_apply_entries
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let per_core_raft_apply_ns = self
-            .inner
-            .per_core_raft_apply_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let raft_apply_ns = per_core_raft_apply_ns.iter().sum();
-        let per_group_raft_apply_ns = self
-            .inner
-            .per_group_raft_apply_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let per_group_raft_snapshot_builds = self
-            .inner
-            .per_group_raft_snapshot_builds
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let raft_snapshot_builds = per_group_raft_snapshot_builds.iter().sum();
-        let per_group_raft_snapshot_build_ns = self
-            .inner
-            .per_group_raft_snapshot_build_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let raft_snapshot_build_ns = per_group_raft_snapshot_build_ns.iter().sum();
-        let per_group_raft_snapshot_body_bytes = self
-            .inner
-            .per_group_raft_snapshot_body_bytes
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let raft_snapshot_body_bytes = per_group_raft_snapshot_body_bytes.iter().sum();
-        let raft_snapshot_body_bytes_max = per_group_raft_snapshot_body_bytes
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0);
-        let per_group_raft_snapshot_pointer_bytes = self
-            .inner
-            .per_group_raft_snapshot_pointer_bytes
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let raft_snapshot_pointer_bytes = per_group_raft_snapshot_pointer_bytes.iter().sum();
-        let raft_snapshot_pointer_bytes_max = per_group_raft_snapshot_pointer_bytes
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0);
-        let per_group_raft_snapshot_streams = self
-            .inner
-            .per_group_raft_snapshot_streams
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let raft_snapshot_streams = per_group_raft_snapshot_streams.iter().sum();
-        let raft_snapshot_streams_max = per_group_raft_snapshot_streams
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0);
-        let per_group_raft_snapshot_external_uploads = self
-            .inner
-            .per_group_raft_snapshot_external_uploads
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let raft_snapshot_external_uploads = per_group_raft_snapshot_external_uploads.iter().sum();
-        let per_group_raft_snapshot_inline_fallbacks = self
-            .inner
-            .per_group_raft_snapshot_inline_fallbacks
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let raft_snapshot_inline_fallbacks = per_group_raft_snapshot_inline_fallbacks.iter().sum();
-        let per_core_live_read_waiters = self
-            .inner
-            .per_core_live_read_waiters
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let live_read_waiters = per_core_live_read_waiters.iter().sum();
-        let per_core_live_read_backpressure_events = self
-            .inner
-            .per_core_live_read_backpressure_events
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let live_read_backpressure_events = per_core_live_read_backpressure_events.iter().sum();
-        let per_core_routed_requests = self
-            .inner
-            .per_core_routed_requests
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let routed_requests = per_core_routed_requests.iter().sum();
-        let per_core_mailbox_send_wait_ns = self
-            .inner
-            .per_core_mailbox_send_wait_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let mailbox_send_wait_ns = per_core_mailbox_send_wait_ns.iter().sum();
-        let per_core_mailbox_full_events = self
-            .inner
-            .per_core_mailbox_full_events
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let mailbox_full_events = per_core_mailbox_full_events.iter().sum();
-        let per_core_wal_batches = self
-            .inner
-            .per_core_wal_batches
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let wal_batches = per_core_wal_batches.iter().sum();
-        let per_group_wal_batches = self
-            .inner
-            .per_group_wal_batches
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let per_core_wal_records = self
-            .inner
-            .per_core_wal_records
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let wal_records = per_core_wal_records.iter().sum();
-        let per_group_wal_records = self
-            .inner
-            .per_group_wal_records
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let per_core_wal_write_ns = self
-            .inner
-            .per_core_wal_write_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let wal_write_ns = per_core_wal_write_ns.iter().sum();
-        let per_group_wal_write_ns = self
-            .inner
-            .per_group_wal_write_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let per_core_wal_sync_ns = self
-            .inner
-            .per_core_wal_sync_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let wal_sync_ns = per_core_wal_sync_ns.iter().sum();
-        let per_group_wal_sync_ns = self
-            .inner
-            .per_group_wal_sync_ns
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let cold_flush_uploads = self.inner.cold_flush_uploads.load_relaxed();
-        let cold_flush_upload_bytes = self.inner.cold_flush_upload_bytes.load_relaxed();
-        let cold_flush_upload_ns = self.inner.cold_flush_upload_ns.load_relaxed();
-        let cold_flush_publishes = self.inner.cold_flush_publishes.load_relaxed();
-        let cold_flush_publish_bytes = self.inner.cold_flush_publish_bytes.load_relaxed();
-        let cold_flush_publish_ns = self.inner.cold_flush_publish_ns.load_relaxed();
-        let cold_orphan_cleanup_attempts = self.inner.cold_orphan_cleanup_attempts.load_relaxed();
-        let cold_orphan_cleanup_errors = self.inner.cold_orphan_cleanup_errors.load_relaxed();
-        let cold_orphan_bytes = self.inner.cold_orphan_bytes.load_relaxed();
-        let cold_gc_reclaimed = self.inner.cold_gc_reclaimed.load_relaxed();
-        let cold_gc_errors = self.inner.cold_gc_errors.load_relaxed();
-        let cold_flush_write_errors = self.inner.cold_flush_write_errors.load_relaxed();
-        let per_group_cold_hot_bytes = self
-            .inner
-            .per_group_cold_hot_bytes
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let cold_hot_bytes = per_group_cold_hot_bytes.iter().sum();
-        let per_group_cold_hot_bytes_max = self
-            .inner
-            .per_group_cold_hot_bytes_max
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let cold_hot_group_bytes_max = per_group_cold_hot_bytes_max
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0);
-        let cold_hot_stream_bytes_max = self.inner.cold_hot_stream_bytes_max.load_relaxed();
-        let per_core_cold_backpressure_events = self
-            .inner
-            .per_core_cold_backpressure_events
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect::<Vec<_>>();
-        let cold_backpressure_events = per_core_cold_backpressure_events.iter().sum();
-        let per_group_cold_backpressure_events = self
-            .inner
-            .per_group_cold_backpressure_events
-            .iter()
-            .map(PaddedAtomicU64::load_relaxed)
-            .collect();
-        let cold_backpressure_bytes = self.inner.cold_backpressure_bytes.load_relaxed();
-
-        RuntimeMetricsSnapshot {
-            accepted_appends,
-            per_core_appends,
-            per_group_appends,
-            applied_mutations,
-            per_core_applied_mutations,
-            per_group_applied_mutations,
-            mutation_apply_ns,
-            per_core_mutation_apply_ns,
-            per_group_mutation_apply_ns,
-            group_lock_wait_ns,
-            per_core_group_lock_wait_ns,
-            per_group_group_lock_wait_ns,
-            group_engine_exec_ns,
-            per_core_group_engine_exec_ns,
-            per_group_group_engine_exec_ns,
-            group_mailbox_depth,
-            per_group_group_mailbox_depth,
-            group_mailbox_max_depth,
-            per_group_group_mailbox_max_depth,
-            group_mailbox_full_events,
-            per_group_group_mailbox_full_events,
-            raft_write_many_batches,
-            per_core_raft_write_many_batches,
-            per_group_raft_write_many_batches,
-            raft_write_many_commands,
-            per_core_raft_write_many_commands,
-            per_group_raft_write_many_commands,
-            raft_write_many_logical_commands,
-            per_core_raft_write_many_logical_commands,
-            per_group_raft_write_many_logical_commands,
-            raft_write_many_responses,
-            per_core_raft_write_many_responses,
-            per_group_raft_write_many_responses,
-            raft_write_many_submit_ns,
-            per_core_raft_write_many_submit_ns,
-            per_group_raft_write_many_submit_ns,
-            raft_write_many_response_ns,
-            per_core_raft_write_many_response_ns,
-            per_group_raft_write_many_response_ns,
-            raft_apply_entries,
-            per_core_raft_apply_entries,
-            per_group_raft_apply_entries,
-            raft_apply_ns,
-            per_core_raft_apply_ns,
-            per_group_raft_apply_ns,
-            raft_snapshot_builds,
-            per_group_raft_snapshot_builds,
-            raft_snapshot_build_ns,
-            per_group_raft_snapshot_build_ns,
-            raft_snapshot_body_bytes,
-            raft_snapshot_body_bytes_max,
-            per_group_raft_snapshot_body_bytes,
-            raft_snapshot_pointer_bytes,
-            raft_snapshot_pointer_bytes_max,
-            per_group_raft_snapshot_pointer_bytes,
-            raft_snapshot_streams,
-            raft_snapshot_streams_max,
-            per_group_raft_snapshot_streams,
-            raft_snapshot_external_uploads,
-            per_group_raft_snapshot_external_uploads,
-            raft_snapshot_inline_fallbacks,
-            per_group_raft_snapshot_inline_fallbacks,
-            live_read_waiters,
-            per_core_live_read_waiters,
-            live_read_backpressure_events,
-            per_core_live_read_backpressure_events,
-            routed_requests,
-            per_core_routed_requests,
-            mailbox_send_wait_ns,
-            per_core_mailbox_send_wait_ns,
-            mailbox_full_events,
-            per_core_mailbox_full_events,
-            wal_batches,
-            per_core_wal_batches,
-            per_group_wal_batches,
-            wal_records,
-            per_core_wal_records,
-            per_group_wal_records,
-            wal_write_ns,
-            per_core_wal_write_ns,
-            per_group_wal_write_ns,
-            wal_sync_ns,
-            per_core_wal_sync_ns,
-            per_group_wal_sync_ns,
-            cold_flush_uploads,
-            cold_flush_upload_bytes,
-            cold_flush_upload_ns,
-            cold_flush_publishes,
-            cold_flush_publish_bytes,
-            cold_flush_publish_ns,
-            cold_orphan_cleanup_attempts,
-            cold_orphan_cleanup_errors,
-            cold_gc_reclaimed,
-            cold_gc_errors,
-            cold_flush_write_errors,
-            cold_orphan_bytes,
-            cold_hot_bytes,
-            per_group_cold_hot_bytes,
-            cold_hot_group_bytes_max,
-            per_group_cold_hot_bytes_max,
-            cold_hot_stream_bytes_max,
-            cold_backpressure_events,
-            per_core_cold_backpressure_events,
-            per_group_cold_backpressure_events,
-            cold_backpressure_bytes,
+/// Declares every runtime metric once and expands the four sections that were
+/// previously hand-replicated per metric: the `RuntimeMetricsInner` counter
+/// fields, `RuntimeMetricsInner::new`, the `RuntimeMetrics::snapshot`
+/// collection logic, and the public serialized `RuntimeMetricsSnapshot`
+/// struct.
+///
+/// Manifest grammar (entries must be listed in serialized snapshot-field
+/// order; every counter and snapshot field name is spelled explicitly so
+/// serialized names stay grep-able and byte-stable):
+///
+/// - `sum GLOBAL: core PER_CORE, group PER_GROUP;` — per-core and per-group
+///   counters; the global value is the sum across cores.
+/// - `sum GLOBAL: core PER_CORE;` — per-core counters summed into the global.
+/// - `sum GLOBAL: group PER_GROUP;` — per-group counters summed into the
+///   global.
+/// - `max GLOBAL: group PER_GROUP;` — per-group values; the global is the
+///   maximum.
+/// - `summax SUM, MAX: group PER_GROUP;` — per-group values exposed both as a
+///   sum and as a maximum.
+/// - `counter GLOBAL;` — a single global counter.
+macro_rules! runtime_metrics {
+    (@munch
+        ctx { $ir:ident $cc:ident $gc:ident }
+        inner { $($inner:tt)* }
+        new { $($new:tt)* }
+        snap { $($snap:tt)* }
+        fields { $($fields:tt)* }
+        names { $($names:ident)* }
+        rest { sum $global:ident: core $core:ident, group $group:ident; $($rest:tt)* }
+    ) => {
+        runtime_metrics! {
+            @munch
+            ctx { $ir $cc $gc }
+            inner {
+                $($inner)*
+                pub(crate) $core: Vec<PaddedAtomicU64>,
+                pub(crate) $group: Vec<PaddedAtomicU64>,
+            }
+            new {
+                $($new)*
+                $core: zeroed_counters($cc),
+                $group: zeroed_counters($gc),
+            }
+            snap {
+                $($snap)*
+                let $core = load_counters(&$ir.$core);
+                let $global: u64 = $core.iter().sum();
+                let $group = load_counters(&$ir.$group);
+            }
+            fields {
+                $($fields)*
+                pub $global: u64,
+                pub $core: Vec<u64>,
+                pub $group: Vec<u64>,
+            }
+            names { $($names)* $global $core $group }
+            rest { $($rest)* }
         }
-    }
+    };
+    (@munch
+        ctx { $ir:ident $cc:ident $gc:ident }
+        inner { $($inner:tt)* }
+        new { $($new:tt)* }
+        snap { $($snap:tt)* }
+        fields { $($fields:tt)* }
+        names { $($names:ident)* }
+        rest { sum $global:ident: core $core:ident; $($rest:tt)* }
+    ) => {
+        runtime_metrics! {
+            @munch
+            ctx { $ir $cc $gc }
+            inner {
+                $($inner)*
+                pub(crate) $core: Vec<PaddedAtomicU64>,
+            }
+            new {
+                $($new)*
+                $core: zeroed_counters($cc),
+            }
+            snap {
+                $($snap)*
+                let $core = load_counters(&$ir.$core);
+                let $global: u64 = $core.iter().sum();
+            }
+            fields {
+                $($fields)*
+                pub $global: u64,
+                pub $core: Vec<u64>,
+            }
+            names { $($names)* $global $core }
+            rest { $($rest)* }
+        }
+    };
+    (@munch
+        ctx { $ir:ident $cc:ident $gc:ident }
+        inner { $($inner:tt)* }
+        new { $($new:tt)* }
+        snap { $($snap:tt)* }
+        fields { $($fields:tt)* }
+        names { $($names:ident)* }
+        rest { sum $global:ident: group $group:ident; $($rest:tt)* }
+    ) => {
+        runtime_metrics! {
+            @munch
+            ctx { $ir $cc $gc }
+            inner {
+                $($inner)*
+                pub(crate) $group: Vec<PaddedAtomicU64>,
+            }
+            new {
+                $($new)*
+                $group: zeroed_counters($gc),
+            }
+            snap {
+                $($snap)*
+                let $group = load_counters(&$ir.$group);
+                let $global: u64 = $group.iter().sum();
+            }
+            fields {
+                $($fields)*
+                pub $global: u64,
+                pub $group: Vec<u64>,
+            }
+            names { $($names)* $global $group }
+            rest { $($rest)* }
+        }
+    };
+    (@munch
+        ctx { $ir:ident $cc:ident $gc:ident }
+        inner { $($inner:tt)* }
+        new { $($new:tt)* }
+        snap { $($snap:tt)* }
+        fields { $($fields:tt)* }
+        names { $($names:ident)* }
+        rest { max $global:ident: group $group:ident; $($rest:tt)* }
+    ) => {
+        runtime_metrics! {
+            @munch
+            ctx { $ir $cc $gc }
+            inner {
+                $($inner)*
+                pub(crate) $group: Vec<PaddedAtomicU64>,
+            }
+            new {
+                $($new)*
+                $group: zeroed_counters($gc),
+            }
+            snap {
+                $($snap)*
+                let $group = load_counters(&$ir.$group);
+                let $global = max_or_zero(&$group);
+            }
+            fields {
+                $($fields)*
+                pub $global: u64,
+                pub $group: Vec<u64>,
+            }
+            names { $($names)* $global $group }
+            rest { $($rest)* }
+        }
+    };
+    (@munch
+        ctx { $ir:ident $cc:ident $gc:ident }
+        inner { $($inner:tt)* }
+        new { $($new:tt)* }
+        snap { $($snap:tt)* }
+        fields { $($fields:tt)* }
+        names { $($names:ident)* }
+        rest { summax $sum:ident, $max:ident: group $group:ident; $($rest:tt)* }
+    ) => {
+        runtime_metrics! {
+            @munch
+            ctx { $ir $cc $gc }
+            inner {
+                $($inner)*
+                pub(crate) $group: Vec<PaddedAtomicU64>,
+            }
+            new {
+                $($new)*
+                $group: zeroed_counters($gc),
+            }
+            snap {
+                $($snap)*
+                let $group = load_counters(&$ir.$group);
+                let $sum: u64 = $group.iter().sum();
+                let $max = max_or_zero(&$group);
+            }
+            fields {
+                $($fields)*
+                pub $sum: u64,
+                pub $max: u64,
+                pub $group: Vec<u64>,
+            }
+            names { $($names)* $sum $max $group }
+            rest { $($rest)* }
+        }
+    };
+    (@munch
+        ctx { $ir:ident $cc:ident $gc:ident }
+        inner { $($inner:tt)* }
+        new { $($new:tt)* }
+        snap { $($snap:tt)* }
+        fields { $($fields:tt)* }
+        names { $($names:ident)* }
+        rest { counter $global:ident; $($rest:tt)* }
+    ) => {
+        runtime_metrics! {
+            @munch
+            ctx { $ir $cc $gc }
+            inner {
+                $($inner)*
+                pub(crate) $global: PaddedAtomicU64,
+            }
+            new {
+                $($new)*
+                $global: PaddedAtomicU64::new(0),
+            }
+            snap {
+                $($snap)*
+                let $global = $ir.$global.load_relaxed();
+            }
+            fields {
+                $($fields)*
+                pub $global: u64,
+            }
+            names { $($names)* $global }
+            rest { $($rest)* }
+        }
+    };
+    (@munch
+        ctx { $ir:ident $cc:ident $gc:ident }
+        inner { $($inner:tt)* }
+        new { $($new:tt)* }
+        snap { $($snap:tt)* }
+        fields { $($fields:tt)* }
+        names { $($names:ident)* }
+        rest { }
+    ) => {
+        #[derive(Debug)]
+        pub(crate) struct RuntimeMetricsInner {
+            $($inner)*
+        }
+
+        impl RuntimeMetricsInner {
+            pub(crate) fn new($cc: usize, $gc: usize) -> Self {
+                Self { $($new)* }
+            }
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+        pub struct RuntimeMetricsSnapshot {
+            $($fields)*
+        }
+
+        impl RuntimeMetrics {
+            pub fn snapshot(&self) -> RuntimeMetricsSnapshot {
+                let $ir = &self.inner;
+                $($snap)*
+                RuntimeMetricsSnapshot { $($names),* }
+            }
+        }
+    };
+    ( $($manifest:tt)* ) => {
+        runtime_metrics! {
+            @munch
+            ctx { inner_counters core_count raft_group_count }
+            inner {}
+            new {}
+            snap {}
+            fields {}
+            names {}
+            rest { $($manifest)* }
+        }
+    };
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct RuntimeMetricsSnapshot {
-    pub accepted_appends: u64,
-    pub per_core_appends: Vec<u64>,
-    pub per_group_appends: Vec<u64>,
-    pub applied_mutations: u64,
-    pub per_core_applied_mutations: Vec<u64>,
-    pub per_group_applied_mutations: Vec<u64>,
-    pub mutation_apply_ns: u64,
-    pub per_core_mutation_apply_ns: Vec<u64>,
-    pub per_group_mutation_apply_ns: Vec<u64>,
-    pub group_lock_wait_ns: u64,
-    pub per_core_group_lock_wait_ns: Vec<u64>,
-    pub per_group_group_lock_wait_ns: Vec<u64>,
-    pub group_engine_exec_ns: u64,
-    pub per_core_group_engine_exec_ns: Vec<u64>,
-    pub per_group_group_engine_exec_ns: Vec<u64>,
-    pub group_mailbox_depth: u64,
-    pub per_group_group_mailbox_depth: Vec<u64>,
-    pub group_mailbox_max_depth: u64,
-    pub per_group_group_mailbox_max_depth: Vec<u64>,
-    pub group_mailbox_full_events: u64,
-    pub per_group_group_mailbox_full_events: Vec<u64>,
-    pub raft_write_many_batches: u64,
-    pub per_core_raft_write_many_batches: Vec<u64>,
-    pub per_group_raft_write_many_batches: Vec<u64>,
-    pub raft_write_many_commands: u64,
-    pub per_core_raft_write_many_commands: Vec<u64>,
-    pub per_group_raft_write_many_commands: Vec<u64>,
-    pub raft_write_many_logical_commands: u64,
-    pub per_core_raft_write_many_logical_commands: Vec<u64>,
-    pub per_group_raft_write_many_logical_commands: Vec<u64>,
-    pub raft_write_many_responses: u64,
-    pub per_core_raft_write_many_responses: Vec<u64>,
-    pub per_group_raft_write_many_responses: Vec<u64>,
-    pub raft_write_many_submit_ns: u64,
-    pub per_core_raft_write_many_submit_ns: Vec<u64>,
-    pub per_group_raft_write_many_submit_ns: Vec<u64>,
-    pub raft_write_many_response_ns: u64,
-    pub per_core_raft_write_many_response_ns: Vec<u64>,
-    pub per_group_raft_write_many_response_ns: Vec<u64>,
-    pub raft_apply_entries: u64,
-    pub per_core_raft_apply_entries: Vec<u64>,
-    pub per_group_raft_apply_entries: Vec<u64>,
-    pub raft_apply_ns: u64,
-    pub per_core_raft_apply_ns: Vec<u64>,
-    pub per_group_raft_apply_ns: Vec<u64>,
-    pub raft_snapshot_builds: u64,
-    pub per_group_raft_snapshot_builds: Vec<u64>,
-    pub raft_snapshot_build_ns: u64,
-    pub per_group_raft_snapshot_build_ns: Vec<u64>,
-    pub raft_snapshot_body_bytes: u64,
-    pub raft_snapshot_body_bytes_max: u64,
-    pub per_group_raft_snapshot_body_bytes: Vec<u64>,
-    pub raft_snapshot_pointer_bytes: u64,
-    pub raft_snapshot_pointer_bytes_max: u64,
-    pub per_group_raft_snapshot_pointer_bytes: Vec<u64>,
-    pub raft_snapshot_streams: u64,
-    pub raft_snapshot_streams_max: u64,
-    pub per_group_raft_snapshot_streams: Vec<u64>,
-    pub raft_snapshot_external_uploads: u64,
-    pub per_group_raft_snapshot_external_uploads: Vec<u64>,
-    pub raft_snapshot_inline_fallbacks: u64,
-    pub per_group_raft_snapshot_inline_fallbacks: Vec<u64>,
-    pub live_read_waiters: u64,
-    pub per_core_live_read_waiters: Vec<u64>,
-    pub live_read_backpressure_events: u64,
-    pub per_core_live_read_backpressure_events: Vec<u64>,
-    pub routed_requests: u64,
-    pub per_core_routed_requests: Vec<u64>,
-    pub mailbox_send_wait_ns: u64,
-    pub per_core_mailbox_send_wait_ns: Vec<u64>,
-    pub mailbox_full_events: u64,
-    pub per_core_mailbox_full_events: Vec<u64>,
-    pub wal_batches: u64,
-    pub per_core_wal_batches: Vec<u64>,
-    pub per_group_wal_batches: Vec<u64>,
-    pub wal_records: u64,
-    pub per_core_wal_records: Vec<u64>,
-    pub per_group_wal_records: Vec<u64>,
-    pub wal_write_ns: u64,
-    pub per_core_wal_write_ns: Vec<u64>,
-    pub per_group_wal_write_ns: Vec<u64>,
-    pub wal_sync_ns: u64,
-    pub per_core_wal_sync_ns: Vec<u64>,
-    pub per_group_wal_sync_ns: Vec<u64>,
-    pub cold_flush_uploads: u64,
-    pub cold_flush_upload_bytes: u64,
-    pub cold_flush_upload_ns: u64,
-    pub cold_flush_publishes: u64,
-    pub cold_flush_publish_bytes: u64,
-    pub cold_flush_publish_ns: u64,
-    pub cold_orphan_cleanup_attempts: u64,
-    pub cold_orphan_cleanup_errors: u64,
-    pub cold_orphan_bytes: u64,
-    pub cold_gc_reclaimed: u64,
-    pub cold_gc_errors: u64,
-    pub cold_flush_write_errors: u64,
-    pub cold_hot_bytes: u64,
-    pub per_group_cold_hot_bytes: Vec<u64>,
-    pub cold_hot_group_bytes_max: u64,
-    pub per_group_cold_hot_bytes_max: Vec<u64>,
-    pub cold_hot_stream_bytes_max: u64,
-    pub cold_backpressure_events: u64,
-    pub per_core_cold_backpressure_events: Vec<u64>,
-    pub per_group_cold_backpressure_events: Vec<u64>,
-    pub cold_backpressure_bytes: u64,
+fn zeroed_counters(len: usize) -> Vec<PaddedAtomicU64> {
+    (0..len).map(|_| PaddedAtomicU64::new(0)).collect()
+}
+
+fn load_counters(counters: &[PaddedAtomicU64]) -> Vec<u64> {
+    counters.iter().map(PaddedAtomicU64::load_relaxed).collect()
+}
+
+fn max_or_zero(values: &[u64]) -> u64 {
+    values.iter().copied().max().unwrap_or(0)
+}
+
+runtime_metrics! {
+    sum accepted_appends: core per_core_appends, group per_group_appends;
+    sum applied_mutations:
+        core per_core_applied_mutations, group per_group_applied_mutations;
+    sum mutation_apply_ns:
+        core per_core_mutation_apply_ns, group per_group_mutation_apply_ns;
+    sum group_lock_wait_ns:
+        core per_core_group_lock_wait_ns, group per_group_group_lock_wait_ns;
+    sum group_engine_exec_ns:
+        core per_core_group_engine_exec_ns, group per_group_group_engine_exec_ns;
+    sum group_mailbox_depth: group per_group_group_mailbox_depth;
+    max group_mailbox_max_depth: group per_group_group_mailbox_max_depth;
+    sum group_mailbox_full_events: group per_group_group_mailbox_full_events;
+    sum raft_write_many_batches:
+        core per_core_raft_write_many_batches, group per_group_raft_write_many_batches;
+    sum raft_write_many_commands:
+        core per_core_raft_write_many_commands, group per_group_raft_write_many_commands;
+    sum raft_write_many_logical_commands:
+        core per_core_raft_write_many_logical_commands,
+        group per_group_raft_write_many_logical_commands;
+    sum raft_write_many_responses:
+        core per_core_raft_write_many_responses, group per_group_raft_write_many_responses;
+    sum raft_write_many_submit_ns:
+        core per_core_raft_write_many_submit_ns, group per_group_raft_write_many_submit_ns;
+    sum raft_write_many_response_ns:
+        core per_core_raft_write_many_response_ns, group per_group_raft_write_many_response_ns;
+    sum raft_apply_entries: core per_core_raft_apply_entries, group per_group_raft_apply_entries;
+    sum raft_apply_ns: core per_core_raft_apply_ns, group per_group_raft_apply_ns;
+    sum raft_snapshot_builds: group per_group_raft_snapshot_builds;
+    sum raft_snapshot_build_ns: group per_group_raft_snapshot_build_ns;
+    summax raft_snapshot_body_bytes, raft_snapshot_body_bytes_max:
+        group per_group_raft_snapshot_body_bytes;
+    summax raft_snapshot_pointer_bytes, raft_snapshot_pointer_bytes_max:
+        group per_group_raft_snapshot_pointer_bytes;
+    summax raft_snapshot_streams, raft_snapshot_streams_max:
+        group per_group_raft_snapshot_streams;
+    sum raft_snapshot_external_uploads: group per_group_raft_snapshot_external_uploads;
+    sum raft_snapshot_inline_fallbacks: group per_group_raft_snapshot_inline_fallbacks;
+    sum live_read_waiters: core per_core_live_read_waiters;
+    sum live_read_backpressure_events: core per_core_live_read_backpressure_events;
+    sum routed_requests: core per_core_routed_requests;
+    sum mailbox_send_wait_ns: core per_core_mailbox_send_wait_ns;
+    sum mailbox_full_events: core per_core_mailbox_full_events;
+    sum wal_batches: core per_core_wal_batches, group per_group_wal_batches;
+    sum wal_records: core per_core_wal_records, group per_group_wal_records;
+    sum wal_write_ns: core per_core_wal_write_ns, group per_group_wal_write_ns;
+    sum wal_sync_ns: core per_core_wal_sync_ns, group per_group_wal_sync_ns;
+    counter cold_flush_uploads;
+    counter cold_flush_upload_bytes;
+    counter cold_flush_upload_ns;
+    counter cold_flush_publishes;
+    counter cold_flush_publish_bytes;
+    counter cold_flush_publish_ns;
+    counter cold_orphan_cleanup_attempts;
+    counter cold_orphan_cleanup_errors;
+    counter cold_orphan_bytes;
+    counter cold_gc_reclaimed;
+    counter cold_gc_errors;
+    counter cold_flush_write_errors;
+    sum cold_hot_bytes: group per_group_cold_hot_bytes;
+    max cold_hot_group_bytes_max: group per_group_cold_hot_bytes_max;
+    counter cold_hot_stream_bytes_max;
+    sum cold_backpressure_events:
+        core per_core_cold_backpressure_events, group per_group_cold_backpressure_events;
+    counter cold_backpressure_bytes;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeMailboxSnapshot {
     pub depths: Vec<usize>,
     pub capacities: Vec<usize>,
-}
-
-#[derive(Debug)]
-pub(crate) struct RuntimeMetricsInner {
-    pub(crate) per_core_appends: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_appends: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_applied_mutations: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_applied_mutations: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_mutation_apply_ns: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_mutation_apply_ns: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_group_lock_wait_ns: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_group_lock_wait_ns: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_group_engine_exec_ns: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_group_engine_exec_ns: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_group_mailbox_depth: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_group_mailbox_max_depth: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_group_mailbox_full_events: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_raft_write_many_batches: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_raft_write_many_batches: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_raft_write_many_commands: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_raft_write_many_commands: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_raft_write_many_logical_commands: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_raft_write_many_logical_commands: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_raft_write_many_responses: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_raft_write_many_responses: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_raft_write_many_submit_ns: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_raft_write_many_submit_ns: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_raft_write_many_response_ns: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_raft_write_many_response_ns: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_raft_apply_entries: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_raft_apply_entries: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_raft_apply_ns: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_raft_apply_ns: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_raft_snapshot_builds: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_raft_snapshot_build_ns: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_raft_snapshot_body_bytes: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_raft_snapshot_pointer_bytes: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_raft_snapshot_streams: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_raft_snapshot_external_uploads: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_raft_snapshot_inline_fallbacks: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_live_read_waiters: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_live_read_backpressure_events: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_routed_requests: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_mailbox_send_wait_ns: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_mailbox_full_events: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_wal_batches: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_wal_batches: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_wal_records: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_wal_records: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_wal_write_ns: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_wal_write_ns: Vec<PaddedAtomicU64>,
-    pub(crate) per_core_wal_sync_ns: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_wal_sync_ns: Vec<PaddedAtomicU64>,
-    pub(crate) cold_flush_uploads: PaddedAtomicU64,
-    pub(crate) cold_flush_upload_bytes: PaddedAtomicU64,
-    pub(crate) cold_flush_upload_ns: PaddedAtomicU64,
-    pub(crate) cold_flush_publishes: PaddedAtomicU64,
-    pub(crate) cold_flush_publish_bytes: PaddedAtomicU64,
-    pub(crate) cold_flush_publish_ns: PaddedAtomicU64,
-    pub(crate) cold_orphan_cleanup_attempts: PaddedAtomicU64,
-    pub(crate) cold_orphan_cleanup_errors: PaddedAtomicU64,
-    pub(crate) cold_gc_reclaimed: PaddedAtomicU64,
-    pub(crate) cold_gc_errors: PaddedAtomicU64,
-    pub(crate) cold_flush_write_errors: PaddedAtomicU64,
-    pub(crate) cold_orphan_bytes: PaddedAtomicU64,
-    pub(crate) per_group_cold_hot_bytes: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_cold_hot_bytes_max: Vec<PaddedAtomicU64>,
-    pub(crate) cold_hot_stream_bytes_max: PaddedAtomicU64,
-    pub(crate) per_core_cold_backpressure_events: Vec<PaddedAtomicU64>,
-    pub(crate) per_group_cold_backpressure_events: Vec<PaddedAtomicU64>,
-    pub(crate) cold_backpressure_bytes: PaddedAtomicU64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -734,160 +405,6 @@ pub(crate) struct RaftSnapshotBuildSample {
 }
 
 impl RuntimeMetricsInner {
-    pub(crate) fn new(core_count: usize, raft_group_count: usize) -> Self {
-        Self {
-            per_core_appends: (0..core_count).map(|_| PaddedAtomicU64::new(0)).collect(),
-            per_group_appends: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_applied_mutations: (0..core_count).map(|_| PaddedAtomicU64::new(0)).collect(),
-            per_group_applied_mutations: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_mutation_apply_ns: (0..core_count).map(|_| PaddedAtomicU64::new(0)).collect(),
-            per_group_mutation_apply_ns: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_group_lock_wait_ns: (0..core_count).map(|_| PaddedAtomicU64::new(0)).collect(),
-            per_group_group_lock_wait_ns: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_group_engine_exec_ns: (0..core_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_group_engine_exec_ns: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_group_mailbox_depth: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_group_mailbox_max_depth: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_group_mailbox_full_events: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_raft_write_many_batches: (0..core_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_raft_write_many_batches: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_raft_write_many_commands: (0..core_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_raft_write_many_commands: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_raft_write_many_logical_commands: (0..core_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_raft_write_many_logical_commands: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_raft_write_many_responses: (0..core_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_raft_write_many_responses: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_raft_write_many_submit_ns: (0..core_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_raft_write_many_submit_ns: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_raft_write_many_response_ns: (0..core_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_raft_write_many_response_ns: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_raft_apply_entries: (0..core_count).map(|_| PaddedAtomicU64::new(0)).collect(),
-            per_group_raft_apply_entries: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_raft_apply_ns: (0..core_count).map(|_| PaddedAtomicU64::new(0)).collect(),
-            per_group_raft_apply_ns: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_raft_snapshot_builds: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_raft_snapshot_build_ns: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_raft_snapshot_body_bytes: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_raft_snapshot_pointer_bytes: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_raft_snapshot_streams: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_raft_snapshot_external_uploads: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_raft_snapshot_inline_fallbacks: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_live_read_waiters: (0..core_count).map(|_| PaddedAtomicU64::new(0)).collect(),
-            per_core_live_read_backpressure_events: (0..core_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_routed_requests: (0..core_count).map(|_| PaddedAtomicU64::new(0)).collect(),
-            per_core_mailbox_send_wait_ns: (0..core_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_mailbox_full_events: (0..core_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_wal_batches: (0..core_count).map(|_| PaddedAtomicU64::new(0)).collect(),
-            per_group_wal_batches: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_wal_records: (0..core_count).map(|_| PaddedAtomicU64::new(0)).collect(),
-            per_group_wal_records: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_wal_write_ns: (0..core_count).map(|_| PaddedAtomicU64::new(0)).collect(),
-            per_group_wal_write_ns: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_core_wal_sync_ns: (0..core_count).map(|_| PaddedAtomicU64::new(0)).collect(),
-            per_group_wal_sync_ns: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            cold_flush_uploads: PaddedAtomicU64::new(0),
-            cold_flush_upload_bytes: PaddedAtomicU64::new(0),
-            cold_flush_upload_ns: PaddedAtomicU64::new(0),
-            cold_flush_publishes: PaddedAtomicU64::new(0),
-            cold_flush_publish_bytes: PaddedAtomicU64::new(0),
-            cold_flush_publish_ns: PaddedAtomicU64::new(0),
-            cold_orphan_cleanup_attempts: PaddedAtomicU64::new(0),
-            cold_orphan_cleanup_errors: PaddedAtomicU64::new(0),
-            cold_gc_reclaimed: PaddedAtomicU64::new(0),
-            cold_gc_errors: PaddedAtomicU64::new(0),
-            cold_flush_write_errors: PaddedAtomicU64::new(0),
-            cold_orphan_bytes: PaddedAtomicU64::new(0),
-            per_group_cold_hot_bytes: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_cold_hot_bytes_max: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            cold_hot_stream_bytes_max: PaddedAtomicU64::new(0),
-            per_core_cold_backpressure_events: (0..core_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            per_group_cold_backpressure_events: (0..raft_group_count)
-                .map(|_| PaddedAtomicU64::new(0))
-                .collect(),
-            cold_backpressure_bytes: PaddedAtomicU64::new(0),
-        }
-    }
-
     pub(crate) fn record_routed_request(&self, core_id: CoreId, mailbox_send_wait_ns: u64) {
         let index = usize::from(core_id.0);
         self.per_core_routed_requests[index].fetch_add_relaxed(1);
@@ -1218,5 +735,179 @@ impl PaddedAtomicU64 {
 
     pub(crate) fn store_relaxed(&self, value: u64) {
         self.value.store(value, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod metric_manifest_tests {
+    use std::sync::Arc;
+
+    use crate::metrics::RuntimeMetrics;
+    use crate::metrics::RuntimeMetricsInner;
+
+    /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
+    /// order, captured from the pre-macro hand-written struct. Metrics
+    /// endpoints and `ursulactl` depend on these names staying byte-identical.
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 105] = [
+        "accepted_appends",
+        "per_core_appends",
+        "per_group_appends",
+        "applied_mutations",
+        "per_core_applied_mutations",
+        "per_group_applied_mutations",
+        "mutation_apply_ns",
+        "per_core_mutation_apply_ns",
+        "per_group_mutation_apply_ns",
+        "group_lock_wait_ns",
+        "per_core_group_lock_wait_ns",
+        "per_group_group_lock_wait_ns",
+        "group_engine_exec_ns",
+        "per_core_group_engine_exec_ns",
+        "per_group_group_engine_exec_ns",
+        "group_mailbox_depth",
+        "per_group_group_mailbox_depth",
+        "group_mailbox_max_depth",
+        "per_group_group_mailbox_max_depth",
+        "group_mailbox_full_events",
+        "per_group_group_mailbox_full_events",
+        "raft_write_many_batches",
+        "per_core_raft_write_many_batches",
+        "per_group_raft_write_many_batches",
+        "raft_write_many_commands",
+        "per_core_raft_write_many_commands",
+        "per_group_raft_write_many_commands",
+        "raft_write_many_logical_commands",
+        "per_core_raft_write_many_logical_commands",
+        "per_group_raft_write_many_logical_commands",
+        "raft_write_many_responses",
+        "per_core_raft_write_many_responses",
+        "per_group_raft_write_many_responses",
+        "raft_write_many_submit_ns",
+        "per_core_raft_write_many_submit_ns",
+        "per_group_raft_write_many_submit_ns",
+        "raft_write_many_response_ns",
+        "per_core_raft_write_many_response_ns",
+        "per_group_raft_write_many_response_ns",
+        "raft_apply_entries",
+        "per_core_raft_apply_entries",
+        "per_group_raft_apply_entries",
+        "raft_apply_ns",
+        "per_core_raft_apply_ns",
+        "per_group_raft_apply_ns",
+        "raft_snapshot_builds",
+        "per_group_raft_snapshot_builds",
+        "raft_snapshot_build_ns",
+        "per_group_raft_snapshot_build_ns",
+        "raft_snapshot_body_bytes",
+        "raft_snapshot_body_bytes_max",
+        "per_group_raft_snapshot_body_bytes",
+        "raft_snapshot_pointer_bytes",
+        "raft_snapshot_pointer_bytes_max",
+        "per_group_raft_snapshot_pointer_bytes",
+        "raft_snapshot_streams",
+        "raft_snapshot_streams_max",
+        "per_group_raft_snapshot_streams",
+        "raft_snapshot_external_uploads",
+        "per_group_raft_snapshot_external_uploads",
+        "raft_snapshot_inline_fallbacks",
+        "per_group_raft_snapshot_inline_fallbacks",
+        "live_read_waiters",
+        "per_core_live_read_waiters",
+        "live_read_backpressure_events",
+        "per_core_live_read_backpressure_events",
+        "routed_requests",
+        "per_core_routed_requests",
+        "mailbox_send_wait_ns",
+        "per_core_mailbox_send_wait_ns",
+        "mailbox_full_events",
+        "per_core_mailbox_full_events",
+        "wal_batches",
+        "per_core_wal_batches",
+        "per_group_wal_batches",
+        "wal_records",
+        "per_core_wal_records",
+        "per_group_wal_records",
+        "wal_write_ns",
+        "per_core_wal_write_ns",
+        "per_group_wal_write_ns",
+        "wal_sync_ns",
+        "per_core_wal_sync_ns",
+        "per_group_wal_sync_ns",
+        "cold_flush_uploads",
+        "cold_flush_upload_bytes",
+        "cold_flush_upload_ns",
+        "cold_flush_publishes",
+        "cold_flush_publish_bytes",
+        "cold_flush_publish_ns",
+        "cold_orphan_cleanup_attempts",
+        "cold_orphan_cleanup_errors",
+        "cold_orphan_bytes",
+        "cold_gc_reclaimed",
+        "cold_gc_errors",
+        "cold_flush_write_errors",
+        "cold_hot_bytes",
+        "per_group_cold_hot_bytes",
+        "cold_hot_group_bytes_max",
+        "per_group_cold_hot_bytes_max",
+        "cold_hot_stream_bytes_max",
+        "cold_backpressure_events",
+        "per_core_cold_backpressure_events",
+        "per_group_cold_backpressure_events",
+        "cold_backpressure_bytes",
+    ];
+
+    fn metrics_for_test() -> RuntimeMetrics {
+        RuntimeMetrics {
+            inner: Arc::new(RuntimeMetricsInner::new(2, 3)),
+        }
+    }
+
+    #[test]
+    fn snapshot_serializes_expected_field_names_in_order() {
+        let json =
+            serde_json::to_string(&metrics_for_test().snapshot()).expect("snapshot serializes");
+        // Every value is a number or an array of numbers, so each `":`
+        // occurrence in the output belongs to exactly one field key.
+        assert_eq!(
+            json.matches("\":").count(),
+            EXPECTED_SNAPSHOT_KEYS.len(),
+            "unexpected number of serialized fields: {json}"
+        );
+        let mut last_position = None;
+        for name in EXPECTED_SNAPSHOT_KEYS {
+            let needle = format!("\"{name}\":");
+            let position = json
+                .find(&needle)
+                .unwrap_or_else(|| panic!("missing serialized key {name}"));
+            assert!(
+                last_position < Some(position),
+                "serialized key {name} out of declaration order"
+            );
+            last_position = Some(position);
+        }
+    }
+
+    #[test]
+    fn snapshot_vector_lengths_follow_metric_scope() {
+        let snapshot = metrics_for_test().snapshot();
+        assert_eq!(snapshot.per_core_appends.len(), 2);
+        assert_eq!(snapshot.per_group_appends.len(), 3);
+        assert_eq!(snapshot.per_core_routed_requests.len(), 2);
+        assert_eq!(snapshot.per_group_raft_snapshot_streams.len(), 3);
+    }
+
+    #[test]
+    fn snapshot_aggregates_sum_and_max_per_manifest() {
+        let metrics = metrics_for_test();
+        metrics.inner.per_core_appends[0].fetch_add_relaxed(3);
+        metrics.inner.per_core_appends[1].fetch_add_relaxed(4);
+        metrics.inner.per_group_group_mailbox_max_depth[1].fetch_max_relaxed(9);
+        metrics.inner.per_group_raft_snapshot_body_bytes[0].store_relaxed(5);
+        metrics.inner.per_group_raft_snapshot_body_bytes[2].store_relaxed(11);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.accepted_appends, 7);
+        assert_eq!(snapshot.group_mailbox_max_depth, 9);
+        assert_eq!(snapshot.raft_snapshot_body_bytes, 16);
+        assert_eq!(snapshot.raft_snapshot_body_bytes_max, 11);
     }
 }
