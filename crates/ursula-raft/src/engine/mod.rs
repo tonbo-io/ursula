@@ -81,14 +81,15 @@ use ursula_runtime::write_cold_chunk_index_pages;
 use ursula_runtime::write_external_segment_index_pages;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
+use ursula_stream::StreamCommand;
 
-use crate::codec::group_write_result_from_raft_response;
 use crate::forward::forward_get_stream_attrs_to_leader;
 use crate::forward::forward_head_stream_to_leader;
 use crate::forward::forward_read_stream_to_leader;
 use crate::forward::group_engine_client_write_error;
 use crate::forward::group_engine_forward_to_leader_error;
 use crate::forward::write_commands_on_raft;
+use crate::forward::write_result_from_raft_response;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftGroupLogStore;
 use crate::registry::SingleNodeRaftNetworkFactory;
@@ -420,14 +421,14 @@ impl RaftGroupEngine {
         &self,
         command: GroupWriteCommand,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
-        let response = match self.raft.client_write(command.into()).await {
+        let response = match self.raft.client_write(command).await {
             Ok(response) => response,
             Err(err) => {
                 let self_id = self.raft.metrics().borrow_watched().id;
                 return Err(group_engine_client_write_error(err, self_id));
             }
         };
-        group_write_result_from_raft_response(response.data)?
+        write_result_from_raft_response(response.data)?
     }
 
     pub(crate) async fn write_commands(
@@ -505,11 +506,13 @@ impl RaftGroupEngine {
             return Ok(None);
         }
         let response = match self
-            .write(GroupWriteCommand::TouchStreamAccess {
-                stream_id: stream_id.clone(),
-                now_ms,
-                renew_ttl,
-            })
+            .write(GroupWriteCommand::Stream(
+                StreamCommand::TouchStreamAccess {
+                    stream_id: stream_id.clone(),
+                    now_ms,
+                    renew_ttl,
+                },
+            ))
             .await?
         {
             GroupWriteResponse::TouchStreamAccess(response) => response,
@@ -843,11 +846,13 @@ impl GroupEngine for RaftGroupEngine {
     ) -> GroupTouchStreamAccessFuture<'a> {
         Box::pin(async move {
             match self
-                .write(GroupWriteCommand::TouchStreamAccess {
-                    stream_id,
-                    now_ms,
-                    renew_ttl,
-                })
+                .write(GroupWriteCommand::Stream(
+                    StreamCommand::TouchStreamAccess {
+                        stream_id,
+                        now_ms,
+                        renew_ttl,
+                    },
+                ))
                 .await?
             {
                 GroupWriteResponse::TouchStreamAccess(response) => Ok(response),
@@ -974,7 +979,9 @@ impl GroupEngine for RaftGroupEngine {
     ) -> GroupAckColdGcFuture<'a> {
         Box::pin(async move {
             match self
-                .write(GroupWriteCommand::AckColdGc { up_to_seq })
+                .write(GroupWriteCommand::Stream(StreamCommand::AckColdGc {
+                    up_to_seq,
+                }))
                 .await?
             {
                 GroupWriteResponse::AckColdGc(response) => Ok(response),
@@ -1155,11 +1162,7 @@ impl GroupEngine for RaftGroupEngine {
                 return Ok(Vec::new());
             }
             let command = GroupWriteCommand::Batch {
-                commands: requests
-                    .iter()
-                    .cloned()
-                    .map(GroupWriteCommand::from)
-                    .collect(),
+                commands: requests.iter().cloned().map(StreamCommand::from).collect(),
             };
             if let Some(response) = self
                 .forward_write_to_leader_if_follower(command.clone())

@@ -31,7 +31,6 @@ use openraft::vote::RaftLeaderId;
 use prost::Message;
 use serde_json::json;
 use ursula_control::ControlCommand;
-use ursula_proto as raft_app_proto;
 use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::CloseStreamRequest;
@@ -63,6 +62,7 @@ use ursula_shard::ShardPlacement;
 use super::*;
 use crate::codec::*;
 use crate::engine::*;
+use crate::forward::write_result_from_raft_response;
 use crate::log_store::*;
 use crate::registry::*;
 use crate::types::*;
@@ -82,8 +82,8 @@ fn group_engine_error_codec_round_trips_stream_context() {
         }],
     );
 
-    let proto = group_engine_error_to_proto(err.clone());
-    let decoded = group_engine_error_from_proto(proto).expect("decode group engine error");
+    let decoded: GroupEngineError =
+        decode_wire(&encode_wire(&err), "group engine error").expect("decode group engine error");
 
     assert_eq!(decoded, err);
 }
@@ -97,8 +97,8 @@ fn group_engine_error_codec_round_trips_stale_cold_flush_context() {
         vec![StreamErrorContext::StaleColdFlushCandidate],
     );
 
-    let proto = group_engine_error_to_proto(err.clone());
-    let decoded = group_engine_error_from_proto(proto).expect("decode group engine error");
+    let decoded: GroupEngineError =
+        decode_wire(&encode_wire(&err), "group engine error").expect("decode group engine error");
 
     assert_eq!(decoded, err);
 }
@@ -108,8 +108,8 @@ fn group_engine_error_codec_round_trips_cold_backpressure_kind() {
     let stream_id = bsid("cold-backpressure-codec");
     let err = GroupEngineError::cold_backpressure(stream_id.clone(), 4, 5, 4);
 
-    let proto = group_engine_error_to_proto(err.clone());
-    let decoded = group_engine_error_from_proto(proto).expect("decode group engine error");
+    let decoded: GroupEngineError =
+        decode_wire(&encode_wire(&err), "group engine error").expect("decode group engine error");
 
     assert_eq!(decoded, err);
     assert!(matches!(
@@ -126,9 +126,8 @@ fn group_engine_error_codec_round_trips_cold_backpressure_kind() {
 
 #[test]
 fn required_missing_proto_field_returns_typed_proto_decode_error() {
-    let err =
-        required::<raft_app_proto::group_engine_error_v1::Error>(None, "group_engine_error.error")
-            .expect_err("missing required field should decode to an error");
+    let err = required::<u64>(None, "group_engine_error.error")
+        .expect_err("missing required field should decode to an error");
 
     assert!(matches!(
         err,
@@ -145,8 +144,8 @@ fn group_engine_error_codec_round_trips_proto_decode_kind() {
         field: "group_engine_error.error".to_owned(),
     });
 
-    let proto = group_engine_error_to_proto(err.clone());
-    let decoded = group_engine_error_from_proto(proto).expect("decode group engine error");
+    let decoded: GroupEngineError =
+        decode_wire(&encode_wire(&err), "group engine error").expect("decode group engine error");
 
     assert_eq!(decoded, err);
 }
@@ -291,7 +290,7 @@ fn normal_entry(
     index: u64,
     command: GroupWriteCommand,
 ) -> <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::Entry {
-    Entry::new(log_id(index), EntryPayload::Normal(command.into()))
+    Entry::new(log_id(index), EntryPayload::Normal(command))
 }
 
 fn meta_log_id(index: u64) -> LogId<MetaLeaderId> {
@@ -339,10 +338,10 @@ fn stream_attrs(title: &str, purpose: &str) -> StreamAttrs {
 }
 
 #[test]
-fn raft_group_command_uses_shared_protobuf_log_schema() {
-    let command = GroupWriteCommand::AppendBatch {
-        stream_id: bsid("shared-proto-log"),
-        content_type: "application/octet-stream".to_owned(),
+fn raft_group_command_round_trips_through_wire_codec() {
+    let command = GroupWriteCommand::Stream(ursula_stream::StreamCommand::AppendBatch {
+        stream_id: bsid("shared-wire-log"),
+        content_type: Some("application/octet-stream".to_owned()),
         payloads: vec![b"ab".to_vec().into(), b"cd".to_vec().into()],
         producer: Some(ProducerRequest {
             producer_id: "writer-1".to_owned(),
@@ -350,71 +349,49 @@ fn raft_group_command_uses_shared_protobuf_log_schema() {
             producer_seq: 42,
         }),
         now_ms: 123,
-    };
-    let raft_command = RaftGroupCommand::from(command.clone());
+    });
 
-    let mut encoded = Vec::new();
-    raft_command
-        .0
-        .encode(&mut encoded)
-        .expect("encode shared proto command");
-    let decoded = raft_app_proto::RaftGroupCommandV1::decode(encoded.as_slice())
-        .expect("decode shared proto command");
+    let encoded = encode_wire(&command);
+    let decoded: GroupWriteCommand =
+        decode_wire(&encoded, "group command").expect("decode wire command");
+    assert_eq!(decoded, command);
 
-    assert_eq!(decoded, raft_command.0);
-    assert_eq!(
-        group_write_command_from_proto(RaftGroupCommand(decoded)).expect("domain command"),
-        command
-    );
+    // Determinism: re-encoding the decoded value is byte-identical.
+    assert_eq!(encode_wire(&decoded), encoded);
 }
 
 #[test]
-fn stream_attrs_update_command_round_trips_through_protobuf() {
+fn stream_attrs_update_command_round_trips_through_wire_codec() {
     let command = GroupWriteCommand::from(UpdateStreamAttrsRequest {
-        stream_id: bsid("attrs-proto"),
+        stream_id: bsid("attrs-wire"),
         attrs: Some(stream_attrs("Support session", "customer-support")),
         now_ms: 123,
     });
-    let raft_command = RaftGroupCommand::from(command.clone());
 
-    let mut encoded = Vec::new();
-    raft_command
-        .0
-        .encode(&mut encoded)
-        .expect("encode attrs update command");
-    let decoded = raft_app_proto::RaftGroupCommandV1::decode(encoded.as_slice())
-        .expect("decode attrs update command");
-
-    assert_eq!(
-        group_write_command_from_proto(RaftGroupCommand(decoded)).expect("domain command"),
-        command
-    );
+    let encoded = encode_wire(&command);
+    let decoded: GroupWriteCommand =
+        decode_wire(&encoded, "group command").expect("decode attrs update command");
+    assert_eq!(decoded, command);
+    assert_eq!(encode_wire(&decoded), encoded);
 }
 
 #[test]
-fn raft_group_response_uses_shared_protobuf_log_schema() {
-    let response = raft_write_applied_response(GroupWriteResponse::CreateStream(
-        ursula_runtime::CreateStreamResponse {
-            placement: placement(),
-            next_offset: 5,
-            closed: false,
-            already_exists: false,
-            group_commit_index: 11,
-            record_range: None,
-        },
-    ));
+fn raft_group_write_response_round_trips_through_wire_codec() {
+    let response = GroupWriteResponse::CreateStream(ursula_runtime::CreateStreamResponse {
+        placement: placement(),
+        next_offset: 5,
+        closed: false,
+        already_exists: false,
+        group_commit_index: 11,
+        record_range: None,
+    });
 
-    let mut encoded_proto = Vec::new();
-    response
-        .0
-        .encode(&mut encoded_proto)
-        .expect("encode shared proto response");
-    let decoded_proto = raft_app_proto::RaftGroupResponseV1::decode(encoded_proto.as_slice())
-        .expect("decode shared proto response");
+    let encoded = encode_wire(&response);
+    let decoded: GroupWriteResponse =
+        decode_wire(&encoded, "group write response").expect("decode wire response");
+    assert_eq!(decoded, response);
 
-    assert_eq!(decoded_proto, response.0);
-
-    match group_write_result_from_raft_response(RaftGroupResponse(decoded_proto))
+    match write_result_from_raft_response(RaftGroupResponse::Write(Ok(decoded)))
         .expect("domain response")
     {
         Ok(GroupWriteResponse::CreateStream(response)) => {
@@ -1004,19 +981,19 @@ async fn single_node_openraft_group_applies_client_writes() {
 
     let stream_id = bsid("raft-client-write");
     let created = raft
-        .client_write(create_command(stream_id.clone()).into())
+        .client_write(create_command(stream_id.clone()))
         .await
         .expect("create stream through openraft");
     assert!(matches!(
-        group_write_result_from_raft_response(created.data).expect("decode create response"),
+        write_result_from_raft_response(created.data).expect("decode create response"),
         Ok(GroupWriteResponse::CreateStream(_))
     ));
 
     let appended = raft
-        .client_write(append_command(stream_id, b"payload").into())
+        .client_write(append_command(stream_id, b"payload"))
         .await
         .expect("append through openraft");
-    match group_write_result_from_raft_response(appended.data).expect("decode append response") {
+    match write_result_from_raft_response(appended.data).expect("decode append response") {
         Ok(GroupWriteResponse::Append(response)) => {
             assert_eq!(response.start_offset, 0);
             assert_eq!(response.stream_append_count, 1);
@@ -1052,11 +1029,11 @@ async fn three_node_openraft_group_replicates_group_writes() {
 
     let appended = engines[leader_index]
         .raft
-        .client_write(append_command(stream_id.clone(), b"replicated").into())
+        .client_write(append_command(stream_id.clone(), b"replicated"))
         .await
         .expect("append through elected leader");
     let appended_log_index = appended.log_id.index();
-    match group_write_result_from_raft_response(appended.data).expect("decode append response") {
+    match write_result_from_raft_response(appended.data).expect("decode append response") {
         Ok(GroupWriteResponse::Append(response)) => {
             assert_eq!(response.start_offset, 0);
             assert_eq!(response.next_offset, 10);
@@ -1164,7 +1141,7 @@ fn madsim_three_node_openraft_group_strict_replay_append_enqueue_probe() {
             create_stream_via_raft(&engines[leader_index], stream_id.clone()).await;
             engines[leader_index]
                 .raft
-                .client_write_ff(append_command(stream_id, b"simulated").into(), None)
+                .client_write_ff(append_command(stream_id, b"simulated"), None)
                 .await
                 .expect("enqueue append through simulated leader");
             assert!((1..=3).contains(&leader_id));
@@ -1189,10 +1166,7 @@ fn madsim_three_node_openraft_group_strict_replay_append_commit_probe() {
             >::new();
             engines[leader_index]
                 .raft
-                .client_write_ff(
-                    append_command(stream_id, b"simulated").into(),
-                    Some(responder),
-                )
+                .client_write_ff(append_command(stream_id, b"simulated"), Some(responder))
                 .await
                 .expect("enqueue append through simulated leader");
             let committed = commit_rx.await.expect("append commit notification");
@@ -1219,10 +1193,7 @@ fn madsim_three_node_openraft_group_strict_replay_append_complete_probe() {
             >::new();
             engines[leader_index]
                 .raft
-                .client_write_ff(
-                    append_command(stream_id, b"simulated").into(),
-                    Some(responder),
-                )
+                .client_write_ff(append_command(stream_id, b"simulated"), Some(responder))
                 .await
                 .expect("enqueue append through simulated leader");
             let committed = commit_rx.await.expect("append commit notification");
@@ -1248,12 +1219,10 @@ fn madsim_three_node_openraft_group_strict_replay_append_response_probe() {
             create_stream_via_raft(&engines[leader_index], stream_id.clone()).await;
             let appended = engines[leader_index]
                 .raft
-                .client_write(append_command(stream_id, b"simulated").into())
+                .client_write(append_command(stream_id, b"simulated"))
                 .await
                 .expect("append through simulated leader");
-            match group_write_result_from_raft_response(appended.data)
-                .expect("decode append response")
-            {
+            match write_result_from_raft_response(appended.data).expect("decode append response") {
                 Ok(GroupWriteResponse::Append(response)) => {
                     assert_eq!(response.start_offset, 0);
                     assert_eq!(response.next_offset, 9);
@@ -1279,7 +1248,7 @@ fn madsim_three_node_openraft_group_strict_replay_append_leader_read_probe() {
             create_stream_via_raft(&engines[leader_index], stream_id.clone()).await;
             let appended = engines[leader_index]
                 .raft
-                .client_write(append_command(stream_id.clone(), b"simulated").into())
+                .client_write(append_command(stream_id.clone(), b"simulated"))
                 .await
                 .expect("append through simulated leader");
             assert!(appended.log_id.index() > 0);
@@ -1426,10 +1395,10 @@ async fn append_madsim_stream(
     create_stream_via_raft(engine, stream_id.clone()).await;
     let appended = engine
         .raft
-        .client_write(append_command(stream_id.clone(), b"simulated").into())
+        .client_write(append_command(stream_id.clone(), b"simulated"))
         .await
         .expect("append through simulated leader");
-    match group_write_result_from_raft_response(appended.data).expect("decode append response") {
+    match write_result_from_raft_response(appended.data).expect("decode append response") {
         Ok(GroupWriteResponse::Append(response)) => {
             assert_eq!(response.start_offset, 0);
             assert_eq!(response.next_offset, 9);
@@ -1442,11 +1411,11 @@ async fn append_madsim_stream(
 async fn create_stream_via_raft(engine: &RaftGroupEngine, stream_id: ursula_shard::BucketStreamId) {
     let created = engine
         .raft
-        .client_write(create_command(stream_id).into())
+        .client_write(create_command(stream_id))
         .await
         .expect("create stream through leader");
     assert!(matches!(
-        group_write_result_from_raft_response(created.data).expect("decode create response"),
+        write_result_from_raft_response(created.data).expect("decode create response"),
         Ok(GroupWriteResponse::CreateStream(_))
     ));
 }
@@ -1483,13 +1452,11 @@ fn run_madsim_three_node_raft_with_policy_once(
 
             let appended = engines[leader_index]
                 .raft
-                .client_write(append_command(stream_id.clone(), b"simulated").into())
+                .client_write(append_command(stream_id.clone(), b"simulated"))
                 .await
                 .expect("append through simulated leader");
             let appended_log_index = appended.log_id.index();
-            match group_write_result_from_raft_response(appended.data)
-                .expect("decode append response")
-            {
+            match write_result_from_raft_response(appended.data).expect("decode append response") {
                 Ok(GroupWriteResponse::Append(response)) => {
                     assert_eq!(response.start_offset, 0);
                     assert_eq!(response.next_offset, 9);
@@ -1739,18 +1706,18 @@ async fn openraft_installs_snapshot_for_lagging_learner() {
     let stream_id = bsid("lagging-learner-snapshot");
     let _created = engines[leader_index]
         .raft
-        .client_write(create_command(stream_id.clone()).into())
+        .client_write(create_command(stream_id.clone()))
         .await
         .expect("create stream through elected leader");
     let appended = engines[leader_index]
         .raft
-        .client_write(append_command(stream_id.clone(), b"snapshot-transfer").into())
+        .client_write(append_command(stream_id.clone(), b"snapshot-transfer"))
         .await
         .expect("append through elected leader");
     let appended_log_id = appended.log_id;
     let appended_log_index = appended_log_id.index();
     assert!(matches!(
-        group_write_result_from_raft_response(appended.data).expect("decode append response"),
+        write_result_from_raft_response(appended.data).expect("decode append response"),
         Ok(GroupWriteResponse::Append(_))
     ));
 

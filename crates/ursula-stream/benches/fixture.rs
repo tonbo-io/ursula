@@ -51,7 +51,7 @@ pub fn build_state(scenario: FlushScenario) -> StreamStateMachine {
             machine.apply(StreamCommand::CreateStream {
                 stream_id: stream_id.clone(),
                 content_type: CONTENT_TYPE.to_owned(),
-                initial_payload: Vec::new(),
+                initial_payload: bytes::Bytes::new(),
                 close_after: false,
                 stream_seq: None,
                 producer: None,
@@ -70,7 +70,7 @@ pub fn build_state(scenario: FlushScenario) -> StreamStateMachine {
                 machine.apply(StreamCommand::Append {
                     stream_id: stream_id.clone(),
                     content_type: Some(CONTENT_TYPE.to_owned()),
-                    payload: payload.clone(),
+                    payload: bytes::Bytes::from(payload.clone()),
                     close_after: false,
                     stream_seq: None,
                     producer: None,

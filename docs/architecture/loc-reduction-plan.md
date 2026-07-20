@@ -122,6 +122,14 @@ wire format. Requires a full DST corpus pass before merge.
    `StreamResponse`; make one representation the wire type so the hand-written
    codec mirrors in `ursula-raft/src/codec.rs`, `types.rs`, and the
    per-variant translation in `engine/in_memory.rs` collapse.
+   **Landed (2026-07):** `StreamCommand` is the canonical per-stream command
+   (payloads moved to `Bytes`); `GroupWriteCommand` shrank to a thin
+   `Stream`/`Batch` envelope; the raft log payload, forwarded group writes,
+   and forwarded leader reads carry serde MessagePack of the canonical types
+   (self-describing, required because stream attrs embed `serde_json::Value`);
+   `codec.rs` fell from 1,173 to ~55 lines, `durable.proto`/`errors.proto`
+   were deleted, and the 24-variant error-code map is gone. Snapshots keep
+   the proto frame format (out of scope by design).
 2. **Serde-carried Raft envelope.** Carry openraft's own serde-capable types
    in the Raft RPC envelope instead of bespoke proto mirrors, deleting
    `log_store/mod.rs:137-465` and the matching `.proto` messages. Trade-off:

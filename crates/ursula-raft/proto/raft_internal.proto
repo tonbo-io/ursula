@@ -2,8 +2,6 @@ syntax = "proto3";
 
 package ursula.raft.v1;
 
-import "durable.proto";
-
 message RaftRpcEnvelopeV1 {
   uint32 raft_group_id = 1;
   uint64 node_id = 2;
@@ -127,7 +125,8 @@ message StoredLogEntryV1 {
   LogIdV1 log_id = 1;
   oneof payload {
     BlankEntryV1 blank = 2;
-    ursula.durable.v1.RaftGroupCommandV1 normal = 3;
+    // Serde-encoded canonical `GroupWriteCommand` (see `codec::encode_wire`).
+    bytes normal = 3;
     MembershipEntryV1 membership = 4;
   }
 }
@@ -220,51 +219,6 @@ message RaftTransferLeaderRequestV1 {
 }
 
 message RaftTransferLeaderAckV1 {}
-
-message HeadStreamResponsePayloadV1 {
-  uint32 core_id = 1;
-  uint32 shard_id = 2;
-  uint32 raft_group_id = 3;
-  string content_type = 4;
-  uint64 tail_offset = 5;
-  bool closed = 6;
-  optional uint64 stream_ttl_seconds = 7;
-  optional uint64 stream_expires_at_ms = 8;
-  optional uint64 snapshot_offset = 9;
-  string integrity_live_setsum = 10;
-  string integrity_evicted_setsum = 11;
-  string integrity_total_setsum = 12;
-  uint64 integrity_live_start_offset = 13;
-  uint64 integrity_live_records = 14;
-  uint64 integrity_evicted_records = 15;
-  uint64 integrity_total_records = 16;
-  uint64 cold_hot_start_offset = 17;
-  optional uint64 record_first = 18;
-  optional uint64 record_next = 19;
-}
-
-message ReadStreamResponsePayloadV1 {
-  uint32 core_id = 1;
-  uint32 shard_id = 2;
-  uint32 raft_group_id = 3;
-  uint64 offset = 4;
-  uint64 next_offset = 5;
-  string content_type = 6;
-  bytes payload = 7;
-  bool up_to_date = 8;
-  bool closed = 9;
-  optional uint64 retained_record_first = 10;
-  optional uint64 retained_record_next = 11;
-  optional uint64 record_start = 12;
-  optional uint64 record_next = 13;
-}
-
-message GetStreamAttrsResponsePayloadV1 {
-  uint32 core_id = 1;
-  uint32 shard_id = 2;
-  uint32 raft_group_id = 3;
-  optional bytes attrs_json = 4;
-}
 
 service RaftInternal {
   rpc Append(RaftRpcEnvelopeV1) returns (RaftRpcAckV1);
