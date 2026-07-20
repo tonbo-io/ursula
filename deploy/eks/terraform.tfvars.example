@@ -1,0 +1,17 @@
+name       = "ursula-production"
+aws_region = "us-east-1"
+
+# Restrict this to the operator or CI network in production.
+cluster_endpoint_public_access_cidrs = ["203.0.113.10/32"]
+
+# Optional: the default creates one NAT gateway per AZ. Set true only when the
+# lower cost is worth making private-node internet egress depend on one AZ.
+single_nat_gateway = false
+
+# Optional globally unique name. Empty generates name-account-region.
+s3_bucket_name = ""
+
+tags = {
+  Environment = "production"
+  Owner       = "platform"
+}

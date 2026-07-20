@@ -2,7 +2,7 @@
 
 This chart installs Ursula as a static-membership Raft cluster on Kubernetes. The default install starts three voter pods, 64 Raft groups, durable per-pod Raft log PVCs, a headless peer Service, an internal client/admin ClusterIP Service, a quorum-protecting PodDisruptionBudget, default multi-pod spread hints, an optional stateless gateway Deployment, and a Helm test that verifies cluster readiness with `ursulactl wait-ready`.
 
-The chart is designed for fresh static-membership clusters. It does not perform online Raft voter expansion, voter removal, leader handoff during Kubernetes rolling updates, or post-bootstrap membership flag mutation. Those operations belong to the future Ursula operator workflow.
+The chart is designed for fresh static-membership clusters. It does not perform online Raft voter expansion, voter removal, leader handoff during Kubernetes rolling updates, or dynamic voter reconfiguration. Those operations belong to the future Ursula operator workflow.
 
 ## Recommended Production Topology
 
@@ -14,9 +14,9 @@ The chart is designed for fresh static-membership clusters. It does not perform 
 - Run two or more indexer workers across zones when event-time query availability or ingestion capacity matters. Claims reduce duplicate work; immutable parts and manifest CAS remain the correctness boundary.
 - Give Ursula and the indexer pool separate workload identities with least-privilege access to non-overlapping S3 prefixes. Enable bucket versioning, encryption, lifecycle policy, access logging, and alerts for indexer readiness, blocked streams, source lag, task backlog, S3 errors, storage growth, and pod restarts.
 
-This topology removes single-pod compute failures from the normal request path, but it does not make chart upgrades an automated Raft operation. Bootstrap membership must still be turned off after first initialization, voter count must not be changed in place, and server rollouts must be performed deliberately with health checks between pods.
+This topology removes single-pod compute failures from the normal request path, but it does not make chart upgrades an automated Raft operation. Persistent Raft groups make membership initialization idempotent across restarts, but voter count must not be changed in place and server rollouts must be performed deliberately with health checks between pods.
 
-[`examples/production-eks.yaml`](examples/production-eks.yaml) is a concrete three-AZ starting point with durable gp3 volumes, S3 cold storage and snapshots, three gateways, separate IRSA roles, and a two-replica indexer worker pool. Replace every account, bucket, capacity, and scheduling value for the target environment, register streams dynamically after they are created, and set `raft.initMembershipPerGroup=false` immediately after the first successful bootstrap.
+[`examples/production-eks.yaml`](examples/production-eks.yaml) is a concrete three-AZ starting point with durable gp3 volumes, S3 cold storage and snapshots, three gateways, separate workload identities, and a two-replica indexer worker pool. For a complete AWS prerequisite flow, use [`deploy/eks`](../../deploy/eks): `./provision.sh` produces `generated-values.yaml`, after which deployment is one `helm install` and one `helm test`.
 
 ## Build A Local Image
 
@@ -35,7 +35,7 @@ kind load docker-image ursula:dev
 From the published OCI chart:
 
 ```bash
-helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.1.0
+helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.2.0
 ```
 
 For a local image loaded into the cluster:
@@ -108,25 +108,9 @@ both for Raft/gRPC traffic and for leader redirects, so the chart keeps those
 addresses on the client-reachable port until Ursula has separate peer and
 redirect URL configuration.
 
-## Required Post-Bootstrap Step
+## Bootstrap Behavior
 
-`raft.initMembershipPerGroup` defaults to `true` so a fresh cluster can
-initialize per-group Raft membership automatically. Keep it `true` only through
-the first successful bootstrap.
-
-After `helm test` passes, update your values and run:
-
-```bash
-helm upgrade ursula charts/ursula \
-  --reuse-values \
-  --set raft.initMembershipPerGroup=false
-```
-
-If you do not use `--reuse-values`, repeat your image overrides or use a values
-file so the upgrade does not roll pods back to the chart default image.
-
-Keep it `false` for normal restarts and upgrades. The future Ursula operator
-will own this transition automatically.
+`raft.initMembershipPerGroup` defaults to `true` so a fresh cluster can initialize per-group Raft membership automatically. Initialization checks the durable Raft log before changing membership, so persistent `logDir` deployments can keep the value enabled across restarts and upgrades. Memory Raft storage cannot recover a lost log and retains a separate automatic-restart guard.
 
 ## Static Membership And `server.replicaCount`
 
@@ -371,7 +355,7 @@ container receives only chart-managed container settings plus explicit
 | Value | Default | Description |
 | --- | --- | --- |
 | `raft.groupCount` | `64` | Number of Raft groups. Helm tests expect every node to report this count. |
-| `raft.initMembershipPerGroup` | `true` | One-time fresh-cluster per-group membership bootstrap flag. Set it to `false` after the first successful readiness check. |
+| `raft.initMembershipPerGroup` | `true` | Idempotent per-group membership bootstrap flag; persistent groups may keep it enabled across restarts. |
 | `raft.storageMode` | `logDir` | Raft storage mode: `logDir` for durable logs, `memory` for ephemeral testing. |
 | `raft.logDir` | `/var/lib/ursula/raft` | Raft log directory mounted to the `raft-data` volume. |
 | `raft.maxUncommittedBytesPerGroup` | `null` | Optional per-group cap for raft-submitted but not-yet-applied payload bytes. Renders `raft.max_uncommitted_size_per_group` in the generated config when set; `0` disables the cap. |
