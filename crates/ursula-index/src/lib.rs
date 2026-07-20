@@ -2,29 +2,37 @@
 //!
 //! Module map:
 //!
+//! - [`cache`]: disposable local caches for whole parts and verified Parquet
+//!   page ranges.
 //! - [`catalog`]: dynamic index registrations shared by a worker pool.
-//! - [`part`]: immutable sorted Parquet parts.
+//! - [`index`]: the S3-authoritative ingest/flush/query/compact/GC engine.
+//! - [`manifest`]: the conditionally published manifest state model.
 //! - [`object_store`]: conditional object operations for S3 and local tests.
-//! - [`serverless`]: S3-authoritative index with a disposable local cache.
+//! - [`part`]: immutable sorted Parquet parts.
+//! - [`source`]: HTTP client for the upstream record stream.
 //! - [`store`]: shared event, query, status, configuration, and error types.
 
+mod cache;
 mod catalog;
+mod index;
+mod manifest;
 mod object_store;
 mod part;
-mod serverless;
 mod source;
 mod store;
 
+pub use cache::EventIndexCache;
 pub use catalog::IndexCatalog;
 pub use catalog::IndexRegistration;
+pub use catalog::validate_stream_url;
+pub use index::EventIndex;
+pub use manifest::CompletedRecordRange;
+pub use manifest::GarbageCollectionReport;
+pub use manifest::RecordSegmentLease;
 pub use object_store::FsObjectStore;
+pub use object_store::ObjectStore;
 pub use object_store::S3ObjectStore;
 pub use object_store::S3ObjectStoreConfig;
-pub use serverless::CompletedRecordRange;
-pub use serverless::EventIndexCache;
-pub use serverless::GarbageCollectionReport;
-pub use serverless::RecordSegmentLease;
-pub use serverless::ServerlessEventIndex;
 pub use source::SourceBatch;
 pub use source::SourceClient;
 pub use source::SourceRecordRange;
