@@ -13,6 +13,7 @@ autobenches = false
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 setsum = { workspace = true }
 slotmap = { workspace = true }
 ursula-shard = { workspace = true }

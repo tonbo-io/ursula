@@ -10,6 +10,7 @@ readme.workspace = true
 description = "OpenRaft integration for Ursula's per-group multi-Raft replication: network, log store, and snapshot transport."
 
 [dependencies]
+bitflags = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
 openraft-rt = { workspace = true }
@@ -18,6 +19,7 @@ opentelemetry = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync"] }
 tonic = { workspace = true, features = ["transport"] }
 tracing = { workspace = true }

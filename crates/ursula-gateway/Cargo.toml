@@ -23,8 +23,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "signal"] }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
+ursula-observability = { workspace = true }
 rand = { workspace = true, features = ["thread_rng"] }
 
 [dev-dependencies]

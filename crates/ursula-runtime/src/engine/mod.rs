@@ -797,20 +797,24 @@ pub struct StreamEngineError {
 /// demand (`message`) instead of storing a denormalized copy alongside the
 /// fields. `Internal` is the exception: it carries free-form text with no
 /// structured source, so it keeps an owned `message`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum GroupInfraError {
-    Internal {
-        message: String,
-    },
-    ProtoDecode {
-        field: String,
-    },
+    #[error("{message}")]
+    Internal { message: String },
+    #[error("ProtoDecode: protobuf raft payload missing {field}")]
+    ProtoDecode { field: String },
+    #[error(
+        "ColdBackpressure: stream '{stream_id}' would raise group hot bytes from {before_group_hot_bytes} to {after_group_hot_bytes}, above limit {limit}"
+    )]
     ColdBackpressure {
         stream_id: BucketStreamId,
         before_group_hot_bytes: u64,
         after_group_hot_bytes: u64,
         limit: u64,
     },
+    #[error(
+        "RaftUncommittedBackpressure: group uncommitted bytes {current} plus incoming {incoming} would exceed limit {limit}"
+    )]
     RaftUncommittedBackpressure {
         current: u64,
         incoming: u64,
@@ -856,24 +860,7 @@ impl GroupInfraError {
     pub fn message(&self) -> Cow<'_, str> {
         match self {
             Self::Internal { message } => Cow::Borrowed(message),
-            Self::ProtoDecode { field } => Cow::Owned(format!(
-                "ProtoDecode: protobuf raft payload missing {field}"
-            )),
-            Self::ColdBackpressure {
-                stream_id,
-                before_group_hot_bytes,
-                after_group_hot_bytes,
-                limit,
-            } => Cow::Owned(format!(
-                "ColdBackpressure: stream '{stream_id}' would raise group hot bytes from {before_group_hot_bytes} to {after_group_hot_bytes}, above limit {limit}"
-            )),
-            Self::RaftUncommittedBackpressure {
-                current,
-                incoming,
-                limit,
-            } => Cow::Owned(format!(
-                "RaftUncommittedBackpressure: group uncommitted bytes {current} plus incoming {incoming} would exceed limit {limit}"
-            )),
+            other => Cow::Owned(other.to_string()),
         }
     }
 
@@ -889,10 +876,13 @@ impl GroupInfraError {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum GroupEngineError {
+    #[error("{}", .0.message)]
     Stream(StreamEngineError),
+    #[error("{}", .0.message())]
     Infra(GroupInfraError),
+    #[error("{message}")]
     ForwardToLeader {
         message: String,
         leader_hint: GroupLeaderHint,
@@ -1036,11 +1026,3 @@ impl GroupEngineError {
         self.infra().is_some_and(GroupInfraError::is_backpressure)
     }
 }
-
-impl std::fmt::Display for GroupEngineError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message())
-    }
-}
-
-impl std::error::Error for GroupEngineError {}

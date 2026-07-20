@@ -11,6 +11,7 @@ description = "Shard placement primitives for Ursula's thread-per-core multi-Raf
 
 [dependencies]
 serde = { workspace = true }
+thiserror = { workspace = true }
 ursula-proto = { workspace = true }
 
 [lints.clippy]
