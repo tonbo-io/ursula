@@ -139,159 +139,28 @@ impl InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
         match command {
-            GroupWriteCommand::CreateStream {
-                stream_id,
-                content_type,
-                initial_payload,
-                close_after,
-                stream_seq,
-                producer,
-                stream_ttl_seconds,
-                stream_expires_at_ms,
-                attrs,
-                now_ms,
-            } => {
-                ensure_bucket_exists(&mut self.state_machine, &stream_id)?;
-                let record_stream_id = stream_id.clone();
-                let response = self.state_machine.apply(StreamCommand::CreateStream {
-                    stream_id,
-                    content_type,
-                    initial_payload: initial_payload.to_vec(),
-                    close_after,
-                    stream_seq,
-                    producer,
-                    stream_ttl_seconds,
-                    stream_expires_at_ms,
-                    attrs,
-                    now_ms,
-                });
-                match response {
-                    StreamResponse::Created {
-                        next_offset,
-                        closed,
-                        ..
-                    } => {
-                        self.commit_index += 1;
-                        Ok(GroupWriteResponse::CreateStream(CreateStreamResponse {
-                            placement,
-                            next_offset,
-                            closed,
-                            already_exists: false,
-                            group_commit_index: self.commit_index,
-                            record_range: self
-                                .state_machine
-                                .record_range(&record_stream_id)
-                                .map_err(|err| {
-                                    GroupEngineError::new(format!("record range: {err:?}"))
-                                })?,
-                        }))
-                    }
-                    StreamResponse::AlreadyExists {
-                        next_offset,
-                        closed,
-                        ..
-                    } => Ok(GroupWriteResponse::CreateStream(CreateStreamResponse {
-                        placement,
-                        next_offset,
-                        closed,
-                        already_exists: true,
-                        group_commit_index: self.commit_index,
-                        record_range: None,
-                    })),
-                    StreamResponse::Error {
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    } => Err(GroupEngineError::stream_with_context(
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    )),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected create stream response: {other:?}"
-                    ))),
-                }
-            }
-            GroupWriteCommand::CreateExternal {
-                stream_id,
-                content_type,
-                initial_payload,
-                record_ends,
-                close_after,
-                stream_seq,
-                producer,
-                stream_ttl_seconds,
-                stream_expires_at_ms,
-                attrs,
-                now_ms,
-            } => {
-                ensure_bucket_exists(&mut self.state_machine, &stream_id)?;
-                let record_stream_id = stream_id.clone();
-                let response = self.state_machine.apply(StreamCommand::CreateExternal {
-                    stream_id,
-                    content_type,
-                    initial_payload,
-                    record_ends,
-                    close_after,
-                    stream_seq,
-                    producer,
-                    stream_ttl_seconds,
-                    stream_expires_at_ms,
-                    attrs,
-                    now_ms,
-                });
-                match response {
-                    StreamResponse::Created {
-                        next_offset,
-                        closed,
-                        ..
-                    } => {
-                        self.commit_index += 1;
-                        Ok(GroupWriteResponse::CreateStream(CreateStreamResponse {
-                            placement,
-                            next_offset,
-                            closed,
-                            already_exists: false,
-                            group_commit_index: self.commit_index,
-                            record_range: self
-                                .state_machine
-                                .record_range(&record_stream_id)
-                                .map_err(|err| {
-                                    GroupEngineError::new(format!("record range: {err:?}"))
-                                })?,
-                        }))
-                    }
-                    StreamResponse::AlreadyExists {
-                        next_offset,
-                        closed,
-                        ..
-                    } => Ok(GroupWriteResponse::CreateStream(CreateStreamResponse {
-                        placement,
-                        next_offset,
-                        closed,
-                        already_exists: true,
-                        group_commit_index: self.commit_index,
-                        record_range: None,
-                    })),
-                    StreamResponse::Error {
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    } => Err(GroupEngineError::stream_with_context(
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    )),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected create external stream response: {other:?}"
-                    ))),
-                }
-            }
-            GroupWriteCommand::Append {
+            GroupWriteCommand::Stream(command) => self.apply_stream_command(command, placement),
+            GroupWriteCommand::Batch { commands } => Ok(GroupWriteResponse::Batch(
+                commands
+                    .into_iter()
+                    .map(|command| self.apply_stream_command(command, placement))
+                    .collect(),
+            )),
+        }
+    }
+
+    /// Applies one canonical [`StreamCommand`] to the deterministic state
+    /// machine and lifts its [`StreamResponse`] into the group-level response,
+    /// maintaining the group commit index and per-stream append counts.
+    pub fn apply_stream_command(
+        &mut self,
+        command: StreamCommand,
+        placement: ShardPlacement,
+    ) -> Result<GroupWriteResponse, GroupEngineError> {
+        match command {
+            // Appends skip `StreamStateMachine::apply` to keep the exact
+            // borrowed fast path (no TTL sweep on the append hot path).
+            StreamCommand::Append {
                 stream_id,
                 content_type,
                 payload,
@@ -304,7 +173,7 @@ impl InMemoryGroupEngine {
                 .append_payload(
                     AppendPayloadInput {
                         stream_id,
-                        content_type: Some(&content_type),
+                        content_type: content_type.as_deref(),
                         payload: &payload,
                         close_after,
                         stream_seq,
@@ -315,446 +184,315 @@ impl InMemoryGroupEngine {
                     placement,
                 )
                 .map(GroupWriteResponse::Append),
-            GroupWriteCommand::AppendExternal {
-                stream_id,
-                content_type,
-                payload,
-                record_ends,
-                close_after,
-                stream_seq,
-                producer,
-                now_ms,
-                record_match,
-            } => {
-                let record_stream_id = stream_id.clone();
-                let response = self.state_machine.apply(StreamCommand::AppendExternal {
-                    stream_id: stream_id.clone(),
-                    content_type: Some(content_type),
-                    payload,
-                    record_ends,
-                    close_after,
-                    stream_seq,
-                    producer,
-                    now_ms,
-                    record_match,
-                });
-                match response {
-                    StreamResponse::Appended {
-                        offset,
-                        next_offset,
-                        closed,
-                        deduplicated,
-                        producer,
-                        ..
-                    } => {
-                        let record_range = self
-                            .state_machine
-                            .record_range_for_append(
-                                &record_stream_id,
-                                offset,
-                                next_offset,
-                                producer.as_ref(),
-                            )
-                            .map_err(|err| {
-                                GroupEngineError::new(format!("record range: {err:?}"))
-                            })?;
-                        let stream_append_count =
-                            self.stream_append_counts.entry(stream_id).or_insert(0);
-                        if !deduplicated {
-                            self.commit_index += 1;
-                            *stream_append_count += 1;
-                        }
-                        Ok(GroupWriteResponse::Append(AppendResponse {
-                            placement,
-                            start_offset: offset,
-                            next_offset,
-                            stream_append_count: *stream_append_count,
-                            group_commit_index: self.commit_index,
-                            closed,
-                            deduplicated,
-                            producer,
-                            record_range,
-                        }))
-                    }
-                    StreamResponse::Error {
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    } => Err(GroupEngineError::stream_with_context(
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    )),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected append external response: {other:?}"
-                    ))),
-                }
-            }
-            GroupWriteCommand::AppendBatch {
+            StreamCommand::AppendBatch {
                 stream_id,
                 content_type,
                 payloads,
                 producer,
                 now_ms,
-            } => {
-                if let Some(producer) = producer {
-                    let payload_refs = payloads.iter().map(Bytes::as_ref).collect::<Vec<_>>();
-                    let batch = self
-                        .state_machine
-                        .append_batch_borrowed(
-                            stream_id.clone(),
-                            Some(&content_type),
-                            &payload_refs,
-                            Some(producer.clone()),
-                            now_ms,
-                        )
-                        .map_err(stream_response_error)?;
-                    let old_commit_index = self.commit_index;
-                    let old_append_count = *self.stream_append_counts.get(&stream_id).unwrap_or(&0);
-                    if !batch.deduplicated {
-                        let count = u64::try_from(batch.items.len()).expect("item count fits u64");
-                        self.commit_index += count;
-                        *self
-                            .stream_append_counts
-                            .entry(stream_id.clone())
-                            .or_insert(0) += count;
-                    }
-                    let items = batch
-                        .items
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, item)| {
-                            let item_index = u64::try_from(index + 1).expect("item index fits u64");
-                            Ok(AppendResponse {
-                                placement,
-                                start_offset: item.offset,
-                                next_offset: item.next_offset,
-                                stream_append_count: if item.deduplicated {
-                                    old_append_count
-                                } else {
-                                    old_append_count + item_index
-                                },
-                                group_commit_index: if item.deduplicated {
-                                    old_commit_index
-                                } else {
-                                    old_commit_index + item_index
-                                },
-                                closed: item.closed,
-                                deduplicated: item.deduplicated,
-                                producer: None,
-                                record_range: self
-                                    .state_machine
-                                    .record_range_for_append(
-                                        &stream_id,
-                                        item.offset,
-                                        item.next_offset,
-                                        Some(&producer),
-                                    )
-                                    .map_err(|err| {
-                                        GroupEngineError::new(format!("record range: {err:?}"))
-                                    })?,
-                            })
-                        })
-                        .collect();
-                    return Ok(GroupWriteResponse::AppendBatch(GroupAppendBatchResponse {
-                        placement,
-                        items,
-                    }));
-                }
-
-                let mut items = Vec::with_capacity(payloads.len());
-                for payload in payloads {
-                    if payload.is_empty() {
-                        items.push(Err(GroupEngineError::stream(
-                            StreamErrorCode::EmptyAppend,
-                            "append payload must be non-empty",
-                        )));
-                        continue;
-                    }
-                    items.push(self.append_payload(
-                        AppendPayloadInput {
-                            stream_id: stream_id.clone(),
-                            content_type: Some(&content_type),
-                            payload: &payload,
-                            close_after: false,
-                            stream_seq: None,
-                            producer: None,
-                            now_ms,
-                            record_match: None,
-                        },
-                        placement,
-                    ));
-                }
-                Ok(GroupWriteResponse::AppendBatch(GroupAppendBatchResponse {
-                    placement,
-                    items,
-                }))
-            }
-            GroupWriteCommand::PublishSnapshot {
+            } => self.apply_append_batch(
                 stream_id,
-                snapshot_offset,
                 content_type,
-                payload,
-                now_ms,
-            } => {
-                let response = self.state_machine.apply(StreamCommand::PublishSnapshot {
-                    stream_id,
-                    snapshot_offset,
-                    content_type,
-                    payload: payload.to_vec(),
-                    now_ms,
-                });
-                match response {
-                    StreamResponse::SnapshotPublished {
-                        snapshot_offset,
-                        record_range,
-                    } => {
-                        self.commit_index += 1;
-                        Ok(GroupWriteResponse::PublishSnapshot(
-                            PublishSnapshotResponse {
-                                placement,
-                                snapshot_offset,
-                                group_commit_index: self.commit_index,
-                                record_range,
-                            },
-                        ))
-                    }
-                    StreamResponse::Error {
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    } => Err(GroupEngineError::stream_with_context(
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    )),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected publish snapshot response: {other:?}"
-                    ))),
-                }
-            }
-            GroupWriteCommand::TouchStreamAccess {
-                stream_id,
-                now_ms,
-                renew_ttl,
-            } => {
-                let response = self.state_machine.apply(StreamCommand::TouchStreamAccess {
-                    stream_id,
-                    now_ms,
-                    renew_ttl,
-                });
-                match response {
-                    StreamResponse::Accessed { changed, expired } => {
-                        if changed || expired {
-                            self.commit_index += 1;
-                        }
-                        Ok(GroupWriteResponse::TouchStreamAccess(
-                            TouchStreamAccessResponse {
-                                placement,
-                                changed,
-                                expired,
-                                group_commit_index: self.commit_index,
-                            },
-                        ))
-                    }
-                    StreamResponse::Error {
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    } => Err(GroupEngineError::stream_with_context(
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    )),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected touch stream access response: {other:?}"
-                    ))),
-                }
-            }
-            GroupWriteCommand::UpdateStreamAttrs {
-                stream_id,
-                attrs,
-                now_ms,
-            } => {
-                let response = self.state_machine.apply(StreamCommand::UpdateStreamAttrs {
-                    stream_id,
-                    attrs,
-                    now_ms,
-                });
-                match response {
-                    StreamResponse::AttrsUpdated { changed } => {
-                        if changed {
-                            self.commit_index += 1;
-                        }
-                        Ok(GroupWriteResponse::UpdateStreamAttrs(
-                            UpdateStreamAttrsResponse {
-                                placement,
-                                changed,
-                                group_commit_index: self.commit_index,
-                            },
-                        ))
-                    }
-                    StreamResponse::Error {
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    } => Err(GroupEngineError::stream_with_context(
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    )),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected update stream attrs response: {other:?}"
-                    ))),
-                }
-            }
-            GroupWriteCommand::FlushCold { stream_id, chunk } => {
-                let response = self
-                    .state_machine
-                    .apply(StreamCommand::FlushCold { stream_id, chunk });
-                match response {
-                    StreamResponse::ColdFlushed { hot_start_offset } => {
-                        self.commit_index += 1;
-                        Ok(GroupWriteResponse::FlushCold(FlushColdResponse {
-                            placement,
-                            hot_start_offset,
-                            group_commit_index: self.commit_index,
-                        }))
-                    }
-                    StreamResponse::Error {
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    } => Err(GroupEngineError::stream_with_context(
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    )),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected flush cold response: {other:?}"
-                    ))),
-                }
-            }
-            GroupWriteCommand::CloseStream {
-                stream_id,
-                stream_seq,
+                payloads,
                 producer,
                 now_ms,
-            } => {
-                let record_stream_id = stream_id.clone();
-                let record_producer = producer.clone();
-                let response = self.state_machine.apply(StreamCommand::Close {
-                    stream_id,
-                    stream_seq,
-                    producer,
+                placement,
+            ),
+            command => {
+                let stream_id = command_stream_id(&command);
+                let command_producer = command_producer(&command);
+                if let StreamCommand::CreateStream { stream_id, .. }
+                | StreamCommand::CreateExternal { stream_id, .. } = &command
+                {
+                    ensure_bucket_exists(&mut self.state_machine, stream_id)?;
+                }
+                let response = self.state_machine.apply(command);
+                self.group_response_from_stream(response, stream_id, command_producer, placement)
+            }
+        }
+    }
+
+    fn apply_append_batch(
+        &mut self,
+        stream_id: BucketStreamId,
+        content_type: Option<String>,
+        payloads: Vec<Bytes>,
+        producer: Option<ProducerRequest>,
+        now_ms: u64,
+        placement: ShardPlacement,
+    ) -> Result<GroupWriteResponse, GroupEngineError> {
+        if let Some(producer) = producer {
+            let payload_refs = payloads.iter().map(Bytes::as_ref).collect::<Vec<_>>();
+            let batch = self
+                .state_machine
+                .append_batch_borrowed(
+                    stream_id.clone(),
+                    content_type.as_deref(),
+                    &payload_refs,
+                    Some(producer.clone()),
                     now_ms,
-                });
-                match response {
-                    StreamResponse::Closed {
-                        next_offset,
-                        deduplicated,
-                        ..
-                    } => {
-                        let record_range = self
+                )
+                .map_err(stream_response_error)?;
+            let old_commit_index = self.commit_index;
+            let old_append_count = *self.stream_append_counts.get(&stream_id).unwrap_or(&0);
+            if !batch.deduplicated {
+                let count = u64::try_from(batch.items.len()).expect("item count fits u64");
+                self.commit_index += count;
+                *self
+                    .stream_append_counts
+                    .entry(stream_id.clone())
+                    .or_insert(0) += count;
+            }
+            let items = batch
+                .items
+                .into_iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let item_index = u64::try_from(index + 1).expect("item index fits u64");
+                    Ok(AppendResponse {
+                        placement,
+                        start_offset: item.offset,
+                        next_offset: item.next_offset,
+                        stream_append_count: if item.deduplicated {
+                            old_append_count
+                        } else {
+                            old_append_count + item_index
+                        },
+                        group_commit_index: if item.deduplicated {
+                            old_commit_index
+                        } else {
+                            old_commit_index + item_index
+                        },
+                        closed: item.closed,
+                        deduplicated: item.deduplicated,
+                        producer: None,
+                        record_range: self
                             .state_machine
                             .record_range_for_append(
-                                &record_stream_id,
-                                next_offset,
-                                next_offset,
-                                record_producer.as_ref(),
+                                &stream_id,
+                                item.offset,
+                                item.next_offset,
+                                Some(&producer),
                             )
                             .map_err(|err| {
                                 GroupEngineError::new(format!("record range: {err:?}"))
-                            })?;
-                        if !deduplicated {
-                            self.commit_index += 1;
-                        }
-                        Ok(GroupWriteResponse::CloseStream(CloseStreamResponse {
-                            placement,
-                            next_offset,
-                            group_commit_index: self.commit_index,
-                            deduplicated,
-                            record_range,
-                        }))
-                    }
-                    StreamResponse::Error {
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    } => Err(GroupEngineError::stream_with_context(
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    )),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected close stream response: {other:?}"
-                    ))),
-                }
+                            })?,
+                    })
+                })
+                .collect();
+            return Ok(GroupWriteResponse::AppendBatch(GroupAppendBatchResponse {
+                placement,
+                items,
+            }));
+        }
+
+        let mut items = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            if payload.is_empty() {
+                items.push(Err(GroupEngineError::stream(
+                    StreamErrorCode::EmptyAppend,
+                    "append payload must be non-empty",
+                )));
+                continue;
             }
-            GroupWriteCommand::DeleteStream { stream_id } => {
-                let response = self.state_machine.apply(StreamCommand::DeleteStream {
+            items.push(self.append_payload(
+                AppendPayloadInput {
                     stream_id: stream_id.clone(),
-                });
-                match response {
-                    StreamResponse::Deleted => {
-                        self.commit_index += 1;
-                        // Stream is gone: drop its runtime append count so the map
-                        // stays bounded under delete churn.
-                        self.stream_append_counts.remove(&stream_id);
-                        Ok(GroupWriteResponse::DeleteStream(DeleteStreamResponse {
-                            placement,
-                            group_commit_index: self.commit_index,
-                        }))
-                    }
-                    StreamResponse::Error {
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    } => Err(GroupEngineError::stream_with_context(
-                        code,
-                        message,
-                        next_offset,
-                        context,
-                    )),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected delete stream response: {other:?}"
-                    ))),
-                }
+                    content_type: content_type.as_deref(),
+                    payload: &payload,
+                    close_after: false,
+                    stream_seq: None,
+                    producer: None,
+                    now_ms,
+                    record_match: None,
+                },
+                placement,
+            ));
+        }
+        Ok(GroupWriteResponse::AppendBatch(GroupAppendBatchResponse {
+            placement,
+            items,
+        }))
+    }
+
+    /// Lifts a [`StreamResponse`] into the matching [`GroupWriteResponse`],
+    /// advancing the group commit index for every mutating outcome.
+    fn group_response_from_stream(
+        &mut self,
+        response: StreamResponse,
+        stream_id: Option<BucketStreamId>,
+        command_producer: Option<ProducerRequest>,
+        placement: ShardPlacement,
+    ) -> Result<GroupWriteResponse, GroupEngineError> {
+        match response {
+            StreamResponse::Created {
+                next_offset,
+                closed,
+                ..
+            } => {
+                let stream_id = require_response_stream_id(stream_id, "created")?;
+                self.commit_index += 1;
+                Ok(GroupWriteResponse::CreateStream(CreateStreamResponse {
+                    placement,
+                    next_offset,
+                    closed,
+                    already_exists: false,
+                    group_commit_index: self.commit_index,
+                    record_range: self
+                        .state_machine
+                        .record_range(&stream_id)
+                        .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?,
+                }))
             }
-            GroupWriteCommand::AckColdGc { up_to_seq } => {
-                let response = self
+            StreamResponse::AlreadyExists {
+                next_offset,
+                closed,
+                ..
+            } => Ok(GroupWriteResponse::CreateStream(CreateStreamResponse {
+                placement,
+                next_offset,
+                closed,
+                already_exists: true,
+                group_commit_index: self.commit_index,
+                record_range: None,
+            })),
+            StreamResponse::Appended {
+                offset,
+                next_offset,
+                closed,
+                deduplicated,
+                producer,
+            } => {
+                let stream_id = require_response_stream_id(stream_id, "appended")?;
+                let record_range = self
                     .state_machine
-                    .apply(StreamCommand::AckColdGc { up_to_seq });
-                match response {
-                    StreamResponse::ColdGcAcked { removed } => {
-                        self.commit_index += 1;
-                        Ok(GroupWriteResponse::AckColdGc(AckColdGcResponse {
-                            placement,
-                            removed,
-                            group_commit_index: self.commit_index,
-                        }))
-                    }
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected ack cold gc response: {other:?}"
-                    ))),
+                    .record_range_for_append(&stream_id, offset, next_offset, producer.as_ref())
+                    .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?;
+                let stream_append_count = self.stream_append_counts.entry(stream_id).or_insert(0);
+                if !deduplicated {
+                    self.commit_index += 1;
+                    *stream_append_count += 1;
                 }
+                Ok(GroupWriteResponse::Append(AppendResponse {
+                    placement,
+                    start_offset: offset,
+                    next_offset,
+                    stream_append_count: *stream_append_count,
+                    group_commit_index: self.commit_index,
+                    closed,
+                    deduplicated,
+                    producer,
+                    record_range,
+                }))
             }
-            GroupWriteCommand::Batch { commands } => Ok(GroupWriteResponse::Batch(
-                self.apply_committed_write_batch(commands, placement),
+            StreamResponse::SnapshotPublished {
+                snapshot_offset,
+                record_range,
+            } => {
+                self.commit_index += 1;
+                Ok(GroupWriteResponse::PublishSnapshot(
+                    PublishSnapshotResponse {
+                        placement,
+                        snapshot_offset,
+                        group_commit_index: self.commit_index,
+                        record_range,
+                    },
+                ))
+            }
+            StreamResponse::Accessed { changed, expired } => {
+                if changed || expired {
+                    self.commit_index += 1;
+                }
+                Ok(GroupWriteResponse::TouchStreamAccess(
+                    TouchStreamAccessResponse {
+                        placement,
+                        changed,
+                        expired,
+                        group_commit_index: self.commit_index,
+                    },
+                ))
+            }
+            StreamResponse::AttrsUpdated { changed } => {
+                if changed {
+                    self.commit_index += 1;
+                }
+                Ok(GroupWriteResponse::UpdateStreamAttrs(
+                    UpdateStreamAttrsResponse {
+                        placement,
+                        changed,
+                        group_commit_index: self.commit_index,
+                    },
+                ))
+            }
+            StreamResponse::ColdFlushed { hot_start_offset } => {
+                self.commit_index += 1;
+                Ok(GroupWriteResponse::FlushCold(FlushColdResponse {
+                    placement,
+                    hot_start_offset,
+                    group_commit_index: self.commit_index,
+                }))
+            }
+            StreamResponse::Closed {
+                next_offset,
+                deduplicated,
+                ..
+            } => {
+                let stream_id = require_response_stream_id(stream_id, "closed")?;
+                let record_range = self
+                    .state_machine
+                    .record_range_for_append(
+                        &stream_id,
+                        next_offset,
+                        next_offset,
+                        command_producer.as_ref(),
+                    )
+                    .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?;
+                if !deduplicated {
+                    self.commit_index += 1;
+                }
+                Ok(GroupWriteResponse::CloseStream(CloseStreamResponse {
+                    placement,
+                    next_offset,
+                    group_commit_index: self.commit_index,
+                    deduplicated,
+                    record_range,
+                }))
+            }
+            StreamResponse::Deleted => {
+                let stream_id = require_response_stream_id(stream_id, "deleted")?;
+                self.commit_index += 1;
+                // Stream is gone: drop its runtime append count so the map
+                // stays bounded under delete churn.
+                self.stream_append_counts.remove(&stream_id);
+                Ok(GroupWriteResponse::DeleteStream(DeleteStreamResponse {
+                    placement,
+                    group_commit_index: self.commit_index,
+                }))
+            }
+            StreamResponse::ColdGcAcked { removed } => {
+                self.commit_index += 1;
+                Ok(GroupWriteResponse::AckColdGc(AckColdGcResponse {
+                    placement,
+                    removed,
+                    group_commit_index: self.commit_index,
+                }))
+            }
+            StreamResponse::Error {
+                code,
+                message,
+                next_offset,
+                context,
+            } => Err(GroupEngineError::stream_with_context(
+                code,
+                message,
+                next_offset,
+                context,
             )),
+            other @ (StreamResponse::BucketCreated { .. }
+            | StreamResponse::BucketAlreadyExists { .. }
+            | StreamResponse::BucketDeleted { .. }) => Err(GroupEngineError::new(format!(
+                "unexpected group write response: {other:?}"
+            ))),
         }
     }
 
@@ -936,11 +674,11 @@ impl InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> Result<TouchStreamAccessResponse, GroupEngineError> {
         match self.apply_committed_write(
-            GroupWriteCommand::TouchStreamAccess {
+            GroupWriteCommand::Stream(StreamCommand::TouchStreamAccess {
                 stream_id,
                 now_ms,
                 renew_ttl,
-            },
+            }),
             placement,
         )? {
             GroupWriteResponse::TouchStreamAccess(response) => Ok(response),
@@ -969,17 +707,6 @@ impl InMemoryGroupEngine {
             ));
         }
         Ok(Some(response))
-    }
-
-    pub fn apply_committed_write_batch(
-        &mut self,
-        commands: Vec<GroupWriteCommand>,
-        placement: ShardPlacement,
-    ) -> Vec<Result<GroupWriteResponse, GroupEngineError>> {
-        commands
-            .into_iter()
-            .map(|command| self.apply_committed_write(command, placement))
-            .collect()
     }
 
     pub(crate) fn append_payload(
@@ -1718,9 +1445,10 @@ impl GroupEngine for InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> GroupAckColdGcFuture<'a> {
         Box::pin(async move {
-            match self
-                .apply_committed_write(GroupWriteCommand::AckColdGc { up_to_seq }, placement)?
-            {
+            match self.apply_committed_write(
+                GroupWriteCommand::Stream(StreamCommand::AckColdGc { up_to_seq }),
+                placement,
+            )? {
                 GroupWriteResponse::AckColdGc(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
                     "unexpected ack cold gc write response: {other:?}"
@@ -1987,6 +1715,44 @@ pub(crate) fn ensure_bucket_exists(
             "unexpected create bucket response: {other:?}"
         ))),
     }
+}
+
+/// Stream id a command targets, if any (bucket and GC commands have none).
+fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
+    match command {
+        StreamCommand::CreateBucket { .. }
+        | StreamCommand::DeleteBucket { .. }
+        | StreamCommand::AckColdGc { .. } => None,
+        StreamCommand::CreateStream { stream_id, .. }
+        | StreamCommand::CreateExternal { stream_id, .. }
+        | StreamCommand::Append { stream_id, .. }
+        | StreamCommand::AppendExternal { stream_id, .. }
+        | StreamCommand::AppendBatch { stream_id, .. }
+        | StreamCommand::PublishSnapshot { stream_id, .. }
+        | StreamCommand::TouchStreamAccess { stream_id, .. }
+        | StreamCommand::UpdateStreamAttrs { stream_id, .. }
+        | StreamCommand::FlushCold { stream_id, .. }
+        | StreamCommand::Close { stream_id, .. }
+        | StreamCommand::DeleteStream { stream_id } => Some(stream_id.clone()),
+    }
+}
+
+fn command_producer(command: &StreamCommand) -> Option<ProducerRequest> {
+    match command {
+        StreamCommand::Close { producer, .. } => producer.clone(),
+        _ => None,
+    }
+}
+
+fn require_response_stream_id(
+    stream_id: Option<BucketStreamId>,
+    response: &str,
+) -> Result<BucketStreamId, GroupEngineError> {
+    stream_id.ok_or_else(|| {
+        GroupEngineError::new(format!(
+            "{response} response for a command without a stream id"
+        ))
+    })
 }
 
 pub(crate) fn stream_response_error(response: StreamResponse) -> GroupEngineError {

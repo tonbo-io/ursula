@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
+use bytes::Bytes;
 use slotmap::Key;
 use slotmap::new_key_type;
 use ursula_shard::BucketStreamId;
@@ -187,7 +188,7 @@ impl StreamStateMachine {
                     Ok(record_ends) => self.create_stream(CreateStreamInput {
                         stream_id,
                         content_type,
-                        initial_payload,
+                        initial_payload: initial_payload.into(),
                         record_ends,
                         close_after,
                         stream_seq,
@@ -292,7 +293,7 @@ impl StreamStateMachine {
                 let response = match self.append_batch_borrowed(
                     stream_id,
                     content_type.as_deref(),
-                    &payloads.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+                    &payloads.iter().map(Bytes::as_ref).collect::<Vec<_>>(),
                     producer,
                     now_ms,
                 ) {
@@ -328,7 +329,7 @@ impl StreamStateMachine {
                     stream_id,
                     snapshot_offset,
                     content_type,
-                    payload,
+                    payload.into(),
                     now_ms,
                 );
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);

@@ -14,6 +14,7 @@ bytes = { workspace = true, features = ["serde"] }
 crossbeam-utils = { workspace = true }
 opendal = { workspace = true, features = ["services-memory", "services-s3"] }
 serde = { workspace = true }
+serde_bytes = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }

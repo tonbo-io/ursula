@@ -17,6 +17,7 @@ openraft-rt = { workspace = true }
 openraft = { workspace = true }
 opentelemetry = { workspace = true }
 prost = { workspace = true }
+rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -67,7 +67,7 @@ fn create_cmd(stream_id: BucketStreamId, args: Create) -> StreamCommand {
     StreamCommand::CreateStream {
         stream_id,
         content_type: args.content_type.to_owned(),
-        initial_payload: args.payload,
+        initial_payload: args.payload.into(),
         close_after: args.close_after,
         stream_seq: args.stream_seq,
         producer: None,
@@ -105,7 +105,7 @@ fn append_cmd(stream_id: BucketStreamId, payload: &[u8], args: Append) -> Stream
     StreamCommand::Append {
         stream_id,
         content_type: args.content_type.map(str::to_owned),
-        payload: payload.to_vec(),
+        payload: bytes::Bytes::copy_from_slice(payload),
         close_after: args.close_after,
         stream_seq: args.stream_seq,
         producer: args.producer,
@@ -154,7 +154,7 @@ fn publish_snapshot_cmd(
         stream_id,
         snapshot_offset,
         content_type: content_type.to_owned(),
-        payload: payload.to_vec(),
+        payload: bytes::Bytes::copy_from_slice(payload),
         now_ms,
     }
 }

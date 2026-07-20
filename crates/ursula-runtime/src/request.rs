@@ -114,7 +114,7 @@ pub struct HeadStreamRequest {
     pub now_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadStreamResponse {
     pub placement: ShardPlacement,
     pub content_type: String,
@@ -164,12 +164,13 @@ pub struct ReadStreamRequest {
     pub max_records: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadStreamResponse {
     pub placement: ShardPlacement,
     pub offset: u64,
     pub next_offset: u64,
     pub content_type: String,
+    #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
     pub up_to_date: bool,
     pub closed: bool,

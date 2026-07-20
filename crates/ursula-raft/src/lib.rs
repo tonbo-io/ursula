@@ -3,9 +3,10 @@
 //! Module map:
 //!
 //! - [`types`]: shared `UrsulaRaftTypeConfig`, type aliases, and the
-//!   protobuf-backed [`RaftGroupCommand`]/[`RaftGroupResponse`] wire types.
-//! - [`codec`]: protobuf <-> Rust-domain conversions for every engine value
-//!   that travels through the Raft state machine.
+//!   [`RaftGroupResponse`] applied-entry response around the canonical
+//!   `ursula_runtime` write types.
+//! - [`codec`]: serde (MessagePack) wire helpers for the canonical command,
+//!   response, and error types that travel through the Raft state machine.
 //! - [`grpc`]: gRPC service ([`RaftGrpcService`]) and network factory
 //!   ([`GrpcRaftNetworkFactory`]) used for inter-node Raft RPCs.
 //! - [`log_store`]: in-memory and durable file-backed Raft log stores (see
@@ -87,7 +88,6 @@ pub use registry::SingleNodeRaftNetworkFactory;
 pub use sim_runtime::MadsimOpenRaftRuntime;
 pub use state_machine::RaftGroupSnapshotBuilder;
 pub use state_machine::RaftGroupStateMachine;
-pub use types::RaftGroupCommand;
 pub use types::RaftGroupMetricsSnapshot;
 pub use types::RaftGroupResponse;
 pub use types::RaftLogProgressSnapshot;

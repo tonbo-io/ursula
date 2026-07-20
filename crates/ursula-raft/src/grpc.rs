@@ -20,30 +20,23 @@ use openraft::error::Unreachable;
 use openraft::network::RPCOption;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
-use prost::Message;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use ursula_proto as raft_app_proto;
 use ursula_runtime::ColdIndexPageCache;
 use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::GetStreamAttrsRequest;
 use ursula_runtime::GroupEngine;
-use ursula_runtime::GroupEngineError;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 
-use crate::codec::encode_group_write_result;
-use crate::codec::get_stream_attrs_response_to_proto;
-use crate::codec::group_engine_error_to_proto;
-use crate::codec::group_write_command_from_proto;
-use crate::codec::head_stream_response_to_proto;
+use crate::codec::decode_wire;
+use crate::codec::encode_wire;
 use crate::codec::placement_from_parts;
-use crate::codec::read_stream_response_to_proto;
 use crate::codec::required;
 use crate::engine::RaftGroupEngine;
 use crate::forward::write_commands_on_raft;
@@ -65,7 +58,6 @@ use crate::log_store::vote_response_to_proto;
 use crate::log_store::vote_to_proto;
 use crate::raft_internal_proto;
 use crate::raft_internal_proto::raft_rpc_ack_v1::Payload as AckPayload;
-use crate::types::RaftGroupCommand;
 use crate::types::UrsulaAppendEntriesRequest;
 use crate::types::UrsulaAppendEntriesResponse;
 use crate::types::UrsulaRaftTypeConfig;
@@ -263,20 +255,23 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             let commands = request
                 .command_payloads
                 .into_iter()
-                .map(|payload| {
-                    let command =
-                        raft_app_proto::RaftGroupCommandV1::decode(payload).map_err(|err| {
-                            GroupEngineError::new(format!("decode group command: {err}"))
-                        })?;
-                    group_write_command_from_proto(RaftGroupCommand(command))
-                })
+                .map(|payload| decode_wire(&payload, "group command"))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
             let results = write_commands_on_raft(raft, placement, None, commands)
                 .await
                 .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?
                 .into_iter()
-                .map(encode_group_write_result)
+                .map(|result| match result {
+                    Ok(response) => raft_internal_proto::GroupWriteResultV1 {
+                        ok: true,
+                        payload: encode_wire(&response),
+                    },
+                    Err(err) => raft_internal_proto::GroupWriteResultV1 {
+                        ok: false,
+                        payload: encode_wire(&err),
+                    },
+                })
                 .collect();
             Ok(tonic::Response::new(
                 raft_internal_proto::GroupWriteResponseV1 { results },
@@ -374,9 +369,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     .await
                     .map(|response| raft_internal_proto::GroupReadResponseV1 {
                         ok: true,
-                        payload: head_stream_response_to_proto(response)
-                            .encode_to_vec()
-                            .into(),
+                        payload: encode_wire(&response),
                     }),
                 raft_internal_proto::group_read_request_v1::Read::GetStreamAttrs(_) => engine
                     .get_stream_attrs(
@@ -389,9 +382,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     .await
                     .map(|response| raft_internal_proto::GroupReadResponseV1 {
                         ok: true,
-                        payload: get_stream_attrs_response_to_proto(response)
-                            .encode_to_vec()
-                            .into(),
+                        payload: encode_wire(&response),
                     }),
                 raft_internal_proto::group_read_request_v1::Read::ReadStream(read) => {
                     let max_len = usize::try_from(read.max_len).map_err(|_| {
@@ -412,9 +403,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                         .await
                         .map(|response| raft_internal_proto::GroupReadResponseV1 {
                             ok: true,
-                            payload: read_stream_response_to_proto(response)
-                                .encode_to_vec()
-                                .into(),
+                            payload: encode_wire(&response),
                         })
                 }
             };
@@ -422,7 +411,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 Ok(response) => response,
                 Err(err) => raft_internal_proto::GroupReadResponseV1 {
                     ok: false,
-                    payload: group_engine_error_to_proto(err).encode_to_vec().into(),
+                    payload: encode_wire(&err),
                 },
             };
             Ok(tonic::Response::new(response))

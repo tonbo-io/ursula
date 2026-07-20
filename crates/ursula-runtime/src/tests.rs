@@ -19,6 +19,7 @@ use ursula_shard::ShardPlacement;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::ObjectPayloadRef;
 use ursula_stream::StreamAttrs;
+use ursula_stream::StreamCommand;
 use ursula_stream::StreamReadSegment;
 use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamStateMachine;
@@ -146,20 +147,23 @@ fn stream_attrs(title: &str, purpose: &str) -> StreamAttrs {
 }
 
 #[test]
-fn group_write_command_decodes_pre_attrs_wal_records() {
+fn group_write_command_decodes_pre_attrs_records() {
     let mut request = CreateStreamRequest::new(
-        BucketStreamId::new("benchcmp", "legacy-wal"),
+        BucketStreamId::new("benchcmp", "legacy-record"),
         "application/octet-stream",
     );
     request.now_ms = 7;
     let command = GroupWriteCommand::from(request);
 
     let mut value = serde_json::to_value(&command).expect("encode command");
-    let fields = value.as_object_mut().expect("command object");
+    let fields = value
+        .pointer_mut("/Stream/CreateStream")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("command object");
     assert!(fields.remove("attrs").is_some());
 
     let decoded: GroupWriteCommand =
-        serde_json::from_value(value).expect("decode pre-attrs WAL record");
+        serde_json::from_value(value).expect("decode pre-attrs record");
     assert_eq!(decoded, command);
 }
 
@@ -300,13 +304,13 @@ fn placement() -> ShardPlacement {
 
 #[test]
 fn group_write_command_round_trips_as_log_payload() {
-    let command = GroupWriteCommand::AppendBatch {
+    let command = GroupWriteCommand::Stream(StreamCommand::AppendBatch {
         stream_id: BucketStreamId::new("benchcmp", "raft-log"),
-        content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+        content_type: Some(DEFAULT_CONTENT_TYPE.to_owned()),
         payloads: vec![Bytes::from_static(b"ab"), Bytes::from_static(b"cd")],
         producer: Some(producer("writer-1", 7, 42)),
         now_ms: 0,
-    };
+    });
 
     let encoded = serde_json::to_vec(&command).expect("encode command");
     let decoded = serde_json::from_slice::<GroupWriteCommand>(&encoded).expect("decode command");
@@ -326,7 +330,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
 
     let created = engine
         .apply_committed_write(
-            GroupWriteCommand::CreateStream {
+            GroupWriteCommand::Stream(StreamCommand::CreateStream {
                 stream_id: stream.clone(),
                 content_type: DEFAULT_CONTENT_TYPE.to_owned(),
                 initial_payload: Bytes::new(),
@@ -337,7 +341,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
                 stream_expires_at_ms: None,
                 attrs: None,
                 now_ms: 0,
-            },
+            }),
             placement,
         )
         .expect("create stream");
@@ -355,16 +359,16 @@ fn committed_write_command_is_state_machine_apply_boundary() {
 
     let appended = engine
         .apply_committed_write(
-            GroupWriteCommand::Append {
+            GroupWriteCommand::Stream(StreamCommand::Append {
                 stream_id: stream.clone(),
-                content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+                content_type: Some(DEFAULT_CONTENT_TYPE.to_owned()),
                 payload: Bytes::from_static(b"abc"),
                 close_after: false,
                 stream_seq: None,
                 producer: None,
                 now_ms: 0,
                 record_match: None,
-            },
+            }),
             placement,
         )
         .expect("append");
@@ -385,7 +389,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
 
     let flushed = engine
         .apply_committed_write(
-            GroupWriteCommand::FlushCold {
+            GroupWriteCommand::Stream(StreamCommand::FlushCold {
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -393,7 +397,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
                     s3_path: "s3://bucket/apply-command/000000".to_owned(),
                     object_size: 2,
                 },
-            },
+            }),
             placement,
         )
         .expect("flush cold");
@@ -433,7 +437,7 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
 
     engine
         .apply_committed_write(
-            GroupWriteCommand::CreateStream {
+            GroupWriteCommand::Stream(StreamCommand::CreateStream {
                 stream_id: stream.clone(),
                 content_type: DEFAULT_CONTENT_TYPE.to_owned(),
                 initial_payload: Bytes::new(),
@@ -444,22 +448,22 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
                 stream_expires_at_ms: None,
                 attrs: None,
                 now_ms: 0,
-            },
+            }),
             placement,
         )
         .expect("create stream");
     engine
         .apply_committed_write(
-            GroupWriteCommand::Append {
+            GroupWriteCommand::Stream(StreamCommand::Append {
                 stream_id: stream.clone(),
-                content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+                content_type: Some(DEFAULT_CONTENT_TYPE.to_owned()),
                 payload: Bytes::from_static(b"abcdef"),
                 close_after: false,
                 stream_seq: None,
                 producer: None,
                 now_ms: 0,
                 record_match: None,
-            },
+            }),
             placement,
         )
         .expect("append");
@@ -906,11 +910,11 @@ fn committed_write_batch_preserves_logical_command_responses() {
         .apply_committed_write(
             GroupWriteCommand::Batch {
                 commands: vec![
-                    GroupWriteCommand::from(CreateStreamRequest::new(
+                    StreamCommand::from(CreateStreamRequest::new(
                         stream.clone(),
                         DEFAULT_CONTENT_TYPE,
                     )),
-                    GroupWriteCommand::from(AppendBatchRequest::new(stream.clone(), vec![
+                    StreamCommand::from(AppendBatchRequest::new(stream.clone(), vec![
                         Bytes::from_static(b"ab"),
                         Bytes::from_static(b"cd"),
                     ])),

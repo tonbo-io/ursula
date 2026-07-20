@@ -48,11 +48,6 @@ use ursula_runtime::default_snapshot_store;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 
-use crate::codec::group_write_command_from_proto;
-use crate::codec::raft_blank_response;
-use crate::codec::raft_membership_response;
-use crate::codec::raft_write_applied_response;
-use crate::codec::raft_write_rejected_response;
 use crate::engine::group_engine_io_error;
 use crate::engine::invalid_data;
 use crate::log_store::elapsed_ns;
@@ -61,6 +56,7 @@ use crate::rt::sync::Semaphore;
 use crate::rt::time::Instant;
 use crate::snapshot_codec::decode_group_snapshot;
 use crate::snapshot_codec::group_snapshot_frames;
+use crate::types::RaftGroupResponse;
 use crate::types::UrsulaRaftTypeConfig;
 
 #[derive(Debug, Clone)]
@@ -487,17 +483,13 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             self.last_applied_log_id = Some(entry.log_id);
 
             let response = match entry.payload {
-                EntryPayload::Blank => raft_blank_response(),
+                EntryPayload::Blank => RaftGroupResponse::Blank,
                 EntryPayload::Normal(command) => {
                     let apply_started_at = Instant::now();
                     applied_entries += 1;
-                    let response =
-                        match group_write_command_from_proto(command).and_then(|command| {
-                            self.engine.apply_committed_write(command, self.placement)
-                        }) {
-                            Ok(response) => raft_write_applied_response(response),
-                            Err(err) => raft_write_rejected_response(err),
-                        };
+                    let response = RaftGroupResponse::Write(
+                        self.engine.apply_committed_write(command, self.placement),
+                    );
                     apply_ns = apply_ns.saturating_add(elapsed_ns(apply_started_at));
                     response
                 }
@@ -506,7 +498,7 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                         Some(entry.log_id),
                         membership,
                     );
-                    raft_membership_response()
+                    RaftGroupResponse::Membership
                 }
             };
 

@@ -475,13 +475,10 @@ pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
             let old_leader_raft = old_leader_raft.clone();
             async move {
                 old_leader_raft
-                    .client_write(
-                        GroupWriteCommand::from(AppendRequest::from_bytes(
-                            pending_stream,
-                            format!("pending-old-leader-{pending_id};").into_bytes(),
-                        ))
-                        .into(),
-                    )
+                    .client_write(GroupWriteCommand::from(AppendRequest::from_bytes(
+                        pending_stream,
+                        format!("pending-old-leader-{pending_id};").into_bytes(),
+                    )))
                     .await
             }
         }));
