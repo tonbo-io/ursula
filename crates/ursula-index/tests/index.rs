@@ -3,22 +3,17 @@
     reason = "integration tests combine fallible setup with assertions"
 )]
 
-use tempfile::TempDir;
-use ursula_index::EventEntry;
-use ursula_index::EventIndexCache;
 use ursula_index::EventIndexConfig;
-use ursula_index::FsObjectStore;
 use ursula_index::IndexStatus;
-use ursula_index::ServerlessEventIndex;
 use ursula_index::SourceEnvelope;
 
+mod common;
+
+use common::entry;
+use common::open;
+
 fn config() -> EventIndexConfig {
-    EventIndexConfig {
-        source_id: "https://example.test/v1/stream".to_owned(),
-        flush_entries: 64,
-        row_group_entries: 16,
-        timestamp_field: "captured_at".to_owned(),
-    }
+    common::config("https://example.test/v1/stream", 64, 16)
 }
 
 fn envelopes(start: u64, timestamps: &[i64]) -> Vec<SourceEnvelope> {
@@ -38,16 +33,8 @@ fn envelopes(start: u64, timestamps: &[i64]) -> Vec<SourceEnvelope> {
 
 #[tokio::test]
 async fn retained_stream_starts_at_an_explicit_record_base() -> anyhow::Result<()> {
-    let object_dir = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let store = FsObjectStore::new(object_dir.path())?;
-    let mut index = ServerlessEventIndex::open_fs_with_cache_from_record(
-        store.clone(),
-        EventIndexCache::serving(cache.path(), 16 * 1024 * 1024)?,
-        config(),
-        41,
-    )
-    .await?;
+    let (_object_dir, store) = common::fs_store()?;
+    let (_cache, mut index) = open(&store, config(), 41).await?;
 
     assert_eq!(index.indexed_from_record(), 41);
     assert_eq!(index.durable_through_record(), 41);
@@ -69,14 +56,7 @@ async fn retained_stream_starts_at_an_explicit_record_base() -> anyhow::Result<(
         .expect_err("a query watermark cannot precede indexed_from_record");
     assert!(matches!(error, ursula_index::IndexError::InvalidQuery));
 
-    let fresh_cache = TempDir::new()?;
-    let reopened = ServerlessEventIndex::open_fs_with_cache_from_record(
-        store,
-        EventIndexCache::serving(fresh_cache.path(), 16 * 1024 * 1024)?,
-        config(),
-        41,
-    )
-    .await?;
+    let (_fresh_cache, reopened) = open(&store, config(), 41).await?;
     assert_eq!(reopened.indexed_from_record(), 41);
     assert_eq!(reopened.durable_through_record(), 43);
     Ok(())
@@ -85,16 +65,9 @@ async fn retained_stream_starts_at_an_explicit_record_base() -> anyhow::Result<(
 #[tokio::test]
 async fn out_of_order_record_segments_advance_only_the_contiguous_watermark() -> anyhow::Result<()>
 {
-    let object_dir = TempDir::new()?;
-    let cache_a = TempDir::new()?;
-    let cache_b = TempDir::new()?;
-    let store = FsObjectStore::new(object_dir.path())?;
-    let mut first =
-        ServerlessEventIndex::open_fs(store.clone(), cache_a.path(), 16 * 1024 * 1024, config())
-            .await?;
-    let mut second =
-        ServerlessEventIndex::open_fs(store.clone(), cache_b.path(), 16 * 1024 * 1024, config())
-            .await?;
+    let (_object_dir, store) = common::fs_store()?;
+    let (_cache_a, mut first) = open(&store, config(), 0).await?;
+    let (_cache_b, mut second) = open(&store, config(), 0).await?;
 
     second
         .commit_envelopes(2, envelopes(2, &[3_000, 2_000]))
@@ -126,15 +99,9 @@ async fn out_of_order_record_segments_advance_only_the_contiguous_watermark() ->
 
 #[tokio::test]
 async fn workers_claim_distinct_ranges_and_publish_out_of_order() -> anyhow::Result<()> {
-    let object_dir = TempDir::new()?;
-    let cache_a = TempDir::new()?;
-    let cache_b = TempDir::new()?;
-    let store = FsObjectStore::new(object_dir.path())?;
-    let mut first =
-        ServerlessEventIndex::open_fs(store.clone(), cache_a.path(), 16 * 1024 * 1024, config())
-            .await?;
-    let mut second =
-        ServerlessEventIndex::open_fs(store, cache_b.path(), 16 * 1024 * 1024, config()).await?;
+    let (_object_dir, store) = common::fs_store()?;
+    let (_cache_a, mut first) = open(&store, config(), 0).await?;
+    let (_cache_b, mut second) = open(&store, config(), 0).await?;
 
     let first_claim = first
         .claim_next_segment(6, 2, "worker-a", 1_000, 60_000)
@@ -166,11 +133,8 @@ async fn workers_claim_distinct_ranges_and_publish_out_of_order() -> anyhow::Res
 
 #[tokio::test]
 async fn claims_stop_before_the_next_completed_range() -> anyhow::Result<()> {
-    let object_dir = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let store = FsObjectStore::new(object_dir.path())?;
-    let mut index =
-        ServerlessEventIndex::open_fs(store, cache.path(), 16 * 1024 * 1024, config()).await?;
+    let (_object_dir, store) = common::fs_store()?;
+    let (_cache, mut index) = open(&store, config(), 0).await?;
     index
         .commit_envelopes(4, envelopes(4, &[4_000, 5_000]))
         .await?;
@@ -185,11 +149,8 @@ async fn claims_stop_before_the_next_completed_range() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn garbage_collection_removes_expired_crashed_worker_claims() -> anyhow::Result<()> {
-    let object_dir = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let store = FsObjectStore::new(object_dir.path())?;
-    let mut index =
-        ServerlessEventIndex::open_fs(store, cache.path(), 16 * 1024 * 1024, config()).await?;
+    let (object_dir, store) = common::fs_store()?;
+    let (_cache, mut index) = open(&store, config(), 0).await?;
     let claim = index
         .claim_next_segment(4, 2, "crashed-worker", 1_000, 100)
         .await?
@@ -221,25 +182,11 @@ async fn garbage_collection_removes_expired_crashed_worker_claims() -> anyhow::R
 
 #[tokio::test]
 async fn concurrent_workers_split_one_hot_stream_into_distinct_ranges() -> anyhow::Result<()> {
-    let object_dir = TempDir::new()?;
-    let caches = [
-        TempDir::new()?,
-        TempDir::new()?,
-        TempDir::new()?,
-        TempDir::new()?,
-    ];
-    let store = FsObjectStore::new(object_dir.path())?;
-    let mut first =
-        ServerlessEventIndex::open_fs(store.clone(), caches[0].path(), 16 * 1024 * 1024, config())
-            .await?;
-    let mut second =
-        ServerlessEventIndex::open_fs(store.clone(), caches[1].path(), 16 * 1024 * 1024, config())
-            .await?;
-    let mut third =
-        ServerlessEventIndex::open_fs(store.clone(), caches[2].path(), 16 * 1024 * 1024, config())
-            .await?;
-    let mut fourth =
-        ServerlessEventIndex::open_fs(store, caches[3].path(), 16 * 1024 * 1024, config()).await?;
+    let (_object_dir, store) = common::fs_store()?;
+    let (_cache_a, mut first) = open(&store, config(), 0).await?;
+    let (_cache_b, mut second) = open(&store, config(), 0).await?;
+    let (_cache_c, mut third) = open(&store, config(), 0).await?;
+    let (_cache_d, mut fourth) = open(&store, config(), 0).await?;
 
     let claims = tokio::join!(
         first.claim_next_segment(8, 2, "worker-a", 1_000, 60_000),
@@ -263,15 +210,9 @@ async fn concurrent_workers_split_one_hot_stream_into_distinct_ranges() -> anyho
 #[tokio::test]
 async fn an_expired_long_claim_can_commit_around_an_already_published_prefix() -> anyhow::Result<()>
 {
-    let object_dir = TempDir::new()?;
-    let cache_a = TempDir::new()?;
-    let cache_b = TempDir::new()?;
-    let store = FsObjectStore::new(object_dir.path())?;
-    let mut short_reader =
-        ServerlessEventIndex::open_fs(store.clone(), cache_a.path(), 16 * 1024 * 1024, config())
-            .await?;
-    let mut long_reader =
-        ServerlessEventIndex::open_fs(store, cache_b.path(), 16 * 1024 * 1024, config()).await?;
+    let (_object_dir, store) = common::fs_store()?;
+    let (_cache_a, mut short_reader) = open(&store, config(), 0).await?;
+    let (_cache_b, mut long_reader) = open(&store, config(), 0).await?;
 
     short_reader
         .commit_envelopes(0, envelopes(0, &[1_000, 2_000]))
@@ -301,36 +242,15 @@ async fn an_expired_long_claim_can_commit_around_an_already_published_prefix() -
 
 #[tokio::test]
 async fn cache_is_disposable_and_rebuilt_from_authoritative_objects() -> anyhow::Result<()> {
-    let object_dir = TempDir::new()?;
-    let first_cache = TempDir::new()?;
-    let store = FsObjectStore::new(object_dir.path())?;
-    let mut writer = ServerlessEventIndex::open_fs(
-        store.clone(),
-        first_cache.path(),
-        16 * 1024 * 1024,
-        config(),
-    )
-    .await?;
-    writer
-        .ingest(EventEntry {
-            captured_at_ms: 200,
-            record: 0,
-        })
-        .await?;
-    writer
-        .ingest(EventEntry {
-            captured_at_ms: 100,
-            record: 1,
-        })
-        .await?;
+    let (_object_dir, store) = common::fs_store()?;
+    let (first_cache, mut writer) = open(&store, config(), 0).await?;
+    writer.ingest(entry(0, 200)).await?;
+    writer.ingest(entry(1, 100)).await?;
     writer.flush().await?;
     drop(writer);
     drop(first_cache);
 
-    let empty_cache = TempDir::new()?;
-    let mut reader =
-        ServerlessEventIndex::open_fs(store, empty_cache.path(), 16 * 1024 * 1024, config())
-            .await?;
+    let (_empty_cache, mut reader) = open(&store, config(), 0).await?;
     let result = reader.query(0, 1_000, None, None, 10).await?;
     assert_eq!(result.durable_through_record, 2);
     assert_eq!(
@@ -346,23 +266,13 @@ async fn cache_is_disposable_and_rebuilt_from_authoritative_objects() -> anyhow:
 
 #[tokio::test]
 async fn concurrent_writers_converge_on_one_checkpoint() -> anyhow::Result<()> {
-    let object_dir = TempDir::new()?;
-    let cache_a = TempDir::new()?;
-    let cache_b = TempDir::new()?;
-    let store = FsObjectStore::new(object_dir.path())?;
-    let mut first =
-        ServerlessEventIndex::open_fs(store.clone(), cache_a.path(), 16 * 1024 * 1024, config())
-            .await?;
-    let mut second =
-        ServerlessEventIndex::open_fs(store.clone(), cache_b.path(), 16 * 1024 * 1024, config())
-            .await?;
+    let (_object_dir, store) = common::fs_store()?;
+    let (_cache_a, mut first) = open(&store, config(), 0).await?;
+    let (_cache_b, mut second) = open(&store, config(), 0).await?;
     for record in 0..8 {
-        let entry = EventEntry {
-            captured_at_ms: 1_000_i64.saturating_sub(i64::try_from(record)?),
-            record,
-        };
-        first.ingest(entry).await?;
-        second.ingest(entry).await?;
+        let event = entry(record, 1_000_i64.saturating_sub(i64::try_from(record)?));
+        first.ingest(event).await?;
+        second.ingest(event).await?;
     }
     let (first_result, second_result) = tokio::join!(first.flush(), second.flush());
     first_result?;
@@ -373,10 +283,7 @@ async fn concurrent_writers_converge_on_one_checkpoint() -> anyhow::Result<()> {
         .await?;
     assert!(gc.deleted_manifests >= 1);
 
-    let verify_cache = TempDir::new()?;
-    let mut verify =
-        ServerlessEventIndex::open_fs(store, verify_cache.path(), 16 * 1024 * 1024, config())
-            .await?;
+    let (_verify_cache, mut verify) = open(&store, config(), 0).await?;
     let result = verify.query(0, 2_000, None, None, 32).await?;
     assert_eq!(result.durable_through_record, 8);
     assert_eq!(result.records.len(), 8);
@@ -392,16 +299,11 @@ async fn concurrent_writers_converge_on_one_checkpoint() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn source_binding_is_stored_in_s3_manifest() -> anyhow::Result<()> {
-    let object_dir = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let store = FsObjectStore::new(object_dir.path())?;
-    let _index =
-        ServerlessEventIndex::open_fs(store.clone(), cache.path(), 16 * 1024 * 1024, config())
-            .await?;
-    let other_cache = TempDir::new()?;
+    let (_object_dir, store) = common::fs_store()?;
+    let (_cache, _index) = open(&store, config(), 0).await?;
     let mut other = config();
     other.source_id = "https://other.example/v1/stream".to_owned();
-    let error = ServerlessEventIndex::open_fs(store, other_cache.path(), 16 * 1024 * 1024, other)
+    let error = open(&store, other, 0)
         .await
         .err()
         .ok_or_else(|| anyhow::anyhow!("expected source mismatch"))?;
@@ -411,27 +313,11 @@ async fn source_binding_is_stored_in_s3_manifest() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn conflicting_writer_cannot_hide_different_event_time() -> anyhow::Result<()> {
-    let object_dir = TempDir::new()?;
-    let cache_a = TempDir::new()?;
-    let cache_b = TempDir::new()?;
-    let store = FsObjectStore::new(object_dir.path())?;
-    let mut first =
-        ServerlessEventIndex::open_fs(store.clone(), cache_a.path(), 16 * 1024 * 1024, config())
-            .await?;
-    let mut second =
-        ServerlessEventIndex::open_fs(store, cache_b.path(), 16 * 1024 * 1024, config()).await?;
-    first
-        .ingest(EventEntry {
-            captured_at_ms: 100,
-            record: 0,
-        })
-        .await?;
-    second
-        .ingest(EventEntry {
-            captured_at_ms: 200,
-            record: 0,
-        })
-        .await?;
+    let (_object_dir, store) = common::fs_store()?;
+    let (_cache_a, mut first) = open(&store, config(), 0).await?;
+    let (_cache_b, mut second) = open(&store, config(), 0).await?;
+    first.ingest(entry(0, 100)).await?;
+    second.ingest(entry(0, 200)).await?;
     first.flush().await?;
     let error = second
         .flush()
@@ -444,33 +330,20 @@ async fn conflicting_writer_cannot_hide_different_event_time() -> anyhow::Result
 
 #[tokio::test]
 async fn loser_can_publish_the_suffix_after_a_partial_concurrent_advance() -> anyhow::Result<()> {
-    let object_dir = TempDir::new()?;
-    let cache_a = TempDir::new()?;
-    let cache_b = TempDir::new()?;
-    let store = FsObjectStore::new(object_dir.path())?;
-    let mut prefix_writer =
-        ServerlessEventIndex::open_fs(store.clone(), cache_a.path(), 16 * 1024 * 1024, config())
-            .await?;
-    let mut full_writer =
-        ServerlessEventIndex::open_fs(store.clone(), cache_b.path(), 16 * 1024 * 1024, config())
-            .await?;
+    let (_object_dir, store) = common::fs_store()?;
+    let (_cache_a, mut prefix_writer) = open(&store, config(), 0).await?;
+    let (_cache_b, mut full_writer) = open(&store, config(), 0).await?;
     for record in 0..4 {
-        let entry = EventEntry {
-            captured_at_ms: i64::try_from(record)?,
-            record,
-        };
-        full_writer.ingest(entry).await?;
+        let event = entry(record, i64::try_from(record)?);
+        full_writer.ingest(event).await?;
         if record < 2 {
-            prefix_writer.ingest(entry).await?;
+            prefix_writer.ingest(event).await?;
         }
     }
     prefix_writer.flush().await?;
     full_writer.flush().await?;
 
-    let verify_cache = TempDir::new()?;
-    let mut verify =
-        ServerlessEventIndex::open_fs(store, verify_cache.path(), 16 * 1024 * 1024, config())
-            .await?;
+    let (_verify_cache, mut verify) = open(&store, config(), 0).await?;
     let result = verify.query(-1, 10, None, None, 10).await?;
     assert_eq!(result.durable_through_record, 4);
     assert_eq!(result.records.len(), 4);
@@ -478,25 +351,13 @@ async fn loser_can_publish_the_suffix_after_a_partial_concurrent_advance() -> an
 }
 
 #[tokio::test]
-async fn serverless_compaction_survives_cache_loss() -> anyhow::Result<()> {
-    let object_dir = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let store = FsObjectStore::new(object_dir.path())?;
-    let mut compact_config = config();
-    compact_config.flush_entries = 2;
-    let mut index = ServerlessEventIndex::open_fs(
-        store.clone(),
-        cache.path(),
-        16 * 1024 * 1024,
-        compact_config.clone(),
-    )
-    .await?;
+async fn compaction_survives_cache_loss() -> anyhow::Result<()> {
+    let (_object_dir, store) = common::fs_store()?;
+    let compact_config = common::config("https://example.test/v1/stream", 2, 16);
+    let (cache, mut index) = open(&store, compact_config.clone(), 0).await?;
     for record in 0..6 {
         index
-            .ingest(EventEntry {
-                captured_at_ms: 10_i64.saturating_sub(i64::try_from(record)?),
-                record,
-            })
+            .ingest(entry(record, 10_i64.saturating_sub(i64::try_from(record)?)))
             .await?;
     }
     assert_eq!(index.part_count(), 3);
@@ -505,10 +366,7 @@ async fn serverless_compaction_survives_cache_loss() -> anyhow::Result<()> {
     drop(index);
     drop(cache);
 
-    let fresh_cache = TempDir::new()?;
-    let mut reopened =
-        ServerlessEventIndex::open_fs(store, fresh_cache.path(), 16 * 1024 * 1024, compact_config)
-            .await?;
+    let (_fresh_cache, mut reopened) = open(&store, compact_config, 0).await?;
     let result = reopened.query(0, 20, None, None, 10).await?;
     assert_eq!(result.records.len(), 6);
     assert_eq!(result.durable_through_record, 6);
@@ -517,22 +375,17 @@ async fn serverless_compaction_survives_cache_loss() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn compaction_is_bounded_to_one_event_time_partition() -> anyhow::Result<()> {
-    let object_dir = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let store = FsObjectStore::new(object_dir.path())?;
-    let mut compact_config = config();
-    compact_config.flush_entries = 1;
-    let mut index =
-        ServerlessEventIndex::open_fs(store, cache.path(), 16 * 1024 * 1024, compact_config)
-            .await?;
+    let (_object_dir, store) = common::fs_store()?;
+    let compact_config = common::config("https://example.test/v1/stream", 1, 16);
+    let (_cache, mut index) = open(&store, compact_config, 0).await?;
     const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
     for record in 0..6 {
         let day = i64::try_from(record / 3)?;
         index
-            .ingest(EventEntry {
-                captured_at_ms: day.saturating_mul(DAY_MS) + i64::try_from(record)?,
+            .ingest(entry(
                 record,
-            })
+                day.saturating_mul(DAY_MS) + i64::try_from(record)?,
+            ))
             .await?;
     }
     assert_eq!(index.part_count(), 6);
@@ -544,12 +397,7 @@ async fn compaction_is_bounded_to_one_event_time_partition() -> anyhow::Result<(
     assert!(!index.compact_partition_once(3, 3).await?);
 
     for record in 6..9 {
-        index
-            .ingest(EventEntry {
-                captured_at_ms: i64::try_from(record)?,
-                record,
-            })
-            .await?;
+        index.ingest(entry(record, i64::try_from(record)?)).await?;
     }
     assert_eq!(index.part_count(), 5);
     assert!(index.compact_partition_once(3, 3).await?);
@@ -564,24 +412,11 @@ async fn compaction_is_bounded_to_one_event_time_partition() -> anyhow::Result<(
 
 #[tokio::test]
 async fn compaction_reduces_fan_in_to_stay_within_the_memory_bound() -> anyhow::Result<()> {
-    let object_dir = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let mut compact_config = config();
-    compact_config.flush_entries = 1;
-    let mut index = ServerlessEventIndex::open_fs(
-        FsObjectStore::new(object_dir.path())?,
-        cache.path(),
-        16 * 1024 * 1024,
-        compact_config,
-    )
-    .await?;
+    let (_object_dir, store) = common::fs_store()?;
+    let compact_config = common::config("https://example.test/v1/stream", 1, 16);
+    let (_cache, mut index) = open(&store, compact_config, 0).await?;
     for record in 0..3 {
-        index
-            .ingest(EventEntry {
-                captured_at_ms: i64::try_from(record)?,
-                record,
-            })
-            .await?;
+        index.ingest(entry(record, i64::try_from(record)?)).await?;
     }
 
     assert!(index.compact_partition_once(3, 2).await?);
@@ -592,41 +427,20 @@ async fn compaction_reduces_fan_in_to_stay_within_the_memory_bound() -> anyhow::
 
 #[tokio::test]
 async fn oversized_old_partition_does_not_block_later_partition() -> anyhow::Result<()> {
-    let object_dir = TempDir::new()?;
-    let large_cache = TempDir::new()?;
-    let store = FsObjectStore::new(object_dir.path())?;
-    let mut large_config = config();
-    large_config.flush_entries = 3;
-    let mut large = ServerlessEventIndex::open_fs(
-        store.clone(),
-        large_cache.path(),
-        16 * 1024 * 1024,
-        large_config,
-    )
-    .await?;
+    let (_object_dir, store) = common::fs_store()?;
+    let large_config = common::config("https://example.test/v1/stream", 3, 16);
+    let (_large_cache, mut large) = open(&store, large_config, 0).await?;
     for record in 0..6 {
-        large
-            .ingest(EventEntry {
-                captured_at_ms: i64::try_from(record)?,
-                record,
-            })
-            .await?;
+        large.ingest(entry(record, i64::try_from(record)?)).await?;
     }
     drop(large);
 
-    let small_cache = TempDir::new()?;
-    let mut small_config = config();
-    small_config.flush_entries = 1;
-    let mut small =
-        ServerlessEventIndex::open_fs(store, small_cache.path(), 16 * 1024 * 1024, small_config)
-            .await?;
+    let small_config = common::config("https://example.test/v1/stream", 1, 16);
+    let (_small_cache, mut small) = open(&store, small_config, 0).await?;
     const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
     for record in 6..8 {
         small
-            .ingest(EventEntry {
-                captured_at_ms: DAY_MS + i64::try_from(record)?,
-                record,
-            })
+            .ingest(entry(record, DAY_MS + i64::try_from(record)?))
             .await?;
     }
 
@@ -645,25 +459,11 @@ async fn oversized_old_partition_does_not_block_later_partition() -> anyhow::Res
 
 #[tokio::test]
 async fn garbage_collection_reclaims_unreferenced_parts_and_manifests() -> anyhow::Result<()> {
-    let object_dir = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let store = FsObjectStore::new(object_dir.path())?;
-    let mut compact_config = config();
-    compact_config.flush_entries = 1;
-    let mut index = ServerlessEventIndex::open_fs(
-        store.clone(),
-        cache.path(),
-        16 * 1024 * 1024,
-        compact_config.clone(),
-    )
-    .await?;
+    let (_object_dir, store) = common::fs_store()?;
+    let compact_config = common::config("https://example.test/v1/stream", 1, 16);
+    let (_cache, mut index) = open(&store, compact_config.clone(), 0).await?;
     for record in 0..3 {
-        index
-            .ingest(EventEntry {
-                captured_at_ms: i64::try_from(record)?,
-                record,
-            })
-            .await?;
+        index.ingest(entry(record, i64::try_from(record)?)).await?;
     }
     assert!(index.compact_partition_once(3, 3).await?);
 
@@ -680,10 +480,7 @@ async fn garbage_collection_reclaims_unreferenced_parts_and_manifests() -> anyho
     assert!(reclaimed.deleted_manifests >= 1);
 
     drop(index);
-    let fresh_cache = TempDir::new()?;
-    let mut reopened =
-        ServerlessEventIndex::open_fs(store, fresh_cache.path(), 16 * 1024 * 1024, compact_config)
-            .await?;
+    let (_fresh_cache, mut reopened) = open(&store, compact_config, 0).await?;
     let result = reopened.query(-1, 10, None, None, 10).await?;
     assert_eq!(result.records.len(), 3);
     Ok(())
@@ -691,11 +488,8 @@ async fn garbage_collection_reclaims_unreferenced_parts_and_manifests() -> anyho
 
 #[tokio::test]
 async fn garbage_collection_skips_and_reclaims_incompatible_manifests() -> anyhow::Result<()> {
-    let object_dir = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let store = FsObjectStore::new(object_dir.path())?;
-    let mut index =
-        ServerlessEventIndex::open_fs(store, cache.path(), 16 * 1024 * 1024, config()).await?;
+    let (object_dir, store) = common::fs_store()?;
+    let (_cache, mut index) = open(&store, config(), 0).await?;
     let legacy = object_dir
         .path()
         .join("manifests/00000000000000000000-legacy-v1.json");
@@ -721,12 +515,8 @@ async fn garbage_collection_skips_and_reclaims_incompatible_manifests() -> anyho
 
 #[tokio::test]
 async fn blocked_status_can_be_cleared_by_an_operator() -> anyhow::Result<()> {
-    let object_dir = TempDir::new()?;
-    let cache = TempDir::new()?;
-    let store = FsObjectStore::new(object_dir.path())?;
-    let mut index =
-        ServerlessEventIndex::open_fs(store.clone(), cache.path(), 16 * 1024 * 1024, config())
-            .await?;
+    let (_object_dir, store) = common::fs_store()?;
+    let (_cache, mut index) = open(&store, config(), 0).await?;
     index
         .mark_blocked(0, "repaired source event".to_owned())
         .await?;
@@ -737,10 +527,7 @@ async fn blocked_status_can_be_cleared_by_an_operator() -> anyhow::Result<()> {
     index.clear_blocked().await?;
     assert_eq!(index.status(), &IndexStatus::Ready);
 
-    let fresh_cache = TempDir::new()?;
-    let reopened =
-        ServerlessEventIndex::open_fs(store, fresh_cache.path(), 16 * 1024 * 1024, config())
-            .await?;
+    let (_fresh_cache, reopened) = open(&store, config(), 0).await?;
     assert_eq!(reopened.status(), &IndexStatus::Ready);
     Ok(())
 }

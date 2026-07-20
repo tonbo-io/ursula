@@ -9,10 +9,11 @@ use anyhow::Context;
 use opendal::Operator;
 use tempfile::TempDir;
 use ursula_index::EventEntry;
+use ursula_index::EventIndex;
+use ursula_index::EventIndexCache;
 use ursula_index::EventIndexConfig;
 use ursula_index::S3ObjectStore;
 use ursula_index::S3ObjectStoreConfig;
-use ursula_index::ServerlessEventIndex;
 
 #[tokio::test]
 async fn real_s3_conditional_publish_and_cache_recovery() -> anyhow::Result<()> {
@@ -44,10 +45,9 @@ async fn real_s3_conditional_publish_and_cache_recovery() -> anyhow::Result<()> 
         timestamp_field: "captured_at".to_owned(),
     };
     let first_cache = TempDir::new()?;
-    let mut writer = ServerlessEventIndex::open_s3(
+    let mut writer = EventIndex::open(
         S3ObjectStore::new(store_config.clone())?,
-        first_cache.path(),
-        16 * 1024 * 1024,
+        EventIndexCache::serving(first_cache.path(), 16 * 1024 * 1024)?,
         source_config.clone(),
     )
     .await?;
@@ -73,10 +73,9 @@ async fn real_s3_conditional_publish_and_cache_recovery() -> anyhow::Result<()> 
     drop(first_cache);
 
     let empty_cache = TempDir::new()?;
-    let mut reader = ServerlessEventIndex::open_s3(
+    let mut reader = EventIndex::open(
         S3ObjectStore::new(store_config)?,
-        empty_cache.path(),
-        16 * 1024 * 1024,
+        EventIndexCache::serving(empty_cache.path(), 16 * 1024 * 1024)?,
         source_config,
     )
     .await?;

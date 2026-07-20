@@ -41,8 +41,11 @@ pub(crate) struct ObjectInfo {
     pub modified: Option<SystemTime>,
 }
 
+/// A conditional-write object backend. Opaque outside this crate: construct
+/// one via [`From`] on [`FsObjectStore`] or [`S3ObjectStore`] and hand it to
+/// [`crate::EventIndex::open`] or [`crate::IndexCatalog::new`].
 #[derive(Clone)]
-pub(crate) enum ObjectStore {
+pub enum ObjectStore {
     Fs(FsObjectStore),
     S3(S3ObjectStore),
 }
@@ -179,7 +182,15 @@ impl FsObjectStore {
         self.range_read_bytes.load(Ordering::Relaxed)
     }
 
-    fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<ConditionalWrite, IndexError> {
+    /// Take the per-key advisory lock, re-check `may_write` under it, then
+    /// atomically install `bytes` via a synced temporary file.
+    fn write_locked(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        lock_extension: &str,
+        may_write: impl FnOnce(&Path) -> Result<bool, IndexError>,
+    ) -> Result<ConditionalWrite, IndexError> {
         let path = self.path(key)?;
         let parent = path
             .parent()
@@ -190,46 +201,9 @@ impl FsObjectStore {
             .truncate(false)
             .read(true)
             .write(true)
-            .open(path.with_extension("create-lock"))?;
+            .open(path.with_extension(lock_extension))?;
         lock.lock()?;
-        if path.exists() {
-            return Ok(ConditionalWrite::Conflict);
-        }
-        let temporary = path.with_extension(format!("{}.tmp", digest(bytes)));
-        let mut file = File::create(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(temporary, &path)?;
-        sync_parent(&path)?;
-        Ok(ConditionalWrite::Written)
-    }
-
-    fn compare_and_swap(
-        &self,
-        key: &str,
-        expected_etag: &str,
-        bytes: &[u8],
-    ) -> Result<ConditionalWrite, IndexError> {
-        let path = self.path(key)?;
-        let lock_path = path.with_extension("cas-lock");
-        if let Some(parent) = lock_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path)?;
-        lock.lock()?;
-        let current = match fs::read(&path) {
-            Ok(current) => current,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ConditionalWrite::Conflict);
-            }
-            Err(error) => return Err(error.into()),
-        };
-        if digest(&current) != expected_etag {
+        if !may_write(&path)? {
             return Ok(ConditionalWrite::Conflict);
         }
         let temporary = path.with_extension(format!("{}.tmp", digest(bytes)));
@@ -239,6 +213,23 @@ impl FsObjectStore {
         fs::rename(&temporary, &path)?;
         sync_parent(&path)?;
         Ok(ConditionalWrite::Written)
+    }
+
+    fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<ConditionalWrite, IndexError> {
+        self.write_locked(key, bytes, "create-lock", |path| Ok(!path.exists()))
+    }
+
+    fn compare_and_swap(
+        &self,
+        key: &str,
+        expected_etag: &str,
+        bytes: &[u8],
+    ) -> Result<ConditionalWrite, IndexError> {
+        self.write_locked(key, bytes, "cas-lock", |path| match fs::read(path) {
+            Ok(current) => Ok(digest(&current) == expected_etag),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        })
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>, IndexError> {

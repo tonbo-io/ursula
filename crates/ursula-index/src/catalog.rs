@@ -1,9 +1,7 @@
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::FsObjectStore;
 use crate::IndexError;
-use crate::S3ObjectStore;
 use crate::object_store::ConditionalWrite;
 use crate::object_store::ObjectStore;
 
@@ -40,13 +38,7 @@ pub struct IndexCatalog {
 }
 
 impl IndexCatalog {
-    pub fn open_fs(store: FsObjectStore) -> Self {
-        Self {
-            store: store.into(),
-        }
-    }
-
-    pub fn open_s3(store: S3ObjectStore) -> Self {
+    pub fn new(store: impl Into<ObjectStore>) -> Self {
         Self {
             store: store.into(),
         }
@@ -163,16 +155,10 @@ fn same_registration_identity(left: &IndexRegistration, right: &IndexRegistratio
         && left.timestamp_field == right.timestamp_field
 }
 
-fn canonical_registration(
-    registration: &IndexRegistration,
-) -> Result<IndexRegistration, IndexError> {
-    validate_id(&registration.id)?;
-    if registration.stream_url.is_empty() || registration.timestamp_field.is_empty() {
-        return Err(IndexError::InvalidConfig(
-            "stream URL and timestamp field must not be empty",
-        ));
-    }
-    let url = reqwest::Url::parse(&registration.stream_url)
+/// Parse a registered source stream URL, rejecting anything that is not
+/// credential-free HTTP(S) without a fragment.
+pub fn validate_stream_url(value: &str) -> Result<reqwest::Url, IndexError> {
+    let url = reqwest::Url::parse(value)
         .map_err(|_error| IndexError::InvalidConfig("stream URL is invalid"))?;
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
@@ -184,6 +170,19 @@ fn canonical_registration(
             "stream URL must be credential-free HTTP(S) without a fragment",
         ));
     }
+    Ok(url)
+}
+
+fn canonical_registration(
+    registration: &IndexRegistration,
+) -> Result<IndexRegistration, IndexError> {
+    validate_id(&registration.id)?;
+    if registration.stream_url.is_empty() || registration.timestamp_field.is_empty() {
+        return Err(IndexError::InvalidConfig(
+            "stream URL and timestamp field must not be empty",
+        ));
+    }
+    let url = validate_stream_url(&registration.stream_url)?;
     Ok(IndexRegistration {
         id: registration.id.clone(),
         stream_url: url.to_string(),

@@ -32,6 +32,7 @@ use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
+use ursula_index::EventIndex;
 use ursula_index::EventIndexCache;
 use ursula_index::EventIndexConfig;
 use ursula_index::FsObjectStore;
@@ -39,10 +40,10 @@ use ursula_index::IndexCatalog;
 use ursula_index::IndexError;
 use ursula_index::IndexRegistration;
 use ursula_index::IndexStatus;
+use ursula_index::ObjectStore;
 use ursula_index::QueryCursor;
 use ursula_index::S3ObjectStore;
 use ursula_index::S3ObjectStoreConfig;
-use ursula_index::ServerlessEventIndex;
 use ursula_index::SourceBatch;
 use ursula_index::SourceClient;
 use ursula_observability::serve::shutdown_signal;
@@ -106,15 +107,12 @@ struct Args {
     timestamp_field: String,
 }
 
+/// Where authoritative index objects live; opens the base store or one
+/// namespaced store per registered source.
 #[derive(Clone)]
-struct SingleAppState {
-    index: Arc<Mutex<ServerlessEventIndex>>,
-}
-
-#[derive(Clone)]
-enum PoolBackend {
+enum StoreTarget {
     Fs {
-        object_root: PathBuf,
+        root: PathBuf,
     },
     S3 {
         bucket: String,
@@ -122,6 +120,90 @@ enum PoolBackend {
         region: Option<String>,
         endpoint: Option<String>,
     },
+}
+
+impl StoreTarget {
+    fn from_args(args: &Args) -> anyhow::Result<Self> {
+        if let Some(object_dir) = &args.object_dir {
+            return Ok(Self::Fs {
+                root: object_dir.clone(),
+            });
+        }
+        let bucket = args
+            .s3_bucket
+            .clone()
+            .context("--s3-bucket is required without --object-dir")?;
+        Ok(Self::S3 {
+            bucket,
+            root: args.s3_prefix.clone(),
+            region: args.s3_region.clone(),
+            endpoint: args.s3_endpoint.clone(),
+        })
+    }
+
+    fn open(&self, suffix: &str) -> Result<ObjectStore, IndexError> {
+        match self {
+            Self::Fs { root } => {
+                let root = if suffix.is_empty() {
+                    root.clone()
+                } else {
+                    root.join(suffix)
+                };
+                Ok(FsObjectStore::new(root)?.into())
+            }
+            Self::S3 {
+                bucket,
+                root,
+                region,
+                endpoint,
+            } => Ok(S3ObjectStore::new(S3ObjectStoreConfig {
+                bucket: bucket.clone(),
+                root: join_object_prefix(root, suffix),
+                region: region.clone(),
+                endpoint: endpoint.clone(),
+            })?
+            .into()),
+        }
+    }
+}
+
+fn join_object_prefix(root: &str, suffix: &str) -> String {
+    let root = root.trim_matches('/');
+    if root.is_empty() {
+        suffix.to_owned()
+    } else if suffix.is_empty() {
+        root.to_owned()
+    } else {
+        format!("{root}/{suffix}")
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MaintenanceConfig {
+    interval: Duration,
+    compaction_fan_in: usize,
+    compaction_max_entries: u64,
+    gc_interval: Duration,
+    gc_grace: Duration,
+    gc_retain_generations: u64,
+}
+
+impl MaintenanceConfig {
+    fn from_args(args: &Args) -> Self {
+        Self {
+            interval: Duration::from_millis(args.maintenance_interval_ms),
+            compaction_fan_in: args.compaction_fan_in,
+            compaction_max_entries: args.compaction_max_entries,
+            gc_interval: Duration::from_secs(args.gc_interval_seconds),
+            gc_grace: Duration::from_secs(args.gc_grace_seconds),
+            gc_retain_generations: args.gc_retain_generations,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SingleAppState {
+    index: Arc<Mutex<EventIndex>>,
 }
 
 #[derive(Clone)]
@@ -133,14 +215,14 @@ struct PoolIndexSettings {
 }
 
 struct PoolIndex {
-    serving: Arc<Mutex<ServerlessEventIndex>>,
-    maintenance: Mutex<ServerlessEventIndex>,
+    serving: Arc<Mutex<EventIndex>>,
+    maintenance: Mutex<EventIndex>,
 }
 
 #[derive(Clone)]
 struct PoolState {
     catalog: IndexCatalog,
-    backend: PoolBackend,
+    backend: StoreTarget,
     settings: PoolIndexSettings,
     indexes: Arc<RwLock<HashMap<String, Arc<PoolIndex>>>>,
 }
@@ -178,6 +260,18 @@ struct StatusBody {
     indexed_through_record: u64,
     durable_through_record: u64,
     parts: usize,
+}
+
+impl StatusBody {
+    fn read(index: &EventIndex) -> Self {
+        Self {
+            status: index.status().clone(),
+            indexed_from_record: index.indexed_from_record(),
+            indexed_through_record: index.indexed_through_record(),
+            durable_through_record: index.durable_through_record(),
+            parts: index.part_count(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -259,52 +353,27 @@ async fn run_single(args: Args, stream_url: Url) -> anyhow::Result<()> {
         source_id: stream_url.to_string(),
         flush_entries: args.flush_entries,
         row_group_entries: args.row_group_entries,
-        timestamp_field: args.timestamp_field,
+        timestamp_field: args.timestamp_field.clone(),
     };
-    let maintenance_cache_dir = args.cache_dir.join("maintenance");
-    let (index, maintenance_index) = if let Some(object_dir) = &args.object_dir {
-        let store = FsObjectStore::new(object_dir).context("open filesystem object store")?;
-        let index = ServerlessEventIndex::open_fs(
-            store.clone(),
-            &args.cache_dir,
-            args.cache_max_bytes,
-            config.clone(),
-        )
-        .await?;
-        let maintenance = ServerlessEventIndex::open_fs_with_cache(
-            store,
-            EventIndexCache::maintenance(&maintenance_cache_dir, args.maintenance_cache_max_bytes)?,
-            config,
-        )
-        .await?;
-        Ok::<_, IndexError>((index, maintenance))
-    } else {
-        let bucket = args
-            .s3_bucket
-            .clone()
-            .context("--s3-bucket is required without --object-dir")?;
-        let store = S3ObjectStore::new(S3ObjectStoreConfig {
-            bucket,
-            root: args.s3_prefix.clone(),
-            region: args.s3_region.clone(),
-            endpoint: args.s3_endpoint.clone(),
-        })
-        .context("configure S3 object store")?;
-        let index = ServerlessEventIndex::open_s3(
-            store.clone(),
-            &args.cache_dir,
-            args.cache_max_bytes,
-            config.clone(),
-        )
-        .await?;
-        let maintenance = ServerlessEventIndex::open_s3_with_cache(
-            store,
-            EventIndexCache::maintenance(&maintenance_cache_dir, args.maintenance_cache_max_bytes)?,
-            config,
-        )
-        .await?;
-        Ok::<_, IndexError>((index, maintenance))
-    }
+    let store = StoreTarget::from_args(&args)?
+        .open("")
+        .context("open object store")?;
+    let index = EventIndex::open(
+        store.clone(),
+        EventIndexCache::serving(&args.cache_dir, args.cache_max_bytes)?,
+        config.clone(),
+    )
+    .await
+    .context("open event index")?;
+    let maintenance_index = EventIndex::open(
+        store,
+        EventIndexCache::maintenance(
+            args.cache_dir.join("maintenance"),
+            args.maintenance_cache_max_bytes,
+        )?,
+        config,
+    )
+    .await
     .context("open event index")?;
     let index = Arc::new(Mutex::new(index));
     let source = SourceClient::new(stream_url.clone(), args.read_batch_records)
@@ -322,17 +391,10 @@ async fn run_single(args: Args, stream_url: Url) -> anyhow::Result<()> {
     ));
     let maintenance_task = tokio::spawn(maintenance_loop(
         maintenance_index,
-        Duration::from_millis(args.maintenance_interval_ms),
-        args.compaction_fan_in,
-        args.compaction_max_entries,
-        Duration::from_secs(args.gc_interval_seconds),
-        Duration::from_secs(args.gc_grace_seconds),
-        args.gc_retain_generations,
+        MaintenanceConfig::from_args(&args),
         shutdown_rx,
     ));
 
-    let app = build_router(Arc::clone(&index));
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!(
         listen = %args.listen,
         stream_url = %stream_url,
@@ -340,14 +402,7 @@ async fn run_single(args: Args, stream_url: Url) -> anyhow::Result<()> {
         s3_bucket = args.s3_bucket.as_deref().unwrap_or("filesystem-dev-backend"),
         "event indexer starting"
     );
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            if shutdown_tx.send(true).is_err() {
-                tracing::debug!("source sync loop already stopped");
-            }
-        })
-        .await?;
+    serve(build_router(Arc::clone(&index)), args.listen, shutdown_tx).await?;
     sync_task.await.context("join source sync loop")??;
     maintenance_task
         .await
@@ -380,56 +435,21 @@ impl PoolState {
             row_group_entries: self.settings.row_group_entries,
             timestamp_field: registration.timestamp_field.clone(),
         };
-        let (serving, maintenance) = match &self.backend {
-            PoolBackend::Fs { object_root } => {
-                let store = FsObjectStore::new(object_root.join("indexes").join(&namespace))?;
-                (
-                    ServerlessEventIndex::open_fs_with_cache_from_record(
-                        store.clone(),
-                        self.settings.serving_cache.clone(),
-                        config.clone(),
-                        registration.indexed_from_record,
-                    )
-                    .await?,
-                    ServerlessEventIndex::open_fs_with_cache_from_record(
-                        store,
-                        self.settings.maintenance_cache.clone(),
-                        config,
-                        registration.indexed_from_record,
-                    )
-                    .await?,
-                )
-            }
-            PoolBackend::S3 {
-                bucket,
-                root,
-                region,
-                endpoint,
-            } => {
-                let store = S3ObjectStore::new(S3ObjectStoreConfig {
-                    bucket: bucket.clone(),
-                    root: join_object_prefix(root, &format!("indexes/{namespace}")),
-                    region: region.clone(),
-                    endpoint: endpoint.clone(),
-                })?;
-                (
-                    ServerlessEventIndex::open_s3_with_cache_from_record(
-                        store.clone(),
-                        self.settings.serving_cache.clone(),
-                        config.clone(),
-                        registration.indexed_from_record,
-                    )
-                    .await?,
-                    ServerlessEventIndex::open_s3_with_cache_from_record(
-                        store,
-                        self.settings.maintenance_cache.clone(),
-                        config,
-                        registration.indexed_from_record,
-                    )
-                    .await?,
-                )
-            }
-        };
+        let store = self.backend.open(&format!("indexes/{namespace}"))?;
+        let serving = EventIndex::open_from_record(
+            store.clone(),
+            self.settings.serving_cache.clone(),
+            config.clone(),
+            registration.indexed_from_record,
+        )
+        .await?;
+        let maintenance = EventIndex::open_from_record(
+            store,
+            self.settings.maintenance_cache.clone(),
+            config,
+            registration.indexed_from_record,
+        )
+        .await?;
         let index = Arc::new(PoolIndex {
             serving: Arc::new(Mutex::new(serving)),
             maintenance: Mutex::new(maintenance),
@@ -442,46 +462,9 @@ impl PoolState {
     }
 }
 
-fn join_object_prefix(root: &str, suffix: &str) -> String {
-    let root = root.trim_matches('/');
-    if root.is_empty() {
-        suffix.to_owned()
-    } else {
-        format!("{root}/{suffix}")
-    }
-}
-
 async fn run_pool(args: Args) -> anyhow::Result<()> {
-    let (backend, catalog) = if let Some(object_dir) = &args.object_dir {
-        let store = FsObjectStore::new(object_dir).context("open filesystem object store")?;
-        (
-            PoolBackend::Fs {
-                object_root: object_dir.clone(),
-            },
-            IndexCatalog::open_fs(store),
-        )
-    } else {
-        let bucket = args
-            .s3_bucket
-            .clone()
-            .context("--s3-bucket is required without --object-dir")?;
-        let store = S3ObjectStore::new(S3ObjectStoreConfig {
-            bucket: bucket.clone(),
-            root: args.s3_prefix.clone(),
-            region: args.s3_region.clone(),
-            endpoint: args.s3_endpoint.clone(),
-        })
-        .context("configure S3 object store")?;
-        (
-            PoolBackend::S3 {
-                bucket,
-                root: args.s3_prefix.clone(),
-                region: args.s3_region.clone(),
-                endpoint: args.s3_endpoint.clone(),
-            },
-            IndexCatalog::open_s3(store),
-        )
-    };
+    let backend = StoreTarget::from_args(&args)?;
+    let catalog = IndexCatalog::new(backend.open("").context("open object store")?);
     let state = PoolState {
         catalog,
         backend,
@@ -512,16 +495,9 @@ async fn run_pool(args: Args) -> anyhow::Result<()> {
     ));
     let maintenance = tokio::spawn(pool_maintenance_loop(
         state.clone(),
-        Duration::from_millis(args.maintenance_interval_ms),
-        args.compaction_fan_in,
-        args.compaction_max_entries,
-        Duration::from_secs(args.gc_interval_seconds),
-        Duration::from_secs(args.gc_grace_seconds),
-        args.gc_retain_generations,
+        MaintenanceConfig::from_args(&args),
         shutdown_rx,
     ));
-    let app = pool_router(state);
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!(
         listen = %args.listen,
         worker_id = %args.worker_id,
@@ -529,18 +505,30 @@ async fn run_pool(args: Args) -> anyhow::Result<()> {
         cache_dir = %args.cache_dir.display(),
         "dynamic event-index worker pool starting"
     );
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            if shutdown_tx.send(true).is_err() {
-                tracing::debug!("event-index worker pool already stopped");
-            }
-        })
-        .await?;
+    serve(pool_router(state), args.listen, shutdown_tx).await?;
     worker.await.context("join event-index worker pool")??;
     maintenance
         .await
         .context("join event-index maintenance pool")??;
+    Ok(())
+}
+
+/// Serve the HTTP app until a shutdown signal, then broadcast shutdown to the
+/// background loops.
+async fn serve(
+    app: Router,
+    listen: SocketAddr,
+    shutdown_tx: watch::Sender<bool>,
+) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            if shutdown_tx.send(true).is_err() {
+                tracing::debug!("background loops already stopped");
+            }
+        })
+        .await?;
     Ok(())
 }
 
@@ -690,25 +678,97 @@ async fn process_pool_source(
     }
 }
 
-async fn pool_maintenance_loop(
-    state: PoolState,
-    interval: Duration,
-    compaction_fan_in: usize,
-    compaction_max_entries: u64,
-    gc_interval: Duration,
-    gc_grace: Duration,
-    gc_retain_generations: u64,
+/// One compaction-plus-GC maintenance pass over one index instance. Failures
+/// are logged and retried on the next pass rather than propagated.
+async fn maintenance_pass(
+    index: &mut EventIndex,
+    index_id: &str,
+    config: &MaintenanceConfig,
+    run_gc: bool,
+) {
+    if let Err(error) = index.refresh().await {
+        tracing::warn!(index_id, %error, "event index maintenance refresh failed; retrying");
+        return;
+    }
+    if matches!(index.status(), IndexStatus::Ready)
+        && index.needs_partition_compaction(config.compaction_fan_in, config.compaction_max_entries)
+    {
+        match index
+            .compact_partition_once(config.compaction_fan_in, config.compaction_max_entries)
+            .await
+        {
+            Ok(true) => tracing::info!(index_id, "compacted one event-time partition tier"),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(index_id, %error, "event index compaction failed; retrying")
+            }
+        }
+    }
+    if run_gc {
+        match index
+            .garbage_collect(
+                config.gc_retain_generations,
+                config.gc_grace,
+                gc_wall_clock_now(),
+            )
+            .await
+        {
+            Ok(report) => tracing::info!(
+                index_id,
+                deleted_parts = report.deleted_parts,
+                deleted_layouts = report.deleted_layouts,
+                deleted_manifests = report.deleted_manifests,
+                deleted_claims = report.deleted_claims,
+                "event index garbage collection completed"
+            ),
+            Err(error) => tracing::warn!(
+                index_id,
+                %error,
+                "event index garbage collection failed; retrying later"
+            ),
+        }
+    }
+}
+
+fn next_gc_deadline(interval: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(interval).unwrap_or(now)
+}
+
+async fn maintenance_loop(
+    mut index: EventIndex,
+    config: MaintenanceConfig,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let now = Instant::now();
-    let mut next_gc = now.checked_add(gc_interval).unwrap_or(now);
+    let mut next_gc = next_gc_deadline(config.gc_interval);
+    loop {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let run_gc = Instant::now() >= next_gc;
+        maintenance_pass(&mut index, "single", &config, run_gc).await;
+        if run_gc {
+            next_gc = next_gc_deadline(config.gc_interval);
+        }
+        if wait_or_shutdown(config.interval, &mut shutdown).await {
+            return Ok(());
+        }
+    }
+}
+
+async fn pool_maintenance_loop(
+    state: PoolState,
+    config: MaintenanceConfig,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let mut next_gc = next_gc_deadline(config.gc_interval);
     loop {
         if *shutdown.borrow() {
             return Ok(());
         }
         if let Err(error) = reconcile_pool_indexes(&state).await {
             tracing::warn!(%error, "event-index maintenance catalog refresh failed");
-            if wait_or_shutdown(interval, &mut shutdown).await {
+            if wait_or_shutdown(config.interval, &mut shutdown).await {
                 return Ok(());
             }
             continue;
@@ -723,31 +783,12 @@ async fn pool_maintenance_loop(
         let run_gc = Instant::now() >= next_gc;
         for (id, handles) in indexes {
             let mut index = handles.maintenance.lock().await;
-            if let Err(error) = index.refresh().await {
-                tracing::warn!(index_id = %id, %error, "event-index maintenance refresh failed");
-                continue;
-            }
-            if matches!(index.status(), IndexStatus::Ready)
-                && index.needs_partition_compaction(compaction_fan_in, compaction_max_entries)
-                && let Err(error) = index
-                    .compact_partition_once(compaction_fan_in, compaction_max_entries)
-                    .await
-            {
-                tracing::warn!(index_id = %id, %error, "event-index compaction failed; retrying");
-            }
-            if run_gc
-                && let Err(error) = index
-                    .garbage_collect(gc_retain_generations, gc_grace, gc_wall_clock_now())
-                    .await
-            {
-                tracing::warn!(index_id = %id, %error, "event-index garbage collection failed");
-            }
+            maintenance_pass(&mut index, &id, &config, run_gc).await;
         }
         if run_gc {
-            let now = Instant::now();
-            next_gc = now.checked_add(gc_interval).unwrap_or(now);
+            next_gc = next_gc_deadline(config.gc_interval);
         }
-        if wait_or_shutdown(interval, &mut shutdown).await {
+        if wait_or_shutdown(config.interval, &mut shutdown).await {
             return Ok(());
         }
     }
@@ -779,7 +820,7 @@ fn wall_clock_millis() -> Result<u64, IndexError> {
 
 async fn sync_loop(
     source: SourceClient,
-    index: Arc<Mutex<ServerlessEventIndex>>,
+    index: Arc<Mutex<EventIndex>>,
     poll_interval: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -856,69 +897,6 @@ async fn sync_loop(
     }
 }
 
-async fn maintenance_loop(
-    mut index: ServerlessEventIndex,
-    interval: Duration,
-    compaction_fan_in: usize,
-    compaction_max_entries: u64,
-    gc_interval: Duration,
-    gc_grace: Duration,
-    gc_retain_generations: u64,
-    mut shutdown: watch::Receiver<bool>,
-) -> anyhow::Result<()> {
-    let now = Instant::now();
-    let mut next_gc = now.checked_add(gc_interval).unwrap_or(now);
-    loop {
-        if *shutdown.borrow() {
-            return Ok(());
-        }
-        match index.refresh().await {
-            Ok(()) => {
-                if matches!(index.status(), IndexStatus::Ready)
-                    && index.needs_partition_compaction(compaction_fan_in, compaction_max_entries)
-                {
-                    match index
-                        .compact_partition_once(compaction_fan_in, compaction_max_entries)
-                        .await
-                    {
-                        Ok(true) => tracing::info!("compacted one event-time partition tier"),
-                        Ok(false) => {}
-                        Err(error) => {
-                            tracing::warn!(%error, "event index compaction failed; retrying")
-                        }
-                    }
-                }
-                if Instant::now() >= next_gc {
-                    match index
-                        .garbage_collect(gc_retain_generations, gc_grace, gc_wall_clock_now())
-                        .await
-                    {
-                        Ok(report) => tracing::info!(
-                            deleted_parts = report.deleted_parts,
-                            deleted_layouts = report.deleted_layouts,
-                            deleted_manifests = report.deleted_manifests,
-                            deleted_claims = report.deleted_claims,
-                            "event index garbage collection completed"
-                        ),
-                        Err(error) => tracing::warn!(
-                            %error,
-                            "event index garbage collection failed; retrying later"
-                        ),
-                    }
-                    let now = Instant::now();
-                    next_gc = now.checked_add(gc_interval).unwrap_or(now);
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, "event index maintenance refresh failed; retrying")
-            }
-        }
-        if wait_or_shutdown(interval, &mut shutdown).await {
-            return Ok(());
-        }
-    }
-}
-
 async fn wait_or_shutdown(duration: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
     tokio::select! {
         () = tokio::time::sleep(duration) => false,
@@ -938,7 +916,7 @@ fn gc_wall_clock_now() -> SystemTime {
     SystemTime::UNIX_EPOCH
 }
 
-fn build_router(index: Arc<Mutex<ServerlessEventIndex>>) -> Router {
+fn build_router(index: Arc<Mutex<EventIndex>>) -> Router {
     Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
@@ -975,18 +953,7 @@ async fn register_pool_index(
     Path(id): Path<String>,
     Json(request): Json<RegisterIndexRequest>,
 ) -> Result<Response, ApiError> {
-    let stream_url = Url::parse(&request.stream_url)
-        .map_err(|_error| ApiError(IndexError::InvalidConfig("stream URL is invalid")))?;
-    if !matches!(stream_url.scheme(), "http" | "https")
-        || stream_url.host_str().is_none()
-        || !stream_url.username().is_empty()
-        || stream_url.password().is_some()
-        || stream_url.fragment().is_some()
-    {
-        return Err(ApiError(IndexError::InvalidConfig(
-            "stream URL must be credential-free HTTP(S) without a fragment",
-        )));
-    }
+    let stream_url = ursula_index::validate_stream_url(&request.stream_url).map_err(ApiError)?;
     let canonical_stream_url = stream_url.to_string();
     let source_range = SourceClient::new(stream_url, 1)
         .map_err(ApiError)?
@@ -1028,45 +995,41 @@ async fn list_pool_indexes(
     Ok(Json(state.catalog.list().await.map_err(ApiError)?))
 }
 
-async fn pool_registration(
-    state: &PoolState,
-    id: &str,
-) -> Result<(IndexRegistration, Arc<Mutex<ServerlessEventIndex>>), ApiError> {
+async fn pool_index(state: &PoolState, id: &str) -> Result<Arc<Mutex<EventIndex>>, ApiError> {
     let registration = state.catalog.get(id).await.map_err(ApiError)?;
     let index = state.ensure_index(&registration).await.map_err(ApiError)?;
-    Ok((registration, Arc::clone(&index.serving)))
+    Ok(Arc::clone(&index.serving))
+}
+
+/// Refresh (or, for a resume request, clear the blocked status of) an index
+/// and report its published status.
+async fn status_response(
+    index: &Mutex<EventIndex>,
+    resume: bool,
+) -> Result<Json<StatusBody>, ApiError> {
+    let mut index = index.lock().await;
+    if resume {
+        index.clear_blocked().await.map_err(ApiError)?;
+    } else {
+        index.refresh().await.map_err(ApiError)?;
+    }
+    Ok(Json(StatusBody::read(&index)))
 }
 
 async fn pool_index_status(
     State(state): State<PoolState>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusBody>, ApiError> {
-    let (_registration, index) = pool_registration(&state, &id).await?;
-    let mut index = index.lock().await;
-    index.refresh().await.map_err(ApiError)?;
-    Ok(Json(StatusBody {
-        status: index.status().clone(),
-        indexed_from_record: index.indexed_from_record(),
-        indexed_through_record: index.indexed_through_record(),
-        durable_through_record: index.durable_through_record(),
-        parts: index.part_count(),
-    }))
+    let index = pool_index(&state, &id).await?;
+    status_response(&index, false).await
 }
 
 async fn resume_pool_index(
     State(state): State<PoolState>,
     Path(id): Path<String>,
 ) -> Result<Json<StatusBody>, ApiError> {
-    let (_registration, index) = pool_registration(&state, &id).await?;
-    let mut index = index.lock().await;
-    index.clear_blocked().await.map_err(ApiError)?;
-    Ok(Json(StatusBody {
-        status: index.status().clone(),
-        indexed_from_record: index.indexed_from_record(),
-        indexed_through_record: index.indexed_through_record(),
-        durable_through_record: index.durable_through_record(),
-        parts: index.part_count(),
-    }))
+    let index = pool_index(&state, &id).await?;
+    status_response(&index, true).await
 }
 
 async fn query_pool_events(
@@ -1074,7 +1037,7 @@ async fn query_pool_events(
     Path(id): Path<String>,
     Query(query): Query<EventQuery>,
 ) -> Result<Response, ApiError> {
-    let (_registration, index) = pool_registration(&state, &id).await?;
+    let index = pool_index(&state, &id).await?;
     query_index(index, query).await
 }
 
@@ -1106,28 +1069,12 @@ fn is_deterministic_data_error(error: &IndexError) -> bool {
     )
 }
 
-async fn resume_index(State(state): State<SingleAppState>) -> Result<impl IntoResponse, ApiError> {
-    let mut index = state.index.lock().await;
-    index.clear_blocked().await.map_err(ApiError)?;
-    Ok(Json(StatusBody {
-        status: index.status().clone(),
-        indexed_from_record: index.indexed_from_record(),
-        indexed_through_record: index.indexed_through_record(),
-        durable_through_record: index.durable_through_record(),
-        parts: index.part_count(),
-    }))
+async fn resume_index(State(state): State<SingleAppState>) -> Result<Json<StatusBody>, ApiError> {
+    status_response(&state.index, true).await
 }
 
-async fn index_status(State(state): State<SingleAppState>) -> Result<impl IntoResponse, ApiError> {
-    let mut index = state.index.lock().await;
-    index.refresh().await.map_err(ApiError)?;
-    Ok(Json(StatusBody {
-        status: index.status().clone(),
-        indexed_from_record: index.indexed_from_record(),
-        indexed_through_record: index.indexed_through_record(),
-        durable_through_record: index.durable_through_record(),
-        parts: index.part_count(),
-    }))
+async fn index_status(State(state): State<SingleAppState>) -> Result<Json<StatusBody>, ApiError> {
+    status_response(&state.index, false).await
 }
 
 async fn query_events(
@@ -1138,7 +1085,7 @@ async fn query_events(
 }
 
 async fn query_index(
-    index: Arc<Mutex<ServerlessEventIndex>>,
+    index: Arc<Mutex<EventIndex>>,
     query: EventQuery,
 ) -> Result<Response, ApiError> {
     let from_ms = parse_query_timestamp(&query.from).ok_or(ApiError(IndexError::InvalidQuery))?;
@@ -1161,33 +1108,16 @@ async fn query_index(
         .await
         .map_err(ApiError)?;
     let mut headers = HeaderMap::new();
-    insert_u64_header(
-        &mut headers,
-        "indexed-from-record",
-        result.indexed_from_record,
-    )?;
-    insert_u64_header(
-        &mut headers,
-        "indexed-through-record",
-        result.indexed_through_record,
-    )?;
-    insert_u64_header(
-        &mut headers,
-        "durable-through-record",
-        result.durable_through_record,
-    )?;
+    for (name, value) in [
+        ("indexed-from-record", result.indexed_from_record),
+        ("indexed-through-record", result.indexed_through_record),
+        ("durable-through-record", result.durable_through_record),
+    ] {
+        let value = HeaderValue::from_str(&value.to_string())
+            .map_err(|_error| ApiError(IndexError::InvalidQuery))?;
+        headers.insert(name, value);
+    }
     Ok((headers, Json(result)).into_response())
-}
-
-fn insert_u64_header(
-    headers: &mut HeaderMap,
-    name: &'static str,
-    value: u64,
-) -> Result<(), ApiError> {
-    let value = HeaderValue::from_str(&value.to_string())
-        .map_err(|_error| ApiError(IndexError::InvalidQuery))?;
-    headers.insert(name, value);
-    Ok(())
 }
 
 fn parse_query_timestamp(value: &str) -> Option<i64> {
@@ -1217,22 +1147,62 @@ mod tests {
     use tokio::sync::Mutex;
     use tower::ServiceExt;
     use ursula_index::EventEntry;
+    use ursula_index::EventIndex;
     use ursula_index::EventIndexCache;
     use ursula_index::EventIndexConfig;
     use ursula_index::FsObjectStore;
     use ursula_index::IndexCatalog;
     use ursula_index::IndexError;
     use ursula_index::IndexRegistration;
-    use ursula_index::ServerlessEventIndex;
 
-    use super::PoolBackend;
     use super::PoolIndexSettings;
     use super::PoolState;
+    use super::StoreTarget;
     use super::build_router;
     use super::is_deterministic_data_error;
     use super::pool_router;
     use super::process_pool_source;
     use super::reconcile_pool_indexes;
+
+    async fn fs_index(
+        objects: &TempDir,
+        cache: &TempDir,
+        source_id: &str,
+    ) -> anyhow::Result<EventIndex> {
+        Ok(EventIndex::open(
+            FsObjectStore::new(objects.path())?,
+            EventIndexCache::serving(cache.path(), 16 * 1024 * 1024)?,
+            EventIndexConfig {
+                source_id: source_id.to_owned(),
+                flush_entries: 2,
+                row_group_entries: 2,
+                timestamp_field: "captured_at".to_owned(),
+            },
+        )
+        .await?)
+    }
+
+    fn pool_state(objects: &TempDir, cache: &TempDir) -> anyhow::Result<PoolState> {
+        Ok(PoolState {
+            catalog: IndexCatalog::new(FsObjectStore::new(objects.path())?),
+            backend: StoreTarget::Fs {
+                root: objects.path().to_path_buf(),
+            },
+            settings: PoolIndexSettings {
+                serving_cache: EventIndexCache::serving(
+                    cache.path().join("serving"),
+                    16 * 1024 * 1024,
+                )?,
+                maintenance_cache: EventIndexCache::maintenance(
+                    cache.path().join("maintenance"),
+                    16 * 1024 * 1024,
+                )?,
+                flush_entries: 2,
+                row_group_entries: 2,
+            },
+            indexes: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        })
+    }
 
     #[test]
     fn only_deterministic_source_data_errors_block_the_index() {
@@ -1257,18 +1227,7 @@ mod tests {
     async fn http_query_exposes_sorted_records_and_watermarks() -> anyhow::Result<()> {
         let objects = TempDir::new()?;
         let cache = TempDir::new()?;
-        let mut index = ServerlessEventIndex::open_fs(
-            FsObjectStore::new(objects.path())?,
-            cache.path(),
-            16 * 1024 * 1024,
-            EventIndexConfig {
-                source_id: "http-test".to_owned(),
-                flush_entries: 2,
-                row_group_entries: 2,
-                timestamp_field: "captured_at".to_owned(),
-            },
-        )
-        .await?;
+        let mut index = fs_index(&objects, &cache, "http-test").await?;
         index
             .ingest(EventEntry {
                 captured_at_ms: 200,
@@ -1305,18 +1264,7 @@ mod tests {
     -> anyhow::Result<()> {
         let objects = TempDir::new()?;
         let cache = TempDir::new()?;
-        let index = ServerlessEventIndex::open_fs(
-            FsObjectStore::new(objects.path())?,
-            cache.path(),
-            16 * 1024 * 1024,
-            EventIndexConfig {
-                source_id: "health-test".to_owned(),
-                flush_entries: 2,
-                row_group_entries: 2,
-                timestamp_field: "captured_at".to_owned(),
-            },
-        )
-        .await?;
+        let index = fs_index(&objects, &cache, "health-test").await?;
         let index = Arc::new(Mutex::new(index));
         let app = build_router(Arc::clone(&index));
 
@@ -1406,25 +1354,7 @@ mod tests {
 
         let objects = TempDir::new()?;
         let cache = TempDir::new()?;
-        let state = PoolState {
-            catalog: IndexCatalog::open_fs(FsObjectStore::new(objects.path())?),
-            backend: PoolBackend::Fs {
-                object_root: objects.path().to_path_buf(),
-            },
-            settings: PoolIndexSettings {
-                serving_cache: EventIndexCache::serving(
-                    cache.path().join("serving"),
-                    16 * 1024 * 1024,
-                )?,
-                maintenance_cache: EventIndexCache::maintenance(
-                    cache.path().join("maintenance"),
-                    16 * 1024 * 1024,
-                )?,
-                flush_entries: 2,
-                row_group_entries: 2,
-            },
-            indexes: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-        };
+        let state = pool_state(&objects, &cache)?;
         let app = pool_router(state.clone());
         let response = app
             .clone()
@@ -1469,25 +1399,7 @@ mod tests {
     async fn catalog_unregistration_is_reconciled_in_every_pool_pod() -> anyhow::Result<()> {
         let objects = TempDir::new()?;
         let cache = TempDir::new()?;
-        let state = PoolState {
-            catalog: IndexCatalog::open_fs(FsObjectStore::new(objects.path())?),
-            backend: PoolBackend::Fs {
-                object_root: objects.path().to_path_buf(),
-            },
-            settings: PoolIndexSettings {
-                serving_cache: EventIndexCache::serving(
-                    cache.path().join("serving"),
-                    16 * 1024 * 1024,
-                )?,
-                maintenance_cache: EventIndexCache::maintenance(
-                    cache.path().join("maintenance"),
-                    16 * 1024 * 1024,
-                )?,
-                flush_entries: 2,
-                row_group_entries: 2,
-            },
-            indexes: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
-        };
+        let state = pool_state(&objects, &cache)?;
         let registration = IndexRegistration {
             id: "removed-stream".to_owned(),
             stream_url: "https://example.test/removed".to_owned(),
