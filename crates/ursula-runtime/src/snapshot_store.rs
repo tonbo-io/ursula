@@ -149,35 +149,20 @@ impl SnapshotPointer {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SnapshotStoreError {
+    #[error("snapshot store backend: {0}")]
     Backend(String),
+    #[error("snapshot not found: {0}")]
     NotFound(String),
+    #[error("snapshot integrity: {0}")]
     Integrity(String),
+    #[error("snapshot serialize: {0}")]
     Serialize(String),
+    #[error("snapshot deserialize: {0}")]
     Deserialize(String),
-    Io(io::Error),
-}
-
-impl std::fmt::Display for SnapshotStoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Backend(m) => write!(f, "snapshot store backend: {m}"),
-            Self::NotFound(m) => write!(f, "snapshot not found: {m}"),
-            Self::Integrity(m) => write!(f, "snapshot integrity: {m}"),
-            Self::Serialize(m) => write!(f, "snapshot serialize: {m}"),
-            Self::Deserialize(m) => write!(f, "snapshot deserialize: {m}"),
-            Self::Io(err) => write!(f, "snapshot io: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for SnapshotStoreError {}
-
-impl From<io::Error> for SnapshotStoreError {
-    fn from(err: io::Error) -> Self {
-        Self::Io(err)
-    }
+    #[error("snapshot io: {0}")]
+    Io(#[from] io::Error),
 }
 
 impl SnapshotStoreError {

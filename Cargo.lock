@@ -4244,7 +4244,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
- "tracing-subscriber",
+ "ursula-observability",
 ]
 
 [[package]]
@@ -4279,10 +4279,12 @@ dependencies = [
 name = "ursula-observability"
 version = "0.3.0"
 dependencies = [
+ "axum 0.8.9",
  "criterion",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "tokio",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -4302,6 +4304,7 @@ dependencies = [
 name = "ursula-raft"
 version = "0.3.0"
 dependencies = [
+ "bitflags",
  "bytes",
  "futures-util",
  "madsim",
@@ -4315,6 +4318,7 @@ dependencies = [
  "rand 0.10.1",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
  "tonic 0.12.3",
  "tonic-build",
@@ -4340,6 +4344,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "ursula-config",
@@ -4353,6 +4358,7 @@ name = "ursula-shard"
 version = "0.3.0"
 dependencies = [
  "serde",
+ "thiserror 1.0.69",
  "ursula-proto",
 ]
 
@@ -4385,6 +4391,7 @@ dependencies = [
  "serde_json",
  "setsum",
  "slotmap",
+ "thiserror 1.0.69",
  "ursula-proto",
  "ursula-shard",
 ]

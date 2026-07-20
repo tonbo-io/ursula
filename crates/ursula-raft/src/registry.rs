@@ -728,37 +728,29 @@ impl fmt::Display for LeadershipShedReason {
     }
 }
 
-const LEADERSHIP_SHED_KNOWN_BITS: u8 = LeadershipShedReason::SnapshotDriverS3.bit()
-    | LeadershipShedReason::ClusterEgress.bit()
-    | LeadershipShedReason::ColdHealth.bit()
-    | LeadershipShedReason::MaintenanceDrain.bit();
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct LeadershipShedState: u8 {
+        const SNAPSHOT_DRIVER_S3 = LeadershipShedReason::SnapshotDriverS3.bit();
+        const CLUSTER_EGRESS = LeadershipShedReason::ClusterEgress.bit();
+        const COLD_HEALTH = LeadershipShedReason::ColdHealth.bit();
+        const MAINTENANCE_DRAIN = LeadershipShedReason::MaintenanceDrain.bit();
+    }
+}
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LeadershipShedState {
-    bits: u8,
+impl From<LeadershipShedReason> for LeadershipShedState {
+    fn from(reason: LeadershipShedReason) -> Self {
+        Self::from_bits_truncate(reason.bit())
+    }
 }
 
 impl LeadershipShedState {
-    pub fn from_bits(bits: u8) -> Self {
-        Self {
-            bits: bits & LEADERSHIP_SHED_KNOWN_BITS,
-        }
-    }
-
     pub fn load(flag: &LeadershipShedFlag) -> Self {
-        Self::from_bits(flag.load(Ordering::Acquire))
-    }
-
-    pub fn bits(self) -> u8 {
-        self.bits
+        Self::from_bits_truncate(flag.load(Ordering::Acquire))
     }
 
     pub fn is_shed(self) -> bool {
-        self.bits != 0
-    }
-
-    pub fn contains(self, reason: LeadershipShedReason) -> bool {
-        self.bits & reason.bit() != 0
+        !self.is_empty()
     }
 
     /// Whether this node should accept an inbound TransferLeader request.
@@ -768,8 +760,7 @@ impl LeadershipShedState {
     /// for those states can deadlock the balancer when every peer has a
     /// transient cold-path bit set.
     pub fn should_accept_transfer(self) -> bool {
-        !self.contains(LeadershipShedReason::ClusterEgress)
-            && !self.contains(LeadershipShedReason::MaintenanceDrain)
+        !self.intersects(Self::CLUSTER_EGRESS | Self::MAINTENANCE_DRAIN)
     }
 
     /// Whether local raft groups should be allowed to campaign.
@@ -779,9 +770,7 @@ impl LeadershipShedState {
     /// leadership, but it must remain electable so a cluster-wide hot backlog
     /// cannot exclude every node from leadership.
     pub fn should_campaign(self) -> bool {
-        !self.contains(LeadershipShedReason::ClusterEgress)
-            && !self.contains(LeadershipShedReason::SnapshotDriverS3)
-            && !self.contains(LeadershipShedReason::MaintenanceDrain)
+        !self.intersects(Self::CLUSTER_EGRESS | Self::SNAPSHOT_DRIVER_S3 | Self::MAINTENANCE_DRAIN)
     }
 
     /// Whether local raft groups should actively move current leadership away.
@@ -790,9 +779,9 @@ impl LeadershipShedState {
     }
 
     pub fn transfer_rejection_reason(self) -> Option<LeadershipShedReason> {
-        if self.contains(LeadershipShedReason::ClusterEgress) {
+        if self.contains(Self::CLUSTER_EGRESS) {
             Some(LeadershipShedReason::ClusterEgress)
-        } else if self.contains(LeadershipShedReason::MaintenanceDrain) {
+        } else if self.contains(Self::MAINTENANCE_DRAIN) {
             Some(LeadershipShedReason::MaintenanceDrain)
         } else {
             None
@@ -804,7 +793,7 @@ impl fmt::Display for LeadershipShedState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut wrote = false;
         for reason in LeadershipShedReason::ALL {
-            if self.contains(reason) {
+            if self.contains(reason.into()) {
                 if wrote {
                     f.write_str("|")?;
                 }
@@ -970,7 +959,7 @@ impl RaftGroupHandleRegistry {
             .leadership_shed
             .fetch_or(reason.bit(), Ordering::Release);
         if previous & reason.bit() == 0 {
-            let current = LeadershipShedState::from_bits(previous | reason.bit());
+            let current = LeadershipShedState::from_bits_truncate(previous | reason.bit());
             tracing::warn!("leadership-shed: mark {reason}; state={current}");
         }
     }
@@ -980,7 +969,7 @@ impl RaftGroupHandleRegistry {
             .leadership_shed
             .fetch_and(!reason.bit(), Ordering::Release);
         if previous & reason.bit() != 0 {
-            let current = LeadershipShedState::from_bits(previous & !reason.bit());
+            let current = LeadershipShedState::from_bits_truncate(previous & !reason.bit());
             tracing::warn!("leadership-shed: clear {reason}; state={current}");
         }
     }
@@ -1383,22 +1372,19 @@ mod tests {
         assert!(!empty.should_shed_current_leaders());
         assert_eq!(empty.transfer_rejection_reason(), None);
 
-        let snapshot_shed =
-            LeadershipShedState::from_bits(LeadershipShedReason::SnapshotDriverS3.bit());
+        let snapshot_shed = LeadershipShedState::from(LeadershipShedReason::SnapshotDriverS3);
         assert!(snapshot_shed.should_accept_transfer());
         assert!(!snapshot_shed.should_campaign());
         assert!(snapshot_shed.should_shed_current_leaders());
         assert_eq!(snapshot_shed.transfer_rejection_reason(), None);
 
-        let cold_shed = LeadershipShedState::from_bits(LeadershipShedReason::ColdHealth.bit());
+        let cold_shed = LeadershipShedState::from(LeadershipShedReason::ColdHealth);
         assert!(cold_shed.should_accept_transfer());
         assert!(cold_shed.should_campaign());
         assert!(cold_shed.should_shed_current_leaders());
         assert_eq!(cold_shed.transfer_rejection_reason(), None);
 
-        let egress_shed = LeadershipShedState::from_bits(
-            LeadershipShedReason::ClusterEgress.bit() | LeadershipShedReason::ColdHealth.bit(),
-        );
+        let egress_shed = LeadershipShedState::CLUSTER_EGRESS | LeadershipShedState::COLD_HEALTH;
         assert!(!egress_shed.should_accept_transfer());
         assert!(!egress_shed.should_campaign());
         assert!(egress_shed.should_shed_current_leaders());
@@ -1407,8 +1393,7 @@ mod tests {
             Some(LeadershipShedReason::ClusterEgress)
         );
 
-        let maintenance_shed =
-            LeadershipShedState::from_bits(LeadershipShedReason::MaintenanceDrain.bit());
+        let maintenance_shed = LeadershipShedState::from(LeadershipShedReason::MaintenanceDrain);
         assert!(!maintenance_shed.should_accept_transfer());
         assert!(!maintenance_shed.should_campaign());
         assert!(maintenance_shed.should_shed_current_leaders());

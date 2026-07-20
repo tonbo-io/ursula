@@ -6,13 +6,20 @@
 //! OTLP endpoint is configured via `OTEL_EXPORTER_OTLP_ENDPOINT`, an
 //! OpenTelemetry layer is added that batch-exports spans to a collector.
 //!
-//! This crate only sets up the subscriber. The hot read/write path stays
-//! span-free by design; these layers exist to carry request-boundary spans and
+//! This crate only sets up the subscriber, plus the shared shutdown/serve
+//! plumbing every binary needs. The hot read/write path stays span-free by
+//! design; these layers exist to carry request-boundary spans and
 //! `warn!`/`error!` events, not per-record work.
+//!
+//! Module map:
+//!
+//! - [`serve`]: shared shutdown-signal handling and graceful HTTP serving.
 
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+pub mod serve;
 
 /// How a binary wants telemetry initialized.
 pub struct InitOptions {
