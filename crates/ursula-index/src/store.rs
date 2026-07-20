@@ -79,6 +79,7 @@ pub struct SourceEnvelope {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct QueryResult {
+    pub indexed_from_record: u64,
     pub indexed_through_record: u64,
     pub durable_through_record: u64,
     pub through_record: u64,
@@ -167,6 +168,8 @@ pub enum IndexError {
     RegistrationConflict(String),
     #[error("index registration `{0}` does not exist")]
     UnknownIndex(String),
+    #[error("index starts at source record {stored}, not configured record {configured}")]
+    IndexBaseMismatch { stored: u64, configured: u64 },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -489,6 +492,7 @@ impl LocalEventIndex {
             .then(|| entries.last().copied().map(QueryCursor::from))
             .flatten();
         Ok(QueryResult {
+            indexed_from_record: 0,
             indexed_through_record,
             durable_through_record: self.manifest.durable_through_record,
             through_record,

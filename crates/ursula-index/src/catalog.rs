@@ -7,11 +7,31 @@ use crate::S3ObjectStore;
 use crate::object_store::ConditionalWrite;
 use crate::object_store::ObjectStore;
 
+const CATALOG_KEY: &str = "CATALOG";
+const CATALOG_VERSION: u32 = 1;
+const MAX_CATALOG_ATTEMPTS: usize = 32;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct IndexRegistration {
     pub id: String,
     pub stream_url: String,
     pub timestamp_field: String,
+    pub indexed_from_record: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CatalogManifest {
+    version: u32,
+    registrations: Vec<IndexRegistration>,
+}
+
+impl Default for CatalogManifest {
+    fn default() -> Self {
+        Self {
+            version: CATALOG_VERSION,
+            registrations: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -33,97 +53,119 @@ impl IndexCatalog {
     }
 
     pub async fn register(&self, registration: &IndexRegistration) -> Result<(), IndexError> {
-        validate_registration(registration)?;
-        let source_key = source_key(&registration.stream_url);
-        let source_bytes = serde_json::to_vec(&registration.id)?;
-        let source_written = match self.store.put_if_absent(&source_key, &source_bytes).await? {
-            ConditionalWrite::Written => true,
-            ConditionalWrite::Conflict => {
-                let existing = self
-                    .store
-                    .get(&source_key)
-                    .await?
-                    .ok_or_else(|| IndexError::MissingObject(source_key.clone()))?;
-                let existing_id: String = serde_json::from_slice(&existing.bytes)?;
-                if existing_id != registration.id {
-                    return Err(IndexError::RegistrationConflict(existing_id));
-                }
-                false
-            }
-        };
-        let key = registration_key(&registration.id);
-        let bytes = serde_json::to_vec(registration)?;
-        match self.store.put_if_absent(&key, &bytes).await? {
-            ConditionalWrite::Written => Ok(()),
-            ConditionalWrite::Conflict => {
-                let existing = self
-                    .store
-                    .get(&key)
-                    .await?
-                    .ok_or_else(|| IndexError::MissingObject(key.clone()))?;
-                let existing: IndexRegistration = serde_json::from_slice(&existing.bytes)?;
-                if existing == *registration {
+        let registration = canonical_registration(registration)?;
+        for _attempt in 0..MAX_CATALOG_ATTEMPTS {
+            let current = self.store.get(CATALOG_KEY).await?;
+            let mut catalog = match &current {
+                Some(current) => decode_catalog(&current.bytes)?,
+                None => CatalogManifest::default(),
+            };
+            if let Some(existing) = catalog
+                .registrations
+                .iter()
+                .find(|existing| existing.id == registration.id)
+            {
+                return if same_registration_identity(existing, &registration) {
                     Ok(())
                 } else {
-                    if source_written {
-                        self.store.delete(&source_key).await?;
-                    }
                     Err(IndexError::RegistrationConflict(registration.id.clone()))
+                };
+            }
+            if let Some(existing) = catalog
+                .registrations
+                .iter()
+                .find(|existing| existing.stream_url == registration.stream_url)
+            {
+                return Err(IndexError::RegistrationConflict(existing.id.clone()));
+            }
+            catalog.registrations.push(registration.clone());
+            catalog
+                .registrations
+                .sort_unstable_by(|left, right| left.id.cmp(&right.id));
+            let bytes = serde_json::to_vec(&catalog)?;
+            let result = match current {
+                Some(current) => {
+                    self.store
+                        .compare_and_swap(CATALOG_KEY, &current.etag, &bytes)
+                        .await?
                 }
+                None => self.store.put_if_absent(CATALOG_KEY, &bytes).await?,
+            };
+            if matches!(result, ConditionalWrite::Written) {
+                return Ok(());
             }
         }
+        Err(IndexError::PublishConflict)
     }
 
     pub async fn get(&self, id: &str) -> Result<IndexRegistration, IndexError> {
         validate_id(id)?;
-        let key = registration_key(id);
-        let object = self
-            .store
-            .get(&key)
+        self.load()
             .await?
-            .ok_or_else(|| IndexError::UnknownIndex(id.to_owned()))?;
-        Ok(serde_json::from_slice(&object.bytes)?)
+            .registrations
+            .into_iter()
+            .find(|registration| registration.id == id)
+            .ok_or_else(|| IndexError::UnknownIndex(id.to_owned()))
     }
 
     pub async fn list(&self) -> Result<Vec<IndexRegistration>, IndexError> {
-        let mut registrations = Vec::new();
-        for object in self.store.list("catalog/").await? {
-            if !object.key.ends_with(".json") {
-                continue;
-            }
-            let Some(stored) = self.store.get(&object.key).await? else {
-                continue;
-            };
-            registrations.push(serde_json::from_slice(&stored.bytes)?);
-        }
-        registrations.sort_unstable_by(|left: &IndexRegistration, right: &IndexRegistration| {
-            left.id.cmp(&right.id)
-        });
-        Ok(registrations)
+        Ok(self.load().await?.registrations)
     }
 
     pub async fn unregister(&self, id: &str) -> Result<(), IndexError> {
         validate_id(id)?;
-        let registration = self.get(id).await?;
-        self.store
-            .delete(&source_key(&registration.stream_url))
-            .await?;
-        self.store.delete(&registration_key(id)).await
+        for _attempt in 0..MAX_CATALOG_ATTEMPTS {
+            let current = self
+                .store
+                .get(CATALOG_KEY)
+                .await?
+                .ok_or_else(|| IndexError::UnknownIndex(id.to_owned()))?;
+            let mut catalog = decode_catalog(&current.bytes)?;
+            let original_len = catalog.registrations.len();
+            catalog
+                .registrations
+                .retain(|registration| registration.id != id);
+            if catalog.registrations.len() == original_len {
+                return Err(IndexError::UnknownIndex(id.to_owned()));
+            }
+            let bytes = serde_json::to_vec(&catalog)?;
+            if matches!(
+                self.store
+                    .compare_and_swap(CATALOG_KEY, &current.etag, &bytes)
+                    .await?,
+                ConditionalWrite::Written
+            ) {
+                return Ok(());
+            }
+        }
+        Err(IndexError::PublishConflict)
+    }
+
+    async fn load(&self) -> Result<CatalogManifest, IndexError> {
+        match self.store.get(CATALOG_KEY).await? {
+            Some(stored) => decode_catalog(&stored.bytes),
+            None => Ok(CatalogManifest::default()),
+        }
     }
 }
 
-fn registration_key(id: &str) -> String {
-    format!("catalog/{id}.json")
+fn decode_catalog(bytes: &[u8]) -> Result<CatalogManifest, IndexError> {
+    let catalog: CatalogManifest = serde_json::from_slice(bytes)?;
+    if catalog.version != CATALOG_VERSION {
+        return Err(IndexError::ManifestVersion(catalog.version));
+    }
+    Ok(catalog)
 }
 
-fn source_key(stream_url: &str) -> String {
-    format!(
-        "sources/{}.json",
-        blake3::hash(stream_url.as_bytes()).to_hex()
-    )
+fn same_registration_identity(left: &IndexRegistration, right: &IndexRegistration) -> bool {
+    left.id == right.id
+        && left.stream_url == right.stream_url
+        && left.timestamp_field == right.timestamp_field
 }
 
-fn validate_registration(registration: &IndexRegistration) -> Result<(), IndexError> {
+fn canonical_registration(
+    registration: &IndexRegistration,
+) -> Result<IndexRegistration, IndexError> {
     validate_id(&registration.id)?;
     if registration.stream_url.is_empty() || registration.timestamp_field.is_empty() {
         return Err(IndexError::InvalidConfig(
@@ -142,7 +184,12 @@ fn validate_registration(registration: &IndexRegistration) -> Result<(), IndexEr
             "stream URL must be credential-free HTTP(S) without a fragment",
         ));
     }
-    Ok(())
+    Ok(IndexRegistration {
+        id: registration.id.clone(),
+        stream_url: url.to_string(),
+        timestamp_field: registration.timestamp_field.clone(),
+        indexed_from_record: registration.indexed_from_record,
+    })
 }
 
 fn validate_id(id: &str) -> Result<(), IndexError> {
