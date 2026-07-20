@@ -15,7 +15,7 @@ from scripts.dst.common import ROOT
 def _run_one_seed(family: str, seed: int, failure_dir: Path) -> None:
     cmd = [
         "cargo", "run", "--quiet", "-p", "ursula-sim",
-        "--bin", "ursula-sim-smoke", "--",
+        "--bin", "ursula-sim", "--", "smoke",
         "--seed", str(seed),
         "--failure-dir", str(failure_dir),
     ]
@@ -29,7 +29,7 @@ def _run_one_seed(family: str, seed: int, failure_dir: Path) -> None:
 def tool_throughput(argv: list[str]) -> int:
     """Measure seeds/min/core so the PR/nightly budget is data-driven.
 
-    DoD #7. Wall-clocks `ursula-sim-smoke --seed N` for `--measure` seeds
+    DoD #7. Wall-clocks `ursula-sim smoke --seed N` for `--measure` seeds
     (after `--warmup` warmup seeds), divides total elapsed by seed count, and
     suggests PR (2 min) and nightly (30 min) seed budgets.
     """
