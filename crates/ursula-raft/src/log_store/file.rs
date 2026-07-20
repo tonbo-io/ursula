@@ -1,4 +1,6 @@
 use std::fmt::Debug;
+// The writer path (cfg(not(madsim))) and the tests are the only users.
+#[cfg(any(not(madsim), test))]
 use std::fs;
 use std::io;
 use std::marker::PhantomData;

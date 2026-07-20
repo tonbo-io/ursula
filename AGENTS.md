@@ -232,16 +232,16 @@ python3 -m scripts.dst all
 RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim smoke_corpus_replays -- --nocapture
 
 # Run a smoke sweep
-RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-smoke -- \
+RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
   --failure-dir target/ursula-sim-failures \
   --seed-range 60..=64
 
 # Replay a recorded artifact
-RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-replay -- \
+RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- replay \
   --artifact path/to/record.json
 
 # Minimize a failure
-RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim-minimize -- \
+RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- minimize \
   --artifact path/to/failure.json \
   --invariant some_invariant_name \
   --output minimized.json

@@ -341,7 +341,7 @@ def audit_pipeline_smoke(argv: list[str]) -> int:
         print()
         print(
             "Fix: extend PIPELINE_SMOKE_RANGES in audits.py (and rename the matching\n"
-            "family in ursula-sim-smoke.rs to pipeline-smoke-...)."
+            "family in crates/ursula-sim/src/bin/ursula-sim/smoke.rs to pipeline-smoke-...)."
         )
         return 1
 
@@ -434,8 +434,8 @@ def audit_ci_shape(argv: list[str]) -> int:
         print(file=sys.stderr)
         print(
             "Fix: replace each clause with `cargo run -p ursula-sim --bin\n"
-            "ursula-sim-assert-shape -- --artifact PATH --steps-exact V1,V2,...`.\n"
-            "That binary uses matches! on SimFaultAction so renames are compile errors.",
+            "ursula-sim -- assert-shape --artifact PATH --steps-exact V1,V2,...`.\n"
+            "That subcommand uses matches! on SimFaultAction so renames are compile errors.",
             file=sys.stderr,
         )
         return 1
@@ -449,18 +449,6 @@ def audit_ci_shape(argv: list[str]) -> int:
 # =============================================================================
 
 HARNESS_MOD = HARNESS_ROOT / "mod.rs"
-SUBMOD_DIRS = {
-    "scenarios": ROOT / "crates/ursula-sim/src/scenarios/mod.rs",
-    "workloads": ROOT / "crates/ursula-sim/src/workloads/mod.rs",
-    "invariants": ROOT / "crates/ursula-sim/src/invariants/mod.rs",
-    "faults": ROOT / "crates/ursula-sim/src/faults/mod.rs",
-}
-REQUIRED_TRAITS = {
-    "scenarios": "pub trait Scenario",
-    "workloads": "pub trait Workload",
-    "invariants": "pub trait Invariant",
-    "faults": "pub trait Fault",
-}
 
 # Ratchet history:
 #   12_500 — initial scaffold
@@ -482,19 +470,15 @@ TARGET_FINAL_BUDGET = 2_500
 
 
 def audit_modularity(argv: list[str]) -> int:
-    """DoD #3: harness sub-mod scaffold + ratcheting line budget on mod.rs."""
+    """DoD #3: ratcheting line budget on madsim_harness/mod.rs.
+
+    The empty scenario/workload/invariant/fault trait scaffold was deleted in
+    the LOC-reduction pass (docs/architecture/loc-reduction-plan.md, stage 1);
+    the audit now only enforces the harness line-budget ratchet.
+    """
     argparse.ArgumentParser(prog="dst modularity").parse_args(argv)
 
     errors: list[str] = []
-    for name, path in SUBMOD_DIRS.items():
-        if not path.exists():
-            errors.append(f"scaffold missing: {rel(path)}")
-            continue
-        if REQUIRED_TRAITS[name] not in path.read_text():
-            errors.append(
-                f"scaffold {rel(path)} missing trait declaration `{REQUIRED_TRAITS[name]}`"
-            )
-
     actual_lines = 0
     if HARNESS_MOD.exists():
         actual_lines = sum(1 for _ in HARNESS_MOD.read_text().splitlines())
@@ -512,8 +496,8 @@ def audit_modularity(argv: list[str]) -> int:
         return 1
 
     print(
-        f"OK: harness modularity scaffold in place; madsim_harness/mod.rs at "
-        f"{actual_lines} lines (budget {LINE_BUDGET}, DoD #3 target {TARGET_FINAL_BUDGET})."
+        f"OK: madsim_harness/mod.rs at {actual_lines} lines "
+        f"(budget {LINE_BUDGET}, DoD #3 target {TARGET_FINAL_BUDGET})."
     )
     return 0
 
@@ -558,7 +542,9 @@ NIGHTLY_SEED_BUDGET = 1500
 
 
 def _supported_families() -> set[str]:
-    return set(re.findall(r'"([a-z0-9-]+)"\s*=>\s*Ok\(', SMOKE_RS.read_text()))
+    # Parses the `SEED_FAMILIES` table in
+    # crates/ursula-sim/src/bin/ursula-sim/smoke.rs.
+    return set(re.findall(r'name:\s*"([a-z0-9-]+)"', SMOKE_RS.read_text()))
 
 
 def _workflow_families(path: Path) -> set[str]:
@@ -571,7 +557,7 @@ def _workflow_ranges(path: Path) -> set[str]:
 
 def _family_seed_count(family: str, smoke: str) -> int | None:
     m = re.search(
-        rf'"{re.escape(family)}"\s*=>\s*Ok\(\((\d+)\.\.=(\d+)\)', smoke,
+        rf'name:\s*"{re.escape(family)}",\s*start:\s*(\d+),\s*end:\s*(\d+)', smoke,
     )
     if not m:
         return None

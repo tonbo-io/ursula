@@ -1,21 +1,17 @@
 //! Deterministic simulation harnesses for Ursula.
+//!
+//! Module map:
+//!
+//! - `madsim_harness` (private): scenarios, schedules, traces, and fault
+//!   plans; its public surface is re-exported at the crate root.
+//! - [`artifact`]: shared artifact schemas and helpers for the `ursula-sim`
+//!   CLI subcommands.
 
 #[cfg(madsim)]
 mod madsim_harness;
 
-// DoD #3 scaffold: trait surfaces for the Workload / Invariant / Fault axes.
-// Empty until the Phase B.1 refactor migrates scenarios out of
-// `madsim_harness/mod.rs`; line-budget ratchet lives in the audit at
-// `scripts/dst/audits.py::audit_modularity` (invoked via
-// `python3 -m scripts.dst modularity`).
 #[cfg(madsim)]
-pub mod faults;
-#[cfg(madsim)]
-pub mod invariants;
-#[cfg(madsim)]
-pub mod scenarios;
-#[cfg(madsim)]
-pub mod workloads;
+pub mod artifact;
 
 #[cfg(madsim)]
 pub use madsim_harness::HttpProtocolSurfacePlan;

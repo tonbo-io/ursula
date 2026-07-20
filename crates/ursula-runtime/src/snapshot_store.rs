@@ -17,10 +17,13 @@ use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(not(madsim))]
 use std::sync::atomic::AtomicU64;
+#[cfg(not(madsim))]
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
+#[cfg(not(madsim))]
 use crossbeam_utils::CachePadded;
 use serde::Deserialize;
 use serde::Serialize;
@@ -35,6 +38,9 @@ pub struct SnapshotKey {
     pub snapshot_id: String,
 }
 
+// Only the S3 store (cfg(not(madsim))) derives object keys; gate the helper
+// so madsim builds stay dead-code-free.
+#[cfg(not(madsim))]
 fn unique_snapshot_leaf(snapshot_id: &str) -> String {
     static COUNTER: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
     let nonce_nanos = std::time::SystemTime::now()
