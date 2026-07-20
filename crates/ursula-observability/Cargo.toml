@@ -25,6 +25,8 @@ otlp = [
 ]
 
 [dependencies]
+axum = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "signal", "sync", "time"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 opentelemetry = { workspace = true, optional = true }

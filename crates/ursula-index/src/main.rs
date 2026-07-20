@@ -45,6 +45,7 @@ use ursula_index::S3ObjectStoreConfig;
 use ursula_index::ServerlessEventIndex;
 use ursula_index::SourceBatch;
 use ursula_index::SourceClient;
+use ursula_observability::serve::shutdown_signal;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -1195,29 +1196,6 @@ fn parse_query_timestamp(value: &str) -> Option<i64> {
             .ok()
             .map(|value| value.timestamp_millis())
     })
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::error!(%error, "failed to install Ctrl+C handler");
-        }
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                let _signal = signal.recv().await;
-            }
-            Err(error) => tracing::error!(%error, "failed to install SIGTERM handler"),
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        () = ctrl_c => {}
-        () = terminate => {}
-    }
 }
 
 #[cfg(test)]

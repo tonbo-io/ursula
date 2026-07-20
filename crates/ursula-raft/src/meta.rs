@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::error::Error;
-use std::fmt;
 use std::io;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -49,10 +48,12 @@ openraft::declare_raft_types!(
 
 pub type MetaRaft = Raft<MetaRaftTypeConfig, MetaRaftStateMachine>;
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{operation}{}{message}", if .message.is_empty() { "" } else { ": " })]
 pub struct MetaRaftError {
     operation: &'static str,
     message: String,
+    #[source]
     source: Option<Box<dyn Error + Send + Sync + 'static>>,
 }
 
@@ -78,24 +79,6 @@ impl MetaRaftError {
 
     pub fn operation(&self) -> &'static str {
         self.operation
-    }
-}
-
-impl fmt::Display for MetaRaftError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.message.is_empty() {
-            f.write_str(self.operation)
-        } else {
-            write!(f, "{}: {}", self.operation, self.message)
-        }
-    }
-}
-
-impl Error for MetaRaftError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        self.source
-            .as_ref()
-            .map(|source| &**source as &(dyn Error + 'static))
     }
 }
 
