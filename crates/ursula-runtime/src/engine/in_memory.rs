@@ -4,9 +4,6 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use ursula_shard::BucketStreamId;
-use ursula_shard::CoreId;
-use ursula_shard::RaftGroupId;
-use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::AppendStreamInput;
 use ursula_stream::ProducerRequest;
@@ -984,18 +981,6 @@ impl InMemoryGroupEngine {
             .into_iter()
             .map(|command| self.apply_committed_write(command, placement))
             .collect()
-    }
-
-    pub(crate) fn apply_replayed_write_command(
-        &mut self,
-        command: GroupWriteCommand,
-    ) -> Result<(), GroupEngineError> {
-        let placement = ShardPlacement {
-            core_id: CoreId(0),
-            shard_id: ShardId(0),
-            raft_group_id: RaftGroupId(0),
-        };
-        self.apply_committed_write(command, placement).map(|_| ())
     }
 
     pub(crate) fn append_payload(

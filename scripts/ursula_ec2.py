@@ -30,6 +30,61 @@ from pathlib import Path
 from typing import Any
 
 
+def _toml_scalar(value: Any) -> str:
+    """Render a scalar as TOML. JSON string escaping is valid TOML."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_scalar(item) for item in value) + "]"
+    raise TypeError(f"unsupported TOML value: {value!r}")
+
+
+def dump_toml(config: dict[str, Any]) -> str:
+    """Serialise a nested dict (the Ursula server config shape) as TOML.
+
+    The server only accepts TOML config files, so the generated config is
+    emitted as `[table]` headers with scalar keys, nested tables, and
+    `[[array]]` tables for lists of dicts (raft peers).
+    """
+    lines: list[str] = []
+
+    def walk(table: dict[str, Any], prefix: str) -> None:
+        scalars: list[tuple[str, Any]] = []
+        subtables: list[tuple[str, dict[str, Any]]] = []
+        array_tables: list[tuple[str, list[dict[str, Any]]]] = []
+        for key, value in table.items():
+            if isinstance(value, dict):
+                subtables.append((key, value))
+            elif isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
+                array_tables.append((key, value))
+            else:
+                scalars.append((key, value))
+        if prefix and scalars:
+            lines.append(f"[{prefix}]")
+        for key, value in scalars:
+            lines.append(f"{key} = {_toml_scalar(value)}")
+        if scalars:
+            lines.append("")
+        for key, items in array_tables:
+            name = f"{prefix}.{key}" if prefix else key
+            for item in items:
+                lines.append(f"[[{name}]]")
+                for item_key, item_value in item.items():
+                    lines.append(f"{item_key} = {_toml_scalar(item_value)}")
+                lines.append("")
+        for key, sub in subtables:
+            walk(sub, f"{prefix}.{key}" if prefix else key)
+
+    walk(config, "")
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines) + "\n"
+
+
 DEFAULT_KNOWN_HOSTS = "/tmp/ursula-ec2-known-hosts"
 
 
@@ -228,7 +283,7 @@ class Ec2Ops:
         return f"{self.config.log_prefix}-{node.id}.log"
 
     def remote_config(self, node: Node) -> str:
-        return f"{self.config.config_prefix}-{node.id}.json"
+        return f"{self.config.config_prefix}-{node.id}.toml"
 
     def _raft_wal_config(self, node: Node) -> dict[str, Any]:
         if self.config.raft_memory:
@@ -416,7 +471,7 @@ class Ec2Ops:
                 "snapshot": snapshot,
             },
         }
-        return json.dumps(cfg, indent=2)
+        return dump_toml(cfg)
 
     def stop_node(self, node: Node) -> None:
         pid = shlex.quote(self.remote_pid(node))
