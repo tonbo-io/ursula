@@ -6,7 +6,7 @@
 //! - [`part`]: immutable sorted Parquet parts.
 //! - [`object_store`]: conditional object operations for S3 and local tests.
 //! - [`serverless`]: S3-authoritative index with a disposable local cache.
-//! - [`store`]: crash-consistent manifest, checkpoint, query, and compaction.
+//! - [`store`]: shared event, query, status, configuration, and error types.
 
 mod catalog;
 mod object_store;
@@ -32,7 +32,6 @@ pub use store::EventEntry;
 pub use store::EventIndexConfig;
 pub use store::IndexError;
 pub use store::IndexStatus;
-pub use store::LocalEventIndex;
 pub use store::QueryCursor;
 pub use store::QueryResult;
 pub use store::SourceEnvelope;

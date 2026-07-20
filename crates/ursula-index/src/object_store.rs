@@ -1,9 +1,21 @@
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
+use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 use opendal::ErrorKind;
@@ -40,6 +52,17 @@ impl ObjectStore {
         match self {
             Self::Fs(store) => store.get(key),
             Self::S3(store) => store.get(key).await,
+        }
+    }
+
+    pub(crate) async fn get_range(
+        &self,
+        key: &str,
+        range: Range<u64>,
+    ) -> Result<Option<Vec<u8>>, IndexError> {
+        match self {
+            Self::Fs(store) => store.get_range(key, range),
+            Self::S3(store) => store.get_range(key, range).await,
         }
     }
 
@@ -84,13 +107,23 @@ impl ObjectStore {
 #[derive(Clone, Debug)]
 pub struct FsObjectStore {
     root: PathBuf,
+    #[cfg(test)]
+    range_reads: Arc<AtomicUsize>,
+    #[cfg(test)]
+    range_read_bytes: Arc<AtomicU64>,
 }
 
 impl FsObjectStore {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, IndexError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            #[cfg(test)]
+            range_reads: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            range_read_bytes: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     fn path(&self, key: &str) -> Result<PathBuf, IndexError> {
@@ -110,6 +143,40 @@ impl FsObjectStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Vec<u8>>, IndexError> {
+        #[cfg(test)]
+        self.range_reads.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        self.range_read_bytes
+            .fetch_add(range.end.saturating_sub(range.start), Ordering::Relaxed);
+        let path = self.path(key)?;
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let length = range
+            .end
+            .checked_sub(range.start)
+            .ok_or_else(|| IndexError::InvalidPartLayout(key.to_owned()))?;
+        let length = usize::try_from(length)
+            .map_err(|_error| IndexError::InvalidPartLayout(key.to_owned()))?;
+        file.seek(SeekFrom::Start(range.start))?;
+        let mut bytes = vec![0_u8; length];
+        file.read_exact(&mut bytes)?;
+        Ok(Some(bytes))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn range_read_count(&self) -> usize {
+        self.range_reads.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn range_read_bytes(&self) -> u64 {
+        self.range_read_bytes.load(Ordering::Relaxed)
     }
 
     fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<ConditionalWrite, IndexError> {
@@ -284,6 +351,14 @@ impl S3ObjectStore {
         Err(IndexError::ObjectStore(format!(
             "object `{key}` changed during three consecutive reads"
         )))
+    }
+
+    async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Vec<u8>>, IndexError> {
+        match self.operator.read_with(key).range(range).await {
+            Ok(bytes) => Ok(Some(bytes.to_vec())),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(object_error(error)),
+        }
     }
 
     async fn put_if_absent(&self, key: &str, bytes: &[u8]) -> Result<ConditionalWrite, IndexError> {

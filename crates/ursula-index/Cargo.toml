@@ -25,6 +25,9 @@ axum = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
+bytes = { workspace = true }
+foyer = { workspace = true }
+futures-util = { workspace = true }
 parquet = { workspace = true }
 opendal = { workspace = true, features = ["services-s3"] }
 reqwest = { workspace = true, features = ["rustls-tls"] }
