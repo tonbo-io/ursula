@@ -86,6 +86,40 @@ resource "local_file" "helm_values" {
   })
 }
 
+resource "local_file" "kubeconfig" {
+  filename        = "${path.module}/kubeconfig"
+  file_permission = "0600"
+  content = yamlencode({
+    apiVersion = "v1"
+    kind       = "Config"
+    clusters = [{
+      name = module.eks.cluster_name
+      cluster = {
+        server                       = module.eks.cluster_endpoint
+        "certificate-authority-data" = module.eks.cluster_certificate_authority_data
+      }
+    }]
+    users = [{
+      name = module.eks.cluster_name
+      user = {
+        exec = {
+          apiVersion = "client.authentication.k8s.io/v1beta1"
+          command    = "aws"
+          args       = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", var.aws_region]
+        }
+      }
+    }]
+    contexts = [{
+      name = module.eks.cluster_name
+      context = {
+        cluster = module.eks.cluster_name
+        user    = module.eks.cluster_name
+      }
+    }]
+    "current-context" = module.eks.cluster_name
+  })
+}
+
 output "cluster_name" {
   value = module.eks.cluster_name
 }
@@ -102,14 +136,14 @@ output "generated_values_file" {
   value = local_file.helm_values.filename
 }
 
-output "configure_kubectl" {
-  value = "aws eks update-kubeconfig --name ${module.eks.cluster_name} --region ${var.aws_region}"
+output "kubeconfig_file" {
+  value = local_file.kubeconfig.filename
 }
 
 output "helm_install" {
-  value = "helm install ${var.release_name} ../../charts/ursula --namespace ${var.namespace} --create-namespace -f generated-values.yaml"
+  value = "KUBECONFIG=${local_file.kubeconfig.filename} helm install ${var.release_name} ../../charts/ursula --namespace ${var.namespace} --create-namespace -f generated-values.yaml"
 }
 
 output "helm_test" {
-  value = "helm test ${var.release_name} --namespace ${var.namespace}"
+  value = "KUBECONFIG=${local_file.kubeconfig.filename} helm test ${var.release_name} --namespace ${var.namespace}"
 }
