@@ -246,10 +246,26 @@ pub enum InProcessRaftRpcKind {
 #[derive(Debug, Clone)]
 pub enum InProcessRaftNetworkPolicyEvent {
     SetDelay(Option<Duration>),
-    PartitionOneWay { source: u64, target: u64 },
-    PartitionBidirectional { a: u64, b: u64 },
-    HealOneWay { source: u64, target: u64 },
-    HealBidirectional { a: u64, b: u64 },
+    /// Retained for external observers (ursula-sim introspection) even though
+    /// no in-crate policy method emits one-way events today.
+    PartitionOneWay {
+        source: u64,
+        target: u64,
+    },
+    PartitionBidirectional {
+        a: u64,
+        b: u64,
+    },
+    /// Retained for external observers (ursula-sim introspection) even though
+    /// no in-crate policy method emits one-way events today.
+    HealOneWay {
+        source: u64,
+        target: u64,
+    },
+    HealBidirectional {
+        a: u64,
+        b: u64,
+    },
     Clear,
 }
 
@@ -317,18 +333,6 @@ impl InProcessRaftNetworkPolicy {
         self.notify_policy_changed(InProcessRaftNetworkPolicyEvent::SetDelay(delay));
     }
 
-    pub fn partition_one_way(&self, source: u64, target: u64) {
-        self.inner
-            .lock()
-            .expect("in-process raft network policy mutex")
-            .partitions
-            .insert((source, target));
-        self.notify_policy_changed(InProcessRaftNetworkPolicyEvent::PartitionOneWay {
-            source,
-            target,
-        });
-    }
-
     pub fn partition_bidirectional(&self, a: u64, b: u64) {
         let mut inner = self
             .inner
@@ -340,15 +344,6 @@ impl InProcessRaftNetworkPolicy {
             a,
             b,
         });
-    }
-
-    pub fn heal_one_way(&self, source: u64, target: u64) {
-        self.inner
-            .lock()
-            .expect("in-process raft network policy mutex")
-            .partitions
-            .remove(&(source, target));
-        self.notify_policy_changed(InProcessRaftNetworkPolicyEvent::HealOneWay { source, target });
     }
 
     pub fn heal_bidirectional(&self, a: u64, b: u64) {
@@ -450,9 +445,7 @@ pub struct InProcessRaftFaultStep {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InProcessRaftFaultAction {
     SetDelay(Option<Duration>),
-    PartitionOneWay { source: u64, target: u64 },
     PartitionBidirectional { a: u64, b: u64 },
-    HealOneWay { source: u64, target: u64 },
     HealBidirectional { a: u64, b: u64 },
     Clear,
 }
@@ -461,9 +454,7 @@ impl InProcessRaftFaultAction {
     fn apply(self, policy: &InProcessRaftNetworkPolicy) {
         match self {
             Self::SetDelay(delay) => policy.set_delay(delay),
-            Self::PartitionOneWay { source, target } => policy.partition_one_way(source, target),
             Self::PartitionBidirectional { a, b } => policy.partition_bidirectional(a, b),
-            Self::HealOneWay { source, target } => policy.heal_one_way(source, target),
             Self::HealBidirectional { a, b } => policy.heal_bidirectional(a, b),
             Self::Clear => policy.clear(),
         }

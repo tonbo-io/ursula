@@ -29,6 +29,7 @@ use crate::codec::head_stream_response_from_proto;
 use crate::codec::read_stream_response_from_proto;
 use crate::grpc::GRPC_LEADER_CHANNELS;
 use crate::grpc::RAFT_GRPC_MAX_MESSAGE_BYTES;
+use crate::grpc::RaftClient;
 use crate::log_store::elapsed_ns;
 use crate::raft_internal_proto;
 use crate::rt::time::Instant;
@@ -45,27 +46,18 @@ pub(crate) async fn forward_head_stream_to_leader(
     leader_node: &BasicNode,
     request: HeadStreamRequest,
 ) -> Result<HeadStreamResponse, GroupEngineError> {
-    let response = forward_group_read_to_leader(
+    forward_typed_read_to_leader(
         placement,
         leader_node,
         request.stream_id,
         request.now_ms,
+        "head",
         raft_internal_proto::group_read_request_v1::Read::Head(
             raft_internal_proto::HeadStreamReadV1 {},
         ),
+        head_stream_response_from_proto,
     )
-    .await?;
-    if response.ok {
-        let response = raft_internal_proto::HeadStreamResponsePayloadV1::decode(response.payload)
-            .map_err(|err| {
-            GroupEngineError::new(format!("decode forwarded head response: {err}"))
-        })?;
-        head_stream_response_from_proto(response)
-    } else {
-        let err = raft_app_proto::GroupEngineErrorV1::decode(response.payload)
-            .map_err(|err| GroupEngineError::new(format!("decode forwarded head error: {err}")))?;
-        Err(group_engine_error_from_proto(err)?)
-    }
+    .await
 }
 
 #[tracing::instrument(
@@ -80,11 +72,12 @@ pub(crate) async fn forward_read_stream_to_leader(
 ) -> Result<ReadStreamResponse, GroupEngineError> {
     let max_len = u64::try_from(request.max_len)
         .map_err(|_| GroupEngineError::new("read max_len does not fit u64"))?;
-    let response = forward_group_read_to_leader(
+    forward_typed_read_to_leader(
         placement,
         leader_node,
         request.stream_id,
         request.now_ms,
+        "read",
         raft_internal_proto::group_read_request_v1::Read::ReadStream(
             raft_internal_proto::ReadStreamReadV1 {
                 offset: request.offset,
@@ -93,19 +86,9 @@ pub(crate) async fn forward_read_stream_to_leader(
                 max_records: request.max_records,
             },
         ),
+        read_stream_response_from_proto,
     )
-    .await?;
-    if response.ok {
-        let response = raft_internal_proto::ReadStreamResponsePayloadV1::decode(response.payload)
-            .map_err(|err| {
-            GroupEngineError::new(format!("decode forwarded read response: {err}"))
-        })?;
-        read_stream_response_from_proto(response)
-    } else {
-        let err = raft_app_proto::GroupEngineErrorV1::decode(response.payload)
-            .map_err(|err| GroupEngineError::new(format!("decode forwarded read error: {err}")))?;
-        Err(group_engine_error_from_proto(err)?)
-    }
+    .await
 }
 
 #[tracing::instrument(
@@ -118,28 +101,46 @@ pub(crate) async fn forward_get_stream_attrs_to_leader(
     leader_node: &BasicNode,
     request: GetStreamAttrsRequest,
 ) -> Result<GetStreamAttrsResponse, GroupEngineError> {
-    let response = forward_group_read_to_leader(
+    forward_typed_read_to_leader(
         placement,
         leader_node,
         request.stream_id,
         request.now_ms,
+        "get stream attrs",
         raft_internal_proto::group_read_request_v1::Read::GetStreamAttrs(
             raft_internal_proto::GetStreamAttrsReadV1 {},
         ),
+        get_stream_attrs_response_from_proto,
     )
-    .await?;
+    .await
+}
+
+/// Forward one leader-only read to the leader over gRPC and decode the typed
+/// response payload (`P`) into the engine-level response (`T`). The three
+/// public forwarders above differ only in the read variant they construct and
+/// the payload decode target, so they all funnel through here.
+async fn forward_typed_read_to_leader<P, T>(
+    placement: ShardPlacement,
+    leader_node: &BasicNode,
+    stream_id: BucketStreamId,
+    now_ms: u64,
+    what: &str,
+    read: raft_internal_proto::group_read_request_v1::Read,
+    from_proto: impl FnOnce(P) -> Result<T, GroupEngineError>,
+) -> Result<T, GroupEngineError>
+where
+    P: Message + Default,
+{
+    let response =
+        forward_group_read_to_leader(placement, leader_node, stream_id, now_ms, read).await?;
     if response.ok {
-        let response =
-            raft_internal_proto::GetStreamAttrsResponsePayloadV1::decode(response.payload)
-                .map_err(|err| {
-                    GroupEngineError::new(format!(
-                        "decode forwarded get stream attrs response: {err}"
-                    ))
-                })?;
-        get_stream_attrs_response_from_proto(response)
+        let payload = P::decode(response.payload).map_err(|err| {
+            GroupEngineError::new(format!("decode forwarded {what} response: {err}"))
+        })?;
+        from_proto(payload)
     } else {
         let err = raft_app_proto::GroupEngineErrorV1::decode(response.payload).map_err(|err| {
-            GroupEngineError::new(format!("decode forwarded get stream attrs error: {err}"))
+            GroupEngineError::new(format!("decode forwarded {what} error: {err}"))
         })?;
         Err(group_engine_error_from_proto(err)?)
     }
@@ -153,7 +154,7 @@ pub(crate) async fn forward_group_read_to_leader(
     read: raft_internal_proto::group_read_request_v1::Read,
 ) -> Result<raft_internal_proto::GroupReadResponseV1, GroupEngineError> {
     let channel = grpc_leader_channel(&leader_node.addr).await?;
-    let mut client = raft_internal_proto::raft_internal_client::RaftInternalClient::new(channel)
+    let mut client = RaftClient::new(channel)
         .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
         .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES);
     let mut grpc_request = tonic::Request::new(raft_internal_proto::GroupReadRequestV1 {
