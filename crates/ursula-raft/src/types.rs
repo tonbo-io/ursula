@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::fmt;
 use std::io::Cursor;
 use std::time::Duration;
 
@@ -9,13 +8,11 @@ use openraft::raft::AppendEntriesRequest;
 use openraft::raft::AppendEntriesResponse;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
-use prost::Message;
 use serde::Deserialize;
-use serde::Deserializer;
 use serde::Serialize;
-use serde::Serializer;
-use ursula_proto as raft_app_proto;
+use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupWriteCommand;
+use ursula_runtime::GroupWriteResponse;
 use ursula_shard::RaftGroupId;
 
 // Used only by the cfg(not(madsim)) file-log writer thread in
@@ -32,7 +29,7 @@ type OpenRaftRuntime = openraft::impls::TokioRuntime;
 
 openraft::declare_raft_types!(
     pub UrsulaRaftTypeConfig:
-        D = RaftGroupCommand,
+        D = GroupWriteCommand,
         R = RaftGroupResponse,
         Node = openraft::BasicNode,
         SnapshotData = Cursor<Vec<u8>>,
@@ -45,262 +42,14 @@ pub type UrsulaVote = VoteOf<UrsulaRaftTypeConfig>;
 pub type UrsulaVoteRequest = VoteRequest<UrsulaRaftTypeConfig>;
 pub type UrsulaVoteResponse = VoteResponse<UrsulaRaftTypeConfig>;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct RaftGroupCommand(pub raft_app_proto::RaftGroupCommandV1);
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RaftGroupResponse(pub raft_app_proto::RaftGroupResponseV1);
-
-impl Serialize for RaftGroupCommand {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: Serializer {
-        serializer.serialize_bytes(&self.0.encode_to_vec())
-    }
-}
-
-impl<'de> Deserialize<'de> for RaftGroupCommand {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de> {
-        let bytes = Vec::<u8>::deserialize(deserializer)?;
-        let command = raft_app_proto::RaftGroupCommandV1::decode(bytes.as_slice())
-            .map_err(serde::de::Error::custom)?;
-        Ok(Self(command))
-    }
-}
-
-impl Serialize for RaftGroupResponse {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: Serializer {
-        serializer.serialize_bytes(&self.0.encode_to_vec())
-    }
-}
-
-impl<'de> Deserialize<'de> for RaftGroupResponse {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: Deserializer<'de> {
-        let bytes = Vec::<u8>::deserialize(deserializer)?;
-        let response = raft_app_proto::RaftGroupResponseV1::decode(bytes.as_slice())
-            .map_err(serde::de::Error::custom)?;
-        Ok(Self(response))
-    }
-}
-
-impl fmt::Display for RaftGroupCommand {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match &self.0.command {
-            Some(raft_app_proto::raft_group_command_v1::Command::CreateStream(_)) => {
-                "create_stream"
-            }
-            Some(raft_app_proto::raft_group_command_v1::Command::CreateExternal(_)) => {
-                "create_external"
-            }
-            Some(raft_app_proto::raft_group_command_v1::Command::Append(_)) => "append",
-            Some(raft_app_proto::raft_group_command_v1::Command::AppendExternal(_)) => {
-                "append_external"
-            }
-            Some(raft_app_proto::raft_group_command_v1::Command::AppendBatch(_)) => "append_batch",
-            Some(raft_app_proto::raft_group_command_v1::Command::PublishSnapshot(_)) => {
-                "publish_snapshot"
-            }
-            Some(raft_app_proto::raft_group_command_v1::Command::TouchStreamAccess(_)) => {
-                "touch_stream_access"
-            }
-            Some(raft_app_proto::raft_group_command_v1::Command::UpdateStreamAttrs(_)) => {
-                "update_stream_attrs"
-            }
-            Some(raft_app_proto::raft_group_command_v1::Command::FlushCold(_)) => "flush_cold",
-            Some(raft_app_proto::raft_group_command_v1::Command::CloseStream(_)) => "close_stream",
-            Some(raft_app_proto::raft_group_command_v1::Command::DeleteStream(_)) => {
-                "delete_stream"
-            }
-            Some(raft_app_proto::raft_group_command_v1::Command::AckColdGc(_)) => "ack_cold_gc",
-            Some(raft_app_proto::raft_group_command_v1::Command::Batch(_)) => "batch",
-            None => "missing",
-        };
-        f.write_str(name)
-    }
-}
-
-impl From<GroupWriteCommand> for RaftGroupCommand {
-    fn from(command: GroupWriteCommand) -> Self {
-        use raft_app_proto::raft_group_command_v1::Command;
-        let command = match command {
-            GroupWriteCommand::CreateStream {
-                stream_id,
-                content_type,
-                initial_payload,
-                close_after,
-                stream_seq,
-                producer,
-                stream_ttl_seconds,
-                stream_expires_at_ms,
-                attrs,
-                now_ms,
-            } => Command::CreateStream(raft_app_proto::CreateStreamCommandV1 {
-                stream_id: Some(stream_id.into()),
-                content_type,
-                initial_payload,
-                close_after,
-                stream_seq,
-                producer,
-                stream_ttl_seconds,
-                stream_expires_at_ms,
-                now_ms,
-                attrs_json: attrs.map(stream_attrs_json),
-            }),
-            GroupWriteCommand::CreateExternal {
-                stream_id,
-                content_type,
-                initial_payload,
-                record_ends,
-                close_after,
-                stream_seq,
-                producer,
-                stream_ttl_seconds,
-                stream_expires_at_ms,
-                attrs,
-                now_ms,
-            } => Command::CreateExternal(raft_app_proto::CreateExternalCommandV1 {
-                stream_id: Some(stream_id.into()),
-                content_type,
-                initial_payload: Some(initial_payload),
-                close_after,
-                stream_seq,
-                producer,
-                stream_ttl_seconds,
-                stream_expires_at_ms,
-                now_ms,
-                attrs_json: attrs.map(stream_attrs_json),
-                record_ends,
-            }),
-            GroupWriteCommand::Append {
-                stream_id,
-                content_type,
-                payload,
-                close_after,
-                stream_seq,
-                producer,
-                now_ms,
-                record_match,
-            } => Command::Append(raft_app_proto::AppendCommandV1 {
-                stream_id: Some(stream_id.into()),
-                content_type,
-                payload,
-                close_after,
-                stream_seq,
-                producer,
-                now_ms,
-                record_match,
-            }),
-            GroupWriteCommand::AppendExternal {
-                stream_id,
-                content_type,
-                payload,
-                record_ends,
-                close_after,
-                stream_seq,
-                producer,
-                now_ms,
-                record_match,
-            } => Command::AppendExternal(raft_app_proto::AppendExternalCommandV1 {
-                stream_id: Some(stream_id.into()),
-                content_type,
-                payload: Some(payload),
-                close_after,
-                stream_seq,
-                producer,
-                now_ms,
-                record_match,
-                record_ends,
-            }),
-            GroupWriteCommand::AppendBatch {
-                stream_id,
-                content_type,
-                payloads,
-                producer,
-                now_ms,
-            } => Command::AppendBatch(raft_app_proto::AppendBatchCommandV1 {
-                stream_id: Some(stream_id.into()),
-                content_type,
-                payloads,
-                producer,
-                now_ms,
-            }),
-            GroupWriteCommand::PublishSnapshot {
-                stream_id,
-                snapshot_offset,
-                content_type,
-                payload,
-                now_ms,
-            } => Command::PublishSnapshot(raft_app_proto::PublishSnapshotCommandV1 {
-                stream_id: Some(stream_id.into()),
-                snapshot_offset,
-                content_type,
-                payload,
-                now_ms,
-            }),
-            GroupWriteCommand::TouchStreamAccess {
-                stream_id,
-                now_ms,
-                renew_ttl,
-            } => Command::TouchStreamAccess(raft_app_proto::TouchStreamAccessCommandV1 {
-                stream_id: Some(stream_id.into()),
-                now_ms,
-                renew_ttl,
-            }),
-            GroupWriteCommand::UpdateStreamAttrs {
-                stream_id,
-                attrs,
-                now_ms,
-            } => Command::UpdateStreamAttrs(raft_app_proto::UpdateStreamAttrsCommandV1 {
-                stream_id: Some(stream_id.into()),
-                attrs_json: attrs.map(stream_attrs_json),
-                now_ms,
-            }),
-            GroupWriteCommand::FlushCold { stream_id, chunk } => {
-                Command::FlushCold(raft_app_proto::FlushColdCommandV1 {
-                    stream_id: Some(stream_id.into()),
-                    chunk: Some(chunk),
-                })
-            }
-            GroupWriteCommand::CloseStream {
-                stream_id,
-                stream_seq,
-                producer,
-                now_ms,
-            } => Command::CloseStream(raft_app_proto::CloseStreamCommandV1 {
-                stream_id: Some(stream_id.into()),
-                stream_seq,
-                producer,
-                now_ms,
-            }),
-            GroupWriteCommand::DeleteStream { stream_id } => {
-                Command::DeleteStream(raft_app_proto::DeleteStreamCommandV1 {
-                    stream_id: Some(stream_id.into()),
-                })
-            }
-            GroupWriteCommand::AckColdGc { up_to_seq } => {
-                Command::AckColdGc(raft_app_proto::AckColdGcCommandV1 { up_to_seq })
-            }
-            GroupWriteCommand::Batch { commands } => {
-                Command::Batch(raft_app_proto::BatchCommandV1 {
-                    commands: commands
-                        .into_iter()
-                        .map(|command| RaftGroupCommand::from(command).0)
-                        .collect(),
-                })
-            }
-        };
-        Self(raft_app_proto::RaftGroupCommandV1 {
-            command: Some(command),
-        })
-    }
-}
-
-fn stream_attrs_json(attrs: ursula_runtime::StreamAttrs) -> bytes::Bytes {
-    serde_json::to_vec(&attrs)
-        .expect("stream attrs serialize to JSON")
-        .into()
+/// Raft-level response for one applied log entry. Write outcomes carry the
+/// canonical [`GroupWriteResponse`]/[`GroupEngineError`] directly; blank and
+/// membership entries have no application payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RaftGroupResponse {
+    Blank,
+    Membership,
+    Write(Result<GroupWriteResponse, GroupEngineError>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

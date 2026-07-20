@@ -5,10 +5,9 @@ use futures_util::TryStreamExt;
 use openraft::BasicNode;
 use openraft::Raft;
 use openraft::rt::WatchReceiver;
-use prost::Message;
+use serde::de::DeserializeOwned;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
-use ursula_proto as raft_app_proto;
 use ursula_runtime::GetStreamAttrsRequest;
 use ursula_runtime::GetStreamAttrsResponse;
 use ursula_runtime::GroupEngineError;
@@ -22,11 +21,7 @@ use ursula_runtime::ReadStreamResponse;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 
-use crate::codec::get_stream_attrs_response_from_proto;
-use crate::codec::group_engine_error_from_proto;
-use crate::codec::group_write_result_from_raft_response;
-use crate::codec::head_stream_response_from_proto;
-use crate::codec::read_stream_response_from_proto;
+use crate::codec::decode_wire;
 use crate::grpc::GRPC_LEADER_CHANNELS;
 use crate::grpc::RAFT_GRPC_MAX_MESSAGE_BYTES;
 use crate::grpc::RaftClient;
@@ -34,6 +29,7 @@ use crate::log_store::elapsed_ns;
 use crate::raft_internal_proto;
 use crate::rt::time::Instant;
 use crate::state_machine::RaftGroupStateMachine;
+use crate::types::RaftGroupResponse;
 use crate::types::UrsulaRaftTypeConfig;
 
 #[tracing::instrument(
@@ -55,7 +51,6 @@ pub(crate) async fn forward_head_stream_to_leader(
         raft_internal_proto::group_read_request_v1::Read::Head(
             raft_internal_proto::HeadStreamReadV1 {},
         ),
-        head_stream_response_from_proto,
     )
     .await
 }
@@ -86,7 +81,6 @@ pub(crate) async fn forward_read_stream_to_leader(
                 max_records: request.max_records,
             },
         ),
-        read_stream_response_from_proto,
     )
     .await
 }
@@ -110,39 +104,31 @@ pub(crate) async fn forward_get_stream_attrs_to_leader(
         raft_internal_proto::group_read_request_v1::Read::GetStreamAttrs(
             raft_internal_proto::GetStreamAttrsReadV1 {},
         ),
-        get_stream_attrs_response_from_proto,
     )
     .await
 }
 
-/// Forward one leader-only read to the leader over gRPC and decode the typed
-/// response payload (`P`) into the engine-level response (`T`). The three
-/// public forwarders above differ only in the read variant they construct and
-/// the payload decode target, so they all funnel through here.
-async fn forward_typed_read_to_leader<P, T>(
+/// Forward one leader-only read to the leader over gRPC and decode the
+/// serde-carried response payload into the engine-level response (`T`). The
+/// three public forwarders above differ only in the read variant they
+/// construct and the decode target, so they all funnel through here.
+async fn forward_typed_read_to_leader<T>(
     placement: ShardPlacement,
     leader_node: &BasicNode,
     stream_id: BucketStreamId,
     now_ms: u64,
     what: &str,
     read: raft_internal_proto::group_read_request_v1::Read,
-    from_proto: impl FnOnce(P) -> Result<T, GroupEngineError>,
 ) -> Result<T, GroupEngineError>
 where
-    P: Message + Default,
+    T: DeserializeOwned,
 {
     let response =
         forward_group_read_to_leader(placement, leader_node, stream_id, now_ms, read).await?;
     if response.ok {
-        let payload = P::decode(response.payload).map_err(|err| {
-            GroupEngineError::new(format!("decode forwarded {what} response: {err}"))
-        })?;
-        from_proto(payload)
+        decode_wire(&response.payload, what)
     } else {
-        let err = raft_app_proto::GroupEngineErrorV1::decode(response.payload).map_err(|err| {
-            GroupEngineError::new(format!("decode forwarded {what} error: {err}"))
-        })?;
-        Err(group_engine_error_from_proto(err)?)
+        Err(decode_wire::<GroupEngineError>(&response.payload, what)?)
     }
 }
 
@@ -214,7 +200,6 @@ pub(crate) async fn write_commands_on_raft(
         .map(logical_group_write_command_count)
         .sum::<usize>();
     let submit_started_at = Instant::now();
-    let commands = commands.into_iter().map(Into::into).collect::<Vec<_>>();
     let mut stream = match raft.client_write_many(commands).await {
         Ok(stream) => stream,
         Err(err) => {
@@ -257,7 +242,7 @@ pub(crate) async fn write_commands_on_raft(
             }
         };
         let response = match result {
-            Ok(response) => group_write_result_from_raft_response(response.response)?,
+            Ok(response) => write_result_from_raft_response(response.response)?,
             Err(err) => Err(group_engine_forward_to_leader_error(
                 format!("OpenRaft client_write_many forwarded to leader: {err}"),
                 err.leader_id,
@@ -289,10 +274,20 @@ pub(crate) async fn write_commands_on_raft(
 
 pub(crate) fn logical_group_write_command_count(command: &GroupWriteCommand) -> usize {
     match command {
-        GroupWriteCommand::Batch { commands } => {
-            commands.iter().map(logical_group_write_command_count).sum()
-        }
-        _ => 1,
+        GroupWriteCommand::Batch { commands } => commands.len(),
+        GroupWriteCommand::Stream(_) => 1,
+    }
+}
+
+/// Unwraps a raft-applied response into the write outcome it carries.
+pub(crate) fn write_result_from_raft_response(
+    response: RaftGroupResponse,
+) -> Result<Result<GroupWriteResponse, GroupEngineError>, GroupEngineError> {
+    match response {
+        RaftGroupResponse::Write(result) => Ok(result),
+        other @ (RaftGroupResponse::Blank | RaftGroupResponse::Membership) => Err(
+            GroupEngineError::new(format!("unexpected OpenRaft write response: {other:?}")),
+        ),
     }
 }
 
