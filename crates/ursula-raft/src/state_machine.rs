@@ -338,14 +338,6 @@ impl RaftGroupStateMachine {
         self.engine.plan_cold_flush(request, placement).await
     }
 
-    pub async fn plan_next_cold_flush(
-        &mut self,
-        request: PlanGroupColdFlushRequest,
-        placement: ShardPlacement,
-    ) -> Result<Option<ColdFlushCandidate>, GroupEngineError> {
-        self.engine.plan_next_cold_flush(request, placement).await
-    }
-
     pub async fn plan_next_cold_flush_batch(
         &mut self,
         request: PlanGroupColdFlushRequest,
@@ -724,6 +716,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(madsim))]
     use bytes::Bytes;
 
     use super::*;

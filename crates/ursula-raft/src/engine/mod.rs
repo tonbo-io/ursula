@@ -54,7 +54,6 @@ use ursula_runtime::GroupInstallSnapshotFuture;
 use ursula_runtime::GroupPlanColdFlushFuture;
 use ursula_runtime::GroupPlanColdGcFuture;
 use ursula_runtime::GroupPlanNextColdFlushBatchFuture;
-use ursula_runtime::GroupPlanNextColdFlushFuture;
 use ursula_runtime::GroupPublishSnapshotFuture;
 use ursula_runtime::GroupReadSnapshotFuture;
 use ursula_runtime::GroupReadStreamFuture;
@@ -565,26 +564,18 @@ impl GroupEngine for RaftGroupEngine {
     fn create_stream<'a>(
         &'a mut self,
         request: CreateStreamRequest,
-        _placement: ShardPlacement,
-    ) -> GroupCreateStreamFuture<'a> {
-        Box::pin(async move {
-            match self.write(GroupWriteCommand::from(request)).await? {
-                GroupWriteResponse::CreateStream(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected create stream write response: {other:?}"
-                ))),
-            }
-        })
-    }
-
-    fn create_stream_with_cold_admission<'a>(
-        &'a mut self,
-        request: CreateStreamRequest,
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> GroupCreateStreamFuture<'a> {
         if admission.max_hot_bytes_per_group.is_none() {
-            return self.create_stream(request, placement);
+            return Box::pin(async move {
+                match self.write(GroupWriteCommand::from(request)).await? {
+                    GroupWriteResponse::CreateStream(response) => Ok(response),
+                    other => Err(GroupEngineError::new(format!(
+                        "unexpected create stream write response: {other:?}"
+                    ))),
+                }
+            });
         }
         Box::pin(async move {
             let command = GroupWriteCommand::from(request.clone());
@@ -904,21 +895,6 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
-    fn plan_next_cold_flush<'a>(
-        &'a mut self,
-        request: PlanGroupColdFlushRequest,
-        placement: ShardPlacement,
-    ) -> GroupPlanNextColdFlushFuture<'a> {
-        Box::pin(async move {
-            self.with_state_machine(move |state_machine| {
-                Box::pin(
-                    async move { state_machine.plan_next_cold_flush(request, placement).await },
-                )
-            })
-            .await?
-        })
-    }
-
     fn plan_next_cold_flush_batch<'a>(
         &'a mut self,
         request: PlanGroupColdFlushRequest,
@@ -1022,32 +998,6 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
-    fn append<'a>(
-        &'a mut self,
-        request: AppendRequest,
-        _placement: ShardPlacement,
-    ) -> GroupAppendFuture<'a> {
-        Box::pin(async move {
-            let command = GroupWriteCommand::from(request.clone());
-            if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
-                return match response {
-                    GroupWriteResponse::Append(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected append write response: {other:?}"
-                    ))),
-                };
-            }
-            self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
-                .await?;
-            match self.write(GroupWriteCommand::from(request)).await? {
-                GroupWriteResponse::Append(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected append write response: {other:?}"
-                ))),
-            }
-        })
-    }
-
     fn append_external<'a>(
         &'a mut self,
         request: AppendExternalRequest,
@@ -1101,15 +1051,12 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
-    fn append_with_cold_admission<'a>(
+    fn append<'a>(
         &'a mut self,
         request: AppendRequest,
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> GroupAppendFuture<'a> {
-        if admission.max_hot_bytes_per_group.is_none() {
-            return self.append(request, placement);
-        }
         Box::pin(async move {
             let command = GroupWriteCommand::from(request.clone());
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
@@ -1122,17 +1069,19 @@ impl GroupEngine for RaftGroupEngine {
             }
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
-            self.with_state_machine({
-                let request = request.clone();
-                move |state_machine| {
-                    Box::pin(async move {
-                        state_machine
-                            .check_append_cold_admission(request, placement, admission)
-                            .await
-                    })
-                }
-            })
-            .await??;
+            if admission.max_hot_bytes_per_group.is_some() {
+                self.with_state_machine({
+                    let request = request.clone();
+                    move |state_machine| {
+                        Box::pin(async move {
+                            state_machine
+                                .check_append_cold_admission(request, placement, admission)
+                                .await
+                        })
+                    }
+                })
+                .await??;
+            }
             match self.write(GroupWriteCommand::from(request)).await? {
                 GroupWriteResponse::Append(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
@@ -1145,44 +1094,9 @@ impl GroupEngine for RaftGroupEngine {
     fn append_batch<'a>(
         &'a mut self,
         request: AppendBatchRequest,
-        _placement: ShardPlacement,
-    ) -> GroupAppendBatchFuture<'a> {
-        Box::pin(async move {
-            let command = GroupWriteCommand::from(request.clone());
-            if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
-                return match response {
-                    GroupWriteResponse::AppendBatch(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected append batch write response: {other:?}"
-                    ))),
-                };
-            }
-            self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
-                .await?;
-            let mut responses = self
-                .write_commands(vec![GroupWriteCommand::from(request)])
-                .await?;
-            let response = responses.pop().ok_or_else(|| {
-                GroupEngineError::new("OpenRaft append batch returned no response")
-            })?;
-            match response? {
-                GroupWriteResponse::AppendBatch(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected append batch write response: {other:?}"
-                ))),
-            }
-        })
-    }
-
-    fn append_batch_with_cold_admission<'a>(
-        &'a mut self,
-        request: AppendBatchRequest,
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> GroupAppendBatchFuture<'a> {
-        if admission.max_hot_bytes_per_group.is_none() {
-            return self.append_batch(request, placement);
-        }
         Box::pin(async move {
             let command = GroupWriteCommand::from(request.clone());
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
@@ -1195,17 +1109,19 @@ impl GroupEngine for RaftGroupEngine {
             }
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
-            self.with_state_machine({
-                let request = request.clone();
-                move |state_machine| {
-                    Box::pin(async move {
-                        state_machine
-                            .check_append_batch_cold_admission(request, placement, admission)
-                            .await
-                    })
-                }
-            })
-            .await??;
+            if admission.max_hot_bytes_per_group.is_some() {
+                self.with_state_machine({
+                    let request = request.clone();
+                    move |state_machine| {
+                        Box::pin(async move {
+                            state_machine
+                                .check_append_batch_cold_admission(request, placement, admission)
+                                .await
+                        })
+                    }
+                })
+                .await??;
+            }
             let mut responses = self
                 .write_commands(vec![GroupWriteCommand::from(request)])
                 .await?;
@@ -1221,7 +1137,7 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
-    fn append_batch_many_with_cold_admission<'a>(
+    fn append_batch_many<'a>(
         &'a mut self,
         requests: Vec<AppendBatchRequest>,
         placement: ShardPlacement,

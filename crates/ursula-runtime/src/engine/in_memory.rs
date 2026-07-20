@@ -38,7 +38,6 @@ use super::GroupInstallSnapshotFuture;
 use super::GroupPlanColdFlushFuture;
 use super::GroupPlanColdGcFuture;
 use super::GroupPlanNextColdFlushBatchFuture;
-use super::GroupPlanNextColdFlushFuture;
 use super::GroupPublishSnapshotFuture;
 use super::GroupReadSnapshotFuture;
 use super::GroupReadStreamFuture;
@@ -1421,7 +1420,13 @@ impl GroupEngine for InMemoryGroupEngine {
         &'a mut self,
         request: CreateStreamRequest,
         placement: ShardPlacement,
+        admission: ColdWriteAdmission,
     ) -> GroupCreateStreamFuture<'a> {
+        if admission.is_enabled() {
+            return Box::pin(async move {
+                self.create_stream_with_admission_inner(request, placement, admission)
+            });
+        }
         let command = GroupWriteCommand::from(request);
         Box::pin(async move {
             match self.apply_committed_write(command, placement)? {
@@ -1431,20 +1436,6 @@ impl GroupEngine for InMemoryGroupEngine {
                 ))),
             }
         })
-    }
-
-    fn create_stream_with_cold_admission<'a>(
-        &'a mut self,
-        request: CreateStreamRequest,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> GroupCreateStreamFuture<'a> {
-        if !admission.is_enabled() {
-            return self.create_stream(request, placement);
-        }
-        Box::pin(
-            async move { self.create_stream_with_admission_inner(request, placement, admission) },
-        )
     }
 
     fn create_stream_external<'a>(
@@ -1751,7 +1742,13 @@ impl GroupEngine for InMemoryGroupEngine {
         &'a mut self,
         request: AppendRequest,
         placement: ShardPlacement,
+        admission: ColdWriteAdmission,
     ) -> GroupAppendFuture<'a> {
+        if admission.is_enabled() {
+            return Box::pin(async move {
+                self.append_with_admission_inner(request, placement, admission)
+            });
+        }
         Box::pin(async move {
             self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
             let command = GroupWriteCommand::from(request);
@@ -1762,18 +1759,6 @@ impl GroupEngine for InMemoryGroupEngine {
                 ))),
             }
         })
-    }
-
-    fn append_with_cold_admission<'a>(
-        &'a mut self,
-        request: AppendRequest,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> GroupAppendFuture<'a> {
-        if !admission.is_enabled() {
-            return self.append(request, placement);
-        }
-        Box::pin(async move { self.append_with_admission_inner(request, placement, admission) })
     }
 
     fn append_external<'a>(
@@ -1818,7 +1803,13 @@ impl GroupEngine for InMemoryGroupEngine {
         &'a mut self,
         request: AppendBatchRequest,
         placement: ShardPlacement,
+        admission: ColdWriteAdmission,
     ) -> GroupAppendBatchFuture<'a> {
+        if admission.is_enabled() {
+            return Box::pin(async move {
+                self.append_batch_with_admission_inner(request, placement, admission)
+            });
+        }
         Box::pin(async move {
             self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
             let command = GroupWriteCommand::from(request);
@@ -1829,20 +1820,6 @@ impl GroupEngine for InMemoryGroupEngine {
                 ))),
             }
         })
-    }
-
-    fn append_batch_with_cold_admission<'a>(
-        &'a mut self,
-        request: AppendBatchRequest,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> GroupAppendBatchFuture<'a> {
-        if !admission.is_enabled() {
-            return self.append_batch(request, placement);
-        }
-        Box::pin(
-            async move { self.append_batch_with_admission_inner(request, placement, admission) },
-        )
     }
 
     fn flush_cold<'a>(
@@ -1904,19 +1881,6 @@ impl GroupEngine for InMemoryGroupEngine {
                     request.min_hot_bytes,
                     request.max_flush_bytes,
                 )
-                .map_err(stream_response_error)
-        })
-    }
-
-    fn plan_next_cold_flush<'a>(
-        &'a mut self,
-        request: PlanGroupColdFlushRequest,
-        _placement: ShardPlacement,
-    ) -> GroupPlanNextColdFlushFuture<'a> {
-        Box::pin(async move {
-            self.state_machine
-                .plan_next_cold_flush_batch(request.min_hot_bytes, request.max_flush_bytes, 1)
-                .map(|candidates| candidates.into_iter().next())
                 .map_err(stream_response_error)
         })
     }
