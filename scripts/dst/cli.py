@@ -9,7 +9,7 @@ Subcommand list (verb-first, flat namespace):
     pipeline-smoke      DoD #2 — corrupt_*_expectation only in pipeline-smoke families
     layer2              DoD #4 — Layer 2 has failpoints or is doc-retired
     ci-shape            DoD #6 — no multi-element strict-equality jq step matches
-    modularity          DoD #3 — sub-mod scaffold + ratcheting line budget
+    modularity          DoD #3 — ratcheting line budget on madsim_harness/mod.rs
     seed-inventory      DoD #7 + family discipline + per-track seed budget
     failure-guards      every failure-smoke entry has fresh PR CI coverage
     all                 run every audit
