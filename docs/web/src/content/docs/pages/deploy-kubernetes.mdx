@@ -10,8 +10,23 @@ powered by `ursulactl`, together with soft multi-pod spread hints.
 
 The chart is for fresh static-membership clusters. It does not perform online
 Raft voter expansion, voter removal, leader handoff during Kubernetes rolling
-updates, or post-bootstrap membership flag mutation. Those operations belong to
-the future Ursula operator workflow.
+updates, or dynamic voter reconfiguration. Those operations belong to the
+future Ursula operator workflow.
+
+## Production EKS with OpenTofu
+
+The repository includes an OpenTofu reference stack under `deploy/eks`. It provisions a three-AZ VPC and EKS cluster, one managed node group per zone, the EBS CSI and Pod Identity add-ons, an encrypted `gp3` StorageClass, a versioned S3 bucket, and separate least-privilege identities for Ursula and the event-time indexer. It writes the complete Helm input to `generated-values.yaml` and configures kubectl.
+
+After copying and editing `deploy/eks/terraform.tfvars.example`, the complete deployment path is:
+
+```bash
+cd deploy/eks
+./provision.sh
+helm install ursula ../../charts/ursula --namespace ursula --create-namespace -f generated-values.yaml
+helm test ursula --namespace ursula
+```
+
+See [`deploy/eks/README.md`](https://github.com/tonbo-io/ursula/tree/main/deploy/eks) for input, cost, state, API CIDR, and teardown guidance. OpenTofu owns AWS prerequisites; Helm owns namespace-scoped Ursula workloads.
 
 ## Install
 
@@ -62,25 +77,9 @@ The test mounts the chart-generated `cluster-manifest.json` and runs
 `ursulactl wait-ready`. It succeeds only when every configured node reports the
 expected Raft group count and every group has a leader.
 
-## Finish bootstrap
+## Bootstrap behavior
 
-Fresh clusters start with `raft.initMembershipPerGroup=true` so Ursula can
-initialize per-group Raft membership automatically. After `helm test` passes,
-update your values and run:
-
-```bash
-helm upgrade ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.2.0 \
-  --reuse-values \
-  --set raft.initMembershipPerGroup=false
-```
-
-Use the same chart source you installed from (`charts/ursula` for a local
-build). If you do not use `--reuse-values`, repeat your image overrides or use
-a values file so the upgrade does not roll pods back to the chart default
-image.
-
-Keep this value false for normal restarts and upgrades. A future Kubernetes
-operator will own this transition automatically.
+Fresh clusters start with `raft.initMembershipPerGroup=true` so Ursula can initialize per-group Raft membership automatically. Membership initialization first checks the durable Raft log and is idempotent after a group has initialized, so persistent `logDir` deployments can keep this value enabled across restarts and upgrades. The static-cluster integration suite exercises a durable restart with per-group bootstrap still enabled. Memory-backed clusters retain their separate restart guard because they cannot recover a lost Raft log.
 
 ## Static membership
 
@@ -100,7 +99,7 @@ waits for catch-up, promotes voters, and removes old voters.
 - Use separate workload identities and non-overlapping S3 prefixes for the Ursula storage plane and each indexer security boundary.
 - Spread replicas across zones and nodes, and alert on Raft readiness, S3 failures, indexer blocked state and lag, object growth, PVC pressure, and restarts.
 
-The chart supplies conservative defaults and rejects several unsafe configurations, but it is not yet an operator: turning off bootstrap membership, drain-aware voter upgrades, backups, restore drills, capacity planning, IAM policy, ingress authentication, and alert routing remain deployment responsibilities.
+The chart supplies conservative defaults and rejects several unsafe configurations, but it is not yet an operator: drain-aware voter upgrades, backups, restore drills, capacity planning, ingress authentication, and alert routing remain deployment responsibilities. The EKS OpenTofu stack supplies IAM and storage prerequisites for its reference topology.
 
 ## Cold storage
 

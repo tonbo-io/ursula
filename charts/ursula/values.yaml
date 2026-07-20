@@ -102,7 +102,7 @@ raft:
   groupCount: 64
   # Fresh-cluster bootstrap flag. Set to false after the first successful ready.
   initMembership: false
-  # Fresh-cluster per-group bootstrap flag. Set to false after the first successful ready.
+  # Idempotent per-group bootstrap flag. Persistent groups may keep this enabled across restarts.
   initMembershipPerGroup: true
   # Storage mode: logDir for durable Raft logs, memory for ephemeral tests.
   storageMode: logDir

@@ -150,7 +150,7 @@ async fn cli_static_grpc_raft_cluster_forwards_follower_writes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cli_static_grpc_raft_log_dir_recovers_after_restart() {
+async fn cli_static_grpc_raft_log_dir_recovers_with_bootstrap_enabled_after_restart() {
     let _guard = static_cluster_cli_test_guard().await;
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
         tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping CLI durable restart smoke test");
@@ -195,7 +195,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_after_restart() {
         "core journal should contain records"
     );
 
-    write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, false, &log_dir);
+    write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, true, &log_dir);
     {
         let mut child = spawn_node_with_cluster_config(binary, &config_path);
         let client = reqwest::Client::new();
@@ -943,7 +943,7 @@ fn write_single_node_cluster_config(
     init_membership: bool,
     log_dir: &Path,
 ) -> u16 {
-    write_cluster_config(
+    let admin_port = write_cluster_config(
         path,
         port,
         node_id,
@@ -951,7 +951,17 @@ fn write_single_node_cluster_config(
         &[(node_id, base_url.to_owned())],
         init_membership,
         log_dir,
+    );
+    let config = std::fs::read_to_string(path).expect("read single-node cluster config");
+    std::fs::write(
+        path,
+        config.replace(
+            "init_membership_per_group = false",
+            "init_membership_per_group = true",
+        ),
     )
+    .expect("enable per-group membership initialization");
+    admin_port
 }
 
 fn write_cluster_config(

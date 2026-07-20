@@ -17,6 +17,33 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  infrastructure:
+    name: OpenTofu and Helm
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: 1.12.4
+
+      - name: Validate EKS prerequisites
+        run: |
+          tofu fmt -check -recursive deploy/eks
+          tofu -chdir=deploy/eks init -backend=false
+          tofu -chdir=deploy/eks validate
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Validate Helm chart
+        run: |
+          helm lint charts/ursula
+          helm template ursula charts/ursula --namespace ursula -f charts/ursula/examples/production-eks.yaml >/dev/null
+          python3 scripts/helm_template_test.py
+
   rust-lint:
     name: Rust lint
     runs-on: ubuntu-24.04
