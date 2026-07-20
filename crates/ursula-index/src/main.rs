@@ -1085,7 +1085,14 @@ async fn livez() -> StatusCode {
 async fn readyz(State(state): State<SingleAppState>) -> StatusCode {
     let mut index = state.index.lock().await;
     match index.refresh().await {
-        Ok(()) if matches!(index.status(), IndexStatus::Ready) => StatusCode::NO_CONTENT,
+        Ok(())
+            if matches!(
+                index.status(),
+                IndexStatus::Ready | IndexStatus::Blocked { .. }
+            ) =>
+        {
+            StatusCode::NO_CONTENT
+        }
         Ok(()) | Err(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
@@ -1297,7 +1304,8 @@ mod tests {
                 record: 1,
             })
             .await?;
-        let app = build_router(Arc::new(Mutex::new(index)));
+        let index = Arc::new(Mutex::new(index));
+        let app = build_router(Arc::clone(&index));
         let response = app
             .oneshot(
                 Request::builder()
@@ -1332,7 +1340,8 @@ mod tests {
             },
         )
         .await?;
-        let app = build_router(Arc::new(Mutex::new(index)));
+        let index = Arc::new(Mutex::new(index));
+        let app = build_router(Arc::clone(&index));
 
         let response = app
             .clone()
@@ -1345,6 +1354,26 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
+        index
+            .lock()
+            .await
+            .mark_blocked(0, "operator repair required".to_owned())
+            .await?;
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/status/resume")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
         let response = app
             .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
             .await?;
