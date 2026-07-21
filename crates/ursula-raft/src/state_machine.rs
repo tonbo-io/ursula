@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io;
 use std::io::Cursor;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -16,6 +18,8 @@ use openraft::alias::StoredMembershipOf;
 use openraft::storage::EntryResponder;
 use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
+use serde::Deserialize;
+use serde::Serialize;
 use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::BootstrapStreamRequest;
@@ -207,6 +211,13 @@ pub struct RaftGroupStateMachine {
     pub(crate) snapshot_store: SharedSnapshotStore,
     pub(crate) snapshot_build: SnapshotBuildCoordinator,
     pub(crate) snapshot_install: SnapshotInstallCoordinator,
+    snapshot_metadata_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedSnapshot {
+    meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
+    pointer_bytes: Vec<u8>,
 }
 
 impl RaftGroupStateMachine {
@@ -242,6 +253,7 @@ impl RaftGroupStateMachine {
             snapshot_store,
             SnapshotBuildCoordinator::default(),
             SnapshotInstallCoordinator::default(),
+            None,
         )
     }
 
@@ -252,6 +264,7 @@ impl RaftGroupStateMachine {
         snapshot_store: SharedSnapshotStore,
         snapshot_build: SnapshotBuildCoordinator,
         snapshot_install: SnapshotInstallCoordinator,
+        snapshot_metadata_path: Option<PathBuf>,
     ) -> Self {
         Self {
             placement,
@@ -266,7 +279,42 @@ impl RaftGroupStateMachine {
             snapshot_store,
             snapshot_build,
             snapshot_install,
+            snapshot_metadata_path,
         }
+    }
+
+    pub(crate) async fn restore_persisted_snapshot(&mut self) -> Result<(), io::Error> {
+        let Some(path) = &self.snapshot_metadata_path else {
+            return Ok(());
+        };
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let persisted = serde_json::from_slice::<PersistedSnapshot>(&std::fs::read(path)?)
+            .map_err(invalid_data)?;
+        let pointer = SnapshotPointer::decode(&persisted.pointer_bytes)
+            .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
+        let snapshot_bytes = match &pointer.location {
+            SnapshotLocation::Inline { bytes } => bytes.clone(),
+            location => self
+                .snapshot_store
+                .download(location)
+                .await
+                .map_err(|err| err.into_io())?,
+        };
+        let group_snapshot = decode_group_snapshot(&snapshot_bytes).map_err(|err| err.into_io())?;
+        self.engine
+            .install_snapshot(group_snapshot)
+            .await
+            .map_err(group_engine_io_error)?;
+        self.last_applied_log_id = persisted.meta.last_log_id;
+        self.last_membership = persisted.meta.last_membership.clone();
+        *self.current_snapshot.lock().expect("snapshot mutex") = Some(CurrentSnapshot {
+            meta: persisted.meta,
+            pointer_bytes: persisted.pointer_bytes,
+        });
+        Ok(())
     }
 
     pub async fn group_snapshot(&mut self) -> Result<GroupSnapshot, io::Error> {
@@ -532,6 +580,7 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             snapshot_store: self.snapshot_store.clone(),
             metrics: self.metrics.clone(),
             _build_permit: build_permit,
+            snapshot_metadata_path: self.snapshot_metadata_path.clone(),
         }
     }
 
@@ -570,6 +619,7 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             .install_snapshot(group_snapshot)
             .await
             .map_err(group_engine_io_error)?;
+        persist_snapshot_metadata(self.snapshot_metadata_path.as_deref(), meta, &pointer_bytes)?;
         self.last_applied_log_id = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
         *self.current_snapshot.lock().expect("snapshot mutex") = Some(CurrentSnapshot {
@@ -602,6 +652,7 @@ pub struct RaftGroupSnapshotBuilder {
     snapshot_store: SharedSnapshotStore,
     metrics: Option<GroupEngineMetrics>,
     _build_permit: OwnedSemaphorePermit,
+    snapshot_metadata_path: Option<PathBuf>,
 }
 
 impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
@@ -664,6 +715,11 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             location,
         };
         let pointer_bytes = pointer.encode().map_err(|err| err.into_io())?;
+        persist_snapshot_metadata(
+            self.snapshot_metadata_path.as_deref(),
+            &self.meta,
+            &pointer_bytes,
+        )?;
         let external_upload = !matches!(pointer.location, SnapshotLocation::Inline { .. });
         let inline_fallback = !external_upload;
         if let Some(metrics) = &self.metrics {
@@ -704,6 +760,39 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             snapshot: Cursor::new(pointer_bytes),
         })
     }
+}
+
+fn persist_snapshot_metadata(
+    path: Option<&Path>,
+    meta: &SnapshotMetaOf<UrsulaRaftTypeConfig>,
+    pointer_bytes: &[u8],
+) -> Result<(), io::Error> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let encoded = serde_json::to_vec(&PersistedSnapshot {
+        meta: meta.clone(),
+        pointer_bytes: pointer_bytes.to_vec(),
+    })
+    .map_err(invalid_data)?;
+    let temporary = path.with_extension("json.tmp");
+    {
+        use std::io::Write;
+
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&temporary, path)?;
+    if let Some(parent) = path.parent()
+        && let Ok(directory) = std::fs::File::open(parent)
+    {
+        directory.sync_all()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -759,6 +848,62 @@ mod tests {
 
     #[cfg(not(madsim))]
     #[tokio::test]
+    async fn persisted_snapshot_restores_state_machine_before_log_replay() {
+        use ursula_shard::CoreId;
+        use ursula_shard::RaftGroupId;
+        use ursula_shard::ShardId;
+
+        let placement = ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: RaftGroupId(7),
+        };
+        let directory =
+            std::env::temp_dir().join(format!("ursula-persisted-snapshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("snapshot metadata directory");
+        let metadata_path = directory.join("group-7.snapshot.json");
+        let current_snapshot = Arc::new(Mutex::new(None));
+        let mut builder = RaftGroupSnapshotBuilder {
+            placement,
+            snapshot: test_group_snapshot(placement, 42),
+            meta: test_snapshot_meta(42),
+            current_snapshot,
+            snapshot_store: default_snapshot_store(),
+            metrics: None,
+            _build_permit: test_build_permit().await,
+            snapshot_metadata_path: Some(metadata_path.clone()),
+        };
+        builder.build_snapshot().await.expect("persist snapshot");
+
+        let mut restored = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+            placement,
+            None,
+            None,
+            default_snapshot_store(),
+            SnapshotBuildCoordinator::default(),
+            SnapshotInstallCoordinator::default(),
+            Some(metadata_path),
+        );
+        restored
+            .restore_persisted_snapshot()
+            .await
+            .expect("restore persisted snapshot");
+
+        assert_eq!(restored.last_applied_log_id, Some(test_log_id(42)));
+        assert_eq!(
+            restored
+                .group_snapshot()
+                .await
+                .expect("snapshot restored state")
+                .group_commit_index,
+            42
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
     async fn snapshot_builder_keeps_external_snapshots_referenced_by_published_pointers() {
         use std::sync::Arc;
 
@@ -791,6 +936,7 @@ mod tests {
             snapshot_store: snapshot_store.clone(),
             metrics: None,
             _build_permit: test_build_permit().await,
+            snapshot_metadata_path: None,
         };
         let first_snapshot = first.build_snapshot().await.expect("first snapshot");
         let first_pointer =
@@ -804,6 +950,7 @@ mod tests {
             snapshot_store: snapshot_store.clone(),
             metrics: None,
             _build_permit: test_build_permit().await,
+            snapshot_metadata_path: None,
         };
         let second_snapshot = second.build_snapshot().await.expect("second snapshot");
         let second_pointer = SnapshotPointer::decode(&second_snapshot.snapshot.into_inner())
@@ -834,6 +981,7 @@ mod tests {
             snapshot_store,
             metrics: None,
             _build_permit: test_build_permit().await,
+            snapshot_metadata_path: None,
         };
         let third_snapshot = third.build_snapshot().await.expect("third snapshot");
         let third_pointer =
@@ -912,6 +1060,7 @@ mod tests {
             snapshot_store: Arc::new(FailingSnapshotStore),
             metrics: None,
             _build_permit: test_build_permit().await,
+            snapshot_metadata_path: None,
         };
 
         let snapshot = builder.build_snapshot().await.expect("inline fallback");
