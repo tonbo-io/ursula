@@ -973,8 +973,16 @@ impl InMemoryGroupEngine {
                     let segment_end = segment
                         .read_start_offset
                         .saturating_add(u64::try_from(segment.len).expect("read len fits u64"));
+                    let mut cursor = segment.read_start_offset;
                     for object in objects {
-                        let start = object.start_offset.max(segment.read_start_offset);
+                        // A retried cold flush can leave overlapping objects in
+                        // an index page. They describe the same byte range, so
+                        // materialize each byte once while still using the
+                        // original object start for range addressing.
+                        let start = object
+                            .start_offset
+                            .max(segment.read_start_offset)
+                            .max(cursor);
                         let end = object.end_offset.min(segment_end);
                         if start >= end {
                             continue;
@@ -989,6 +997,7 @@ impl InMemoryGroupEngine {
                             .await
                             .map_err(|err| GroupEngineError::new(err.to_string()))?;
                         payload.extend_from_slice(&bytes);
+                        cursor = end;
                     }
                 }
                 StreamReadSegment::Object(segment) => {

@@ -20,6 +20,8 @@ use ursula_stream::ExternalPayloadRef;
 use ursula_stream::ObjectPayloadRef;
 use ursula_stream::StreamAttrs;
 use ursula_stream::StreamCommand;
+use ursula_stream::StreamReadColdIndexSegment;
+use ursula_stream::StreamReadPlan;
 use ursula_stream::StreamReadSegment;
 use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamStateMachine;
@@ -490,6 +492,65 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
     assert_eq!(read.payload, b"cdef");
     assert_eq!(read.next_offset, 6);
     assert!(read.up_to_date);
+}
+
+#[tokio::test]
+async fn cold_index_read_materializes_overlapping_flush_objects_once() {
+    let stream = BucketStreamId::new("benchcmp", "overlapping-cold-read");
+    let cold_store = Arc::new(memory_cold_store());
+    let first = ColdChunkRef {
+        start_offset: 0,
+        end_offset: 4,
+        s3_path: "benchcmp/overlapping-cold-read/chunks/first.bin".to_owned(),
+        object_size: 4,
+    };
+    let second = ColdChunkRef {
+        start_offset: 2,
+        end_offset: 6,
+        s3_path: "benchcmp/overlapping-cold-read/chunks/second.bin".to_owned(),
+        object_size: 4,
+    };
+    cold_store
+        .write_chunk(&first.s3_path, b"abcd")
+        .await
+        .expect("write first cold object");
+    cold_store
+        .write_chunk(&second.s3_path, b"cdef")
+        .await
+        .expect("write second cold object");
+    let page_store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+    write_cold_chunk_index_pages(&page_store, &stream, &first)
+        .await
+        .expect("index first cold object");
+    write_cold_chunk_index_pages(&page_store, &stream, &second)
+        .await
+        .expect("index overlapping cold object");
+    let cache = Arc::new(ColdIndexPageCache::new(Arc::new(page_store), 8));
+    let plan = StreamReadPlan {
+        offset: 0,
+        next_offset: 6,
+        content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+        segments: vec![StreamReadSegment::ColdIndex(StreamReadColdIndexSegment {
+            generation: 0,
+            page_id: 0,
+            read_start_offset: 0,
+            len: 6,
+        })],
+        up_to_date: true,
+        closed: false,
+        retained_record_range: None,
+        record_range: None,
+    };
+
+    let payload = InMemoryGroupEngine::read_payload_from_plan(
+        Some(&cold_store),
+        Some(&cache),
+        &stream,
+        &plan,
+    )
+    .await
+    .expect("materialize overlapping cold objects");
+    assert_eq!(payload, b"abcdef");
 }
 
 #[tokio::test]
