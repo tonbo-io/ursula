@@ -49,6 +49,7 @@ pub struct RaftEngineConfig {
     pub memory_bootstrap_marker_dir: Option<PathBuf>,
     pub grpc_reconnect_after_failures: u32,
     pub snapshot_build_max_concurrency: usize,
+    pub max_in_snapshot_log_to_keep: u64,
 }
 
 impl Default for RaftEngineConfig {
@@ -63,6 +64,7 @@ impl Default for RaftEngineConfig {
             memory_bootstrap_marker_dir: None,
             grpc_reconnect_after_failures: 8,
             snapshot_build_max_concurrency: 1,
+            max_in_snapshot_log_to_keep: 64,
         }
     }
 }
@@ -81,6 +83,7 @@ impl From<&ursula_config::RaftConfig> for RaftEngineConfig {
             grpc_reconnect_after_failures: u32::try_from(cfg.grpc_reconnect_after_failures)
                 .expect("config validation ensures grpc_reconnect_after_failures fits u32"),
             snapshot_build_max_concurrency: cfg.snapshot_build_max_concurrency,
+            max_in_snapshot_log_to_keep: cfg.max_in_snapshot_log_to_keep,
         }
     }
 }
@@ -653,6 +656,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 election_timeout_min: 1500,
                 election_timeout_max: 3000,
                 install_snapshot_timeout: self.engine_config.install_snapshot_timeout_ms,
+                max_in_snapshot_log_to_keep: self.engine_config.max_in_snapshot_log_to_keep,
                 ..Default::default()
             };
             // With the manual snapshot driver, snapshots are driver-driven and
@@ -839,5 +843,17 @@ mod tests {
             120_000
         );
         assert_eq!(parse_positive_millis(None, 120_000), 120_000);
+    }
+
+    #[test]
+    fn engine_config_uses_bounded_snapshot_log_retention() {
+        let config = ursula_config::RaftConfig {
+            max_in_snapshot_log_to_keep: 128,
+            ..Default::default()
+        };
+
+        let engine_config = RaftEngineConfig::from(&config);
+
+        assert_eq!(engine_config.max_in_snapshot_log_to_keep, 128);
     }
 }

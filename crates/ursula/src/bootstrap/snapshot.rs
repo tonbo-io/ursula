@@ -15,7 +15,7 @@ pub(crate) fn resolve_snapshot_drive_interval_ms(
     configured: Option<usize>,
     snapshot_store_configured: bool,
 ) -> usize {
-    configured.unwrap_or(if snapshot_store_configured { 60_000 } else { 0 })
+    configured.unwrap_or(if snapshot_store_configured { 5_000 } else { 0 })
 }
 
 pub(crate) fn next_snapshot_to_drive(
