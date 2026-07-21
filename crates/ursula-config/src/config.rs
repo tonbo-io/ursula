@@ -402,7 +402,8 @@ impl Default for ColdCacheConfig {
 pub struct RaftSnapshotConfig {
     /// Snapshot store backend.
     pub backend: RaftSnapshotBackend,
-    /// S3 prefix for snapshot objects. Used only when `backend` is `S3`.
+    /// S3 namespace for snapshot objects, relative to the cold-storage root.
+    /// Used only when `backend` is `S3`.
     pub s3_prefix: Option<String>,
     /// Interval for the manual snapshot driver.
     ///
