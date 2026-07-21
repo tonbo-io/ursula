@@ -35,6 +35,13 @@ data "aws_iam_policy_document" "status" {
   }
 
   statement {
+    sid       = "ListPublishedStatus"
+    effect    = "Allow"
+    actions   = ["s3:ListBucket"]
+    resources = ["arn:aws:s3:::${var.status_bucket}"]
+  }
+
+  statement {
     sid       = "PublishChaosStatus"
     effect    = "Allow"
     actions   = ["s3:GetObject", "s3:PutObject"]
