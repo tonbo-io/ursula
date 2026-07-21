@@ -652,13 +652,9 @@ pub fn snapshot_store_from_config(
         ursula_config::RaftSnapshotBackend::Inline => Ok(None),
         #[cfg(not(madsim))]
         ursula_config::RaftSnapshotBackend::S3 => {
-            let suffix = cfg.s3_prefix.as_deref().unwrap_or("snapshots");
-            let prefix = match cold_cfg.root.as_deref() {
-                Some(root) if !root.trim_matches('/').is_empty() => {
-                    format!("{}/{}", root.trim_matches('/'), suffix.trim_matches('/'))
-                }
-                _ => suffix.trim_matches('/').to_owned(),
-            };
+            // `try_new` configures the OpenDAL operator with `cold_cfg.root`, so
+            // this namespace must stay relative to that root.
+            let prefix = snapshot_namespace(cfg);
             Ok(Some(Arc::new(S3SnapshotStore::try_new(cold_cfg, &prefix)?)))
         }
         #[cfg(madsim)]
@@ -667,6 +663,15 @@ pub fn snapshot_store_from_config(
             cfg.backend
         ))),
     }
+}
+
+#[cfg(not(madsim))]
+fn snapshot_namespace(cfg: &ursula_config::RaftSnapshotConfig) -> String {
+    cfg.s3_prefix
+        .as_deref()
+        .unwrap_or("snapshots")
+        .trim_matches('/')
+        .to_owned()
 }
 
 #[cfg(test)]
@@ -678,6 +683,18 @@ mod tests {
             raft_group_id,
             snapshot_id: snapshot_id.to_owned(),
         }
+    }
+
+    #[cfg(not(madsim))]
+    #[test]
+    fn snapshot_namespace_stays_relative_to_the_cold_root() {
+        let config = ursula_config::RaftSnapshotConfig {
+            backend: ursula_config::RaftSnapshotBackend::S3,
+            s3_prefix: Some("/snapshots/".to_owned()),
+            ..Default::default()
+        };
+
+        assert_eq!(snapshot_namespace(&config), "snapshots");
     }
 
     #[tokio::test]
