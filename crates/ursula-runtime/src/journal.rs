@@ -11,6 +11,7 @@ use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
+use std::io::Read;
 use std::io::Write;
 use std::marker::PhantomData;
 use std::path::Path;
@@ -110,15 +111,59 @@ impl JournalWriter {
 /// crash mid-write is truncated away and ignored, leaving the file at its last clean
 /// record boundary.
 pub fn replay<C: FrameCodec>(path: &Path) -> io::Result<Vec<C::Record>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let bytes = fs::read(path)?;
-    let (records, valid_len) = decode_frames::<C>(&bytes)?;
-    if valid_len < bytes.len() {
-        truncate_to(path, valid_len)?;
-    }
+    let mut records = Vec::new();
+    replay_each::<C>(path, |record| {
+        records.push(record);
+        Ok(())
+    })?;
     Ok(records)
+}
+
+/// Stream every valid record from `path` through `visit` without retaining the
+/// entire journal in memory. A torn trailing frame is truncated with the same
+/// recovery semantics as [`replay`].
+pub fn replay_each<C: FrameCodec>(
+    path: &Path,
+    mut visit: impl FnMut(C::Record) -> io::Result<()>,
+) -> io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut valid_len = 0_u64;
+    while valid_len < file_len {
+        let remaining = file_len.saturating_sub(valid_len);
+        if remaining < 4 {
+            break;
+        }
+
+        let mut len_bytes = [0_u8; 4];
+        file.read_exact(&mut len_bytes)?;
+        let payload_len = u64::from(u32::from_le_bytes(len_bytes));
+        if remaining.saturating_sub(4) < payload_len {
+            break;
+        }
+
+        let payload_len = usize::try_from(payload_len).expect("u32 fits usize");
+        let mut payload = vec![0_u8; payload_len];
+        file.read_exact(&mut payload)?;
+        visit(C::decode(&payload)?)?;
+        valid_len = valid_len
+            .checked_add(4_u64.saturating_add(u64::try_from(payload_len).expect("usize fits u64")))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "journal offset overflow"))?;
+    }
+
+    if valid_len < file_len {
+        truncate_to(
+            path,
+            usize::try_from(valid_len).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "journal offset exceeds usize")
+            })?,
+        )?;
+    }
+    Ok(())
 }
 
 /// Decode framed records from an in-memory buffer, returning the records and the byte
@@ -219,5 +264,25 @@ mod tests {
         assert!(healed_len < torn_len);
         let reread = replay::<JsonCodec<String>>(&path).expect("re-replay");
         assert_eq!(reread, vec!["clean".to_owned()]);
+    }
+
+    #[test]
+    fn replay_each_visits_records_without_collecting_them() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("journal");
+        write_all(&path, &[
+            "first".to_owned(),
+            "second".to_owned(),
+            "third".to_owned(),
+        ]);
+
+        let mut replayed = Vec::new();
+        replay_each::<JsonCodec<String>>(&path, |record| {
+            replayed.push(record);
+            Ok(())
+        })
+        .expect("stream replay");
+
+        assert_eq!(replayed, vec!["first", "second", "third"]);
     }
 }
