@@ -29,6 +29,7 @@ deploy/eks/generated-values.yaml
 deploy/chaos-eks/generated-values.yaml
 deploy/eks/kubeconfig
 deploy/eks/backend.tf
+deploy/chaos-eks/backend.tf
 deploy/eks/terraform.tfvars
 deploy/chaos-eks/terraform.tfvars
 
