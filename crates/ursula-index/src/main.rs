@@ -417,6 +417,14 @@ async fn run_single(args: Args, stream_url: Url) -> anyhow::Result<()> {
 }
 
 impl PoolState {
+    fn namespace(registration: &IndexRegistration) -> String {
+        format!(
+            "{}-{}",
+            registration.id,
+            blake3::hash(registration.stream_url.as_bytes()).to_hex()
+        )
+    }
+
     async fn ensure_index(
         &self,
         registration: &IndexRegistration,
@@ -424,11 +432,7 @@ impl PoolState {
         if let Some(index) = self.indexes.read().await.get(&registration.id).cloned() {
             return Ok(index);
         }
-        let namespace = format!(
-            "{}-{}",
-            registration.id,
-            blake3::hash(registration.stream_url.as_bytes()).to_hex()
-        );
+        let namespace = Self::namespace(registration);
         let config = EventIndexConfig {
             source_id: registration.stream_url.clone(),
             flush_entries: self.settings.flush_entries,
@@ -786,10 +790,47 @@ async fn pool_maintenance_loop(
             maintenance_pass(&mut index, &id, &config, run_gc).await;
         }
         if run_gc {
+            cleanup_retired_indexes(&state, config.gc_grace).await;
             next_gc = next_gc_deadline(config.gc_interval);
         }
         if wait_or_shutdown(config.interval, &mut shutdown).await {
             return Ok(());
+        }
+    }
+}
+
+async fn cleanup_retired_indexes(state: &PoolState, grace: Duration) {
+    let grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
+    let cutoff_ms = wall_clock_millis()
+        .map(|now| now.saturating_sub(grace_ms))
+        .unwrap_or(0);
+    let retired = match state.catalog.retired_before(cutoff_ms).await {
+        Ok(retired) => retired,
+        Err(error) => {
+            tracing::warn!(%error, "failed to load retired event indexes");
+            return;
+        }
+    };
+    for registration in retired {
+        let namespace = PoolState::namespace(&registration);
+        let store = match state.backend.open(&format!("indexes/{namespace}")) {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(index_id = %registration.id, %error, "failed to open retired event index namespace");
+                continue;
+            }
+        };
+        match store.delete_all().await {
+            Ok(deleted_objects) => {
+                if let Err(error) = state.catalog.forget_retired(&registration.id).await {
+                    tracing::warn!(index_id = %registration.id, %error, "retired event index was deleted but its tombstone remains");
+                } else {
+                    tracing::info!(index_id = %registration.id, deleted_objects, "deleted retired event index namespace");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(index_id = %registration.id, %error, "failed to delete retired event index namespace")
+            }
         }
     }
 }
@@ -1159,6 +1200,7 @@ mod tests {
     use super::PoolState;
     use super::StoreTarget;
     use super::build_router;
+    use super::cleanup_retired_indexes;
     use super::is_deterministic_data_error;
     use super::pool_router;
     use super::process_pool_source;
@@ -1409,10 +1451,19 @@ mod tests {
         state.catalog.register(&registration).await?;
         state.ensure_index(&registration).await?;
         assert_eq!(state.indexes.read().await.len(), 1);
+        let current = objects
+            .path()
+            .join("indexes")
+            .join(PoolState::namespace(&registration))
+            .join("CURRENT");
+        assert!(current.exists());
 
         state.catalog.unregister(&registration.id).await?;
         reconcile_pool_indexes(&state).await?;
         assert!(state.indexes.read().await.is_empty());
+        cleanup_retired_indexes(&state, std::time::Duration::ZERO).await;
+        assert!(!current.exists());
+        assert!(state.catalog.retired_before(u64::MAX).await?.is_empty());
         Ok(())
     }
 }
