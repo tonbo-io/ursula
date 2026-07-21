@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::fs;
@@ -834,10 +835,14 @@ fn event_time_partition(captured_at_ms: i64) -> i64 {
 }
 
 fn select_compaction(parts: &[PartMeta], fan_in: usize, max_entries: u64) -> Option<Vec<PartMeta>> {
-    let mut tiers = BTreeMap::<(i64, u8), Vec<&PartMeta>>::new();
+    // Drain higher levels before accepting more work from L0. A continuously
+    // written partition otherwise keeps L0 eligible forever and starves every
+    // higher level, allowing the manifest and its immutable parts to grow
+    // without bound. Within one level, compact older partitions first.
+    let mut tiers = BTreeMap::<(Reverse<u8>, i64), Vec<&PartMeta>>::new();
     for part in parts {
         tiers
-            .entry((part.partition_start_ms, part.level))
+            .entry((Reverse(part.level), part.partition_start_ms))
             .or_default()
             .push(part);
     }
@@ -929,11 +934,38 @@ mod tests {
     use crate::cache::EventIndexCache;
     use crate::index::EventIndex;
     use crate::index::eligible_for_gc;
+    use crate::index::select_compaction;
+    use crate::manifest::PartMeta;
     use crate::object_store::FsObjectStore;
 
     #[test]
     fn missing_modification_time_is_not_eligible_for_gc() {
         assert!(!eligible_for_gc(None, SystemTime::UNIX_EPOCH));
+    }
+
+    #[test]
+    fn compaction_prioritizes_higher_levels_under_continuous_l0_writes() {
+        let mut parts = Vec::new();
+        for level in [0_u8, 1_u8] {
+            for ordinal in 0..8_u64 {
+                parts.push(PartMeta {
+                    key: format!("level-{level}-part-{ordinal}"),
+                    layout_key: format!("level-{level}-layout-{ordinal}"),
+                    level,
+                    partition_start_ms: 0,
+                    entries: 1,
+                    min_captured_at_ms: 0,
+                    max_captured_at_ms: 0,
+                    min_record: ordinal,
+                    max_record: ordinal,
+                    bytes: 1,
+                });
+            }
+        }
+
+        let selected = select_compaction(&parts, 8, 8).expect("both levels are eligible");
+        assert_eq!(selected.len(), 8);
+        assert!(selected.iter().all(|part| part.level == 1));
     }
 
     #[tokio::test]
