@@ -82,6 +82,7 @@ data:
     group_count = {{ .Values.raft.groupCount }}
     init_membership = {{ .Values.raft.initMembership }}
     init_membership_per_group = {{ .Values.raft.initMembershipPerGroup }}
+    max_in_snapshot_log_to_keep = {{ .Values.raft.maxInSnapshotLogToKeep }}
 {{- if not (eq .Values.raft.maxUncommittedBytesPerGroup nil) }}
     max_uncommitted_size_per_group = "{{ .Values.raft.maxUncommittedBytesPerGroup }}"
 {{- end }}

@@ -164,6 +164,9 @@ pub struct RaftConfig {
     pub snapshot_build_max_concurrency: usize,
     /// Max concurrent snapshot installs across all groups on this node.
     pub snapshot_install_max_concurrency: usize,
+    /// Maximum number of payload-bearing Raft log entries retained per group
+    /// after they are covered by a snapshot.
+    pub max_in_snapshot_log_to_keep: u64,
 }
 
 impl Default for RaftConfig {
@@ -188,6 +191,7 @@ impl Default for RaftConfig {
             grpc_reconnect_after_failures: 8,
             snapshot_build_max_concurrency: 1,
             snapshot_install_max_concurrency: 1,
+            max_in_snapshot_log_to_keep: 64,
         }
     }
 }
@@ -408,7 +412,7 @@ pub struct RaftSnapshotConfig {
     /// Interval for the manual snapshot driver.
     ///
     /// When omitted, inline snapshot stores keep the manual driver disabled and
-    /// external snapshot stores use a 60s manual-driver default. Explicit `0s`
+    /// external snapshot stores use a 5s manual-driver default. Explicit `0s`
     /// disables the manual driver and keeps openraft's default auto-policy.
     pub drive_interval: Option<HumanDuration>,
     /// Max concurrent snapshot flushes.
