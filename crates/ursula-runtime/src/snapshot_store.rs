@@ -648,13 +648,18 @@ pub fn snapshot_store_from_config(
     cfg: &ursula_config::RaftSnapshotConfig,
     cold_cfg: &crate::ColdConfig,
 ) -> Result<Option<SharedSnapshotStore>, SnapshotStoreError> {
-    let _ = cold_cfg;
     match cfg.backend {
         ursula_config::RaftSnapshotBackend::Inline => Ok(None),
         #[cfg(not(madsim))]
         ursula_config::RaftSnapshotBackend::S3 => {
-            let prefix = cfg.s3_prefix.as_deref().unwrap_or("snapshots");
-            Ok(Some(Arc::new(S3SnapshotStore::try_new(cold_cfg, prefix)?)))
+            let suffix = cfg.s3_prefix.as_deref().unwrap_or("snapshots");
+            let prefix = match cold_cfg.root.as_deref() {
+                Some(root) if !root.trim_matches('/').is_empty() => {
+                    format!("{}/{}", root.trim_matches('/'), suffix.trim_matches('/'))
+                }
+                _ => suffix.trim_matches('/').to_owned(),
+            };
+            Ok(Some(Arc::new(S3SnapshotStore::try_new(cold_cfg, &prefix)?)))
         }
         #[cfg(madsim)]
         ursula_config::RaftSnapshotBackend::S3 => Err(SnapshotStoreError::Backend(format!(
