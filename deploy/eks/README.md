@@ -1,6 +1,6 @@
 # EKS with OpenTofu
 
-This reference stack provisions the AWS prerequisites for a production-shaped Ursula cluster and writes `generated-values.yaml` plus a dedicated `kubeconfig` for the repository Helm chart. OpenTofu owns the VPC, three private and three public subnets, one managed node group per availability zone, EKS control plane and add-ons, encrypted gp3 storage class, versioned S3 bucket, least-privilege Pod Identity roles, and the Pod Identity associations for Ursula and the event-time indexer.
+This reference stack provisions the AWS prerequisites for a production-shaped Ursula cluster and writes `generated-values.yaml` plus a dedicated `kubeconfig` for the repository Helm chart. OpenTofu owns the VPC, three private and three public subnets, one managed node group per availability zone, EKS control plane and add-ons, encrypted gp3 storage class, versioned S3 bucket, least-privilege IRSA roles for Ursula and the event-time indexer, and Pod Identity for the EBS CSI add-on.
 
 The default topology uses three `m6i.xlarge` on-demand nodes across three availability zones and one NAT gateway per zone. It creates billable AWS resources. Review `tofu plan` and keep `s3_force_destroy=false`.
 
@@ -35,7 +35,7 @@ KUBECONFIG=./kubeconfig helm install ursula ../../charts/ursula --namespace ursu
 KUBECONFIG=./kubeconfig helm test ursula --namespace ursula
 ```
 
-OpenTofu loads the ignored `backend.tf` and `terraform.tfvars` automatically. `tofu apply` writes `generated-values.yaml` and a cluster-specific `kubeconfig`; it never mutates `~/.kube/config`. The kubeconfig uses `aws eks get-token`, so AWS CLI remains a runtime prerequisite for Helm authentication. The generated values use fixed ServiceAccount names that match the EKS Pod Identity associations, enable S3 cold storage and snapshots, create the configured gateway and dynamic indexer worker counts, and use the generated gp3 StorageClass for voter PVCs.
+OpenTofu loads the ignored `backend.tf` and `terraform.tfvars` automatically. `tofu apply` writes `generated-values.yaml` and a cluster-specific `kubeconfig`; it never mutates `~/.kube/config`. The kubeconfig uses `aws eks get-token`, so AWS CLI remains a runtime prerequisite for Helm authentication. The generated values use fixed ServiceAccount names annotated with their IRSA role ARNs, enable S3 cold storage and snapshots, create the configured gateway and dynamic indexer worker counts, and use the generated gp3 StorageClass for voter PVCs.
 
 OpenTofu exposes the small set of capacity decisions that affect AWS or the production baseline: node instance types and counts, voter cores and memory, Raft group count and PVC size, and gateway/indexer replicas. Keep workload-specific or experimental tuning in a second Helm values file passed after `generated-values.yaml`.
 

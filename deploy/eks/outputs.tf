@@ -13,6 +13,9 @@ resource "local_file" "helm_values" {
     serviceAccount = {
       create = true
       name   = local.server_sa
+      annotations = {
+        "eks.amazonaws.com/role-arn" = aws_iam_role.server.arn
+      }
     }
     server = {
       replicaCount = 3
@@ -78,6 +81,9 @@ resource "local_file" "helm_values" {
       serviceAccount = {
         create = true
         name   = local.indexer_sa
+        annotations = {
+          "eks.amazonaws.com/role-arn" = aws_iam_role.indexer.arn
+        }
       }
       podDisruptionBudget = {
         enabled = true

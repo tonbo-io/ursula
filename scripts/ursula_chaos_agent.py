@@ -12,8 +12,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import random
 import re
+import ssl
 import subprocess
 import sys
 import threading
@@ -96,7 +98,12 @@ FAULT_PROFILES = {
     # symptoms to a single subsystem instead of the ens6-bundles-everything
     # blast radius of the legacy network profile.
     "orthogonal": "cluster_netem_delay,cluster_netem_loss,cluster_partition,s3_unavailable",
+    # Kubernetes owns pod restart. Deleting one StatefulSet pod exercises the
+    # same single-voter crash/rejoin path without granting the agent node-level
+    # privileges or coupling it to an EC2 instance lifecycle.
+    "kubernetes": "pod_delete",
 }
+KUBERNETES_FAULT_SCENARIOS = {"pod_delete"}
 # Per-node raft endpoints used to scope netem to inter-node raft traffic.
 # Single-port deployment: raft replication shares the primary interface
 # (ens5) with the client API on :4491, so we target each peer's ens5 IP as a
@@ -401,6 +408,7 @@ def _lower_headers(headers: Any) -> dict[str, str]:
 @dataclass
 class WorkloadStream:
     name: str
+    content_type: str = CONTENT_TYPE
     next_offset: int = 0
     verified_offsets: int = 0
     needs_integrity_resync: bool = False
@@ -426,6 +434,9 @@ class ChaosAgent:
             raise SystemExit("at least one --node is required")
         self.status_file = args.status_file
         self.status_s3_uri = args.status_s3_uri
+        self.fault_backend = args.fault_backend
+        self.kubernetes_namespace = args.kubernetes_namespace or self._service_account_namespace()
+        self.kubernetes_api_url = args.kubernetes_api_url.rstrip("/")
         # Fault transitions publish immediately in addition to the regular
         # cadence, so a point-count limit cannot guarantee a seven-day window.
         # `build_status` prunes this deque by timestamp after every append.
@@ -445,6 +456,13 @@ class ChaosAgent:
             raise SystemExit("--fault-scenarios is required when --fault-profile=custom")
         self.fault_profile = args.fault_profile
         self.fault_scenarios = [scenario.strip() for scenario in fault_scenarios.split(",") if scenario.strip()]
+        if self.fault_backend == "kubernetes":
+            unsupported = sorted(set(self.fault_scenarios) - KUBERNETES_FAULT_SCENARIOS)
+            if unsupported:
+                raise SystemExit(
+                    "unsupported Kubernetes fault scenarios: " + ",".join(unsupported)
+                    + "; use --fault-profile=kubernetes or --fault-scenarios=pod_delete"
+                )
         self.raft_ready_max_lag = max(0, args.raft_ready_max_lag)
         configured_unsupported = sorted(set(self.fault_scenarios) & UNSUPPORTED_QUORUM_LOSS_SCENARIOS)
         if configured_unsupported:
@@ -471,6 +489,13 @@ class ChaosAgent:
         self.old_sample_every = max(1, args.old_sample_every)
         self.started_at = utc_now()
         self.workload_stream_count = max(1, args.stream_count)
+        if args.record_stream_count < 0 or args.record_stream_count > self.workload_stream_count:
+            raise SystemExit("--record-stream-count must be between 0 and --stream-count")
+        self.record_stream_count = args.record_stream_count
+        self.indexer_url = args.indexer_url.rstrip("/")
+        self.index_source_base_url = args.index_source_base_url.rstrip("/")
+        self.index_registration_prefix = args.index_registration_prefix.strip("-")
+        self.index_cleanup_done = False
         self.workload_stream_ttl_secs = max(0, args.workload_stream_ttl_secs)
         self.workload_run_secs = max(0, args.workload_run_secs)
         if (
@@ -570,6 +595,9 @@ class ChaosAgent:
         self.gc_churn_errors = 0
         self.gc_churn_pending: deque[tuple[str, float]] = deque()
         self.last_gc_churn_success = 0
+        self.index_registration_success = 0
+        self.index_registration_errors = 0
+        self.last_indexer_error: str | None = None
         self.restored_workload_coverage: dict[str, Any] = {}
         self.restored_started_at: datetime | None = None
         self.restore_published_state()
@@ -580,15 +608,31 @@ class ChaosAgent:
         return f"{self.base_run_id}-r{generation:04d}"
 
     def build_workload_streams(self, run_id: str) -> list[WorkloadStream]:
-        return [
-            WorkloadStream(f"{run_id}-{index:04d}")
-            for index in range(self.workload_stream_count)
-        ]
+        streams = []
+        for index in range(self.workload_stream_count):
+            if index < self.record_stream_count:
+                streams.append(
+                    WorkloadStream(
+                        f"{run_id}-record-{index:04d}",
+                        content_type="application/json",
+                    )
+                )
+            else:
+                streams.append(WorkloadStream(f"{run_id}-{index:04d}"))
+        return streams
 
     def workload_stream_headers(self) -> dict[str, str]:
         if self.workload_stream_ttl_secs <= 0:
             return {}
         return {"stream-ttl": str(self.workload_stream_ttl_secs)}
+
+    @staticmethod
+    def _service_account_namespace() -> str:
+        path = Path("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+        try:
+            return path.read_text().strip() or "default"
+        except OSError:
+            return "default"
 
     def choose_next_fault(self, *, initial: bool = False) -> datetime | None:
         if self.disable_faults:
@@ -646,11 +690,29 @@ class ChaosAgent:
             }
 
     def load_previous_status(self) -> dict[str, Any] | None:
+        if not self.status_file.exists() and self.status_s3_uri:
+            self.status_file.parent.mkdir(parents=True, exist_ok=True)
+            result = run(
+                ["aws", "s3", "cp", self.status_s3_uri, str(self.status_file)],
+                check=False,
+                timeout_secs=self.aws_timeout_secs,
+            )
+            if result.returncode != 0:
+                missing_markers = ("(404)", "NoSuchKey", "Not Found")
+                if not any(marker in result.stderr for marker in missing_markers):
+                    raise RuntimeError(
+                        "unable to restore published chaos status from S3: "
+                        + result.stderr.strip()[:240]
+                    )
         if not self.status_file.exists():
             return None
         try:
             return json.loads(self.status_file.read_text())
         except Exception as exc:  # noqa: BLE001
+            if self.status_s3_uri:
+                raise RuntimeError(
+                    f"refusing to replace unreadable published chaos status: {exc}"
+                ) from exc
             print(f"{iso(utc_now())} WARN unable to restore previous status: {exc}", flush=True)
             return None
 
@@ -837,6 +899,25 @@ class ChaosAgent:
             return status, data, resp_headers
         return status, data, resp_headers
 
+    def kubernetes_request(self, method: str, path: str) -> tuple[int, bytes]:
+        token_path = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
+        ca_path = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+        try:
+            token = token_path.read_text().strip()
+        except OSError as exc:
+            raise RuntimeError(f"Kubernetes service-account token unavailable: {exc}") from exc
+        request = urllib.request.Request(
+            f"{self.kubernetes_api_url}{path}",
+            method=method,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        context = ssl.create_default_context(cafile=ca_path)
+        try:
+            with urllib.request.urlopen(request, timeout=self.aws_timeout_secs, context=context) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read()
+
     @staticmethod
     def is_transient_append_failure(status: int, body: bytes, headers: dict[str, str]) -> bool:
         if status == 0:
@@ -855,6 +936,7 @@ class ChaosAgent:
         return False
 
     def create_streams(self) -> None:
+        self.cleanup_stale_index_registrations()
         self.create_workload_run_streams(
             self.run_id,
             self.streams,
@@ -870,13 +952,17 @@ class ChaosAgent:
                 status, _, _ = self.request(
                     "PUT",
                     f"{node.base_url}/{BUCKET}/{stream.name}",
-                    headers=self.workload_stream_headers(),
+                    headers={
+                        **self.workload_stream_headers(),
+                        "Content-Type": stream.content_type,
+                    },
                     timeout_secs=15,
                 )
             except Exception as exc:  # noqa: BLE001
                 last_error = f"{node.name}: {exc}"
                 continue
             if status in {200, 201, 409}:
+                self.register_index_stream(stream)
                 self.created_streams.add(stream.name)
                 return
             last_error = f"{node.name}: status={status}"
@@ -884,6 +970,85 @@ class ChaosAgent:
             f"unable to create chaos stream {stream.name} on any node"
             + (f" ({last_error})" if last_error else "")
         )
+
+    def register_index_stream(self, stream: WorkloadStream) -> None:
+        if stream.content_type != "application/json" or not self.indexer_url:
+            return
+        source_base = self.index_source_base_url or self.nodes[0].base_url
+        index_id = urllib.parse.quote(self.index_registration_id(stream), safe="")
+        payload = json.dumps(
+            {
+                "stream_url": f"{source_base}/{BUCKET}/{stream.name}",
+                "timestamp_field": "captured_at",
+            }
+        ).encode()
+        status, body, _ = self.request(
+            "PUT",
+            f"{self.indexer_url}/v1/indexes/{index_id}",
+            body=payload,
+            headers={"Content-Type": "application/json"},
+            timeout_secs=15,
+        )
+        if status in {200, 201, 204}:
+            self.index_registration_success += 1
+            self.last_indexer_error = None
+            return
+        self.index_registration_errors += 1
+        self.last_indexer_error = (
+            f"register {stream.name}: status={status} body={body[:160].decode(errors='replace')!r}"
+        )
+        raise RuntimeError(self.last_indexer_error)
+
+    def index_registration_id(self, stream: WorkloadStream) -> str:
+        if not self.index_registration_prefix:
+            return stream.name
+        return f"{self.index_registration_prefix}-{stream.name}"
+
+    def unregister_index_stream(self, stream: WorkloadStream) -> None:
+        if stream.content_type != "application/json" or not self.indexer_url:
+            return
+        index_id = urllib.parse.quote(self.index_registration_id(stream), safe="")
+        status, body, _ = self.request(
+            "DELETE",
+            f"{self.indexer_url}/v1/indexes/{index_id}",
+            timeout_secs=15,
+        )
+        if status in {204, 404}:
+            return
+        self.index_registration_errors += 1
+        self.last_indexer_error = (
+            f"unregister {stream.name}: status={status} body={body[:160].decode(errors='replace')!r}"
+        )
+        self.event("warn", self.last_indexer_error)
+
+    def cleanup_stale_index_registrations(self) -> None:
+        if self.index_cleanup_done or not self.indexer_url or not self.index_registration_prefix:
+            return
+        status, body, _ = self.request("GET", f"{self.indexer_url}/v1/indexes", timeout_secs=15)
+        if status != 200:
+            raise RuntimeError(f"list index registrations failed: status={status}")
+        registrations = json.loads(body)
+        current_ids = {
+            self.index_registration_id(stream)
+            for stream in self.streams
+            if stream.content_type == "application/json"
+        }
+        prefix = f"{self.index_registration_prefix}-"
+        for registration in registrations if isinstance(registrations, list) else []:
+            registration_id = registration.get("id") if isinstance(registration, dict) else None
+            if not isinstance(registration_id, str) or not registration_id.startswith(prefix):
+                continue
+            if registration_id in current_ids:
+                continue
+            encoded_id = urllib.parse.quote(registration_id, safe="")
+            delete_status, _, _ = self.request(
+                "DELETE", f"{self.indexer_url}/v1/indexes/{encoded_id}", timeout_secs=15
+            )
+            if delete_status not in {204, 404}:
+                raise RuntimeError(
+                    f"delete stale index registration {registration_id} failed: status={delete_status}"
+                )
+        self.index_cleanup_done = True
 
     def create_workload_run_streams(
         self,
@@ -925,6 +1090,7 @@ class ChaosAgent:
             raise
         with self.state_lock:
             previous_run_id = self.run_id
+            previous_streams = self.streams
             self.run_generation = next_generation
             self.run_id = next_run_id
             self.current_run_started_at = utc_now()
@@ -937,6 +1103,8 @@ class ChaosAgent:
             self.rollover_in_progress = False
             self.next_workload_rollover_at = time.monotonic() + self.workload_run_secs
         self.event("info", f"rolled workload streams {previous_run_id} -> {next_run_id}")
+        for stream in previous_streams:
+            self.unregister_index_stream(stream)
 
     def append_once(self, lane_id: int | None = None) -> bool:
         with self.state_lock:
@@ -994,7 +1162,7 @@ class ChaosAgent:
                         f"{node.base_url}/{BUCKET}/{stream_name}",
                         body=payload,
                         headers={
-                            "Content-Type": CONTENT_TYPE,
+                            "Content-Type": stream.content_type,
                             "Producer-Id": producer_id,
                             "Producer-Epoch": str(producer_epoch),
                             "Producer-Seq": str(producer_seq),
@@ -1242,6 +1410,21 @@ class ChaosAgent:
     ) -> bytes:
         epoch = producer.epoch if producer_epoch is None else producer_epoch
         ordinal = self.append_success if append_ordinal is None else append_ordinal
+        if stream.content_type == "application/json":
+            event = {
+                "captured_at": iso(utc_now()),
+                "producer": producer.producer_id,
+                "seq": producer_seq,
+                "kind": kind,
+                "padding": "",
+            }
+            # Keep the record valid JSON while still exercising the configured
+            # payload-size distribution. The newline makes each append directly
+            # compatible with the stream's NDJSON record view.
+            encoded = json.dumps(event, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+            padding = max(0, size - len(encoded))
+            event["padding"] = "x" * padding
+            return json.dumps(event, separators=(",", ":"), sort_keys=True).encode() + b"\n"
         prefix = (
             f"{ordinal:020d}:{stream.name}:{start_offset:020d}:"
             f"{producer.producer_id}:{epoch}:{producer_seq}:{kind}\n"
@@ -1651,31 +1834,50 @@ class ChaosAgent:
             "role": "node",
             "instance_id": node.instance_id,
         }
-        try:
-            placement = json.loads(
-                run(
-                    [
-                        "aws",
-                        "ec2",
-                        "describe-instances",
-                        "--instance-ids",
-                        node.instance_id,
-                        "--query",
-                        "Reservations[0].Instances[0].{state: State.Name, az: Placement.AvailabilityZone}",
-                        "--output",
-                        "json",
-                    ],
-                    timeout_secs=self.aws_timeout_secs,
-                ).stdout
-            )
-            sample["instance_state"] = placement.get("state") or "unknown"
-            az = placement.get("az")
-            if isinstance(az, str) and az:
-                sample["availability_zone"] = az
-                sample["region"] = az[:-1] if az[-1:].isalpha() else az
-        except Exception as exc:  # noqa: BLE001
-            sample["instance_state"] = "unknown"
-            sample["last_error"] = f"describe-instance: {exc}"
+        if self.fault_backend == "kubernetes":
+            try:
+                path = (
+                    f"/api/v1/namespaces/{urllib.parse.quote(self.kubernetes_namespace, safe='')}"
+                    f"/pods/{urllib.parse.quote(node.instance_id, safe='')}"
+                )
+                status, body = self.kubernetes_request("GET", path)
+                pod = json.loads(body) if status == 200 else {}
+                phase = pod.get("status", {}).get("phase")
+                deleting = pod.get("metadata", {}).get("deletionTimestamp") is not None
+                sample["instance_state"] = "running" if phase == "Running" and not deleting else (
+                    "stopped" if status == 404 else "stopping" if deleting else str(phase or "unknown").lower()
+                )
+                sample["kubernetes_node"] = pod.get("spec", {}).get("nodeName")
+                sample["pod_uid"] = pod.get("metadata", {}).get("uid")
+            except Exception as exc:  # noqa: BLE001
+                sample["instance_state"] = "unknown"
+                sample["last_error"] = f"describe-pod: {exc}"
+        else:
+            try:
+                placement = json.loads(
+                    run(
+                        [
+                            "aws",
+                            "ec2",
+                            "describe-instances",
+                            "--instance-ids",
+                            node.instance_id,
+                            "--query",
+                            "Reservations[0].Instances[0].{state: State.Name, az: Placement.AvailabilityZone}",
+                            "--output",
+                            "json",
+                        ],
+                        timeout_secs=self.aws_timeout_secs,
+                    ).stdout
+                )
+                sample["instance_state"] = placement.get("state") or "unknown"
+                az = placement.get("az")
+                if isinstance(az, str) and az:
+                    sample["availability_zone"] = az
+                    sample["region"] = az[:-1] if az[-1:].isalpha() else az
+            except Exception as exc:  # noqa: BLE001
+                sample["instance_state"] = "unknown"
+                sample["last_error"] = f"describe-instance: {exc}"
         try:
             status, body, _ = self.request("GET", f"{node.base_url}/__ursula/metrics")
             sample["metrics_state"] = "ok" if status == 200 else f"http_{status}"
@@ -1762,6 +1964,8 @@ class ChaosAgent:
                     "metrics_state": node.get("metrics_state"),
                     "availability_zone": node.get("availability_zone"),
                     "region": node.get("region"),
+                    "kubernetes_node": node.get("kubernetes_node"),
+                    "pod_uid": node.get("pod_uid"),
                 }
                 for node in nodes
             ],
@@ -1942,6 +2146,24 @@ class ChaosAgent:
         return False
 
     def instance_state(self, node: Node) -> str:
+        if self.fault_backend == "kubernetes":
+            try:
+                path = (
+                    f"/api/v1/namespaces/{urllib.parse.quote(self.kubernetes_namespace, safe='')}"
+                    f"/pods/{urllib.parse.quote(node.instance_id, safe='')}"
+                )
+                status, body = self.kubernetes_request("GET", path)
+                if status == 404:
+                    return "stopped"
+                if status != 200:
+                    return "unknown"
+                pod = json.loads(body)
+                if pod.get("metadata", {}).get("deletionTimestamp") is not None:
+                    return "stopping"
+                return "running" if pod.get("status", {}).get("phase") == "Running" else "pending"
+            except Exception as exc:  # noqa: BLE001
+                self.event("warn", f"describe {node.name} pod failed during recovery check: {exc}")
+                return "unknown"
         try:
             return json.loads(
                 run(
@@ -1966,12 +2188,40 @@ class ChaosAgent:
     def stop_instances(self, targets: list[Node], *, wait: bool) -> None:
         if not targets:
             return
+        if self.fault_backend == "kubernetes":
+            for node in targets:
+                path = (
+                    f"/api/v1/namespaces/{urllib.parse.quote(self.kubernetes_namespace, safe='')}"
+                    f"/pods/{urllib.parse.quote(node.instance_id, safe='')}"
+                )
+                status, body = self.kubernetes_request("DELETE", path)
+                if status not in {200, 202, 404}:
+                    raise RuntimeError(
+                        f"delete pod {node.instance_id} failed: status={status} body={body[:160]!r}"
+                    )
+            if wait:
+                deadline = time.monotonic() + self.aws_timeout_secs
+                while time.monotonic() < deadline:
+                    if all(self.instance_state(node) != "running" for node in targets):
+                        break
+                    time.sleep(1)
+            return
         instance_ids = [node.instance_id for node in targets]
         run(["aws", "ec2", "stop-instances", "--instance-ids", *instance_ids], check=False)
         if wait:
             run(["aws", "ec2", "wait", "instance-stopped", "--instance-ids", *instance_ids], check=False)
 
+    def start_nodes(self, targets: list[Node]) -> None:
+        if self.fault_backend != "kubernetes":
+            run(["aws", "ec2", "start-instances", "--instance-ids", *[node.instance_id for node in targets]], check=False)
+            return
+        # StatefulSet reconciliation starts replacements immediately after
+        # DELETE. Status sampling observes recovery without blocking the
+        # control loop and its publication cadence.
+
     def recover_stopped_nodes_on_startup(self) -> None:
+        if self.fault_backend == "kubernetes":
+            return
         for node in self.nodes:
             state = self.instance_state(node)
             if state not in {"stopped", "stopping"}:
@@ -2029,11 +2279,16 @@ class ChaosAgent:
             targets: list[Node] = self.active_fault["targets"]
             scenario = self.active_fault["scenario"]
             self.event("warn", f"recovering {scenario} fault on {', '.join(node.name for node in targets)}")
-            if self.active_fault.get("cleanup") == "start_instances":
+            cleanup = self.active_fault.get("cleanup")
+            if cleanup == "start_instances":
                 if self.active_fault.get("allow_revert", False):
                     for node in targets:
                         self.allow_next_revert_for_node(node)
-                run(["aws", "ec2", "start-instances", "--instance-ids", *[node.instance_id for node in targets]], check=False)
+                self.start_nodes(targets)
+            elif cleanup == "automatic_recreate":
+                # Kubernetes StatefulSet reconciliation already owns restart.
+                # Recording start_requested_at below starts the recovery SLO.
+                pass
             else:
                 cleared = True
                 # Single-active-fault invariant: when an impairment fault
@@ -2099,7 +2354,13 @@ class ChaosAgent:
         )
         injection_id = (self.injections[-1]["id"] + 1) if self.injections else 1
         self.active_injection_id = injection_id
-        cleanup = "clear_impairment" if scenario in IMPAIRMENT_SCENARIOS else "start_instances"
+        if scenario == "pod_delete":
+            cleanup = "automatic_recreate"
+        elif scenario in IMPAIRMENT_SCENARIOS:
+            cleanup = "clear_impairment"
+        else:
+            cleanup = "start_instances"
+        fault_duration_secs = 0 if cleanup == "automatic_recreate" else self.recovery_secs
         self.injections.append(
             {
                 "id": injection_id,
@@ -2116,7 +2377,7 @@ class ChaosAgent:
                 "stopped_at": None,
                 "start_requested_at": None,
                 "recovered_at": None,
-                "recover_after": iso(now + timedelta(seconds=self.recovery_secs)),
+                "recover_after": iso(now + timedelta(seconds=fault_duration_secs)),
                 "timeline": [
                     {
                         "time": iso(now),
@@ -2129,7 +2390,7 @@ class ChaosAgent:
         self.active_fault = {
             "scenario": scenario,
             "targets": targets,
-            "recover_at": now + timedelta(seconds=self.recovery_secs),
+            "recover_at": now + timedelta(seconds=fault_duration_secs),
             "allow_revert": allow_revert,
             "cleanup": cleanup,
         }
@@ -2267,7 +2528,7 @@ class ChaosAgent:
         return [random.choice(self.nodes)]
 
     def apply_fault_scenario(self, scenario: str, targets: list[Node], *, allow_revert: bool = False) -> None:
-        if scenario in {"clean_stop", "no_allow_stop", "mixed_stop", "rolling_restart"}:
+        if scenario in {"clean_stop", "no_allow_stop", "mixed_stop", "rolling_restart", "pod_delete"}:
             self.stop_instances(targets, wait=allow_revert)
             return
         if scenario == "netem_delay":
@@ -2416,7 +2677,7 @@ class ChaosAgent:
             self.mark_current_injection_apply_result(applied)
             return
         self.event("warn", f"unknown fault scenario {scenario}; falling back to clean stop")
-        run(["aws", "ec2", "stop-instances", "--instance-ids", *[node.instance_id for node in targets]], check=False)
+        self.stop_instances(targets, wait=False)
 
     def mark_current_injection_apply_result(self, applied: bool) -> None:
         injection = self.current_injection()
@@ -2848,6 +3109,7 @@ class ChaosAgent:
         running_nodes = sum(1 for node in nodes if node.get("instance_state") == "running")
         metrics_ok = sum(1 for node in nodes if node.get("metrics_state") == "ok")
         storage = self.storage_status(nodes)
+        indexer = self.sample_indexer()
         raft_lag_status = self.raft_replica_lag_status(topology)
         raft_replicas_caught_up = raft_lag_status["ok"]
         full_raft_nodes = sum(
@@ -3142,6 +3404,10 @@ class ChaosAgent:
                 "workload_run_secs": self.workload_run_secs,
                 "next_workload_rollover_after": iso(next_workload_rollover_after),
                 "stream_count": len(self.streams),
+                "record_stream_count": sum(
+                    1 for stream in self.streams if stream.content_type == "application/json"
+                ),
+                "indexer": indexer,
                 "gc_churn_created_total": self.gc_churn_created,
                 "gc_churn_deleted_total": self.gc_churn_deleted,
                 "gc_churn_error_total": self.gc_churn_errors,
@@ -3165,6 +3431,7 @@ class ChaosAgent:
             "chaos": {
                 "enabled": not self.disable_faults,
                 "active_fault": active_fault,
+                "last_fault": self.last_fault,
                 "next_fault_after": iso(published_next_fault_at),
                 "fault_profile": self.fault_profile,
                 "coverage": self.chaos_coverage(),
@@ -3181,6 +3448,35 @@ class ChaosAgent:
             self.last_status_cold_backpressure_events = cold_backpressure_events
         self.last_status_published_at = published_at
         return status
+
+    def sample_indexer(self) -> dict[str, Any]:
+        if not self.indexer_url:
+            return {"enabled": False}
+        status, body, _ = self.request(
+            "GET", f"{self.indexer_url}/v1/indexes", timeout_secs=10
+        )
+        result: dict[str, Any] = {
+            "enabled": True,
+            "url": self.indexer_url,
+            "registration_success_total": self.index_registration_success,
+            "registration_error_total": self.index_registration_errors,
+            "last_error": self.last_indexer_error,
+        }
+        if status != 200:
+            result.update({"status": "unavailable", "http_status": status})
+            return result
+        try:
+            registrations = json.loads(body)
+        except ValueError as exc:
+            result.update({"status": "invalid_response", "last_error": str(exc)})
+            return result
+        result.update(
+            {
+                "status": "ready",
+                "registered_streams": len(registrations) if isinstance(registrations, list) else None,
+            }
+        )
+        return result
 
     def storage_status(self, nodes: list[dict[str, Any]]) -> dict[str, Any]:
         def numeric(node: dict[str, Any], field: str) -> int:
@@ -3384,12 +3680,43 @@ def parse_node(raw: str) -> Node:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the Ursula 24/7 EC2 chaos agent")
-    parser.add_argument("--node", action="append", default=[], help="name=instance-id=http://host:port")
+    parser = argparse.ArgumentParser(description="Run the Ursula 24/7 chaos agent")
+    parser.add_argument(
+        "--node",
+        action="append",
+        default=[],
+        help="name=target-id=http://host:port (target-id is an EC2 instance ID or Kubernetes pod name)",
+    )
+    parser.add_argument("--fault-backend", choices=["ec2", "kubernetes"], default="ec2")
+    parser.add_argument("--kubernetes-namespace", default="")
+    parser.add_argument(
+        "--kubernetes-api-url",
+        default=(
+            f"https://{os.environ.get('KUBERNETES_SERVICE_HOST', 'kubernetes.default.svc')}:"
+            f"{os.environ.get('KUBERNETES_SERVICE_PORT_HTTPS', '443')}"
+        ),
+    )
     parser.add_argument("--status-file", type=Path, default=Path("/tmp/ursula-chaos/status.json"))
     parser.add_argument("--status-s3-uri", default="")
     parser.add_argument("--stream", default="")
     parser.add_argument("--stream-count", type=int, default=24)
+    parser.add_argument(
+        "--record-stream-count",
+        type=int,
+        default=0,
+        help="number of workload streams that append JSON records with captured_at",
+    )
+    parser.add_argument("--indexer-url", default="")
+    parser.add_argument(
+        "--index-registration-prefix",
+        default="",
+        help="ownership prefix used to clean stale dynamic index registrations",
+    )
+    parser.add_argument(
+        "--index-source-base-url",
+        default="",
+        help="Ursula base URL reachable by the indexer; defaults to the first --node URL",
+    )
     parser.add_argument("--workload-stream-ttl-secs", type=int, default=7200,
                         help="server-side TTL for main workload streams (0 disables)")
     parser.add_argument("--workload-run-secs", type=int, default=3600,
@@ -3435,7 +3762,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--fault-profile",
-        choices=["network", "orthogonal", "revert-detection", "custom"],
+        choices=["network", "orthogonal", "revert-detection", "kubernetes", "custom"],
         default="network",
         help="Preset fault scenario set. Use custom with --fault-scenarios.",
     )

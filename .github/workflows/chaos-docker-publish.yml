@@ -1,16 +1,22 @@
-name: Docker Publish
+name: Chaos Agent Docker Publish
 
 on:
   pull_request:
     paths:
-      - .dockerignore
-      - .github/workflows/docker-publish.yml
-      - Dockerfile
+      - .github/workflows/chaos-docker-publish.yml
+      - Dockerfile.chaos-agent
+      - Dockerfile.chaos-agent.dockerignore
+      - scripts/ursula_chaos_agent.py
   push:
     branches:
       - main
     tags:
       - "v*.*.*"
+    paths:
+      - .github/workflows/chaos-docker-publish.yml
+      - Dockerfile.chaos-agent
+      - Dockerfile.chaos-agent.dockerignore
+      - scripts/ursula_chaos_agent.py
   workflow_dispatch:
 
 permissions:
@@ -25,13 +31,13 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: ${{ github.repository }}-chaos-agent
   DOCKER_PLATFORMS: linux/amd64,linux/arm64
   DOCKER_METADATA_ANNOTATIONS_LEVELS: index
 
 jobs:
   docker:
-    name: Docker image
+    name: Chaos-agent image
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -62,12 +68,12 @@ jobs:
             type=sha,prefix=sha-
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and publish Docker image
+      - name: Build and publish chaos-agent image
         uses: depot/build-push-action@v1
         with:
           project: ls2d88cjpz
           context: .
-          file: ./Dockerfile
+          file: ./Dockerfile.chaos-agent
           platforms: ${{ env.DOCKER_PLATFORMS }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}

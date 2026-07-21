@@ -10,14 +10,62 @@ data "aws_iam_policy_document" "pod_identity_assume" {
   }
 }
 
+data "aws_iam_policy_document" "server_irsa_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [module.eks.oidc_provider_arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${replace(module.eks.cluster_oidc_issuer_url, "https://", "")}:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${replace(module.eks.cluster_oidc_issuer_url, "https://", "")}:sub"
+      values   = ["system:serviceaccount:${var.namespace}:${local.server_sa}"]
+    }
+  }
+}
+
+data "aws_iam_policy_document" "indexer_irsa_assume" {
+  statement {
+    effect  = "Allow"
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [module.eks.oidc_provider_arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${replace(module.eks.cluster_oidc_issuer_url, "https://", "")}:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "${replace(module.eks.cluster_oidc_issuer_url, "https://", "")}:sub"
+      values   = ["system:serviceaccount:${var.namespace}:${local.indexer_sa}"]
+    }
+  }
+}
+
 resource "aws_iam_role" "server" {
   name               = "${local.cluster_name}-storage"
-  assume_role_policy = data.aws_iam_policy_document.pod_identity_assume.json
+  assume_role_policy = data.aws_iam_policy_document.server_irsa_assume.json
 }
 
 resource "aws_iam_role" "indexer" {
   name               = "${local.cluster_name}-indexer"
-  assume_role_policy = data.aws_iam_policy_document.pod_identity_assume.json
+  assume_role_policy = data.aws_iam_policy_document.indexer_irsa_assume.json
 }
 
 resource "aws_iam_role" "ebs_csi" {
@@ -84,18 +132,4 @@ resource "aws_iam_role_policy" "indexer_s3" {
   name   = "ursula-index"
   role   = aws_iam_role.indexer.id
   policy = data.aws_iam_policy_document.indexer_s3.json
-}
-
-resource "aws_eks_pod_identity_association" "server" {
-  cluster_name    = module.eks.cluster_name
-  namespace       = var.namespace
-  service_account = local.server_sa
-  role_arn        = aws_iam_role.server.arn
-}
-
-resource "aws_eks_pod_identity_association" "indexer" {
-  cluster_name    = module.eks.cluster_name
-  namespace       = var.namespace
-  service_account = local.indexer_sa
-  role_arn        = aws_iam_role.indexer.arn
 }
