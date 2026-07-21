@@ -1025,7 +1025,11 @@ async fn unregister_pool_index(
     State(state): State<PoolState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    state.catalog.unregister(&id).await.map_err(ApiError)?;
+    state
+        .catalog
+        .unregister(&id, wall_clock_millis().map_err(ApiError)?)
+        .await
+        .map_err(ApiError)?;
     state.indexes.write().await.remove(&id);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1458,7 +1462,7 @@ mod tests {
             .join("CURRENT");
         assert!(current.exists());
 
-        state.catalog.unregister(&registration.id).await?;
+        state.catalog.unregister(&registration.id, 0).await?;
         reconcile_pool_indexes(&state).await?;
         assert!(state.indexes.read().await.is_empty());
         cleanup_retired_indexes(&state, std::time::Duration::ZERO).await;
