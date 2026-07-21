@@ -1,0 +1,157 @@
+{{- if ne (.Values.target.replicaCount | int) 3 -}}
+{{- fail "target.replicaCount must be 3 for the Kubernetes chaos profile" -}}
+{{- end -}}
+{{- if gt (.Values.recordStreamCount | int) (.Values.streamCount | int) -}}
+{{- fail "recordStreamCount must not exceed streamCount" -}}
+{{- end -}}
+{{- if and (gt (.Values.recordStreamCount | int) 0) (eq (.Values.target.indexerUrl | trim) "") -}}
+{{- fail "recordStreamCount requires target.indexerUrl" -}}
+{{- end -}}
+{{- $name := include "ursula-chaos.fullname" . -}}
+{{- $targetNamespace := include "ursula-chaos.targetNamespace" . -}}
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "ursula-chaos.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ursula-chaos.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+automountServiceAccountToken: true
+---
+{{- end }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ $targetNamespace }}
+  labels:
+    {{- include "ursula-chaos.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    resourceNames:
+      {{- range $ordinal := until (.Values.target.replicaCount | int) }}
+      - {{ printf "%s-%d" $.Values.target.serverFullname $ordinal | quote }}
+      {{- end }}
+    verbs: ["get", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ $targetNamespace }}
+  labels:
+    {{- include "ursula-chaos.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "ursula-chaos.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ursula-chaos.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "ursula-chaos.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "ursula-chaos.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ include "ursula-chaos.serviceAccountName" . }}
+      automountServiceAccountToken: true
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        fsGroup: 10001
+      containers:
+        - name: chaos-agent
+          image: {{ include "ursula-chaos.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --fault-backend=kubernetes
+            - --kubernetes-namespace={{ $targetNamespace }}
+            - --fault-profile={{ .Values.faultProfile }}
+            - --stream-count={{ .Values.streamCount }}
+            - --record-stream-count={{ .Values.recordStreamCount }}
+            - --append-per-second={{ .Values.appendPerSecond }}
+            - --append-workers={{ .Values.appendWorkers }}
+            - --payload-sizes={{ .Values.payloadSizes }}
+            - --fault-min-secs={{ .Values.faultMinSeconds }}
+            - --fault-max-secs={{ .Values.faultMaxSeconds }}
+            - --first-fault-secs={{ .Values.firstFaultSeconds }}
+            - --recovery-secs={{ .Values.recoverySeconds }}
+            - --recovery-slo-secs={{ .Values.recoverySloSeconds }}
+            - --workload-stream-ttl-secs={{ .Values.streamTtlSeconds }}
+            - --workload-run-secs={{ .Values.workloadRunSeconds }}
+            - --status-file=/var/lib/ursula-chaos/status.json
+            - --indexer-url={{ .Values.target.indexerUrl }}
+            - --index-registration-prefix={{ $name }}
+            - --index-source-base-url={{ .Values.target.indexSourceBaseUrl }}
+            {{- if .Values.statusS3Uri }}
+            - --status-s3-uri={{ .Values.statusS3Uri }}
+            {{- end }}
+            {{- range $ordinal := until (.Values.target.replicaCount | int) }}
+            - --node={{ printf "%s-%d=%s-%d=http://%s-%d.%s.%s.svc.%s:%d" $.Values.target.serverFullname $ordinal $.Values.target.serverFullname $ordinal $.Values.target.serverFullname $ordinal $.Values.target.headlessService $targetNamespace $.Values.target.clusterDomain ($.Values.target.clientPort | int) }}
+            {{- end }}
+            {{- with .Values.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/ursula-chaos
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: state
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

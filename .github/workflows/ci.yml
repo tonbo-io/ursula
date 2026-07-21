@@ -34,6 +34,8 @@ jobs:
           tofu fmt -check -recursive deploy/eks
           tofu -chdir=deploy/eks init -backend=false
           tofu -chdir=deploy/eks validate
+          tofu -chdir=deploy/chaos-eks init -backend=false
+          tofu -chdir=deploy/chaos-eks validate
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -43,10 +45,13 @@ jobs:
           helm lint charts/ursula
           helm template ursula charts/ursula --namespace ursula -f charts/ursula/examples/production-eks.yaml >/dev/null
           python3 scripts/helm_template_test.py
+          helm lint charts/ursula-chaos
+          helm template ursula-chaos charts/ursula-chaos --namespace ursula >/dev/null
+          python3 scripts/chaos_helm_template_test.py
 
   rust-lint:
     name: Rust lint
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04-16
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -69,8 +74,8 @@ jobs:
       fail-fast: false
       matrix:
         runner:
-          - ubuntu-24.04
-          - ubuntu-24.04-arm
+          - depot-ubuntu-24.04-16
+          - depot-ubuntu-24.04-arm-16
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -94,7 +99,7 @@ jobs:
 
   deterministic-simulation:
     name: Deterministic simulation smoke
-    runs-on: ubuntu-24.04
+    runs-on: depot-ubuntu-24.04-16
     steps:
       - name: Checkout
         uses: actions/checkout@v6

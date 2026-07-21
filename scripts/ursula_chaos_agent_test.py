@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
+import json
+import subprocess
+import tempfile
 import threading
 import unittest
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import patch
 
 from ursula_chaos_agent import (
     CATCH_UP_RECOVERY_SLO_SECS,
@@ -20,6 +25,93 @@ from ursula_chaos_agent import (
 
 
 class ChaosAgentStateTest(unittest.TestCase):
+    def test_restore_preserves_status_timeline_and_fault_schedule(self) -> None:
+        agent = object.__new__(ChaosAgent)
+        agent.history = deque()
+        agent.events = deque()
+        agent.restored_started_at = None
+        agent.restored_workload_coverage = {}
+        agent.last_fault = None
+        agent.next_fault_at = None
+        agent.injections = deque(maxlen=32)
+        agent.active_injection_id = None
+        agent.active_fault = None
+        agent.nodes = []
+        next_fault = datetime.now(timezone.utc) + timedelta(hours=1)
+        previous = {
+            "started_at": "2026-07-20T00:00:00Z",
+            "history": [{"time": "2026-07-20T01:00:00Z", "status": "operational"}],
+            "events": [{"time": "2026-07-20T01:00:00Z", "level": "info"}],
+            "workload": {"coverage": {"probes": {"reader": {"covered": True}}}},
+            "chaos": {
+                "last_fault": "pod_delete on ursula-0",
+                "next_fault_after": next_fault.isoformat().replace("+00:00", "Z"),
+                "injections": [{"id": 4, "status": "recovered", "recovered_at": "2026-07-20T02:00:00Z"}],
+            },
+        }
+        agent.load_previous_status = lambda: previous
+
+        agent.restore_published_state()
+
+        self.assertEqual(agent.restored_started_at, datetime(2026, 7, 20, tzinfo=timezone.utc))
+        self.assertEqual(len(agent.history), 1)
+        self.assertEqual(agent.last_fault, "pod_delete on ursula-0")
+        self.assertEqual(agent.next_fault_at, next_fault)
+        self.assertTrue(agent.restored_workload_coverage["probes"]["reader"]["covered"])
+        self.assertEqual(agent.injections[-1]["id"], 4)
+
+    def test_s3_restore_failure_does_not_overwrite_published_history(self) -> None:
+        agent = object.__new__(ChaosAgent)
+        with tempfile.TemporaryDirectory() as directory:
+            agent.status_file = Path(directory) / "status.json"
+            agent.status_s3_uri = "s3://status/chaos/status.json"
+            agent.aws_timeout_secs = 15
+            failure = subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr="AccessDenied"
+            )
+
+            with patch("ursula_chaos_agent.run", return_value=failure):
+                with self.assertRaisesRegex(RuntimeError, "unable to restore"):
+                    agent.load_previous_status()
+
+    def test_missing_s3_status_is_treated_as_first_run(self) -> None:
+        agent = object.__new__(ChaosAgent)
+        with tempfile.TemporaryDirectory() as directory:
+            agent.status_file = Path(directory) / "status.json"
+            agent.status_s3_uri = "s3://status/chaos/status.json"
+            agent.aws_timeout_secs = 15
+            missing = subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr="HeadObject operation: (404)"
+            )
+
+            with patch("ursula_chaos_agent.run", return_value=missing):
+                self.assertIsNone(agent.load_previous_status())
+
+    def test_record_payload_is_valid_captured_at_json(self) -> None:
+        agent = object.__new__(ChaosAgent)
+        agent.append_success = 7
+        stream = WorkloadStream("record-stream", content_type="application/json")
+        producer = ProducerState("producer-1")
+
+        payload = agent.build_payload(512, "ascii", stream, producer, 3, 42)
+        record = json.loads(payload)
+
+        self.assertEqual(record["seq"], 3)
+        self.assertEqual(record["producer"], "producer-1")
+        self.assertTrue(record["captured_at"].endswith("Z"))
+        self.assertTrue(payload.endswith(b"\n"))
+        self.assertEqual(len(payload), 512)
+
+    def test_kubernetes_profile_deletes_the_target_pod(self) -> None:
+        agent = object.__new__(ChaosAgent)
+        target = Node("ursula-0", "ursula-0", "http://ursula-0:4437")
+        calls: list[tuple[list[Node], bool]] = []
+        agent.stop_instances = lambda targets, wait: calls.append((targets, wait))
+
+        agent.apply_fault_scenario("pod_delete", [target])
+
+        self.assertEqual(calls, [([target], False)])
+
     def test_published_started_at_uses_earliest_health_history(self) -> None:
         process_started_at = datetime(2026, 6, 6, 6, 25, 26, tzinfo=timezone.utc)
         history = [

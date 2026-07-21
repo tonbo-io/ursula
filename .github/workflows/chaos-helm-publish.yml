@@ -1,0 +1,96 @@
+name: Chaos Helm Publish
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/chaos-helm-publish.yml
+      - charts/ursula-chaos/**
+      - scripts/chaos_helm_template_test.py
+  push:
+    branches:
+      - main
+    tags:
+      - "v*.*.*"
+    paths:
+      - .github/workflows/chaos-helm-publish.yml
+      - charts/ursula-chaos/**
+      - scripts/chaos_helm_template_test.py
+  workflow_dispatch:
+    inputs:
+      chart_version:
+        description: Override the chaos chart version.
+        required: false
+        type: string
+      app_version:
+        description: Override the chaos-agent app version.
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CHART_DIR: charts/ursula-chaos
+  CHART_PACKAGE_DIR: dist/chaos-charts
+  CHART_REGISTRY: oci://ghcr.io/${{ github.repository_owner }}/charts
+
+jobs:
+  helm:
+    name: Chaos Helm chart
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint and test chart
+        run: |
+          helm lint "$CHART_DIR" --strict
+          helm template ursula-chaos "$CHART_DIR" --namespace ursula >/tmp/ursula-chaos-chart.yaml
+          python3 scripts/chaos_helm_template_test.py
+
+      - name: Package chart
+        id: package
+        env:
+          CHART_VERSION_INPUT: ${{ inputs.chart_version }}
+          APP_VERSION_INPUT: ${{ inputs.app_version }}
+        run: |
+          mkdir -p "$CHART_PACKAGE_DIR"
+          chart_version="$CHART_VERSION_INPUT"
+          if [[ -z "$chart_version" && "$GITHUB_REF_TYPE" == "tag" ]]; then
+            chart_version="${GITHUB_REF_NAME#v}"
+          fi
+          app_version="$APP_VERSION_INPUT"
+          if [[ -z "$app_version" && -n "$chart_version" ]]; then
+            app_version="$chart_version"
+          fi
+          package_args=()
+          if [[ -n "$chart_version" ]]; then
+            package_args+=(--version "$chart_version")
+          fi
+          if [[ -n "$app_version" ]]; then
+            package_args+=(--app-version "$app_version")
+          fi
+          helm package "$CHART_DIR" --destination "$CHART_PACKAGE_DIR" "${package_args[@]}"
+          package="$(find "$CHART_PACKAGE_DIR" -maxdepth 1 -type f -name 'ursula-chaos-*.tgz' | sort | tail -n 1)"
+          test -n "$package"
+          echo "package=$package" >>"$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: github.event_name == 'workflow_dispatch' || github.ref_type == 'tag'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            helm registry login ghcr.io \
+              --username "${{ github.actor }}" \
+              --password-stdin
+
+      - name: Push chart to GHCR
+        if: github.event_name == 'workflow_dispatch' || github.ref_type == 'tag'
+        run: helm push "${{ steps.package.outputs.package }}" "$CHART_REGISTRY"
