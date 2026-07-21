@@ -219,6 +219,26 @@ impl RaftGroupEngine {
     where
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
+        Self::new_single_node_with_log_store_metrics_and_snapshot_metadata(
+            placement, node_id, node, config, log_store, metrics, cold_store, None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn new_single_node_with_log_store_metrics_and_snapshot_metadata<LS>(
+        placement: ShardPlacement,
+        node_id: u64,
+        node: BasicNode,
+        config: Arc<Config>,
+        log_store: LS,
+        metrics: Option<GroupEngineMetrics>,
+        cold_store: Option<ColdStoreHandle>,
+        snapshot_metadata_path: Option<PathBuf>,
+    ) -> Result<Self, GroupEngineError>
+    where
+        LS: RaftLogStorage<UrsulaRaftTypeConfig>,
+    {
         let engine = Self::new_node_full(
             placement,
             node_id,
@@ -230,6 +250,7 @@ impl RaftGroupEngine {
             None,
             None,
             None,
+            snapshot_metadata_path,
         )
         .await?;
 
@@ -277,6 +298,7 @@ impl RaftGroupEngine {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -293,6 +315,7 @@ impl RaftGroupEngine {
         snapshot_store: Option<SharedSnapshotStore>,
         snapshot_build: Option<SnapshotBuildCoordinator>,
         snapshot_install: Option<SnapshotInstallCoordinator>,
+        snapshot_metadata_path: Option<PathBuf>,
     ) -> Result<Self, GroupEngineError>
     where
         NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
@@ -301,19 +324,25 @@ impl RaftGroupEngine {
         let snapshot_store = snapshot_store.unwrap_or_else(default_snapshot_store);
         let snapshot_build = snapshot_build.unwrap_or_default();
         let snapshot_install = snapshot_install.unwrap_or_default();
+        let mut state_machine = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+            placement,
+            metrics.clone(),
+            cold_store.clone(),
+            snapshot_store,
+            snapshot_build,
+            snapshot_install,
+            snapshot_metadata_path,
+        );
+        state_machine
+            .restore_persisted_snapshot()
+            .await
+            .map_err(|err| GroupEngineError::new(format!("restore OpenRaft snapshot: {err}")))?;
         let raft = Raft::<UrsulaRaftTypeConfig, RaftGroupStateMachine>::new(
             node_id,
             config,
             network_factory,
             log_store,
-            RaftGroupStateMachine::new_with_stores_and_snapshot_install(
-                placement,
-                metrics.clone(),
-                cold_store.clone(),
-                snapshot_store,
-                snapshot_build,
-                snapshot_install,
-            ),
+            state_machine,
         )
         .await
         .map_err(|err| GroupEngineError::new(format!("create OpenRaft group: {err}")))?;

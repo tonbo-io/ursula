@@ -1297,6 +1297,7 @@ mod tests {
             Arc::new(StaticSnapshotStore { bytes: None }),
             SnapshotBuildCoordinator::default(),
             coordinator,
+            None,
         );
         state_machine
             .install_snapshot(&prefetched.snapshot.meta, prefetched.snapshot.snapshot)

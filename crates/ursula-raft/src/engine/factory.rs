@@ -310,6 +310,12 @@ impl DurableRaftLogStoreFactory {
             .join("journal.bin")
     }
 
+    pub(crate) fn snapshot_metadata_path(&self, placement: ShardPlacement) -> PathBuf {
+        self.root
+            .join(format!("core-{}", placement.core_id.0))
+            .join(format!("group-{}.snapshot.json", placement.raft_group_id.0))
+    }
+
     pub(crate) fn core_writer(
         &self,
         core_id: CoreId,
@@ -385,7 +391,7 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
             );
             let log_store = self.log_stores.open(placement, metrics.clone())?;
             let engine: Box<dyn GroupEngine> = Box::new(
-                RaftGroupEngine::new_single_node_with_log_store_and_metrics(
+                RaftGroupEngine::new_single_node_with_log_store_metrics_and_snapshot_metadata(
                     placement,
                     1,
                     BasicNode::new("local"),
@@ -393,6 +399,7 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
                     log_store,
                     Some(metrics),
                     self.cold_store.clone(),
+                    Some(self.log_stores.snapshot_metadata_path(placement)),
                 )
                 .await?,
             );
@@ -673,6 +680,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     self.snapshot_store.clone(),
                     Some(self.registry.snapshot_build_coordinator()),
                     Some(self.registry.snapshot_install_coordinator()),
+                    Some(log_stores.snapshot_metadata_path(placement)),
                 )
                 .await?
             } else {
@@ -688,6 +696,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     self.snapshot_store.clone(),
                     Some(self.registry.snapshot_build_coordinator()),
                     Some(self.registry.snapshot_install_coordinator()),
+                    None,
                 )
                 .await?
             };
