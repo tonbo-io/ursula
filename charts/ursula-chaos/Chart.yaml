@@ -1,0 +1,12 @@
+apiVersion: v2
+name: ursula-chaos
+description: Kubernetes chaos workload and fault injection for an Ursula cluster
+type: application
+version: 0.3.0
+appVersion: "0.3.0"
+kubeVersion: ">=1.24.0-0"
+home: https://ursula.tonbo.io
+sources:
+  - https://github.com/tonbo-io/ursula
+maintainers:
+  - name: The Ursula contributors

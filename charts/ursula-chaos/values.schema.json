@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      },
+      "required": ["repository", "tag", "pullPolicy"]
+    },
+    "imagePullSecrets": { "type": "array", "items": { "type": "object" } },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "namespace": { "type": "string" },
+        "serverFullname": { "type": "string", "minLength": 1 },
+        "headlessService": { "type": "string", "minLength": 1 },
+        "clientPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "replicaCount": { "type": "integer", "const": 3 },
+        "clusterDomain": { "type": "string", "minLength": 1 },
+        "indexerUrl": { "type": "string" },
+        "indexSourceBaseUrl": { "type": "string", "minLength": 1 }
+      },
+      "required": ["namespace", "serverFullname", "headlessService", "clientPort", "replicaCount", "clusterDomain", "indexerUrl", "indexSourceBaseUrl"]
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "type": "object", "additionalProperties": { "type": "string" } }
+      },
+      "required": ["create", "name", "annotations"]
+    },
+    "statusS3Uri": { "type": "string" },
+    "streamCount": { "type": "integer", "minimum": 1 },
+    "recordStreamCount": { "type": "integer", "minimum": 0 },
+    "appendPerSecond": { "type": "integer", "minimum": 1 },
+    "appendWorkers": { "type": "integer", "minimum": 1 },
+    "payloadSizes": { "type": "string", "minLength": 1 },
+    "faultProfile": { "type": "string", "enum": ["kubernetes"] },
+    "faultMinSeconds": { "type": "integer", "minimum": 1 },
+    "faultMaxSeconds": { "type": "integer", "minimum": 1 },
+    "recoverySeconds": { "type": "integer", "minimum": 1 },
+    "recoverySloSeconds": { "type": "integer", "minimum": 1 },
+    "firstFaultSeconds": { "type": "integer", "minimum": 1 },
+    "streamTtlSeconds": { "type": "integer", "minimum": 0 },
+    "workloadRunSeconds": { "type": "integer", "minimum": 0 },
+    "resources": { "type": "object" },
+    "extraArgs": { "type": "array", "items": { "type": "string" } },
+    "extraEnv": { "type": "array", "items": { "type": "object" } },
+    "nodeSelector": { "type": "object", "additionalProperties": { "type": "string" } },
+    "tolerations": { "type": "array", "items": { "type": "object" } },
+    "affinity": { "type": "object" }
+  },
+  "required": ["image", "imagePullSecrets", "target", "serviceAccount", "statusS3Uri", "streamCount", "recordStreamCount", "appendPerSecond", "appendWorkers", "payloadSizes", "faultProfile", "faultMinSeconds", "faultMaxSeconds", "recoverySeconds", "recoverySloSeconds", "firstFaultSeconds", "streamTtlSeconds", "workloadRunSeconds", "resources", "extraArgs", "extraEnv", "nodeSelector", "tolerations", "affinity"]
+}

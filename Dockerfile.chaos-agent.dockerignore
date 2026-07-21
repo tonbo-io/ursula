@@ -1,0 +1,4 @@
+**
+!Dockerfile.chaos-agent
+!scripts/
+!scripts/ursula_chaos_agent.py

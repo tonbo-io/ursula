@@ -1,0 +1,51 @@
+image:
+  repository: ghcr.io/tonbo-io/ursula-chaos-agent
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+target:
+  # Existing Ursula release to exercise. This chart never creates or mutates
+  # the StatefulSet; its Role can only get/delete the generated voter pod names.
+  namespace: ""
+  serverFullname: ursula
+  headlessService: ursula-headless
+  clientPort: 4437
+  replicaCount: 3
+  clusterDomain: cluster.local
+  indexerUrl: http://ursula-indexer:4493
+  indexSourceBaseUrl: http://ursula:4437
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+statusS3Uri: ""
+streamCount: 24
+recordStreamCount: 8
+appendPerSecond: 60
+appendWorkers: 32
+payloadSizes: "128,1024,16384,65536"
+faultProfile: kubernetes
+faultMinSeconds: 900
+faultMaxSeconds: 1800
+recoverySeconds: 180
+recoverySloSeconds: 300
+firstFaultSeconds: 600
+streamTtlSeconds: 7200
+workloadRunSeconds: 3600
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+extraArgs: []
+extraEnv: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
