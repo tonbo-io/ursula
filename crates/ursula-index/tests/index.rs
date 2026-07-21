@@ -374,6 +374,25 @@ async fn compaction_survives_cache_loss() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn compaction_rewrites_full_higher_levels() -> anyhow::Result<()> {
+    let (_object_dir, store) = common::fs_store()?;
+    let compact_config = common::config("https://example.test/v1/stream", 1, 16);
+    let (_cache, mut index) = open(&store, compact_config, 0).await?;
+    for record in 0..64 {
+        index.ingest(entry(record, i64::try_from(record)?)).await?;
+    }
+
+    while index.compact_partition_once(4, 64).await? {}
+
+    assert_eq!(index.part_count(), 1);
+    assert_eq!(
+        index.query(-1, 100, None, None, 100).await?.records.len(),
+        64
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn compaction_is_bounded_to_one_event_time_partition() -> anyhow::Result<()> {
     let (_object_dir, store) = common::fs_store()?;
     let compact_config = common::config("https://example.test/v1/stream", 1, 16);

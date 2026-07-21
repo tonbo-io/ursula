@@ -1,3 +1,5 @@
+use std::time::SystemTime;
+
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -21,6 +23,14 @@ pub struct IndexRegistration {
 struct CatalogManifest {
     version: u32,
     registrations: Vec<IndexRegistration>,
+    #[serde(default)]
+    retired: Vec<RetiredIndexRegistration>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RetiredIndexRegistration {
+    registration: IndexRegistration,
+    retired_at_ms: u64,
 }
 
 impl Default for CatalogManifest {
@@ -28,6 +38,7 @@ impl Default for CatalogManifest {
         Self {
             version: CATALOG_VERSION,
             registrations: Vec::new(),
+            retired: Vec::new(),
         }
     }
 }
@@ -70,6 +81,14 @@ impl IndexCatalog {
             {
                 return Err(IndexError::RegistrationConflict(existing.id.clone()));
             }
+            if let Some(existing) = catalog.retired.iter().find(|existing| {
+                existing.registration.id == registration.id
+                    || existing.registration.stream_url == registration.stream_url
+            }) {
+                return Err(IndexError::RegistrationConflict(
+                    existing.registration.id.clone(),
+                ));
+            }
             catalog.registrations.push(registration.clone());
             catalog
                 .registrations
@@ -106,6 +125,7 @@ impl IndexCatalog {
 
     pub async fn unregister(&self, id: &str) -> Result<(), IndexError> {
         validate_id(id)?;
+        let retired_at_ms = wall_clock_millis()?;
         for _attempt in 0..MAX_CATALOG_ATTEMPTS {
             let current = self
                 .store
@@ -113,12 +133,58 @@ impl IndexCatalog {
                 .await?
                 .ok_or_else(|| IndexError::UnknownIndex(id.to_owned()))?;
             let mut catalog = decode_catalog(&current.bytes)?;
-            let original_len = catalog.registrations.len();
-            catalog
+            let position = catalog
                 .registrations
-                .retain(|registration| registration.id != id);
-            if catalog.registrations.len() == original_len {
-                return Err(IndexError::UnknownIndex(id.to_owned()));
+                .iter()
+                .position(|registration| registration.id == id)
+                .ok_or_else(|| IndexError::UnknownIndex(id.to_owned()))?;
+            let registration = catalog.registrations.remove(position);
+            catalog.retired.push(RetiredIndexRegistration {
+                registration,
+                retired_at_ms,
+            });
+            let bytes = serde_json::to_vec(&catalog)?;
+            if matches!(
+                self.store
+                    .compare_and_swap(CATALOG_KEY, &current.etag, &bytes)
+                    .await?,
+                ConditionalWrite::Written
+            ) {
+                return Ok(());
+            }
+        }
+        Err(IndexError::PublishConflict)
+    }
+
+    pub async fn retired_before(
+        &self,
+        cutoff_ms: u64,
+    ) -> Result<Vec<IndexRegistration>, IndexError> {
+        Ok(self
+            .load()
+            .await?
+            .retired
+            .into_iter()
+            .filter(|retired| retired.retired_at_ms <= cutoff_ms)
+            .map(|retired| retired.registration)
+            .collect())
+    }
+
+    pub async fn forget_retired(&self, id: &str) -> Result<(), IndexError> {
+        validate_id(id)?;
+        for _attempt in 0..MAX_CATALOG_ATTEMPTS {
+            let current = self
+                .store
+                .get(CATALOG_KEY)
+                .await?
+                .ok_or_else(|| IndexError::UnknownIndex(id.to_owned()))?;
+            let mut catalog = decode_catalog(&current.bytes)?;
+            let original_len = catalog.retired.len();
+            catalog
+                .retired
+                .retain(|retired| retired.registration.id != id);
+            if catalog.retired.len() == original_len {
+                return Ok(());
             }
             let bytes = serde_json::to_vec(&catalog)?;
             if matches!(
@@ -139,6 +205,16 @@ impl IndexCatalog {
             None => Ok(CatalogManifest::default()),
         }
     }
+}
+
+fn wall_clock_millis() -> Result<u64, IndexError> {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .ok_or(IndexError::InvalidConfig(
+            "system clock is before the Unix epoch",
+        ))
 }
 
 fn decode_catalog(bytes: &[u8]) -> Result<CatalogManifest, IndexError> {
