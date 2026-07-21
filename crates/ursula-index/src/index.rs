@@ -607,8 +607,12 @@ impl EventIndex {
                 .first()
                 .map(|meta| meta.partition_start_ms)
                 .ok_or(IndexError::InvalidQuery)?;
+            let output_level = candidate
+                .first()
+                .and_then(|meta| meta.level.checked_add(1))
+                .ok_or(IndexError::InvalidQuery)?;
             let meta = self
-                .write_and_upload_part(&entries, 1, partition_start_ms)
+                .write_and_upload_part(&entries, output_level, partition_start_ms)
                 .await?;
             let mut next = self.draft_manifest();
             next.parts
@@ -830,14 +834,14 @@ fn event_time_partition(captured_at_ms: i64) -> i64 {
 }
 
 fn select_compaction(parts: &[PartMeta], fan_in: usize, max_entries: u64) -> Option<Vec<PartMeta>> {
-    let mut partitions = BTreeMap::<i64, Vec<&PartMeta>>::new();
-    for part in parts.iter().filter(|part| part.level == 0) {
-        partitions
-            .entry(part.partition_start_ms)
+    let mut tiers = BTreeMap::<(i64, u8), Vec<&PartMeta>>::new();
+    for part in parts {
+        tiers
+            .entry((part.partition_start_ms, part.level))
             .or_default()
             .push(part);
     }
-    partitions.into_iter().find_map(|(_, mut parts)| {
+    tiers.into_iter().find_map(|(_, mut parts)| {
         if parts.len() < fan_in {
             return None;
         }

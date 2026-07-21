@@ -59,6 +59,20 @@ async fn catalog_registration_is_dynamic_durable_and_idempotent() -> anyhow::Res
 
     catalog.unregister(&registration.id).await?;
     assert!(catalog.list().await?.is_empty());
+    assert_eq!(catalog.retired_before(u64::MAX).await?, vec![
+        registration.clone()
+    ]);
+    let error = catalog
+        .register(&registration)
+        .await
+        .expect_err("a retired namespace cannot be reused before cleanup");
+    assert!(matches!(
+        error,
+        ursula_index::IndexError::RegistrationConflict(_)
+    ));
+    catalog.forget_retired(&registration.id).await?;
+    assert!(catalog.retired_before(u64::MAX).await?.is_empty());
+    catalog.register(&registration).await?;
     Ok(())
 }
 

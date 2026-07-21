@@ -105,6 +105,16 @@ impl ObjectStore {
             Self::S3(store) => store.delete(key).await,
         }
     }
+
+    /// Delete every object in this store's configured namespace.
+    pub async fn delete_all(&self) -> Result<usize, IndexError> {
+        let objects = self.list("").await?;
+        let count = objects.len();
+        for object in objects {
+            self.delete(&object.key).await?;
+        }
+        Ok(count)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -233,7 +243,11 @@ impl FsObjectStore {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>, IndexError> {
-        let root = self.path(prefix)?;
+        let root = if prefix.is_empty() {
+            self.root.clone()
+        } else {
+            self.path(prefix)?
+        };
         if !root.exists() {
             return Ok(Vec::new());
         }
