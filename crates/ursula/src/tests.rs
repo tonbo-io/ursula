@@ -5143,7 +5143,7 @@ mod snapshot_driver {
     #[test]
     fn snapshot_driver_default_interval_follows_external_store() {
         assert_eq!(resolve_snapshot_drive_interval_ms(None, false), 0);
-        assert_eq!(resolve_snapshot_drive_interval_ms(None, true), 60_000);
+        assert_eq!(resolve_snapshot_drive_interval_ms(None, true), 5_000);
         assert_eq!(resolve_snapshot_drive_interval_ms(Some(0), false), 0);
         assert_eq!(resolve_snapshot_drive_interval_ms(Some(0), true), 0);
         assert_eq!(

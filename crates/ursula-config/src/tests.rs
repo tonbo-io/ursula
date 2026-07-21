@@ -176,6 +176,22 @@ snapshot_build_max_concurrency = 2
     }
 
     #[test]
+    fn raft_snapshot_log_retention_is_bounded_and_configurable() {
+        let default = UrsulaConfig::default();
+        assert_eq!(default.raft.max_in_snapshot_log_to_keep, 64);
+
+        let config: UrsulaConfig = toml::from_str(
+            r#"
+[raft]
+max_in_snapshot_log_to_keep = 128
+"#,
+        )
+        .expect("max_in_snapshot_log_to_keep parses");
+
+        assert_eq!(config.raft.max_in_snapshot_log_to_keep, 128);
+    }
+
+    #[test]
     fn snapshot_drive_interval_is_optional_and_zero_is_explicit_disable() {
         use crate::human::HumanDuration;
 

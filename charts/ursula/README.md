@@ -269,8 +269,9 @@ snapshotStore:
 
 When `snapshotStore.backend=s3`, the generated config sets
 `storage.snapshot.backend = "s3"` and shares the top-level `s3` bucket/credential
-settings. Set `snapshotStore.driveIntervalMs=60000` to render
-`storage.snapshot.drive_interval = "60000ms"`, or `0` to disable the manual driver.
+settings. The runtime drives one due group every 5 seconds by default. Set
+`snapshotStore.driveIntervalMs=10000` to render
+`storage.snapshot.drive_interval = "10000ms"`, or `0` to disable the manual driver.
 
 It uses the shared top-level `s3` bucket/credential settings. Runtime S3 snapshot
 keys are built under the resolved `storage.cold.root` plus
@@ -359,6 +360,7 @@ container receives only chart-managed container settings plus explicit
 | `raft.storageMode` | `logDir` | Raft storage mode: `logDir` for durable logs, `memory` for ephemeral testing. |
 | `raft.logDir` | `/var/lib/ursula/raft` | Raft log directory mounted to the `raft-data` volume. |
 | `raft.maxUncommittedBytesPerGroup` | `null` | Optional per-group cap for raft-submitted but not-yet-applied payload bytes. Renders `raft.max_uncommitted_size_per_group` in the generated config when set; `0` disables the cap. |
+| `raft.maxInSnapshotLogToKeep` | `64` | Payload-bearing Raft log entries retained per group after snapshot coverage. Renders `raft.max_in_snapshot_log_to_keep`. |
 
 ### Persistence
 
@@ -405,7 +407,7 @@ container receives only chart-managed container settings plus explicit
 | --- | --- | --- |
 | `snapshotStore.backend` | `inline` | OpenRaft snapshot backend: `inline` or `s3`. Rendered as `storage.snapshot.backend` in the generated config. |
 | `snapshotStore.prefix` | `snapshots` | Snapshot object suffix rendered as `storage.snapshot.s3_prefix`; resolved against `storage.cold.root` when present, otherwise against the S3 bucket root for S3 snapshots. |
-| `snapshotStore.driveIntervalMs` | `null` | Optional manual snapshot driver interval in milliseconds. Renders `storage.snapshot.drive_interval`; omitted uses runtime default semantics, and `0` disables the manual driver. |
+| `snapshotStore.driveIntervalMs` | `null` | Optional manual snapshot driver interval in milliseconds. Renders `storage.snapshot.drive_interval`; omitted drives one due group every 5 seconds for external stores, and `0` disables the manual driver. |
 
 ### Gateway
 

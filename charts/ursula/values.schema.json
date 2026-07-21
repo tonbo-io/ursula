@@ -872,6 +872,11 @@
           "type": ["integer", "null"],
           "minimum": 0,
           "description": "Optional raft uncommitted byte cap per group; 0 disables the cap."
+        },
+        "maxInSnapshotLogToKeep": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Payload-bearing raft log entries retained per group after snapshot coverage."
         }
       }
     },
