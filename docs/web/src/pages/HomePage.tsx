@@ -425,9 +425,8 @@ function HomePage() {
               on record.
             </h3>
             <p className="home-lede">
-              A 3-node cluster on EC2 takes faults around the clock: nodes killed, networks
-              partitioned, clocks skewed. Every read is verified against a running
-              checksum.
+              A 3-node cluster on EKS takes voter Pod failures around the clock. Kubernetes
+              recreates each voter while every read is verified against a running checksum.
             </p>
             <div className="hp-cluster">
               <div className="hp-head">

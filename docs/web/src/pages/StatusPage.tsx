@@ -1146,7 +1146,7 @@ function StatusPage() {
             </div>
           </div>
           <p className="status-summary">
-            {status?.summary ?? "Waiting for the EC2 chaos runner to publish live test data."}
+            {status?.summary ?? "Waiting for the EKS chaos runner to publish live test data."}
           </p>
         </section>
 
@@ -1198,7 +1198,7 @@ function StatusPage() {
             </div>
           </dl>
           <p className="status-verdict-spec">
-            3-node cluster on EC2
+            3-node cluster on EKS
             {topologyPlacement ? <> · {topologyPlacement}</> : null}
             {streamCount ? <> · {streamCount.toLocaleString()} streams</> : null}
             {producerCount ? <> · {producerCount.toLocaleString()} producers</> : null}

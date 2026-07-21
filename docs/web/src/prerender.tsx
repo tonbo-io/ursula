@@ -75,7 +75,7 @@ function getHeadForUrl(url: string): HeadData {
   if (url === CHAOS_TEST_PATH || url === STATUS_PATH) {
     return {
       title: "Chaos Test | Ursula",
-      description: "Live view of Ursula's continuous EC2 chaos test.",
+      description: "Live view of Ursula's continuous EKS chaos test.",
       ogType: "website",
       ogImage: DEFAULT_OG_IMAGE,
       canonical,
