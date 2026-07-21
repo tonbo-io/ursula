@@ -57,7 +57,7 @@ async fn catalog_registration_is_dynamic_durable_and_idempotent() -> anyhow::Res
         ursula_index::IndexError::RegistrationConflict(_)
     ));
 
-    catalog.unregister(&registration.id).await?;
+    catalog.unregister(&registration.id, 42).await?;
     assert!(catalog.list().await?.is_empty());
     assert_eq!(catalog.retired_before(u64::MAX).await?, vec![
         registration.clone()

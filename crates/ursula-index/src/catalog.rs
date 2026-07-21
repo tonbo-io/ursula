@@ -1,5 +1,3 @@
-use std::time::SystemTime;
-
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -123,9 +121,8 @@ impl IndexCatalog {
         Ok(self.load().await?.registrations)
     }
 
-    pub async fn unregister(&self, id: &str) -> Result<(), IndexError> {
+    pub async fn unregister(&self, id: &str, retired_at_ms: u64) -> Result<(), IndexError> {
         validate_id(id)?;
-        let retired_at_ms = wall_clock_millis()?;
         for _attempt in 0..MAX_CATALOG_ATTEMPTS {
             let current = self
                 .store
@@ -205,16 +202,6 @@ impl IndexCatalog {
             None => Ok(CatalogManifest::default()),
         }
     }
-}
-
-fn wall_clock_millis() -> Result<u64, IndexError> {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
-        .ok_or(IndexError::InvalidConfig(
-            "system clock is before the Unix epoch",
-        ))
 }
 
 fn decode_catalog(bytes: &[u8]) -> Result<CatalogManifest, IndexError> {
