@@ -51,3 +51,5 @@ tofu destroy
 ```
 
 The S3 bucket is protected from deletion while it contains objects. Archive or explicitly remove the Ursula prefixes before destroying a disposable environment; do not set `s3_force_destroy=true` for production data.
+
+Versioning retains overwritten and application-deleted objects for 30 days by default. A disposable high-churn chaos environment can set `s3_noncurrent_version_expiration_days=1`; production deployments should keep a recovery window appropriate for their restore policy.

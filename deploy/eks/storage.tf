@@ -51,8 +51,12 @@ resource "aws_s3_bucket_lifecycle_configuration" "ursula" {
 
     filter {}
 
+    expiration {
+      expired_object_delete_marker = true
+    }
+
     noncurrent_version_expiration {
-      noncurrent_days = 30
+      noncurrent_days = var.s3_noncurrent_version_expiration_days
     }
   }
 
