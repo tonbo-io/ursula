@@ -2933,6 +2933,26 @@ async fn warm_group_instantiates_engine_on_owner_core_without_stream_mutation() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn warm_all_groups_warms_owner_cores_concurrently() {
+    let factory = BlockingWarmFactory::default();
+    let runtime = ShardRuntime::spawn_with_engine_factory(test_config(2, 2, 128), factory.clone())
+        .expect("spawn runtime");
+    let blocked_entered = factory.blocked_entered.notified();
+    let other_created = factory.other_created.notified();
+    let warm = tokio::spawn(async move { runtime.warm_all_groups().await });
+
+    tokio::time::timeout(Duration::from_secs(1), blocked_entered)
+        .await
+        .expect("group zero started warming");
+    tokio::time::timeout(Duration::from_secs(1), other_created)
+        .await
+        .expect("other owner core should warm while group zero is blocked");
+
+    factory.release.notify_one();
+    warm.await.expect("warm task").expect("warm all groups");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn core_worker_dispatches_other_groups_while_one_group_waits() {
     let factory = BlockingFirstCreateEngineFactory::default();
     let runtime = ShardRuntime::spawn_with_engine_factory(test_config(1, 2, 128), factory.clone())
@@ -3248,6 +3268,47 @@ struct RecordingEngine {
     commit_index: u64,
     accepts_local_writes: bool,
     cold_hot_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+struct BlockingWarmFactory {
+    blocked_entered: Arc<Notify>,
+    other_created: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl Default for BlockingWarmFactory {
+    fn default() -> Self {
+        Self {
+            blocked_entered: Arc::new(Notify::new()),
+            other_created: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        }
+    }
+}
+
+impl GroupEngineFactory for BlockingWarmFactory {
+    fn create<'a>(
+        &'a self,
+        placement: ShardPlacement,
+        _metrics: GroupEngineMetrics,
+    ) -> GroupEngineCreateFuture<'a> {
+        Box::pin(async move {
+            if placement.raft_group_id == RaftGroupId(0) {
+                self.blocked_entered.notify_one();
+                self.release.notified().await;
+            } else {
+                self.other_created.notify_one();
+            }
+            let engine: Box<dyn GroupEngine> = Box::new(RecordingEngine {
+                placement,
+                commit_index: 0,
+                accepts_local_writes: true,
+                cold_hot_bytes: 0,
+            });
+            Ok(engine)
+        })
+    }
 }
 
 #[derive(Clone)]

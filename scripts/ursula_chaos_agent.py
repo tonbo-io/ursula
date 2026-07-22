@@ -2441,7 +2441,6 @@ class ChaosAgent:
                         "message": f"repair stopped after {repair_count} attempts; pausing further fault injection",
                     }
                 )
-                self.active_injection_id = None
                 changed = True
             if changed:
                 self.publish_status()
