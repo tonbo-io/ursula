@@ -2953,6 +2953,26 @@ async fn warm_all_groups_warms_owner_cores_concurrently() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn warm_all_groups_warms_groups_within_one_core_concurrently() {
+    let factory = BlockingWarmFactory::default();
+    let runtime = ShardRuntime::spawn_with_engine_factory(test_config(1, 2, 128), factory.clone())
+        .expect("spawn runtime");
+    let blocked_entered = factory.blocked_entered.notified();
+    let other_created = factory.other_created.notified();
+    let warm = tokio::spawn(async move { runtime.warm_all_groups().await });
+
+    tokio::time::timeout(Duration::from_secs(1), blocked_entered)
+        .await
+        .expect("group zero started warming");
+    tokio::time::timeout(Duration::from_secs(1), other_created)
+        .await
+        .expect("another group on the same core should warm concurrently");
+
+    factory.release.notify_one();
+    warm.await.expect("warm task").expect("warm all groups");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn core_worker_dispatches_other_groups_while_one_group_waits() {
     let factory = BlockingFirstCreateEngineFactory::default();
     let runtime = ShardRuntime::spawn_with_engine_factory(test_config(1, 2, 128), factory.clone())

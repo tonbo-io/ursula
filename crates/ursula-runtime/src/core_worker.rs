@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use futures_util::StreamExt;
 use tracing::Instrument;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
@@ -69,6 +70,8 @@ use crate::rt::sync::oneshot;
 use crate::rt::time::Instant;
 use crate::trace::Traced;
 
+const WARM_GROUP_CONCURRENCY_PER_CORE: usize = 8;
+
 #[derive(Debug, Clone)]
 pub(crate) struct CoreMailbox {
     pub(crate) core_id: CoreId,
@@ -103,6 +106,10 @@ pub(crate) enum CoreCommand {
     WarmGroup {
         placement: ShardPlacement,
         response_tx: oneshot::Sender<Result<ShardPlacement, RuntimeError>>,
+    },
+    WarmGroups {
+        placements: Vec<ShardPlacement>,
+        response_tx: oneshot::Sender<Result<(), RuntimeError>>,
     },
     #[cfg(madsim)]
     ShutdownGroupEngine {
@@ -241,6 +248,13 @@ impl CoreWorker {
             } => {
                 debug_assert_eq!(placement.core_id, self.core_id);
                 let response = self.group(placement).await.map(|_| placement);
+                let _ = response_tx.send(response);
+            }
+            CoreCommand::WarmGroups {
+                placements,
+                response_tx,
+            } => {
+                let response = self.warm_groups(placements).await;
                 let _ = response_tx.send(response);
             }
             #[cfg(madsim)]
@@ -382,7 +396,6 @@ impl CoreWorker {
         }
     }
 
-    #[cfg(madsim)]
     pub(crate) async fn install_group_engine(
         &mut self,
         placement: ShardPlacement,
@@ -412,6 +425,41 @@ impl CoreWorker {
             tx,
             metrics: self.metrics.clone(),
         });
+        Ok(())
+    }
+
+    async fn warm_groups(&mut self, placements: Vec<ShardPlacement>) -> Result<(), RuntimeError> {
+        let placements = placements
+            .into_iter()
+            .filter(|placement| !self.groups.contains_key(&placement.raft_group_id))
+            .collect::<Vec<_>>();
+        let engine_factory = self.engine_factory.clone();
+        let metrics = self.metrics.clone();
+        let core_id = self.core_id;
+        let mut engines = futures_util::stream::iter(placements)
+            .map(|placement| {
+                let engine_factory = engine_factory.clone();
+                let metrics = metrics.clone();
+                async move {
+                    debug_assert_eq!(placement.core_id, core_id);
+                    if !engine_factory.hosts_group(placement) {
+                        return Err(RuntimeError::GroupNotHosted {
+                            core_id: placement.core_id,
+                            raft_group_id: placement.raft_group_id,
+                        });
+                    }
+                    let engine = engine_factory
+                        .create(placement, GroupEngineMetrics { inner: metrics })
+                        .await
+                        .map_err(|err| RuntimeError::group_engine(placement, err))?;
+                    Ok((placement, engine))
+                }
+            })
+            .buffer_unordered(WARM_GROUP_CONCURRENCY_PER_CORE);
+        while let Some(engine) = engines.next().await {
+            let (placement, engine) = engine?;
+            self.install_group_engine(placement, engine).await?;
+        }
         Ok(())
     }
 

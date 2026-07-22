@@ -4370,6 +4370,7 @@ dependencies = [
  "bytes",
  "criterion",
  "crossbeam-utils",
+ "futures-util",
  "madsim-tokio",
  "opendal",
  "serde",
