@@ -11,6 +11,7 @@ use ursula_runtime::RuntimeConfig;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::SharedSnapshotStore;
+use ursula_runtime::SnapshotReferenceConfig;
 use ursula_runtime::snapshot_store_from_config;
 use ursula_runtime::spawn_cold_flush_worker_if_configured;
 use ursula_runtime::spawn_cold_gc_worker_if_configured;
@@ -48,10 +49,29 @@ pub fn spawn_runtime(
             let bytes = s.as_bytes();
             if bytes == 0 { None } else { Some(bytes) }
         });
-    let snapshot_store = snapshot_store_from_config(&config.storage.snapshot, &config.storage.cold)
-        .map_err(|err| RuntimeError::ColdStoreConfig {
-            message: err.to_string(),
-        })?;
+    let default_voters = if config.raft.peers.is_empty() {
+        std::collections::BTreeSet::from([config.raft.node_id])
+    } else {
+        config.raft.peers.iter().map(|peer| peer.node_id).collect()
+    };
+    let snapshot_references = SnapshotReferenceConfig {
+        node_id: config.raft.node_id,
+        default_voters,
+        per_group_voters: config
+            .raft
+            .groups
+            .iter()
+            .map(|group| (group.raft_group_id, group.voters.iter().copied().collect()))
+            .collect(),
+    };
+    let snapshot_store = snapshot_store_from_config(
+        &config.storage.snapshot,
+        &config.storage.cold,
+        snapshot_references,
+    )
+    .map_err(|err| RuntimeError::ColdStoreConfig {
+        message: err.to_string(),
+    })?;
     let mut engine_config = RaftEngineConfig::from(&config.raft);
     let configured_snapshot_drive_interval_ms = config
         .storage
