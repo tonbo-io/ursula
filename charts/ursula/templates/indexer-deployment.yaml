@@ -83,12 +83,16 @@ spec:
             - $(POD_NAME)
             - --poll-interval-ms
             - {{ $root.Values.indexer.ingest.pollIntervalMs | quote }}
+            - --tail-flush-interval-ms
+            - {{ $root.Values.indexer.ingest.tailFlushIntervalMs | quote }}
             - --compact-parts
             - {{ $root.Values.indexer.compaction.fanIn | quote }}
             - --compaction-max-entries
             - {{ $root.Values.indexer.compaction.maxEntries | int64 | quote }}
             - --maintenance-interval-ms
             - {{ $root.Values.indexer.compaction.maintenanceIntervalMs | quote }}
+            - --maintenance-lease-ms
+            - {{ $root.Values.indexer.compaction.maintenanceLeaseMs | quote }}
             - --gc-interval-seconds
             - {{ $root.Values.indexer.garbageCollection.intervalSeconds | quote }}
             - --gc-grace-seconds

@@ -39,7 +39,7 @@ async fn retained_stream_starts_at_an_explicit_record_base() -> anyhow::Result<(
     assert_eq!(index.indexed_from_record(), 41);
     assert_eq!(index.durable_through_record(), 41);
     let claim = index
-        .claim_next_segment(45, 2, "worker-a", 1_000, 60_000)
+        .claim_next_segment(45, 2, true, "worker-a", 1_000, 60_000)
         .await?
         .ok_or_else(|| anyhow::anyhow!("retained range was not claimed"))?;
     assert_eq!((claim.start_record, claim.end_record), (41, 43));
@@ -104,11 +104,11 @@ async fn workers_claim_distinct_ranges_and_publish_out_of_order() -> anyhow::Res
     let (_cache_b, mut second) = open(&store, config(), 0).await?;
 
     let first_claim = first
-        .claim_next_segment(6, 2, "worker-a", 1_000, 60_000)
+        .claim_next_segment(6, 2, true, "worker-a", 1_000, 60_000)
         .await?
         .ok_or_else(|| anyhow::anyhow!("first range was not claimed"))?;
     let second_claim = second
-        .claim_next_segment(6, 2, "worker-b", 1_000, 60_000)
+        .claim_next_segment(6, 2, true, "worker-b", 1_000, 60_000)
         .await?
         .ok_or_else(|| anyhow::anyhow!("second range was not claimed"))?;
     assert_eq!((first_claim.start_record, first_claim.end_record), (0, 2));
@@ -124,7 +124,7 @@ async fn workers_claim_distinct_ranges_and_publish_out_of_order() -> anyhow::Res
     assert_eq!(first.durable_through_record(), 4);
 
     let third_claim = second
-        .claim_next_segment(6, 2, "worker-b", 1_001, 60_000)
+        .claim_next_segment(6, 2, true, "worker-b", 1_001, 60_000)
         .await?
         .ok_or_else(|| anyhow::anyhow!("third range was not claimed"))?;
     assert_eq!((third_claim.start_record, third_claim.end_record), (4, 6));
@@ -140,10 +140,29 @@ async fn claims_stop_before_the_next_completed_range() -> anyhow::Result<()> {
         .await?;
 
     let claim = index
-        .claim_next_segment(10, 10, "worker-a", 1_000, 60_000)
+        .claim_next_segment(10, 10, true, "worker-a", 1_000, 60_000)
         .await?
         .ok_or_else(|| anyhow::anyhow!("gap before completed range was not claimed"))?;
     assert_eq!((claim.start_record, claim.end_record), (0, 4));
+    Ok(())
+}
+
+#[tokio::test]
+async fn partial_tail_waits_for_an_explicit_flush() -> anyhow::Result<()> {
+    let (_object_dir, store) = common::fs_store()?;
+    let (_cache, mut index) = open(&store, config(), 0).await?;
+
+    assert!(
+        index
+            .claim_next_segment(3, 4, false, "worker-a", 1_000, 60_000)
+            .await?
+            .is_none()
+    );
+    let claim = index
+        .claim_next_segment(3, 4, true, "worker-a", 1_001, 60_000)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("partial tail was not flushed"))?;
+    assert_eq!((claim.start_record, claim.end_record), (0, 3));
     Ok(())
 }
 
@@ -152,7 +171,7 @@ async fn garbage_collection_removes_expired_crashed_worker_claims() -> anyhow::R
     let (object_dir, store) = common::fs_store()?;
     let (_cache, mut index) = open(&store, config(), 0).await?;
     let claim = index
-        .claim_next_segment(4, 2, "crashed-worker", 1_000, 100)
+        .claim_next_segment(4, 2, true, "crashed-worker", 1_000, 100)
         .await?
         .ok_or_else(|| anyhow::anyhow!("range was not claimed"))?;
     assert!(
@@ -189,10 +208,10 @@ async fn concurrent_workers_split_one_hot_stream_into_distinct_ranges() -> anyho
     let (_cache_d, mut fourth) = open(&store, config(), 0).await?;
 
     let claims = tokio::join!(
-        first.claim_next_segment(8, 2, "worker-a", 1_000, 60_000),
-        second.claim_next_segment(8, 2, "worker-b", 1_000, 60_000),
-        third.claim_next_segment(8, 2, "worker-c", 1_000, 60_000),
-        fourth.claim_next_segment(8, 2, "worker-d", 1_000, 60_000),
+        first.claim_next_segment(8, 2, true, "worker-a", 1_000, 60_000),
+        second.claim_next_segment(8, 2, true, "worker-b", 1_000, 60_000),
+        third.claim_next_segment(8, 2, true, "worker-c", 1_000, 60_000),
+        fourth.claim_next_segment(8, 2, true, "worker-d", 1_000, 60_000),
     );
     let mut ranges = [claims.0?, claims.1?, claims.2?, claims.3?]
         .into_iter()
