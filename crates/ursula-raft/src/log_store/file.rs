@@ -206,6 +206,14 @@ impl CoreFileLogWriter {
         }
         let (tx, rx) = mpsc::channel();
         let recovered = load_log_store_inners_from_core_journal(&journal_path)?;
+        if let Some((before, after)) = compact_core_journal(&journal_path, &recovered)? {
+            tracing::info!(
+                path = %journal_path.display(),
+                before_bytes = before,
+                after_bytes = after,
+                "compacted recovered OpenRaft core journal"
+            );
+        }
         let writer = Arc::new(Self {
             tx,
             recovered: Mutex::new(recovered),
@@ -572,6 +580,65 @@ fn load_log_store_inners_from_core_journal(
     Ok(inners)
 }
 
+#[cfg(not(madsim))]
+fn compact_core_journal(
+    journal_path: &Path,
+    inners: &BTreeMap<u32, RaftGroupLogStoreInner>,
+) -> Result<Option<(u64, u64)>, io::Error> {
+    if !journal_path.exists() {
+        return Ok(None);
+    }
+    let before = fs::metadata(journal_path)?.len();
+    let compact_path = journal_path.with_extension("compact");
+    if compact_path.exists() {
+        fs::remove_file(&compact_path)?;
+    }
+
+    let mut handle = RaftGroupFileLogHandle::new(true);
+    let mut wrote_record = false;
+    for (group_id, inner) in inners {
+        let mut write = |record| -> Result<(), io::Error> {
+            wrote_record = true;
+            write_wire_frame_to_file(&compact_path, &mut handle, &CoreJournalRecord {
+                group_id: *group_id,
+                record,
+            })
+        };
+        if let Some(vote) = inner.vote {
+            write(RaftGroupLogRecord::SaveVote(vote))?;
+        }
+        if let Some(committed) = inner.committed {
+            write(RaftGroupLogRecord::SaveCommitted(Some(committed)))?;
+        }
+        if let Some(purged) = inner.last_purged_log_id {
+            write(RaftGroupLogRecord::Purge(purged))?;
+        }
+        if !inner.entries.is_empty() {
+            write(RaftGroupLogRecord::Append(
+                inner.entries.values().cloned().collect(),
+            ))?;
+        }
+    }
+    if wrote_record {
+        sync_file_handle(&compact_path, &mut handle)?;
+    } else {
+        let file = fs::File::create(&compact_path)?;
+        file.sync_all()?;
+    }
+    drop(handle);
+
+    let after = fs::metadata(&compact_path)?.len();
+    if after >= before {
+        fs::remove_file(&compact_path)?;
+        return Ok(None);
+    }
+    fs::rename(&compact_path, journal_path)?;
+    if let Some(parent) = journal_path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(Some((before, after)))
+}
+
 /// Frames Raft log records as length-delimited MessagePack for the shared
 /// journal (see [`crate::codec::encode_wire`]).
 struct WireCodec<T>(PhantomData<T>);
@@ -690,6 +757,11 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
 
+    use openraft::EntryPayload;
+    use openraft::LogId;
+    use openraft::entry::RaftEntry;
+    use openraft::vote::RaftLeaderId;
+    use openraft::vote::leader_id_adv::CommittedLeaderId;
     use ursula_shard::CoreId;
     use ursula_shard::RaftGroupId;
     use ursula_shard::ShardId;
@@ -716,6 +788,17 @@ mod tests {
             .expect("write torn frame length");
         file.write_all(b"torn").expect("write partial torn payload");
         file.sync_data().expect("sync torn tail");
+    }
+
+    fn test_log_id(index: u64) -> LogIdOf<UrsulaRaftTypeConfig> {
+        LogId {
+            leader_id: CommittedLeaderId::new(5, 1),
+            index,
+        }
+    }
+
+    fn blank_entry(index: u64) -> EntryOf<UrsulaRaftTypeConfig> {
+        EntryOf::<UrsulaRaftTypeConfig>::new(test_log_id(index), EntryPayload::Blank)
     }
 
     fn committed_vote() -> VoteOf<UrsulaRaftTypeConfig> {
@@ -820,6 +903,54 @@ mod tests {
             Some(second_vote)
         );
 
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(not(madsim))]
+    #[test]
+    fn compact_core_journal_keeps_only_recovered_state() {
+        let path = temp_journal_path("core-journal-compact");
+        let first_vote = openraft::Vote::new_committed(3, 1);
+        let latest_vote = openraft::Vote::new_committed(5, 1);
+        let mut handle = RaftGroupFileLogHandle::new(true);
+        for vote in std::iter::repeat_n(first_vote, 100).chain([latest_vote]) {
+            write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
+                group_id: 7,
+                record: RaftGroupLogRecord::SaveVote(vote),
+            })
+            .expect("write redundant vote");
+        }
+        for record in [
+            RaftGroupLogRecord::Append((1..=3).map(blank_entry).collect()),
+            RaftGroupLogRecord::Purge(test_log_id(2)),
+            RaftGroupLogRecord::SaveCommitted(Some(test_log_id(3))),
+        ] {
+            write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
+                group_id: 7,
+                record,
+            })
+            .expect("write retained log state");
+        }
+        sync_file_handle(&path, &mut handle).expect("sync redundant journal");
+        drop(handle);
+        let before = fs::metadata(&path).expect("journal metadata").len();
+        let inners = load_log_store_inners_from_core_journal(&path).expect("replay journal");
+
+        let compacted = compact_core_journal(&path, &inners)
+            .expect("compact journal")
+            .expect("redundant journal should shrink");
+
+        assert_eq!(compacted.0, before);
+        assert!(compacted.1 < compacted.0);
+        let recovered = load_log_store_inners_from_core_journal(&path).expect("replay compacted");
+        assert_eq!(
+            recovered.get(&7).and_then(|inner| inner.vote),
+            Some(latest_vote)
+        );
+        let recovered = recovered.get(&7).expect("recovered group");
+        assert_eq!(recovered.last_purged_log_id, Some(test_log_id(2)));
+        assert_eq!(recovered.committed, Some(test_log_id(3)));
+        assert_eq!(recovered.entries.keys().copied().collect::<Vec<_>>(), [3]);
         let _ = fs::remove_file(&path);
     }
 }
