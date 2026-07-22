@@ -346,6 +346,9 @@ indexer:
     rowGroupEntries: 16384
     readBatchRecords: 4096
     pollIntervalMs: 250
+    # Bound near-tail indexing latency without publishing one tiny Parquet part
+    # on every poll. Full worker segments are published immediately.
+    tailFlushIntervalMs: 5000
   workers:
     # Concurrent range tasks per pod. One hot stream may occupy several slots.
     concurrency: 4
@@ -357,6 +360,8 @@ indexer:
     fanIn: 8
     maxEntries: 1000000
     maintenanceIntervalMs: 1000
+    # One pool replica compacts and garbage-collects at a time.
+    maintenanceLeaseMs: 300000
   garbageCollection:
     intervalSeconds: 3600
     graceSeconds: 86400

@@ -8,6 +8,39 @@ use ursula_index::IndexRegistration;
     clippy::panic_in_result_fn,
     reason = "the test combines fallible setup with assertions"
 )]
+async fn one_pool_worker_owns_the_renewable_maintenance_lease() -> anyhow::Result<()> {
+    let object_dir = TempDir::new()?;
+    let first = IndexCatalog::new(FsObjectStore::new(object_dir.path())?);
+    let second = first.clone();
+
+    assert!(
+        first
+            .acquire_maintenance_lease("worker-a", 1_000, 1_000)
+            .await?
+    );
+    assert!(
+        !second
+            .acquire_maintenance_lease("worker-b", 1_100, 1_000)
+            .await?
+    );
+    assert!(
+        first
+            .acquire_maintenance_lease("worker-a", 1_200, 1_000)
+            .await?
+    );
+    assert!(
+        second
+            .acquire_maintenance_lease("worker-b", 2_001, 1_000)
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "the test combines fallible setup with assertions"
+)]
 async fn catalog_registration_is_dynamic_durable_and_idempotent() -> anyhow::Result<()> {
     let object_dir = TempDir::new()?;
     let catalog = IndexCatalog::new(FsObjectStore::new(object_dir.path())?);

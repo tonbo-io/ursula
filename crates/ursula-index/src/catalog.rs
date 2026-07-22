@@ -6,6 +6,7 @@ use crate::object_store::ConditionalWrite;
 use crate::object_store::ObjectStore;
 
 const CATALOG_KEY: &str = "CATALOG";
+const MAINTENANCE_LEASE_KEY: &str = "maintenance/lease.json";
 const CATALOG_VERSION: u32 = 1;
 const MAX_CATALOG_ATTEMPTS: usize = 32;
 
@@ -29,6 +30,12 @@ struct CatalogManifest {
 struct RetiredIndexRegistration {
     registration: IndexRegistration,
     retired_at_ms: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct MaintenanceLease {
+    worker_id: String,
+    expires_at_ms: u64,
 }
 
 impl Default for CatalogManifest {
@@ -119,6 +126,50 @@ impl IndexCatalog {
 
     pub async fn list(&self) -> Result<Vec<IndexRegistration>, IndexError> {
         Ok(self.load().await?.registrations)
+    }
+
+    /// Elect one pool replica to compact and garbage-collect all indexes.
+    /// The owner renews only after half the lease has elapsed so S3 versioning
+    /// does not turn the coordination object itself into high-frequency churn.
+    pub async fn acquire_maintenance_lease(
+        &self,
+        worker_id: &str,
+        now_ms: u64,
+        lease_ms: u64,
+    ) -> Result<bool, IndexError> {
+        if worker_id.is_empty() || lease_ms == 0 {
+            return Err(IndexError::InvalidConfig(
+                "maintenance worker id and lease duration must be non-empty",
+            ));
+        }
+        let current = self.store.get(MAINTENANCE_LEASE_KEY).await?;
+        if let Some(current) = &current {
+            let lease: MaintenanceLease = serde_json::from_slice(&current.bytes)?;
+            if lease.worker_id != worker_id && lease.expires_at_ms > now_ms {
+                return Ok(false);
+            }
+            let renewal_threshold = now_ms.saturating_add(lease_ms / 2);
+            if lease.worker_id == worker_id && lease.expires_at_ms > renewal_threshold {
+                return Ok(true);
+            }
+        }
+        let bytes = serde_json::to_vec(&MaintenanceLease {
+            worker_id: worker_id.to_owned(),
+            expires_at_ms: now_ms.saturating_add(lease_ms),
+        })?;
+        let write = match current {
+            Some(current) => {
+                self.store
+                    .compare_and_swap(MAINTENANCE_LEASE_KEY, &current.etag, &bytes)
+                    .await?
+            }
+            None => {
+                self.store
+                    .put_if_absent(MAINTENANCE_LEASE_KEY, &bytes)
+                    .await?
+            }
+        };
+        Ok(matches!(write, ConditionalWrite::Written))
     }
 
     pub async fn unregister(&self, id: &str, retired_at_ms: u64) -> Result<(), IndexError> {
