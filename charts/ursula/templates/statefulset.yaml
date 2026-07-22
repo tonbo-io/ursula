@@ -95,6 +95,28 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          {{- if .Values.server.probes.startup.enabled }}
+          startupProbe:
+            tcpSocket:
+              port: client
+            failureThreshold: {{ .Values.server.probes.startup.failureThreshold }}
+            periodSeconds: {{ .Values.server.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.server.probes.startup.timeoutSeconds }}
+          {{- end }}
+          {{- if .Values.server.probes.readiness.enabled }}
+          readinessProbe:
+            tcpSocket:
+              port: client
+            periodSeconds: {{ .Values.server.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.server.probes.readiness.timeoutSeconds }}
+          {{- end }}
+          {{- if .Values.server.probes.liveness.enabled }}
+          livenessProbe:
+            tcpSocket:
+              port: client
+            periodSeconds: {{ .Values.server.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.server.probes.liveness.timeoutSeconds }}
+          {{- end }}
           volumeMounts:
             - name: entrypoint
               mountPath: /opt/ursula/entrypoint

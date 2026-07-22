@@ -84,6 +84,21 @@ server:
     capabilities:
       drop:
         - ALL
+  probes:
+    # Cold snapshot restore can take several minutes on large group counts.
+    startup:
+      enabled: true
+      failureThreshold: 180
+      periodSeconds: 5
+      timeoutSeconds: 2
+    readiness:
+      enabled: true
+      periodSeconds: 5
+      timeoutSeconds: 2
+    liveness:
+      enabled: true
+      periodSeconds: 10
+      timeoutSeconds: 2
   podDisruptionBudget:
     # Enable quorum-friendly PDB for multi-node clusters.
     enabled: true
