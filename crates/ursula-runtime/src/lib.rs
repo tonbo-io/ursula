@@ -156,6 +156,7 @@ pub use snapshot_store::SnapshotCompression;
 pub use snapshot_store::SnapshotKey;
 pub use snapshot_store::SnapshotLocation;
 pub use snapshot_store::SnapshotPointer;
+pub use snapshot_store::SnapshotReferenceConfig;
 pub use snapshot_store::SnapshotStore;
 pub use snapshot_store::SnapshotStoreError;
 pub use snapshot_store::SnapshotStoreFuture;
