@@ -304,6 +304,12 @@ impl RaftGroupStateMachine {
                 .map_err(|err| err.into_io())?,
         };
         let group_snapshot = decode_group_snapshot(&snapshot_bytes).map_err(|err| err.into_io())?;
+        if matches!(pointer.location, SnapshotLocation::S3 { .. }) {
+            self.snapshot_store
+                .publish_reference(self.placement.raft_group_id.0, &pointer.location)
+                .await
+                .map_err(|err| err.into_io())?;
+        }
         self.engine
             .install_snapshot(group_snapshot)
             .await
@@ -620,6 +626,12 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             .await
             .map_err(group_engine_io_error)?;
         persist_snapshot_metadata(self.snapshot_metadata_path.as_deref(), meta, &pointer_bytes)?;
+        if matches!(pointer.location, SnapshotLocation::S3 { .. }) {
+            self.snapshot_store
+                .publish_reference(self.placement.raft_group_id.0, &pointer.location)
+                .await
+                .map_err(|err| err.into_io())?;
+        }
         self.last_applied_log_id = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
         *self.current_snapshot.lock().expect("snapshot mutex") = Some(CurrentSnapshot {
@@ -710,16 +722,49 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                 }
             }
         };
-        let pointer = SnapshotPointer {
-            snapshot_id,
+        let mut pointer = SnapshotPointer {
+            snapshot_id: snapshot_id.clone(),
             location,
         };
-        let pointer_bytes = pointer.encode().map_err(|err| err.into_io())?;
+        let mut pointer_bytes = pointer.encode().map_err(|err| err.into_io())?;
         persist_snapshot_metadata(
             self.snapshot_metadata_path.as_deref(),
             &self.meta,
             &pointer_bytes,
         )?;
+        if matches!(pointer.location, SnapshotLocation::S3 { .. })
+            && let Err(err) = self
+                .snapshot_store
+                .publish_reference(self.placement.raft_group_id.0, &pointer.location)
+                .await
+        {
+            tracing::warn!(
+                snapshot_id,
+                error = %err,
+                "falling back to inline OpenRaft snapshot after external reference publication failed"
+            );
+            if let Err(delete_error) = self.snapshot_store.delete(&pointer.location).await {
+                tracing::warn!(
+                    snapshot_id,
+                    error = %delete_error,
+                    "failed to delete unreferenced external snapshot after reference publication failure"
+                );
+            }
+            pointer.location = SnapshotLocation::Inline {
+                bytes: group_snapshot_frames(self.snapshot.clone())
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|err| err.into_io())?
+                    .into_iter()
+                    .flat_map(|chunk| chunk.to_vec())
+                    .collect(),
+            };
+            pointer_bytes = pointer.encode().map_err(|err| err.into_io())?;
+            persist_snapshot_metadata(
+                self.snapshot_metadata_path.as_deref(),
+                &self.meta,
+                &pointer_bytes,
+            )?;
+        }
         let external_upload = !matches!(pointer.location, SnapshotLocation::Inline { .. });
         let inline_fallback = !external_upload;
         if let Some(metrics) = &self.metrics {
