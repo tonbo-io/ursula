@@ -313,6 +313,32 @@ class ChaosAgentStateTest(unittest.TestCase):
         self.assertEqual(agent.effective_recovery_slo_secs("cluster_netem_delay"), 120)
         self.assertEqual(agent.effective_recovery_slo_secs(None), 120)
 
+    def test_exhausted_repair_keeps_injection_active_until_recovery(self) -> None:
+        agent = object.__new__(ChaosAgent)
+        now = datetime.now(timezone.utc)
+        injection = {
+            "id": 29,
+            "status": "repairing",
+            "start_requested_at": (now - timedelta(minutes=10)).isoformat(),
+            "slo_missed_at": (now - timedelta(minutes=5)).isoformat(),
+            "recovered_at": None,
+            "repair_attempts": 2,
+            "timeline": [],
+        }
+        agent.injections = deque([injection])
+        agent.active_injection_id = 29
+        agent.active_fault = None
+        agent.max_repair_attempts = 2
+        agent.next_fault_at = now + timedelta(minutes=1)
+        agent.publish_status = lambda: None
+
+        self.assertTrue(agent.repair_unrecovered_injection(now))
+
+        self.assertEqual(injection["status"], "repair_failed")
+        self.assertIsNone(agent.next_fault_at)
+        self.assertEqual(agent.active_injection_id, 29)
+        self.assertIs(agent.current_injection(), injection)
+
     def test_parse_producer_seq_conflict(self) -> None:
         parsed = ChaosAgent.parse_producer_seq_conflict(
             b"core 1 raft group 3 operation failed: "
