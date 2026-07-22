@@ -645,17 +645,20 @@ impl ShardRuntime {
     }
 
     pub async fn warm_all_groups(&self) -> Result<(), RuntimeError> {
-        let mut responses = Vec::new();
+        let mut placements_by_core = vec![Vec::new(); self.mailboxes.len()];
         for raw_group_id in 0..self.shard_map.raft_group_count() {
             let placement = self.placement_for_group(RaftGroupId(raw_group_id))?;
-            let mailbox = &self.mailboxes[usize::from(placement.core_id.0)];
+            placements_by_core[usize::from(placement.core_id.0)].push(placement);
+        }
+        let mut responses = Vec::new();
+        for (mailbox, placements) in self.mailboxes.iter().zip(placements_by_core) {
             let (response_tx, response_rx) = oneshot::channel();
-            self.enqueue_core_command(mailbox, CoreCommand::WarmGroup {
-                placement,
+            self.enqueue_core_command(mailbox, CoreCommand::WarmGroups {
+                placements,
                 response_tx,
             })
             .await?;
-            responses.push((placement.core_id, response_rx));
+            responses.push((mailbox.core_id, response_rx));
         }
         for (core_id, response_rx) in responses {
             response_rx
