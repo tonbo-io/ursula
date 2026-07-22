@@ -91,10 +91,16 @@ struct Args {
     worker_id: String,
     #[arg(long, default_value_t = 250)]
     poll_interval_ms: u64,
+    /// Maximum delay before publishing an incomplete tail segment. Full
+    /// segments are still claimed immediately.
+    #[arg(long, default_value_t = 5_000)]
+    tail_flush_interval_ms: u64,
     #[arg(long = "compact-parts", default_value_t = 8)]
     compaction_fan_in: usize,
     #[arg(long, default_value_t = 1_000_000)]
     compaction_max_entries: u64,
+    #[arg(long, default_value_t = 300_000)]
+    maintenance_lease_ms: u64,
     #[arg(long, default_value_t = 3_600)]
     gc_interval_seconds: u64,
     #[arg(long, default_value_t = 86_400)]
@@ -183,6 +189,7 @@ struct MaintenanceConfig {
     interval: Duration,
     compaction_fan_in: usize,
     compaction_max_entries: u64,
+    lease_ms: u64,
     gc_interval: Duration,
     gc_grace: Duration,
     gc_retain_generations: u64,
@@ -194,6 +201,7 @@ impl MaintenanceConfig {
             interval: Duration::from_millis(args.maintenance_interval_ms),
             compaction_fan_in: args.compaction_fan_in,
             compaction_max_entries: args.compaction_max_entries,
+            lease_ms: args.maintenance_lease_ms,
             gc_interval: Duration::from_secs(args.gc_interval_seconds),
             gc_grace: Duration::from_secs(args.gc_grace_seconds),
             gc_retain_generations: args.gc_retain_generations,
@@ -495,10 +503,12 @@ async fn run_pool(args: Args) -> anyhow::Result<()> {
         args.segment_lease_ms,
         args.read_batch_records,
         Duration::from_millis(args.poll_interval_ms),
+        Duration::from_millis(args.tail_flush_interval_ms),
         shutdown_rx.clone(),
     ));
     let maintenance = tokio::spawn(pool_maintenance_loop(
         state.clone(),
+        args.worker_id.clone(),
         MaintenanceConfig::from_args(&args),
         shutdown_rx,
     ));
@@ -544,12 +554,15 @@ async fn pool_worker_loop(
     lease_ms: u64,
     read_batch_records: usize,
     poll_interval: Duration,
+    tail_flush_interval: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    let mut next_tail_flush = Instant::now();
     loop {
         if *shutdown.borrow() {
             return Ok(());
         }
+        let allow_partial = Instant::now() >= next_tail_flush;
         match state.catalog.list().await {
             Ok(registrations) => {
                 if !registrations.is_empty() {
@@ -561,6 +574,7 @@ async fn pool_worker_loop(
                     let mut pending = registrations.into_iter().collect::<VecDeque<_>>();
                     let mut tasks = JoinSet::new();
                     let mut attempts = 0_usize;
+                    let mut partial_attempted = HashSet::new();
                     while (!pending.is_empty() || !tasks.is_empty()) && attempts < max_attempts {
                         while tasks.len() < worker_concurrency && attempts < max_attempts {
                             let Some(registration) = pending.pop_front() else {
@@ -569,6 +583,8 @@ async fn pool_worker_loop(
                             attempts = attempts.saturating_add(1);
                             let task_state = state.clone();
                             let task_worker_id = worker_id.clone();
+                            let task_allow_partial =
+                                allow_partial && partial_attempted.insert(registration.id.clone());
                             tasks.spawn(async move {
                                 let result = process_pool_source(
                                     &task_state,
@@ -577,6 +593,7 @@ async fn pool_worker_loop(
                                     segment_records,
                                     lease_ms,
                                     read_batch_records,
+                                    task_allow_partial,
                                 )
                                 .await;
                                 (registration, result)
@@ -601,6 +618,11 @@ async fn pool_worker_loop(
             }
             Err(error) => tracing::warn!(%error, "event-index catalog refresh failed; retrying"),
         }
+        if allow_partial {
+            next_tail_flush = Instant::now()
+                .checked_add(tail_flush_interval)
+                .unwrap_or_else(Instant::now);
+        }
         if wait_or_shutdown(poll_interval, &mut shutdown).await {
             return Ok(());
         }
@@ -614,6 +636,7 @@ async fn process_pool_source(
     segment_records: u64,
     lease_ms: u64,
     read_batch_records: usize,
+    allow_partial: bool,
 ) -> Result<bool, IndexError> {
     let stream_url = Url::parse(&registration.stream_url)
         .map_err(|_error| IndexError::InvalidConfig("registered stream URL is invalid"))?;
@@ -635,6 +658,7 @@ async fn process_pool_source(
             .claim_next_segment(
                 source_range.next_record,
                 task_records,
+                allow_partial,
                 worker_id,
                 now_ms,
                 lease_ms,
@@ -762,6 +786,7 @@ async fn maintenance_loop(
 
 async fn pool_maintenance_loop(
     state: PoolState,
+    worker_id: String,
     config: MaintenanceConfig,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -769,6 +794,29 @@ async fn pool_maintenance_loop(
     loop {
         if *shutdown.borrow() {
             return Ok(());
+        }
+        let owns_maintenance = match wall_clock_millis() {
+            Ok(now_ms) => match state
+                .catalog
+                .acquire_maintenance_lease(&worker_id, now_ms, config.lease_ms)
+                .await
+            {
+                Ok(owns_maintenance) => owns_maintenance,
+                Err(error) => {
+                    tracing::warn!(%error, "event-index maintenance lease failed");
+                    false
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "event-index maintenance clock failed");
+                false
+            }
+        };
+        if !owns_maintenance {
+            if wait_or_shutdown(config.interval, &mut shutdown).await {
+                return Ok(());
+            }
+            continue;
         }
         if let Err(error) = reconcile_pool_indexes(&state).await {
             tracing::warn!(%error, "event-index maintenance catalog refresh failed");
@@ -1421,8 +1469,8 @@ mod tests {
         let registration = state.catalog.get("session-42").await?;
         assert_eq!(registration.indexed_from_record, 5);
 
-        process_pool_source(&state, &registration, "worker-a", 2, 60_000, 2).await?;
-        process_pool_source(&state, &registration, "worker-b", 2, 60_000, 2).await?;
+        process_pool_source(&state, &registration, "worker-a", 2, 60_000, 2, true).await?;
+        process_pool_source(&state, &registration, "worker-b", 2, 60_000, 2, true).await?;
         let response = app
             .oneshot(
                 Request::builder()

@@ -164,6 +164,9 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- if gt (mul $flushEntries $fanIn) $maxEntries -}}
 {{- fail "indexer.compaction.maxEntries must cover ingest.flushEntries times compaction.fanIn" -}}
 {{- end -}}
+{{- if lt (.Values.indexer.compaction.maintenanceLeaseMs | int64) (.Values.indexer.compaction.maintenanceIntervalMs | int64) -}}
+{{- fail "indexer.compaction.maintenanceLeaseMs must cover maintenanceIntervalMs" -}}
+{{- end -}}
 {{- if lt (.Values.indexer.garbageCollection.graceSeconds | int) 300 -}}
 {{- fail "indexer.garbageCollection.graceSeconds must be at least 300" -}}
 {{- end -}}

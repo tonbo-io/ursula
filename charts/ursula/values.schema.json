@@ -741,9 +741,10 @@
             "flushEntries": { "type": "integer", "minimum": 1 },
             "rowGroupEntries": { "type": "integer", "minimum": 1 },
             "readBatchRecords": { "type": "integer", "minimum": 1 },
-            "pollIntervalMs": { "type": "integer", "minimum": 1 }
+            "pollIntervalMs": { "type": "integer", "minimum": 1 },
+            "tailFlushIntervalMs": { "type": "integer", "minimum": 1 }
           },
-          "required": ["flushEntries", "rowGroupEntries", "readBatchRecords", "pollIntervalMs"]
+          "required": ["flushEntries", "rowGroupEntries", "readBatchRecords", "pollIntervalMs", "tailFlushIntervalMs"]
         },
         "workers": {
           "type": "object",
@@ -761,9 +762,10 @@
           "properties": {
             "fanIn": { "type": "integer", "minimum": 2 },
             "maxEntries": { "type": "integer", "minimum": 1 },
-            "maintenanceIntervalMs": { "type": "integer", "minimum": 1 }
+            "maintenanceIntervalMs": { "type": "integer", "minimum": 1 },
+            "maintenanceLeaseMs": { "type": "integer", "minimum": 1 }
           },
-          "required": ["fanIn", "maxEntries", "maintenanceIntervalMs"]
+          "required": ["fanIn", "maxEntries", "maintenanceIntervalMs", "maintenanceLeaseMs"]
         },
         "garbageCollection": {
           "type": "object",

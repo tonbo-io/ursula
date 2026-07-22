@@ -118,6 +118,7 @@ impl EventIndex {
         &mut self,
         tail_record: u64,
         segment_records: u64,
+        allow_partial: bool,
         worker_id: &str,
         now_ms: u64,
         lease_ms: u64,
@@ -156,6 +157,9 @@ impl EventIndex {
                 .saturating_add(segment_records)
                 .min(tail_record)
                 .min(next_covered_record);
+            if !allow_partial && end_record.saturating_sub(start_record) < segment_records {
+                return Ok(None);
+            }
             let key = format!("claims/{start_record:020}.json");
             let claim = RecordSegmentLease {
                 start_record,
