@@ -191,6 +191,45 @@
           "additionalProperties": true,
           "description": "Container-level securityContext for the Ursula server container."
         },
+        "probes": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "TCP probe settings for the Ursula server.",
+          "properties": {
+            "startup": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "failureThreshold": { "type": "integer", "minimum": 1 },
+                "periodSeconds": { "type": "integer", "minimum": 1 },
+                "timeoutSeconds": { "type": "integer", "minimum": 1 }
+              },
+              "required": ["enabled", "failureThreshold", "periodSeconds", "timeoutSeconds"]
+            },
+            "readiness": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "periodSeconds": { "type": "integer", "minimum": 1 },
+                "timeoutSeconds": { "type": "integer", "minimum": 1 }
+              },
+              "required": ["enabled", "periodSeconds", "timeoutSeconds"]
+            },
+            "liveness": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "periodSeconds": { "type": "integer", "minimum": 1 },
+                "timeoutSeconds": { "type": "integer", "minimum": 1 }
+              },
+              "required": ["enabled", "periodSeconds", "timeoutSeconds"]
+            }
+          },
+          "required": ["startup", "readiness", "liveness"]
+        },
         "podDisruptionBudget": {
           "type": "object",
           "additionalProperties": false,
@@ -228,6 +267,7 @@
         "resources",
         "podSecurityContext",
         "securityContext",
+        "probes",
         "podDisruptionBudget",
         "scheduling"
       ]

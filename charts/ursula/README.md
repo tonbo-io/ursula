@@ -338,6 +338,9 @@ operationally safe restarts on an initialized cluster.
 | `server.resources` | `{}` | Container resource requests and limits for the Ursula server container. |
 | `server.podSecurityContext` | `{fsGroup: 10001, fsGroupChangePolicy: OnRootMismatch}` | Pod-level securityContext for Ursula server pods. |
 | `server.securityContext` | `{runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}` | Container-level securityContext for the Ursula server container. |
+| `server.probes.startup` | `{enabled: true, failureThreshold: 180, periodSeconds: 5, timeoutSeconds: 2}` | TCP startup probe. The 15-minute budget allows S3 snapshot restore before Kubernetes enables liveness checks. |
+| `server.probes.readiness` | `{enabled: true, periodSeconds: 5, timeoutSeconds: 2}` | TCP readiness probe. Rolling updates wait until the Ursula client port is actually serving before replacing the next voter. |
+| `server.probes.liveness` | `{enabled: true, periodSeconds: 10, timeoutSeconds: 2}` | TCP liveness probe enabled after startup succeeds. |
 | `server.podDisruptionBudget.enabled` | `true` | Render a PDB for multi-node clusters. The chart omits the PDB when `server.replicaCount=1`. |
 | `server.podDisruptionBudget.maxUnavailable` | `1` | Maximum voluntary disruptions. The template fails if this value would allow loss of Raft quorum. |
 | `server.scheduling.nodeSelector` | `{}` | Node selector labels for server pods. |
