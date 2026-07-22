@@ -101,6 +101,17 @@ variable "s3_force_destroy" {
   default     = false
 }
 
+variable "s3_noncurrent_version_expiration_days" {
+  description = "Days to retain noncurrent S3 object versions. Keep the 30-day default for recovery; disposable chaos clusters can use 1."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.s3_noncurrent_version_expiration_days >= 1
+    error_message = "s3_noncurrent_version_expiration_days must be at least 1."
+  }
+}
+
 variable "namespace" {
   description = "Kubernetes namespace passed to Helm and EKS Pod Identity."
   type        = string
