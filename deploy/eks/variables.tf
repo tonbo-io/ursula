@@ -192,6 +192,17 @@ variable "cold_compaction_enabled" {
   default     = false
 }
 
+variable "cold_compaction_max_streams_per_pass" {
+  description = "Maximum streams compacted by each voter in one discovery pass."
+  type        = number
+  default     = 16
+
+  validation {
+    condition     = var.cold_compaction_max_streams_per_pass >= 1
+    error_message = "cold_compaction_max_streams_per_pass must be at least 1."
+  }
+}
+
 variable "raft_volume_size" {
   description = "gp3 PVC size for each voter Raft log."
   type        = string

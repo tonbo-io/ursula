@@ -27,6 +27,7 @@ indexer_replicas      = 2
 
 # Enable only after every voter runs a Ursula image that supports compaction.
 cold_compaction_enabled = false
+cold_compaction_max_streams_per_pass = 16
 
 tags = {
   Environment = "production"
