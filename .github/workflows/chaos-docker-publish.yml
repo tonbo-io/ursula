@@ -8,16 +8,8 @@ on:
       - Dockerfile.chaos-agent.dockerignore
       - scripts/ursula_chaos_agent.py
   push:
-    branches:
-      - main
     tags:
       - "v*.*.*"
-    paths:
-      - .github/workflows/chaos-docker-publish.yml
-      - Dockerfile.chaos-agent
-      - Dockerfile.chaos-agent.dockerignore
-      - scripts/ursula_chaos_agent.py
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -60,13 +52,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
             type=ref,event=pr
             type=ref,event=tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and publish chaos-agent image
         uses: depot/build-push-action@v1
@@ -75,7 +64,7 @@ jobs:
           context: .
           file: ./Dockerfile.chaos-agent
           platforms: ${{ env.DOCKER_PLATFORMS }}
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.ref_type == 'tag' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}

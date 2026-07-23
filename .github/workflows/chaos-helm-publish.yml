@@ -7,24 +7,8 @@ on:
       - charts/ursula-chaos/**
       - scripts/chaos_helm_template_test.py
   push:
-    branches:
-      - main
     tags:
       - "v*.*.*"
-    paths:
-      - .github/workflows/chaos-helm-publish.yml
-      - charts/ursula-chaos/**
-      - scripts/chaos_helm_template_test.py
-  workflow_dispatch:
-    inputs:
-      chart_version:
-        description: Override the chaos chart version.
-        required: false
-        type: string
-      app_version:
-        description: Override the chaos-agent app version.
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -58,25 +42,16 @@ jobs:
 
       - name: Package chart
         id: package
-        env:
-          CHART_VERSION_INPUT: ${{ inputs.chart_version }}
-          APP_VERSION_INPUT: ${{ inputs.app_version }}
         run: |
           mkdir -p "$CHART_PACKAGE_DIR"
-          chart_version="$CHART_VERSION_INPUT"
-          if [[ -z "$chart_version" && "$GITHUB_REF_TYPE" == "tag" ]]; then
-            chart_version="${GITHUB_REF_NAME#v}"
-          fi
-          app_version="$APP_VERSION_INPUT"
-          if [[ -z "$app_version" && -n "$chart_version" ]]; then
-            app_version="$chart_version"
-          fi
           package_args=()
-          if [[ -n "$chart_version" ]]; then
-            package_args+=(--version "$chart_version")
-          fi
-          if [[ -n "$app_version" ]]; then
-            package_args+=(--app-version "$app_version")
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            chart_version="$(awk '$1 == "version:" {print $2; exit}' "$CHART_DIR/Chart.yaml")"
+            app_version="$(awk '$1 == "appVersion:" {gsub(/"/, "", $2); print $2; exit}' "$CHART_DIR/Chart.yaml")"
+            test "$chart_version" = "$tag_version"
+            test "$app_version" = "$tag_version"
+            package_args+=(--version "$tag_version" --app-version "$tag_version")
           fi
           helm package "$CHART_DIR" --destination "$CHART_PACKAGE_DIR" "${package_args[@]}"
           package="$(find "$CHART_PACKAGE_DIR" -maxdepth 1 -type f -name 'ursula-chaos-*.tgz' | sort | tail -n 1)"
@@ -84,7 +59,7 @@ jobs:
           echo "package=$package" >>"$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
-        if: github.event_name == 'workflow_dispatch' || github.ref_type == 'tag'
+        if: github.ref_type == 'tag'
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | \
             helm registry login ghcr.io \
@@ -92,5 +67,5 @@ jobs:
               --password-stdin
 
       - name: Push chart to GHCR
-        if: github.event_name == 'workflow_dispatch' || github.ref_type == 'tag'
+        if: github.ref_type == 'tag'
         run: helm push "${{ steps.package.outputs.package }}" "$CHART_REGISTRY"

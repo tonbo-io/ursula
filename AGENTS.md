@@ -6,7 +6,7 @@ Ursula is a self-hosted, distributed Durable Streams server for replayable, appe
 
 The server uses a thread-per-core, multi-Raft architecture: each stream hashes to one Raft group, that group has one replica on each voter node, and the same group ID is owned by a deterministic core on every node. Groups replicate independently with no cross-group transaction path.
 
-- **Version**: 0.3.1 (prototype phase)
+- **Version**: 0.3.2 (prototype phase)
 - **License**: Apache-2.0
 - **Repository**: <https://github.com/tonbo-io/ursula>
 - **Homepage**: <https://ursula.tonbo.io>
