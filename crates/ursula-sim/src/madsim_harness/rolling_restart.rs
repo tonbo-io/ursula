@@ -210,10 +210,7 @@ fn synthetic_node_info(node_id: u64) -> NodeInfo {
             .parse()
             .expect("synthetic admin url"),
         host: format!("node-{node_id}"),
-        instance_id: None,
-        ssh_host: None,
         http_url: None,
-        name: None,
     }
 }
 

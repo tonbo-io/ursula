@@ -47,7 +47,7 @@ The server uses a thread-per-core, multi-Raft architecture: each stream hashes t
 | `ursula-observability` | Shared tracing/OpenTelemetry initialization for Ursula binaries.                                                                              |
 | `ursula-gateway`       | Gateway binary (`ursulagw`) that routes client HTTP traffic while hiding internal leader redirects.                                           |
 | `ursula-bench`         | HTTP/client benchmark harnesses for performance testing.                                                                                      |
-| `ursula-ctl`           | Operational CLI (`ursulactl`) for cluster management: drain leaderships, wait for catch-up, rolling restarts.                                 |
+| `ursula-ctl`           | Operational CLI (`ursulactl`) for logical cluster management over the admin HTTP API: drain leaderships, wait for catch-up, readiness gates.                                 |
 | `ursula-sim`           | Deterministic simulation harnesses using madsim for fault injection and invariant checking.                                                   |
 
 ### Other Top-Level Directories
@@ -55,7 +55,7 @@ The server uses a thread-per-core, multi-Raft architecture: each stream hashes t
 - `docs/web/`: Documentation site content (Vite + React + MDX). Deployed to Cloudflare Pages.
 - `docs/architecture/`: Architecture design documents (DST, thread-per-core multi-Raft, runtime evaluation).
 - `charts/ursula/`: Helm chart for Kubernetes deployment.
-- `scripts/`: Repository helper scripts including EC2 test orchestration (`ursula_ec2.py`), chaos testing (`ursula_chaos_agent.py`), and DST audit tools (`scripts/dst/`).
+- `scripts/`: Repository helper scripts including chaos testing (`ursula_chaos_agent.py`) and DST audit tools (`scripts/dst/`).
 - `target/`: Cargo build output.
 
 ## Build System

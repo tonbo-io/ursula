@@ -55,7 +55,7 @@ curl -N 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
 
 ## Inspect runtime state
 
-For a multi-node cluster the canonical day-2 tool is [`ursulactl`](/docs/cli). It speaks to every node, summarises leadership, and is what you'll use for rolling restarts. For a single local node you can either point it at a one-line manifest:
+For a multi-node cluster the canonical day-2 tool is [`ursulactl`](/docs/cli). It speaks to every node, summarises leadership, and wraps restarts in safe drain and catch-up steps. For a single local node you can either point it at a one-line manifest:
 
 ```bash
 cat > /tmp/local.json <<'JSON'

@@ -4,19 +4,26 @@
 //! These operate purely on Ursula's admin/metrics HTTP surface and never
 //! execute anything on a host. Physical lifecycle (stopping and starting the
 //! process) belongs to the platform that owns it: Kubernetes and Helm for pod
-//! clusters, systemd for bare-metal hosts. [`crate::orchestrate::run_restart`]
-//! composes these verbs with a physical restart command for environments with
-//! no platform controller.
+//! clusters, systemd for bare-metal hosts. A safe rolling restart runs these
+//! verbs around the platform's own restart, one node at a time.
 
 use std::time::Duration;
-use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 
-use crate::metrics::ClusterSnapshot;
+use crate::maintenance::CatchUpOptions;
+use crate::maintenance::CatchUpOutcome;
+use crate::maintenance::DrainOptions;
+use crate::maintenance::DrainOutcome;
+use crate::maintenance::arm_empty_rejoin;
+use crate::maintenance::clear_maintenance_drain;
+use crate::maintenance::drain_node;
+use crate::maintenance::resolve_empty_rejoin_policy;
+use crate::maintenance::wait_cluster_ready;
+use crate::maintenance::wait_node_ready;
 use crate::metrics::MetricsClient;
 use crate::plan::DrainPlan;
 use crate::plan::check_readiness;
@@ -44,6 +51,27 @@ impl Default for DrainOptions {
             poll_interval: Duration::from_secs(2),
             lag_tolerance: 16,
             dry_run: false,
+        }
+    }
+}
+
+impl RestartOptions {
+    fn drain_options(&self) -> DrainOptions {
+        DrainOptions {
+            drain_timeout: self.drain_timeout,
+            ready_timeout: self.ready_timeout,
+            poll_interval: self.poll_interval,
+            lag_tolerance: self.lag_tolerance,
+            dry_run: self.dry_run,
+        }
+    }
+
+    fn catch_up_options(&self) -> CatchUpOptions {
+        CatchUpOptions {
+            stall_timeout: self.stall_timeout,
+            ready_timeout: self.ready_timeout,
+            poll_interval: self.poll_interval,
+            lag_tolerance: self.lag_tolerance,
         }
     }
 }
@@ -576,10 +604,7 @@ mod tests {
             id,
             admin_url: url::Url::parse(&format!("http://{host}:4438")).unwrap(),
             host: host.to_owned(),
-            instance_id: None,
-            ssh_host: None,
             http_url: Some(url::Url::parse(&format!("http://{host}:8080")).unwrap()),
-            name: Some(format!("node-{id}")),
         }
     }
 
