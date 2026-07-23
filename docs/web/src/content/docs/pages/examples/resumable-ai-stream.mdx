@@ -1,0 +1,76 @@
+---
+title: Resumable AI Stream
+description: Stream LLM tokens through a durable timeline so clients can refresh, reconnect, and resume without losing a token.
+---
+
+The canonical Durable Streams use case: instead of piping a model's output straight into one fragile HTTP response, the generating worker appends tokens to a stream, and clients replay and tail that stream. A page refresh mid-answer replays the full answer so far and keeps streaming — nothing is lost, nothing arrives twice. The same pattern powers the [upstream `chat-aisdk` example](https://github.com/durable-streams/durable-streams/tree/main/examples).
+
+## One stream per run
+
+Create a text stream per generation, with a TTL so finished runs clean themselves up:
+
+```bash
+curl -X PUT http://127.0.0.1:4437/agent/run-42 \
+  -H 'Content-Type: text/plain' \
+  -H 'Stream-TTL: 86400'
+```
+
+## Producer: append tokens, close at the end
+
+The worker that talks to the model appends each chunk. Producer headers make retries safe — a chunk re-sent after a network error is deduplicated instead of duplicated in the transcript:
+
+```ts
+const base = "http://127.0.0.1:4437";
+let seq = 0;
+
+for await (const chunk of modelResponse) {
+  await fetch(`${base}/agent/run-42`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "text/plain",
+      "Producer-Id": "worker-1",
+      "Producer-Epoch": "1",
+      "Producer-Seq": String(seq++),
+    },
+    body: chunk.text,
+  });
+}
+
+// Seal the stream: readers get an EOF signal, further appends return 409.
+await fetch(`${base}/agent/run-42`, {
+  method: "POST",
+  headers: { "Stream-Closed": "true" },
+});
+```
+
+If the worker crashes and restarts, bump `Producer-Epoch` and start `Producer-Seq` back at `0` — see [Exactly-once writes](/docs/concepts/exactly-once-writes).
+
+## Consumer: replay, then tail
+
+`offset=-1` replays everything appended so far, then stays live for new tokens. That one query parameter is the whole resume story — reopening the page mid-generation shows the full partial answer immediately and continues streaming:
+
+```ts
+const es = new EventSource(`${base}/agent/run-42?offset=-1&live=sse`);
+
+es.addEventListener("data", (e) => {
+  answerEl.textContent += e.data;
+});
+
+es.addEventListener("control", (e) => {
+  if (JSON.parse(e.data).streamClosed) es.close(); // generation finished
+});
+```
+
+Or watch it from a terminal:
+
+```bash
+curl -N 'http://127.0.0.1:4437/agent/run-42?offset=-1&live=sse'
+```
+
+Because the stream is durable and readable by any number of clients, the same transcript can be tailed from a second device, audited after the fact, or fed to another agent — the producer never knows or cares.
+
+## Next
+
+- [Chat Room](/docs/examples/chat-room): the same pattern with JSON records and multiple writers
+- [Read stream](/docs/api/read): catch-up, long-poll, and SSE read modes
+- [Exactly-once writes](/docs/concepts/exactly-once-writes): producer epoch and sequence rules
