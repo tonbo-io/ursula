@@ -3,7 +3,7 @@ title: Quick Start
 sidebarTitle: Quick Start
 ---
 
-This page assumes a single node is already running on `127.0.0.1:4437` — that's one command via Docker or Cargo, see [Install](/docs/install). The default node is in-memory: nothing survives a restart, which is exactly right for kicking the tires; for disk-backed persistence, see [Configuration](/docs/configuration).
+This page assumes a single node is already running on `127.0.0.1:4437`. Starting one is a single Docker or Cargo command, see [Install](/docs/install). The default node is in-memory and nothing survives a restart. For disk-backed persistence, see [Configuration](/docs/configuration).
 
 Drive the HTTP API with `curl` from another terminal.
 
@@ -71,7 +71,7 @@ Or hit the underlying JSON endpoint directly:
 curl http://127.0.0.1:4437/__ursula/metrics
 ```
 
-The raw endpoint is also what `ursulactl` consumes; reach for it when you want the full snapshot or are building custom tooling.
+The raw endpoint is also what `ursulactl` consumes. Use it directly when you want the full snapshot or are building custom tooling.
 
 ## Next steps
 

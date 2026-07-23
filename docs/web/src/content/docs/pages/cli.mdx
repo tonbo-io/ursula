@@ -4,21 +4,21 @@ title: ursulactl
 
 `ursulactl` is the first interface to reach for once a cluster is running. Its verbs encode the safety properties an operator otherwise has to remember manually:
 
-- before restarting a node, transfer every Raft group it leads to a healthy successor;
-- after a restart, refuse to move on until `last_applied_index` has caught up to peers' `committed_index`;
-- abort the rollout rather than corner a group with no leader.
+- before restarting a node, transfer every Raft group it leads to a healthy successor
+- after a restart, refuse to move on until `last_applied_index` has caught up to peers' `committed_index`
+- abort the rollout rather than corner a group with no leader
 
 The same orchestration is exercised under [deterministic simulation](/docs/architecture/overview), so failure modes like a leader transfer timing out, the target node entering a crash loop, or a partition during drain produce a clean abort instead of a half-rolled cluster.
 
 ## The admin plane
 
-Nodes carry **no cluster-mutation surface on the network**. The mutating operator endpoints (raft snapshot/purge/membership/learners/leader-transfer/allow-next-revert, maintenance drain, cold-flush trigger) plus metrics are served on a separate **admin plane** bound to `server.admin_listen` — loopback (`127.0.0.1:4438`) by default. The public client plane (`:4437`) serves only stream traffic and read-only metrics.
+Nodes carry **no cluster-mutation surface on the network**. The mutating operator endpoints (raft snapshot/purge/membership/learners/leader-transfer/allow-next-revert, maintenance drain, cold-flush trigger) plus metrics are served on a separate **admin plane** bound to `server.admin_listen`, which defaults to loopback (`127.0.0.1:4438`). The public client plane (`:4437`) serves only stream traffic and read-only metrics.
 
-`status` and `wait-ready` prefer each node's `http_url` because read-only metrics are available on the client plane; legacy manifests without `http_url` fall back to `admin_url`. Mutating restart operations still use the admin plane. Because that plane is loopback-bound, ursulactl reaches it through a **provider** — a named transport that knows how to both tunnel to a node's admin plane and restart it. You select one and give it a few structured values; the provider builds its own commands, so you never hand-write ssh/aws/kubectl boilerplate.
+`status` and `wait-ready` prefer each node's `http_url` because read-only metrics are available on the client plane. Legacy manifests without `http_url` fall back to `admin_url`. Mutating restart operations still use the admin plane. Because that plane is loopback-bound, ursulactl reaches it through a **provider**: a named transport that knows how to both tunnel to a node's admin plane and restart it. You select one and give it a few structured values, and the provider builds its own commands, so you never hand-write ssh/aws/kubectl boilerplate.
 
 | Provider | Reaches admin via | Restarts via | Needs |
 |----------|-------------------|--------------|-------|
-| `direct` (default) | `admin_url` as-is (must be reachable) | — (observe only) | — |
+| `direct` (default) | `admin_url` as-is (must be reachable) | not supported (observe only) | nothing |
 | `ssh` | `ssh -N -L` | `ssh … systemctl restart <unit>` | `--ssh-user`, `--restart-unit` |
 | `eice` | ssh over AWS EC2 Instance Connect | same as ssh | `--region`, `--ssh-user`, `--ssh-key`, `--restart-unit` |
 | `command` | your `--forward-cmd` | your `--restart-cmd` | the templates below |
@@ -36,9 +36,9 @@ ursulactl status --config cluster.toml --provider command \
   --forward-cmd 'kubectl port-forward pod/{name} {local_port}:{admin_port}'
 ```
 
-The `command` provider renders `{local_port}` `{admin_port}` `{admin_host}` `{host}` `{instance_id}` `{node_id}` `{name}` and runs under `sh -c`, the forward staying foreground for the tunnel's life (ursulactl tears it down when done). Prefer a named provider — reach for `command` only when the named set does not cover your transport.
+The `command` provider renders `{local_port}` `{admin_port}` `{admin_host}` `{host}` `{instance_id}` `{node_id}` `{name}` and runs under `sh -c`, the forward staying foreground for the tunnel's life (ursulactl tears it down when done). Prefer a named provider, and reach for `command` only when the named set does not cover your transport.
 
-`direct` has no way to execute a restart on a node, so it supports only the observe verbs (`status`, `wait-ready`); `restart` requires `ssh`, `eice`, or `command`.
+`direct` has no way to execute a restart on a node, so it supports only the observe verbs (`status`, `wait-ready`). `restart` requires `ssh`, `eice`, or `command`.
 
 ## When to use ursulactl vs. the other surfaces
 
@@ -56,7 +56,7 @@ Build from the workspace alongside the server:
 cargo build --release -p ursula-ctl --bin ursulactl
 ```
 
-The binary lands at `target/release/ursulactl`. Drop it on your control machine; it does not need to run on the Ursula hosts themselves.
+The binary lands at `target/release/ursulactl`. Drop it on your control machine. It does not need to run on the Ursula hosts themselves.
 
 ## Manifest format
 
@@ -84,14 +84,14 @@ instance_id = "i-0e4f5a6b"
 ursulactl restart --config cluster.toml --ready-timeout-secs 900
 ```
 
-Any `[provider]` field can be overridden on the command line (`--provider`, `--region`, `--ssh-user`, `--restart-unit`, …); flags win over the file.
+Any `[provider]` field can be overridden on the command line (`--provider`, `--region`, `--ssh-user`, `--restart-unit`, and so on). Flags win over the file.
 
 Per-node fields, all optional except `id`:
 
-- `admin_port` (default `4438`) or an explicit `admin_url` — the admin plane to reach. Tunnelling providers only need the port; `direct` needs a reachable `admin_url`.
-- `instance_id` — required by `eice`; how it addresses the node.
-- `host` / `ssh_host` — address for `ssh` and `{host}` interpolation. Falls back to the admin URL host, then the instance id.
-- `http_url` — optional client-plane URL used by `status` and `wait-ready` for read-only metrics, and available as `{http_url}` in the `command` provider. Metrics fall back to `admin_url` when omitted.
+- `admin_port` (default `4438`) or an explicit `admin_url`: the admin plane to reach. Tunnelling providers only need the port, while `direct` needs a reachable `admin_url`.
+- `instance_id`: required by `eice`, which uses it to address the node.
+- `host` / `ssh_host`: address for `ssh` and `{host}` interpolation. Falls back to the admin URL host, then the instance id.
+- `http_url`: optional client-plane URL used by `status` and `wait-ready` for read-only metrics, and available as `{http_url}` in the `command` provider. Metrics fall back to `admin_url` when omitted.
 
 The JSON form stays compatible with `scripts/ursula_ec2.py`'s `cluster.json` (bare array, or `public_ip`/`private_ip` + `http_port`), so you can keep pointing both tools at the same file.
 
@@ -104,7 +104,7 @@ Safe rolling restart. Per target node, in manifest order (or `--only` order):
 3. For every Raft group the target leads, pick the most-caught-up voter as successor and call `POST /__ursula/raft/{group}/leader/transfer/{successor}`.
 4. Poll until the target leads zero groups, or abort on drain timeout.
 5. Run the provider's restart action for the target (e.g. `ssh … systemctl restart <unit>`).
-6. Wait until the target is back as a voter in every group and its `last_applied_index` is within `--lag-tolerance` of peers' `committed_index`. This wait is **progress-gated, not a fixed timeout**: as long as the target keeps catching up (its applied index or voter memberships advance) it is never timed out; it aborts only after `--stall-timeout-secs` with no progress, or at the `--ready-timeout-secs` absolute backstop.
+6. Wait until the target is back as a voter in every group and its `last_applied_index` is within `--lag-tolerance` of peers' `committed_index`. This wait is **progress-gated, not a fixed timeout**: as long as the target keeps catching up (its applied index or voter memberships advance) it is never timed out. It aborts only after `--stall-timeout-secs` with no progress, or at the `--ready-timeout-secs` absolute backstop.
 7. Clear the maintenance drain and move to the next node only on success. Any abort clears the drain mark on the current target and stops the rollout.
 
 ```bash
@@ -113,7 +113,7 @@ ursulactl restart \
   --provider ssh --ssh-user ec2-user --restart-unit ursula.service
 ```
 
-The restart action comes from the [provider](#the-admin-plane); with `--provider ssh`/`eice` it is `systemctl restart <--restart-unit>`, and `--provider command --restart-cmd '…'` is the escape hatch for anything else. Add `--dry-run` to print the drain plan and skip transfers and restarts (no restart channel required, so `direct` is fine for a dry run).
+The restart action comes from the [provider](#the-admin-plane). With `--provider ssh`/`eice` it is `systemctl restart <--restart-unit>`, and `--provider command --restart-cmd '…'` is the escape hatch for anything else. Add `--dry-run` to print the drain plan and skip transfers and restarts (no restart channel required, so `direct` is fine for a dry run).
 
 Because step 6 watches progress rather than a clock, the defaults suit both a fast disk-backed restart and a multi-minute raft-memory rebuild without tuning: `--stall-timeout-secs` (default 90) is the real control, and `--ready-timeout-secs` (default 1800) is only a backstop for a genuinely wedged node.
 
@@ -132,10 +132,10 @@ The naive manual procedure of "restart followers, then leader" does **not** wait
 
 On clusters running the volatile `raft.wal.backend = "memory"`, a restarted node rejoins with an **empty** log, and group leaders refuse that log reversion unless it was explicitly permitted. ursulactl handles this automatically:
 
-- **Empty-log rejoin is auto-derived from the cluster's backend.** Each node reports its `wal_backend` in `/__ursula/metrics`; when ursulactl sees `memory` it asks every group's leader to accept one empty-log rejoin from the target before restarting it, and when it sees `disk` it refuses to (an empty rejoin on a durable cluster means a wiped node the leader is meant to reject). You do not pass a flag. `--allow-empty-raft-rejoin` still exists but only matters against servers too old to report the backend; setting it on a disk-backed cluster is refused.
-- **The readiness wait needs no tuning.** An amnesiac node rebuilds every group from snapshots, which can take 10+ minutes — but because step 6 is progress-gated, a rebuild that keeps advancing is never timed out. You do not raise `--ready-timeout-secs`; the default 90s stall window and 1800s backstop cover both backends.
+- **Empty-log rejoin is auto-derived from the cluster's backend.** Each node reports its `wal_backend` in `/__ursula/metrics`. When ursulactl sees `memory` it asks every group's leader to accept one empty-log rejoin from the target before restarting it, and when it sees `disk` it refuses to (an empty rejoin on a durable cluster means a wiped node the leader is meant to reject). You do not pass a flag. `--allow-empty-raft-rejoin` still exists but only matters against servers too old to report the backend. Setting it on a disk-backed cluster is refused.
+- **The readiness wait needs no tuning.** An amnesiac node rebuilds every group from snapshots, which can take 10+ minutes, but because step 6 is progress-gated, a rebuild that keeps advancing is never timed out. You do not raise `--ready-timeout-secs`. The default 90s stall window and 1800s backstop cover both backends.
 
-The permission must land on the node that is leader at that moment; the endpoint answers `409 Conflict` from any other node (ursulactl resolves leadership per group and handles this). A node that is the membership initializer for some groups additionally refuses to start at all after losing its volatile log (the bootstrap-marker guard) — that recovery is an explicit operator reset on the host, outside ursulactl's reach.
+The permission must land on the node that is leader at that moment, since the endpoint answers `409 Conflict` from any other node (ursulactl resolves leadership per group and handles this). A node that is the membership initializer for some groups additionally refuses to start at all after losing its volatile log (the bootstrap-marker guard). That recovery is an explicit operator reset on the host, outside ursulactl's reach.
 
 ## `status`
 
@@ -181,7 +181,7 @@ These still live in `scripts/ursula_ec2.py` because they require SSH or AWS APIs
 - `install-service`, `install-chaos-agent`, `install-faultd`, `deploy-chaos`: write/refresh systemd units.
 - `cleanup-s3`, `perf` / `perf-many`: AWS S3 and benchmark drivers.
 
-They will move to `ursulactl` once a `NodeProvider`-backed SSH transport lands; the AWS deployment scaffolding (IAM / EC2 lifecycle / security groups) stays in Python permanently.
+They will move to `ursulactl` once a `NodeProvider`-backed SSH transport lands. The AWS deployment scaffolding (IAM / EC2 lifecycle / security groups) stays in Python permanently.
 
 ## Underlying HTTP surface
 

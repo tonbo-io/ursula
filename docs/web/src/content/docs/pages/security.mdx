@@ -55,7 +55,7 @@ CORS is permissive (`Access-Control-Allow-Origin: *`). Restrict at the proxy for
 - **Bind to the private interface.** Set `server.listen = "10.0.0.X:4437"` or use a security group / firewall so the listener is unreachable from public networks.
 - **Terminate TLS at the proxy.** Ursula stays plain HTTP on the internal side.
 - **Authenticate at the proxy.** Validate the caller (OAuth2, mTLS, signed requests) and reject unauthenticated traffic before it reaches Ursula.
-- **Block admin paths from public traffic.** Deny `/__ursula/*` from the public listener; allow it only on an internal or ops network.
+- **Block admin paths from public traffic.** Deny `/__ursula/*` on the public listener and allow it only on an internal or ops network.
 - **Use IAM roles for S3.** Omit static `storage.cold.s3.access_key_id` / `storage.cold.s3.secret_access_key` values and let the AWS SDK credential chain discover credentials.
 - **Encrypt data volumes.** Apply full-disk encryption to `raft.wal.path`.
 - **Keep peer traffic private.** Never route gRPC peer traffic across the public internet.

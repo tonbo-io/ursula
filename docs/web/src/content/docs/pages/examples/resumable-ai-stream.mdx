@@ -3,7 +3,7 @@ title: Resumable AI Stream
 description: Stream LLM tokens through a durable timeline so clients can refresh, reconnect, and resume without losing a token.
 ---
 
-The canonical Durable Streams use case: instead of piping a model's output straight into one fragile HTTP response, the generating worker appends tokens to a stream, and clients replay and tail that stream. A page refresh mid-answer replays the full answer so far and keeps streaming — nothing is lost, nothing arrives twice. The same pattern powers the [upstream `chat-aisdk` example](https://github.com/durable-streams/durable-streams/tree/main/examples).
+Instead of piping a model's output straight into one HTTP response, the generating worker appends tokens to a stream, and clients replay and tail that stream. A client that reconnects mid-generation replays the answer so far and continues from the same position, without losing or duplicating tokens. The upstream [`chat-aisdk` example](https://github.com/durable-streams/durable-streams/tree/main/examples) uses the same pattern.
 
 ## One stream per run
 
@@ -17,7 +17,7 @@ curl -X PUT http://127.0.0.1:4437/agent/run-42 \
 
 ## Producer: append tokens, close at the end
 
-The worker that talks to the model appends each chunk. Producer headers make retries safe — a chunk re-sent after a network error is deduplicated instead of duplicated in the transcript:
+The worker that talks to the model appends each chunk. Producer headers make retries safe: a chunk re-sent after a network error is deduplicated instead of appended twice:
 
 ```ts
 const base = "http://127.0.0.1:4437";
@@ -43,11 +43,11 @@ await fetch(`${base}/agent/run-42`, {
 });
 ```
 
-If the worker crashes and restarts, bump `Producer-Epoch` and start `Producer-Seq` back at `0` — see [Exactly-once writes](/docs/concepts/exactly-once-writes).
+If the worker crashes and restarts, bump `Producer-Epoch` and start `Producer-Seq` back at `0` (see [Exactly-once writes](/docs/concepts/exactly-once-writes)).
 
 ## Consumer: replay, then tail
 
-`offset=-1` replays everything appended so far, then stays live for new tokens. That one query parameter is the whole resume story — reopening the page mid-generation shows the full partial answer immediately and continues streaming:
+`offset=-1` replays everything appended so far, then stays live for new tokens. Reopening the page mid-generation therefore shows the partial answer immediately and continues streaming:
 
 ```ts
 const es = new EventSource(`${base}/agent/run-42?offset=-1&live=sse`);
@@ -67,7 +67,7 @@ Or watch it from a terminal:
 curl -N 'http://127.0.0.1:4437/agent/run-42?offset=-1&live=sse'
 ```
 
-Because the stream is durable and readable by any number of clients, the same transcript can be tailed from a second device, audited after the fact, or fed to another agent — the producer never knows or cares.
+The stream is durable and readable by any number of clients, so the same transcript can be tailed from a second device, read after the fact, or consumed by another process. The producer does not need to know about its readers.
 
 ## Next
 

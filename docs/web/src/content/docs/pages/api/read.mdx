@@ -85,15 +85,15 @@ api: "GET /{bucket}/{stream}"
 
 Response headers include `Stream-Next-Offset`, `Stream-Cursor`, `ETag`, `Stream-Up-To-Date`, `Stream-Closed`, and `Content-Type`.
 
-Record-aware responses also advertise `json-record-coordinates-v1` in `Stream-Extensions` and include `Stream-Record-First`, `Stream-Record-Start`, and `Stream-Record-Next`. Continue with `record=<Stream-Record-Next>`. A record below `Stream-Record-First` returns `410`; a record beyond the current tail returns `400`.
+Record-aware responses also advertise `json-record-coordinates-v1` in `Stream-Extensions` and include `Stream-Record-First`, `Stream-Record-Start`, and `Stream-Record-Next`. Continue with `record=<Stream-Record-Next>`. A record below `Stream-Record-First` returns `410`, and a record beyond the current tail returns `400`.
 
-Streams written with `Content-Type: application/json` are returned as newline-delimited JSON with response `Content-Type: application/x-ndjson`. `max_bytes` applies to the encoded byte stream, so a response can end mid-line. Resume from `Stream-Next-Offset` and buffer any incomplete trailing line before parsing. `HEAD` reports the configured stream content type; read responses report the wire representation.
+Streams written with `Content-Type: application/json` are returned as newline-delimited JSON with response `Content-Type: application/x-ndjson`. `max_bytes` applies to the encoded byte stream, so a response can end mid-line. Resume from `Stream-Next-Offset` and buffer any incomplete trailing line before parsing. `HEAD` reports the configured stream content type, while read responses report the wire representation.
 
 ## SSE event format
 
 In SSE mode, the server sends:
 
-- **Data events** (`event: data`): stream payload in the `data` field. The response `Stream-Data-Content-Type` header identifies the data payload type (`application/x-ndjson` for JSON streams, the original content type for other streams). SSE `data:` lines are transport lines, not guaranteed message boundaries; JSON clients should buffer until newline before parsing records. For binary streams, data is base64-encoded (controlled by the `Stream-Sse-Data-Encoding` header).
+- **Data events** (`event: data`): stream payload in the `data` field. The response `Stream-Data-Content-Type` header identifies the data payload type (`application/x-ndjson` for JSON streams, the original content type for other streams). SSE `data:` lines are transport lines, not guaranteed message boundaries. JSON clients should buffer until newline before parsing records. For binary streams, data is base64-encoded (controlled by the `Stream-Sse-Data-Encoding` header).
 - **Control events** (`event: control`): JSON metadata including the current offset and stream state.
 - **Heartbeat comments**: periodic `:` lines to keep the connection alive through proxies.
 

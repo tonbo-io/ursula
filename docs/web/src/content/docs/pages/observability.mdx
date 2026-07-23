@@ -57,7 +57,7 @@ is propagated across the internal actor mailboxes, so on-core work
 read to the leader, the W3C `traceparent` rides the Raft gRPC request, so the
 follower and leader appear in the **same trace** end to end.
 
-Trace context travels only in gRPC transport metadata; it is never written to
+Trace context travels only in gRPC transport metadata. It is never written to
 the Raft log, so state-machine determinism and replay are unaffected.
 
 ### Sampling and the hot path

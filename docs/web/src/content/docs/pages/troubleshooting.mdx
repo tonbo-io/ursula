@@ -90,7 +90,7 @@ The supplied `Stream-Seq` is not lexicographically greater than the last accepte
 
 ### `404 Not Found` on `POST /{bucket}/{stream}`
 
-The stream hasn't been created. Create with `PUT /{bucket}/{stream}` first; there is no implicit creation on POST.
+The stream hasn't been created. Create with `PUT /{bucket}/{stream}` first. There is no implicit creation on POST.
 
 ### `400 Bad Request` on JSON appends
 
@@ -133,7 +133,7 @@ State-machine apply runs on the follower's owner core. If CPU is pinned, `last_a
 
 ### Manually trigger a snapshot
 
-These are admin-plane endpoints (`server.admin_listen`, loopback `:4438` by default), reached over a tunnel — see [ursulactl's operation providers](/docs/cli#the-admin-plane). The examples assume a forward from local `4438` to the node's admin plane.
+These are admin-plane endpoints (`server.admin_listen`, loopback `:4438` by default), reached over a tunnel (see [ursulactl's operation providers](/docs/cli#the-admin-plane)). The examples assume a forward from local `4438` to the node's admin plane.
 
 ```bash
 curl -X POST http://127.0.0.1:4438/__ursula/raft/{group_id}/snapshot

@@ -18,7 +18,7 @@ Ursula keeps all four. For the head-to-head numbers, see [How Ursula compares](/
 
 ## One timeline per entity
 
-Most event systems multiplex many entities into shared channels and rebuild per-entity state downstream. Ursula inverts that: each document, session, task, room, or agent run gets its own durable timeline. Writers append directly to it; readers resume from its offsets.
+Most event systems multiplex many entities into shared channels and rebuild per-entity state downstream. Ursula inverts that: each document, session, task, room, or agent run gets its own durable timeline. Writers append directly to it and readers resume from its offsets.
 
 Treat it as a per-entity durable log runtime, purpose-built for that pattern rather than a general event backbone.
 
