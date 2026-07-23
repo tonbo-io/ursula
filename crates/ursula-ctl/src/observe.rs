@@ -1,5 +1,5 @@
 //! Read-only verbs that operate on `/__ursula/metrics`. These are direct ports
-//! of `ursula_ec2.py`'s `status` / `wait-ready` — same metrics surface, no SSH
+//! of the retired `ursula_ec2.py` `status` / `wait-ready` — same metrics surface, no SSH
 //! dependency.
 
 use std::collections::BTreeMap;

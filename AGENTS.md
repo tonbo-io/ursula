@@ -55,7 +55,7 @@ The server uses a thread-per-core, multi-Raft architecture: each stream hashes t
 - `docs/web/`: Documentation site content (Vite + React + MDX). Deployed to Cloudflare Pages.
 - `docs/architecture/`: Architecture design documents (DST, thread-per-core multi-Raft, runtime evaluation).
 - `charts/ursula/`: Helm chart for Kubernetes deployment.
-- `scripts/`: Repository helper scripts including EC2 test orchestration (`ursula_ec2.py`), chaos testing (`ursula_chaos_agent.py`), and DST audit tools (`scripts/dst/`).
+- `scripts/`: Repository helper scripts including chaos testing (`ursula_chaos_agent.py`) and DST audit tools (`scripts/dst/`).
 - `target/`: Cargo build output.
 
 ## Build System

@@ -2,14 +2,13 @@
 title: Operations
 ---
 
-The first tool to reach for is [`ursulactl`](/docs/cli). It covers the raft-aware verbs operators run most often: rolling restart, status, readiness gate. This page covers everything **around** it: the metrics shape ursulactl reads, the admin endpoints it (and your custom tooling) can call, the SSH-side lifecycle that still lives in Python, and the operational policies ursulactl does not encode (backups, log levels, S3 cleanup).
+The first tool to reach for is [`ursulactl`](/docs/cli). It covers the raft-aware verbs operators run most often: drain, status, readiness gates. This page covers everything **around** it: the metrics shape ursulactl reads, the admin endpoints it (and your custom tooling) can call, and the operational policies ursulactl does not encode (backups, log levels). Deployment and process lifecycle belong to the platform, [Helm and OpenTofu](/docs/deploy-cluster).
 
 ## Tooling map
 
 | Surface | When to reach for it |
 |---------|---------------------|
-| [`ursulactl`](/docs/cli) | Day-2 cluster ops over HTTP: restart, status, wait-ready. |
-| `scripts/ursula_ec2.py` | SSH/IAM/EC2 lifecycle: push binaries, write systemd units, S3 cleanup, drive the benchmark client. |
+| [`ursulactl`](/docs/cli) | Day-2 cluster ops over HTTP: drain, restart, status, wait-ready. |
 | `/__ursula/metrics` and the `/__ursula/raft/...` admin endpoints | Custom tooling. ursulactl uses these underneath. The surface is small and stable enough to script directly. |
 
 There is no Prometheus scrape and no general-purpose orchestrator yet.
@@ -79,39 +78,15 @@ A node that lost its Raft log (disk replaced, data dir wiped) rejoins with a sho
 
 `POST /__ursula/cluster-probe` also exists on the client plane, but it is machinery rather than an operator surface: nodes send each other heartbeat-sized bodies through it to verify cluster-plane egress, and it bypasses ingress admission.
 
-## SSH-side lifecycle
-
-`scripts/ursula_ec2.py` drives a static EC2 manifest (instance IDs, IPs, port, binary path, cold env, peer list) over SSH. It complements `ursulactl`: push binaries and start daemons here, then switch to `ursulactl` for raft-aware verbs.
-
-```bash
-# Push a fresh binary to every server in the manifest
-python3 scripts/ursula_ec2.py --config cluster.json upload-binary \
-  --target servers --local ./target/release/ursula --remote /tmp/ursula
-
-# Bring daemons up, then gate on readiness via ursulactl
-python3 scripts/ursula_ec2.py --config cluster.json start
-ursulactl wait-ready --config cluster.json --expected-groups 256
-
-# Stop the cluster (kills the pid recorded in the configured pid file)
-python3 scripts/ursula_ec2.py --config cluster.json stop
-
-# Drive the benchmark workload from the configured client host
-python3 scripts/ursula_ec2.py --config cluster.json perf-many \
-  --processes 4 --bucket-prefix benchcmp-mp
-```
-
-`perf-many` rotates entrypoints across service nodes by default. Use `--target-mode first` only to reproduce a single-ingress run. `stop` kills only the recorded PID rather than running `pkill`, because broad patterns can match the SSH cleanup command itself. If a pid file is stale, kill by hand.
-
-The Python script still exposes `status` and `wait-ready`, kept around for environments where `ursulactl` isn't deployed yet. They print the same numbers but via SSH-curl, so prefer `ursulactl` when you have a choice. Verbs scheduled to migrate to `ursulactl` once SSH transport lands: `upload-binary`, `install-binary`, `install-service`, `install-chaos-agent`, `install-faultd`, `deploy-chaos`. AWS deployment scaffolding (IAM / EC2 lifecycle / security groups) stays in Python permanently.
-
 ## Cleaning S3
 
+Cold data lives under the `storage.cold.root` prefix. Benchmark and test runs should use a date-stamped root so cleanup is one prefix delete with standard S3 tooling:
+
 ```bash
-python3 scripts/ursula_ec2.py --config cluster.json cleanup-s3 \
-  --root ursula-test-20260518T000000Z
+aws s3 rm "s3://my-ursula-bucket/ursula-test-20260518T000000Z" --recursive
 ```
 
-Deletes everything under one `storage.cold.root` prefix in the manifest's bucket. Run after benchmark sweeps.
+There is no built-in retention policy beyond Ursula's snapshot GC.
 
 ## Backup and disaster recovery
 

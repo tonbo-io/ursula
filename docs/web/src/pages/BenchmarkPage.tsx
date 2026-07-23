@@ -1010,7 +1010,7 @@ export URSULA_COLD_BACKEND=s3
 export URSULA_COLD_S3_BUCKET=<s3-bucket>
 export URSULA_COLD_S3_REGION=<region>
 export URSULA_COLD_FLUSH_BYTES=65536
-python3 scripts/ursula_ec2.py --config <manifest>.json start
+ursula --config /etc/ursula/ursula.toml --node-id <id>   # on each node
 ~/.cargo/bin/s2 lite --bucket <s3-bucket> --path s2-lite --port 4439
 durable-streams-server --profile dev --config ds-ebs-file-durable.toml
 

@@ -146,8 +146,8 @@ struct WaitReadyArgs {
     /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
-    /// Number of raft groups each node must report. Matches
-    /// `ClusterConfig.raft_group_count` from scripts/ursula_ec2.py.
+    /// Number of raft groups each node must report
+    /// (the cluster's `raft.group_count`).
     #[arg(long)]
     expected_groups: usize,
     #[arg(long, default_value_t = 120)]
@@ -230,7 +230,6 @@ struct WaitArgs {
 #[derive(Args, Debug)]
 struct RestartArgs {
     /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
-    /// JSON stays compatible with scripts/ursula_ec2.py's nodes.json.
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
     /// Restrict the rollout to these node ids (in the supplied order).

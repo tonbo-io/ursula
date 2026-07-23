@@ -77,7 +77,7 @@ pub trait NodeProvider {
 
 /// File-backed manifest. Accepts TOML, JSON, or YAML (chosen by extension),
 /// carrying an optional `[provider]` block plus the node list. The JSON form
-/// stays tolerant of the legacy `scripts/ursula_ec2.py` shapes (a bare array,
+/// stays tolerant of the legacy `cluster.json` shapes (a bare array,
 /// or `public_ip`/`private_ip` + `http_port`).
 #[derive(Debug, Clone)]
 pub struct StaticNodeProvider {
@@ -401,7 +401,7 @@ instance_id = "i-0def"
 
     #[test]
     fn unknown_provider_field_is_rejected() {
-        // Node/top-level keys stay tolerant (shared with ursula_ec2.py's file),
+        // Node/top-level keys stay tolerant (legacy cluster.json shapes),
         // but the provider block is our own schema and catches typos.
         let json =
             br#"{"provider":{"kind":"ssh","bogus":true},"nodes":[{"id":1,"host":"10.0.0.1"}]}"#;

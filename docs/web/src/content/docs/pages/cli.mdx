@@ -64,8 +64,8 @@ The `command` provider renders `{local_port}` `{admin_port}` `{admin_host}` `{ho
 
 | Task | Tool |
 |------|------|
-| Day-2 cluster operations: restart, observe, gate on readiness | **`ursulactl`** |
-| Push binaries, write systemd units, EC2 Instance Connect, S3 cleanup | `scripts/ursula_ec2.py` |
+| Day-2 cluster operations: drain, restart, observe, gate on readiness | **`ursulactl`** |
+| Deployment, upgrades, topology | [Helm and OpenTofu](/docs/deploy-cluster) (systemd on bare metal) |
 | Custom operator tooling | The admin-plane HTTP endpoints, reached over your own tunnel |
 
 ## Install
@@ -124,7 +124,7 @@ Per-node fields, all optional except `id`:
 - `host` / `ssh_host`: address for `ssh` and `{host}` interpolation. Falls back to the admin URL host, then the instance id.
 - `http_url`: optional client-plane URL used by `status` and `wait-ready` for read-only metrics, and available as `{http_url}` in the `command` provider. Metrics fall back to `admin_url` when omitted.
 
-The JSON form stays compatible with `scripts/ursula_ec2.py`'s `cluster.json` (bare array, or `public_ip`/`private_ip` + `http_port`), so you can keep pointing both tools at the same file.
+The JSON form also accepts the legacy `cluster.json` shapes (a bare node array, or `public_ip`/`private_ip` + `http_port`).
 
 ## `restart`
 
@@ -203,16 +203,6 @@ Exits non-zero with a one-line reason if the timeout passes (`cluster not ready 
 | `0` | All target nodes finished successfully (`restart`), readiness reached (`wait-ready`), or status report rendered (`status`). |
 | `2` | `restart`: at least one node aborted (drain timeout, restart command non-zero, or readiness timeout). Subsequent nodes were not touched. |
 | Non-zero (other) | Configuration or transport error. The error message is single-line and machine-greppable. |
-
-## Roadmap: verbs not yet migrated
-
-These still live in `scripts/ursula_ec2.py` because they require SSH or AWS APIs and benefit from the same EC2 Instance Connect plumbing that the script already does:
-
-- `upload-binary`, `install-binary`: push and stage release artefacts.
-- `install-service`, `install-chaos-agent`, `install-faultd`, `deploy-chaos`: write/refresh systemd units.
-- `cleanup-s3`, `perf` / `perf-many`: AWS S3 and benchmark drivers.
-
-They will move to `ursulactl` once a `NodeProvider`-backed SSH transport lands. The AWS deployment scaffolding (IAM / EC2 lifecycle / security groups) stays in Python permanently.
 
 ## Underlying HTTP surface
 
