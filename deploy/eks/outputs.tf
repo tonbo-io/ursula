@@ -63,7 +63,8 @@ resource "local_file" "helm_values" {
     coldStorage = {
       enabled = true
       compaction = {
-        enabled = var.cold_compaction_enabled
+        enabled           = var.cold_compaction_enabled
+        maxStreamsPerPass = var.cold_compaction_max_streams_per_pass
       }
     }
     snapshotStore = {
