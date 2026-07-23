@@ -44,6 +44,10 @@ pub enum StreamResponse {
     ColdFlushed {
         hot_start_offset: u64,
     },
+    ColdCompacted {
+        compacted_chunks: u64,
+        compacted_bytes: u64,
+    },
     SnapshotPublished {
         snapshot_offset: u64,
         record_range: Option<StreamRecordRange>,

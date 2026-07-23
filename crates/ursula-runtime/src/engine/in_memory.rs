@@ -23,6 +23,7 @@ use super::GroupAppendFuture;
 use super::GroupBootstrapStreamFuture;
 use super::GroupCloseStreamFuture;
 use super::GroupColdHotBacklogFuture;
+use super::GroupCompactColdFuture;
 use super::GroupCreateStreamFuture;
 use super::GroupDeleteSnapshotFuture;
 use super::GroupDeleteStreamFuture;
@@ -48,6 +49,7 @@ use super::GroupUpdateStreamAttrsFuture;
 use super::GroupWriteResponse;
 use crate::cold_index::ColdIndexPageCache;
 use crate::cold_index::ColdStoreColdIndexPageStore;
+use crate::cold_index::replace_cold_chunk_index_pages;
 use crate::cold_index::rollback_cold_index_pages;
 use crate::cold_index::write_cold_chunk_index_pages_with_rollback;
 use crate::cold_index::write_external_segment_index_pages;
@@ -67,6 +69,8 @@ use crate::request::CloseStreamRequest;
 use crate::request::CloseStreamResponse;
 use crate::request::ColdHotBacklog;
 use crate::request::ColdWriteAdmission;
+use crate::request::CompactColdRequest;
+use crate::request::CompactColdResponse;
 use crate::request::CreateStreamExternalRequest;
 use crate::request::CreateStreamRequest;
 use crate::request::CreateStreamResponse;
@@ -201,13 +205,29 @@ impl InMemoryGroupEngine {
             command => {
                 let stream_id = command_stream_id(&command);
                 let command_producer = command_producer(&command);
+                let compacted_stream_id = match &command {
+                    StreamCommand::CompactCold { stream_id, .. } => Some(stream_id.clone()),
+                    _ => None,
+                };
                 if let StreamCommand::CreateStream { stream_id, .. }
                 | StreamCommand::CreateExternal { stream_id, .. } = &command
                 {
                     ensure_bucket_exists(&mut self.state_machine, stream_id)?;
                 }
                 let response = self.state_machine.apply(command);
-                self.group_response_from_stream(response, stream_id, command_producer, placement)
+                let response = self.group_response_from_stream(
+                    response,
+                    stream_id,
+                    command_producer,
+                    placement,
+                );
+                if response.is_ok()
+                    && let (Some(cache), Some(stream_id)) =
+                        (self.cold_index_cache.as_ref(), compacted_stream_id.as_ref())
+                {
+                    cache.invalidate_stream(stream_id);
+                }
+                response
             }
         }
     }
@@ -429,6 +449,18 @@ impl InMemoryGroupEngine {
                 Ok(GroupWriteResponse::FlushCold(FlushColdResponse {
                     placement,
                     hot_start_offset,
+                    group_commit_index: self.commit_index,
+                }))
+            }
+            StreamResponse::ColdCompacted {
+                compacted_chunks,
+                compacted_bytes,
+            } => {
+                self.commit_index += 1;
+                Ok(GroupWriteResponse::CompactCold(CompactColdResponse {
+                    placement,
+                    compacted_chunks,
+                    compacted_bytes,
                     group_commit_index: self.commit_index,
                 }))
             }
@@ -1606,6 +1638,38 @@ impl GroupEngine for InMemoryGroupEngine {
         })
     }
 
+    fn compact_cold<'a>(
+        &'a mut self,
+        request: CompactColdRequest,
+        placement: ShardPlacement,
+    ) -> GroupCompactColdFuture<'a> {
+        Box::pin(async move {
+            if let Some(cold_store) = self.cold_store.as_ref() {
+                let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+                let replaced = replace_cold_chunk_index_pages(
+                    &store,
+                    &request.stream_id,
+                    &request.old_chunks,
+                    &request.replacement,
+                )
+                .await
+                .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                if !replaced {
+                    return Err(GroupEngineError::new(
+                        "cold compaction input no longer matches the cold index",
+                    ));
+                }
+            }
+            let command = GroupWriteCommand::from(request);
+            match self.apply_committed_write(command, placement)? {
+                GroupWriteResponse::CompactCold(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected compact cold write response: {other:?}"
+                ))),
+            }
+        })
+    }
+
     fn plan_cold_flush<'a>(
         &'a mut self,
         request: PlanColdFlushRequest,
@@ -1741,6 +1805,7 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::TouchStreamAccess { stream_id, .. }
         | StreamCommand::UpdateStreamAttrs { stream_id, .. }
         | StreamCommand::FlushCold { stream_id, .. }
+        | StreamCommand::CompactCold { stream_id, .. }
         | StreamCommand::Close { stream_id, .. }
         | StreamCommand::DeleteStream { stream_id } => Some(stream_id.clone()),
     }

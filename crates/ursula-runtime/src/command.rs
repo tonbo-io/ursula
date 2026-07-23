@@ -10,6 +10,7 @@ use crate::request::AppendBatchRequest;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
 use crate::request::CloseStreamRequest;
+use crate::request::CompactColdRequest;
 use crate::request::CreateStreamExternalRequest;
 use crate::request::CreateStreamRequest;
 use crate::request::DeleteStreamRequest;
@@ -175,6 +176,17 @@ impl From<FlushColdRequest> for StreamCommand {
     }
 }
 
+impl From<CompactColdRequest> for StreamCommand {
+    fn from(request: CompactColdRequest) -> Self {
+        Self::CompactCold {
+            stream_id: request.stream_id,
+            old_chunks: request.old_chunks,
+            replacement: request.replacement,
+            gc_not_before_ms: request.gc_not_before_ms,
+        }
+    }
+}
+
 macro_rules! group_write_from_request {
     ($($request:ty),+ $(,)?) => {
         $(impl From<$request> for GroupWriteCommand {
@@ -196,6 +208,7 @@ group_write_from_request!(
     CloseStreamRequest,
     DeleteStreamRequest,
     FlushColdRequest,
+    CompactColdRequest,
 );
 
 impl fmt::Display for GroupWriteCommand {

@@ -423,6 +423,22 @@ pub struct FlushColdResponse {
     pub group_commit_index: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactColdRequest {
+    pub stream_id: BucketStreamId,
+    pub old_chunks: Vec<ColdChunkRef>,
+    pub replacement: ColdChunkRef,
+    pub gc_not_before_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactColdResponse {
+    pub placement: ShardPlacement,
+    pub compacted_chunks: u64,
+    pub compacted_bytes: u64,
+    pub group_commit_index: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TouchStreamAccessResponse {
     pub placement: ShardPlacement,

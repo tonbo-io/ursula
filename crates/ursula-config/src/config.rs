@@ -286,6 +286,18 @@ pub struct ColdConfig {
     pub flush_max_size: Option<HumanSize>,
     /// Max groups flushed concurrently.
     pub flush_max_concurrency: usize,
+    /// Enable background same-stream cold chunk compaction.
+    pub compaction_enabled: bool,
+    /// Interval between cold chunk compaction discovery passes.
+    pub compaction_interval: HumanDuration,
+    /// Preferred compacted object size.
+    pub compaction_target_size: HumanSize,
+    /// Hard maximum compacted object size.
+    pub compaction_max_size: HumanSize,
+    /// Maximum streams compacted per pass.
+    pub compaction_max_streams_per_pass: usize,
+    /// Grace period before compacted input objects are physically deleted.
+    pub compaction_gc_grace: HumanDuration,
     /// Per-group hot-size cap. When a group's hot bytes exceed this, new
     /// writes are rejected with HTTP 503. `None` or `0` disables the admission.
     pub max_hot_size_per_group: Option<HumanSize>,
@@ -325,6 +337,12 @@ impl Default for ColdConfig {
             flush_min_hot_size: None,
             flush_max_size: None,
             flush_max_concurrency: 4,
+            compaction_enabled: false,
+            compaction_interval: HumanDuration::sec(30),
+            compaction_target_size: HumanSize::mib(8),
+            compaction_max_size: HumanSize::mib(16),
+            compaction_max_streams_per_pass: 16,
+            compaction_gc_grace: HumanDuration::sec(300),
             max_hot_size_per_group: Some(HumanSize::mib(64)),
             gc_interval: HumanDuration::sec(5),
             gc_max_entries: 256,

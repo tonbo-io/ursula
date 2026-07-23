@@ -228,6 +228,22 @@ macro_rules! runtime_operations {
                 }
                 client { pub stream fn flush_cold }
             }
+            op CompactCold {
+                fields { request: CompactColdRequest }
+                reply { response_tx: CompactColdResponse }
+                guard { none }
+                handle {
+                    call compact_cold(
+                        engine,
+                        metrics,
+                        read_materialization,
+                        read_watchers,
+                        request,
+                        placement
+                    )
+                }
+                client { pub stream fn compact_cold }
+            }
             op PlanColdFlush {
                 fields { request: PlanColdFlushRequest }
                 reply { response_tx: Option<ColdFlushCandidate> }

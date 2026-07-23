@@ -354,6 +354,12 @@ impl StreamStateMachine {
                 response
             }
             StreamCommand::FlushCold { stream_id, chunk } => self.flush_cold(stream_id, chunk),
+            StreamCommand::CompactCold {
+                stream_id,
+                old_chunks,
+                replacement,
+                gc_not_before_ms,
+            } => self.compact_cold(stream_id, old_chunks, replacement, gc_not_before_ms),
             StreamCommand::Close {
                 stream_id,
                 stream_seq,

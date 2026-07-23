@@ -27,9 +27,21 @@ impl ColdGcQueue {
 
     /// Append a reclamation target, stamping it with the next sequence number.
     pub(super) fn enqueue(&mut self, target: ColdGcTarget) {
+        self.enqueue_after(target, 0);
+    }
+
+    /// Append a reclamation target that must remain readable until the given
+    /// wall-clock timestamp. Cold-object compaction uses this grace period so
+    /// a lagging replica can apply the replacement and invalidate its cached
+    /// cold-index page before the old objects disappear.
+    pub(super) fn enqueue_after(&mut self, target: ColdGcTarget, not_before_ms: u64) {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
-        self.pending.push_back(ColdGcEntry { seq, target });
+        self.pending.push_back(ColdGcEntry {
+            seq,
+            not_before_ms,
+            target,
+        });
     }
 
     /// Drain every entry with `seq <= up_to_seq`; returns how many were removed.

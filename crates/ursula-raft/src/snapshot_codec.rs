@@ -506,6 +506,7 @@ fn append_count_from_proto(
 fn cold_gc_to_proto(entry: ColdGcEntry) -> proto::ColdGcEntryV1 {
     proto::ColdGcEntryV1 {
         seq: entry.seq,
+        not_before_ms: entry.not_before_ms,
         target: Some(match entry.target {
             ColdGcTarget::Stream(stream_id) => {
                 proto::cold_gc_entry_v1::Target::Stream(stream_id.into())
@@ -520,6 +521,7 @@ fn cold_gc_to_proto(entry: ColdGcEntry) -> proto::ColdGcEntryV1 {
 fn cold_gc_from_proto(entry: proto::ColdGcEntryV1) -> Result<ColdGcEntry, SnapshotStoreError> {
     Ok(ColdGcEntry {
         seq: entry.seq,
+        not_before_ms: entry.not_before_ms,
         target: match required(entry.target, "snapshot cold gc target")? {
             proto::cold_gc_entry_v1::Target::Stream(stream_id) => {
                 ColdGcTarget::Stream(stream_id.into())

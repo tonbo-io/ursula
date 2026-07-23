@@ -2,6 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+#[cfg(not(madsim))]
+use std::time::SystemTime;
+#[cfg(not(madsim))]
+use std::time::UNIX_EPOCH;
 
 #[cfg(not(madsim))]
 use tokio::task::JoinSet;
@@ -18,7 +22,10 @@ use ursula_stream::ColdGcTarget;
 
 use crate::admission::RaftUncommittedAdmission;
 use crate::admission::RaftUncommittedBytesTracker;
+use crate::cold_index::ColdStoreColdIndexPageStore;
 use crate::cold_index::cold_index_prefix;
+use crate::cold_index::load_cold_chunks_from_pages;
+use crate::cold_index::select_cold_chunk_compaction;
 use crate::cold_store::ColdStoreHandle;
 use crate::cold_store::ColdStoreInfo;
 use crate::cold_store::cold_chunk_prefix;
@@ -50,6 +57,8 @@ use crate::request::BootstrapStreamResponse;
 use crate::request::CloseStreamRequest;
 use crate::request::CloseStreamResponse;
 use crate::request::ColdWriteAdmission;
+use crate::request::CompactColdRequest;
+use crate::request::CompactColdResponse;
 use crate::request::CreateStreamExternalRequest;
 use crate::request::CreateStreamRequest;
 use crate::request::CreateStreamResponse;
@@ -471,6 +480,112 @@ impl ShardRuntime {
         Ok(flushed)
     }
 
+    /// Rewrites undersized, contiguous objects from the same stream into
+    /// target-sized immutable chunks. Discovery reads only cold-index pages.
+    pub async fn compact_cold_once(
+        &self,
+        target_bytes: u64,
+        max_bytes: u64,
+        max_streams: usize,
+        gc_grace_ms: u64,
+    ) -> Result<usize, RuntimeError> {
+        let Some(cold_store) = self.cold_store.as_ref() else {
+            return Ok(0);
+        };
+        let pages =
+            cold_store
+                .list_cold_index_pages()
+                .await
+                .map_err(|err| RuntimeError::ColdStoreIo {
+                    message: err.to_string(),
+                })?;
+        let mut pages_by_stream: HashMap<BucketStreamId, Vec<_>> = HashMap::new();
+        for page in pages {
+            if page.generation == 0 {
+                pages_by_stream
+                    .entry(page.stream_id.clone())
+                    .or_default()
+                    .push(page);
+            }
+        }
+        let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+        let mut compacted = 0;
+        for (stream_id, stream_pages) in pages_by_stream {
+            if compacted >= max_streams {
+                break;
+            }
+            // Only the local Raft leader may publish a replacement.
+            if self
+                .require_local_live_read_owner(&stream_id)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let chunks = load_cold_chunks_from_pages(&store, &stream_pages)
+                .await
+                .map_err(|err| RuntimeError::ColdStoreIo {
+                    message: err.to_string(),
+                })?;
+            let Some(old_chunks) = select_cold_chunk_compaction(&chunks, target_bytes, max_bytes)
+            else {
+                continue;
+            };
+            let total_bytes = old_chunks
+                .iter()
+                .try_fold(0_u64, |total, chunk| total.checked_add(chunk.object_size))
+                .ok_or_else(|| RuntimeError::ColdStoreIo {
+                    message: "cold compaction byte count overflow".to_owned(),
+                })?;
+            let capacity = usize::try_from(total_bytes).map_err(|_| RuntimeError::ColdStoreIo {
+                message: "cold compaction object exceeds addressable memory".to_owned(),
+            })?;
+            let mut payload = Vec::with_capacity(capacity);
+            for chunk in &old_chunks {
+                let len =
+                    usize::try_from(chunk.object_size).map_err(|_| RuntimeError::ColdStoreIo {
+                        message: "cold chunk exceeds addressable memory".to_owned(),
+                    })?;
+                let bytes = cold_store
+                    .read_chunk_range(chunk, chunk.start_offset, len)
+                    .await
+                    .map_err(|err| RuntimeError::ColdStoreIo {
+                        message: err.to_string(),
+                    })?;
+                payload.extend_from_slice(&bytes);
+            }
+            let first = old_chunks
+                .first()
+                .expect("candidate contains at least two chunks");
+            let last = old_chunks
+                .last()
+                .expect("candidate contains at least two chunks");
+            let path = new_cold_chunk_path(&stream_id, first.start_offset, last.end_offset);
+            let object_size = cold_store
+                .write_chunk(&path, &payload)
+                .await
+                .map_err(|err| RuntimeError::ColdStoreIo {
+                    message: err.to_string(),
+                })?;
+            let replacement = ColdChunkRef {
+                start_offset: first.start_offset,
+                end_offset: last.end_offset,
+                object_size,
+                s3_path: path,
+            };
+            let gc_not_before_ms = unix_time_ms().saturating_add(gc_grace_ms);
+            self.compact_cold(CompactColdRequest {
+                stream_id,
+                old_chunks,
+                replacement,
+                gc_not_before_ms,
+            })
+            .await?;
+            compacted += 1;
+        }
+        Ok(compacted)
+    }
+
     /// Drains the leader-side cold-GC queue for one group: physically reclaims
     /// each queued target from cold storage, then replicates an ack that pops
     /// the reclaimed entries. Deletions are idempotent, so a crash or leader
@@ -492,6 +607,9 @@ impl ShardRuntime {
         // Entries are FIFO by seq; stop at the first failure so the ack never
         // skips past an object that is still present in cold storage.
         for entry in entries {
+            if entry.not_before_ms > unix_time_ms() {
+                break;
+            }
             let result = match &entry.target {
                 ColdGcTarget::Stream(stream_id) => {
                     match cold_store.remove_all(&cold_chunk_prefix(stream_id)).await {
@@ -767,6 +885,19 @@ impl ShardRuntime {
             .collect::<Vec<_>>();
         RuntimeMailboxSnapshot { depths, capacities }
     }
+}
+
+#[cfg(not(madsim))]
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+#[cfg(madsim)]
+fn unix_time_ms() -> u64 {
+    0
 }
 
 /// Expands the operation manifest into the uniform `ShardRuntime` client

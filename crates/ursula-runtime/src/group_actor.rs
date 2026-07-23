@@ -31,6 +31,8 @@ use crate::request::BootstrapStreamResponse;
 use crate::request::CloseStreamRequest;
 use crate::request::CloseStreamResponse;
 use crate::request::ColdWriteAdmission;
+use crate::request::CompactColdRequest;
+use crate::request::CompactColdResponse;
 use crate::request::CreateStreamExternalRequest;
 use crate::request::CreateStreamRequest;
 use crate::request::CreateStreamResponse;

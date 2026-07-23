@@ -2038,6 +2038,68 @@ async fn cold_gc_worker_physically_reclaims_deleted_stream_chunks() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cold_compaction_preserves_reads_and_reclaims_inputs_after_grace() {
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(RuntimeConfig::new(2, 8), cold_store.clone());
+    let stream = BucketStreamId::new("benchcmp", "compact-runtime");
+    create_stream(&runtime, &stream).await;
+    append_bytes(&runtime, &stream, b"abcdefgh").await;
+    for (start, end, payload) in [(0, 4, b"abcd".as_slice()), (4, 8, b"efgh".as_slice())] {
+        let chunk = ColdChunkRef {
+            start_offset: start,
+            end_offset: end,
+            s3_path: format!("benchcmp/compact-runtime/chunks/{start}.bin"),
+            object_size: end - start,
+        };
+        cold_store
+            .write_chunk(&chunk.s3_path, payload)
+            .await
+            .expect("write input chunk");
+        runtime
+            .flush_cold(FlushColdRequest {
+                stream_id: stream.clone(),
+                chunk,
+            })
+            .await
+            .expect("flush input chunk");
+    }
+
+    assert_eq!(
+        runtime
+            .compact_cold_once(8, 16, 1, 0)
+            .await
+            .expect("compact cold chunks"),
+        1
+    );
+    let read = runtime
+        .read_stream(read_req(stream.clone(), 0, 8))
+        .await
+        .expect("read compacted stream");
+    assert_eq!(read.payload, b"abcdefgh");
+    assert_eq!(
+        runtime
+            .run_cold_gc_all_groups_once(256)
+            .await
+            .expect("reclaim compacted inputs"),
+        1
+    );
+    for start in [0, 4] {
+        let old = ColdChunkRef {
+            start_offset: start,
+            end_offset: start + 4,
+            s3_path: format!("benchcmp/compact-runtime/chunks/{start}.bin"),
+            object_size: 4,
+        };
+        assert!(
+            cold_store
+                .read_chunk_range(&old, old.start_offset, 4)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stale_cold_flush_batch_after_delete_recreate_is_classified_for_cleanup() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(RuntimeConfig::new(2, 8), cold_store);

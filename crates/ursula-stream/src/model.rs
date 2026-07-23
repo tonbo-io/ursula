@@ -159,6 +159,10 @@ pub type ExternalPayloadRef = ExternalPayloadRefV1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColdGcEntry {
     pub seq: u64,
+    /// Earliest wall-clock timestamp at which the physical object may be
+    /// reclaimed. Zero preserves the immediate behavior of legacy entries.
+    #[serde(default)]
+    pub not_before_ms: u64,
     pub target: ColdGcTarget,
 }
 

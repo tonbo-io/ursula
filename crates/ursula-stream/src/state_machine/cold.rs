@@ -333,6 +333,76 @@ impl StreamStateMachine {
         }
     }
 
+    pub(super) fn compact_cold(
+        &mut self,
+        stream_id: BucketStreamId,
+        old_chunks: Vec<ColdChunkRef>,
+        replacement: ColdChunkRef,
+        gc_not_before_ms: u64,
+    ) -> StreamResponse {
+        if let Err(response) = self.validate_stream_scope(&stream_id) {
+            return response;
+        }
+        if self.stream_slot(&stream_id).is_none() {
+            return StreamResponse::error(
+                StreamErrorCode::StreamNotFound,
+                format!("stream '{stream_id}' does not exist"),
+            );
+        }
+        if old_chunks.len() < 2 {
+            return StreamResponse::error(
+                StreamErrorCode::InvalidColdFlush,
+                "cold compaction requires at least two input chunks",
+            );
+        }
+        if replacement.s3_path.trim().is_empty() || replacement.object_size == 0 {
+            return StreamResponse::error(
+                StreamErrorCode::InvalidColdFlush,
+                "cold compaction replacement must name a non-empty object",
+            );
+        }
+        let mut expected_start = old_chunks
+            .first()
+            .map_or(replacement.start_offset, |chunk| chunk.start_offset);
+        let mut compacted_bytes = 0_u64;
+        for chunk in &old_chunks {
+            if chunk.start_offset != expected_start
+                || chunk.end_offset <= chunk.start_offset
+                || chunk.object_size != chunk.end_offset.saturating_sub(chunk.start_offset)
+            {
+                return StreamResponse::error(
+                    StreamErrorCode::InvalidColdFlush,
+                    "cold compaction inputs must be contiguous raw chunks",
+                );
+            }
+            expected_start = chunk.end_offset;
+            compacted_bytes = compacted_bytes.saturating_add(chunk.object_size);
+        }
+        let first = old_chunks
+            .first()
+            .expect("cold compaction input count validated");
+        if replacement.start_offset != first.start_offset
+            || replacement.end_offset != expected_start
+            || replacement.object_size != compacted_bytes
+        {
+            return StreamResponse::error(
+                StreamErrorCode::InvalidColdFlush,
+                "cold compaction replacement must cover the exact input range",
+            );
+        }
+        let old_paths = old_chunks
+            .into_iter()
+            .map(|chunk| chunk.s3_path)
+            .collect::<Vec<_>>();
+        let compacted_chunks = u64::try_from(old_paths.len()).expect("chunk count fits u64");
+        self.cold_gc
+            .enqueue_after(ColdGcTarget::Paths(old_paths), gc_not_before_ms);
+        StreamResponse::ColdCompacted {
+            compacted_chunks,
+            compacted_bytes,
+        }
+    }
+
     pub fn delete_snapshot(
         &self,
         stream_id: &BucketStreamId,

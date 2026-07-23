@@ -41,6 +41,8 @@ use crate::request::BootstrapStreamResponse;
 use crate::request::CloseStreamRequest;
 use crate::request::CloseStreamResponse;
 use crate::request::ColdWriteAdmission;
+use crate::request::CompactColdRequest;
+use crate::request::CompactColdResponse;
 use crate::request::CreateStreamExternalRequest;
 use crate::request::CreateStreamRequest;
 use crate::request::CreateStreamResponse;
@@ -852,6 +854,56 @@ impl CoreWorker {
                 elapsed_ns(started_at),
             );
             record_cold_hot_backlog(group, &metrics, stream_id.clone(), placement).await;
+            Self::notify_read_watchers(
+                group,
+                metrics,
+                read_materialization,
+                read_watchers,
+                &stream_id,
+                placement,
+            )
+            .await;
+        }
+        response
+    }
+
+    #[tracing::instrument(
+        name = "runtime.cold_compact",
+        skip_all,
+        fields(
+            group = placement.raft_group_id.0,
+            bucket = %request.stream_id.bucket_id,
+            stream = %request.stream_id.stream_id,
+            chunks = request.old_chunks.len(),
+            bytes = request.replacement.object_size,
+        ),
+    )]
+    pub(crate) async fn compact_cold(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        read_materialization: Arc<Semaphore>,
+        read_watchers: &mut ReadWatchers,
+        request: CompactColdRequest,
+        placement: ShardPlacement,
+    ) -> Result<CompactColdResponse, RuntimeError> {
+        let stream_id = request.stream_id.clone();
+        let started_at = Instant::now();
+        let exec_started_at = Instant::now();
+        let response = group
+            .compact_cold(request, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err));
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(exec_started_at),
+        );
+        if response.is_ok() {
+            metrics.record_applied_mutation(
+                placement.core_id,
+                placement.raft_group_id,
+                elapsed_ns(started_at),
+            );
             Self::notify_read_watchers(
                 group,
                 metrics,

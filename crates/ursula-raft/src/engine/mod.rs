@@ -29,6 +29,7 @@ use ursula_runtime::ColdIndexPageCache;
 use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::ColdWriteAdmission;
+use ursula_runtime::CompactColdRequest;
 use ursula_runtime::CreateStreamExternalRequest;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::DeleteSnapshotRequest;
@@ -41,6 +42,7 @@ use ursula_runtime::GroupAppendFuture;
 use ursula_runtime::GroupBootstrapStreamFuture;
 use ursula_runtime::GroupCloseStreamFuture;
 use ursula_runtime::GroupColdHotBacklogFuture;
+use ursula_runtime::GroupCompactColdFuture;
 use ursula_runtime::GroupCreateStreamFuture;
 use ursula_runtime::GroupDeleteSnapshotFuture;
 use ursula_runtime::GroupDeleteStreamFuture;
@@ -77,6 +79,7 @@ use ursula_runtime::StreamErrorCode;
 use ursula_runtime::TouchStreamAccessResponse;
 use ursula_runtime::UpdateStreamAttrsRequest;
 use ursula_runtime::default_snapshot_store;
+use ursula_runtime::replace_cold_chunk_index_pages;
 use ursula_runtime::write_cold_chunk_index_pages;
 use ursula_runtime::write_external_segment_index_pages;
 use ursula_shard::BucketStreamId;
@@ -1244,6 +1247,37 @@ impl GroupEngine for RaftGroupEngine {
                 GroupWriteResponse::FlushCold(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
                     "unexpected flush cold write response: {other:?}"
+                ))),
+            }
+        })
+    }
+
+    fn compact_cold<'a>(
+        &'a mut self,
+        request: CompactColdRequest,
+        _placement: ShardPlacement,
+    ) -> GroupCompactColdFuture<'a> {
+        Box::pin(async move {
+            if let Some(cold_store) = self.cold_store.as_ref() {
+                let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+                let replaced = replace_cold_chunk_index_pages(
+                    &store,
+                    &request.stream_id,
+                    &request.old_chunks,
+                    &request.replacement,
+                )
+                .await
+                .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                if !replaced {
+                    return Err(GroupEngineError::new(
+                        "cold compaction input no longer matches the cold index",
+                    ));
+                }
+            }
+            match self.write(GroupWriteCommand::from(request)).await? {
+                GroupWriteResponse::CompactCold(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected compact cold write response: {other:?}"
                 ))),
             }
         })
