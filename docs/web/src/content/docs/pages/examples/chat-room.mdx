@@ -1,0 +1,64 @@
+---
+title: Chat Room
+description: "One JSON stream per room: append messages, replay history by record, and tail new messages live."
+---
+
+A chat room is a JSON timeline: every message is one record, Ursula assigns record ordinals in commit order, and every participant replays history and tails the same stream. This mirrors the chat examples in the [upstream Durable Streams repo](https://github.com/durable-streams/durable-streams/tree/main/examples).
+
+## One stream per room
+
+```bash
+curl -X PUT http://127.0.0.1:4437/chat/room-7 \
+  -H 'Content-Type: application/json'
+```
+
+`application/json` streams advertise `json-record-coordinates-v1`: each appended JSON object becomes one complete record with a stable zero-based ordinal, so clients paginate and resume by message, not by byte offset.
+
+## Send a message
+
+```bash
+curl -X POST http://127.0.0.1:4437/chat/room-7 \
+  -H 'Content-Type: application/json' \
+  --data '{"user":"ada","text":"hello","sent_at":"2026-07-23T09:00:00Z"}'
+```
+
+Each append returns the record range it created in `Stream-Record-Start` / `Stream-Record-Next`. Appending a top-level JSON array creates one record per element — useful for flushing an offline outbox in one request. For send-button retries that can't double-post, add the [exactly-once producer headers](/docs/concepts/exactly-once-writes) with one `Producer-Id` per device.
+
+## Load recent history
+
+Fetch the last 50 messages as self-describing `{record, value}` envelopes, newest ordinals last:
+
+```bash
+curl 'http://127.0.0.1:4437/chat/room-7?tail_records=50&record_view=envelope'
+```
+
+```json
+{"record":118,"value":{"sent_at":"2026-07-23T09:00:00Z","text":"hello","user":"ada"}}
+{"record":119,"value":{"sent_at":"2026-07-23T09:00:07Z","text":"hey ada","user":"lin"}}
+```
+
+JSON records are validated and normalized on append, so key order may differ from what the sender wrote.
+
+## Tail new messages live
+
+`record=now` skips history and streams only messages committed from now on. In envelope mode, every SSE data event carries exactly one `{record, value}` object, so the client parses each event directly:
+
+```ts
+const base = "http://127.0.0.1:4437";
+const es = new EventSource(
+  `${base}/chat/room-7?record=now&record_view=envelope&live=sse`,
+);
+
+es.addEventListener("data", (e) => {
+  const { record, value } = JSON.parse(e.data);
+  renderMessage(record, value);
+});
+```
+
+Control events publish `streamNextRecord`; store it and reconnect with `record=<streamNextRecord>` to resume without missing or repeating a message. Deduplicate by `record` if you combine a history fetch with a live tail.
+
+## Next
+
+- [Resumable AI Stream](/docs/examples/resumable-ai-stream): the single-writer variant for streaming model output
+- [Record Coordinates](/docs/concepts/record-coordinates): the complete record replay model
+- [Browser Telemetry](/docs/examples/browser-telemetry): an advanced example with event-time indexing on top of records

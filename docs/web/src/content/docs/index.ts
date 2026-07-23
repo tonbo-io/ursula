@@ -44,8 +44,10 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   configuration: { group: "Deploy", order: 2 },
   security: { group: "Deploy", order: 3 },
 
-  // Guides - complete application-shaped examples.
-  "guides/browser-telemetry": { group: "Guides", order: 1 },
+  // Examples - basic patterns first, then the advanced application.
+  "examples/resumable-ai-stream": { group: "Examples", order: 1 },
+  "examples/chat-room": { group: "Examples", order: 2 },
+  "examples/browser-telemetry": { group: "Examples", order: 3 },
 
   // Concepts - encounter order: primitive, organization, reading, writing, long-stream, transport.
   "concepts/streams": { group: "Concepts", order: 1 },
@@ -134,7 +136,7 @@ const docsPages: DocsPage[] = Object.entries(docsModules)
 const groupOrder = [
   "Getting Started",
   "Deploy",
-  "Guides",
+  "Examples",
   "Concepts",
   "API Reference",
   "Operate",

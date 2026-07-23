@@ -24,7 +24,7 @@ const ORIGIN = "https://ursula.tonbo.io";
 const GROUP_ORDER = [
   "Getting Started",
   "Deploy",
-  "Guides",
+  "Examples",
   "Concepts",
   "API Reference",
   "Operate",
@@ -48,7 +48,9 @@ const PAGE_ORDER = new Map([
   ["configuration", ["Deploy", 2]],
   ["security", ["Deploy", 3]],
 
-  ["guides/browser-telemetry", ["Guides", 1]],
+  ["examples/resumable-ai-stream", ["Examples", 1]],
+  ["examples/chat-room", ["Examples", 2]],
+  ["examples/browser-telemetry", ["Examples", 3]],
 
   ["concepts/streams", ["Concepts", 1]],
   ["concepts/buckets", ["Concepts", 2]],
