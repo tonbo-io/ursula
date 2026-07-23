@@ -8,7 +8,7 @@ title: ursulactl
 - after it comes back, refuse to move on until `last_applied_index` has caught up to peers' `committed_index` (`wait-node-ready`)
 - abort rather than corner a group with no leader
 
-On a platform with its own controller, run the logical verbs around the platform's restart. On Kubernetes:
+On a platform with its own controller, run the maintenance verbs around the platform's restart. On Kubernetes:
 
 ```bash
 ursulactl drain --config manifest.json --node 3
@@ -19,7 +19,7 @@ ursulactl undrain --config manifest.json --node 3
 
 On bare metal there is no controller, so `ursulactl restart` packages the same loop with a physical restart command per node. That orchestration is exercised under [deterministic simulation](/docs/architecture/overview), so failure modes like a leader transfer timing out, the target node entering a crash loop, or a partition during drain produce a clean abort instead of a half-rolled cluster.
 
-## Logical verbs
+## Verbs
 
 | Verb | Effect |
 |------|--------|
