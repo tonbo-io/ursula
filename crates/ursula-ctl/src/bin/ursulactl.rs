@@ -31,12 +31,25 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Rolling restart with raft-aware leadership drain and applied_index catch-up checks.
+    /// Rolling restart for hosts with no platform controller: composes drain,
+    /// a provider restart command, and the catch-up wait per node.
     Restart(RestartArgs),
     /// Print per-node raft group count and leadership distribution from /__ursula/metrics.
     Status(ObserveArgs),
     /// Block until every node reports the expected number of raft groups and initialized groups have leaders.
     WaitReady(WaitReadyArgs),
+    /// Mark one node as draining and transfer away every leadership it holds.
+    /// The mark persists until `undrain` so the node does not re-acquire
+    /// groups while the platform restarts it.
+    Drain(DrainArgs),
+    /// Clear a node's maintenance-drain mark so it can hold leaderships again.
+    Undrain(NodeArgs),
+    /// Block until one node is back as a voter in every group and caught up.
+    /// Progress-gated: a node that keeps advancing is never timed out.
+    WaitNodeReady(WaitNodeReadyArgs),
+    /// Arm one empty-log rejoin per group for a raft-memory node that lost its
+    /// volatile log. Refused on disk-backed clusters.
+    AllowRejoin(NodeArgs),
 }
 
 /// How ursulactl reaches each node's loopback-bound admin plane. A named
@@ -146,6 +159,70 @@ struct WaitReadyArgs {
 }
 
 #[derive(Args, Debug)]
+struct NodeArgs {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// Target node id from the manifest.
+    #[arg(long)]
+    node: u64,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+    #[command(flatten)]
+    provider: ProviderArgs,
+}
+
+#[derive(Args, Debug)]
+struct DrainArgs {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// Target node id from the manifest.
+    #[arg(long)]
+    node: u64,
+    /// Seconds to wait for the target to relinquish all leaderships before aborting.
+    #[arg(long, default_value_t = 60)]
+    drain_timeout_secs: u64,
+    /// Budget for the surrounding whole-cluster readiness waits.
+    #[arg(long, default_value_t = 120)]
+    ready_timeout_secs: u64,
+    #[arg(long, default_value_t = 2)]
+    poll_interval_secs: u64,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+    /// Allowed gap (in log indices) between applied and committed for readiness.
+    #[arg(long, default_value_t = 16)]
+    lag_tolerance: u64,
+    /// Print the transfer plan and stop before mutating anything.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+    #[command(flatten)]
+    provider: ProviderArgs,
+}
+
+#[derive(Args, Debug)]
+struct WaitNodeReadyArgs {
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// Target node id from the manifest.
+    #[arg(long)]
+    node: u64,
+    /// Abort when the target makes no catch-up progress for this long.
+    #[arg(long, default_value_t = 90)]
+    stall_timeout_secs: u64,
+    /// Absolute backstop above the stall detector.
+    #[arg(long, default_value_t = 1800)]
+    ready_timeout_secs: u64,
+    #[arg(long, default_value_t = 2)]
+    poll_interval_secs: u64,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+    /// Allowed gap (in log indices) between applied and committed for readiness.
+    #[arg(long, default_value_t = 16)]
+    lag_tolerance: u64,
+    #[command(flatten)]
+    provider: ProviderArgs,
+}
+
+#[derive(Args, Debug)]
 struct RestartArgs {
     /// Path to the node config JSON (compatible with scripts/ursula_ec2.py's nodes.json).
     #[arg(long, value_name = "PATH")]
@@ -200,7 +277,19 @@ async fn main() -> Result<()> {
         Command::Restart(args) => run_restart_subcommand(args).await,
         Command::Status(args) => run_status_subcommand(args).await,
         Command::WaitReady(args) => run_wait_ready_subcommand(args).await,
+        Command::Drain(args) => run_drain_subcommand(args).await,
+        Command::Undrain(args) => run_undrain_subcommand(args).await,
+        Command::WaitNodeReady(args) => run_wait_node_ready_subcommand(args).await,
+        Command::AllowRejoin(args) => run_allow_rejoin_subcommand(args).await,
     }
+}
+
+/// Find one node by id in the connected manifest.
+fn find_node(nodes: &[ursula_ctl::NodeInfo], id: u64) -> Result<&ursula_ctl::NodeInfo> {
+    nodes
+        .iter()
+        .find(|n| n.id == id)
+        .ok_or_else(|| anyhow::anyhow!("node id {id} not present in the manifest"))
 }
 
 /// Load the manifest, resolve the provider (manifest `[provider]` block merged
@@ -253,6 +342,94 @@ async fn run_wait_ready_subcommand(args: WaitReadyArgs) -> Result<()> {
         "ready: {} node(s), {} groups each",
         snapshot.per_node.len(),
         args.expected_groups
+    );
+    Ok(())
+}
+
+async fn run_drain_subcommand(args: DrainArgs) -> Result<()> {
+    let (_provider, access) = connect_nodes(&args.config, &args.provider, false).await?;
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let target = find_node(&access.nodes, args.node)?;
+    let options = ursula_ctl::DrainOptions {
+        drain_timeout: Duration::from_secs(args.drain_timeout_secs),
+        ready_timeout: Duration::from_secs(args.ready_timeout_secs),
+        poll_interval: Duration::from_secs(args.poll_interval_secs),
+        lag_tolerance: args.lag_tolerance,
+        dry_run: args.dry_run,
+    };
+    match ursula_ctl::drain_node(&access.nodes, target, &client, &options).await? {
+        ursula_ctl::DrainOutcome::Drained => {
+            println!(
+                "node {}: drained (mark stays set; run `undrain` after maintenance)",
+                target.id
+            );
+            Ok(())
+        }
+        ursula_ctl::DrainOutcome::DryRun(plan) => {
+            if plan.transfers.is_empty() {
+                println!("node {}: leads no groups, nothing to transfer", target.id);
+            } else {
+                for transfer in &plan.transfers {
+                    println!(
+                        "group {}: transfer to node {}",
+                        transfer.raft_group_id, transfer.preferred_successor
+                    );
+                }
+            }
+            Ok(())
+        }
+        ursula_ctl::DrainOutcome::Aborted { reason } => {
+            eprintln!("node {}: ABORTED ({reason})", target.id);
+            std::process::exit(2);
+        }
+    }
+}
+
+async fn run_undrain_subcommand(args: NodeArgs) -> Result<()> {
+    let (_provider, access) = connect_nodes(&args.config, &args.provider, false).await?;
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let target = find_node(&access.nodes, args.node)?;
+    ursula_ctl::undrain_node(&client, target).await?;
+    println!("node {}: drain mark cleared", target.id);
+    Ok(())
+}
+
+async fn run_wait_node_ready_subcommand(args: WaitNodeReadyArgs) -> Result<()> {
+    let (_provider, access) = connect_nodes(&args.config, &args.provider, false).await?;
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let target = find_node(&access.nodes, args.node)?;
+    let options = ursula_ctl::CatchUpOptions {
+        stall_timeout: Duration::from_secs(args.stall_timeout_secs),
+        ready_timeout: Duration::from_secs(args.ready_timeout_secs),
+        poll_interval: Duration::from_secs(args.poll_interval_secs),
+        lag_tolerance: args.lag_tolerance,
+    };
+    match ursula_ctl::wait_node_ready(&access.nodes, target, &client, &options, false).await? {
+        ursula_ctl::CatchUpOutcome::Ready => {
+            println!("node {}: caught up", target.id);
+            Ok(())
+        }
+        ursula_ctl::CatchUpOutcome::Stalled { reason } => {
+            eprintln!("node {}: NOT READY ({reason})", target.id);
+            std::process::exit(2);
+        }
+    }
+}
+
+async fn run_allow_rejoin_subcommand(args: NodeArgs) -> Result<()> {
+    let (_provider, access) = connect_nodes(&args.config, &args.provider, false).await?;
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let target = find_node(&access.nodes, args.node)?;
+    // Refuses on all-disk clusters: an empty rejoin there means a wiped node.
+    let allowed = ursula_ctl::resolve_empty_rejoin_policy(&client, &access.nodes, true).await?;
+    if !allowed {
+        bail!("empty-log rejoin is not applicable to this cluster");
+    }
+    let snap = client.fetch_cluster(&access.nodes).await?;
+    ursula_ctl::arm_empty_rejoin(&access.nodes, target, &client, &snap).await?;
+    println!(
+        "node {}: empty-log rejoin armed on every group leader",
+        target.id
     );
     Ok(())
 }
