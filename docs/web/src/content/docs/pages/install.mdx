@@ -2,33 +2,30 @@
 title: Install
 ---
 
-Ursula installs two ways: pull the pre-built Docker image from GHCR, or build from source. Standalone release binaries are on the way; the source build is plain Rust plus the standard C toolchain that Cargo expects, with no embedded KV dependency.
+This page gets a **single Ursula node** running on your machine so you can try the API. There are two ways to do it:
 
-Ursula ships **two binaries** you will use side by side:
+| Pick | When |
+| ---- | ---- |
+| **Docker** | You just want to try Ursula. One command, no toolchain. |
+| **Build from source** | You want local binaries, plan to hack on Ursula, or can't run Docker. |
 
-- **`ursula`**: the server daemon. Runs on every node in the cluster.
-- **`ursulactl`**: the operator CLI. Lives on your control machine and talks to each node's HTTP surface. See [ursulactl](/docs/cli) for the verbs it exposes.
+Both start the same in-memory, non-replicated node on port `4437` — perfect for a first look, with nothing persisted across restarts. For a production cluster, skip ahead to [Deploy a Cluster](/docs/deploy-cluster).
 
-## Docker image
+## Docker
 
-Every release publishes a multi-arch image containing `ursula` and `ursulactl`:
+Every release publishes a multi-arch image to GHCR:
 
 ```bash
-docker pull ghcr.io/tonbo-io/ursula:0.3.1
 docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.3.1
 ```
 
-The image runs as a non-root user and exposes port 4437. `latest` tracks the main branch; pin a version tag for anything you keep running. For Kubernetes, the [Helm chart](/docs/deploy-kubernetes) wires this image up for you.
+The image runs as a non-root user and contains both `ursula` (the server) and `ursulactl` (the operator CLI). `latest` tracks the main branch; pin a version tag for anything you keep running.
 
-## Prerequisites
+## Build from source
 
-Required:
+You need rustup (the repo pins the right nightly via `rust-toolchain.toml`), a C compiler, and `pkg-config`.
 
-- the pinned Rust nightly toolchain from `rust-toolchain.toml` and Cargo
-- a C compiler (for transitive native crates)
-- `pkg-config`
-
-On macOS, install rustup so Cargo selects the pinned nightly from `rust-toolchain.toml`:
+On macOS:
 
 ```bash
 brew install rustup pkg-config
@@ -43,65 +40,34 @@ sudo apt-get install -y build-essential pkg-config curl
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-## Clone and build
+Then clone, build, and run:
 
 ```bash
 git clone https://github.com/tonbo-io/ursula.git
 cd ursula
+cargo run --release --bin ursula
+```
+
+To install the binaries somewhere instead of running in place:
+
+```bash
 cargo build --release -p ursula -p ursula-ctl
 ```
 
-The resulting binaries land at `target/release/ursula` and `target/release/ursulactl`. Ship `ursula` to every node; keep `ursulactl` wherever you run operational tooling (laptop, CI runner, bastion host).
-
-To work on the whole workspace:
-
-```bash
-cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-```
-
-`cargo build --workspace` compiles every crate. For just the server use `cargo build -p ursula`; for just the CLI use `cargo build -p ursula-ctl`.
+They land at `target/release/ursula` and `target/release/ursulactl`.
 
 ## Verify
 
-```bash
-./target/release/ursula --help
-./target/release/ursulactl --help
-```
-
-Both should print supported CLI flags. From the repository root, `./target/release/ursula --preset default` still performs config-file discovery and will load `./ursula.toml` when present. Use that command when you want the bundled `./ursula.toml` with the default preset; for a true no-file smoke test, run from a directory with no Ursula config file or temporarily move/rename `./ursula.toml` first.
+With the node running, from another terminal:
 
 ```bash
-./target/release/ursula --preset default &
+curl http://127.0.0.1:4437/__ursula/metrics
 ```
 
-For a single local node, `ursulactl` needs a one-node manifest to talk to:
-
-```bash
-cat > /tmp/local.json <<'JSON'
-{"nodes": [{"id": 1, "http_url": "http://127.0.0.1:4437", "host": "127.0.0.1"}]}
-JSON
-
-./target/release/ursulactl status --config /tmp/local.json
-```
-
-Or, for a quick eyeball without writing a manifest, hit the HTTP surface directly:
-
-```bash
-curl -X PUT http://127.0.0.1:4437/demo
-curl -X PUT http://127.0.0.1:4437/demo/hello
-curl -X POST -H 'Content-Type: text/plain' --data 'hi' http://127.0.0.1:4437/demo/hello
-curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
-```
-
-Kill the background process when you're done.
+A JSON snapshot of runtime state means the node is up.
 
 ## Next
 
-- [Quick start](/docs/quick-start): drive the HTTP API end-to-end
-- [Run locally](/docs/run-locally): durability modes and flags
-- [Deploy a cluster](/docs/deploy-cluster): static gRPC Raft cluster
-- [Deploy on Kubernetes](/docs/deploy-kubernetes): one `helm install` from the published chart
-- [ursulactl](/docs/cli): the verbs you'll use once the cluster is up
-- [Configure S3](/docs/configure-s3): shared cold storage
+- [Quick Start](/docs/quick-start): create streams, append, replay, and tail live over SSE
+- [Deploy a Cluster](/docs/deploy-cluster): the production three-voter shape with OpenTofu + Helm
+- [Configuration](/docs/configuration): every knob in one place — persistence, presets, S3 cold storage
