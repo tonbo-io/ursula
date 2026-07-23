@@ -2,13 +2,33 @@
 title: ursulactl
 ---
 
-`ursulactl` is the first interface to reach for once a cluster is running. Its verbs encode the safety properties an operator otherwise has to remember manually:
+`ursulactl` manages the **logical** state of a running cluster: which node leads which Raft groups, whether a node is caught up, and whether a leader will accept an amnesiac node back. Physical lifecycle belongs to whatever owns the process: Helm and the StatefulSet controller on Kubernetes, systemd on hosts, OpenTofu for the infrastructure underneath. The verbs encode the safety properties an operator otherwise has to remember manually:
 
-- before restarting a node, transfer every Raft group it leads to a healthy successor
-- after a restart, refuse to move on until `last_applied_index` has caught up to peers' `committed_index`
-- abort the rollout rather than corner a group with no leader
+- before a node goes down, transfer every Raft group it leads to a healthy successor (`drain`)
+- after it comes back, refuse to move on until `last_applied_index` has caught up to peers' `committed_index` (`wait`)
+- abort rather than corner a group with no leader
 
-The same orchestration is exercised under [deterministic simulation](/docs/architecture/overview), so failure modes like a leader transfer timing out, the target node entering a crash loop, or a partition during drain produce a clean abort instead of a half-rolled cluster.
+On a platform with its own controller, run the maintenance verbs around the platform's restart. On Kubernetes:
+
+```bash
+ursulactl drain --config manifest.json --node 3
+kubectl delete pod ursula-2        # the platform restarts the pod
+ursulactl wait --config manifest.json --node 3
+ursulactl undrain --config manifest.json --node 3
+```
+
+On bare metal there is no controller, so `ursulactl restart` packages the same loop with a physical restart command per node. That orchestration is exercised under [deterministic simulation](/docs/architecture/overview), so failure modes like a leader transfer timing out, the target node entering a crash loop, or a partition during drain produce a clean abort instead of a half-rolled cluster.
+
+## Verbs
+
+| Verb | Effect |
+|------|--------|
+| `drain --node N` | Mark the node draining and transfer away every leadership it holds. The mark persists (the node attracts no leaderships) until `undrain`. `--dry-run` prints the transfer plan |
+| `undrain --node N` | Clear the drain mark so the node may hold leaderships again |
+| `wait --node N` | Block until the node is a voter in every group and within `--lag-tolerance` of peers. Progress-gated: a node that keeps advancing is never timed out |
+| `allow-rejoin --node N` | Arm one empty-log rejoin per group for a raft-memory node that lost its volatile log. Refused on disk-backed clusters |
+| `status` | Per-node group counts and leadership distribution |
+| `wait-ready` | Block until every node reports the expected group count and every group has a leader |
 
 ## The admin plane
 
@@ -60,7 +80,18 @@ The binary lands at `target/release/ursulactl`. Drop it on your control machine.
 
 ## Manifest format
 
-Every verb accepts `--config <path>`. The manifest is **TOML, JSON, or YAML** (chosen by file extension) and carries two things: an optional `[provider]` block (how to reach the cluster) and the node list (what the cluster is). Putting the provider in the manifest keeps the command line to just the operational knobs:
+Every verb accepts `--config <path>`. The manifest is **TOML, JSON, or YAML** (chosen by file extension, sniffed when read from stdin with `-`) and carries two things: an optional `[provider]` block (how to reach the cluster) and the node list (what the cluster is).
+
+Prefer generating the manifest from whatever already knows the topology instead of writing it by hand. On Kubernetes the Helm chart renders one into its ConfigMap, and the URLs in it are in-cluster DNS, so pipe it to ursulactl running where those names resolve (the server image contains ursulactl):
+
+```bash
+kubectl get configmap ursula -o jsonpath='{.data.cluster-manifest\.json}' \
+  | ursulactl status --config -
+```
+
+For infrastructure provisioned by OpenTofu, emit the manifest as a stack output or generated file (the same pattern as `deploy/eks`'s `generated-values.yaml`) rather than teaching ursulactl to read state files. `tofu output -json <name> | ursulactl status --config -` composes the same way.
+
+Putting the provider in the manifest keeps the command line to just the operational knobs:
 
 ```toml
 [provider]
