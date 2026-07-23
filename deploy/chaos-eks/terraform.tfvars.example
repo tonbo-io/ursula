@@ -2,7 +2,7 @@ aws_region    = "us-east-1"
 cluster_name  = "ursula-eks"
 namespace     = "ursula"
 status_bucket = "replace-with-chaos-status-bucket"
-image_tag     = "0.3.0"
+image_tag     = "0.3.1"
 
 # These defaults match a Helm release installed with fullnameOverride=ursula.
 server_fullname = "ursula"
