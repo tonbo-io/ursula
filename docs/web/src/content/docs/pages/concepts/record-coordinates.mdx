@@ -100,11 +100,11 @@ A mismatch returns `412 Precondition Failed` with the current `Stream-Record-Nex
 
 `captured_at` is not a Durable Streams coordinate, so `GET ?captured_at=...` is intentionally not part of the stream protocol. The optional `ursula-indexer` tails the envelope view, builds a rebuildable S3-backed event-time index, and returns record ordinals for a time range. Callers can then resolve those records through Ursula.
 
-The index reports `indexed_through_record` and `durable_through_record`. Pagination pins one `through_record` watermark so newly indexed events do not move a query between pages. See the [Browser Telemetry guide](/docs/guides/browser-telemetry) for the complete setup and query flow.
+The index reports `indexed_through_record` and `durable_through_record`. Pagination pins one `through_record` watermark so newly indexed events do not move a query between pages. See the [Browser Telemetry example](/docs/examples/browser-telemetry) for the complete setup and query flow.
 
 ## Related
 
 - [Offsets](/docs/concepts/offsets)
 - [Append API](/docs/api/append)
 - [Read API](/docs/api/read)
-- [Browser Telemetry](/docs/guides/browser-telemetry)
+- [Browser Telemetry](/docs/examples/browser-telemetry)
