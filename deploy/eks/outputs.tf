@@ -47,7 +47,7 @@ resource "local_file" "helm_values" {
     }
     raft = {
       groupCount             = var.raft_group_count
-      initMembershipPerGroup = true
+      initMembershipPerGroup = var.raft_init_membership_per_group
       storageMode            = "logDir"
     }
     persistence = {
@@ -62,6 +62,9 @@ resource "local_file" "helm_values" {
     }
     coldStorage = {
       enabled = true
+      compaction = {
+        enabled = var.cold_compaction_enabled
+      }
     }
     snapshotStore = {
       backend = "s3"

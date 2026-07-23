@@ -18,9 +18,15 @@ server_cpu_request    = "2"
 server_memory_request = "4Gi"
 server_memory_limit   = "8Gi"
 raft_group_count      = 256
+# Keep true only for the first cluster bootstrap, then persist false before
+# future generated-values upgrades.
+raft_init_membership_per_group = true
 raft_volume_size      = "100Gi"
 gateway_replicas      = 3
 indexer_replicas      = 2
+
+# Enable only after every voter runs a Ursula image that supports compaction.
+cold_compaction_enabled = false
 
 tags = {
   Environment = "production"

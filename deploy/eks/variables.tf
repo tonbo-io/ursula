@@ -180,6 +180,18 @@ variable "raft_group_count" {
   }
 }
 
+variable "raft_init_membership_per_group" {
+  description = "Initialize static Raft membership. Set false after the first successful cluster bootstrap."
+  type        = bool
+  default     = true
+}
+
+variable "cold_compaction_enabled" {
+  description = "Enable same-stream cold chunk compaction after every voter runs a compatible Ursula image."
+  type        = bool
+  default     = false
+}
+
 variable "raft_volume_size" {
   description = "gp3 PVC size for each voter Raft log."
   type        = string
