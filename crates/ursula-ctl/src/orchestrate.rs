@@ -1,6 +1,6 @@
 //! Rolling-restart orchestration for clusters with no platform controller.
 //!
-//! This composes the logical verbs in [`crate::logical`] (drain, catch-up
+//! This composes the logical verbs in [`crate::maintenance`] (drain, catch-up
 //! wait, empty-log rejoin arming) with a physical restart command built by an
 //! [`crate::operation::OperationProvider`]. It is the bare-metal counterpart
 //! of what a drain-aware Kubernetes rollout does: on platforms that own
@@ -17,16 +17,16 @@ use anyhow::anyhow;
 use anyhow::bail;
 use tokio::process::Command;
 
-use crate::logical::CatchUpOptions;
-use crate::logical::CatchUpOutcome;
-use crate::logical::DrainOptions;
-use crate::logical::DrainOutcome;
-use crate::logical::arm_empty_rejoin;
-use crate::logical::clear_maintenance_drain;
-use crate::logical::drain_node;
-use crate::logical::resolve_empty_rejoin_policy;
-use crate::logical::wait_cluster_ready;
-use crate::logical::wait_node_ready;
+use crate::maintenance::CatchUpOptions;
+use crate::maintenance::CatchUpOutcome;
+use crate::maintenance::DrainOptions;
+use crate::maintenance::DrainOutcome;
+use crate::maintenance::arm_empty_rejoin;
+use crate::maintenance::clear_maintenance_drain;
+use crate::maintenance::drain_node;
+use crate::maintenance::resolve_empty_rejoin_policy;
+use crate::maintenance::wait_cluster_ready;
+use crate::maintenance::wait_node_ready;
 use crate::metrics::MetricsClient;
 use crate::provider::NodeInfo;
 

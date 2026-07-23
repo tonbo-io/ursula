@@ -1,4 +1,4 @@
-//! Logical cluster-state verbs: drain, undrain, catch-up wait, and empty-log
+//! Node maintenance verbs: drain, undrain, catch-up wait, and empty-log
 //! rejoin arming.
 //!
 //! These operate purely on Ursula's admin/metrics HTTP surface and never
