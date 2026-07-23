@@ -34,31 +34,26 @@ On bare metal there is no controller, so `ursulactl restart` packages the same l
 
 Nodes carry **no cluster-mutation surface on the network**. The mutating operator endpoints (raft snapshot/purge/membership/learners/leader-transfer/allow-next-revert, maintenance drain, cold-flush trigger) plus metrics are served on a separate **admin plane** bound to `server.admin_listen`, which defaults to loopback (`127.0.0.1:4438`). The public client plane (`:4437`) serves only stream traffic and read-only metrics.
 
-`status` and `wait-ready` prefer each node's `http_url` because read-only metrics are available on the client plane. Legacy manifests without `http_url` fall back to `admin_url`. Mutating restart operations still use the admin plane. Because that plane is loopback-bound, ursulactl reaches it through a **provider**: a named transport that knows how to both tunnel to a node's admin plane and restart it. You select one and give it a few structured values, and the provider builds its own commands, so you never hand-write ssh/aws/kubectl boilerplate.
+`status` and `wait-ready` prefer each node's `http_url` because read-only metrics are available on the client plane. Legacy manifests without `http_url` fall back to `admin_url`. Mutating operations use the admin plane. Because that plane is loopback-bound, ursulactl reaches it through a **provider**:
 
-| Provider | Reaches admin via | Restarts via | Needs |
-|----------|-------------------|--------------|-------|
-| `direct` (default) | `admin_url` as-is (must be reachable) | not supported (observe only) | nothing |
-| `ssh` | `ssh -N -L` | `ssh … systemctl restart <unit>` | `--ssh-user`, `--restart-unit` |
-| `eice` | ssh over AWS EC2 Instance Connect | same as ssh | `--region`, `--ssh-user`, `--ssh-key`, `--restart-unit` |
-| `command` | your `--forward-cmd` | your `--restart-cmd` | the templates below |
+| Provider | Reaches admin via | Restarts via |
+|----------|-------------------|--------------|
+| `direct` (default) | `admin_url` as-is (must be reachable) | not supported (observe only) |
+| `command` | your `--forward-cmd` template | your `--restart-cmd` template |
+
+The `command` provider renders one shell command per node from your templates. Placeholders: `{local_port}` `{admin_port}` `{admin_host}` `{host}` `{instance_id}` `{node_id}` `{name}` (`--restart-cmd` gets the same set minus the port ones). Commands run under `sh -c`, the forward staying foreground for the tunnel's life (ursulactl tears it down when done). Any transport that can forward a port and restart a process fits:
 
 ```bash
-# SSH: nodes reachable by hostname/IP with a key
-ursulactl status --config cluster.toml --provider ssh --ssh-user ec2-user
-
-# EICE: private nodes with no inbound SSH (send-key + open-tunnel, addressed by instance id)
-ursulactl status --config cluster.toml --provider eice --region us-east-1 \
-  --ssh-user ec2-user --ssh-key ~/.ssh/id_ed25519
-
-# Kubernetes / anything else: the command escape hatch
+# Kubernetes
 ursulactl status --config cluster.toml --provider command \
   --forward-cmd 'kubectl port-forward pod/{name} {local_port}:{admin_port}'
+
+# Bare metal over SSH
+ursulactl status --config cluster.toml --provider command \
+  --forward-cmd 'ssh -N -L {local_port}:127.0.0.1:{admin_port} admin@{host}'
 ```
 
-The `command` provider renders `{local_port}` `{admin_port}` `{admin_host}` `{host}` `{instance_id}` `{node_id}` `{name}` and runs under `sh -c`, the forward staying foreground for the tunnel's life (ursulactl tears it down when done). Prefer a named provider, and reach for `command` only when the named set does not cover your transport.
-
-`direct` has no way to execute a restart on a node, so it supports only the observe verbs (`status`, `wait-ready`). `restart` requires `ssh`, `eice`, or `command`.
+`direct` has no way to execute a restart on a node, so it supports only the observe verbs (`status`, `wait-ready`). `restart` requires the `command` provider with a `--restart-cmd`.
 
 ## When to use ursulactl vs. the other surfaces
 
@@ -95,19 +90,17 @@ Putting the provider in the manifest keeps the command line to just the operatio
 
 ```toml
 [provider]
-kind = "eice"
-region = "us-east-1"
-ssh_user = "ec2-user"
-ssh_key = "~/.ssh/id_ed25519"
-restart_unit = "ursula.service"
+kind = "command"
+forward_cmd = "ssh -N -L {local_port}:127.0.0.1:{admin_port} admin@{host}"
+restart_cmd = "ssh admin@{host} sudo systemctl restart ursula"
 
 [[nodes]]
 id = 1
-instance_id = "i-0a1b2c3d"
+host = "10.0.0.1"
 
 [[nodes]]
 id = 2
-instance_id = "i-0e4f5a6b"
+host = "10.0.0.2"
 ```
 
 ```bash
@@ -115,16 +108,14 @@ instance_id = "i-0e4f5a6b"
 ursulactl restart --config cluster.toml --ready-timeout-secs 900
 ```
 
-Any `[provider]` field can be overridden on the command line (`--provider`, `--region`, `--ssh-user`, `--restart-unit`, and so on). Flags win over the file.
+Any `[provider]` field can be overridden on the command line (`--provider`, `--forward-cmd`, `--restart-cmd`). Flags win over the file.
 
 Per-node fields, all optional except `id`:
 
-- `admin_port` (default `4438`) or an explicit `admin_url`: the admin plane to reach. Tunnelling providers only need the port, while `direct` needs a reachable `admin_url`.
-- `instance_id`: required by `eice`, which uses it to address the node.
-- `host` / `ssh_host`: address for `ssh` and `{host}` interpolation. Falls back to the admin URL host, then the instance id.
+- `admin_port` (default `4438`) or an explicit `admin_url`: the admin plane to reach. The `command` provider only needs the port, while `direct` needs a reachable `admin_url`.
+- `host`: address exposed as `{host}` in `command` templates. Falls back to the admin URL host, then the instance id.
+- `instance_id`, `name`: opaque values exposed as `{instance_id}` / `{name}` in `command` templates.
 - `http_url`: optional client-plane URL used by `status` and `wait-ready` for read-only metrics, and available as `{http_url}` in the `command` provider. Metrics fall back to `admin_url` when omitted.
-
-The JSON form also accepts the legacy `cluster.json` shapes (a bare node array, or `public_ip`/`private_ip` + `http_port`).
 
 ## `restart`
 
@@ -134,25 +125,25 @@ Safe rolling restart. Per target node, in manifest order (or `--only` order):
 2. Mark the target's [maintenance drain](/docs/operations) so it stops campaigning and re-acquiring leaderships mid-drain.
 3. For every Raft group the target leads, pick the most-caught-up voter as successor and call `POST /__ursula/raft/{group}/leader/transfer/{successor}`.
 4. Poll until the target leads zero groups, or abort on drain timeout.
-5. Run the provider's restart action for the target (e.g. `ssh … systemctl restart <unit>`).
+5. Run your `--restart-cmd` for the target (e.g. `ssh … systemctl restart ursula`).
 6. Wait until the target is back as a voter in every group and its `last_applied_index` is within `--lag-tolerance` of peers' `committed_index`. This wait is **progress-gated, not a fixed timeout**: as long as the target keeps catching up (its applied index or voter memberships advance) it is never timed out. It aborts only after `--stall-timeout-secs` with no progress, or at the `--ready-timeout-secs` absolute backstop.
 7. Clear the maintenance drain and move to the next node only on success. Any abort clears the drain mark on the current target and stops the rollout.
 
 ```bash
-ursulactl restart \
-  --config cluster.toml \
-  --provider ssh --ssh-user ec2-user --restart-unit ursula.service
+ursulactl restart --config cluster.toml \
+  --provider command \
+  --forward-cmd 'ssh -N -L {local_port}:127.0.0.1:{admin_port} admin@{host}' \
+  --restart-cmd 'ssh admin@{host} sudo systemctl restart ursula'
 ```
 
-The restart action comes from the [provider](#the-admin-plane). With `--provider ssh`/`eice` it is `systemctl restart <--restart-unit>`, and `--provider command --restart-cmd '…'` is the escape hatch for anything else. Add `--dry-run` to print the drain plan and skip transfers and restarts (no restart channel required, so `direct` is fine for a dry run).
+Add `--dry-run` to print the drain plan and skip transfers and restarts (no restart channel required, so `direct` is fine for a dry run).
 
 Because step 6 watches progress rather than a clock, the defaults suit both a fast disk-backed restart and a multi-minute raft-memory rebuild without tuning: `--stall-timeout-secs` (default 90) is the real control, and `--ready-timeout-secs` (default 1800) is only a backstop for a genuinely wedged node.
 
-Restrict the rollout with `--only`:
+Restrict the rollout with `--only` (provider settings in the manifest):
 
 ```bash
-ursulactl restart --config cluster.toml --provider ssh --ssh-user ec2-user \
-  --restart-unit ursula.service --only 2,3
+ursulactl restart --config cluster.toml --only 2,3
 ```
 
 <Warning>

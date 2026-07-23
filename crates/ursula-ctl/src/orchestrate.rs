@@ -293,37 +293,3 @@ async fn execute_restart_cmd(target: &NodeInfo, rendered: &str) -> Result<()> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::provider::NodeInfo;
-
-    fn n(id: u64, host: &str) -> NodeInfo {
-        NodeInfo {
-            id,
-            admin_url: url::Url::parse(&format!("http://{host}:4438")).unwrap(),
-            host: host.to_owned(),
-            instance_id: None,
-            ssh_host: None,
-            http_url: Some(url::Url::parse(&format!("http://{host}:8080")).unwrap()),
-            name: Some(format!("node-{id}")),
-        }
-    }
-
-    #[test]
-    fn ssh_provider_builds_restart_command() {
-        use crate::operation::OperationProvider;
-        use crate::operation::ProviderKind;
-        let provider = OperationProvider {
-            kind: ProviderKind::Ssh,
-            ssh_user: Some("ec2-user".to_owned()),
-            restart_unit: Some("ursula-chaos.service".to_owned()),
-            ..Default::default()
-        };
-        let rendered = provider.restart_command(&n(3, "10.0.0.3")).unwrap();
-        assert_eq!(
-            rendered,
-            "ssh -o StrictHostKeyChecking=no -o BatchMode=yes ec2-user@10.0.0.3 'sudo systemctl restart ursula-chaos.service'"
-        );
-    }
-}

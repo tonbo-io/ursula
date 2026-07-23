@@ -52,28 +52,15 @@ enum Command {
     AllowRejoin(NodeArgs),
 }
 
-/// How ursulactl reaches each node's loopback-bound admin plane. A named
-/// provider builds its own forward/restart commands; the manifest's optional
-/// `[provider]` block supplies defaults and these flags override it.
+/// How ursulactl reaches each node's loopback-bound admin plane. The
+/// manifest's optional `[provider]` block supplies defaults and these flags
+/// override it.
 #[derive(Args, Debug)]
 struct ProviderArgs {
-    /// Transport: `direct` (admin reachable, observe-only), `ssh`, `eice`
-    /// (ssh over AWS EC2 Instance Connect), or `command` (raw templates).
-    /// Overrides the manifest `[provider] kind`.
+    /// Transport: `direct` (admin reachable, observe-only) or `command`
+    /// (raw templates). Overrides the manifest `[provider] kind`.
     #[arg(long)]
     provider: Option<String>,
-    /// AWS region (eice).
-    #[arg(long)]
-    region: Option<String>,
-    /// SSH login user (ssh, eice).
-    #[arg(long)]
-    ssh_user: Option<String>,
-    /// SSH private key path (ssh, eice); its `.pub` is sent for eice.
-    #[arg(long)]
-    ssh_key: Option<String>,
-    /// systemd unit to restart (ssh, eice).
-    #[arg(long)]
-    restart_unit: Option<String>,
     /// Raw port-forward command for `--provider command`. Placeholders:
     /// `{local_port}` `{admin_port}` `{admin_host}` `{host}` `{instance_id}`
     /// `{node_id}` `{name}`.
@@ -101,22 +88,6 @@ impl ProviderArgs {
         let kind = ursula_ctl::ProviderKind::parse(&kind_str)?;
         Ok(OperationProvider {
             kind,
-            region: self
-                .region
-                .clone()
-                .or_else(|| m.and_then(|p| p.region.clone())),
-            ssh_user: self
-                .ssh_user
-                .clone()
-                .or_else(|| m.and_then(|p| p.ssh_user.clone())),
-            ssh_key: self
-                .ssh_key
-                .clone()
-                .or_else(|| m.and_then(|p| p.ssh_key.clone())),
-            restart_unit: self
-                .restart_unit
-                .clone()
-                .or_else(|| m.and_then(|p| p.restart_unit.clone())),
             forward_cmd: self
                 .forward_cmd
                 .clone()

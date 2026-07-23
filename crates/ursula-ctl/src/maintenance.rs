@@ -577,7 +577,6 @@ mod tests {
             admin_url: url::Url::parse(&format!("http://{host}:4438")).unwrap(),
             host: host.to_owned(),
             instance_id: None,
-            ssh_host: None,
             http_url: Some(url::Url::parse(&format!("http://{host}:8080")).unwrap()),
             name: Some(format!("node-{id}")),
         }

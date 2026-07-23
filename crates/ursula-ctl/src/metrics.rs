@@ -333,7 +333,6 @@ mod tests {
             admin_url: Url::parse("http://127.0.0.1:4438")?,
             host: "127.0.0.1".to_owned(),
             instance_id: None,
-            ssh_host: None,
             http_url: Some(Url::parse("http://127.0.0.1:4437")?),
             name: None,
         };
@@ -349,7 +348,6 @@ mod tests {
             admin_url: Url::parse("http://127.0.0.1:4438")?,
             host: "127.0.0.1".to_owned(),
             instance_id: None,
-            ssh_host: None,
             http_url: None,
             name: None,
         };
