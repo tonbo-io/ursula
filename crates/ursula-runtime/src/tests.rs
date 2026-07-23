@@ -637,6 +637,60 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
 }
 
 #[tokio::test]
+async fn failed_cold_compaction_publish_rolls_back_index_replacement() {
+    let placement = placement();
+    let stream = BucketStreamId::new("benchcmp", "failed-compact-index");
+    let cold_store = Arc::new(memory_cold_store());
+    let page_store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+    let first = ColdChunkRef {
+        start_offset: 0,
+        end_offset: 4,
+        s3_path: "benchcmp/failed-compact-index/chunks/first.bin".to_owned(),
+        object_size: 4,
+    };
+    let second = ColdChunkRef {
+        start_offset: 4,
+        end_offset: 8,
+        s3_path: "benchcmp/failed-compact-index/chunks/second.bin".to_owned(),
+        object_size: 4,
+    };
+    let replacement = ColdChunkRef {
+        start_offset: 0,
+        end_offset: 8,
+        s3_path: "benchcmp/failed-compact-index/chunks/replacement.bin".to_owned(),
+        object_size: 8,
+    };
+    for chunk in [&first, &second] {
+        write_cold_chunk_index_pages(&page_store, &stream, chunk)
+            .await
+            .expect("index input chunk");
+    }
+    let mut engine = InMemoryGroupEngine::with_cold_store(cold_store);
+
+    engine
+        .compact_cold(
+            CompactColdRequest {
+                stream_id: stream.clone(),
+                old_chunks: vec![first.clone(), second.clone()],
+                replacement,
+                gc_not_before_ms: 0,
+            },
+            placement,
+        )
+        .await
+        .expect_err("missing stream must reject compaction publish");
+
+    let chunks = load_cold_chunks_from_pages(&page_store, &[ColdIndexPageKey {
+        stream_id: stream,
+        generation: 0,
+        page_id: 0,
+    }])
+    .await
+    .expect("load rolled-back index");
+    assert_eq!(chunks, vec![first, second]);
+}
+
+#[tokio::test]
 async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
     let cold_store = Arc::new(memory_cold_store());
     let runtime = spawn_with_cold_store(RuntimeConfig::new(1, 1), cold_store.clone());

@@ -782,8 +782,19 @@ pub async fn replace_cold_chunk_index_pages<S: ColdIndexPageStore + ?Sized>(
     old_chunks: &[ColdChunkRef],
     replacement: &ColdChunkRef,
 ) -> io::Result<bool> {
+    replace_cold_chunk_index_pages_with_rollback(store, stream_id, old_chunks, replacement)
+        .await
+        .map(|rollback| rollback.is_some())
+}
+
+pub async fn replace_cold_chunk_index_pages_with_rollback<S: ColdIndexPageStore + ?Sized>(
+    store: &S,
+    stream_id: &BucketStreamId,
+    old_chunks: &[ColdChunkRef],
+    replacement: &ColdChunkRef,
+) -> io::Result<Option<Vec<ColdIndexPageRollback>>> {
     if old_chunks.len() < 2 || replacement.end_offset <= replacement.start_offset {
-        return Ok(false);
+        return Ok(None);
     }
     let first_page_id = replacement.start_offset / ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
     let last_page_id = (replacement.end_offset - 1) / ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
@@ -800,8 +811,9 @@ pub async fn replace_cold_chunk_index_pages<S: ColdIndexPageStore + ?Sized>(
             page_id,
         };
         let Some(mut page) = store.get_page(&key).await? else {
-            return Ok(false);
+            return Ok(None);
         };
+        let previous = page.clone();
         for chunk in &page.cold_chunks {
             let identity = (chunk.start_offset, chunk.end_offset, chunk.s3_path.as_str());
             if old_identities.contains(&identity) {
@@ -821,15 +833,24 @@ pub async fn replace_cold_chunk_index_pages<S: ColdIndexPageStore + ?Sized>(
         });
         page.cold_chunks.push(replacement.clone());
         page.cold_chunks.sort_by_key(|chunk| chunk.start_offset);
-        pages.push((key, page));
+        pages.push((key, previous, page));
     }
     if found.len() != old_identities.len() {
-        return Ok(false);
+        return Ok(None);
     }
-    for (key, page) in pages {
-        store.put_page(&key, &page).await?;
+    let mut rollback = Vec::with_capacity(pages.len());
+    for (key, previous, page) in pages {
+        if let Err(err) = store.put_page(&key, &page).await {
+            rollback_cold_index_pages(store, rollback).await?;
+            return Err(err);
+        }
+        rollback.push(ColdIndexPageRollback {
+            key,
+            previous: Some(previous),
+            written_chunk: replacement.clone(),
+        });
     }
-    Ok(true)
+    Ok(Some(rollback))
 }
 
 fn objects_for_read(page: &ColdIndexPage, read_start: u64, read_end: u64) -> Vec<ObjectPayloadRef> {
@@ -968,6 +989,59 @@ mod tests {
             .expect("get page")
             .expect("page exists");
         assert_eq!(page.cold_chunks, vec![newer]);
+    }
+
+    #[tokio::test]
+    async fn compact_replacement_rollback_restores_input_chunks() {
+        let store = InMemoryColdIndexPageStore::new();
+        let stream_id = BucketStreamId::new("benchcmp", "cold-index");
+        let first = ColdChunkRef {
+            start_offset: 0,
+            end_offset: 64,
+            s3_path: "benchcmp/cold-index/chunks/first.bin".to_owned(),
+            object_size: 64,
+        };
+        let second = ColdChunkRef {
+            start_offset: 64,
+            end_offset: 128,
+            s3_path: "benchcmp/cold-index/chunks/second.bin".to_owned(),
+            object_size: 64,
+        };
+        let replacement = ColdChunkRef {
+            start_offset: 0,
+            end_offset: 128,
+            s3_path: "benchcmp/cold-index/chunks/compacted.bin".to_owned(),
+            object_size: 128,
+        };
+        for chunk in [&first, &second] {
+            write_cold_chunk_index_pages(&store, &stream_id, chunk)
+                .await
+                .expect("write input chunk");
+        }
+
+        let rollback = replace_cold_chunk_index_pages_with_rollback(
+            &store,
+            &stream_id,
+            &[first.clone(), second.clone()],
+            &replacement,
+        )
+        .await
+        .expect("replace chunks")
+        .expect("inputs still match");
+        rollback_cold_index_pages(&store, rollback)
+            .await
+            .expect("rollback replacement");
+
+        let page = store
+            .get_page(&ColdIndexPageKey {
+                stream_id,
+                generation: 0,
+                page_id: 0,
+            })
+            .await
+            .expect("get page")
+            .expect("page exists");
+        assert_eq!(page.cold_chunks, vec![first, second]);
     }
 
     #[tokio::test]

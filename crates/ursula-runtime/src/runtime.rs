@@ -573,14 +573,37 @@ impl ShardRuntime {
                 object_size,
                 s3_path: path,
             };
+            let replacement_path = replacement.s3_path.clone();
             let gc_not_before_ms = unix_time_ms().saturating_add(gc_grace_ms);
-            self.compact_cold(CompactColdRequest {
-                stream_id,
-                old_chunks,
-                replacement,
-                gc_not_before_ms,
-            })
-            .await?;
+            let compact_result = self
+                .compact_cold(CompactColdRequest {
+                    stream_id: stream_id.clone(),
+                    old_chunks,
+                    replacement,
+                    gc_not_before_ms,
+                })
+                .await;
+            if let Err(err) = compact_result {
+                let rollback_safe =
+                    err.leader_hint().is_some() || err.stream_error_code().is_some();
+                if !rollback_safe {
+                    return Err(err);
+                }
+                if let Err(cleanup_err) = cold_store.delete_chunk(&replacement_path).await {
+                    tracing::warn!(
+                        stream = %stream_id,
+                        path = %replacement_path,
+                        error = %cleanup_err,
+                        "failed to remove unpublished cold compaction replacement"
+                    );
+                }
+                tracing::warn!(
+                    stream = %stream_id,
+                    error = %err,
+                    "cold compaction publish failed; continuing with remaining streams"
+                );
+                continue;
+            }
             compacted += 1;
         }
         Ok(compacted)

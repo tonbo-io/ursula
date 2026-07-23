@@ -49,7 +49,7 @@ use super::GroupUpdateStreamAttrsFuture;
 use super::GroupWriteResponse;
 use crate::cold_index::ColdIndexPageCache;
 use crate::cold_index::ColdStoreColdIndexPageStore;
-use crate::cold_index::replace_cold_chunk_index_pages;
+use crate::cold_index::replace_cold_chunk_index_pages_with_rollback;
 use crate::cold_index::rollback_cold_index_pages;
 use crate::cold_index::write_cold_chunk_index_pages_with_rollback;
 use crate::cold_index::write_external_segment_index_pages;
@@ -1644,29 +1644,44 @@ impl GroupEngine for InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> GroupCompactColdFuture<'a> {
         Box::pin(async move {
+            let mut index_rollback = None;
             if let Some(cold_store) = self.cold_store.as_ref() {
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-                let replaced = replace_cold_chunk_index_pages(
+                let Some(rollback) = replace_cold_chunk_index_pages_with_rollback(
                     &store,
                     &request.stream_id,
                     &request.old_chunks,
                     &request.replacement,
                 )
                 .await
-                .map_err(|err| GroupEngineError::new(err.to_string()))?;
-                if !replaced {
+                .map_err(|err| GroupEngineError::new(err.to_string()))?
+                else {
                     return Err(GroupEngineError::new(
                         "cold compaction input no longer matches the cold index",
                     ));
-                }
+                };
+                index_rollback = Some((store, rollback));
             }
             let command = GroupWriteCommand::from(request);
-            match self.apply_committed_write(command, placement)? {
-                GroupWriteResponse::CompactCold(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
+            let result = match self.apply_committed_write(command, placement) {
+                Ok(GroupWriteResponse::CompactCold(response)) => Ok(response),
+                Ok(other) => Err(GroupEngineError::new(format!(
                     "unexpected compact cold write response: {other:?}"
                 ))),
+                Err(err) => Err(err),
+            };
+            if result.is_err()
+                && let Some((store, rollback)) = index_rollback
+            {
+                rollback_cold_index_pages(&store, rollback)
+                    .await
+                    .map_err(|err| {
+                        GroupEngineError::new(format!(
+                            "rollback cold index after compaction failure: {err}"
+                        ))
+                    })?;
             }
+            result
         })
     }
 
