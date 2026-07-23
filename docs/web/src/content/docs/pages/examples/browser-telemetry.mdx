@@ -19,7 +19,7 @@ Keep one timestamp: the time captured by the browser. It remains application dat
 }
 ```
 
-Ursula does not reorder the stream by `captured_at` and does not invent a second protocol timestamp. Record `42` means the 42nd committed JSON event; its opaque offset identifies the same byte boundary for base Durable Streams clients.
+Ursula does not reorder the stream by `captured_at` and does not invent a second protocol timestamp. Record `42` means the 42nd committed JSON event. Its opaque offset identifies the same byte boundary for base Durable Streams clients.
 
 ## Browser collector
 
@@ -65,17 +65,17 @@ curl 'http://127.0.0.1:4437/telemetry/events?record=42&max_records=100&record_vi
 {"record":42,"value":{"captured_at":"2026-07-18T10:30:00.100Z","type":"network_response","status":500}}
 ```
 
-For a live native `EventSource`, add `live=sse`; every envelope-mode SSE data event contains exactly one `{record, value}` object, and control events publish `streamNextRecord` for reconnection. See [Record Coordinates](/docs/concepts/record-coordinates) for the complete replay model.
+For a live native `EventSource`, add `live=sse`. Every envelope-mode SSE data event contains exactly one `{record, value}` object, and control events publish `streamNextRecord` for reconnection. See [Record Coordinates](/docs/concepts/record-coordinates) for the complete replay model.
 
 ## Event-time queries
 
 Event time is an ordinary secondary index, not another Durable Streams coordinate. The optional `ursula-indexer` crate:
 
-1. consumes the envelope view in record order;
-2. extracts `captured_at` and buffers `(captured_at, record)` in memory;
-3. flushes immutable sorted Parquet parts to S3 and advances `CURRENT` with an ETag compare-and-swap;
-4. publishes `indexed_through_record` and `durable_through_record` so queries can distinguish the live prefix from the crash-recoverable prefix;
-5. returns record ordinals for time queries, which callers resolve back through Ursula;
+1. consumes the envelope view in record order
+2. extracts `captured_at` and buffers `(captured_at, record)` in memory
+3. flushes immutable sorted Parquet parts to S3 and advances `CURRENT` with an ETag compare-and-swap
+4. publishes `indexed_through_record` and `durable_through_record` so queries can distinguish the live prefix from the crash-recoverable prefix
+5. returns record ordinals for time queries, which callers resolve back through Ursula
 6. reports a retention gap instead of presenting an incomplete result.
 
 The source stream remains canonical and the derived index can be rebuilt from retained records. Equal timestamps are ordered by record ordinal.
@@ -117,7 +117,7 @@ curl -X PUT http://ursula-indexer:4493/v1/indexes/browser-session-42 \
 
 The registration preflight rejects sources that are not JSON or do not advertise record coordinates. The fixed worker pool then balances `(stream, record range)` tasks: many small browser streams share pods, while a hot stream can occupy several workers. Per-stream S3 namespaces isolate checkpoints and queries without becoming compute-assignment boundaries.
 
-S3 stores immutable content-addressed Parquet parts and versioned manifests. Flushes are split into UTC-day event-time partitions, and bounded size-tiered compaction merges only a fixed number of new parts within one day; historical compacted parts are never rewritten when later telemetry arrives. Manifest-aware garbage collection preserves a configurable recent-generation and in-flight grace window, then removes superseded and failed-CAS objects. Compaction and GC use a separate bounded cache and index instance, so their Parquet and S3 work does not hold the HTTP query mutex. The serving cache is bounded and disposable, so a replacement instance can recover from `CURRENT` without a persistent volume. For local development, use `--object-dir ./target/browser-telemetry-objects` in place of the S3 options.
+S3 stores immutable content-addressed Parquet parts and versioned manifests. Flushes are split into UTC-day event-time partitions, and bounded size-tiered compaction merges only a fixed number of new parts within one day. Historical compacted parts are never rewritten when later telemetry arrives. Manifest-aware garbage collection preserves a configurable recent-generation and in-flight grace window, then removes superseded and failed-CAS objects. Compaction and GC use a separate bounded cache and index instance, so their Parquet and S3 work does not hold the HTTP query mutex. The serving cache is bounded and disposable, so a replacement instance can recover from `CURRENT` without a persistent volume. For local development, use `--object-dir ./target/browser-telemetry-objects` in place of the S3 options.
 
 The query API is ordinary HTTP:
 
@@ -148,6 +148,6 @@ Fetch the next page with all three cursor fields from the first response:
 GET /v1/indexes/browser-session-42/events?from=2026-07-18T10:00:00Z&until=2026-07-18T11:00:00Z&limit=100&through_record=1200&after_captured_at_ms=1784370600100&after_record=57
 ```
 
-`through_record` prevents newly indexed source records from appearing halfway through one paginated query. In worker-pool mode, the visible and durable watermarks are the same contiguous S3-published prefix; completed ranges beyond a gap remain invisible until the missing range commits. Resolve returned record ordinals through Ursula to fetch the canonical event values.
+`through_record` prevents newly indexed source records from appearing halfway through one paginated query. In worker-pool mode, the visible and durable watermarks are the same contiguous S3-published prefix, and completed ranges beyond a gap remain invisible until the missing range commits. Resolve returned record ordinals through Ursula to fetch the canonical event values.
 
-Registration captures the source's current retained boundary as `indexed_from_record`, so browser telemetry can be enabled for an existing stream after record 0 has been trimmed. The registration response, `/status`, query JSON, and the `indexed-from-record` query header make that lower bound explicit. An invalid query returns `400`. A deterministically invalid source record or conflicting event time blocks further advancement for that registration; its existing durable prefix remains queryable and `/status` reports the blocked record until an operator repairs the source and calls `POST /v1/indexes/{id}/status/resume`. If retention later advances past an unfinished registered range, the resulting `409` cannot be resumed because those records are no longer recoverable.
+Registration captures the source's current retained boundary as `indexed_from_record`, so browser telemetry can be enabled for an existing stream after record 0 has been trimmed. The registration response, `/status`, query JSON, and the `indexed-from-record` query header make that lower bound explicit. An invalid query returns `400`. A deterministically invalid source record or conflicting event time blocks further advancement for that registration. Its existing durable prefix remains queryable and `/status` reports the blocked record until an operator repairs the source and calls `POST /v1/indexes/{id}/status/resume`. If retention later advances past an unfinished registered range, the resulting `409` cannot be resumed because those records are no longer recoverable.

@@ -9,7 +9,7 @@ This page gets a **single Ursula node** running on your machine so you can try t
 | **Docker** | You just want to try Ursula. One command, no toolchain. |
 | **Build from source** | You want local binaries, plan to hack on Ursula, or can't run Docker. |
 
-Both start the same in-memory, non-replicated node on port `4437` — perfect for a first look, with nothing persisted across restarts. For a production cluster, skip ahead to [Deploy a Cluster](/docs/deploy-cluster).
+Both start the same in-memory, non-replicated node on port `4437`. Nothing is persisted across restarts. For a production cluster, see [Deploy a Cluster](/docs/deploy-cluster).
 
 ## Docker
 
@@ -19,11 +19,13 @@ Every release publishes a multi-arch image to GHCR:
 docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.3.1
 ```
 
-The image runs as a non-root user and contains both `ursula` (the server) and `ursulactl` (the operator CLI). `latest` tracks the main branch; pin a version tag for anything you keep running.
+The image runs as a non-root user and contains both `ursula` (the server) and `ursulactl` (the operator CLI). `latest` tracks the main branch. Pin a version tag for anything you keep running.
 
 ## Build from source
 
-You need rustup (the repo pins the right nightly via `rust-toolchain.toml`), a C compiler, and `pkg-config`.
+You need rustup, a C compiler, and `pkg-config`. The repository pins the toolchain in `rust-toolchain.toml`, so rustup selects the right nightly automatically.
+
+<Accordion title="Installing the prerequisites (macOS, Debian/Ubuntu)">
 
 On macOS:
 
@@ -40,21 +42,18 @@ sudo apt-get install -y build-essential pkg-config curl
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-Then clone, build, and run:
+</Accordion>
+
+Clone, build, and start the server:
 
 ```bash
 git clone https://github.com/tonbo-io/ursula.git
 cd ursula
-cargo run --release --bin ursula
-```
-
-To install the binaries somewhere instead of running in place:
-
-```bash
 cargo build --release -p ursula -p ursula-ctl
+./target/release/ursula
 ```
 
-They land at `target/release/ursula` and `target/release/ursulactl`.
+The server is now listening on `127.0.0.1:4437`. The build also produces `target/release/ursulactl`, the operator CLI you will use once a cluster is up.
 
 ## Verify
 
@@ -70,4 +69,4 @@ A JSON snapshot of runtime state means the node is up.
 
 - [Quick Start](/docs/quick-start): create streams, append, replay, and tail live over SSE
 - [Deploy a Cluster](/docs/deploy-cluster): the production three-voter shape with OpenTofu + Helm
-- [Configuration](/docs/configuration): every knob in one place — persistence, presets, S3 cold storage
+- [Configuration](/docs/configuration): persistence, presets, and S3 cold storage

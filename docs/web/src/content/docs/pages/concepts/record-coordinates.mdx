@@ -11,11 +11,11 @@ Record Coordinates are available only on `application/json` streams that adverti
 
 | Value | Assigned by | Meaning | Client arithmetic |
 | --- | --- | --- | --- |
-| Offset | Ursula | Exact position in the canonical byte stream | No; pass it back unchanged |
-| Record | Ursula | Zero-based JSON value number in commit order | Yes; records occupy ranges such as `[42, 44)` |
+| Offset | Ursula | Exact position in the canonical byte stream | No, pass it back unchanged |
+| Record | Ursula | Zero-based JSON value number in commit order | Yes, records occupy ranges such as `[42, 44)` |
 | `captured_at` | Your application | When the event happened at the source | Query through an external event-time index |
 
-Records and offsets identify the same committed stream order at different levels. A record points to a complete JSON value; an offset points to a byte boundary. `captured_at` is ordinary JSON data and may be out of order after retries, offline buffering, or backfill. It never changes the committed record order.
+Records and offsets identify the same committed stream order at different levels. A record points to a complete JSON value, and an offset points to a byte boundary. `captured_at` is ordinary JSON data and may be out of order after retries, offline buffering, or backfill. It never changes the committed record order.
 
 ```json
 {

@@ -6,16 +6,16 @@ Production Ursula is a static-membership Raft cluster: three voting nodes across
 
 The recommended way to run it is **Kubernetes via the Helm chart**, with **OpenTofu** provisioning the cloud prerequisites:
 
-- **Starting from scratch on AWS**: use the OpenTofu stack in `deploy/eks`. It provisions everything — VPC, EKS, storage, S3, IAM — and generates the exact Helm values to install with.
+- **Starting from scratch on AWS**: use the OpenTofu stack in `deploy/eks`. It provisions the VPC, EKS cluster, storage, S3 bucket, and IAM identities, and generates the Helm values to install with.
 - **Already have a Kubernetes cluster**: `helm install` directly from GHCR and supply your own S3 bucket and storage class.
 
-No Kubernetes at all? See [bare metal](#without-kubernetes-bare-metal--vms) at the end.
+If you are not running Kubernetes, see [bare metal](#without-kubernetes-bare-metal--vms) at the end.
 
 ## Recommended: OpenTofu + Helm on EKS
 
 The repository includes an OpenTofu reference stack under [`deploy/eks`](https://github.com/tonbo-io/ursula/tree/main/deploy/eks). It provisions a three-AZ VPC and EKS cluster, one managed node group per zone, the EBS CSI and Pod Identity add-ons, an encrypted `gp3` StorageClass, a versioned S3 bucket, and least-privilege identities for Ursula and the event-time indexer. It writes the complete Helm input to `generated-values.yaml` and a dedicated kubeconfig without touching `~/.kube/config`.
 
-One-time setup: create a versioned, encrypted S3 bucket for OpenTofu state, copy `backend.tf.example` to the ignored `backend.tf` with a unique state key, and copy `terraform.tfvars.example` to the ignored `terraform.tfvars` — pick an explicit image tag and restrict the EKS public API to your operator or CI CIDRs (the stack rejects `0.0.0.0/0` and `::/0`).
+One-time setup: create a versioned, encrypted S3 bucket for OpenTofu state, copy `backend.tf.example` to the ignored `backend.tf` with a unique state key, and copy `terraform.tfvars.example` to the ignored `terraform.tfvars`. In the tfvars, pick an explicit image tag and restrict the EKS public API to your operator or CI CIDRs (the stack rejects `0.0.0.0/0` and `::/0`).
 
 After that, the complete deployment path is:
 
@@ -27,7 +27,7 @@ KUBECONFIG=./kubeconfig helm install ursula ../../charts/ursula --namespace ursu
 KUBECONFIG=./kubeconfig helm test ursula --namespace ursula
 ```
 
-See [`deploy/eks/README.md`](https://github.com/tonbo-io/ursula/tree/main/deploy/eks) for inputs, cost, state, and teardown guidance. OpenTofu owns the AWS prerequisites; Helm owns the namespace-scoped Ursula workloads.
+See [`deploy/eks/README.md`](https://github.com/tonbo-io/ursula/tree/main/deploy/eks) for inputs, cost, state, and teardown guidance. OpenTofu owns the AWS prerequisites and Helm owns the namespace-scoped Ursula workloads.
 
 ## Existing Kubernetes cluster: Helm
 
@@ -37,7 +37,7 @@ The chart and images are published to GHCR on every release. One command starts 
 helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.3.1
 ```
 
-The chart defaults to the `ghcr.io/tonbo-io/ursula` image pinned to the chart's `appVersion` — three voters, 64 Raft groups, durable per-pod Raft logs on PVCs, a headless peer Service, a client Service, and a quorum-protecting PodDisruptionBudget.
+The chart defaults to the `ghcr.io/tonbo-io/ursula` image pinned to the chart's `appVersion`. The default install runs three voters and 64 Raft groups, with durable per-pod Raft logs on PVCs, a headless peer Service, a client Service, and a quorum-protecting PodDisruptionBudget.
 
 For production, add shared S3 cold storage and workload identity:
 
@@ -57,7 +57,7 @@ serviceAccount:
 
 For MinIO or another S3-compatible backend, set `s3.endpoint`. Prefer workload identity over static S3 credentials. To use a registry mirror, set `global.image.repository`, `global.image.tag`, and optionally `global.imagePullSecrets`.
 
-`server.replicaCount` controls the voter set for a **fresh** cluster and supports `1`, `3`, and `5`; production should use `3` (or `5` only when tolerating two simultaneous voter failures justifies the larger write quorum). Changing it on an initialized cluster is not safe Raft voter reconfiguration — safe scaling needs the future operator workflow.
+`server.replicaCount` controls the voter set for a **fresh** cluster and supports `1`, `3`, and `5`. Production should use `3`, or `5` only when tolerating two simultaneous voter failures justifies the larger write quorum. Changing it on an initialized cluster is not safe Raft voter reconfiguration. Safe scaling needs the future operator workflow.
 
 ## Verify
 
@@ -65,7 +65,7 @@ For MinIO or another S3-compatible backend, set `s3.endpoint`. Prefer workload i
 helm test ursula
 ```
 
-The test mounts the chart-generated cluster manifest and runs `ursulactl wait-ready`; it succeeds only when every node reports the expected Raft group count and every group has a leader. To poke at a node directly:
+The test mounts the chart-generated cluster manifest and runs `ursulactl wait-ready`. It succeeds only when every node reports the expected Raft group count and every group has a leader. To query a node directly:
 
 ```bash
 kubectl port-forward svc/ursula 4437:4437
@@ -76,9 +76,9 @@ curl http://127.0.0.1:4437/__ursula/metrics
 
 - Run three voters across three availability zones, each with its own zonal persistent volume for the Raft log. Never use memory Raft storage or ephemeral voter data in production.
 - Shared S3 is required for any multi-node cluster: replicas must be able to read chunks flushed by any leader.
-- Put stateless gateway replicas behind authenticated TLS ingress and keep voter and peer Services private — Ursula itself has no TLS or auth; see [Security](/docs/security).
+- Put stateless gateway replicas behind authenticated TLS ingress and keep voter and peer Services private. Ursula itself has no TLS or auth (see [Security](/docs/security)).
 - Kubernetes rolling updates do not transfer Raft leaders. For operationally safe restarts and upgrades, drain leaderships with [`ursulactl restart`](/docs/cli). See [Operations](/docs/operations) for day-2 work.
-- There are no dedicated health probes yet; cluster readiness comes from `helm test` or `ursulactl wait-ready`. The mutating admin surface is bound to pod loopback (`127.0.0.1:4438`); reach it with `kubectl port-forward`.
+- There are no dedicated health probes yet. Cluster readiness comes from `helm test` or `ursulactl wait-ready`. The mutating admin surface is bound to pod loopback (`127.0.0.1:4438`) and is reached with `kubectl port-forward`.
 
 ## Optional: event-time indexer
 
@@ -95,11 +95,11 @@ indexer:
       eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-index
 ```
 
-Register streams dynamically with `PUT /v1/indexes/{id}` on the internal indexer Service — no Helm upgrade needed. The Service is an internal ClusterIP; if remote applications need read access, front it with an authenticated, path-aware proxy and never expose the registration or administration routes.
+Register streams dynamically with `PUT /v1/indexes/{id}` on the internal indexer Service. No Helm upgrade is needed. The Service is an internal ClusterIP. If remote applications need read access, front it with an authenticated, path-aware proxy and never expose the registration or administration routes.
 
 ## Without Kubernetes (bare metal / VMs)
 
-The same static-membership model works by hand. Every node runs the same config file; only the node ID differs:
+The same static-membership model works by hand. Every node runs the same config file, and only the node ID differs:
 
 ```toml
 [server]
@@ -140,7 +140,7 @@ Start each node with its own ID:
 ursula --config /etc/ursula/ursula.toml --node-id 1   # node 2 and 3 likewise
 ```
 
-`init_membership_per_group = true` is only needed on the very first start of a fresh cluster; flip it to `false` afterwards. Then verify with a one-file manifest:
+`init_membership_per_group = true` is only needed on the very first start of a fresh cluster. Flip it to `false` afterwards. Then verify with a one-file manifest:
 
 ```bash
 cat > cluster-manifest.json <<'JSON'
@@ -157,4 +157,4 @@ ursulactl wait-ready --config cluster-manifest.json --expected-groups 256
 ursulactl status      --config cluster-manifest.json
 ```
 
-Every config key — peers, listeners, WAL, cold-tier tuning — is documented in [Configuration](/docs/configuration).
+Every config key (peers, listeners, WAL, cold-tier tuning) is documented in [Configuration](/docs/configuration).

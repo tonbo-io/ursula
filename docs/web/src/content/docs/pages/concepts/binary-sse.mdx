@@ -20,7 +20,7 @@ event: control
 data: {"streamNextOffset":"123456_789","streamCursor":"abc"}
 ```
 
-The choice is automatic, determined by the stream's content type. There is no client opt-in. What you get is what the stream's content type implied. The response advertises base64 data with `Stream-Sse-Data-Encoding: base64`; when that header is absent, the `data` event payload is already UTF-8 text with the type identified by `Stream-Data-Content-Type`.
+The choice is automatic, determined by the stream's content type. There is no client opt-in. What you get is what the stream's content type implied. The response advertises base64 data with `Stream-Sse-Data-Encoding: base64`. When that header is absent, the `data` event payload is already UTF-8 text with the type identified by `Stream-Data-Content-Type`.
 
 ## Decoding
 

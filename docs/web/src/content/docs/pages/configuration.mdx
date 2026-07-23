@@ -14,21 +14,21 @@ The normal startup command is:
 ursula --config /etc/ursula/ursula.toml --node-id 1
 ```
 
-With no config file at all, `ursula` starts a single-node in-memory runtime — that's what [Install](/docs/install) uses.
+With no config file at all, `ursula` starts a single-node in-memory runtime. That's what [Install](/docs/install) uses.
 
 ## CLI flags
 
 | Flag | Default | Notes |
 | ---- | ------- | ----- |
 | `--config FILE` | searches `./ursula.toml`, `/etc/ursula/ursula.toml`, then user config paths | TOML config file |
-| `--preset PRESET` | `default` when no config file is found; otherwise none | Resource preset: `default`, `dev`, `tiny`, `small`, `standard`, or `large` |
+| `--preset PRESET` | `default` when no config file is found, otherwise none | Resource preset: `default`, `dev`, `tiny`, `small`, `standard`, or `large` |
 | `--node-id ID` | config file or preset | Overrides `raft.node_id` |
 
 CLI `--node-id` intentionally overrides any `raft.node_id` value in the config file so the same file can be mounted on every node. Helm derives it from the StatefulSet ordinal.
 
 ## Resource presets
 
-`--preset` supplies a base configuration before the config file is merged; config-file values win. Pick by node size:
+`--preset` supplies a base configuration before the config file is merged, and config-file values win. Pick by node size:
 
 | Preset | Intended use | Main defaults |
 | ------ | ------------ | ------------- |
@@ -45,7 +45,7 @@ CLI `--node-id` intentionally overrides any `raft.node_id` value in the config f
 | `server.listen` | `127.0.0.1:4437` | Client/API listener |
 | `server.cluster_listen` | none | Optional separate Raft/cluster listener |
 | `runtime.core_count` | `available_parallelism` | Worker threads, each pinned to its mailbox event loop |
-| `runtime.live_read_max_waiters_per_core` | `65536` | SSE waiter cap per core; `0` disables the limit |
+| `runtime.live_read_max_waiters_per_core` | `65536` | SSE waiter cap per core. `0` disables the limit |
 | `observability.tokio_console` | `false` | Enables Tokio console when the binary is built with the feature |
 
 Without `server.cluster_listen`, `server.listen` serves both client/API and Raft/cluster routes, and each `[[raft.peers]].url` should point at that address. With `server.cluster_listen` set, `server.listen` is client/API-only and peer URLs must point at the cluster listener instead. Note that the same peer URL is currently also used for HTTP leader redirects, so it must be reachable by clients or the gateway as well as by peers.
@@ -54,18 +54,18 @@ Without `server.cluster_listen`, `server.listen` serves both client/API and Raft
 
 | Config key | Default | Purpose |
 | ---------- | ------- | ------- |
-| `raft.node_id` | — | This node's stable ID; usually overridden per host with `--node-id` |
+| `raft.node_id` | none | This node's stable ID, usually overridden per host with `--node-id` |
 | `raft.group_count` | `core_count × 16` | Total Raft groups. Higher values improve stream-to-group hash spread |
 | `raft.wal.backend` | `memory` | `memory` (volatile, survives no restart) or `disk` (durable, required for clusters) |
-| `raft.wal.path` | none | Required for `backend = "disk"`; Raft logs live under `PATH/raft-log`. Removing the directory wipes state cleanly |
-| `raft.peers` | empty | Static gRPC peer list — one `[[raft.peers]]` entry per voter, including this node |
+| `raft.wal.path` | none | Required for `backend = "disk"`. Raft logs live under `PATH/raft-log`, and removing the directory wipes state cleanly |
+| `raft.peers` | empty | Static gRPC peer list, with one `[[raft.peers]]` entry per voter, including this node |
 | `raft.init_membership_per_group` | `false` | One-time per-group membership bootstrap. Set `true` on the very first start of a fresh cluster, then flip back to `false` |
 
 Pick one WAL backend per cluster and use it on every peer.
 
 ## Cold storage
 
-Ursula keeps recent data in an in-memory hot ring on every replica and flushes older segments and snapshot blobs to a cold backend. Multi-node clusters should use S3 or an S3-compatible object store so every replica can read chunks flushed by any leader — all replicas must point at the same shared bucket.
+Ursula keeps recent data in an in-memory hot ring on every replica and flushes older segments and snapshot blobs to a cold backend. Multi-node clusters should use S3 or an S3-compatible object store so every replica can read chunks flushed by any leader. All replicas must point at the same shared bucket.
 
 ```toml
 [storage.cold]
@@ -81,7 +81,7 @@ region = "us-east-1"
 # session_token = "..."
 ```
 
-When `access_key_id` and `secret_access_key` are omitted, Ursula uses the standard AWS SDK credential chain (instance profile, environment, profile, …) — prefer that over static keys. Set `endpoint` for S3-compatible stores such as MinIO, R2, or TOS.
+When `access_key_id` and `secret_access_key` are omitted, Ursula uses the standard AWS SDK credential chain (instance profile, environment, profile, and so on). Prefer that over static keys. Set `endpoint` for S3-compatible stores such as MinIO, R2, or TOS.
 
 | Config key | Default | Purpose |
 | ---------- | ------- | ------- |
@@ -93,7 +93,7 @@ When `access_key_id` and `secret_access_key` are omitted, Ursula uses the standa
 | `storage.cold.flush_max_concurrency` | `4` | Parallel cold writes in flight |
 | `storage.cold.max_hot_size_per_group` | `64MiB` | Backpressure ceiling: when a group's hot bytes exceed this, new writes get HTTP `503` until the flush catches up. Explicit `0` disables the cap |
 
-Flush defaults are conservative — tune them under load. A typical benchmark profile drops the interval to `200ms`, raises concurrency to `32`, and bumps the per-group ceiling. Advanced deployments can split the flush threshold and batch size with `storage.cold.flush_min_hot_size` and `storage.cold.flush_max_size`, but the single `storage.cold.flush_size` knob is the normal path.
+Flush defaults are conservative, so tune them under load. A typical benchmark profile drops the interval to `200ms`, raises concurrency to `32`, and bumps the per-group ceiling. Advanced deployments can split the flush threshold and batch size with `storage.cold.flush_min_hot_size` and `storage.cold.flush_max_size`, but the single `storage.cold.flush_size` knob is the normal path.
 
 Helm and the EC2 scripts map their deployment inputs onto these same keys, so this table applies to every deployment method.
 
@@ -118,7 +118,7 @@ path = "./data"
 ursula --config ./ursula.toml
 ```
 
-Three-node durable cluster — same file on each host, override the node ID per host:
+Three-node durable cluster (same file on each host, override the node ID per host):
 
 ```toml
 [server]
