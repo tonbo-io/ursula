@@ -47,6 +47,8 @@ pub use cold_index::InMemoryColdIndexPageStore;
 pub use cold_index::cold_index_prefix;
 pub use cold_index::load_cold_chunks_from_pages;
 pub use cold_index::replace_cold_chunk_index_pages;
+pub use cold_index::replace_cold_chunk_index_pages_with_rollback;
+pub use cold_index::rollback_cold_index_pages;
 pub use cold_index::select_cold_chunk_compaction;
 pub use cold_index::write_cold_chunk_index_pages;
 pub use cold_index::write_external_segment_index_pages;
