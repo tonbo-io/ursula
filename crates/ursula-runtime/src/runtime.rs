@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+#[cfg(not(madsim))]
 use std::time::SystemTime;
+#[cfg(not(madsim))]
 use std::time::UNIX_EPOCH;
 
 #[cfg(not(madsim))]
@@ -885,11 +887,17 @@ impl ShardRuntime {
     }
 }
 
+#[cfg(not(madsim))]
 fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(madsim)]
+fn unix_time_ms() -> u64 {
+    0
 }
 
 /// Expands the operation manifest into the uniform `ShardRuntime` client
