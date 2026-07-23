@@ -1,6 +1,6 @@
 name       = "ursula-production"
 aws_region = "us-east-1"
-image_tag  = "0.3.0"
+image_tag  = "0.3.1"
 
 # Restrict this to the operator or CI network in production.
 cluster_endpoint_public_access_cidrs = ["replace-with-operator-cidr"]
