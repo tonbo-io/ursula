@@ -33,9 +33,11 @@ curl 'http://127.0.0.1:4437/chat/room-7?tail_records=50&record_view=envelope'
 ```
 
 ```json
-{"record":118,"value":{"user":"ada","text":"hello","sent_at":"2026-07-23T09:00:00Z"}}
-{"record":119,"value":{"user":"lin","text":"hey ada","sent_at":"2026-07-23T09:00:07Z"}}
+{"record":118,"value":{"sent_at":"2026-07-23T09:00:00Z","text":"hello","user":"ada"}}
+{"record":119,"value":{"sent_at":"2026-07-23T09:00:07Z","text":"hey ada","user":"lin"}}
 ```
+
+JSON records are validated and normalized on append, so key order may differ from what the sender wrote.
 
 ## Tail new messages live
 
