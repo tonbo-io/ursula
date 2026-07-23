@@ -3,34 +3,9 @@ title: Quick Start
 sidebarTitle: Quick Start
 ---
 
-> Prefer containers? `docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.3.1` starts the same single node. See [Install](/docs/install). This page uses a source build.
+This page assumes a single node is already running on `127.0.0.1:4437` — that's one command via Docker or Cargo, see [Install](/docs/install). The default node is in-memory: nothing survives a restart, which is exactly right for kicking the tires; for disk-backed persistence, see [Configuration](/docs/configuration).
 
-Start a local node from the workspace root. The default preset is in-memory (no on-disk state, good for kicking the tires):
-
-```bash
-cargo run --bin ursula -- --preset default
-```
-
-It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses the in-memory engine. For local disk-backed persistence instead, create a small config file:
-
-```bash
-cat > ./ursula.toml <<'TOML'
-[server]
-listen = "127.0.0.1:4437"
-
-[raft]
-node_id = 1
-group_count = 16
-
-[raft.wal]
-backend = "disk"
-path = "./data"
-TOML
-
-cargo run --bin ursula -- --config ./ursula.toml
-```
-
-Then drive the HTTP API with `curl` in another terminal.
+Drive the HTTP API with `curl` from another terminal.
 
 ## Acknowledge the bucket
 
@@ -100,11 +75,9 @@ The raw endpoint is also what `ursulactl` consumes; reach for it when you want t
 
 ## Next steps
 
+- [Deploy a Cluster](/docs/deploy-cluster): the production three-voter shape with OpenTofu + Helm
+- [Configuration](/docs/configuration): persistence, presets, and S3 cold storage in one place
 - [ursulactl](/docs/cli): the operator CLI you'll use once a cluster is up
-- [Run locally](/docs/run-locally): config files, presets, and durability modes
-- [Deploy a cluster](/docs/deploy-cluster): static gRPC Raft cluster shape
-- [Deploy on Kubernetes](/docs/deploy-kubernetes): one `helm install` from the published chart
-- [Configure S3](/docs/configure-s3): shared cold storage for clusters
 - [API overview](/docs/api/overview): the HTTP surface Ursula currently exposes
 - [Streams](/docs/concepts/streams): the core stream abstraction and lifecycle
 - [Architecture](/docs/architecture/overview): thread-per-core, multi-Raft internals

@@ -1,46 +1,125 @@
 ---
-title: Deploy a cluster
+title: Deploy a Cluster
 ---
 
-Production-style Ursula runs as a static-membership Raft cluster: a fixed list of nodes with stable IDs, gRPC peer-to-peer Raft traffic, and a shared S3 cold backend. The migration benchmark target is three voting nodes across availability zones.
+Production Ursula is a static-membership Raft cluster: three voting nodes across availability zones, a durable Raft log per node, and a shared S3 bucket for the cold tier.
 
-For Kubernetes, use the [Helm chart](/docs/deploy-kubernetes). It maps the same
-static-membership model onto StatefulSet pod ordinals, stable peer DNS, and
-per-pod PVCs.
+The recommended way to run it is **Kubernetes via the Helm chart**, with **OpenTofu** provisioning the cloud prerequisites:
 
-## Topology
+- **Starting from scratch on AWS**: use the OpenTofu stack in `deploy/eks`. It provisions everything — VPC, EKS, storage, S3, IAM — and generates the exact Helm values to install with.
+- **Already have a Kubernetes cluster**: `helm install` directly from GHCR and supply your own S3 bucket and storage class.
 
-Each node needs:
+No Kubernetes at all? See [bare metal](#without-kubernetes-bare-metal--vms) at the end.
 
-- a stable Raft `raft.node_id`
-- a client/API bind address in `server.listen`
-- optional separate cluster/Raft bind address in `server.cluster_listen` when you need to isolate cluster traffic from client/API traffic
-- peer URLs in `[[raft.peers]]` that every peer can reach over gRPC (including itself)
-- the same `raft.wal.backend` mode on every peer
-- a one-time membership initializer on the first start (`raft.init_membership_per_group = true`)
-- a shared cold backend (`memory` for single-host smoke, S3 or an S3-compatible store for production)
+## Recommended: OpenTofu + Helm on EKS
 
-Without `server.cluster_listen`, `server.listen` serves client/API and Raft/cluster routes, so each `[[raft.peers]].url` should point at that node's `server.listen` address. With `server.cluster_listen`, `server.listen` serves client/API routes and `server.cluster_listen` serves Raft/cluster routes, so each `[[raft.peers]].url` must point at that node's cluster listener address and port. The same `[[raft.peers]].url` is also used for HTTP leader redirects today, so clients and gateways must be able to reach that URL unless separate redirect URL configuration is added in the future.
+The repository includes an OpenTofu reference stack under [`deploy/eks`](https://github.com/tonbo-io/ursula/tree/main/deploy/eks). It provisions a three-AZ VPC and EKS cluster, one managed node group per zone, the EBS CSI and Pod Identity add-ons, an encrypted `gp3` StorageClass, a versioned S3 bucket, and least-privilege identities for Ursula and the event-time indexer. It writes the complete Helm input to `generated-values.yaml` and a dedicated kubeconfig without touching `~/.kube/config`.
 
-## Cluster config file
+One-time setup: create a versioned, encrypted S3 bucket for OpenTofu state, copy `backend.tf.example` to the ignored `backend.tf` with a unique state key, and copy `terraform.tfvars.example` to the ignored `terraform.tfvars` — pick an explicit image tag and restrict the EKS public API to your operator or CI CIDRs (the stack rejects `0.0.0.0/0` and `::/0`).
 
-The Ursula config file is shared across all nodes. Only `raft.node_id` differs per host, or override it with `--node-id`.
+After that, the complete deployment path is:
+
+```bash
+cd deploy/eks
+tofu init
+tofu apply
+KUBECONFIG=./kubeconfig helm install ursula ../../charts/ursula --namespace ursula --create-namespace -f generated-values.yaml
+KUBECONFIG=./kubeconfig helm test ursula --namespace ursula
+```
+
+See [`deploy/eks/README.md`](https://github.com/tonbo-io/ursula/tree/main/deploy/eks) for inputs, cost, state, and teardown guidance. OpenTofu owns the AWS prerequisites; Helm owns the namespace-scoped Ursula workloads.
+
+## Existing Kubernetes cluster: Helm
+
+The chart and images are published to GHCR on every release. One command starts a three-voter cluster:
+
+```bash
+helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.3.1
+```
+
+The chart defaults to the `ghcr.io/tonbo-io/ursula` image pinned to the chart's `appVersion` — three voters, 64 Raft groups, durable per-pod Raft logs on PVCs, a headless peer Service, a client Service, and a quorum-protecting PodDisruptionBudget.
+
+For production, add shared S3 cold storage and workload identity:
+
+```yaml
+s3:
+  bucket: my-ursula-bucket
+  region: us-east-1
+  prefix: ursula-prod
+
+coldStorage:
+  enabled: true
+
+serviceAccount:
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-s3
+```
+
+For MinIO or another S3-compatible backend, set `s3.endpoint`. Prefer workload identity over static S3 credentials. To use a registry mirror, set `global.image.repository`, `global.image.tag`, and optionally `global.imagePullSecrets`.
+
+`server.replicaCount` controls the voter set for a **fresh** cluster and supports `1`, `3`, and `5`; production should use `3` (or `5` only when tolerating two simultaneous voter failures justifies the larger write quorum). Changing it on an initialized cluster is not safe Raft voter reconfiguration — safe scaling needs the future operator workflow.
+
+## Verify
+
+```bash
+helm test ursula
+```
+
+The test mounts the chart-generated cluster manifest and runs `ursulactl wait-ready`; it succeeds only when every node reports the expected Raft group count and every group has a leader. To poke at a node directly:
+
+```bash
+kubectl port-forward svc/ursula 4437:4437
+curl http://127.0.0.1:4437/__ursula/metrics
+```
+
+## Production notes
+
+- Run three voters across three availability zones, each with its own zonal persistent volume for the Raft log. Never use memory Raft storage or ephemeral voter data in production.
+- Shared S3 is required for any multi-node cluster: replicas must be able to read chunks flushed by any leader.
+- Put stateless gateway replicas behind authenticated TLS ingress and keep voter and peer Services private — Ursula itself has no TLS or auth; see [Security](/docs/security).
+- Kubernetes rolling updates do not transfer Raft leaders. For operationally safe restarts and upgrades, drain leaderships with [`ursulactl restart`](/docs/cli). See [Operations](/docs/operations) for day-2 work.
+- There are no dedicated health probes yet; cluster readiness comes from `helm test` or `ursulactl wait-ready`. The mutating admin surface is bound to pod loopback (`127.0.0.1:4438`); reach it with `kubectl port-forward`.
+
+## Optional: event-time indexer
+
+`ursula-indexer` is an optional worker pool that builds queryable event-time indexes from streams, kept outside the voter processes so query and compaction work never touches commit latency:
+
+```yaml
+indexer:
+  enabled: true
+  replicaCount: 2
+  s3:
+    prefix: indexes
+  serviceAccount:
+    annotations:
+      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-index
+```
+
+Register streams dynamically with `PUT /v1/indexes/{id}` on the internal indexer Service — no Helm upgrade needed. The Service is an internal ClusterIP; if remote applications need read access, front it with an authenticated, path-aware proxy and never expose the registration or administration routes.
+
+## Without Kubernetes (bare metal / VMs)
+
+The same static-membership model works by hand. Every node runs the same config file; only the node ID differs:
 
 ```toml
 [server]
 listen = "0.0.0.0:4437"
 
-[runtime]
-core_count = 16
-
 [raft]
-node_id = 1
 group_count = 256
 init_membership_per_group = true
 
 [raft.wal]
 backend = "disk"
 path = "/var/lib/ursula"
+
+[storage.cold]
+backend = "s3"
+root = "ursula-prod"
+
+[storage.cold.s3]
+bucket = "my-ursula-bucket"
+region = "us-east-1"
 
 [[raft.peers]]
 node_id = 1
@@ -55,30 +134,13 @@ node_id = 3
 url = "http://10.0.0.3:4437"
 ```
 
-Same file on each host; change `raft.node_id` or start with `--node-id 2` / `--node-id 3`.
-
-## Start node 1
+Start each node with its own ID:
 
 ```bash
-ursula --config /etc/ursula/ursula.toml --node-id 1
+ursula --config /etc/ursula/ursula.toml --node-id 1   # node 2 and 3 likewise
 ```
 
-`raft.init_membership_per_group = true` only needs to be present on the very first start of a fresh cluster. After that, Ursula remembers membership. Flip it to `false` (or remove it) for subsequent starts.
-
-## Start nodes 2 and 3
-
-Use the same config file and change the node ID:
-
-```bash
-ursula --config /etc/ursula/ursula.toml --node-id 2
-ursula --config /etc/ursula/ursula.toml --node-id 3
-```
-
-Use `raft.wal.backend = "memory"` instead of the disk settings if you want a non-durable test cluster.
-
-## Verify with ursulactl
-
-Once daemons are up on every node, point [`ursulactl`](/docs/cli) at a one-file manifest of the cluster and block until each Raft group has elected a leader:
+`init_membership_per_group = true` is only needed on the very first start of a fresh cluster; flip it to `false` afterwards. Then verify with a one-file manifest:
 
 ```bash
 cat > cluster-manifest.json <<'JSON'
@@ -95,60 +157,4 @@ ursulactl wait-ready --config cluster-manifest.json --expected-groups 256
 ursulactl status      --config cluster-manifest.json
 ```
 
-`wait-ready` returns non-zero with a single-line reason if the timeout elapses. `status` prints one line per node showing the raft group count and per-leader group counts as observed from that node's metrics. Healthy clusters report the same distribution from every reporter.
-
-If you don't have `ursulactl` handy, the raw metrics endpoint works as a fallback:
-
-```bash
-for host in 10.0.0.1 10.0.0.2 10.0.0.3; do
-  curl -s "http://$host:4437/__ursula/metrics" | jq '.raft_groups | length'
-done
-```
-
-## Storage exclusivity
-
-Pick one storage backend per cluster.
-
-- `raft.wal.backend = "memory"` - fast, volatile. Survives no restart
-- `raft.wal.backend = "disk"` with `raft.wal.path = "DIR"` - durable OpenRaft log mode under `DIR/raft-log` (recommended for clusters)
-
-## Cold storage
-
-A shared object store is recommended for any multi-node deployment because peers need to read each other's flushed chunks. Configure it in the Ursula config file on every node:
-
-```toml
-[storage.cold]
-backend = "s3"
-root = "ursula-prod-20260518"
-
-[storage.cold.s3]
-bucket = "my-ursula-bucket"
-region = "us-east-1"
-```
-
-See [configure S3](/docs/configure-s3) for canonical `[storage.cold]` and `[storage.cold.s3]` keys.
-
-## Operating the cluster
-
-The first tool for day-2 work is [`ursulactl`](/docs/cli):
-
-- `ursulactl restart`: drain-aware rolling restart with applied-index catch-up gates.
-- `ursulactl status`: leadership distribution per node.
-- `ursulactl wait-ready`: gate scripts on group + leader counts.
-
-Use `scripts/ursula_ec2.py` for the SSH/AWS-side plumbing: pushing binaries, writing systemd units, EC2 Instance Connect, S3 cleanup. See [operations](/docs/operations) for the full split.
-
-The HTTP admin surface underneath both tools is small and stable enough to script against directly:
-
-- `GET /__ursula/metrics`: per-node JSON snapshot.
-- `POST /__ursula/raft/{group_id}/snapshot`: manually trigger a Raft snapshot.
-- `POST /__ursula/raft/{group_id}/purge`: purge stale log entries.
-- `POST /__ursula/raft/{group_id}/learners/{node_id}`: add a learner (non-voting) replica.
-- `POST /__ursula/raft/{group_id}/leader/transfer/{node_id}`: hand off leadership to another voter (the primitive `ursulactl restart` builds on).
-- `POST /__ursula/flush-cold/{bucket}/{stream}`: force a cold flush for one stream.
-
-## Limits in the current build
-
-- Membership changes (adding/removing voters after bootstrap) are not yet exposed as a routine workflow. Learners can be added via the admin endpoint above.
-- `ursulactl restart` packages the safe rolling restart loop (drain → restart-cmd → wait-ready); version-upgrade tooling that diffs binaries before restart is not yet packaged.
-- There is no zero-downtime config reload. Restart the process to pick up config-file or CLI-override changes.
+Every config key — peers, listeners, WAL, cold-tier tuning — is documented in [Configuration](/docs/configuration).
