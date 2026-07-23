@@ -64,10 +64,10 @@
   },
   {
     "category": "std_time_instant_import",
-    "path": "crates/ursula-ctl/src/orchestrate.rs",
+    "path": "crates/ursula-ctl/src/maintenance.rs",
     "snippet_contains": "use std::time::Instant;",
     "reason": "not-sim-reachable",
-    "plan": "no action: orchestrate.rs holds the host-only drain / wait-ready deadline loops invoked by the ursulactl binary. DST reaches ursula-ctl through ursula_ctl::plan helpers only, which take pre-built ClusterSnapshot/NodeMetricsView arguments and don't touch wall-clock time."
+    "plan": "no action: maintenance.rs holds the host-only drain / catch-up deadline loops extracted from orchestrate.rs (drain_node, wait_node_ready, wait_cluster_ready), invoked by the ursulactl binary. DST reaches ursula-ctl through ursula_ctl::plan helpers only, which take pre-built ClusterSnapshot/NodeMetricsView arguments and don't touch wall-clock time."
   },
   {
     "category": "std_time_instant_import",

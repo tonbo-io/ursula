@@ -88,6 +88,12 @@ pub struct StaticNodeProvider {
 impl StaticNodeProvider {
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        if path == Path::new("-") {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+                .context("read manifest from stdin")?;
+            return Self::from_text_sniffed(&text);
+        }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read node config {}", path.display()))?;
         let raw = match path.extension().and_then(|e| e.to_str()) {
@@ -111,6 +117,30 @@ impl StaticNodeProvider {
     /// Parse a JSON manifest from bytes (back-compat entry point / tests).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         Self::from_raw(serde_json::from_slice(bytes)?)
+    }
+
+    /// Parse a manifest with no filename to dispatch on (stdin). `{` is
+    /// unambiguously JSON. A leading `[` is tried as JSON first but may be a
+    /// TOML table header (`[provider]`, `[[nodes]]`), so it falls through.
+    /// Everything else is tried as TOML, then YAML.
+    fn from_text_sniffed(text: &str) -> Result<Self> {
+        let trimmed = text.trim_start();
+        if trimmed.starts_with('{') {
+            return Self::from_raw(
+                serde_json::from_str(text).context("parse JSON manifest from stdin")?,
+            );
+        }
+        if trimmed.starts_with('[')
+            && let Ok(raw) = serde_json::from_str(text)
+        {
+            return Self::from_raw(raw);
+        }
+        if let Ok(parsed) = toml::from_str(text) {
+            return Self::from_raw(RawConfig::Wrapped(parsed));
+        }
+        let parsed =
+            yaml_serde::from_str(text).context("parse manifest from stdin as TOML or YAML")?;
+        Self::from_raw(RawConfig::Wrapped(parsed))
     }
 
     pub fn from_nodes(nodes: Vec<NodeInfo>) -> Self {
@@ -300,6 +330,27 @@ mod tests {
         // admin_url defaults to host:4438.
         assert_eq!(nodes[0].admin_url.as_str(), "http://203.0.113.10:4438/");
         assert!(provider.provider_config().is_none());
+    }
+
+    #[test]
+    fn stdin_sniffing_dispatches_on_content() {
+        let json = r#"{"nodes":[{"id":1,"public_ip":"10.0.0.1"}]}"#;
+        let provider = StaticNodeProvider::from_text_sniffed(json).unwrap();
+        assert_eq!(provider.nodes.len(), 1);
+
+        let bare_array = r#"[{"id":1,"public_ip":"10.0.0.1"}]"#;
+        let provider = StaticNodeProvider::from_text_sniffed(bare_array).unwrap();
+        assert_eq!(provider.nodes.len(), 1);
+
+        let toml = "[[nodes]]\nid = 1\nhost = \"10.0.0.1\"\n";
+        let provider = StaticNodeProvider::from_text_sniffed(toml).unwrap();
+        assert_eq!(provider.nodes.len(), 1);
+
+        let yaml = "nodes:\n  - id: 1\n    host: 10.0.0.1\n";
+        let provider = StaticNodeProvider::from_text_sniffed(yaml).unwrap();
+        assert_eq!(provider.nodes.len(), 1);
+
+        assert!(StaticNodeProvider::from_text_sniffed("not a manifest").is_err());
     }
 
     #[tokio::test]

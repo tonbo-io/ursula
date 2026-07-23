@@ -39,7 +39,7 @@ curl -X POST http://127.0.0.1:4438/__ursula/raft/42/purge
 # Add a learner (non-voting replica) to one group
 curl -X POST http://127.0.0.1:4438/__ursula/raft/42/learners/4
 
-# Hand leadership of one group to another voter (used by `ursulactl restart`)
+# Hand leadership of one group to another voter (used by `ursulactl drain`)
 curl -X POST http://127.0.0.1:4438/__ursula/raft/42/leader/transfer/2
 
 # Replace the voter set of one group (call on the group's current leader)
@@ -71,7 +71,7 @@ The membership endpoint has the same leader-only contract: it answers `409 Confl
 }
 ```
 
-`ursulactl restart` wraps its drain step in exactly this pair: mark first so the node stops re-acquiring groups, then transfer leaderships away explicitly instead of waiting for the balancer, and clear after the node is back and caught up (or on any abort path). If a rollout ever dies between the two, a node can be left refusing leadership. `DELETE` the mark by hand to recover. Peers read each other's shed state (`GET /__ursula/leadership-shed` on the cluster-plane listener) when deciding which nodes are eligible to pick up leaderships, so a drained node stops attracting groups cluster-wide, not just locally.
+`ursulactl drain` wraps exactly this pair: mark first so the node stops re-acquiring groups, then transfer leaderships away explicitly instead of waiting for the balancer. The mark stays set until `ursulactl undrain` clears it (`ursulactl restart` does the same around its restart command). If a rollout ever dies mid-way, a node can be left refusing leadership. Run `ursulactl undrain` (or `DELETE` the mark directly) to recover. Peers read each other's shed state (`GET /__ursula/leadership-shed` on the cluster-plane listener) when deciding which nodes are eligible to pick up leaderships, so a drained node stops attracting groups cluster-wide, not just locally.
 
 ### Rejoining a wiped node
 
