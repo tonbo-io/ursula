@@ -26,6 +26,12 @@
 {{- $coldFlushMaxBytes := .Values.coldStorage.flush.maxBytes | int64 -}}
 {{- $coldFlushMaxConcurrency := .Values.coldStorage.flush.maxConcurrency | int64 -}}
 {{- $coldMaxHotBytesPerGroup := .Values.coldStorage.flush.maxHotBytesPerGroup | int64 -}}
+{{- $coldCompaction := .Values.coldStorage.compaction -}}
+{{- $coldCompactionIntervalMs := $coldCompaction.intervalMs | int64 -}}
+{{- $coldCompactionTargetBytes := $coldCompaction.targetBytes | int64 -}}
+{{- $coldCompactionMaxBytes := $coldCompaction.maxBytes | int64 -}}
+{{- $coldCompactionMaxStreamsPerPass := $coldCompaction.maxStreamsPerPass | int64 -}}
+{{- $coldCompactionGcGraceMs := $coldCompaction.gcGraceMs | int64 -}}
 {{- $coldCache := .Values.coldStorage.cache | default dict -}}
 {{- $coldCacheMaxSizeBytes := $coldCache.maxSizeBytes -}}
 {{- $coldCacheBlockSizeBytes := $coldCache.blockSizeBytes -}}
@@ -112,6 +118,12 @@ data:
     flush_max_size = "{{ $coldFlushMaxBytes }}"
     flush_max_concurrency = {{ $coldFlushMaxConcurrency }}
     max_hot_size_per_group = "{{ $coldMaxHotBytesPerGroup }}"
+    compaction_enabled = {{ $coldCompaction.enabled }}
+    compaction_interval = "{{ $coldCompactionIntervalMs }}ms"
+    compaction_target_size = "{{ $coldCompactionTargetBytes }}"
+    compaction_max_size = "{{ $coldCompactionMaxBytes }}"
+    compaction_max_streams_per_pass = {{ $coldCompactionMaxStreamsPerPass }}
+    compaction_gc_grace = "{{ $coldCompactionGcGraceMs }}ms"
 {{- if or (not (eq $coldCacheMaxSizeBytes nil)) (not (eq $coldCacheBlockSizeBytes nil)) (not (eq $coldCacheReadaheadBlocks nil)) }}
 
     [storage.cold.cache]

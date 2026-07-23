@@ -98,6 +98,16 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
         chunk: ColdChunkRef,
     },
+    /// Replaces a contiguous run of immutable cold chunks with one equivalent
+    /// object. The external cold-index page update is completed before this
+    /// command is replicated; applying it schedules the old paths for delayed
+    /// reclamation.
+    CompactCold {
+        stream_id: BucketStreamId,
+        old_chunks: Vec<ColdChunkRef>,
+        replacement: ColdChunkRef,
+        gc_not_before_ms: u64,
+    },
     Close {
         stream_id: BucketStreamId,
         stream_seq: Option<String>,
@@ -167,6 +177,18 @@ impl fmt::Display for StreamCommand {
                 f,
                 "flush_cold:{stream_id}:{}..{}",
                 chunk.start_offset, chunk.end_offset
+            ),
+            Self::CompactCold {
+                stream_id,
+                old_chunks,
+                replacement,
+                ..
+            } => write!(
+                f,
+                "compact_cold:{stream_id}:{} chunks:{}..{}",
+                old_chunks.len(),
+                replacement.start_offset,
+                replacement.end_offset
             ),
             Self::Close { stream_id, .. } => write!(f, "close_stream:{stream_id}"),
             Self::DeleteStream { stream_id } => write!(f, "delete_stream:{stream_id}"),

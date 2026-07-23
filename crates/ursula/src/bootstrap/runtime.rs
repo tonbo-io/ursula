@@ -13,6 +13,7 @@ use ursula_runtime::ShardRuntime;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::SnapshotReferenceConfig;
 use ursula_runtime::snapshot_store_from_config;
+use ursula_runtime::spawn_cold_compaction_worker_if_configured;
 use ursula_runtime::spawn_cold_flush_worker_if_configured;
 use ursula_runtime::spawn_cold_gc_worker_if_configured;
 
@@ -109,6 +110,7 @@ pub fn spawn_runtime(
 
     if spawned.runtime.has_cold_store() {
         spawn_cold_flush_worker_if_configured(&spawned.runtime, &config.storage.cold);
+        spawn_cold_compaction_worker_if_configured(&spawned.runtime, &config.storage.cold);
         spawn_cold_gc_worker_if_configured(&spawned.runtime, &config.storage.cold);
     }
 
