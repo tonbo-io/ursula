@@ -15,6 +15,13 @@
   },
   {
     "category": "system_time_now",
+    "path": "crates/ursula-runtime/src/runtime.rs",
+    "snippet_contains": "SystemTime::now()",
+    "reason": "already-cfg-gated",
+    "plan": "no action: unix_time_ms() is split \u2014 cfg(not(madsim)) reads the real wall clock for cold-compaction GC grace, while cfg(madsim) returns 0 so simulation scheduling and replicated commands remain deterministic."
+  },
+  {
+    "category": "system_time_now",
     "path": "crates/ursula-runtime/src/snapshot_store.rs",
     "snippet_contains": "SystemTime::now()",
     "reason": "already-cfg-gated",
