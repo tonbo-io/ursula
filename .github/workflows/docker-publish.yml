@@ -7,11 +7,8 @@ on:
       - .github/workflows/docker-publish.yml
       - Dockerfile
   push:
-    branches:
-      - main
     tags:
       - "v*.*.*"
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -54,13 +51,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
             type=ref,event=pr
             type=ref,event=tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and publish Docker image
         uses: depot/build-push-action@v1
@@ -69,7 +63,7 @@ jobs:
           context: .
           file: ./Dockerfile
           platforms: ${{ env.DOCKER_PLATFORMS }}
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ github.ref_type == 'tag' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}

@@ -34,7 +34,7 @@ See [`deploy/eks/README.md`](https://github.com/tonbo-io/ursula/tree/main/deploy
 The chart and images are published to GHCR on every release. One command starts a three-voter cluster:
 
 ```bash
-helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.3.1
+helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.3.2
 ```
 
 The chart defaults to the `ghcr.io/tonbo-io/ursula` image pinned to the chart's `appVersion`. The default install runs three voters and 64 Raft groups, with durable per-pod Raft logs on PVCs, a headless peer Service, a client Service, and a quorum-protecting PodDisruptionBudget.
