@@ -53,6 +53,13 @@ impl UrsulaConfig {
             self.validate_groups(&peer_ids)?;
         }
         self.validate_non_zero_durations()?;
+        if self.storage.cold.compaction_target_size.as_bytes()
+            > self.storage.cold.compaction_max_size.as_bytes()
+        {
+            return Err(ValidationError::Other(
+                "storage.cold.compaction_target_size must not exceed compaction_max_size".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -86,6 +93,14 @@ impl UrsulaConfig {
             (
                 "storage.cold.gc_interval",
                 self.storage.cold.gc_interval.as_duration(),
+            ),
+            (
+                "storage.cold.compaction_interval",
+                self.storage.cold.compaction_interval.as_duration(),
+            ),
+            (
+                "storage.cold.compaction_gc_grace",
+                self.storage.cold.compaction_gc_grace.as_duration(),
             ),
         ] {
             if value.is_zero() {

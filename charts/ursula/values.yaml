@@ -177,6 +177,13 @@ coldStorage:
     maxBytes: 8388608
     maxConcurrency: 4
     maxHotBytesPerGroup: 67108864
+  compaction:
+    enabled: false
+    intervalMs: 30000
+    targetBytes: 8388608
+    maxBytes: 16777216
+    maxStreamsPerPass: 16
+    gcGraceMs: 300000
   cache:
     # Optional cold-read cache override. Leave all fields null/omitted to let Ursula install its default cache.
     maxSizeBytes: null

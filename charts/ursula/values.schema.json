@@ -1044,6 +1044,35 @@
             }
           }
         },
+        "compaction": {
+          "type": "object",
+          "description": "Same-stream cold chunk compaction settings.",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "intervalMs": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "targetBytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "maxBytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "maxStreamsPerPass": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "gcGraceMs": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
         "cache": {
           "type": ["object", "null"],
           "description": "Optional cold-read cache override. Omitted values use Ursula runtime defaults.",

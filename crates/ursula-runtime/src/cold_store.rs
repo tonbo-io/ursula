@@ -16,6 +16,8 @@ use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
 use crossbeam_utils::CachePadded;
+use futures_util::TryStreamExt;
+use opendal::EntryMode;
 use opendal::Operator;
 use opendal::Scheme;
 use opendal::layers::RetryLayer;
@@ -26,6 +28,7 @@ use ursula_stream::ColdChunkRef;
 use ursula_stream::ObjectPayloadRef;
 
 use crate::ColdConfig;
+use crate::ColdIndexPageKey;
 
 pub(crate) const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 // Keep this global atomic isolated from unrelated statics. This does not remove
@@ -235,6 +238,41 @@ pub struct ColdStoreInfo {
 }
 
 impl ColdStore {
+    /// Lists the authoritative cold-index pages rather than every chunk. One
+    /// page covers 64 MiB of one stream, so this is the bounded discovery
+    /// surface used by the background chunk compactor.
+    pub async fn list_cold_index_pages(&self) -> io::Result<Vec<ColdIndexPageKey>> {
+        let mut lister = self
+            .operator
+            .lister_with("")
+            .recursive(true)
+            .await
+            .map_err(|err| cold_store_io_error("", err))?;
+        let mut pages = Vec::new();
+        while let Some(entry) = lister
+            .try_next()
+            .await
+            .map_err(|err| cold_store_io_error("", err))?
+        {
+            if entry.metadata().mode() != EntryMode::FILE {
+                continue;
+            }
+            if let Some(key) = parse_cold_index_page_path(entry.path()) {
+                pages.push(key);
+            }
+        }
+        pages.sort_by(|left, right| {
+            left.stream_id
+                .bucket_id
+                .cmp(&right.stream_id.bucket_id)
+                .then_with(|| left.stream_id.stream_id.cmp(&right.stream_id.stream_id))
+                .then_with(|| left.generation.cmp(&right.generation))
+                .then_with(|| left.page_id.cmp(&right.page_id))
+        });
+        pages.dedup();
+        Ok(pages)
+    }
+
     pub fn memory() -> io::Result<Self> {
         let operator = Operator::via_iter(Scheme::Memory, [])
             .map_err(|err| io::Error::other(err.to_string()))?;
@@ -917,6 +955,25 @@ impl ColdStore {
             truncate_read_to: effect.truncate_read_to,
         })
     }
+}
+
+fn parse_cold_index_page_path(path: &str) -> Option<ColdIndexPageKey> {
+    let mut parts = path.split('/');
+    let bucket_id = parts.next()?;
+    let stream_id = parts.next()?;
+    if parts.next()? != "cold-index" {
+        return None;
+    }
+    let generation = parts.next()?.parse().ok()?;
+    let page_id = parts.next()?.strip_suffix(".idx")?.parse().ok()?;
+    if parts.next().is_some() || bucket_id.is_empty() || stream_id.is_empty() {
+        return None;
+    }
+    Some(ColdIndexPageKey {
+        stream_id: BucketStreamId::new(bucket_id, stream_id),
+        generation,
+        page_id,
+    })
 }
 
 #[derive(Debug, Default)]

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
@@ -585,6 +586,14 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
         self.reload_page(key).await
     }
 
+    /// Drops every cached generation/page for one stream. Compaction invokes
+    /// this on every replica when the replicated replacement command applies.
+    pub fn invalidate_stream(&self, stream_id: &BucketStreamId) {
+        let mut inner = self.inner.lock().expect("cold index cache mutex poisoned");
+        inner.pages.retain(|key, _| &key.stream_id != stream_id);
+        inner.lru.retain(|(key, _)| &key.stream_id != stream_id);
+    }
+
     async fn reload_page(&self, key: &ColdIndexPageKey) -> io::Result<Option<Arc<ColdIndexPage>>> {
         let Some(page) = self.store.get_page(key).await? else {
             return Ok(None);
@@ -694,6 +703,133 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
             inner.pages.remove(&key);
         }
     }
+}
+
+/// Loads and de-duplicates the chunk references present in a stream's index
+/// pages. Chunks crossing a 64 MiB page boundary intentionally appear in more
+/// than one page.
+pub async fn load_cold_chunks_from_pages<S: ColdIndexPageStore + ?Sized>(
+    store: &S,
+    keys: &[ColdIndexPageKey],
+) -> io::Result<Vec<ColdChunkRef>> {
+    let mut chunks = Vec::new();
+    let mut seen = HashSet::new();
+    for key in keys {
+        let Some(page) = store.get_page(key).await? else {
+            continue;
+        };
+        for chunk in page.cold_chunks {
+            let identity = (chunk.start_offset, chunk.end_offset, chunk.s3_path.clone());
+            if seen.insert(identity) {
+                chunks.push(chunk);
+            }
+        }
+    }
+    chunks.sort_by(|left, right| {
+        left.start_offset
+            .cmp(&right.start_offset)
+            .then_with(|| left.end_offset.cmp(&right.end_offset))
+            .then_with(|| left.s3_path.cmp(&right.s3_path))
+    });
+    Ok(chunks)
+}
+
+/// Selects the oldest contiguous run of undersized raw chunks whose combined
+/// payload reaches the byte target without exceeding the configured maximum.
+pub fn select_cold_chunk_compaction(
+    chunks: &[ColdChunkRef],
+    target_bytes: u64,
+    max_bytes: u64,
+) -> Option<Vec<ColdChunkRef>> {
+    if target_bytes == 0 || max_bytes < target_bytes {
+        return None;
+    }
+    let mut candidate = Vec::new();
+    let mut bytes = 0_u64;
+    let mut next_offset = None;
+    for chunk in chunks {
+        let logical_bytes = chunk.end_offset.checked_sub(chunk.start_offset)?;
+        let usable = logical_bytes > 0
+            && chunk.object_size == logical_bytes
+            && chunk.object_size < target_bytes;
+        let contiguous = next_offset.is_none_or(|offset| offset == chunk.start_offset);
+        let next_bytes = bytes.checked_add(chunk.object_size);
+        if !usable || !contiguous || next_bytes.is_none_or(|total| total > max_bytes) {
+            candidate.clear();
+            bytes = 0;
+            next_offset = None;
+            if !usable {
+                continue;
+            }
+        }
+        bytes = bytes.checked_add(chunk.object_size)?;
+        next_offset = Some(chunk.end_offset);
+        candidate.push(chunk.clone());
+        if candidate.len() >= 2 && bytes >= target_bytes {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Atomically at the page-object level replaces a contiguous set of chunk
+/// references with one equivalent object. Every rewritten page always points
+/// at readable old or new bytes, so a retry after a partial S3 failure remains
+/// safe.
+pub async fn replace_cold_chunk_index_pages<S: ColdIndexPageStore + ?Sized>(
+    store: &S,
+    stream_id: &BucketStreamId,
+    old_chunks: &[ColdChunkRef],
+    replacement: &ColdChunkRef,
+) -> io::Result<bool> {
+    if old_chunks.len() < 2 || replacement.end_offset <= replacement.start_offset {
+        return Ok(false);
+    }
+    let first_page_id = replacement.start_offset / ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
+    let last_page_id = (replacement.end_offset - 1) / ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
+    let old_identities = old_chunks
+        .iter()
+        .map(|chunk| (chunk.start_offset, chunk.end_offset, chunk.s3_path.as_str()))
+        .collect::<HashSet<_>>();
+    let mut pages = Vec::new();
+    let mut found = HashSet::new();
+    for page_id in first_page_id..=last_page_id {
+        let key = ColdIndexPageKey {
+            stream_id: stream_id.clone(),
+            generation: 0,
+            page_id,
+        };
+        let Some(mut page) = store.get_page(&key).await? else {
+            return Ok(false);
+        };
+        for chunk in &page.cold_chunks {
+            let identity = (chunk.start_offset, chunk.end_offset, chunk.s3_path.as_str());
+            if old_identities.contains(&identity) {
+                found.insert((chunk.start_offset, chunk.end_offset, chunk.s3_path.clone()));
+            }
+        }
+        page.cold_chunks.retain(|chunk| {
+            !old_identities.contains(&(
+                chunk.start_offset,
+                chunk.end_offset,
+                chunk.s3_path.as_str(),
+            ))
+        });
+        page.cold_chunks.retain(|chunk| {
+            chunk.start_offset != replacement.start_offset
+                || chunk.end_offset != replacement.end_offset
+        });
+        page.cold_chunks.push(replacement.clone());
+        page.cold_chunks.sort_by_key(|chunk| chunk.start_offset);
+        pages.push((key, page));
+    }
+    if found.len() != old_identities.len() {
+        return Ok(false);
+    }
+    for (key, page) in pages {
+        store.put_page(&key, &page).await?;
+    }
+    Ok(true)
 }
 
 fn objects_for_read(page: &ColdIndexPage, read_start: u64, read_end: u64) -> Vec<ObjectPayloadRef> {
@@ -976,5 +1112,46 @@ mod tests {
 
         assert!(cache.get_page(&key(0)).await.expect("load page").is_some());
         assert_eq!(cache.cached_page_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn selects_and_replaces_target_sized_contiguous_chunks() {
+        let store = InMemoryColdIndexPageStore::new();
+        let stream_id = BucketStreamId::new("benchcmp", "compact");
+        let chunks = (0..4)
+            .map(|index| ColdChunkRef {
+                start_offset: index * 2,
+                end_offset: index * 2 + 2,
+                object_size: 2,
+                s3_path: format!("old-{index}"),
+            })
+            .collect::<Vec<_>>();
+        for chunk in &chunks {
+            write_cold_chunk_index_pages(&store, &stream_id, chunk)
+                .await
+                .expect("write chunk index");
+        }
+        let selected =
+            select_cold_chunk_compaction(&chunks, 8, 16).expect("select compaction candidate");
+        assert_eq!(selected, chunks);
+        let replacement = ColdChunkRef {
+            start_offset: 0,
+            end_offset: 8,
+            object_size: 8,
+            s3_path: "replacement".to_owned(),
+        };
+        assert!(
+            replace_cold_chunk_index_pages(&store, &stream_id, &selected, &replacement)
+                .await
+                .expect("replace chunks")
+        );
+        let loaded = load_cold_chunks_from_pages(&store, &[ColdIndexPageKey {
+            stream_id,
+            generation: 0,
+            page_id: 0,
+        }])
+        .await
+        .expect("load replacement");
+        assert_eq!(loaded, vec![replacement]);
     }
 }

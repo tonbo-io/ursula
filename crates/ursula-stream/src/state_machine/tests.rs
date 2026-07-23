@@ -998,6 +998,68 @@ fn delete_stream_enqueues_cold_gc_then_ack_drains_it() {
 }
 
 #[test]
+fn compact_cold_enqueues_inputs_with_gc_grace() {
+    let mut machine = machine();
+    create_stream(&mut machine, "compact");
+    machine.apply(append_cmd(
+        stream("compact"),
+        b"abcdefgh",
+        Append::default(),
+    ));
+    let first = ColdChunkRef {
+        start_offset: 0,
+        end_offset: 4,
+        object_size: 4,
+        s3_path: "old-0".to_owned(),
+    };
+    let second = ColdChunkRef {
+        start_offset: 4,
+        end_offset: 8,
+        object_size: 4,
+        s3_path: "old-1".to_owned(),
+    };
+    assert!(matches!(
+        machine.apply(StreamCommand::FlushCold {
+            stream_id: stream("compact"),
+            chunk: first.clone(),
+        }),
+        StreamResponse::ColdFlushed { .. }
+    ));
+    assert!(matches!(
+        machine.apply(StreamCommand::FlushCold {
+            stream_id: stream("compact"),
+            chunk: second.clone(),
+        }),
+        StreamResponse::ColdFlushed { .. }
+    ));
+
+    assert_eq!(
+        machine.apply(StreamCommand::CompactCold {
+            stream_id: stream("compact"),
+            old_chunks: vec![first, second],
+            replacement: ColdChunkRef {
+                start_offset: 0,
+                end_offset: 8,
+                object_size: 8,
+                s3_path: "replacement".to_owned(),
+            },
+            gc_not_before_ms: 42,
+        }),
+        StreamResponse::ColdCompacted {
+            compacted_chunks: 2,
+            compacted_bytes: 8,
+        }
+    );
+    let pending = machine.pending_cold_gc_batch(16);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].not_before_ms, 42);
+    assert_eq!(
+        pending[0].target,
+        ColdGcTarget::Paths(vec!["old-0".to_owned(), "old-1".to_owned()])
+    );
+}
+
+#[test]
 fn expired_stream_with_cold_chunks_enqueues_cold_gc() {
     let mut machine = machine();
     machine.apply(create_cmd(stream("ttl"), Create {

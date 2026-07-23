@@ -127,6 +127,7 @@ message ColdGcEntryV1 {
     BucketStreamIdV1 stream = 2;
     ColdGcPathsV1 paths = 3;
   }
+  uint64 not_before_ms = 4;
 }
 
 message ColdGcPathsV1 {

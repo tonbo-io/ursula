@@ -31,6 +31,8 @@ use crate::request::CloseStreamRequest;
 use crate::request::CloseStreamResponse;
 use crate::request::ColdHotBacklog;
 use crate::request::ColdWriteAdmission;
+use crate::request::CompactColdRequest;
+use crate::request::CompactColdResponse;
 use crate::request::CreateStreamExternalRequest;
 use crate::request::CreateStreamRequest;
 use crate::request::CreateStreamResponse;
@@ -62,6 +64,8 @@ pub type GroupAppendBatchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<GroupAppendBatchResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupFlushColdFuture<'a> =
     Pin<Box<dyn Future<Output = Result<FlushColdResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupCompactColdFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<CompactColdResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupPlanColdFlushFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<ColdFlushCandidate>, GroupEngineError>> + Send + 'a>>;
 pub type GroupPlanNextColdFlushBatchFuture<'a> =
@@ -137,6 +141,7 @@ pub enum GroupWriteResponse {
     TouchStreamAccess(TouchStreamAccessResponse),
     UpdateStreamAttrs(UpdateStreamAttrsResponse),
     FlushCold(FlushColdResponse),
+    CompactCold(CompactColdResponse),
     CloseStream(CloseStreamResponse),
     DeleteStream(DeleteStreamResponse),
     AckColdGc(AckColdGcResponse),
@@ -370,6 +375,19 @@ pub trait GroupEngine: Send + 'static {
         Box::pin(async move {
             Err(GroupEngineError::new(format!(
                 "cold flush is not supported for stream '{}'",
+                request.stream_id
+            )))
+        })
+    }
+
+    fn compact_cold<'a>(
+        &'a mut self,
+        request: CompactColdRequest,
+        _placement: ShardPlacement,
+    ) -> GroupCompactColdFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "cold compaction is not supported for stream '{}'",
                 request.stream_id
             )))
         })
@@ -641,6 +659,23 @@ pub trait GroupEngine: Send + 'static {
                     .flush_cold(FlushColdRequest { stream_id, chunk }, placement)
                     .await
                     .map(GroupWriteResponse::FlushCold),
+                StreamCommand::CompactCold {
+                    stream_id,
+                    old_chunks,
+                    replacement,
+                    gc_not_before_ms,
+                } => self
+                    .compact_cold(
+                        CompactColdRequest {
+                            stream_id,
+                            old_chunks,
+                            replacement,
+                            gc_not_before_ms,
+                        },
+                        placement,
+                    )
+                    .await
+                    .map(GroupWriteResponse::CompactCold),
                 StreamCommand::Close {
                     stream_id,
                     stream_seq,
