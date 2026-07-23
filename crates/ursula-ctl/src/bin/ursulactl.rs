@@ -132,6 +132,7 @@ impl ProviderArgs {
 
 #[derive(Args, Debug)]
 struct ObserveArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
     #[arg(long, default_value_t = 10)]
@@ -142,6 +143,7 @@ struct ObserveArgs {
 
 #[derive(Args, Debug)]
 struct WaitReadyArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
     /// Number of raft groups each node must report. Matches
@@ -160,6 +162,7 @@ struct WaitReadyArgs {
 
 #[derive(Args, Debug)]
 struct NodeArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
     /// Target node id from the manifest.
@@ -173,6 +176,7 @@ struct NodeArgs {
 
 #[derive(Args, Debug)]
 struct DrainArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
     /// Target node id from the manifest.
@@ -200,6 +204,7 @@ struct DrainArgs {
 
 #[derive(Args, Debug)]
 struct WaitArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
     /// Target node id from the manifest.
@@ -224,7 +229,8 @@ struct WaitArgs {
 
 #[derive(Args, Debug)]
 struct RestartArgs {
-    /// Path to the node config JSON (compatible with scripts/ursula_ec2.py's nodes.json).
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
+    /// JSON stays compatible with scripts/ursula_ec2.py's nodes.json.
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
     /// Restrict the rollout to these node ids (in the supplied order).

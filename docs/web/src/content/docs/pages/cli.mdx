@@ -80,7 +80,18 @@ The binary lands at `target/release/ursulactl`. Drop it on your control machine.
 
 ## Manifest format
 
-Every verb accepts `--config <path>`. The manifest is **TOML, JSON, or YAML** (chosen by file extension) and carries two things: an optional `[provider]` block (how to reach the cluster) and the node list (what the cluster is). Putting the provider in the manifest keeps the command line to just the operational knobs:
+Every verb accepts `--config <path>`. The manifest is **TOML, JSON, or YAML** (chosen by file extension, sniffed when read from stdin with `-`) and carries two things: an optional `[provider]` block (how to reach the cluster) and the node list (what the cluster is).
+
+Prefer generating the manifest from whatever already knows the topology instead of writing it by hand. On Kubernetes the Helm chart renders one into its ConfigMap, and the URLs in it are in-cluster DNS, so pipe it to ursulactl running where those names resolve (the server image contains ursulactl):
+
+```bash
+kubectl get configmap ursula -o jsonpath='{.data.cluster-manifest\.json}' \
+  | ursulactl status --config -
+```
+
+For infrastructure provisioned by OpenTofu, emit the manifest as a stack output or generated file (the same pattern as `deploy/eks`'s `generated-values.yaml`) rather than teaching ursulactl to read state files. `tofu output -json <name> | ursulactl status --config -` composes the same way.
+
+Putting the provider in the manifest keeps the command line to just the operational knobs:
 
 ```toml
 [provider]
