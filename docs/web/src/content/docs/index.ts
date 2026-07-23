@@ -31,11 +31,18 @@ type MdxModule = {
 const docsModules = import.meta.glob<MdxModule>("./pages/**/*.mdx", { eager: true });
 
 const pageOrder: Record<string, { group: string; order: number; title?: string }> = {
-  // Getting Started - orient, try, decide, call.
+  // Getting Started - orient, decide, install, use.
   introduction: { group: "Getting Started", order: 1, title: "Introduction" },
-  "quick-start": { group: "Getting Started", order: 2 },
-  "why-ursula": { group: "Getting Started", order: 3 },
-  clients: { group: "Getting Started", order: 4 },
+  "why-ursula": { group: "Getting Started", order: 2 },
+  install: { group: "Getting Started", order: 3 },
+  "quick-start": { group: "Getting Started", order: 4 },
+  clients: { group: "Getting Started", order: 5 },
+
+  // Deploy - the production path (OpenTofu + Helm), then the consolidated
+  // configuration reference and the security model.
+  "deploy-cluster": { group: "Deploy", order: 1 },
+  configuration: { group: "Deploy", order: 2 },
+  security: { group: "Deploy", order: 3 },
 
   // Guides - complete application-shaped examples.
   "guides/browser-telemetry": { group: "Guides", order: 1 },
@@ -66,15 +73,6 @@ const pageOrder: Record<string, { group: string; order: number; title?: string }
   "api/read-snapshot": { group: "API Reference", order: 9 },
   "api/bootstrap": { group: "API Reference", order: 10 },
   "api/delete-stream": { group: "API Reference", order: 11 },
-
-  // Install & Deploy - get the binaries, get the cluster running.
-  install: { group: "Install & Deploy", order: 1 },
-  "run-locally": { group: "Install & Deploy", order: 2 },
-  configuration: { group: "Install & Deploy", order: 3 },
-  "configure-s3": { group: "Install & Deploy", order: 4 },
-  "deploy-cluster": { group: "Install & Deploy", order: 5 },
-  "deploy-kubernetes": { group: "Install & Deploy", order: 6 },
-  security: { group: "Install & Deploy", order: 7 },
 
   // Operate - day-2 entrypoints. `ursulactl` is the first one to reach for.
   cli: { group: "Operate", order: 1, title: "ursulactl" },
@@ -135,13 +133,13 @@ const docsPages: DocsPage[] = Object.entries(docsModules)
 
 const groupOrder = [
   "Getting Started",
-  "Architecture",
-  "Comparisons",
+  "Deploy",
   "Guides",
   "Concepts",
   "API Reference",
-  "Install & Deploy",
   "Operate",
+  "Architecture",
+  "Comparisons",
   "Protocol Specification",
   "Reference",
 ];

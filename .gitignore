@@ -25,6 +25,7 @@ docs/web/target/
 **/.terraform/
 **/*.tfstate
 **/*.tfstate.*
+**/*.tfplan
 deploy/eks/generated-values.yaml
 deploy/chaos-eks/generated-values.yaml
 deploy/eks/kubeconfig

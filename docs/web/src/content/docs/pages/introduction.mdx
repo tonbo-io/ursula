@@ -16,14 +16,12 @@ Quorum-replicated in-memory front-ends give you single-digit-millisecond appends
 - **Thread-per-core × multi-Raft.** Each stream hashes to one Raft group and one owner core. Hot-path requests touch that core only, with no cross-core synchronization. Hundreds to thousands of small groups co-exist per node, so a slow follower for one group never stalls another.
 - **Hot ring + S3 cold tier.** Writes commit at Raft quorum in an in-memory ring. Older segments flush to S3 in the background. A single `GET` transparently spans both tiers.
 
-## Run locally
+## Try it
 
-For now, Ursula builds from Rust source. Pre-built release binaries are on the way.
-
-Start a single in-memory node (fast iteration, no persistence):
+Start a single in-memory node with Docker — or build from source, see [Install](/docs/install):
 
 ```bash
-cargo run --bin ursula -- --preset default
+docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.3.1
 ```
 
 Create a stream, append bytes, and read them back:
@@ -38,6 +36,8 @@ curl -X POST http://127.0.0.1:4437/demo/hello \
 
 curl 'http://127.0.0.1:4437/demo/hello?offset=-1'
 ```
+
+Continue with the [Quick Start](/docs/quick-start) to replay and tail streams live, and [Deploy a Cluster](/docs/deploy-cluster) when you're ready for the production three-voter shape.
 
 ## Learn more
 
