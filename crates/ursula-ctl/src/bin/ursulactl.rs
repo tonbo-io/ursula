@@ -46,7 +46,7 @@ enum Command {
     Undrain(NodeArgs),
     /// Block until one node is back as a voter in every group and caught up.
     /// Progress-gated: a node that keeps advancing is never timed out.
-    WaitNodeReady(WaitNodeReadyArgs),
+    Wait(WaitArgs),
     /// Arm one empty-log rejoin per group for a raft-memory node that lost its
     /// volatile log. Refused on disk-backed clusters.
     AllowRejoin(NodeArgs),
@@ -199,7 +199,7 @@ struct DrainArgs {
 }
 
 #[derive(Args, Debug)]
-struct WaitNodeReadyArgs {
+struct WaitArgs {
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
     /// Target node id from the manifest.
@@ -279,7 +279,7 @@ async fn main() -> Result<()> {
         Command::WaitReady(args) => run_wait_ready_subcommand(args).await,
         Command::Drain(args) => run_drain_subcommand(args).await,
         Command::Undrain(args) => run_undrain_subcommand(args).await,
-        Command::WaitNodeReady(args) => run_wait_node_ready_subcommand(args).await,
+        Command::Wait(args) => run_wait_subcommand(args).await,
         Command::AllowRejoin(args) => run_allow_rejoin_subcommand(args).await,
     }
 }
@@ -394,7 +394,7 @@ async fn run_undrain_subcommand(args: NodeArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_wait_node_ready_subcommand(args: WaitNodeReadyArgs) -> Result<()> {
+async fn run_wait_subcommand(args: WaitArgs) -> Result<()> {
     let (_provider, access) = connect_nodes(&args.config, &args.provider, false).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
     let target = find_node(&access.nodes, args.node)?;
