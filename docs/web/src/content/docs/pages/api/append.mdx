@@ -57,7 +57,7 @@ api: "POST /{bucket}/{stream}"
 
 Response headers include `Stream-Next-Offset` (always). When a `Producer-Id` was supplied, the server echoes the accepted `Producer-Epoch` and `Producer-Seq` so the producer can confirm what was durably recorded. `Stream-Closed: true` is set if this request closed the stream. `ETag` is set on reads only, not on appends.
 
-For an `application/json` stream advertising `json-record-coordinates-v1`, the response also includes `Stream-Record-Start` and `Stream-Record-Next`. A JSON object creates one record; a top-level array creates one record per element. The returned half-open range identifies exactly the records created by this request.
+For an `application/json` stream advertising `json-record-coordinates-v1`, the response also includes `Stream-Record-Start` and `Stream-Record-Next`. A JSON object creates one record, and a top-level array creates one record per element. The returned half-open range identifies exactly the records created by this request.
 
 <RequestExample>
 ```bash Append binary

@@ -22,7 +22,7 @@ curl -X POST http://127.0.0.1:4437/chat/room-7 \
   --data '{"user":"ada","text":"hello","sent_at":"2026-07-23T09:00:00Z"}'
 ```
 
-Each append returns the record range it created in `Stream-Record-Start` / `Stream-Record-Next`. Appending a top-level JSON array creates one record per element — useful for flushing an offline outbox in one request. For send-button retries that can't double-post, add the [exactly-once producer headers](/docs/concepts/exactly-once-writes) with one `Producer-Id` per device.
+Each append returns the record range it created in `Stream-Record-Start` / `Stream-Record-Next`. Appending a top-level JSON array creates one record per element, which is useful for flushing an offline outbox in one request. To make send retries safe against double-posting, add the [exactly-once producer headers](/docs/concepts/exactly-once-writes) with one `Producer-Id` per device.
 
 ## Load recent history
 
@@ -55,7 +55,7 @@ es.addEventListener("data", (e) => {
 });
 ```
 
-Control events publish `streamNextRecord`; store it and reconnect with `record=<streamNextRecord>` to resume without missing or repeating a message. Deduplicate by `record` if you combine a history fetch with a live tail.
+Control events publish `streamNextRecord`. Store it and reconnect with `record=<streamNextRecord>` to resume without missing or repeating a message. Deduplicate by `record` if you combine a history fetch with a live tail.
 
 ## Next
 

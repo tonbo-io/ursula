@@ -5,7 +5,7 @@ sidebarTitle: Overview
 
 ## The problem
 
-Building a durable stream directly on S3 hits two walls: S3 has no append (every write either pays per-PUT or batches and eats the latency), and its conditional writes are optimistic compare-and-set, so concurrent writers retry-storm with exponential latency ([Chroma's wal3 post](https://www.trychroma.com/engineering/wal3) covers the mechanics). The market splits on which wall to lean against: [S2](https://s2.dev/blog/intro) writes through S3 Express to get under 50 ms but pays around 7x per-GB; [WarpStream](https://www.warpstream.com/blog/minimizing-s3-api-costs-with-warpstream) batches to S3 Standard and accepts 250 ms+ p50.
+Building a durable stream directly on S3 hits two walls: S3 has no append (every write either pays per-PUT or batches and eats the latency), and its conditional writes are optimistic compare-and-set, so concurrent writers retry-storm with exponential latency ([Chroma's wal3 post](https://www.trychroma.com/engineering/wal3) covers the mechanics). The market splits on which wall to lean against. [S2](https://s2.dev/blog/intro) writes through S3 Express to get under 50 ms but pays around 7x per-GB, while [WarpStream](https://www.warpstream.com/blog/minimizing-s3-api-costs-with-warpstream) batches to S3 Standard and accepts 250 ms+ p50.
 
 ## How Ursula works
 
@@ -139,7 +139,7 @@ The stream data plane lives in the group's state machine. A group owns many stre
 
 Recent bytes stay in an in-memory hot ring on every replica. When a group's hot bytes exceed the configured cold-flush threshold, a background worker uploads older contiguous segments to the cold backend, usually S3. After upload succeeds, Ursula commits a metadata update through Raft that publishes the cold chunk reference and advances the stream's hot start offset.
 
-Reads assemble one logical stream from both tiers. The state machine first builds a read plan: which byte ranges are still hot and which ranges are cold chunk references. Hot bytes are copied from memory; cold ranges are fetched with object-store range reads. Any replica that has applied the cold chunk metadata can serve those cold reads, as long as all nodes point at the same S3 bucket/prefix.
+Reads assemble one logical stream from both tiers. The state machine first builds a read plan: which byte ranges are still hot and which ranges are cold chunk references. Hot bytes are copied from memory, and cold ranges are fetched with object-store range reads. Any replica that has applied the cold chunk metadata can serve those cold reads, as long as all nodes point at the same S3 bucket/prefix.
 
 ## Read path and cold offload
 
