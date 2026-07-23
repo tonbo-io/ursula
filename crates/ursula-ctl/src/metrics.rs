@@ -332,9 +332,7 @@ mod tests {
             id: 1,
             admin_url: Url::parse("http://127.0.0.1:4438")?,
             host: "127.0.0.1".to_owned(),
-            instance_id: None,
             http_url: Some(Url::parse("http://127.0.0.1:4437")?),
-            name: None,
         };
 
         assert_eq!(metrics_base_url(&node).port(), Some(4437));
@@ -347,9 +345,7 @@ mod tests {
             id: 1,
             admin_url: Url::parse("http://127.0.0.1:4438")?,
             host: "127.0.0.1".to_owned(),
-            instance_id: None,
             http_url: None,
-            name: None,
         };
 
         assert_eq!(metrics_base_url(&node).port(), Some(4438));

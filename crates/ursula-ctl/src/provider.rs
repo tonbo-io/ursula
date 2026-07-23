@@ -14,44 +14,17 @@ const DEFAULT_ADMIN_PORT: u16 = 4438;
 pub struct NodeInfo {
     pub id: u64,
     /// Admin-plane endpoint carrying the operator surface (raft ops,
-    /// maintenance drain, metrics). ursulactl sends every request here, never
-    /// to the public client plane. Nodes bind this to loopback, so under a
-    /// tunnelling provider only its port matters; under `direct` it must be
-    /// network-reachable.
+    /// maintenance drain, metrics). Mutating verbs send requests here, never
+    /// to the public client plane. Nodes bind this plane to loopback, so from
+    /// outside the host point it at your own tunnel (for example a
+    /// `kubectl port-forward` local port).
     pub admin_url: Url,
-    /// Generic address (hostname or IP) exposed to `{host}` interpolation in
-    /// the `command` provider. Defaults to the admin URL's host.
+    /// Address shown in reports. Defaults to the admin URL's host.
     pub host: String,
-    /// Opaque machine id (e.g. an AWS instance id) exposed to `{instance_id}`
-    /// interpolation in the `command` provider.
-    #[serde(default)]
-    pub instance_id: Option<String>,
-    /// Optional public client-plane URL; kept for `{http_url}` interpolation in
-    /// the `command` provider. ursulactl itself never sends operator traffic here.
+    /// Optional public client-plane URL. `status` and `wait-ready` prefer it
+    /// for read-only metrics and fall back to `admin_url` when absent.
     #[serde(default)]
     pub http_url: Option<Url>,
-    #[serde(default)]
-    pub name: Option<String>,
-}
-
-impl NodeInfo {
-    /// Admin-plane port; the tunnelling providers forward a local port to it.
-    pub fn admin_port(&self) -> u16 {
-        self.admin_url.port().unwrap_or(DEFAULT_ADMIN_PORT)
-    }
-}
-
-/// Optional `[provider]` block: how ursulactl reaches this cluster. Flags on the
-/// command line override any field set here.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawProvider {
-    #[serde(default)]
-    pub kind: Option<String>,
-    #[serde(default)]
-    pub forward_cmd: Option<String>,
-    #[serde(default)]
-    pub restart_cmd: Option<String>,
 }
 
 #[allow(async_fn_in_trait)]
@@ -60,12 +33,10 @@ pub trait NodeProvider {
 }
 
 /// File-backed manifest. Accepts TOML, JSON, or YAML (chosen by extension, or
-/// sniffed for stdin), carrying an optional `[provider]` block plus the node
-/// list.
+/// sniffed for stdin), carrying the node list.
 #[derive(Debug, Clone)]
 pub struct StaticNodeProvider {
     nodes: Vec<NodeInfo>,
-    provider: Option<RawProvider>,
 }
 
 impl StaticNodeProvider {
@@ -117,20 +88,13 @@ impl StaticNodeProvider {
     }
 
     pub fn from_nodes(nodes: Vec<NodeInfo>) -> Self {
-        Self {
-            nodes,
-            provider: None,
-        }
+        Self { nodes }
     }
 
     fn from_raw(raw: RawConfig) -> Result<Self> {
-        let (provider, nodes) = raw.into_parts()?;
-        Ok(Self { nodes, provider })
-    }
-
-    /// The `[provider]` block, if the manifest declared one.
-    pub fn provider_config(&self) -> Option<&RawProvider> {
-        self.provider.as_ref()
+        Ok(Self {
+            nodes: raw.into_nodes()?,
+        })
     }
 }
 
@@ -142,19 +106,15 @@ impl NodeProvider for StaticNodeProvider {
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
-    #[serde(default)]
-    provider: Option<RawProvider>,
     nodes: Vec<RawNode>,
 }
 
 impl RawConfig {
-    fn into_parts(self) -> Result<(Option<RawProvider>, Vec<NodeInfo>)> {
-        let nodes = self
-            .nodes
+    fn into_nodes(self) -> Result<Vec<NodeInfo>> {
+        self.nodes
             .into_iter()
             .map(RawNode::into_node)
-            .collect::<Result<_>>()?;
-        Ok((self.provider, nodes))
+            .collect::<Result<_>>()
     }
 }
 
@@ -162,13 +122,9 @@ impl RawConfig {
 struct RawNode {
     id: u64,
     #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
     admin_url: Option<String>,
     #[serde(default)]
     admin_port: Option<u16>,
-    #[serde(default)]
-    instance_id: Option<String>,
     #[serde(default)]
     http_url: Option<String>,
     #[serde(default)]
@@ -201,13 +157,7 @@ impl RawNode {
                         .and_then(|p| p.host_str().map(str::to_owned))
                 })
             })
-            .or_else(|| self.instance_id.clone())
-            .with_context(|| {
-                format!(
-                    "node {} needs host, http_url, admin_url, or instance_id",
-                    self.id
-                )
-            })?;
+            .with_context(|| format!("node {} needs host, http_url, or admin_url", self.id))?;
 
         let admin_url = if let Some(url) = self.admin_url.as_deref().and_then(non_empty) {
             Url::parse(url).with_context(|| format!("invalid admin_url for node {}", self.id))?
@@ -220,11 +170,7 @@ impl RawNode {
             id: self.id,
             admin_url,
             host,
-            instance_id: self
-                .instance_id
-                .and_then(|s| non_empty(&s).map(str::to_owned)),
             http_url,
-            name: self.name,
         })
     }
 }
@@ -250,7 +196,6 @@ mod tests {
         assert_eq!(nodes[0].host, "203.0.113.10");
         // admin_url defaults to host:4438.
         assert_eq!(nodes[0].admin_url.as_str(), "http://203.0.113.10:4438/");
-        assert!(provider.provider_config().is_none());
     }
 
     #[test]
@@ -271,46 +216,28 @@ mod tests {
     }
 
     #[test]
-    fn toml_manifest_with_provider_block() {
+    fn toml_manifest_resolves_admin_urls() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cluster.toml");
         std::fs::write(
             &path,
             r#"
-[provider]
-kind = "command"
-forward_cmd = "kubectl port-forward pod/{name} {local_port}:{admin_port}"
-restart_cmd = "kubectl delete pod {name}"
-
 [[nodes]]
 id = 1
-instance_id = "i-0abc"
-admin_port = 4438
+host = "127.0.0.1"
+admin_port = 5441
 
 [[nodes]]
 id = 2
-instance_id = "i-0def"
+admin_url = "http://127.0.0.1:5442"
 "#,
         )
         .unwrap();
         let provider = StaticNodeProvider::from_path(&path).unwrap();
-        let pc = provider.provider_config().expect("provider block");
-        assert_eq!(pc.kind.as_deref(), Some("command"));
-        assert_eq!(pc.restart_cmd.as_deref(), Some("kubectl delete pod {name}"));
         let nodes = provider.nodes.clone();
         assert_eq!(nodes.len(), 2);
-        assert_eq!(nodes[0].instance_id.as_deref(), Some("i-0abc"));
-        assert_eq!(nodes[0].admin_port(), 4438);
-        // host falls back to the instance id when nothing else is given.
-        assert_eq!(nodes[0].host, "i-0abc");
-    }
-
-    #[test]
-    fn unknown_provider_field_is_rejected() {
-        // Node keys stay tolerant, but the provider block is our own schema
-        // and catches typos.
-        let json =
-            br#"{"provider":{"kind":"command","bogus":true},"nodes":[{"id":1,"host":"10.0.0.1"}]}"#;
-        assert!(StaticNodeProvider::from_bytes(json).is_err());
+        assert_eq!(nodes[0].admin_url.as_str(), "http://127.0.0.1:5441/");
+        // host falls back to the admin URL's host when not given.
+        assert_eq!(nodes[1].host, "127.0.0.1");
     }
 }

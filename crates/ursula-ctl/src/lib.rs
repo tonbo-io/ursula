@@ -1,27 +1,25 @@
 //! Operational library behind the `ursulactl` CLI.
 //!
-//! ursulactl manages logical cluster state: leadership placement, readiness,
-//! and rejoin permission. Physical lifecycle (deploying, restarting, and
-//! scaling processes) belongs to the platform that owns it, such as OpenTofu
-//! and Helm on Kubernetes or systemd on hosts.
+//! ursulactl manages logical cluster state over Ursula's admin and metrics
+//! HTTP APIs: leadership placement, readiness, and rejoin permission. It
+//! executes nothing on hosts. Physical lifecycle (deploying, restarting, and
+//! scaling processes) belongs to the platform, such as Helm and OpenTofu on
+//! Kubernetes or systemd on hosts, and the operator brings their own tunnel
+//! (for example `kubectl port-forward`) when the loopback-bound admin plane
+//! must be reached from outside.
 //!
 //! Module map:
 //!
 //! - [`metrics`]: HTTP client for `/__ursula/metrics` and the admin endpoints.
 //! - [`observe`]: read-only status and cluster-wide readiness reporting.
 //! - [`plan`]: pure drain planning and per-node readiness checks.
-//! - [`maintenance`]: node-maintenance verbs (drain, undrain, catch-up wait, rejoin arming).
-//! - [`orchestrate`]: bare-metal rolling restart composing logical verbs with
-//!   a physical restart command.
-//! - [`operation`]: transports (providers) that reach each node's
-//!   loopback-bound admin plane and, for bare metal, restart it.
+//! - [`maintenance`]: node-maintenance verbs (drain, undrain, catch-up wait,
+//!   rejoin arming).
 //! - [`provider`]: cluster manifest loading and node addressing.
 
 pub mod maintenance;
 pub mod metrics;
 pub mod observe;
-pub mod operation;
-pub mod orchestrate;
 pub mod plan;
 pub mod provider;
 
@@ -41,17 +39,9 @@ pub use metrics::RaftGroupView;
 pub use observe::StatusReport;
 pub use observe::wait_ready;
 pub use observe::write_status;
-pub use operation::AdminAccess;
-pub use operation::OperationProvider;
-pub use operation::ProviderKind;
-pub use orchestrate::RestartOptions;
-pub use orchestrate::RestartOutcome;
-pub use orchestrate::RestartReport;
-pub use orchestrate::run_restart;
 pub use plan::DrainPlan;
 pub use plan::GroupTransfer;
 pub use plan::ReadinessReport;
 pub use provider::NodeInfo;
 pub use provider::NodeProvider;
-pub use provider::RawProvider;
 pub use provider::StaticNodeProvider;

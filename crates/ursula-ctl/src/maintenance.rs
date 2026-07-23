@@ -4,9 +4,8 @@
 //! These operate purely on Ursula's admin/metrics HTTP surface and never
 //! execute anything on a host. Physical lifecycle (stopping and starting the
 //! process) belongs to the platform that owns it: Kubernetes and Helm for pod
-//! clusters, systemd for bare-metal hosts. [`crate::orchestrate::run_restart`]
-//! composes these verbs with a physical restart command for environments with
-//! no platform controller.
+//! clusters, systemd for bare-metal hosts. A safe rolling restart runs these
+//! verbs around the platform's own restart, one node at a time.
 
 use std::time::Duration;
 use std::time::Instant;
@@ -576,9 +575,7 @@ mod tests {
             id,
             admin_url: url::Url::parse(&format!("http://{host}:4438")).unwrap(),
             host: host.to_owned(),
-            instance_id: None,
             http_url: Some(url::Url::parse(&format!("http://{host}:8080")).unwrap()),
-            name: Some(format!("node-{id}")),
         }
     }
 
