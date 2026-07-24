@@ -4,10 +4,10 @@
 clients one stable HTTP endpoint while keeping internal Ursula node addresses
 out of public responses.
 
-The gateway is intentionally thin: it does not parse the Durable Streams
-Protocol, own stream routing state, terminate SSE streams, or cache Raft
-leaders. It buffers request bodies up to a configured limit only so it can
-replay requests when Ursula identifies the Raft leader.
+The gateway is intentionally thin: it does not own stream routing state,
+terminate SSE streams, or cache Raft leaders. It buffers request bodies up to a
+configured limit only so it can replay requests when Ursula identifies the Raft
+leader.
 
 ## Behavior
 
@@ -19,6 +19,35 @@ replay requests when Ursula identifies the Raft leader.
 - Returns other redirects to clients and rewrites redirect targets so clients
   continue through the gateway.
 - Keeps long-lived SSE reads open after response headers arrive.
+- Optionally classifies Durable Streams requests as an explicit
+  `bucket/stream/action` resource before forwarding them to provider-neutral
+  authentication and authorization hooks.
+
+## Access Control and Logical Tenancy
+
+Ursula keeps the public resource model at two levels: `/{bucket}/{stream}`.
+Shared hosted deployments can treat the bucket as the logical tenant or owner
+namespace, while a standalone deployment can keep using bucket names exactly as
+before.
+
+`Gateway::new` does not enable access control. The stock `ursulagw` binary
+therefore remains a transparent, tenant-unaware gateway and requires no OAuth
+configuration.
+
+A hosted gateway can instead construct `Gateway::with_access_control` with an
+`auth::AccessControl` containing:
+
+- a `PrincipalResolver` that verifies a presented OAuth bearer token and
+  normalizes it into a provider-neutral principal;
+- an `Authorizer` that evaluates the optional principal, explicit bucket and
+  stream, and requested action.
+
+Anonymous requests still reach the authorizer, allowing public buckets to be
+read without a token. An authorizer can return `ConcealAsNotFound` for a private
+bucket the caller cannot see. Validated bearer credentials terminate at the
+gateway and are not forwarded to Ursula nodes. Once access control is enabled,
+unrecognized and internal Ursula paths fail closed with `404`; a hosted binary
+can mount its own health or operator routes outside the gateway fallback.
 
 ## Redirects
 

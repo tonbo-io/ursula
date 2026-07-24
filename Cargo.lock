@@ -4266,6 +4266,7 @@ dependencies = [
  "bytes",
  "clap",
  "http-body-util",
+ "percent-encoding",
  "rand 0.10.1",
  "reqwest",
  "serde",

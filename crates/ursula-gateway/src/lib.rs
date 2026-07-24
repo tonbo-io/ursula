@@ -8,6 +8,10 @@
 //! internally by the gateway after buffering the request body. This avoids
 //! leaking internal node addresses to clients and prevents SSE live reads from
 //! looping when the initial random upstream lands on a follower.
+//!
+//! Module map:
+//!
+//! - [`auth`]: opt-in, provider-neutral authentication and authorization hooks.
 
 use std::error::Error as _;
 use std::net::SocketAddr;
@@ -16,19 +20,33 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
+use axum::http::Method;
 use axum::http::Request;
 use axum::http::Response;
 use axum::http::StatusCode;
 use axum::http::Uri;
+use axum::http::header::AUTHORIZATION;
 use axum::http::header::CONNECTION;
 use axum::http::header::LOCATION;
+use axum::http::header::WWW_AUTHENTICATE;
 use axum::response::IntoResponse;
 use axum::response::Response as AxumResponse;
+use percent_encoding::percent_decode_str;
 use rand::prelude::IndexedRandom;
 use tracing::debug;
 use tracing::error;
 
+pub mod auth;
+
+use crate::auth::AccessControl;
+use crate::auth::Action;
+use crate::auth::AuthenticationError;
+use crate::auth::AuthorizationDecision;
+use crate::auth::AuthorizationRequest;
+use crate::auth::Resource;
+
 const HEADER_URSULA_RAFT_LEADER_ID: &str = "x-ursula-raft-leader-id";
+const HEADER_STREAM_CLOSED: &str = "stream-closed";
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -46,6 +64,7 @@ pub struct Gateway {
     config: GatewayConfig,
     client: reqwest::Client,
     response_header_timeout: Duration,
+    access_control: Option<AccessControl>,
 }
 
 impl std::fmt::Debug for Gateway {
@@ -53,6 +72,7 @@ impl std::fmt::Debug for Gateway {
         f.debug_struct("Gateway")
             .field("config", &self.config)
             .field("response_header_timeout", &self.response_header_timeout)
+            .field("access_control", &self.access_control)
             .finish_non_exhaustive()
     }
 }
@@ -69,11 +89,32 @@ impl Gateway {
             config,
             client,
             response_header_timeout,
+            access_control: None,
+        }
+    }
+
+    /// Installs provider-neutral authentication and authorization hooks.
+    ///
+    /// [`Gateway::new`] intentionally leaves access control disabled so
+    /// self-hosted deployments retain the original pass-through behavior.
+    pub fn with_access_control(config: GatewayConfig, access_control: AccessControl) -> Self {
+        Self {
+            access_control: Some(access_control),
+            ..Self::new(config)
         }
     }
 
     pub async fn handle(&self, req: Request<Body>) -> AxumResponse {
-        let (parts, body) = req.into_parts();
+        let (mut parts, body) = req.into_parts();
+
+        if let Some(response) = self.authorize(&parts).await {
+            return response;
+        }
+        if self.access_control.is_some() {
+            // The credential terminates at the gateway. Internal Ursula nodes
+            // do not need the user's bearer token.
+            parts.headers.remove(AUTHORIZATION);
+        }
 
         let body_bytes = match axum::body::to_bytes(body, self.config.max_request_body_bytes).await
         {
@@ -103,6 +144,48 @@ impl Gateway {
             Err(e) => {
                 error!(error = %e, "gateway request failed");
                 e.into_response()
+            }
+        }
+    }
+
+    async fn authorize(&self, parts: &axum::http::request::Parts) -> Option<AxumResponse> {
+        let access_control = self.access_control.as_ref()?;
+        let Some(request) = classify_request(&parts.method, &parts.uri, &parts.headers) else {
+            // An access-controlled gateway is a public resource server, not a
+            // transparent escape hatch to internal or newly added routes.
+            return Some(StatusCode::NOT_FOUND.into_response());
+        };
+
+        let principal = match bearer_token(&parts.headers) {
+            Ok(Some(token)) => match access_control.principal_resolver().resolve(token).await {
+                Ok(principal) => Some(principal),
+                Err(error) => return Some(authentication_error_response(error)),
+            },
+            Ok(None) => None,
+            Err(()) => {
+                return Some(authentication_error_response(
+                    AuthenticationError::InvalidCredential,
+                ));
+            }
+        };
+
+        match access_control
+            .authorizer()
+            .authorize(AuthorizationRequest {
+                principal,
+                resource: request.resource,
+                action: request.action,
+            })
+            .await
+        {
+            Ok(AuthorizationDecision::Allow) => None,
+            Ok(AuthorizationDecision::Deny) => Some(StatusCode::FORBIDDEN.into_response()),
+            Ok(AuthorizationDecision::ConcealAsNotFound) => {
+                Some(StatusCode::NOT_FOUND.into_response())
+            }
+            Err(error) => {
+                error!(error = %error, "gateway authorization failed");
+                Some(StatusCode::SERVICE_UNAVAILABLE.into_response())
             }
         }
     }
@@ -211,6 +294,145 @@ impl Gateway {
             .find(|u| location.starts_with(*u))
             .map(String::as_str)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClassifiedRequest {
+    resource: Resource,
+    action: Action,
+}
+
+fn classify_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<ClassifiedRequest> {
+    let segments = uri
+        .path()
+        .strip_prefix('/')?
+        .split('/')
+        .map(decode_path_segment)
+        .collect::<Option<Vec<_>>>()?;
+    let bucket_id = segments.first()?.clone();
+    if bucket_id.is_empty() || bucket_id == "__ursula" {
+        return None;
+    }
+
+    let (stream_id, action) = match segments.as_slice() {
+        [_bucket] if *method == Method::PUT => (None, Action::AdministerBucket),
+        [_bucket, stream] if *method == Method::PUT => {
+            let action = if closes_stream(headers) {
+                Action::CreateAndClose
+            } else {
+                Action::Create
+            };
+            (Some(stream.clone()), action)
+        }
+        [_bucket, stream] if *method == Method::POST => {
+            let action = if closes_stream(headers) {
+                Action::AppendAndClose
+            } else {
+                Action::Append
+            };
+            (Some(stream.clone()), action)
+        }
+        [_bucket, stream] if *method == Method::GET => {
+            let action = if query_has_pair(uri, "live", "sse") {
+                Action::Tail
+            } else {
+                Action::Read
+            };
+            (Some(stream.clone()), action)
+        }
+        [_bucket, stream] if *method == Method::HEAD => (Some(stream.clone()), Action::Head),
+        [_bucket, stream] if *method == Method::DELETE => (Some(stream.clone()), Action::Delete),
+        [_bucket, stream, suffix] if suffix == "attrs" && *method == Method::PUT => {
+            (Some(stream.clone()), Action::Update)
+        }
+        [_bucket, stream, suffix] if suffix == "attrs" && *method == Method::GET => {
+            (Some(stream.clone()), Action::Head)
+        }
+        [_bucket, stream, suffix] if suffix == "bootstrap" && *method == Method::GET => {
+            (Some(stream.clone()), Action::Read)
+        }
+        [_bucket, stream, suffix] if suffix == "append-batch" && *method == Method::POST => {
+            (Some(stream.clone()), Action::Append)
+        }
+        [_bucket, stream, suffix] if suffix == "snapshot" && *method == Method::GET => {
+            (Some(stream.clone()), Action::ReadSnapshot)
+        }
+        [_bucket, stream, suffix, _offset] if suffix == "snapshot" && *method == Method::PUT => {
+            (Some(stream.clone()), Action::PublishSnapshot)
+        }
+        [_bucket, stream, suffix, _offset] if suffix == "snapshot" && *method == Method::GET => {
+            (Some(stream.clone()), Action::ReadSnapshot)
+        }
+        [_bucket, stream, suffix, _offset] if suffix == "snapshot" && *method == Method::DELETE => {
+            (Some(stream.clone()), Action::DeleteSnapshot)
+        }
+        _ => return None,
+    };
+
+    Some(ClassifiedRequest {
+        resource: Resource {
+            bucket_id,
+            stream_id,
+        },
+        action,
+    })
+}
+
+fn closes_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(HEADER_STREAM_CLOSED)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+}
+
+fn decode_path_segment(segment: &str) -> Option<String> {
+    percent_decode_str(segment)
+        .decode_utf8()
+        .ok()
+        .map(|decoded| decoded.into_owned())
+}
+
+fn query_has_pair(uri: &Uri, expected_name: &str, expected_value: &str) -> bool {
+    uri.query().is_some_and(|query| {
+        query.split('&').any(|pair| {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            decode_path_segment(name).as_deref() == Some(expected_name)
+                && decode_path_segment(value).as_deref() == Some(expected_value)
+        })
+    })
+}
+
+fn bearer_token(headers: &HeaderMap) -> Result<Option<&str>, ()> {
+    let mut values = headers.get_all(AUTHORIZATION).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    let value = value.to_str().map_err(|_invalid_header| ())?;
+    let (scheme, token) = value.split_once(' ').ok_or(())?;
+    if !scheme.eq_ignore_ascii_case("bearer")
+        || token.is_empty()
+        || token.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err(());
+    }
+    Ok(Some(token))
+}
+
+fn authentication_error_response(error: AuthenticationError) -> AxumResponse {
+    if error == AuthenticationError::Unavailable {
+        error!(error = %error, "gateway authentication failed");
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+
+    let mut response = StatusCode::UNAUTHORIZED.into_response();
+    response.headers_mut().insert(
+        WWW_AUTHENTICATE,
+        HeaderValue::from_static(r#"Bearer error="invalid_token""#),
+    );
+    response
 }
 
 // Copy end-to-end headers while removing hop-by-hop proxy headers. Hop-by-hop
