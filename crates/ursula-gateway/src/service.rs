@@ -7,26 +7,21 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::Request;
 use axum::routing::any;
-use clap::Parser;
-use ursula_gateway::DEFAULT_MAX_REQUEST_BODY_BYTES;
-use ursula_gateway::Gateway;
-use ursula_gateway::GatewayConfig;
+use clap::Args;
 use ursula_observability::serve::serve_until_shutdown;
 use ursula_observability::serve::shutdown_signal;
 
+use crate::DEFAULT_MAX_REQUEST_BODY_BYTES;
+use crate::Gateway;
+use crate::GatewayConfig;
+
 const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 3600;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    run().await
-}
-
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut init_options = ursula_observability::InitOptions::new("ursula-gateway");
     init_options.default_directives = "ursula_gateway=info";
     let _observability = ursula_observability::init(init_options);
 
-    let args = Args::parse();
     let config = GatewayConfig {
         listen: args.listen,
         upstreams: args.upstream,
@@ -51,7 +46,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         listen = %config.listen,
         upstreams = ?config.upstreams,
-        "ursulagw starting"
+        "Ursula gateway starting"
     );
 
     serve_until_shutdown(
@@ -65,9 +60,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[derive(Parser, Debug)]
-#[command(version, about = "Ursula Gateway: HTTP/SSE proxy for Ursula nodes")]
-struct Args {
+#[derive(Args, Debug)]
+pub struct GatewayArgs {
     /// Address to bind the gateway server.
     #[arg(long, default_value = "0.0.0.0:4437")]
     listen: SocketAddr,

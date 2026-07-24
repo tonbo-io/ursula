@@ -173,6 +173,6 @@ data:
     chmod 600 "${config_path}"
     umask "${old_umask}"
 
-    exec /usr/local/bin/ursula --config "${config_path}" --node-id "${node_id}" "$@"
+    exec /usr/local/bin/ursula server --config "${config_path}" --node-id "${node_id}" "$@"
   cluster-manifest.json: |
 {{ dict "nodes" $nodes | toPrettyJson | indent 4 }}

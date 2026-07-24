@@ -22,8 +22,7 @@ use axum::routing::get;
 use axum::routing::post;
 use axum::routing::put;
 use chrono::DateTime;
-use clap::ArgGroup;
-use clap::Parser;
+use clap::Args;
 use reqwest::Url;
 use serde::Deserialize;
 use serde::Serialize;
@@ -32,35 +31,29 @@ use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
-use ursula_index::EventIndex;
-use ursula_index::EventIndexCache;
-use ursula_index::EventIndexConfig;
-use ursula_index::FsObjectStore;
-use ursula_index::IndexCatalog;
-use ursula_index::IndexError;
-use ursula_index::IndexRegistration;
-use ursula_index::IndexStatus;
-use ursula_index::ObjectStore;
-use ursula_index::QueryCursor;
-use ursula_index::S3ObjectStore;
-use ursula_index::S3ObjectStoreConfig;
-use ursula_index::SourceBatch;
-use ursula_index::SourceClient;
 use ursula_observability::serve::shutdown_signal;
 
-#[derive(Debug, Parser)]
-#[command(
-    version,
-    about = "S3-backed client-event-time index for an Ursula JSON stream",
-    group(ArgGroup::new("backend").required(true).args(["object_dir", "s3_bucket"]))
-)]
-struct Args {
+use crate::EventIndex;
+use crate::EventIndexCache;
+use crate::EventIndexConfig;
+use crate::FsObjectStore;
+use crate::IndexCatalog;
+use crate::IndexError;
+use crate::IndexRegistration;
+use crate::IndexStatus;
+use crate::ObjectStore;
+use crate::QueryCursor;
+use crate::S3ObjectStore;
+use crate::S3ObjectStoreConfig;
+use crate::SourceBatch;
+use crate::SourceClient;
+
+#[derive(Debug, Args)]
+pub struct IndexerArgs {
     #[arg(long)]
     stream_url: Option<Url>,
-    #[arg(long, conflicts_with = "s3_bucket")]
-    object_dir: Option<PathBuf>,
-    #[arg(long, conflicts_with = "object_dir")]
-    s3_bucket: Option<String>,
+    #[command(flatten)]
+    backend: BackendArgs,
     #[arg(long, default_value = "event-index")]
     s3_prefix: String,
     #[arg(long)]
@@ -113,6 +106,15 @@ struct Args {
     timestamp_field: String,
 }
 
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct BackendArgs {
+    #[arg(long)]
+    object_dir: Option<PathBuf>,
+    #[arg(long)]
+    s3_bucket: Option<String>,
+}
+
 /// Where authoritative index objects live; opens the base store or one
 /// namespaced store per registered source.
 #[derive(Clone)]
@@ -129,13 +131,14 @@ enum StoreTarget {
 }
 
 impl StoreTarget {
-    fn from_args(args: &Args) -> anyhow::Result<Self> {
-        if let Some(object_dir) = &args.object_dir {
+    fn from_args(args: &IndexerArgs) -> anyhow::Result<Self> {
+        if let Some(object_dir) = &args.backend.object_dir {
             return Ok(Self::Fs {
                 root: object_dir.clone(),
             });
         }
         let bucket = args
+            .backend
             .s3_bucket
             .clone()
             .context("--s3-bucket is required without --object-dir")?;
@@ -196,7 +199,7 @@ struct MaintenanceConfig {
 }
 
 impl MaintenanceConfig {
-    fn from_args(args: &Args) -> Self {
+    fn from_args(args: &IndexerArgs) -> Self {
         Self {
             interval: Duration::from_millis(args.maintenance_interval_ms),
             compaction_fan_in: args.compaction_fan_in,
@@ -310,11 +313,9 @@ impl IntoResponse for ApiError {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub async fn run(args: IndexerArgs) -> anyhow::Result<()> {
     let _observability =
         ursula_observability::init(ursula_observability::InitOptions::new("ursula-indexer"));
-    let args = Args::parse();
     validate_args(&args)?;
     match args.stream_url.clone() {
         Some(stream_url) => run_single(args, stream_url).await,
@@ -322,7 +323,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-fn validate_args(args: &Args) -> anyhow::Result<()> {
+fn validate_args(args: &IndexerArgs) -> anyhow::Result<()> {
     if args.compaction_fan_in < 2 {
         anyhow::bail!("--compact-parts must be at least 2");
     }
@@ -356,7 +357,7 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_single(args: Args, stream_url: Url) -> anyhow::Result<()> {
+async fn run_single(args: IndexerArgs, stream_url: Url) -> anyhow::Result<()> {
     let config = EventIndexConfig {
         source_id: stream_url.to_string(),
         flush_entries: args.flush_entries,
@@ -407,7 +408,11 @@ async fn run_single(args: Args, stream_url: Url) -> anyhow::Result<()> {
         listen = %args.listen,
         stream_url = %stream_url,
         cache_dir = %args.cache_dir.display(),
-        s3_bucket = args.s3_bucket.as_deref().unwrap_or("filesystem-dev-backend"),
+        s3_bucket = args
+            .backend
+            .s3_bucket
+            .as_deref()
+            .unwrap_or("filesystem-dev-backend"),
         "event indexer starting"
     );
     serve(build_router(Arc::clone(&index)), args.listen, shutdown_tx).await?;
@@ -474,7 +479,7 @@ impl PoolState {
     }
 }
 
-async fn run_pool(args: Args) -> anyhow::Result<()> {
+async fn run_pool(args: IndexerArgs) -> anyhow::Result<()> {
     let backend = StoreTarget::from_args(&args)?;
     let catalog = IndexCatalog::new(backend.open("").context("open object store")?);
     let state = PoolState {
@@ -1042,7 +1047,7 @@ async fn register_pool_index(
     Path(id): Path<String>,
     Json(request): Json<RegisterIndexRequest>,
 ) -> Result<Response, ApiError> {
-    let stream_url = ursula_index::validate_stream_url(&request.stream_url).map_err(ApiError)?;
+    let stream_url = crate::validate_stream_url(&request.stream_url).map_err(ApiError)?;
     let canonical_stream_url = stream_url.to_string();
     let source_range = SourceClient::new(stream_url, 1)
         .map_err(ApiError)?
@@ -1239,14 +1244,6 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::Mutex;
     use tower::ServiceExt;
-    use ursula_index::EventEntry;
-    use ursula_index::EventIndex;
-    use ursula_index::EventIndexCache;
-    use ursula_index::EventIndexConfig;
-    use ursula_index::FsObjectStore;
-    use ursula_index::IndexCatalog;
-    use ursula_index::IndexError;
-    use ursula_index::IndexRegistration;
 
     use super::PoolIndexSettings;
     use super::PoolState;
@@ -1257,6 +1254,14 @@ mod tests {
     use super::pool_router;
     use super::process_pool_source;
     use super::reconcile_pool_indexes;
+    use crate::EventEntry;
+    use crate::EventIndex;
+    use crate::EventIndexCache;
+    use crate::EventIndexConfig;
+    use crate::FsObjectStore;
+    use crate::IndexCatalog;
+    use crate::IndexError;
+    use crate::IndexRegistration;
 
     async fn fs_index(
         objects: &TempDir,
