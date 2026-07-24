@@ -27,6 +27,22 @@ def indexer_values() -> tuple[str, ...]:
 
 
 class HelmTemplateConfigTest(unittest.TestCase):
+    def test_every_deployment_role_uses_the_unified_ursula_binary(self) -> None:
+        rendered = render_chart(
+            *indexer_values(),
+            "--set",
+            "gateway.enabled=true",
+        )
+
+        self.assertNotIn("/usr/local/bin/ursulagw", rendered)
+        self.assertNotIn("/usr/local/bin/ursula-indexer", rendered)
+        self.assertIn("- /usr/local/bin/ursula\n          args:\n            - gateway", rendered)
+        self.assertIn("- /usr/local/bin/ursula\n          args:\n            - indexer", rendered)
+        self.assertIn(
+            'exec /usr/local/bin/ursula server --config "${config_path}"',
+            rendered,
+        )
+
     def test_max_uncommitted_value_uses_single_raft_table(self) -> None:
         config = render_config("--set", "raft.maxUncommittedBytesPerGroup=8388608", "--set", "s3.bucket=bkt")
 

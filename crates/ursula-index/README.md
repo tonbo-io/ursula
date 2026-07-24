@@ -1,6 +1,6 @@
 # Ursula event-time index
 
-`ursula-indexer` is a rebuildable materialized index for the client-supplied event time in Ursula JSON record streams. Ursula remains the event source. The indexer consumes record envelopes over HTTP, writes immutable sorted Parquet parts to S3, and conditionally publishes source-record progress.
+The `ursula indexer` role is a rebuildable materialized index for the client-supplied event time in Ursula JSON record streams. Ursula remains the event source. The indexer consumes record envelopes over HTTP, writes immutable sorted Parquet parts to S3, and conditionally publishes source-record progress.
 
 The index is deliberately outside Ursula's Raft state machine. S3 is authoritative for the derived index; local disk is only a bounded, disposable Parquet cache. Multiple stateless workers claim different `(stream, record range)` tasks. Claims reduce duplicate work but are not locks: immutable content-addressed parts and an ETag compare-and-swap on each stream's `CURRENT` manifest provide correctness. Ranges may complete out of order, while `durable_through_record` advances only through a gap-free prefix.
 
@@ -19,7 +19,7 @@ The verified-range manifest is format version 5. Older indexes are not adopted a
 Passing `--stream-url` selects the legacy single-source mode for local development and focused recovery work:
 
 ```bash
-cargo run -p ursula-index --bin ursula-indexer -- \
+cargo run -p ursula --bin ursula -- indexer \
   --stream-url http://127.0.0.1:4437/telemetry/browser-telemetry \
   --s3-bucket my-telemetry-index \
   --s3-region us-east-1 \

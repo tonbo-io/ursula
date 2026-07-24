@@ -1,6 +1,6 @@
 # Ursula Gateway
 
-`ursulagw` is a small HTTP/SSE gateway for Ursula clusters. It gives public
+The `ursula gateway` role is a small HTTP/SSE gateway for Ursula clusters. It gives public
 clients one stable HTTP endpoint while keeping internal Ursula node addresses
 out of public responses.
 
@@ -30,7 +30,7 @@ Shared hosted deployments can treat the bucket as the logical tenant or owner
 namespace, while a standalone deployment can keep using bucket names exactly as
 before.
 
-`Gateway::new` does not enable access control. The stock `ursulagw` binary
+`Gateway::new` does not enable access control. The stock `ursula gateway` role
 therefore remains a transparent, tenant-unaware gateway and requires no OAuth
 configuration.
 
@@ -77,7 +77,7 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
 Start a gateway in front of one or more Ursula HTTP or HTTPS nodes:
 
 ```bash
-cargo run -p ursula-gateway --bin ursulagw -- \
+cargo run -p ursula --bin ursula -- gateway \
   --listen 127.0.0.1:8080 \
   --upstream http://127.0.0.1:4437 \
   --upstream http://127.0.0.1:4438 \

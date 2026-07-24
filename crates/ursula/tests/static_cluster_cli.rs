@@ -803,7 +803,7 @@ fn spawn_node(
         None,
     );
     let mut command = Command::new(binary);
-    command.arg("--config").arg(&config_path);
+    command.arg("server").arg("--config").arg(&config_path);
     let mut guard = spawn_child(command, format!("memory-node-{node_id}-{port}"));
     guard.config_path = Some(config_path);
     guard
@@ -811,13 +811,13 @@ fn spawn_node(
 
 fn spawn_node_with_cluster_config(binary: &str, config_path: &Path) -> ChildGuard {
     let mut command = Command::new(binary);
-    command.arg("--config").arg(config_path);
+    command.arg("server").arg("--config").arg(config_path);
     spawn_child(command, child_label("durable-node", config_path))
 }
 
 fn spawn_node_with_cluster_config_and_cold_s3(binary: &str, config_path: &Path) -> ChildGuard {
     let mut command = Command::new(binary);
-    command.arg("--config").arg(config_path);
+    command.arg("server").arg("--config").arg(config_path);
     for name in [
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",

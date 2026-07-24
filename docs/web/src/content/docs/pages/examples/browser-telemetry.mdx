@@ -83,7 +83,7 @@ The source stream remains canonical and the derived index can be rebuilt from re
 This flow uses only HTTP/SSE. It does not depend on Append Session.
 
 ```bash
-cargo run -p ursula-index --bin ursula-indexer -- \
+cargo run -p ursula --bin ursula -- indexer \
   --stream-url http://127.0.0.1:4437/telemetry/browser-telemetry \
   --s3-bucket my-telemetry-index \
   --s3-prefix production/browser-telemetry \

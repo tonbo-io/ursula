@@ -5,9 +5,11 @@
 //!
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
 //! - [`bootstrap`]: typed-config `spawn_*_runtime` constructors and cold-flush worker.
+//! - [`server`]: command arguments and the long-running server service entrypoint.
 
 mod bootstrap;
 mod otel_metrics;
+pub mod server;
 mod http_time {
     #[cfg(madsim)]
     pub use madsim::time::timeout;

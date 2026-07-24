@@ -29,7 +29,7 @@
   },
   {
     "category": "system_time_now",
-    "path": "crates/ursula-index/src/main.rs",
+    "path": "crates/ursula-index/src/service.rs",
     "snippet_contains": "SystemTime::now()",
     "reason": "already-cfg-gated",
     "plan": "no action: gc_wall_clock_now() uses the real wall clock only under cfg(not(madsim)); cfg(madsim) returns UNIX_EPOCH, and garbage_collect accepts an injected SystemTime for deterministic tests."
