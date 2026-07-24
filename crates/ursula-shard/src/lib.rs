@@ -12,6 +12,12 @@ pub struct ShardId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct RaftGroupId(pub u32);
 
+/// Stable two-level resource identity.
+///
+/// `bucket_id` is the top-level namespace and logical tenant boundary;
+/// `stream_id` identifies one Durable Stream inside that namespace. Hosted
+/// deployments keep tenant membership and bucket visibility policy outside the
+/// replicated stream state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BucketStreamId {
     pub bucket_id: String,
