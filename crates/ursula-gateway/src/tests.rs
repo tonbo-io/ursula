@@ -1,12 +1,15 @@
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
+use axum::http::header::AUTHORIZATION;
 use axum::http::header::LOCATION;
 use axum::routing::any;
 use axum::routing::get;
@@ -17,6 +20,13 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::*;
+use crate::auth::AccessControl;
+use crate::auth::AuthorizationError;
+use crate::auth::AuthorizationFuture;
+use crate::auth::Authorizer;
+use crate::auth::PrincipalResolver;
+use crate::auth::PrincipalResolverFuture;
+use crate::auth::VerifiedPrincipal;
 
 #[test]
 fn header_forwarding_applies_proxy_rules() {
@@ -133,6 +143,168 @@ fn gateway_with_response_header_timeout(
     Arc::new(Gateway::new(config))
 }
 
+#[derive(Debug)]
+struct FixedPrincipalResolver {
+    calls: AtomicUsize,
+    result: Result<VerifiedPrincipal, AuthenticationError>,
+}
+
+impl FixedPrincipalResolver {
+    fn valid() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            result: Ok(VerifiedPrincipal {
+                issuer: "https://issuer.example".to_owned(),
+                subject: "user-1".to_owned(),
+                client_id: "client-1".to_owned(),
+                scopes: auth::parse_scope("streams:read streams:write"),
+                issued_at: 1,
+                expires_at: u64::MAX,
+                token_id: "token-1".to_owned(),
+            }),
+        }
+    }
+}
+
+impl PrincipalResolver for FixedPrincipalResolver {
+    fn resolve<'a>(&'a self, bearer_token: &'a str) -> PrincipalResolverFuture<'a> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let result = if bearer_token == "valid-token" {
+            self.result.clone()
+        } else {
+            Err(AuthenticationError::InvalidCredential)
+        };
+        Box::pin(async move { result })
+    }
+}
+
+#[derive(Debug)]
+struct RecordingAuthorizer {
+    decision: Result<AuthorizationDecision, AuthorizationError>,
+    requests: Mutex<Vec<AuthorizationRequest>>,
+}
+
+impl RecordingAuthorizer {
+    fn new(decision: AuthorizationDecision) -> Self {
+        Self {
+            decision: Ok(decision),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl Authorizer for RecordingAuthorizer {
+    fn authorize<'a>(&'a self, request: AuthorizationRequest) -> AuthorizationFuture<'a> {
+        self.requests
+            .lock()
+            .expect("authorization request lock")
+            .push(request);
+        let decision = self.decision.clone();
+        Box::pin(async move { decision })
+    }
+}
+
+fn gateway_with_access_control(
+    upstream_url: impl Into<String>,
+    resolver: Arc<FixedPrincipalResolver>,
+    authorizer: Arc<RecordingAuthorizer>,
+) -> Gateway {
+    Gateway::with_access_control(
+        test_config(vec![upstream_url.into()]),
+        AccessControl::new(resolver, authorizer),
+    )
+}
+
+#[test]
+fn request_classifier_maps_durable_stream_routes_to_bucket_resources() {
+    let cases = [
+        ("PUT", "/owner-a", Action::AdministerBucket, None),
+        ("PUT", "/owner-a/orders", Action::Create, Some("orders")),
+        ("POST", "/owner-a/orders", Action::Append, Some("orders")),
+        ("GET", "/owner-a/orders", Action::Read, Some("orders")),
+        (
+            "GET",
+            "/owner-a/orders?record=now&live=sse",
+            Action::Tail,
+            Some("orders"),
+        ),
+        ("HEAD", "/owner-a/orders", Action::Head, Some("orders")),
+        ("DELETE", "/owner-a/orders", Action::Delete, Some("orders")),
+        (
+            "PUT",
+            "/owner-a/orders/attrs",
+            Action::Update,
+            Some("orders"),
+        ),
+        (
+            "GET",
+            "/owner-a/orders/snapshot",
+            Action::ReadSnapshot,
+            Some("orders"),
+        ),
+        (
+            "PUT",
+            "/owner-a/orders/snapshot/42",
+            Action::PublishSnapshot,
+            Some("orders"),
+        ),
+    ];
+
+    for (method, uri, expected_action, expected_stream) in cases {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request");
+        let classified = classify_request(request.method(), request.uri(), request.headers())
+            .expect("classified Durable Streams request");
+        assert_eq!(classified.resource.bucket_id, "owner-a");
+        assert_eq!(
+            classified.resource.stream_id.as_deref(),
+            expected_stream,
+            "{method} {uri}"
+        );
+        assert_eq!(classified.action, expected_action, "{method} {uri}");
+    }
+}
+
+#[test]
+fn request_classifier_distinguishes_final_writes() {
+    for (method, expected_action) in [
+        ("PUT", Action::CreateAndClose),
+        ("POST", Action::AppendAndClose),
+    ] {
+        let request = Request::builder()
+            .method(method)
+            .uri("/owner-a/orders")
+            .header(HEADER_STREAM_CLOSED, "true")
+            .body(Body::empty())
+            .expect("request");
+
+        let classified = classify_request(request.method(), request.uri(), request.headers())
+            .expect("classified final write");
+
+        assert_eq!(classified.action, expected_action);
+    }
+}
+
+#[test]
+fn request_classifier_decodes_resource_path_segments() {
+    let request = Request::builder()
+        .method("GET")
+        .uri("/owner-a/hello%20world")
+        .body(Body::empty())
+        .expect("request");
+
+    let classified = classify_request(request.method(), request.uri(), request.headers())
+        .expect("classified request");
+
+    assert_eq!(
+        classified.resource.stream_id.as_deref(),
+        Some("hello world")
+    );
+}
+
 #[tokio::test]
 async fn gateway_handle_returns_service_unavailable_without_upstreams() {
     let gateway = Gateway::new(test_config(Vec::new()));
@@ -145,6 +317,203 @@ async fn gateway_handle_returns_service_unavailable_without_upstreams() {
     let resp = gateway.handle(req).await;
 
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn gateway_without_access_control_preserves_existing_pass_through_behavior() {
+    let upstream = spawn_upstream(Router::new().route(
+        "/bucket/stream",
+        get(|headers: HeaderMap| async move {
+            headers
+                .get(AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("missing")
+                .to_owned()
+        }),
+    ))
+    .await;
+    let gateway = Gateway::new(test_config(vec![upstream.url.clone()]));
+    let request = Request::builder()
+        .method("GET")
+        .uri("/bucket/stream")
+        .header(AUTHORIZATION, "Bearer existing-client-token")
+        .body(Body::empty())
+        .expect("request");
+
+    let response = gateway.handle(request).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body")
+        .to_bytes();
+    assert_eq!(&body[..], b"Bearer existing-client-token");
+}
+
+#[tokio::test]
+async fn access_control_allows_anonymous_public_resource_without_resolving_token() {
+    let upstream =
+        spawn_upstream(Router::new().route("/public/events", get(|| async { StatusCode::OK })))
+            .await;
+    let resolver = Arc::new(FixedPrincipalResolver::valid());
+    let authorizer = Arc::new(RecordingAuthorizer::new(AuthorizationDecision::Allow));
+    let gateway = gateway_with_access_control(
+        upstream.url.clone(),
+        Arc::clone(&resolver),
+        Arc::clone(&authorizer),
+    );
+    let request = Request::builder()
+        .method("GET")
+        .uri("/public/events")
+        .body(Body::empty())
+        .expect("request");
+
+    let response = gateway.handle(request).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 0);
+    let requests = authorizer.requests.lock().expect("authorization requests");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].principal, None);
+    assert_eq!(requests[0].resource.bucket_id, "public");
+    assert_eq!(requests[0].resource.stream_id.as_deref(), Some("events"));
+    assert_eq!(requests[0].action, Action::Read);
+}
+
+#[tokio::test]
+async fn access_control_resolves_bearer_and_does_not_forward_it_upstream() {
+    let upstream = spawn_upstream(Router::new().route(
+        "/owner-a/events",
+        get(|headers: HeaderMap| async move {
+            if headers.contains_key(AUTHORIZATION) {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::OK
+            }
+        }),
+    ))
+    .await;
+    let resolver = Arc::new(FixedPrincipalResolver::valid());
+    let authorizer = Arc::new(RecordingAuthorizer::new(AuthorizationDecision::Allow));
+    let gateway = gateway_with_access_control(
+        upstream.url.clone(),
+        Arc::clone(&resolver),
+        Arc::clone(&authorizer),
+    );
+    let request = Request::builder()
+        .method("GET")
+        .uri("/owner-a/events")
+        .header(AUTHORIZATION, "Bearer valid-token")
+        .body(Body::empty())
+        .expect("request");
+
+    let response = gateway.handle(request).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+    let requests = authorizer.requests.lock().expect("authorization requests");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]
+            .principal
+            .as_ref()
+            .map(|principal| principal.subject.as_str()),
+        Some("user-1")
+    );
+}
+
+#[tokio::test]
+async fn access_control_conceals_private_resource_before_forwarding() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream_hits = Arc::clone(&hits);
+    let upstream = spawn_upstream(Router::new().route(
+        "/private/events",
+        get(move || {
+            let upstream_hits = Arc::clone(&upstream_hits);
+            async move {
+                upstream_hits.fetch_add(1, Ordering::Relaxed);
+                StatusCode::OK
+            }
+        }),
+    ))
+    .await;
+    let resolver = Arc::new(FixedPrincipalResolver::valid());
+    let authorizer = Arc::new(RecordingAuthorizer::new(
+        AuthorizationDecision::ConcealAsNotFound,
+    ));
+    let gateway = gateway_with_access_control(upstream.url.clone(), resolver, authorizer);
+    let request = Request::builder()
+        .method("GET")
+        .uri("/private/events")
+        .body(Body::empty())
+        .expect("request");
+
+    let response = gateway.handle(request).await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn access_control_rejects_invalid_bearer_before_authorization() {
+    let resolver = Arc::new(FixedPrincipalResolver::valid());
+    let authorizer = Arc::new(RecordingAuthorizer::new(AuthorizationDecision::Allow));
+    let gateway =
+        gateway_with_access_control("http://127.0.0.1:1", resolver, Arc::clone(&authorizer));
+    let request = Request::builder()
+        .method("GET")
+        .uri("/owner-a/events")
+        .header(AUTHORIZATION, "Basic not-a-bearer")
+        .body(Body::empty())
+        .expect("request");
+
+    let response = gateway.handle(request).await;
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response
+            .headers()
+            .get(WWW_AUTHENTICATE)
+            .expect("authenticate challenge"),
+        r#"Bearer error="invalid_token""#
+    );
+    assert!(
+        authorizer
+            .requests
+            .lock()
+            .expect("authorization requests")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn access_control_fails_closed_for_unclassified_routes() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream_hits = Arc::clone(&hits);
+    let upstream = spawn_upstream(Router::new().fallback(any(move || {
+        let upstream_hits = Arc::clone(&upstream_hits);
+        async move {
+            upstream_hits.fetch_add(1, Ordering::Relaxed);
+            StatusCode::OK
+        }
+    })))
+    .await;
+    let resolver = Arc::new(FixedPrincipalResolver::valid());
+    let authorizer = Arc::new(RecordingAuthorizer::new(AuthorizationDecision::Allow));
+    let gateway = gateway_with_access_control(upstream.url.clone(), resolver, authorizer);
+
+    for uri in ["/__ursula/metrics", "/future-unclassified-route"] {
+        let request = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request");
+        let response = gateway.handle(request).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]

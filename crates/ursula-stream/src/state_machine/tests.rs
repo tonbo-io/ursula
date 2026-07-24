@@ -627,6 +627,53 @@ fn stream_create_requires_existing_bucket_and_valid_ids() {
 }
 
 #[test]
+fn identical_stream_names_are_isolated_by_bucket_namespace() {
+    let mut machine = StreamStateMachine::new();
+    for bucket_id in ["owner-a", "owner-b"] {
+        assert_eq!(
+            machine.apply(StreamCommand::CreateBucket {
+                bucket_id: bucket_id.to_owned(),
+            }),
+            StreamResponse::BucketCreated {
+                bucket_id: bucket_id.to_owned(),
+            }
+        );
+    }
+    let first = BucketStreamId::new("owner-a", "same-stream");
+    let second = BucketStreamId::new("owner-b", "same-stream");
+
+    assert_eq!(
+        machine.apply(create_cmd(first.clone(), Create {
+            payload: b"first".to_vec(),
+            ..Create::default()
+        })),
+        created(first.clone(), 5)
+    );
+    assert_eq!(
+        machine.apply(create_cmd(second.clone(), Create {
+            payload: b"second".to_vec(),
+            ..Create::default()
+        })),
+        created(second.clone(), 6)
+    );
+
+    assert_eq!(
+        machine
+            .read(&first, 0, 16)
+            .expect("read first bucket")
+            .payload,
+        b"first"
+    );
+    assert_eq!(
+        machine
+            .read(&second, 0, 16)
+            .expect("read second bucket")
+            .payload,
+        b"second"
+    );
+}
+
+#[test]
 fn create_stream_is_idempotent_only_when_metadata_matches() {
     let mut machine = machine();
     create_stream(&mut machine, "s-1");
