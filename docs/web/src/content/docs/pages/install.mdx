@@ -16,7 +16,7 @@ Both start the same in-memory, non-replicated node on port `4437`. Nothing is pe
 Every release publishes a multi-arch image to GHCR:
 
 ```bash
-docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.3.2
+docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.3.3
 ```
 
 The image runs as a non-root user and contains both `ursula` (the server) and `ursulactl` (the operator CLI). Images are published only from release tags, so pin the version you want to run.
@@ -50,7 +50,7 @@ Clone, build, and start the server:
 git clone https://github.com/tonbo-io/ursula.git
 cd ursula
 cargo build --release -p ursula -p ursula-ctl
-./target/release/ursula
+./target/release/ursula server
 ```
 
 The server is now listening on `127.0.0.1:4437`. The build also produces `target/release/ursulactl`, the operator CLI you will use once a cluster is up.

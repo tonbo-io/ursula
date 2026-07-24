@@ -107,7 +107,7 @@ Node-level loss: replace the host with the same `node_id` and cluster config, an
 `RUST_LOG=ursula=info,ursula_runtime=info,ursula_raft=info` is the baseline. Bump to `debug` for one crate when chasing a subsystem:
 
 ```bash
-RUST_LOG=ursula_raft=debug ./target/release/ursula ...
+RUST_LOG=ursula_raft=debug ./target/release/ursula server ...
 ```
 
 `debug` is verbose under sustained load, so redirect to a file.

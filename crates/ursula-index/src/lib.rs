@@ -9,6 +9,7 @@
 //! - [`manifest`]: the conditionally published manifest state model.
 //! - [`object_store`]: conditional object operations for S3 and local tests.
 //! - [`part`]: immutable sorted Parquet parts.
+//! - [`service`]: command arguments and the long-running indexer service entrypoint.
 //! - [`source`]: HTTP client for the upstream record stream.
 //! - [`store`]: shared event, query, status, configuration, and error types.
 
@@ -18,6 +19,7 @@ mod index;
 mod manifest;
 mod object_store;
 mod part;
+pub mod service;
 mod source;
 mod store;
 

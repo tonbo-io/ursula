@@ -12,6 +12,7 @@
 //! Module map:
 //!
 //! - [`auth`]: opt-in, provider-neutral authentication and authorization hooks.
+//! - [`service`]: command arguments and the long-running gateway service entrypoint.
 
 use std::error::Error as _;
 use std::net::SocketAddr;
@@ -37,6 +38,7 @@ use tracing::debug;
 use tracing::error;
 
 pub mod auth;
+pub mod service;
 
 use crate::auth::AccessControl;
 use crate::auth::Action;

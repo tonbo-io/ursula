@@ -60,8 +60,9 @@ spec:
           image: {{ include "ursula.gatewayImage" . | quote }}
           imagePullPolicy: {{ default .Values.global.image.pullPolicy .Values.gateway.image.pullPolicy }}
           command:
-            - /usr/local/bin/ursulagw
+            - /usr/local/bin/ursula
           args:
+            - gateway
             - --listen
             - {{ printf "0.0.0.0:%d" (.Values.gateway.ports.http | int) | quote }}
             - --connect-timeout

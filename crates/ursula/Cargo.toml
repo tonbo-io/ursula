@@ -7,7 +7,7 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
-description = "Ursula durable-stream server: thread-per-core, multi-Raft, HTTP front door."
+description = "Ursula deployment binary: Durable Streams server, gateway, and event-time indexer."
 
 [features]
 default = ["release-max-info"]
@@ -45,6 +45,8 @@ tonic = { workspace = true, features = ["transport"] }
 tower = { workspace = true, features = ["util", "limit", "load-shed"] }
 tracing = { workspace = true }
 ursula-config = { workspace = true }
+ursula-gateway = { workspace = true }
+ursula-index = { workspace = true }
 ursula-observability = { workspace = true, features = ["otlp"] }
 ursula-raft = { workspace = true }
 ursula-runtime = { workspace = true }

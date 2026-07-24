@@ -53,8 +53,9 @@ spec:
           image: {{ include "ursula.indexerImage" $root | quote }}
           imagePullPolicy: {{ default $root.Values.global.image.pullPolicy $root.Values.indexer.image.pullPolicy }}
           command:
-            - /usr/local/bin/ursula-indexer
+            - /usr/local/bin/ursula
           args:
+            - indexer
             - --s3-bucket
             - {{ $bucket | quote }}
             - --s3-prefix

@@ -9,10 +9,6 @@ homepage.workspace = true
 readme = "README.md"
 description = "Ursula Gateway: routes client HTTP traffic while hiding internal leader redirects."
 
-[[bin]]
-name = "ursulagw"
-path = "src/main.rs"
-
 [dependencies]
 axum = { workspace = true }
 bytes = { workspace = true }
