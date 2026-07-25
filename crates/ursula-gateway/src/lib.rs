@@ -66,6 +66,8 @@ use crate::usage::UsageKey;
 
 const HEADER_URSULA_RAFT_LEADER_ID: &str = "x-ursula-raft-leader-id";
 const HEADER_STREAM_CLOSED: &str = "stream-closed";
+const MAX_LONG_POLL_TIMEOUT_MS: u64 = 60_000;
+const LONG_POLL_RESPONSE_HEADER_GRACE: Duration = Duration::from_secs(2);
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
@@ -369,7 +371,7 @@ impl Gateway {
         debug!(method = %parts.method, url = %url, "sending upstream request");
 
         tokio::time::timeout(
-            self.response_header_timeout,
+            self.response_header_timeout_for_url(url),
             self.client
                 .request(parts.method.clone(), url)
                 .headers(copy_forwarded_headers(&parts.headers, true))
@@ -379,6 +381,30 @@ impl Gateway {
         .await
         .map_err(|e| GatewayError::Upstream(format!("upstream response header timeout: {e}")))?
         .map_err(|e| GatewayError::Upstream(e.to_string()))
+    }
+
+    fn response_header_timeout_for_url(&self, url: &str) -> Duration {
+        let Ok(url) = reqwest::Url::parse(url) else {
+            return self.response_header_timeout;
+        };
+        let mut is_long_poll = false;
+        let mut requested_timeout_ms = None;
+        for (key, value) in url.query_pairs() {
+            match key.as_ref() {
+                "live" if value == "long-poll" => is_long_poll = true,
+                "timeout_ms" => requested_timeout_ms = value.parse::<u64>().ok(),
+                _ => {}
+            }
+        }
+        if !is_long_poll {
+            return self.response_header_timeout;
+        }
+        let upstream_timeout = requested_timeout_ms
+            .unwrap_or(1_000)
+            .clamp(1, MAX_LONG_POLL_TIMEOUT_MS);
+        self.response_header_timeout.max(
+            Duration::from_millis(upstream_timeout).saturating_add(LONG_POLL_RESPONSE_HEADER_GRACE),
+        )
     }
 
     fn build_response(
