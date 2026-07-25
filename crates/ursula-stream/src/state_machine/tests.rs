@@ -3350,3 +3350,62 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn purge_bucket_removes_streams_usage_and_bucket_idempotently() {
+    let mut machine = machine();
+    create_stream(&mut machine, "orders");
+    create_stream(&mut machine, "journal");
+    assert!(matches!(
+        machine.apply(append_cmd(stream("orders"), b"abc", Append::default())),
+        StreamResponse::Appended { .. }
+    ));
+    // A second tenant that must survive the purge untouched.
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateBucket {
+            bucket_id: "other-tenant".to_owned(),
+        }),
+        StreamResponse::BucketCreated { .. }
+    ));
+    let other = BucketStreamId::new("other-tenant", "orders");
+    assert!(matches!(
+        machine.apply(create_cmd(other.clone(), Create::default())),
+        StreamResponse::Created { .. }
+    ));
+
+    let response = machine.apply(StreamCommand::PurgeBucket {
+        bucket_id: "benchcmp".to_owned(),
+    });
+    let StreamResponse::BucketPurged {
+        bucket_id,
+        removed_streams,
+    } = response
+    else {
+        panic!("expected BucketPurged, got {response:?}");
+    };
+    assert_eq!(bucket_id, "benchcmp");
+    assert_eq!(removed_streams, 2);
+
+    // Streams, usage ledger, and the bucket itself are gone.
+    assert!(
+        machine
+            .bucket_usage_report()
+            .into_iter()
+            .all(|entry| entry.bucket_id != "benchcmp")
+    );
+    assert!(matches!(
+        machine.apply(append_cmd(stream("orders"), b"x", Append::default())),
+        StreamResponse::Error { .. }
+    ));
+    // The other tenant is untouched.
+    assert_eq!(bucket_usage(&machine, "other-tenant").stream_count, 1);
+
+    // Idempotent re-run reports zero removals.
+    let rerun = machine.apply(StreamCommand::PurgeBucket {
+        bucket_id: "benchcmp".to_owned(),
+    });
+    assert!(matches!(rerun, StreamResponse::BucketPurged {
+        removed_streams: 0,
+        ..
+    }));
+}

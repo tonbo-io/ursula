@@ -6315,3 +6315,99 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
     }
     assert!(conflicted, "expected at least one bucket-owning group");
 }
+
+// #150: administrator-triggered tenant purge. Purging tenant A must remove
+// its streams, bucket, and usage ledger entry while tenant B's identically
+// named stream, record coordinates, and snapshot survive untouched; a re-run
+// converges idempotently on the same report shape with zero counts.
+#[tokio::test]
+async fn purge_endpoint_erases_one_tenant_and_leaves_the_other_intact() {
+    let app = test_router();
+
+    for (bucket, payload) in [
+        ("tenant-a", r#"{"who":"a"}"#),
+        ("tenant-b", r#"{"who":"b"}"#),
+    ] {
+        let response = http_put(
+            &app,
+            &format!("/{bucket}/orders"),
+            &[(CONTENT_TYPE.as_str(), "application/json")],
+            Body::from(payload),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+    let response = http_put(
+        &app,
+        "/tenant-a/orders/snapshot?record=1",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"count":1}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = send(
+        &app,
+        "DELETE",
+        "/__ursula/purge/tenant-a",
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    let report: serde_json::Value = serde_json::from_slice(&body).expect("purge report JSON");
+    assert_eq!(report["bucket"], "tenant-a");
+    assert_eq!(report["removed_streams"], 1);
+    assert!(
+        report["groups_with_streams"]
+            .as_array()
+            .is_some_and(|groups| !groups.is_empty())
+    );
+
+    // Tenant A conceals as not-found across streams and snapshots.
+    let response = http_get(&app, "/tenant-a/orders?record=0&max_records=1").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = http_get(&app, "/tenant-a/orders/snapshot").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // Tenant B's identically named stream is untouched.
+    let response = http_get(&app, "/tenant-b/orders?record=0&max_records=10").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
+    let body = body_bytes(response).await;
+    let body = std::str::from_utf8(&body).expect("utf8 body");
+    assert!(body.contains(r#""who":"b""#));
+
+    // The usage ledger no longer reports the purged tenant.
+    let response = http_get(&app, "/__ursula/usage").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    let usage: serde_json::Value = serde_json::from_slice(&body).expect("usage JSON");
+    assert!(usage["buckets"].get("tenant-a").is_none());
+    assert!(usage["buckets"].get("tenant-b").is_some());
+
+    // Idempotent re-run: same report shape, zero removals.
+    let response = send(
+        &app,
+        "DELETE",
+        "/__ursula/purge/tenant-a",
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    let rerun: serde_json::Value = serde_json::from_slice(&body).expect("rerun report JSON");
+    assert_eq!(rerun["removed_streams"], 0);
+
+    // The tenant can be recreated cleanly after a purge.
+    let response = http_put(
+        &app,
+        "/tenant-a/orders",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"who":"a2"}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+}

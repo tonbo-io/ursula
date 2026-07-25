@@ -76,6 +76,7 @@ use ursula_runtime::GroupInstallSnapshotFuture;
 use ursula_runtime::GroupPlanColdFlushFuture;
 use ursula_runtime::GroupPlanNextColdFlushBatchFuture;
 use ursula_runtime::GroupPublishSnapshotFuture;
+use ursula_runtime::GroupPurgeBucketFuture;
 use ursula_runtime::GroupReadSnapshotFuture;
 use ursula_runtime::GroupReadStreamFuture;
 use ursula_runtime::GroupReadStreamPartsFuture;
@@ -1136,6 +1137,16 @@ impl GroupEngine for MadsimScopedGroupEngine {
     fn bucket_usage<'a>(&'a mut self, placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
             self.inner.bucket_usage(placement).await
+        }))
+    }
+
+    fn purge_bucket<'a>(
+        &'a mut self,
+        bucket_id: String,
+        placement: ShardPlacement,
+    ) -> GroupPurgeBucketFuture<'a> {
+        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
+            self.inner.purge_bucket(bucket_id, placement).await
         }))
     }
 

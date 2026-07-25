@@ -64,6 +64,7 @@ use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
+use crate::request::PurgeBucketResponse;
 use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
@@ -1011,6 +1012,17 @@ impl CoreWorker {
     ) -> Result<AckColdGcResponse, RuntimeError> {
         group
             .ack_cold_gc(up_to_seq, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err))
+    }
+
+    pub(crate) async fn purge_bucket(
+        group: &mut Box<dyn GroupEngine>,
+        bucket_id: String,
+        placement: ShardPlacement,
+    ) -> Result<PurgeBucketResponse, RuntimeError> {
+        group
+            .purge_bucket(bucket_id, placement)
             .await
             .map_err(|err| RuntimeError::group_engine(placement, err))
     }

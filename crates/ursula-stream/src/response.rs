@@ -67,6 +67,13 @@ pub enum StreamResponse {
     ColdGcAcked {
         removed: u64,
     },
+    /// A whole-bucket purge accepted by [`StreamCommand::PurgeBucket`].
+    ///
+    /// [`StreamCommand::PurgeBucket`]: crate::StreamCommand::PurgeBucket
+    BucketPurged {
+        bucket_id: String,
+        removed_streams: u64,
+    },
     /// A whole-group state import accepted by [`StreamCommand::ImportSnapshot`].
     ///
     /// [`StreamCommand::ImportSnapshot`]: crate::StreamCommand::ImportSnapshot

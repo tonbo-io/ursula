@@ -755,6 +755,10 @@ pub fn admin_router(state: HttpState) -> Router {
         Router::new()
             .route("/__ursula/metrics", get(metrics))
             .route("/__ursula/usage", get(bucket_usage))
+            .route(
+                "/__ursula/purge/{bucket}",
+                axum::routing::delete(purge_bucket),
+            )
             .with_state(state),
     )
 }
@@ -1018,6 +1022,10 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
     Router::new()
         .route("/__ursula/metrics", get(metrics))
         .route("/__ursula/usage", get(bucket_usage))
+        .route(
+            "/__ursula/purge/{bucket}",
+            axum::routing::delete(purge_bucket),
+        )
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route("/{bucket}", put(create_bucket))
         .route(
@@ -1156,6 +1164,52 @@ pub(crate) fn append_http_response(response: AppendResponse) -> Response {
     };
     (status, headers).into_response()
 }
+
+/// Administrator-triggered tenant offboarding (#150): purges the bucket from
+/// every Raft group, then runs one cold-GC pass so the enqueued cold-object
+/// prefixes are reclaimed before the report returns. Idempotent — purging an
+/// absent bucket returns the same report shape with zero counts, and a
+/// crashed purge converges on re-run because cold reclamation is
+/// list-then-delete over object prefixes.
+pub(crate) async fn purge_bucket(
+    State(state): State<HttpState>,
+    Path(bucket): Path<String>,
+) -> Response {
+    let report = match state.runtime.purge_bucket_all_groups(&bucket).await {
+        Ok(report) => report,
+        Err(err) => {
+            let target = format!("/__ursula/purge/{bucket}");
+            return runtime_error_or_leader_redirect_async(&state, err, &target).await;
+        }
+    };
+    // Reclaim the just-enqueued cold prefixes now instead of waiting for the
+    // background worker's next pass. Failures leave entries queued for the
+    // worker; the purge itself is already durable.
+    let cold_gc_reclaimed = match state
+        .runtime
+        .run_cold_gc_all_groups_once(COLD_GC_PURGE_BATCH_MAX_ENTRIES)
+        .await
+    {
+        Ok(reclaimed) => reclaimed,
+        Err(err) => {
+            tracing::warn!(
+                bucket = %bucket,
+                error = %err,
+                "cold GC pass after purge failed; background worker will finish reclamation"
+            );
+            0
+        }
+    };
+    axum::Json(serde_json::json!({
+        "bucket": bucket,
+        "removed_streams": report.removed_streams,
+        "groups_with_streams": report.groups_with_streams,
+        "cold_gc_entries_reclaimed": cold_gc_reclaimed,
+    }))
+    .into_response()
+}
+
+const COLD_GC_PURGE_BATCH_MAX_ENTRIES: usize = 4096;
 
 pub(crate) async fn create_bucket(Path(_bucket): Path<String>) -> Response {
     StatusCode::CREATED.into_response()

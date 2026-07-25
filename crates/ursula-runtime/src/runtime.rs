@@ -79,6 +79,7 @@ use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
+use crate::request::PurgeBucketResponse;
 use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
@@ -161,6 +162,13 @@ pub struct ShardRuntime {
     metrics: Arc<RuntimeMetricsInner>,
     next_waiter_id: Arc<AtomicU64>,
     cold_store: Option<ColdStoreHandle>,
+}
+
+/// Cluster-local summary of a bucket purge across all Raft groups.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PurgeBucketReport {
+    pub removed_streams: u64,
+    pub groups_with_streams: Vec<usize>,
 }
 
 impl ShardRuntime {
@@ -411,6 +419,31 @@ impl ShardRuntime {
     /// Groups are read serially from their local applied state (leader or
     /// follower); usage export consumers tolerate replication lag, so this
     /// never requires leadership and never blocks on quorum.
+    /// Purges one tenant bucket from every Raft group: streams, bucket, and
+    /// usage entries. Idempotent — a re-run over an already purged bucket
+    /// reports zero removals. Cold objects are reclaimed by the enqueued GC
+    /// entries; callers wanting synchronous reclamation run the cold GC pass
+    /// afterwards.
+    pub async fn purge_bucket_all_groups(
+        &self,
+        bucket_id: &str,
+    ) -> Result<PurgeBucketReport, RuntimeError> {
+        let mut report = PurgeBucketReport::default();
+        let group_count = self.shard_map.raft_group_count();
+        for group_id in 0..group_count {
+            let response = self
+                .purge_bucket(RaftGroupId(group_id), bucket_id.to_owned())
+                .await?;
+            if response.removed_streams > 0 {
+                report.groups_with_streams.push(group_id as usize);
+            }
+            report.removed_streams = report
+                .removed_streams
+                .saturating_add(response.removed_streams);
+        }
+        Ok(report)
+    }
+
     pub async fn bucket_usage_all_groups(
         &self,
     ) -> Result<Vec<ursula_stream::BucketUsageSnapshot>, RuntimeError> {
