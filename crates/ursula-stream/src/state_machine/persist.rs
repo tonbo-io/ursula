@@ -86,6 +86,7 @@ impl StreamStateMachine {
             streams,
             pending_cold_gc: self.cold_gc.entries().cloned().collect(),
             next_cold_gc_seq: self.cold_gc.next_seq(),
+            bucket_usage: self.bucket_usage_report(),
         }
     }
 
@@ -205,6 +206,34 @@ impl StreamStateMachine {
 
         machine.cold_gc =
             ColdGcQueue::from_parts(snapshot.pending_cold_gc, snapshot.next_cold_gc_seq);
+
+        // Usage restore: gauges are recomputed from the restored slots so a
+        // snapshot can never carry gauge drift forward; only the monotonic
+        // counters are taken from the snapshot. Legacy snapshots without the
+        // field restart the monotonic counters from the recomputed gauges.
+        let mut recomputed: HashMap<String, super::BucketUsage> = HashMap::new();
+        for slot in machine.registry.slots() {
+            let usage = recomputed
+                .entry(slot.metadata.stream_id.bucket_id.clone())
+                .or_default();
+            usage.stream_count = usage.stream_count.saturating_add(1);
+            usage.retained_bytes = usage.retained_bytes.saturating_add(
+                slot.metadata
+                    .tail_offset
+                    .saturating_sub(slot.retained_offset),
+            );
+        }
+        for persisted in snapshot.bucket_usage {
+            let usage = recomputed.entry(persisted.bucket_id).or_default();
+            usage.committed_append_bytes = persisted.usage.committed_append_bytes;
+            usage.committed_records = persisted.usage.committed_records;
+        }
+        for usage in recomputed.values_mut() {
+            if usage.committed_append_bytes == 0 {
+                usage.committed_append_bytes = usage.retained_bytes;
+            }
+        }
+        machine.bucket_usage = recomputed;
 
         Ok(machine)
     }

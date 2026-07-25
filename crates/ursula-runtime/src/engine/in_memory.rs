@@ -22,6 +22,7 @@ use super::GroupAppendBatchFuture;
 use super::GroupAppendBatchResponse;
 use super::GroupAppendFuture;
 use super::GroupBootstrapStreamFuture;
+use super::GroupBucketUsageFuture;
 use super::GroupCloseStreamFuture;
 use super::GroupColdHotBacklogFuture;
 use super::GroupCompactColdFuture;
@@ -927,6 +928,12 @@ impl InMemoryGroupEngine {
         Ok(plan)
     }
 
+    /// Per-bucket usage held by this group's state machine. Public so the
+    /// Raft engine can serve usage reads from its applied state machine.
+    pub fn bucket_usage_report(&self) -> Vec<ursula_stream::BucketUsageSnapshot> {
+        self.state_machine.bucket_usage_report()
+    }
+
     pub fn head_stream_after_access(
         &mut self,
         request: &HeadStreamRequest,
@@ -1458,6 +1465,10 @@ impl GroupEngine for InMemoryGroupEngine {
             self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
             self.head_stream_after_access(&request, placement)
         })
+    }
+
+    fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
+        Box::pin(async move { Ok(self.state_machine.bucket_usage_report()) })
     }
 
     fn get_stream_attrs<'a>(

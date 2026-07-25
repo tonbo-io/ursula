@@ -16,6 +16,137 @@ fn stream(id: &str) -> BucketStreamId {
     BucketStreamId::new("benchcmp", id)
 }
 
+fn bucket_usage(machine: &StreamStateMachine, bucket_id: &str) -> crate::model::BucketUsage {
+    machine
+        .bucket_usage_report()
+        .into_iter()
+        .find(|entry| entry.bucket_id == bucket_id)
+        .map(|entry| entry.usage)
+        .unwrap_or_default()
+}
+
+#[test]
+fn usage_tracks_appends_retention_and_stream_lifecycle() {
+    let mut machine = machine();
+    create_stream(&mut machine, "usage");
+    let usage = bucket_usage(&machine, "benchcmp");
+    assert_eq!(usage.stream_count, 1);
+    assert_eq!(usage.committed_append_bytes, 0);
+
+    assert!(matches!(
+        machine.apply(append_cmd(stream("usage"), b"abc", Append::default())),
+        StreamResponse::Appended { .. }
+    ));
+    assert!(matches!(
+        machine.apply(append_cmd(stream("usage"), b"de", Append::default())),
+        StreamResponse::Appended { .. }
+    ));
+    let usage = bucket_usage(&machine, "benchcmp");
+    assert_eq!(usage.committed_append_bytes, 5);
+    assert_eq!(usage.committed_records, 2);
+    assert_eq!(usage.retained_bytes, 5);
+
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(
+            stream("usage"),
+            3,
+            "application/json",
+            br#"{"state":"abc"}"#,
+            0
+        )),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    assert!(matches!(
+        machine.apply(advance_retention_cmd(stream("usage"), 3, 1)),
+        StreamResponse::RetentionAdvanced { .. }
+    ));
+    let usage = bucket_usage(&machine, "benchcmp");
+    assert_eq!(
+        usage.committed_append_bytes, 5,
+        "monotonic counter survives retention"
+    );
+    assert_eq!(usage.retained_bytes, 2);
+
+    assert!(matches!(
+        machine.apply(delete_cmd(stream("usage"))),
+        StreamResponse::Deleted
+    ));
+    let usage = bucket_usage(&machine, "benchcmp");
+    assert_eq!(usage.stream_count, 0);
+    assert_eq!(usage.retained_bytes, 0);
+    assert_eq!(usage.committed_append_bytes, 5);
+}
+
+#[test]
+fn usage_does_not_count_deduplicated_appends() {
+    let mut machine = machine();
+    create_stream(&mut machine, "dedup");
+    let request = append_cmd(stream("dedup"), b"abcd", Append {
+        producer: Some(producer("writer", 0, 0)),
+        ..Append::default()
+    });
+    assert!(matches!(
+        machine.apply(request.clone()),
+        StreamResponse::Appended {
+            deduplicated: false,
+            ..
+        }
+    ));
+    assert!(matches!(machine.apply(request), StreamResponse::Appended {
+        deduplicated: true,
+        ..
+    }));
+    let usage = bucket_usage(&machine, "benchcmp");
+    assert_eq!(
+        usage.committed_append_bytes, 4,
+        "retried append counts once"
+    );
+    assert_eq!(usage.committed_records, 1);
+}
+
+#[test]
+fn usage_counts_json_records_and_survives_snapshot_restore() {
+    let mut machine = machine();
+    assert!(matches!(
+        machine.apply(create_cmd(stream("json-usage"), Create {
+            content_type: "application/json",
+            payload: b"{\"a\":1}\n{\"b\":2}\n".to_vec(),
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+    let usage = bucket_usage(&machine, "benchcmp");
+    assert_eq!(usage.committed_records, 2);
+    assert_eq!(usage.committed_append_bytes, 16);
+
+    let restored =
+        StreamStateMachine::restore(machine.snapshot()).expect("snapshot restores cleanly");
+    assert_eq!(
+        bucket_usage(&restored, "benchcmp"),
+        bucket_usage(&machine, "benchcmp"),
+        "usage survives a snapshot round-trip"
+    );
+
+    // TTL expiry releases the gauges but never the monotonic counters.
+    assert!(matches!(
+        machine.apply(create_cmd(stream("expiring"), Create {
+            payload: b"xyz".to_vec(),
+            ttl_seconds: Some(1),
+            now_ms: 0,
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+    assert!(matches!(
+        machine.apply(touch_cmd(stream("expiring"), 10_000)),
+        StreamResponse::Accessed { expired: true, .. }
+    ));
+    let usage = bucket_usage(&machine, "benchcmp");
+    assert_eq!(usage.stream_count, 1, "expired stream left the gauge");
+    assert_eq!(usage.committed_append_bytes, 19);
+    assert_eq!(usage.retained_bytes, 16);
+}
+
 /// A fresh state machine with the shared `benchcmp` bucket created.
 fn machine() -> StreamStateMachine {
     let mut machine = StreamStateMachine::new();
@@ -1701,6 +1832,7 @@ fn snapshot_restore_rejects_invalid_entries() {
             next_cold_gc_seq: 0,
             buckets: vec!["benchcmp".to_owned(), "benchcmp".to_owned()],
             streams: Vec::new(),
+            bucket_usage: Vec::new(),
         })
         .expect_err("duplicate bucket"),
         StreamSnapshotError::DuplicateBucket("benchcmp".to_owned())
@@ -1712,6 +1844,7 @@ fn snapshot_restore_rejects_invalid_entries() {
             next_cold_gc_seq: 0,
             buckets: vec!["benchcmp".to_owned()],
             streams: vec![entry],
+            bucket_usage: Vec::new(),
         })
     };
 

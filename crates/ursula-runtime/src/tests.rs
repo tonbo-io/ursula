@@ -1568,6 +1568,7 @@ async fn install_group_snapshot_rejects_mismatched_placement_before_routing() {
             streams: Vec::new(),
             pending_cold_gc: Vec::new(),
             next_cold_gc_seq: 0,
+            bucket_usage: Vec::new(),
         },
         stream_append_counts: Vec::new(),
     };
@@ -3538,6 +3539,10 @@ impl GroupEngine for BlockingReadEngine {
         self.inner.head_stream(request, placement)
     }
 
+    fn bucket_usage<'a>(&'a mut self, placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
+        self.inner.bucket_usage(placement)
+    }
+
     fn read_stream<'a>(
         &'a mut self,
         request: ReadStreamRequest,
@@ -3665,6 +3670,7 @@ impl GroupEngine for BlockingReadEngine {
                     streams: Vec::new(),
                     pending_cold_gc: Vec::new(),
                     next_cold_gc_seq: 0,
+                    bucket_usage: Vec::new(),
                 },
                 stream_append_counts: Vec::new(),
             })
@@ -3680,6 +3686,10 @@ impl GroupEngine for BlockingReadEngine {
 }
 
 impl GroupEngine for RecordingEngine {
+    fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn accepts_local_writes(&self) -> bool {
         self.accepts_local_writes
     }
@@ -3889,6 +3899,7 @@ impl GroupEngine for RecordingEngine {
                     streams: Vec::new(),
                     pending_cold_gc: Vec::new(),
                     next_cold_gc_seq: 0,
+                    bucket_usage: Vec::new(),
                 },
                 stream_append_counts: Vec::new(),
             })
@@ -3976,6 +3987,10 @@ impl GroupEngine for BlockingFirstCreateEngine {
         placement: ShardPlacement,
     ) -> GroupHeadStreamFuture<'a> {
         self.inner.head_stream(request, placement)
+    }
+
+    fn bucket_usage<'a>(&'a mut self, placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
+        self.inner.bucket_usage(placement)
     }
 
     fn read_stream<'a>(
@@ -4096,6 +4111,10 @@ impl GroupEngineFactory for FailingFactory {
 struct FailingEngine;
 
 impl GroupEngine for FailingEngine {
+    fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     fn create_stream<'a>(
         &'a mut self,
         _request: CreateStreamRequest,

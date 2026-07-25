@@ -753,6 +753,7 @@ pub fn admin_router(state: HttpState) -> Router {
     admin_ops_router(state.clone()).merge(
         Router::new()
             .route("/__ursula/metrics", get(metrics))
+            .route("/__ursula/usage", get(bucket_usage))
             .with_state(state),
     )
 }
@@ -1006,6 +1007,7 @@ async fn clear_maintenance_drain(State(state): State<HttpState>) -> Response {
 pub fn client_router_with_admission(state: HttpState, admission: IngressAdmission) -> Router {
     Router::new()
         .route("/__ursula/metrics", get(metrics))
+        .route("/__ursula/usage", get(bucket_usage))
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route("/{bucket}", put(create_bucket))
         .route(
@@ -1147,6 +1149,36 @@ pub(crate) fn append_http_response(response: AppendResponse) -> Response {
 
 pub(crate) async fn create_bucket(Path(_bucket): Path<String>) -> Response {
     StatusCode::CREATED.into_response()
+}
+
+/// Per-bucket committed usage summed across this node's Raft groups: the
+/// data-plane half of tenant usage accounting. Served from local replica
+/// state; consumers tolerate replication lag.
+pub(crate) async fn bucket_usage(State(state): State<HttpState>) -> Response {
+    match state.runtime.bucket_usage_all_groups().await {
+        Ok(report) => {
+            let buckets = report
+                .into_iter()
+                .map(|entry| {
+                    (
+                        entry.bucket_id,
+                        serde_json::json!({
+                            "committed_append_bytes": entry.usage.committed_append_bytes,
+                            "committed_records": entry.usage.committed_records,
+                            "retained_bytes": entry.usage.retained_bytes,
+                            "stream_count": entry.usage.stream_count,
+                        }),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>();
+            axum::Json(serde_json::json!({ "buckets": buckets })).into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("bucket usage read failed: {err}"),
+        )
+            .into_response(),
+    }
 }
 
 pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {

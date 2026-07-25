@@ -92,9 +92,36 @@ pub(crate) fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, Snaps
             streams,
             pending_cold_gc,
             next_cold_gc_seq: header.next_cold_gc_seq,
+            bucket_usage: header
+                .bucket_usage
+                .into_iter()
+                .map(bucket_usage_from_proto)
+                .collect(),
         },
         stream_append_counts,
     })
+}
+
+fn bucket_usage_from_proto(value: proto::BucketUsageV1) -> ursula_stream::BucketUsageSnapshot {
+    ursula_stream::BucketUsageSnapshot {
+        bucket_id: value.bucket_id,
+        usage: ursula_stream::BucketUsage {
+            committed_append_bytes: value.committed_append_bytes,
+            committed_records: value.committed_records,
+            retained_bytes: value.retained_bytes,
+            stream_count: value.stream_count,
+        },
+    }
+}
+
+fn bucket_usage_to_proto(value: ursula_stream::BucketUsageSnapshot) -> proto::BucketUsageV1 {
+    proto::BucketUsageV1 {
+        bucket_id: value.bucket_id,
+        committed_append_bytes: value.usage.committed_append_bytes,
+        committed_records: value.usage.committed_records,
+        retained_bytes: value.usage.retained_bytes,
+        stream_count: value.usage.stream_count,
+    }
 }
 
 struct GroupSnapshotFrameIter {
@@ -118,6 +145,7 @@ impl GroupSnapshotFrameIter {
             streams,
             pending_cold_gc,
             next_cold_gc_seq,
+            bucket_usage,
         } = stream_snapshot;
         Self {
             header: Some(proto::SnapshotHeaderV1 {
@@ -125,6 +153,10 @@ impl GroupSnapshotFrameIter {
                 group_commit_index,
                 buckets,
                 next_cold_gc_seq,
+                bucket_usage: bucket_usage
+                    .into_iter()
+                    .map(bucket_usage_to_proto)
+                    .collect(),
             }),
             streams: streams.into_iter(),
             append_counts: stream_append_counts.into_iter(),
@@ -610,6 +642,15 @@ mod tests {
                 streams: Vec::new(),
                 pending_cold_gc: Vec::new(),
                 next_cold_gc_seq: 9,
+                bucket_usage: vec![ursula_stream::BucketUsageSnapshot {
+                    bucket_id: "bucket".to_owned(),
+                    usage: ursula_stream::BucketUsage {
+                        committed_append_bytes: 100,
+                        committed_records: 7,
+                        retained_bytes: 60,
+                        stream_count: 2,
+                    },
+                }],
             },
             stream_append_counts: vec![StreamAppendCount {
                 stream_id: BucketStreamId {
@@ -644,6 +685,7 @@ mod tests {
                     group_commit_index: 0,
                     buckets: Vec::new(),
                     next_cold_gc_seq: 0,
+                    bucket_usage: Vec::new(),
                 },
             )),
         })

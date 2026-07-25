@@ -352,9 +352,15 @@ impl StreamStateMachine {
                 stream.tail_offset,
             );
         }
-        self.stream_slot_mut(&stream_id)
-            .expect("stream existence checked before retention mutation")
-            .retained_offset = retained_offset;
+        let slot = self
+            .stream_slot_mut(&stream_id)
+            .expect("stream existence checked before retention mutation");
+        let previous_retained_offset = slot.retained_offset;
+        slot.retained_offset = retained_offset;
+        self.usage_on_retention(
+            &stream_id.bucket_id,
+            retained_offset.saturating_sub(previous_retained_offset),
+        );
         self.compact_retained_prefix(&stream_id, retained_offset, retained_record_index);
         StreamResponse::RetentionAdvanced {
             retained_offset,

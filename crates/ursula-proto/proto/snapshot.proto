@@ -19,6 +19,17 @@ message SnapshotHeaderV1 {
   uint64 group_commit_index = 2;
   repeated string buckets = 3;
   uint64 next_cold_gc_seq = 4;
+  // Monotonic per-bucket usage counters; gauges are recomputed from the
+  // restored streams. Absent in legacy snapshots.
+  repeated BucketUsageV1 bucket_usage = 5;
+}
+
+message BucketUsageV1 {
+  string bucket_id = 1;
+  uint64 committed_append_bytes = 2;
+  uint64 committed_records = 3;
+  uint64 retained_bytes = 4;
+  uint64 stream_count = 5;
 }
 
 message SnapshotFooterV1 {}

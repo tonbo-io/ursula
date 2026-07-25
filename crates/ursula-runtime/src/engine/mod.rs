@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
+use ursula_stream::BucketUsageSnapshot;
 use ursula_stream::ColdFlushCandidate;
 use ursula_stream::ColdGcEntry;
 use ursula_stream::StreamCommand;
@@ -74,6 +75,8 @@ pub type GroupPlanNextColdFlushBatchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<ColdFlushCandidate>, GroupEngineError>> + Send + 'a>>;
 pub type GroupColdHotBacklogFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ColdHotBacklog, GroupEngineError>> + Send + 'a>>;
+pub type GroupBucketUsageFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<BucketUsageSnapshot>, GroupEngineError>> + Send + 'a>>;
 pub type GroupCreateStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CreateStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupHeadStreamFuture<'a> =
@@ -183,6 +186,15 @@ pub trait GroupEngine: Send + 'static {
         request: HeadStreamRequest,
         placement: ShardPlacement,
     ) -> GroupHeadStreamFuture<'a>;
+
+    /// Per-bucket committed usage held by this group's replicated state.
+    ///
+    /// Served from local replica state, leader or follower: usage export
+    /// tolerates replication lag, and requiring leadership would make a
+    /// node-local aggregate fail whenever any group is led elsewhere.
+    /// Deliberately a required method — an engine that silently reported
+    /// nothing would underbill.
+    fn bucket_usage<'a>(&'a mut self, placement: ShardPlacement) -> GroupBucketUsageFuture<'a>;
 
     fn get_stream_attrs<'a>(
         &'a mut self,

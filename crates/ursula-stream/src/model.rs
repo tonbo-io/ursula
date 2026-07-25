@@ -274,3 +274,26 @@ pub struct StreamBootstrapPlan {
     pub up_to_date: bool,
     pub closed: bool,
 }
+
+/// Per-bucket committed usage inside one Raft group's replicated state.
+///
+/// `committed_append_bytes` and `committed_records` are monotonic: they count
+/// accepted (non-deduplicated) appends and survive restarts through the
+/// snapshot. `retained_bytes` and `stream_count` are gauges derived from live
+/// stream state and are recomputed from the restored slots, so drift cannot
+/// accumulate across snapshot cycles. A bucket-wide total is the sum of this
+/// value across every Raft group.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketUsage {
+    pub committed_append_bytes: u64,
+    pub committed_records: u64,
+    pub retained_bytes: u64,
+    pub stream_count: u64,
+}
+
+/// One bucket's usage as reported by a group or persisted in a snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketUsageSnapshot {
+    pub bucket_id: String,
+    pub usage: BucketUsage,
+}
