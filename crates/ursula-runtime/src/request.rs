@@ -342,6 +342,21 @@ pub struct AdvanceRetentionResponse {
     pub record_range: Option<StreamRecordRange>,
 }
 
+/// Sets or clears one bucket's data-plane quota record on a group. The
+/// caller replicates the same request to every group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetBucketQuotaRequest {
+    pub bucket_id: String,
+    pub max_streams: Option<u64>,
+    pub max_retained_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetBucketQuotaResponse {
+    pub placement: ShardPlacement,
+    pub group_commit_index: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportGroupStateRequest {
     pub snapshot: Box<ursula_stream::StreamSnapshot>,

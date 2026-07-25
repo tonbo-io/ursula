@@ -1833,6 +1833,7 @@ fn snapshot_restore_rejects_invalid_entries() {
             buckets: vec!["benchcmp".to_owned(), "benchcmp".to_owned()],
             streams: Vec::new(),
             bucket_usage: Vec::new(),
+            bucket_quotas: Vec::new(),
         })
         .expect_err("duplicate bucket"),
         StreamSnapshotError::DuplicateBucket("benchcmp".to_owned())
@@ -1845,6 +1846,7 @@ fn snapshot_restore_rejects_invalid_entries() {
             buckets: vec!["benchcmp".to_owned()],
             streams: vec![entry],
             bucket_usage: Vec::new(),
+            bucket_quotas: Vec::new(),
         })
     };
 
@@ -3408,4 +3410,110 @@ fn purge_bucket_removes_streams_usage_and_bucket_idempotently() {
         removed_streams: 0,
         ..
     }));
+}
+
+fn set_quota_cmd(max_streams: Option<u64>, max_retained_bytes: Option<u64>) -> StreamCommand {
+    StreamCommand::SetBucketQuota {
+        bucket_id: "benchcmp".to_owned(),
+        max_streams,
+        max_retained_bytes,
+    }
+}
+
+#[test]
+fn quota_limits_stream_count_and_retained_bytes_locally() {
+    let mut machine = machine();
+    assert_eq!(
+        machine.apply(set_quota_cmd(Some(1), Some(4))),
+        StreamResponse::BucketQuotaSet {
+            bucket_id: "benchcmp".to_owned(),
+        }
+    );
+
+    create_stream(&mut machine, "first");
+    // Stream-count backstop: a second stream in this group is rejected.
+    assert!(matches!(
+        machine.apply(create_cmd(stream("second"), Create::default())),
+        StreamResponse::Error {
+            code: StreamErrorCode::QuotaExceeded,
+            ..
+        }
+    ));
+    // Idempotent re-create of the existing stream still succeeds.
+    assert!(matches!(
+        machine.apply(create_cmd(stream("first"), Create::default())),
+        StreamResponse::AlreadyExists { .. }
+    ));
+
+    // Retained-bytes backstop: the first append fits, the next does not.
+    assert!(matches!(
+        machine.apply(append_cmd(stream("first"), b"abcd", Append::default())),
+        StreamResponse::Appended { .. }
+    ));
+    assert!(matches!(
+        machine.apply(append_cmd(stream("first"), b"x", Append::default())),
+        StreamResponse::Error {
+            code: StreamErrorCode::QuotaExceeded,
+            ..
+        }
+    ));
+
+    // Retention reclaim frees quota headroom again. Destructive retention
+    // requires a published application snapshot at or beyond the floor.
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(
+            stream("first"),
+            4,
+            OCTET,
+            b"snapshot",
+            0
+        )),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    assert!(matches!(
+        machine.apply(advance_retention_cmd(stream("first"), 4, 1)),
+        StreamResponse::RetentionAdvanced { .. }
+    ));
+    assert!(matches!(
+        machine.apply(append_cmd(stream("first"), b"yz", Append::default())),
+        StreamResponse::Appended { .. }
+    ));
+
+    // Clearing the quota removes every limit and leaves no snapshot residue.
+    assert_eq!(
+        machine.apply(set_quota_cmd(None, None)),
+        StreamResponse::BucketQuotaSet {
+            bucket_id: "benchcmp".to_owned(),
+        }
+    );
+    assert!(machine.bucket_quota_report().is_empty());
+    assert!(matches!(
+        machine.apply(create_cmd(stream("second"), Create::default())),
+        StreamResponse::Created { .. }
+    ));
+}
+
+#[test]
+fn quota_survives_snapshot_round_trip() {
+    let mut machine = machine();
+    assert!(matches!(
+        machine.apply(set_quota_cmd(Some(2), None)),
+        StreamResponse::BucketQuotaSet { .. }
+    ));
+    create_stream(&mut machine, "first");
+
+    let mut restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
+    assert_eq!(
+        restored.bucket_quota_report(),
+        machine.bucket_quota_report()
+    );
+
+    create_stream(&mut restored, "second");
+    assert!(matches!(
+        restored.apply(create_cmd(stream("third"), Create::default())),
+        StreamResponse::Error {
+            code: StreamErrorCode::QuotaExceeded,
+            ..
+        }
+    ));
 }

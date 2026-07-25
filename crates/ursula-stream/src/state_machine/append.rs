@@ -117,6 +117,12 @@ impl StreamStateMachine {
             .as_ref()
             .map(crate::PreparedRecordAppend::range);
 
+        // Quota backstop before any state mutation. Producer-deduplicated
+        // retries returned above, so an accepted append never re-fails here.
+        if let Err(response) = self.check_append_quota(&stream_id.bucket_id, payload_len) {
+            return response;
+        }
+
         let Some(stream) = self.stream_metadata_mut(&stream_id) else {
             unreachable!("stream existence checked before producer evaluation");
         };
@@ -349,6 +355,11 @@ impl StreamStateMachine {
         }
         let offset = stream.tail_offset;
         let next_offset = offset.saturating_add(payload.payload_len);
+        // Quota backstop before any state mutation; deduplicated retries
+        // returned above.
+        if let Err(response) = self.check_append_quota(&stream_id.bucket_id, payload.payload_len) {
+            return response;
+        }
         let stream = self
             .stream_metadata_mut(&stream_id)
             .expect("stream existence checked before external append mutation");
@@ -573,6 +584,13 @@ impl StreamStateMachine {
             };
             item_record_ranges.push(range);
         }
+
+        // Quota backstop for the whole batch before any state mutation;
+        // deduplicated retries returned above.
+        let batch_bytes = payloads.iter().fold(0u64, |total, payload| {
+            total.saturating_add(payload.len() as u64)
+        });
+        self.check_append_quota(&stream_id.bucket_id, batch_bytes)?;
 
         let stream = self
             .stream_metadata_mut(&stream_id)

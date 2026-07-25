@@ -759,6 +759,7 @@ pub fn admin_router(state: HttpState) -> Router {
                 "/__ursula/purge/{bucket}",
                 axum::routing::delete(purge_bucket),
             )
+            .route("/__ursula/quota/{bucket}", put(set_bucket_quota))
             .with_state(state),
     )
 }
@@ -1026,6 +1027,7 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
             "/__ursula/purge/{bucket}",
             axum::routing::delete(purge_bucket),
         )
+        .route("/__ursula/quota/{bucket}", put(set_bucket_quota))
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route("/{bucket}", put(create_bucket))
         .route(
@@ -1242,6 +1244,38 @@ pub(crate) async fn bucket_usage(State(state): State<HttpState>) -> Response {
             format!("bucket usage read failed: {err}"),
         )
             .into_response(),
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BucketQuotaBody {
+    #[serde(default)]
+    max_streams: Option<u64>,
+    #[serde(default)]
+    max_retained_bytes: Option<u64>,
+}
+
+/// Sets or clears one bucket's data-plane quota, replicated to every Raft
+/// group. An empty or omitted body clears the record. Limits are per-group
+/// backstops: the cluster-wide bound is `limit × group_count`; exact
+/// tenant-level enforcement lives at the gateway.
+pub(crate) async fn set_bucket_quota(
+    State(state): State<HttpState>,
+    Path(bucket): Path<String>,
+    body: Option<axum::Json<BucketQuotaBody>>,
+) -> Response {
+    let body = body.map(|axum::Json(body)| body).unwrap_or_default();
+    match state
+        .runtime
+        .set_bucket_quota_all_groups(&bucket, body.max_streams, body.max_retained_bytes)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => {
+            let status = crate::render::runtime_error_status(&err);
+            (status, format!("bucket quota update failed: {err}")).into_response()
+        }
     }
 }
 

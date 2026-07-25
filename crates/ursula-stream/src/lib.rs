@@ -22,6 +22,8 @@ mod validate;
 pub use command::StreamCommand;
 pub use integrity::StreamIntegritySnapshot;
 pub use model::AppendStreamInput;
+pub use model::BucketQuota;
+pub use model::BucketQuotaSnapshot;
 pub use model::BucketUsage;
 pub use model::BucketUsageSnapshot;
 pub use model::COLD_INDEX_PAGE_SPAN_BYTES;

@@ -147,6 +147,14 @@ pub enum StreamCommand {
     ImportSnapshot {
         snapshot: Box<StreamSnapshot>,
     },
+    /// Sets or clears this group's data-plane quota record for a bucket.
+    /// Replicated to every group so each enforces the same local backstop;
+    /// both limits `None` removes the record. Idempotent under replay.
+    SetBucketQuota {
+        bucket_id: String,
+        max_streams: Option<u64>,
+        max_retained_bytes: Option<u64>,
+    },
 }
 
 impl fmt::Display for StreamCommand {
@@ -229,6 +237,9 @@ impl fmt::Display for StreamCommand {
                 snapshot.buckets.len(),
                 snapshot.streams.len()
             ),
+            Self::SetBucketQuota { bucket_id, .. } => {
+                write!(f, "set_bucket_quota:{bucket_id}")
+            }
         }
     }
 }

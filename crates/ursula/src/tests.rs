@@ -6411,3 +6411,86 @@ async fn purge_endpoint_erases_one_tenant_and_leaves_the_other_intact() {
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 }
+
+// #134 data-plane half: per-bucket quota backstops enforced over HTTP.
+#[tokio::test]
+async fn bucket_quota_endpoint_enforces_and_clears_backstops() {
+    let app = test_router();
+
+    let response = http_put(
+        &app,
+        "/__ursula/quota/tenant-a",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"max_streams":1,"max_retained_bytes":8}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // First stream fits; the payload counts against retained bytes.
+    let response = http_put(
+        &app,
+        "/tenant-a/first",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"n":1}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // A second stream trips the local stream-count backstop on its group.
+    // Streams hash across groups, so probe several names: at least one must
+    // land on the first stream's group and be rejected.
+    let mut saw_quota_rejection = false;
+    for index in 0..32 {
+        let response = http_put(
+            &app,
+            &format!("/tenant-a/probe-{index}"),
+            &[(CONTENT_TYPE.as_str(), "application/json")],
+            Body::empty(),
+        )
+        .await;
+        match response.status() {
+            StatusCode::TOO_MANY_REQUESTS => {
+                saw_quota_rejection = true;
+                break;
+            }
+            StatusCode::CREATED => {}
+            other => panic!("unexpected status during quota probe: {other}"),
+        }
+    }
+    assert!(
+        saw_quota_rejection,
+        "expected at least one create to trip the per-group stream quota"
+    );
+
+    // Retained-bytes backstop rejects an append that would exceed the cap.
+    let response = http_post(
+        &app,
+        "/tenant-a/first",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"pad":"xxxxxxxxxxxxxxxx"}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Another tenant is unaffected by tenant-a's quota.
+    let response = http_put(
+        &app,
+        "/tenant-b/first",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"n":2}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // Clearing the quota (empty body) lifts every backstop.
+    let response = http_put(&app, "/__ursula/quota/tenant-a", &[], Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = http_put(
+        &app,
+        "/tenant-a/after-clear",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
