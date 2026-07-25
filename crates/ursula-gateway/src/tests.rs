@@ -806,6 +806,48 @@ async fn gateway_does_not_apply_response_header_timeout_to_sse_body() {
 }
 
 #[tokio::test]
+async fn gateway_gives_long_poll_response_headers_timeout_headroom() {
+    let upstream = spawn_upstream(Router::new().route(
+        "/bucket/stream",
+        get(|| async {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            StatusCode::NO_CONTENT
+        }),
+    ))
+    .await;
+    let gateway =
+        gateway_with_response_header_timeout(upstream.url.clone(), Duration::from_millis(50));
+    let req = Request::builder()
+        .method("GET")
+        .uri("/bucket/stream?live=long-poll&timeout_ms=75")
+        .body(Body::empty())
+        .expect("build request");
+
+    let response = gateway.handle(req).await;
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[test]
+fn gateway_caps_long_poll_timeout_headroom_at_server_limit() {
+    let gateway =
+        gateway_with_response_header_timeout("http://127.0.0.1:1", Duration::from_secs(30));
+
+    assert_eq!(
+        gateway.response_header_timeout_for_url(
+            "http://127.0.0.1:1/bucket/stream?live=long-poll&timeout_ms=999999"
+        ),
+        Duration::from_secs(62)
+    );
+    assert_eq!(
+        gateway.response_header_timeout_for_url(
+            "http://127.0.0.1:1/bucket/stream?live=sse&timeout_ms=999999"
+        ),
+        Duration::from_secs(30)
+    );
+}
+
+#[tokio::test]
 async fn gateway_preserves_public_snapshot_redirect_without_upstream_host() {
     let app = Router::new()
         .route(
