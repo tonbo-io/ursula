@@ -31,6 +31,8 @@ use crate::metrics::elapsed_ns;
 use crate::metrics::record_cold_backpressure_error;
 use crate::metrics::record_cold_hot_backlog;
 use crate::request::AckColdGcResponse;
+use crate::request::AdvanceRetentionRequest;
+use crate::request::AdvanceRetentionResponse;
 use crate::request::AppendBatchRequest;
 use crate::request::AppendBatchResponse;
 use crate::request::AppendExternalRequest;
@@ -559,6 +561,46 @@ impl CoreWorker {
         let exec_started_at = Instant::now();
         let response = group
             .publish_snapshot(request, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err));
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(exec_started_at),
+        );
+        if response.is_ok() {
+            metrics.record_applied_mutation(
+                placement.core_id,
+                placement.raft_group_id,
+                elapsed_ns(started_at),
+            );
+            record_cold_hot_backlog(group, &metrics, stream_id.clone(), placement).await;
+            Self::notify_read_watchers(
+                group,
+                metrics,
+                read_materialization,
+                read_watchers,
+                &stream_id,
+                placement,
+            )
+            .await;
+        }
+        response
+    }
+
+    pub(crate) async fn advance_retention(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        read_materialization: Arc<Semaphore>,
+        read_watchers: &mut ReadWatchers,
+        request: AdvanceRetentionRequest,
+        placement: ShardPlacement,
+    ) -> Result<AdvanceRetentionResponse, RuntimeError> {
+        let stream_id = request.stream_id.clone();
+        let started_at = Instant::now();
+        let exec_started_at = Instant::now();
+        let response = group
+            .advance_retention(request, placement)
             .await
             .map_err(|err| RuntimeError::group_engine(placement, err));
         metrics.record_group_engine_exec(

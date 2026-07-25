@@ -129,6 +129,10 @@ impl StreamStateMachine {
             .unwrap_or(slot.metadata.tail_offset)
     }
 
+    pub fn retained_offset(&self, stream_id: &BucketStreamId) -> u64 {
+        self.earliest_retained_offset(stream_id)
+    }
+
     pub fn cold_chunks(&self, stream_id: &BucketStreamId) -> &[ColdChunkRef] {
         self.stream_slot(stream_id)
             .map(|slot| slot.cold.cold_chunks())

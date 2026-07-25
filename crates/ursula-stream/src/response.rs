@@ -50,6 +50,11 @@ pub enum StreamResponse {
     },
     SnapshotPublished {
         snapshot_offset: u64,
+        snapshot_digest: String,
+        record_range: Option<StreamRecordRange>,
+    },
+    RetentionAdvanced {
+        retained_offset: u64,
         record_range: Option<StreamRecordRange>,
     },
     Accessed {

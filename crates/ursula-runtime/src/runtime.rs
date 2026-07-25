@@ -47,6 +47,8 @@ use crate::metrics::append_batch_payload_bytes;
 use crate::metrics::elapsed_ns;
 use crate::metrics::is_stale_cold_flush_candidate_error;
 use crate::request::AckColdGcResponse;
+use crate::request::AdvanceRetentionRequest;
+use crate::request::AdvanceRetentionResponse;
 use crate::request::AppendBatchRequest;
 use crate::request::AppendBatchResponse;
 use crate::request::AppendExternalRequest;

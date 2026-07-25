@@ -158,6 +158,7 @@ Creates a snapshot at the specified offset. The snapshot represents the material
 **Request Headers:**
 
 - `Content-Type`: The content type of the snapshot blob. Servers MUST store this value and return it on subsequent reads. Defaults to `application/octet-stream`.
+- `Stream-Snapshot-Match`: Optional digest of the currently visible snapshot. If supplied and it does not match, the server MUST reject the publish with `409 Conflict`.
 
 **Response Codes:**
 
@@ -168,9 +169,28 @@ Creates a snapshot at the specified offset. The snapshot represents the material
 - `410 Gone`: `snapshot_offset` is older than the current earliest retained offset.
 - `413 Payload Too Large`: Snapshot exceeds the server's size limit.
 
+**Idempotency:**
+
+The server MUST return `Stream-Snapshot-Digest` for a successful publish. Repeating a publish at the same offset with the same content type and body MUST succeed and return the same digest. Publishing different content at an already-published offset MUST return `409 Conflict`.
+
 **Retention Effect:**
 
-When a new snapshot is published, the server MUST treat `snapshot_offset` as the new earliest retained offset. For any offset less than `snapshot_offset` (including `-1`), the server MUST return `410 Gone`, forcing clients to re-initialize via `/bootstrap`.
+Publishing a snapshot MUST NOT change the earliest retained offset. Retention is a separate, explicit operation:
+
+```
+PUT {stream_url}/retention/{retained_offset}
+```
+
+The server MUST reject a retention boundary that is not aligned to committed data, moves backward, or is newer than the latest published snapshot. After success, offsets less than `retained_offset` MUST return `410 Gone`.
+
+For record-aware JSON streams, servers also expose:
+
+```
+PUT {stream_url}/snapshot?record={record}
+PUT {stream_url}/retention?record={record}
+```
+
+The server resolves the stable record ordinal to the canonical byte boundary before applying the operation.
 
 Publishing a new snapshot replaces the previously visible snapshot immediately. The superseded snapshot MAY be garbage-collected asynchronously after the new snapshot becomes visible. Clients MUST NOT depend on older snapshots remaining readable after overwrite.
 
@@ -202,6 +222,7 @@ Servers SHOULD include `Stream-Snapshot-Offset` when a latest visible snapshot e
 **Response Headers:**
 
 - `Stream-Snapshot-Offset`: The latest visible snapshot offset.
+- `Stream-Snapshot-Digest`: A digest of the latest visible snapshot's content type and body.
 
 **Semantics:**
 
@@ -220,6 +241,7 @@ Returns the snapshot blob at the specified offset.
 
 - `Content-Type`: The content type stored at publish time.
 - `Stream-Snapshot-Offset`: The snapshot offset.
+- `Stream-Snapshot-Digest`: The snapshot digest returned at publish time.
 - `Stream-Next-Offset`: The next offset after the snapshot.
 - `Stream-Up-To-Date`: Boolean indicating whether the stream has updates beyond the snapshot.
 
@@ -364,7 +386,7 @@ The current Ursula append-batch endpoint does not support controls that require 
 
 - `Stream-Closed`
 - `Producer-Id`, `Producer-Epoch`, `Producer-Seq`
-- `If-Match`
+- `Stream-Record-Match`
 - `Stream-Seq`
 
 Clients that need producer fencing, idempotent producer sequence checks, stream preconditions, or atomic stream close MUST use the standard `POST {stream_url}` append operation.

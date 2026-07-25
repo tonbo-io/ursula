@@ -129,6 +129,22 @@ macro_rules! runtime_operations {
                 }
                 client { pub stream fn publish_snapshot }
             }
+            op AdvanceRetention {
+                fields { request: AdvanceRetentionRequest }
+                reply { response_tx: AdvanceRetentionResponse }
+                guard { none }
+                handle {
+                    call advance_retention(
+                        engine,
+                        metrics,
+                        read_materialization,
+                        read_watchers,
+                        request,
+                        placement
+                    )
+                }
+                client { pub stream fn advance_retention }
+            }
             op ReadSnapshot {
                 fields { request: ReadSnapshotRequest }
                 reply { response_tx: ReadSnapshotResponse }

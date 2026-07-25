@@ -86,7 +86,7 @@ Cold data lives under the `storage.cold.root` prefix. Benchmark and test runs sh
 aws s3 rm "s3://my-ursula-bucket/ursula-test-20260518T000000Z" --recursive
 ```
 
-There is no built-in retention policy beyond Ursula's snapshot GC.
+There is no automatic retention policy. Application checkpoints and explicit stream-retention advances control which cold objects become eligible for GC.
 
 ## Backup and disaster recovery
 

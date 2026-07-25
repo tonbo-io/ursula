@@ -124,6 +124,8 @@ pub struct HeadStreamResponse {
     pub stream_ttl_seconds: Option<u64>,
     pub stream_expires_at_ms: Option<u64>,
     pub snapshot_offset: Option<u64>,
+    pub snapshot_digest: Option<String>,
+    pub retained_offset: u64,
     pub integrity: StreamIntegritySnapshot,
     pub record_range: Option<StreamRecordRange>,
 }
@@ -312,6 +314,7 @@ pub struct PublishSnapshotRequest {
     pub snapshot_offset: u64,
     pub content_type: String,
     pub payload: Bytes,
+    pub expected_digest: Option<String>,
     pub now_ms: u64,
 }
 
@@ -319,6 +322,22 @@ pub struct PublishSnapshotRequest {
 pub struct PublishSnapshotResponse {
     pub placement: ShardPlacement,
     pub snapshot_offset: u64,
+    pub snapshot_digest: String,
+    pub group_commit_index: u64,
+    pub record_range: Option<StreamRecordRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvanceRetentionRequest {
+    pub stream_id: BucketStreamId,
+    pub retained_offset: u64,
+    pub now_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvanceRetentionResponse {
+    pub placement: ShardPlacement,
+    pub retained_offset: u64,
     pub group_commit_index: u64,
     pub record_range: Option<StreamRecordRange>,
 }
@@ -336,6 +355,7 @@ pub struct ReadSnapshotResponse {
     pub snapshot_offset: u64,
     pub next_offset: u64,
     pub content_type: String,
+    pub snapshot_digest: String,
     pub payload: Vec<u8>,
     pub up_to_date: bool,
     pub record_range: Option<StreamRecordRange>,

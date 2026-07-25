@@ -3,7 +3,7 @@ title: Publish snapshot
 api: "PUT /{bucket}/{stream}/snapshot/{offset}"
 ---
 
-Publishes a new snapshot blob at the given offset. The snapshot replaces any previously published snapshot and enables cold storage cleanup of data before this offset.
+Publishes a new checkpoint blob at the given offset. The snapshot replaces any previously published snapshot, but does not delete stream history. Retention advances only through the separate `/retention` endpoint.
 
 <ParamField path="bucket" type="string" required>
  Bucket ID.
@@ -17,8 +17,14 @@ Publishes a new snapshot blob at the given offset. The snapshot replaces any pre
  Stream offset this snapshot represents: the 20-character zero-padded decimal token.
 </ParamField>
 
+For JSON streams, `PUT /{bucket}/{stream}/snapshot?record={record}` resolves a stable record ordinal to its byte offset and publishes at that boundary.
+
 <ParamField header="Content-Type" type="string">
  Content type of the snapshot blob, stored separately from the stream's own content type. Defaults to `application/octet-stream`.
+</ParamField>
+
+<ParamField header="Stream-Snapshot-Match" type="string">
+ Optional digest of the currently visible snapshot. The publish succeeds only if it still matches.
 </ParamField>
 
 <ParamField body="body" type="binary" required>
@@ -33,10 +39,10 @@ Publishes a new snapshot blob at the given offset. The snapshot replaces any pre
 | `400` | Invalid offset or content type. |
 | `404` | Stream not found or expired. |
 | `409` | Stale publish (a newer snapshot exists) or offset out of range. |
-| `410` | Snapshot offset is too old (data already garbage-collected). |
+| `410` | Snapshot offset is older than the retained stream history. |
 | `413` | Snapshot body exceeds the maximum allowed size. |
 
-Response headers include `Stream-Next-Offset` and `Stream-Snapshot-Offset`.
+Response headers include `Stream-Next-Offset`, `Stream-Snapshot-Offset`, and `Stream-Snapshot-Digest`. Repeating the same offset, content type, and body is idempotent and returns the same digest. Reusing an offset with different content returns `409`.
 
 <RequestExample>
 ```bash Example
@@ -45,6 +51,12 @@ curl -X PUT 'http://127.0.0.1:4437/demo/hello/snapshot/00000000000000000042' \
   --data-binary '{"state": "aggregated snapshot data"}'
 ```
 </RequestExample>
+
+## Advance retention
+
+`PUT /{bucket}/{stream}/retention/{offset}` explicitly discards history before a published checkpoint. For JSON streams, `PUT /{bucket}/{stream}/retention?record={record}` accepts a record ordinal. The boundary must be monotonic, aligned, and no newer than the visible checkpoint.
+
+After a successful `204`, reads before the retained offset return `410 Gone`. This separate step lets clients publish and verify a checkpoint before making history unreachable.
 
 ---
 
@@ -60,5 +72,5 @@ Attempting to delete the current visible snapshot is not allowed.
 | `409` | Cannot delete the current snapshot. |
 
 <Note>
-Snapshots are immutable once published. Each publish creates a new blob with a unique key, so retries cannot overwrite a committed snapshot. After a snapshot is committed, cold storage chunks before the snapshot offset are automatically cleaned up.
+Snapshots are immutable at a given offset. A byte-identical retry is idempotent; a different body at the same offset conflicts. Publishing does not advance retention.
 </Note>

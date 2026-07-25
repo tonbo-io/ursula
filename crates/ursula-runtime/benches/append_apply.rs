@@ -315,16 +315,25 @@ fn snapshot_compaction(machine: &mut StreamStateMachine, payload: &[u8]) -> u64 
     let snapshot_offset =
         u64::try_from(APPENDS_PER_ITER / 2 * payload.len()).expect("snapshot offset fits u64");
     match machine.apply(StreamCommand::PublishSnapshot {
-        stream_id,
+        stream_id: stream_id.clone(),
         snapshot_offset,
         content_type: "application/json".to_owned(),
         payload: bytes::Bytes::from_static(b"{}"),
+        expected_digest: None,
         now_ms: 0,
     }) {
-        StreamResponse::SnapshotPublished {
-            snapshot_offset, ..
-        } => snapshot_offset,
+        StreamResponse::SnapshotPublished { .. } => {}
         response => panic!("publish snapshot failed: {response:?}"),
+    }
+    match machine.apply(StreamCommand::AdvanceRetention {
+        stream_id,
+        retained_offset: snapshot_offset,
+        now_ms: 0,
+    }) {
+        StreamResponse::RetentionAdvanced {
+            retained_offset, ..
+        } => retained_offset,
+        response => panic!("advance retention failed: {response:?}"),
     }
 }
 

@@ -5,6 +5,7 @@ use super::AppendStreamInput;
 use super::BucketStreamId;
 use super::ObjectPayloadRef;
 use super::ProducerAppendRecord;
+use super::ProducerReceipt;
 use super::ProducerRequest;
 use super::ProducerState;
 use super::StreamBatchAppend;
@@ -718,16 +719,33 @@ impl StreamStateMachine {
         }
 
         if producer.producer_seq <= state.producer_seq {
+            let Some(receipt) = state
+                .receipts
+                .iter()
+                .find(|receipt| receipt.producer_seq == producer.producer_seq)
+            else {
+                return Err(StreamResponse::error_with_context(
+                    StreamErrorCode::ProducerSeqConflict,
+                    format!(
+                        "producer '{}' sequence {} is older than the retained receipt window ending at {}",
+                        producer.producer_id, producer.producer_seq, state.producer_seq
+                    ),
+                    vec![StreamErrorContext::ProducerSeqConflict {
+                        expected_seq: state.producer_seq.saturating_add(1),
+                        received_seq: producer.producer_seq,
+                    }],
+                ));
+            };
             return Ok(ProducerDecision::Duplicate {
-                offset: state.last_start_offset,
-                next_offset: state.last_next_offset,
-                closed: state.last_closed,
+                offset: receipt.start_offset,
+                next_offset: receipt.next_offset,
+                closed: receipt.closed,
                 producer: ProducerRequest {
                     producer_id: producer.producer_id.clone(),
                     producer_epoch: state.producer_epoch,
-                    producer_seq: state.producer_seq,
+                    producer_seq: receipt.producer_seq,
                 },
-                items: state.last_items.clone(),
+                items: receipt.items.clone(),
             });
         }
         if producer.producer_seq == state.producer_seq + 1 {
@@ -755,17 +773,37 @@ impl StreamStateMachine {
         last: ProducerAppendRecord,
         last_items: Vec<ProducerAppendRecord>,
     ) {
-        self.stream_slot_mut(&stream_id)
+        let receipt = ProducerReceipt {
+            producer_seq: producer.producer_seq,
+            start_offset: last.start_offset,
+            next_offset: last.next_offset,
+            closed: last.closed,
+            items: last_items.clone(),
+        };
+        let producers = &mut self
+            .stream_slot_mut(&stream_id)
             .expect("stream existence checked before producer mutation")
-            .producers
-            .insert(producer.producer_id, ProducerState {
-                producer_epoch: producer.producer_epoch,
-                producer_seq: producer.producer_seq,
-                last_start_offset: last.start_offset,
-                last_next_offset: last.next_offset,
-                last_closed: last.closed,
-                last_items,
-            });
+            .producers;
+        if let Some(state) = producers.get_mut(&producer.producer_id)
+            && state.producer_epoch == producer.producer_epoch
+        {
+            state.producer_seq = producer.producer_seq;
+            state.last_start_offset = last.start_offset;
+            state.last_next_offset = last.next_offset;
+            state.last_closed = last.closed;
+            state.last_items = last_items;
+            state.receipts.push(receipt);
+            return;
+        }
+        producers.insert(producer.producer_id, ProducerState {
+            producer_epoch: producer.producer_epoch,
+            producer_seq: producer.producer_seq,
+            last_start_offset: last.start_offset,
+            last_next_offset: last.next_offset,
+            last_closed: last.closed,
+            last_items,
+            receipts: vec![receipt],
+        });
     }
 }
 

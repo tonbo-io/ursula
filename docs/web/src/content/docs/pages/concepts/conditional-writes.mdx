@@ -3,11 +3,7 @@ title: Conditional Writes
 sidebarTitle: Conditional Writes
 ---
 
-Writers appending to the same stream sometimes need coordination. Ursula currently supports one form of optimistic concurrency control via request headers, without locks or transactions.
-
-<Note>
-The Durable Streams Protocol also specifies an `If-Match` ETag-based precondition for multi-writer guards. Ursula does not yet implement `If-Match`. For current deployments use `Stream-Seq` or producer epoch/seq headers ([exactly-once writes](/docs/concepts/exactly-once-writes)) for ordering and dedup.
-</Note>
+Writers appending to the same stream sometimes need coordination. Ursula supports two complementary request-header guards without introducing locks or cross-stream transactions.
 
 ## Stream-Seq
 
@@ -15,8 +11,25 @@ The Durable Streams Protocol also specifies an `If-Match` ETag-based preconditio
 
 This is useful when a single logical writer wants to enforce ordering without relying on server-side ETags. For instance, an agent that numbers its steps and wants the server to reject out-of-order delivery.
 
+## Stream-Record-Match
+
+`Stream-Record-Match` is an Ursula extension for JSON streams using [Record Coordinates](/docs/concepts/record-coordinates). The server accepts the append only when the current record tail equals the supplied ordinal.
+
+Use it when multiple writers may race after reading the same stream state:
+
+```http
+POST /demo/events
+Content-Type: application/json
+Stream-Record-Match: 44
+
+{"type":"checkout"}
+```
+
+A mismatch returns `412 Precondition Failed` with the current `Stream-Record-Next`, allowing the client to re-read and retry.
+
 ## When to use
 
 - **Stream-Seq**: single-writer ordering. "Reject this if my writes arrive out of order."
+- **Stream-Record-Match**: multi-writer optimistic concurrency on a JSON stream. "Append this only if nobody has committed another record since I read."
 - **Producer-Id / Producer-Epoch / Producer-Seq** ([exactly-once writes](/docs/concepts/exactly-once-writes)): deduplicate retries from a producer that may resend the same logical append after a network hiccup or restart.
 - **Neither**: append-only workloads where every write is independent (e.g. event logging). Just POST.

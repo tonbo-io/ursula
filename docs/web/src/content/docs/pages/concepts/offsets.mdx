@@ -25,7 +25,7 @@ For pure catch-up reads, `Stream-Next-Offset` is enough. For live tailing across
 
 ## Stability across snapshots
 
-Offsets are byte positions, not sequence numbers, and they're stable across snapshot publishes. Publishing a snapshot at offset 100 doesn't renumber later offsets. It only enables the server to garbage-collect data before offset 100. Reads to trimmed offsets return `410 Gone` with a `stream-earliest-offset` header pointing at the first still-available position.
+Offsets are byte positions, not sequence numbers, and they're stable across snapshot publishes. Publishing a snapshot at offset 100 does not renumber later offsets or delete earlier data. A separate retention advance makes data before offset 100 eligible for garbage collection. Reads to trimmed offsets return `410 Gone` with a `stream-earliest-offset` header pointing at the first still-available position.
 
 ## Related
 

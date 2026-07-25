@@ -1465,9 +1465,24 @@ async fn json_record_coordinates_snapshot_and_bootstrap_headers_are_aligned() {
 
     let response = http_put(
         &app,
-        &format!("/benchcmp/json-record-snapshot/snapshot/{snapshot_offset}"),
+        "/benchcmp/json-record-snapshot/snapshot?record=1",
         &[(CONTENT_TYPE.as_str(), "application/json")],
         Body::from(r#"{"count":1}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_SNAPSHOT_OFFSET),
+        snapshot_offset
+    );
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "0");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
+
+    let response = http_put(
+        &app,
+        "/benchcmp/json-record-snapshot/retention?record=1",
+        &[],
+        Body::empty(),
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -1483,6 +1498,49 @@ async fn json_record_coordinates_snapshot_and_bootstrap_headers_are_aligned() {
         assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "1");
         assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
     }
+}
+
+#[tokio::test]
+async fn json_record_checkpoint_can_publish_and_retain_at_the_record_tail() {
+    let app = test_router();
+    let response = http_put(
+        &app,
+        "/benchcmp/json-record-tail-checkpoint",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"[{"id":1},{"id":2}]"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = http_put(
+        &app,
+        "/benchcmp/json-record-tail-checkpoint/snapshot?record=2",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"count":2}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "0");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
+
+    let response = http_put(
+        &app,
+        "/benchcmp/json-record-tail-checkpoint/retention?record=2",
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "2");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
+
+    let response = http_get(
+        &app,
+        "/benchcmp/json-record-tail-checkpoint?record=0&max_records=1",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::GONE);
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "2");
 }
 
 #[tokio::test]
@@ -1987,6 +2045,33 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_bytes(response).await;
     assert_eq!(&body[..], b"raft-payload");
+
+    let response = http_put(
+        &app,
+        "/benchcmp/raft-retention",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"[{"id":1},{"id":2}]"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = http_put(
+        &app,
+        "/benchcmp/raft-retention/snapshot?record=2",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"count":2}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = http_put(
+        &app,
+        "/benchcmp/raft-retention/retention?record=2",
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = http_get(&app, "/benchcmp/raft-retention?record=0&max_records=1").await;
+    assert_eq!(response.status(), StatusCode::GONE);
 
     let response = http_get(&app, "/__ursula/metrics").await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -4408,6 +4493,18 @@ async fn snapshot_and_bootstrap_routes_follow_extension_semantics() {
     assert_eq!(&body[..], br#"{"state":"abc"}"#);
 
     let response = http_get(&app, "/benchcmp/snapshot-http?offset=0&max_bytes=1").await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = http_put(
+        &app,
+        "/benchcmp/snapshot-http/retention/00000000000000000003",
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = http_get(&app, "/benchcmp/snapshot-http?offset=0&max_bytes=1").await;
     assert_eq!(response.status(), StatusCode::GONE);
     assert_eq!(
         header_str(&response, HEADER_STREAM_NEXT_OFFSET),
@@ -4548,6 +4645,39 @@ async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let snapshot_digest = header_str(&response, HEADER_STREAM_SNAPSHOT_DIGEST).to_owned();
+    assert_eq!(snapshot_digest.len(), 64);
+
+    let response = http_put(
+        &app,
+        "/benchcmp/snapshot-errors/snapshot/00000000000000000003",
+        &[(HEADER_STREAM_SNAPSHOT_MATCH, snapshot_digest.as_str())],
+        Body::from("abc-state"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_SNAPSHOT_DIGEST),
+        snapshot_digest
+    );
+
+    let response = http_put(
+        &app,
+        "/benchcmp/snapshot-errors/snapshot/00000000000000000003",
+        &[(HEADER_STREAM_SNAPSHOT_MATCH, &"0".repeat(64))],
+        Body::from("abc-state"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let response = http_put(
+        &app,
+        "/benchcmp/snapshot-errors/snapshot/00000000000000000003",
+        &[],
+        Body::from("different-state"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 
     let response = http_put(
         &app,
@@ -4556,7 +4686,7 @@ async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
         Body::from("old-state"),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::GONE);
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 
     let response = http_put(
         &app,
@@ -4580,6 +4710,18 @@ async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = http_get(&app, "/benchcmp/snapshot-errors?offset=3&max_bytes=2").await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = http_put(
+        &app,
+        "/benchcmp/snapshot-errors/retention/00000000000000000005",
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     let response = http_get(&app, "/benchcmp/snapshot-errors?offset=3&max_bytes=2").await;
     assert_eq!(response.status(), StatusCode::GONE);

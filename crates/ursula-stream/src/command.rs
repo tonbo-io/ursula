@@ -82,6 +82,13 @@ pub enum StreamCommand {
         snapshot_offset: u64,
         content_type: String,
         payload: Bytes,
+        #[serde(default)]
+        expected_digest: Option<String>,
+        now_ms: u64,
+    },
+    AdvanceRetention {
+        stream_id: BucketStreamId,
+        retained_offset: u64,
         now_ms: u64,
     },
     TouchStreamAccess {
@@ -165,6 +172,11 @@ impl fmt::Display for StreamCommand {
                 "publish_snapshot:{stream_id}:{snapshot_offset}:{} bytes",
                 payload.len()
             ),
+            Self::AdvanceRetention {
+                stream_id,
+                retained_offset,
+                ..
+            } => write!(f, "advance_retention:{stream_id}:{retained_offset}"),
             Self::TouchStreamAccess {
                 stream_id,
                 renew_ttl,

@@ -17,6 +17,7 @@ use ursula_stream::ColdGcTarget;
 use ursula_stream::HotPayloadSegment;
 use ursula_stream::ObjectPayloadRef;
 use ursula_stream::ProducerAppendRecord;
+use ursula_stream::ProducerReceipt;
 use ursula_stream::ProducerSnapshot;
 use ursula_stream::StreamAttrs;
 use ursula_stream::StreamIntegritySnapshot;
@@ -217,17 +218,20 @@ fn stream_to_proto(
             .collect(),
         first_record,
         record_offsets,
+        retained_offset: entry.retained_offset,
     })
 }
 
 fn stream_from_proto(
     entry: proto::StreamSnapshotEntryV1,
 ) -> Result<StreamSnapshotEntry, SnapshotStoreError> {
-    let retained_offset = entry
-        .visible_snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.offset)
-        .unwrap_or(0);
+    let retained_offset = entry.retained_offset.unwrap_or_else(|| {
+        entry
+            .visible_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.offset)
+            .unwrap_or(0)
+    });
     let tail_offset = entry
         .metadata
         .as_ref()
@@ -274,6 +278,7 @@ fn stream_from_proto(
             .collect(),
         record_index,
         integrity: integrity_from_proto(required(entry.integrity, "snapshot stream integrity")?),
+        retained_offset: entry.retained_offset,
         visible_snapshot: entry.visible_snapshot.map(visible_snapshot_from_proto),
         producer_states: entry
             .producer_states
@@ -422,6 +427,7 @@ fn visible_snapshot_to_proto(snapshot: StreamVisibleSnapshot) -> proto::StreamVi
         offset: snapshot.offset,
         content_type: snapshot.content_type,
         payload: snapshot.payload.into(),
+        digest: snapshot.digest,
     }
 }
 
@@ -430,6 +436,7 @@ fn visible_snapshot_from_proto(snapshot: proto::StreamVisibleSnapshotV1) -> Stre
         offset: snapshot.offset,
         content_type: snapshot.content_type,
         payload: snapshot.payload.to_vec(),
+        digest: snapshot.digest,
     }
 }
 
@@ -446,6 +453,11 @@ fn producer_to_proto(producer: ProducerSnapshot) -> proto::ProducerSnapshotV1 {
             .into_iter()
             .map(producer_append_record_to_proto)
             .collect(),
+        receipts: producer
+            .receipts
+            .into_iter()
+            .map(producer_receipt_to_proto)
+            .collect(),
     }
 }
 
@@ -459,6 +471,39 @@ fn producer_from_proto(producer: proto::ProducerSnapshotV1) -> ProducerSnapshot 
         last_closed: producer.last_closed,
         last_items: producer
             .last_items
+            .into_iter()
+            .map(producer_append_record_from_proto)
+            .collect(),
+        receipts: producer
+            .receipts
+            .into_iter()
+            .map(producer_receipt_from_proto)
+            .collect(),
+    }
+}
+
+fn producer_receipt_to_proto(receipt: ProducerReceipt) -> proto::ProducerReceiptV1 {
+    proto::ProducerReceiptV1 {
+        producer_seq: receipt.producer_seq,
+        start_offset: receipt.start_offset,
+        next_offset: receipt.next_offset,
+        closed: receipt.closed,
+        items: receipt
+            .items
+            .into_iter()
+            .map(producer_append_record_to_proto)
+            .collect(),
+    }
+}
+
+fn producer_receipt_from_proto(receipt: proto::ProducerReceiptV1) -> ProducerReceipt {
+    ProducerReceipt {
+        producer_seq: receipt.producer_seq,
+        start_offset: receipt.start_offset,
+        next_offset: receipt.next_offset,
+        closed: receipt.closed,
+        items: receipt
+            .items
             .into_iter()
             .map(producer_append_record_from_proto)
             .collect(),

@@ -42,6 +42,7 @@ use crate::HEADER_STREAM_CLOSED;
 use crate::HEADER_STREAM_CURSOR;
 use crate::HEADER_STREAM_EXPIRES_AT;
 use crate::HEADER_STREAM_NEXT_OFFSET;
+use crate::HEADER_STREAM_SNAPSHOT_DIGEST;
 use crate::HEADER_STREAM_SNAPSHOT_OFFSET;
 use crate::HEADER_STREAM_TTL;
 use crate::HEADER_STREAM_UP_TO_DATE;
@@ -121,6 +122,10 @@ pub(crate) fn insert_offset(headers: &mut HeaderMap, next_offset: u64) {
 
 pub(crate) fn insert_snapshot_offset(headers: &mut HeaderMap, snapshot_offset: u64) {
     insert_padded_offset(headers, HEADER_STREAM_SNAPSHOT_OFFSET, snapshot_offset);
+}
+
+pub(crate) fn insert_snapshot_digest(headers: &mut HeaderMap, digest: &str) {
+    insert_header_str(headers, HEADER_STREAM_SNAPSHOT_DIGEST, digest);
 }
 
 pub(crate) fn insert_cursor(headers: &mut HeaderMap, cursor: u64) {
@@ -542,6 +547,7 @@ pub(crate) fn snapshot_response(response: ReadSnapshotResponse) -> Response {
     insert_default_response_headers(&mut headers);
     insert_content_type(&mut headers, &response.content_type);
     insert_snapshot_offset(&mut headers, response.snapshot_offset);
+    insert_snapshot_digest(&mut headers, &response.snapshot_digest);
     insert_offset(&mut headers, response.next_offset);
     if response.up_to_date {
         insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");

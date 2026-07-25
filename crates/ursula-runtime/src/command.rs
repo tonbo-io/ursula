@@ -6,6 +6,7 @@ use ursula_shard::ShardPlacement;
 use ursula_stream::StreamCommand;
 use ursula_stream::StreamSnapshot;
 
+use crate::request::AdvanceRetentionRequest;
 use crate::request::AppendBatchRequest;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
@@ -143,6 +144,17 @@ impl From<PublishSnapshotRequest> for StreamCommand {
             snapshot_offset: request.snapshot_offset,
             content_type: request.content_type,
             payload: request.payload,
+            expected_digest: request.expected_digest,
+            now_ms: request.now_ms,
+        }
+    }
+}
+
+impl From<AdvanceRetentionRequest> for StreamCommand {
+    fn from(request: AdvanceRetentionRequest) -> Self {
+        Self::AdvanceRetention {
+            stream_id: request.stream_id,
+            retained_offset: request.retained_offset,
             now_ms: request.now_ms,
         }
     }
@@ -205,6 +217,7 @@ group_write_from_request!(
     AppendExternalRequest,
     AppendBatchRequest,
     PublishSnapshotRequest,
+    AdvanceRetentionRequest,
     CloseStreamRequest,
     DeleteStreamRequest,
     FlushColdRequest,

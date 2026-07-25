@@ -13,9 +13,9 @@ Both epoch and seq are capped at `2^53 − 1` so they survive a round-trip throu
 
 ## How dedup works
 
-The server records the highest `(epoch, seq)` accepted from each `Producer-Id` per stream. On an append:
+The server records the exact receipt for every accepted sequence in the current epoch from each `Producer-Id` per stream. On an append:
 
-- **Exact duplicate** (same epoch and same seq as already accepted): silently deduplicated. The response carries the existing offset.
+- **Delayed duplicate** (same epoch and any seq already accepted): silently deduplicated. The response carries that sequence's original byte and record ranges, even when newer sequences have committed.
 - **Next in sequence** (`seq = last_seq + 1`): accepted.
 - **Out of order** (seq skips ahead or goes backward): rejected with `409 producer_seq_conflict`. The response body includes the `expected_seq` the server wanted.
 - **Epoch regression** (new epoch less than last accepted): rejected with `409`.
@@ -28,7 +28,7 @@ When a producer crashes and restarts, **bump `Producer-Epoch`**. Otherwise the s
 
 Dedup state is scoped per stream. The same `Producer-Id` writing to two different streams maintains two independent epoch/seq counters, so you do not have to elect a single global writer per producer.
 
-The server retains only the highest accepted `(epoch, seq)` per `(producer_id, stream)` pair. Older epochs are dropped once a higher epoch is observed.
+The server retains exact receipts for the current epoch per `(producer_id, stream)` pair. Older epochs and their receipts are dropped once a higher epoch is observed.
 
 ## When you don't need this
 

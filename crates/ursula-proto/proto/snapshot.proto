@@ -39,6 +39,7 @@ message StreamSnapshotEntryV1 {
   repeated ProducerSnapshotV1 producer_states = 13;
   optional uint64 first_record = 14;
   repeated uint64 record_offsets = 15;
+  optional uint64 retained_offset = 16;
 }
 
 message StreamMetadataV1 {
@@ -96,6 +97,7 @@ message StreamVisibleSnapshotV1 {
   uint64 offset = 1;
   string content_type = 2;
   bytes payload = 3;
+  string digest = 4;
 }
 
 message ProducerSnapshotV1 {
@@ -106,6 +108,15 @@ message ProducerSnapshotV1 {
   uint64 last_next_offset = 5;
   bool last_closed = 6;
   repeated ProducerAppendRecordV1 last_items = 7;
+  repeated ProducerReceiptV1 receipts = 8;
+}
+
+message ProducerReceiptV1 {
+  uint64 producer_seq = 1;
+  uint64 start_offset = 2;
+  uint64 next_offset = 3;
+  bool closed = 4;
+  repeated ProducerAppendRecordV1 items = 5;
 }
 
 message ProducerAppendRecordV1 {

@@ -155,6 +155,19 @@ fn publish_snapshot_cmd(
         snapshot_offset,
         content_type: content_type.to_owned(),
         payload: bytes::Bytes::copy_from_slice(payload),
+        expected_digest: None,
+        now_ms,
+    }
+}
+
+fn advance_retention_cmd(
+    stream_id: BucketStreamId,
+    retained_offset: u64,
+    now_ms: u64,
+) -> StreamCommand {
+    StreamCommand::AdvanceRetention {
+        stream_id,
+        retained_offset,
         now_ms,
     }
 }
@@ -339,7 +352,7 @@ fn json_record_coordinates_survive_flush_restore_and_retention() {
     );
     let mut restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
     assert_eq!(restored.offset_for_record(&stream_id, 1), Ok(Some(8)));
-    assert_eq!(
+    assert!(matches!(
         restored.apply(publish_snapshot_cmd(
             stream_id.clone(),
             16,
@@ -349,6 +362,20 @@ fn json_record_coordinates_survive_flush_restore_and_retention() {
         )),
         StreamResponse::SnapshotPublished {
             snapshot_offset: 16,
+            ..
+        }
+    ));
+    assert_eq!(
+        restored.record_range(&stream_id),
+        Ok(Some(StreamRecordRange {
+            first_record: 0,
+            next_record: 3,
+        }))
+    );
+    assert_eq!(
+        restored.apply(advance_retention_cmd(stream_id.clone(), 16, 3)),
+        StreamResponse::RetentionAdvanced {
+            retained_offset: 16,
             record_range: Some(StreamRecordRange {
                 first_record: 2,
                 next_record: 3,
@@ -373,7 +400,7 @@ fn json_record_coordinates_survive_flush_restore_and_retention() {
 }
 
 #[test]
-fn snapshot_record_trim_failure_does_not_mutate_stream_state() {
+fn retention_advance_without_checkpoint_does_not_mutate_stream_state() {
     let mut machine = machine();
     let stream_id = stream("snapshot-record-atomicity");
     assert!(matches!(
@@ -385,27 +412,11 @@ fn snapshot_record_trim_failure_does_not_mutate_stream_state() {
         StreamResponse::Created { .. }
     ));
 
-    // Simulate an internally inconsistent index so record trimming fails even
-    // though the requested snapshot offset is a retained message boundary.
-    machine
-        .stream_slot_mut(&stream_id)
-        .expect("stream slot")
-        .record_index
-        .as_mut()
-        .expect("record index")
-        .retain_from_offset(8, 16)
-        .expect("advance test index");
     let before = machine.snapshot();
 
     assert_error_code(
-        machine.apply(publish_snapshot_cmd(
-            stream_id,
-            0,
-            "application/json",
-            br#"{"state":0}"#,
-            1,
-        )),
-        StreamErrorCode::InvalidRecordBoundaries,
+        machine.apply(advance_retention_cmd(stream_id, 8, 1)),
+        StreamErrorCode::SnapshotConflict,
     );
     assert_eq!(machine.snapshot(), before);
 }
@@ -965,7 +976,7 @@ fn flush_cold_compacts_message_records_to_cold_prefix() {
         start_offset: 0,
         end_offset: 6,
     }]);
-    assert_eq!(
+    assert!(matches!(
         machine.apply(publish_snapshot_cmd(
             stream("cold-records"),
             3,
@@ -975,9 +986,9 @@ fn flush_cold_compacts_message_records_to_cold_prefix() {
         )),
         StreamResponse::SnapshotPublished {
             snapshot_offset: 3,
-            record_range: None,
+            ..
         }
-    );
+    ));
 }
 
 fn flush_one_cold_chunk(machine: &mut StreamStateMachine, id: &str) {
@@ -1653,6 +1664,7 @@ fn snapshot_entry(
             last_ttl_touch_at_ms: 0,
         },
         attrs: None,
+        retained_offset: None,
         hot_start_offset: 0,
         payload,
         hot_segments: Vec::new(),
@@ -1677,6 +1689,7 @@ fn producer_snapshot(epoch: u64) -> ProducerSnapshot {
         last_next_offset: 0,
         last_closed: false,
         last_items: Vec::new(),
+        receipts: Vec::new(),
     }
 }
 
@@ -1851,6 +1864,47 @@ fn producer_headers_deduplicate_retries_and_fence_stale_epochs() {
             ..Append::default()
         })),
         StreamErrorCode::ProducerEpochStale,
+    );
+}
+
+#[test]
+fn producer_delayed_retry_returns_its_original_receipt() {
+    let mut machine = machine();
+    create_stream(&mut machine, "producer-delayed-retry");
+
+    assert_eq!(
+        machine.apply(append_cmd(stream("producer-delayed-retry"), b"a", Append {
+            producer: Some(producer("writer-1", 0, 0)),
+            ..Append::default()
+        })),
+        appended_by(producer("writer-1", 0, 0), 0, 1, false, false)
+    );
+    assert_eq!(
+        machine.apply(append_cmd(stream("producer-delayed-retry"), b"b", Append {
+            producer: Some(producer("writer-1", 0, 1)),
+            ..Append::default()
+        })),
+        appended_by(producer("writer-1", 0, 1), 1, 2, false, false)
+    );
+    let mut machine =
+        StreamStateMachine::restore(machine.snapshot()).expect("restore producer receipts");
+    assert_eq!(
+        machine.apply(append_cmd(
+            stream("producer-delayed-retry"),
+            b"ignored",
+            Append {
+                producer: Some(producer("writer-1", 0, 0)),
+                ..Append::default()
+            }
+        )),
+        appended_by(producer("writer-1", 0, 0), 0, 1, false, true)
+    );
+    assert_eq!(
+        machine
+            .read(&stream("producer-delayed-retry"), 0, 16)
+            .expect("read")
+            .payload,
+        b"ab"
     );
 }
 
@@ -2236,7 +2290,7 @@ fn bucket_delete_requires_empty_bucket() {
 }
 
 #[test]
-fn publish_snapshot_advances_retention_on_message_boundary() {
+fn checkpoint_publish_and_retention_advance_are_independent() {
     let mut machine = machine();
     create_stream(&mut machine, "snap");
     assert!(matches!(
@@ -2256,7 +2310,7 @@ fn publish_snapshot_advances_retention_on_message_boundary() {
         }
     ));
 
-    assert_eq!(
+    assert!(matches!(
         machine.apply(publish_snapshot_cmd(
             stream("snap"),
             3,
@@ -2266,6 +2320,21 @@ fn publish_snapshot_advances_retention_on_message_boundary() {
         )),
         StreamResponse::SnapshotPublished {
             snapshot_offset: 3,
+            ..
+        }
+    ));
+    assert_eq!(
+        machine
+            .read(&stream("snap"), 0, 5)
+            .expect("unpruned read")
+            .payload,
+        b"abcde"
+    );
+    assert_eq!(machine.retained_offset(&stream("snap")), 0);
+    assert_eq!(
+        machine.apply(advance_retention_cmd(stream("snap"), 3, 1)),
+        StreamResponse::RetentionAdvanced {
+            retained_offset: 3,
             record_range: None,
         }
     );
@@ -2838,16 +2907,29 @@ proptest! {
 
         let snapshot_message_count = 1 + (snapshot_index_seed % (payloads.len() - 1));
         let snapshot_offset = boundaries[snapshot_message_count - 1].end_offset;
+        let publish_response = machine.apply(publish_snapshot_cmd(
+            stream_id.clone(),
+            snapshot_offset,
+            OCTET,
+            &snapshot_payload,
+            0
+        ));
+        let StreamResponse::SnapshotPublished {
+            snapshot_offset: published_offset,
+            ..
+        } = publish_response else {
+            prop_assert!(false, "unexpected snapshot response: {:?}", publish_response);
+            unreachable!();
+        };
+        prop_assert_eq!(published_offset, snapshot_offset);
         prop_assert_eq!(
-            machine.apply(publish_snapshot_cmd(
+            machine.apply(advance_retention_cmd(
                 stream_id.clone(),
                 snapshot_offset,
-                OCTET,
-                &snapshot_payload,
-                0
+                1,
             )),
-            StreamResponse::SnapshotPublished {
-                snapshot_offset,
+            StreamResponse::RetentionAdvanced {
+                retained_offset: snapshot_offset,
                 record_range: None,
             }
         );
@@ -2908,11 +2990,9 @@ proptest! {
         ));
 
         let bootstrap = machine.bootstrap_plan(&stream_id).expect("bootstrap plan");
-        let expected_snapshot = Some(StreamVisibleSnapshot {
-            offset: snapshot_offset,
-            content_type: OCTET.to_owned(),
-            payload: snapshot_payload.clone(),
-        });
+        let expected_snapshot = machine
+            .latest_snapshot(&stream_id)
+            .expect("latest snapshot");
         prop_assert_eq!(
             bootstrap.snapshot.as_ref(),
             expected_snapshot.as_ref()
