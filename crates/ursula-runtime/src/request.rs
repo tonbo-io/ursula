@@ -343,6 +343,19 @@ pub struct AdvanceRetentionResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportGroupStateRequest {
+    pub snapshot: Box<ursula_stream::StreamSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ImportGroupStateResponse {
+    pub placement: ShardPlacement,
+    pub buckets: u64,
+    pub streams: u64,
+    pub group_commit_index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadSnapshotRequest {
     pub stream_id: BucketStreamId,
     pub snapshot_offset: Option<u64>,

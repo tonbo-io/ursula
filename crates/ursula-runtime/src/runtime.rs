@@ -73,6 +73,8 @@ use crate::request::GetStreamAttrsRequest;
 use crate::request::GetStreamAttrsResponse;
 use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
+use crate::request::ImportGroupStateRequest;
+use crate::request::ImportGroupStateResponse;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -726,6 +728,12 @@ impl ShardRuntime {
                 .await?;
         }
         Ok(reclaimed)
+    }
+
+    /// Number of raft groups this runtime is sharded into. Backup tooling
+    /// iterates `0..raft_group_count()` to cover the whole keyspace.
+    pub fn raft_group_count(&self) -> u32 {
+        self.shard_map.raft_group_count()
     }
 
     pub async fn install_group_snapshot(

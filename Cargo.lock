@@ -4260,6 +4260,7 @@ version = "0.3.4"
 dependencies = [
  "axum 0.8.9",
  "base64 0.22.1",
+ "blake3",
  "chrono",
  "clap",
  "console-subscriber",
@@ -4269,6 +4270,7 @@ dependencies = [
  "openraft",
  "opentelemetry",
  "reqwest",
+ "rmp-serde",
  "serde",
  "serde_json",
  "tempfile",
@@ -4331,8 +4333,11 @@ name = "ursula-ctl"
 version = "0.3.4"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
+ "opendal",
  "reqwest",
+ "rmp-serde",
  "serde",
  "serde_json",
  "tempfile",
@@ -4342,6 +4347,7 @@ dependencies = [
  "tracing",
  "url",
  "ursula-observability",
+ "ursula-stream",
  "yaml_serde",
 ]
 

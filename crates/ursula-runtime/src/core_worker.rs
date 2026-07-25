@@ -58,6 +58,8 @@ use crate::request::GetStreamAttrsResponse;
 use crate::request::GroupReadStreamParts;
 use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
+use crate::request::ImportGroupStateRequest;
+use crate::request::ImportGroupStateResponse;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -624,6 +626,33 @@ impl CoreWorker {
                 placement,
             )
             .await;
+        }
+        response
+    }
+
+    pub(crate) async fn import_group_state(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        request: ImportGroupStateRequest,
+        placement: ShardPlacement,
+    ) -> Result<ImportGroupStateResponse, RuntimeError> {
+        let started_at = Instant::now();
+        let exec_started_at = Instant::now();
+        let response = group
+            .import_group_state(request, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err));
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(exec_started_at),
+        );
+        if response.is_ok() {
+            metrics.record_applied_mutation(
+                placement.core_id,
+                placement.raft_group_id,
+                elapsed_ns(started_at),
+            );
         }
         response
     }

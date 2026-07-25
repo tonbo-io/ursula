@@ -90,6 +90,36 @@ impl StreamStateMachine {
         }
     }
 
+    /// Applies a whole-group state import (`StreamCommand::ImportSnapshot`).
+    ///
+    /// Restore-only by design: importing over live state would silently merge
+    /// two histories, so a non-empty group fails closed with
+    /// [`StreamErrorCode::ImportConflict`] and an invalid payload with
+    /// [`StreamErrorCode::ImportInvalid`].
+    pub(crate) fn import_snapshot(&mut self, snapshot: StreamSnapshot) -> StreamResponse {
+        if !self.buckets.is_empty() || !self.registry.is_empty() {
+            return StreamResponse::error(
+                StreamErrorCode::ImportConflict,
+                format!(
+                    "group already holds {} bucket(s); snapshot import requires an empty group",
+                    self.buckets.len()
+                ),
+            );
+        }
+        let buckets = u64::try_from(snapshot.buckets.len()).unwrap_or(u64::MAX);
+        let streams = u64::try_from(snapshot.streams.len()).unwrap_or(u64::MAX);
+        match Self::restore(snapshot) {
+            Ok(restored) => {
+                *self = restored;
+                StreamResponse::SnapshotImported { buckets, streams }
+            }
+            Err(error) => StreamResponse::error(
+                StreamErrorCode::ImportInvalid,
+                format!("snapshot import failed validation: {error}"),
+            ),
+        }
+    }
+
     pub fn restore(snapshot: StreamSnapshot) -> Result<Self, StreamSnapshotError> {
         let mut machine = Self::default();
         for bucket_id in snapshot.buckets {

@@ -864,6 +864,33 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
+    fn import_group_state<'a>(
+        &'a mut self,
+        request: ursula_runtime::ImportGroupStateRequest,
+        _placement: ShardPlacement,
+    ) -> ursula_runtime::GroupImportGroupStateFuture<'a> {
+        Box::pin(async move {
+            let command = GroupWriteCommand::from(ursula_stream::StreamCommand::from(request));
+            if let Some(response) = self
+                .forward_write_to_leader_if_follower(command.clone())
+                .await?
+            {
+                return match response {
+                    GroupWriteResponse::ImportGroupState(response) => Ok(response),
+                    other => Err(GroupEngineError::new(format!(
+                        "unexpected group state import response: {other:?}"
+                    ))),
+                };
+            }
+            match self.write(command).await? {
+                GroupWriteResponse::ImportGroupState(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected group state import response: {other:?}"
+                ))),
+            }
+        })
+    }
+
     fn read_snapshot<'a>(
         &'a mut self,
         request: ReadSnapshotRequest,

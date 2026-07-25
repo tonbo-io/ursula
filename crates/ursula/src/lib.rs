@@ -95,6 +95,7 @@ use ursula_runtime::ErrorStatus;
 use ursula_runtime::ExternalPayloadRef;
 use ursula_runtime::GetStreamAttrsRequest;
 use ursula_runtime::HeadStreamRequest;
+use ursula_runtime::ImportGroupStateRequest;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::ProducerRequest;
 use ursula_runtime::PublishSnapshotRequest;
@@ -767,6 +768,15 @@ fn admin_ops_router(state: HttpState) -> Router {
             "/__ursula/flush-cold/{bucket}/{stream}",
             post(flush_cold_stream),
         )
+        .route("/__ursula/backup/info", get(backup_info))
+        .route(
+            "/__ursula/backup/group/{raft_group_id}",
+            get(export_backup_group),
+        )
+        .route(
+            "/__ursula/backup/group/{raft_group_id}/import",
+            post(import_backup_group),
+        )
         .route(
             "/__ursula/raft/{raft_group_id}/snapshot",
             post(trigger_raft_snapshot),
@@ -1412,6 +1422,131 @@ pub(crate) async fn flush_cold_stream(
             .to_string(),
         ),
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => {
+            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
+        }
+    }
+}
+
+pub(crate) const BACKUP_FORMAT_VERSION: u32 = 1;
+pub(crate) const HEADER_BACKUP_FORMAT: &str = "x-ursula-backup-format";
+pub(crate) const HEADER_BACKUP_BLAKE3: &str = "x-ursula-backup-blake3";
+pub(crate) const HEADER_BACKUP_COMMIT_INDEX: &str = "x-ursula-backup-commit-index";
+
+/// Cluster shape a backup client needs before iterating groups.
+pub(crate) async fn backup_info(State(state): State<HttpState>) -> Response {
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "format_version": BACKUP_FORMAT_VERSION,
+            "raft_group_count": state.runtime.raft_group_count(),
+        })
+        .to_string(),
+    )
+}
+
+/// Exports one group's complete stream state as a MessagePack document.
+///
+/// The export is the same deterministic `StreamSnapshot` the raft snapshot
+/// path persists, so it is internally consistent per group while writes
+/// continue; cross-group consistency is intentionally not promised (the
+/// recovery boundary is per stream).
+pub(crate) async fn export_backup_group(
+    State(state): State<HttpState>,
+    OriginalUri(uri): OriginalUri,
+    Path(raft_group_id): Path<u64>,
+) -> Response {
+    let group_count = u64::from(state.runtime.raft_group_count());
+    if raft_group_id >= group_count {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("raft group {raft_group_id} out of range 0..{group_count}"),
+        )
+            .into_response();
+    }
+    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
+    };
+    let snapshot = match state.runtime.snapshot_group(raft_group_id).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            return runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri))
+                .await;
+        }
+    };
+    let body = match rmp_serde::to_vec_named(&snapshot.stream_snapshot) {
+        Ok(body) => body,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("encode backup snapshot: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let checksum = blake3::hash(&body).to_hex().to_string();
+    let mut response = (StatusCode::OK, body).into_response();
+    let headers = response.headers_mut();
+    headers.insert(HEADER_BACKUP_FORMAT, HeaderValue::from_static("1"));
+    if let Ok(value) = HeaderValue::from_str(&checksum) {
+        headers.insert(HEADER_BACKUP_BLAKE3, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&snapshot.group_commit_index.to_string()) {
+        headers.insert(HEADER_BACKUP_COMMIT_INDEX, value);
+    }
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-msgpack"),
+    );
+    response
+}
+
+/// Imports one group's backup snapshot into an empty group as a replicated
+/// write. Non-empty groups fail closed with `409`; invalid payloads with
+/// `400`. The restored cluster keeps its own raft identity and membership.
+pub(crate) async fn import_backup_group(
+    State(state): State<HttpState>,
+    OriginalUri(uri): OriginalUri,
+    Path(raft_group_id): Path<u64>,
+    body: axum::body::Bytes,
+) -> Response {
+    let group_count = u64::from(state.runtime.raft_group_count());
+    if raft_group_id >= group_count {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("raft group {raft_group_id} out of range 0..{group_count}"),
+        )
+            .into_response();
+    }
+    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid raft group id").into_response();
+    };
+    let snapshot: ursula_runtime::StreamSnapshot = match rmp_serde::from_slice(&body) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("decode backup snapshot: {err}"),
+            )
+                .into_response();
+        }
+    };
+    match state
+        .runtime
+        .import_group_state(raft_group_id, ImportGroupStateRequest {
+            snapshot: Box::new(snapshot),
+        })
+        .await
+    {
+        Ok(response) => json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "buckets": response.buckets,
+                "streams": response.streams,
+                "group_commit_index": response.group_commit_index,
+            })
+            .to_string(),
+        ),
         Err(err) => {
             runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
         }

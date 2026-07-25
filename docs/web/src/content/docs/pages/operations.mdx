@@ -90,17 +90,38 @@ There is no automatic retention policy. Application checkpoints and explicit str
 
 ## Backup and disaster recovery
 
-<Warning>
-Ursula has no backup or restore tool: no `--export`, no cluster dump, no "restore from snapshot file". Plan recovery accordingly.
-</Warning>
+`ursulactl` provides a verifiable whole-cluster backup and restore workflow:
 
-What you can rely on:
+```bash
+# Create: one MessagePack snapshot object per raft group + manifest.json,
+# into a local directory or s3://bucket/prefix.
+ursulactl backup-create --config cluster.yaml --location s3://backups/ursula/2026-07-25
+
+# Verify: manifest completeness, byte sizes, BLAKE3 checksums, and deep
+# state-machine validation of every snapshot. Touches no cluster.
+ursulactl backup-verify --location s3://backups/ursula/2026-07-25
+
+# Restore: into a FRESH, EMPTY cluster with the same raft group count.
+ursulactl restore --config new-cluster.yaml --location s3://backups/ursula/2026-07-25
+```
+
+The recovery contract:
+
+- **Consistency boundary.** Each group export is the deterministic state-machine snapshot the raft snapshot path persists: internally consistent per group while writes continue. Cross-group consistency is not promised; the boundary is per stream. Acknowledged writes in the exporting replica's applied state are included whether or not they were cold-flushed, so **RPO is bounded by export time**, not by the cold-flush interval. `backup-create` asks every node and keeps the reply with the highest group commit index.
+- **Fresh identity on restore.** Restore replays each snapshot as one replicated write on the target cluster, which keeps its own raft membership and log identity — nothing from the source cluster's raft metadata is reused. Groups that already hold buckets refuse the import with `409`; group-count mismatches fail closed before the first import. Group commit indexes and per-stream append counters restart under the new identity; stream bytes, offsets, record coordinates, attrs, close/TTL state, published snapshots, retention floors, and producer dedup states are preserved exactly.
+- **Cold objects are part of the backup set.** Snapshots reference cold-tier chunks by object key; point the restored cluster at the same (or a copied) cold-store namespace. `backup-verify` validates snapshots but does not dereference cold objects.
+- **Format compatibility.** The backup format is versioned (`format_version` in the manifest) independently from the server binary; tools refuse newer formats and servers refuse imports they cannot validate. Within `v0.x`, restore into the same minor version is the supported path.
+- **RTO** is dominated by transferring and importing the group snapshots; each import is a single replicated write per group.
+
+The recovery drill — write, snapshot, retain, close; back up; destroy the cluster; restore; verify checksums, coordinates, and boundaries; continue appending — runs in CI (`backup_restore_drill_preserves_streams_and_allows_continued_appends`).
+
+What you can additionally rely on:
 
 - **Quorum durability.** Acknowledged writes survive as long as a majority of voters survives. Three voters across AZs tolerate any single-AZ outage.
 - **Cold-tier durability.** Once flushed to S3, a chunk inherits S3-grade durability. The unflushed window is bounded by the flush interval (seconds by default).
 - **No on-disk migration.** `v0.x` does not promise stable on-disk formats. The runtime won't refuse to start on stale data, but it won't migrate either. Cross-version upgrades currently mean rebuild + replay from external truth.
 
-Node-level loss: replace the host with the same `node_id` and cluster config, and it rehydrates from peers. Use `ursulactl wait-ready` afterwards to confirm the replacement is voting and caught up before declaring the recovery done. Total-cluster loss: the durable data on S3 is what you have, and there is no tooling yet to materialize a fresh cluster from those objects.
+Node-level loss: replace the host with the same `node_id` and cluster config, and it rehydrates from peers. Use `ursulactl wait-ready` afterwards to confirm the replacement is voting and caught up before declaring the recovery done. Total-cluster loss: restore the latest verified backup into a fresh cluster as above.
 
 ## Logs
 

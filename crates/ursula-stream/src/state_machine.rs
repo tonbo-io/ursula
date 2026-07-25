@@ -456,6 +456,7 @@ impl StreamStateMachine {
             }
             StreamCommand::DeleteStream { stream_id } => self.delete_stream(&stream_id),
             StreamCommand::AckColdGc { up_to_seq } => self.ack_cold_gc(up_to_seq),
+            StreamCommand::ImportSnapshot { snapshot } => self.import_snapshot(*snapshot),
         }
     }
 }

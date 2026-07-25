@@ -6140,3 +6140,178 @@ async fn usage_endpoint_reports_per_bucket_committed_counters() {
     );
     assert_eq!(tenant_a_truncated["retained_bytes"], 0);
 }
+
+// #136: the full recovery drill against the HTTP surface. Build a cluster,
+// write two tenants' streams (records, close state, app snapshot, retention
+// floor), export every group, destroy the cluster, restore into a fresh one,
+// and verify bytes, record coordinates, closed state, retention, snapshots,
+// tenant boundaries, and continued appends -- with no offset drift.
+#[tokio::test]
+async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
+    let source = test_router();
+
+    // Tenant A: JSON records, app snapshot, retention floor at record 2.
+    let response = http_put(
+        &source,
+        "/tenant-a/orders",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"[{"id":1},{"id":2}]"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = http_post(
+        &source,
+        "/tenant-a/orders",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"id":3}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = http_put(
+        &source,
+        "/tenant-a/orders/snapshot?record=2",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"count":2}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = http_put(
+        &source,
+        "/tenant-a/orders/retention?record=2",
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // Tenant B: raw byte stream, closed.
+    let response = http_put(
+        &source,
+        "/tenant-b/journal",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("raw-payload"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = http_post(
+        &source,
+        "/tenant-b/journal",
+        &[("stream-closed", "true")],
+        Body::empty(),
+    )
+    .await;
+    assert!(response.status().is_success());
+
+    // Export every group, checking transfer checksums like ursulactl does.
+    let info = http_get(&source, "/__ursula/backup/info").await;
+    assert_eq!(info.status(), StatusCode::OK);
+    let info: serde_json::Value =
+        serde_json::from_slice(&body_bytes(info).await).expect("backup info json");
+    assert_eq!(info["format_version"], 1);
+    let group_count = info["raft_group_count"].as_u64().expect("group count");
+    let mut exports = Vec::new();
+    for group in 0..group_count {
+        let response = http_get(&source, &format!("/__ursula/backup/group/{group}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let declared = header_str(&response, "x-ursula-backup-blake3").to_owned();
+        let body = body_bytes(response).await;
+        assert_eq!(blake3::hash(&body).to_hex().to_string(), declared);
+        exports.push(body);
+    }
+
+    // Destroy the source cluster entirely (in-memory: dropping it is total
+    // loss) and build a fresh one with its own identity.
+    drop(source);
+    let restored = test_router();
+
+    for (group, body) in exports.iter().enumerate() {
+        let response = http_post(
+            &restored,
+            &format!("/__ursula/backup/group/{group}/import"),
+            &[(CONTENT_TYPE.as_str(), "application/x-msgpack")],
+            Body::from(body.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "import group {group}");
+    }
+
+    // Retention floor survived: reads below record 2 are GONE, the app
+    // snapshot is intact, and the tail record is exactly where it was.
+    let response = http_get(&restored, "/tenant-a/orders?record=0&max_records=1").await;
+    assert_eq!(response.status(), StatusCode::GONE);
+    let response = http_get(&restored, "/tenant-a/orders?record=2&max_records=10").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "3");
+    let body = body_bytes(response).await;
+    assert!(
+        std::str::from_utf8(&body)
+            .expect("utf8")
+            .contains("\"id\":3")
+    );
+    // The latest-snapshot URL canonicalizes via 307; follow it like a client.
+    let response = http_get(&restored, "/tenant-a/orders/snapshot").await;
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    let location = header_str(&response, "location").to_owned();
+    let response = http_get(&restored, &location).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    assert_eq!(&body[..], br#"{"count":2}"#);
+
+    // Closed byte stream: bytes identical, close state preserved.
+    let response = http_get(&restored, "/tenant-b/journal?offset=0&max_bytes=100").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_str(&response, "stream-closed"), "true");
+    let body = body_bytes(response).await;
+    assert_eq!(&body[..], b"raw-payload");
+    let response = http_post(
+        &restored,
+        "/tenant-b/journal",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("more"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    // Tenant boundary: a bucket that never existed stays absent.
+    let response = http_get(&restored, "/tenant-c/orders?record=0").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // Continued append lands at the next record with no drift.
+    let response = http_post(
+        &restored,
+        "/tenant-a/orders",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"id":4}"#),
+    )
+    .await;
+    assert!(response.status().is_success());
+    let response = http_get(&restored, "/tenant-a/orders?record=3&max_records=10").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "4");
+    let body = body_bytes(response).await;
+    assert!(
+        std::str::from_utf8(&body)
+            .expect("utf8")
+            .contains("\"id\":4")
+    );
+
+    // Re-importing into a group that now owns a bucket fails closed.
+    let mut conflicted = false;
+    for (group, body) in exports.iter().enumerate() {
+        let snapshot: ursula_runtime::StreamSnapshot =
+            rmp_serde::from_slice(body).expect("decode export");
+        if snapshot.buckets.is_empty() {
+            continue;
+        }
+        let response = http_post(
+            &restored,
+            &format!("/__ursula/backup/group/{group}/import"),
+            &[(CONTENT_TYPE.as_str(), "application/x-msgpack")],
+            Body::from(body.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT, "group {group}");
+        conflicted = true;
+    }
+    assert!(conflicted, "expected at least one bucket-owning group");
+}

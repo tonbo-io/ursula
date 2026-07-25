@@ -92,7 +92,8 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         | StreamErrorCode::StreamClosed
         | StreamErrorCode::StreamSeqConflict
         | StreamErrorCode::SnapshotConflict
-        | StreamErrorCode::ProducerSeqConflict => StatusCode::CONFLICT,
+        | StreamErrorCode::ProducerSeqConflict
+        | StreamErrorCode::ImportConflict => StatusCode::CONFLICT,
         StreamErrorCode::RecordPreconditionFailed => StatusCode::PRECONDITION_FAILED,
         StreamErrorCode::ProducerEpochStale => StatusCode::FORBIDDEN,
         StreamErrorCode::OffsetOutOfRange => StatusCode::RANGE_NOT_SATISFIABLE,
@@ -106,7 +107,8 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         | StreamErrorCode::InvalidColdFlush
         | StreamErrorCode::InvalidSnapshot
         | StreamErrorCode::InvalidStreamAttrs
-        | StreamErrorCode::InvalidRecordBoundaries => StatusCode::BAD_REQUEST,
+        | StreamErrorCode::InvalidRecordBoundaries
+        | StreamErrorCode::ImportInvalid => StatusCode::BAD_REQUEST,
     }
 }
 

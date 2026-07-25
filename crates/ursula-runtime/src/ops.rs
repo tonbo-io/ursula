@@ -358,6 +358,13 @@ macro_rules! runtime_operations {
                 handle { call snapshot_group(engine, metrics, placement) }
                 client { pub group fn snapshot_group }
             }
+            op ImportGroupState {
+                fields { request: ImportGroupStateRequest }
+                reply { response_tx: ImportGroupStateResponse }
+                guard { none }
+                handle { call import_group_state(engine, metrics, request, placement) }
+                client { pub group fn import_group_state }
+            }
             op InstallGroupSnapshot {
                 fields { snapshot: GroupSnapshot }
                 reply { response_tx: () }

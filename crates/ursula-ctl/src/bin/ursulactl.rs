@@ -11,6 +11,7 @@ use ursula_ctl::MetricsClient;
 use ursula_ctl::NodeInfo;
 use ursula_ctl::NodeProvider;
 use ursula_ctl::StaticNodeProvider;
+use ursula_ctl::backup;
 use ursula_ctl::observe::collect_status;
 use ursula_ctl::wait_ready;
 use ursula_ctl::write_status;
@@ -44,6 +45,40 @@ enum Command {
     /// Arm one empty-log rejoin per group for a raft-memory node that lost its
     /// volatile log. Refused on disk-backed clusters.
     AllowRejoin(NodeArgs),
+    /// Create a verifiable backup of every raft group into a local directory
+    /// or `s3://bucket/prefix`.
+    #[command(name = "backup-create")]
+    BackupCreate(BackupCreateArgs),
+    /// Verify a backup's manifest, checksums, and snapshot validity without
+    /// touching any cluster.
+    #[command(name = "backup-verify")]
+    BackupVerify(BackupLocationArgs),
+    /// Restore a verified backup into a fresh, empty cluster with the same
+    /// raft group count.
+    Restore(BackupCreateArgs),
+}
+
+#[derive(Args, Debug)]
+struct BackupCreateArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// Backup location: local directory or `s3://bucket/prefix`.
+    #[arg(long, value_name = "LOCATION")]
+    location: String,
+    /// Manifest creation timestamp override (unix milliseconds); defaults to
+    /// the current wall clock.
+    #[arg(long)]
+    created_unix_ms: Option<u64>,
+    #[arg(long, default_value_t = 30)]
+    http_timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+struct BackupLocationArgs {
+    /// Backup location: local directory or `s3://bucket/prefix`.
+    #[arg(long, value_name = "LOCATION")]
+    location: String,
 }
 
 #[derive(Args, Debug)]
@@ -146,7 +181,74 @@ async fn main() -> Result<()> {
         Command::Undrain(args) => run_undrain_subcommand(args).await,
         Command::Wait(args) => run_wait_subcommand(args).await,
         Command::AllowRejoin(args) => run_allow_rejoin_subcommand(args).await,
+        Command::BackupCreate(args) => run_backup_create_subcommand(args).await,
+        Command::BackupVerify(args) => run_backup_verify_subcommand(args).await,
+        Command::Restore(args) => run_restore_subcommand(args).await,
     }
+}
+
+fn backup_client(nodes: &[NodeInfo], http_timeout_secs: u64) -> Result<backup::BackupClient> {
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(http_timeout_secs))
+        .build()
+        .context("build backup HTTP client")?;
+    let urls = nodes
+        .iter()
+        .map(|node| node.admin_url.as_str().trim_end_matches('/').to_owned())
+        .collect::<Vec<_>>();
+    backup::BackupClient::new(http, urls)
+}
+
+fn wall_clock_unix_ms() -> u64 {
+    // Operator-CLI wall clock: manifests are billing/ops artifacts, not
+    // simulation-visible state.
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+async fn run_backup_create_subcommand(args: BackupCreateArgs) -> Result<()> {
+    let nodes = load_nodes(&args.config).await?;
+    let client = backup_client(&nodes, args.http_timeout_secs)?;
+    let store = backup::BackupStore::open(&args.location)?;
+    let created_unix_ms = args.created_unix_ms.unwrap_or_else(wall_clock_unix_ms);
+    let manifest = backup::create(&client, &store, created_unix_ms).await?;
+    let (buckets, streams) = manifest.groups.iter().fold((0u64, 0u64), |acc, group| {
+        (
+            acc.0.saturating_add(group.buckets),
+            acc.1.saturating_add(group.streams),
+        )
+    });
+    println!(
+        "backup created: {} groups, {buckets} buckets, {streams} streams -> {}",
+        manifest.raft_group_count, args.location
+    );
+    Ok(())
+}
+
+async fn run_backup_verify_subcommand(args: BackupLocationArgs) -> Result<()> {
+    let store = backup::BackupStore::open(&args.location)?;
+    let report = backup::verify(&store).await?;
+    println!(
+        "backup verified: {} groups, {} buckets, {} streams",
+        report.groups, report.buckets, report.streams
+    );
+    Ok(())
+}
+
+async fn run_restore_subcommand(args: BackupCreateArgs) -> Result<()> {
+    let nodes = load_nodes(&args.config).await?;
+    let client = backup_client(&nodes, args.http_timeout_secs)?;
+    let store = backup::BackupStore::open(&args.location)?;
+    let report = backup::restore(&client, &store).await?;
+    println!(
+        "restore complete: {} groups, {} buckets, {} streams",
+        report.groups, report.buckets, report.streams
+    );
+    Ok(())
 }
 
 /// Load the manifest and return its node list.

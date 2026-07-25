@@ -9,6 +9,7 @@ use crate::model::ColdChunkRef;
 use crate::model::ExternalPayloadRef;
 use crate::model::ProducerRequest;
 use crate::model::StreamAttrs;
+use crate::snapshot::StreamSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamCommand {
@@ -130,6 +131,16 @@ pub enum StreamCommand {
     AckColdGc {
         up_to_seq: u64,
     },
+    /// Replaces this group's entire state with a backup snapshot.
+    ///
+    /// Restore-only: the target group must be empty. Travelling as a normal
+    /// replicated command keeps every replica of the restored cluster
+    /// deterministic while the cluster retains its own raft identity and
+    /// membership -- nothing from the backed-up cluster's raft metadata is
+    /// reused.
+    ImportSnapshot {
+        snapshot: Box<StreamSnapshot>,
+    },
 }
 
 impl fmt::Display for StreamCommand {
@@ -205,6 +216,12 @@ impl fmt::Display for StreamCommand {
             Self::Close { stream_id, .. } => write!(f, "close_stream:{stream_id}"),
             Self::DeleteStream { stream_id } => write!(f, "delete_stream:{stream_id}"),
             Self::AckColdGc { up_to_seq } => write!(f, "ack_cold_gc:up_to_seq={up_to_seq}"),
+            Self::ImportSnapshot { snapshot } => write!(
+                f,
+                "import_snapshot:buckets={}:streams={}",
+                snapshot.buckets.len(),
+                snapshot.streams.len()
+            ),
         }
     }
 }

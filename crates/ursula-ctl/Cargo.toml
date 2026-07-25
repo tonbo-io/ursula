@@ -15,6 +15,10 @@ path = "src/bin/ursulactl.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+blake3 = { workspace = true }
+opendal = { workspace = true, features = ["services-fs", "services-s3"] }
+rmp-serde = { workspace = true }
+ursula-stream = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 reqwest = { workspace = true, features = ["rustls-tls", "json"] }
 serde = { workspace = true }
