@@ -12,6 +12,8 @@
 //! Module map:
 //!
 //! - [`auth`]: opt-in, provider-neutral authentication and authorization hooks.
+//! - [`admission`]: opt-in per-tenant rate, live-read, and body-size limits.
+//! - [`usage`]: opt-in per-tenant request/byte accounting and batch export.
 //! - [`service`]: command arguments and the long-running gateway service entrypoint.
 
 use std::error::Error as _;
@@ -29,6 +31,7 @@ use axum::http::Uri;
 use axum::http::header::AUTHORIZATION;
 use axum::http::header::CONNECTION;
 use axum::http::header::LOCATION;
+use axum::http::header::RETRY_AFTER;
 use axum::http::header::WWW_AUTHENTICATE;
 use axum::response::IntoResponse;
 use axum::response::Response as AxumResponse;
@@ -37,15 +40,29 @@ use rand::prelude::IndexedRandom;
 use tracing::debug;
 use tracing::error;
 
+pub mod admission;
 pub mod auth;
 pub mod service;
+pub mod usage;
 
+use std::sync::Arc;
+
+use crate::admission::Admission;
+use crate::admission::AdmissionRejection;
+use crate::admission::LiveReadGuard;
+use crate::admission::QuotaProvider;
+use crate::admission::TenantLimits;
 use crate::auth::AccessControl;
 use crate::auth::Action;
 use crate::auth::AuthenticationError;
 use crate::auth::AuthorizationDecision;
 use crate::auth::AuthorizationRequest;
 use crate::auth::Resource;
+use crate::auth::VerifiedPrincipal;
+use crate::usage::PrincipalRef;
+use crate::usage::UsageClass;
+use crate::usage::UsageCollector;
+use crate::usage::UsageKey;
 
 const HEADER_URSULA_RAFT_LEADER_ID: &str = "x-ursula-raft-leader-id";
 const HEADER_STREAM_CLOSED: &str = "stream-closed";
@@ -67,6 +84,9 @@ pub struct Gateway {
     client: reqwest::Client,
     response_header_timeout: Duration,
     access_control: Option<AccessControl>,
+    quota_provider: Option<Arc<dyn QuotaProvider>>,
+    admission: Arc<Admission>,
+    usage: Option<Arc<UsageCollector>>,
 }
 
 impl std::fmt::Debug for Gateway {
@@ -92,6 +112,9 @@ impl Gateway {
             client,
             response_header_timeout,
             access_control: None,
+            quota_provider: None,
+            admission: Arc::new(Admission::default()),
+            usage: None,
         }
     }
 
@@ -106,16 +129,40 @@ impl Gateway {
         }
     }
 
+    /// Installs per-tenant admission limits. Requires access control: limits
+    /// are keyed by the classified bucket resource.
+    pub fn with_quota_provider(mut self, provider: Arc<dyn QuotaProvider>) -> Self {
+        self.quota_provider = Some(provider);
+        self
+    }
+
+    /// Installs per-tenant usage accounting. Requires access control for the
+    /// same reason as quotas. Pair with [`usage::run_exporter`] to drain the
+    /// collector into a [`usage::UsageSink`].
+    pub fn with_usage_collector(mut self, collector: Arc<UsageCollector>) -> Self {
+        self.usage = Some(collector);
+        self
+    }
+
     pub async fn handle(&self, req: Request<Body>) -> AxumResponse {
         let (mut parts, body) = req.into_parts();
 
-        if let Some(response) = self.authorize(&parts).await {
-            return response;
-        }
+        let context = match self.gate(&parts).await {
+            Ok(context) => context,
+            Err(response) => return response,
+        };
         if self.access_control.is_some() {
             // The credential terminates at the gateway. Internal Ursula nodes
             // do not need the user's bearer token.
             parts.headers.remove(AUTHORIZATION);
+        }
+
+        let mut live_guard = None;
+        if let Some(context) = &context {
+            match self.admit(context) {
+                Ok(guard) => live_guard = guard,
+                Err(response) => return response,
+            }
         }
 
         let body_bytes = match axum::body::to_bytes(body, self.config.max_request_body_bytes).await
@@ -132,6 +179,13 @@ impl Gateway {
                 }
             }
         };
+        if let Some(max) = context
+            .as_ref()
+            .and_then(|ctx| ctx.limits.max_request_body_bytes)
+            && body_bytes.len() as u64 > max
+        {
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
 
         let upstream = match self.pick_upstream() {
             Some(u) => u,
@@ -141,7 +195,27 @@ impl Gateway {
             }
         };
 
-        match self.forward(upstream, &parts, body_bytes).await {
+        let tail = ResponseTail {
+            meter: context.as_ref().and_then(|ctx| {
+                self.usage.as_ref().map(|collector| EgressMeter {
+                    collector: Arc::clone(collector),
+                    key: UsageKey {
+                        bucket_id: ctx.bucket_id.clone(),
+                        principal: ctx.principal.clone(),
+                        class: ctx.class,
+                    },
+                    request_bytes: if matches!(ctx.class, UsageClass::Append) {
+                        body_bytes.len() as u64
+                    } else {
+                        0
+                    },
+                    response_bytes: 0,
+                })
+            }),
+            _live_guard: live_guard,
+        };
+
+        match self.forward(upstream, &parts, body_bytes, tail).await {
             Ok(response) => response,
             Err(e) => {
                 error!(error = %e, "gateway request failed");
@@ -150,46 +224,92 @@ impl Gateway {
         }
     }
 
-    async fn authorize(&self, parts: &axum::http::request::Parts) -> Option<AxumResponse> {
-        let access_control = self.access_control.as_ref()?;
+    /// Classifies and authorizes the request. `Ok(None)` means access control
+    /// is not installed and the gateway keeps its pass-through behavior.
+    async fn gate(
+        &self,
+        parts: &axum::http::request::Parts,
+    ) -> Result<Option<RequestContext>, AxumResponse> {
+        let Some(access_control) = self.access_control.as_ref() else {
+            return Ok(None);
+        };
         let Some(request) = classify_request(&parts.method, &parts.uri, &parts.headers) else {
             // An access-controlled gateway is a public resource server, not a
             // transparent escape hatch to internal or newly added routes.
-            return Some(StatusCode::NOT_FOUND.into_response());
+            return Err(StatusCode::NOT_FOUND.into_response());
         };
 
         let principal = match bearer_token(&parts.headers) {
             Ok(Some(token)) => match access_control.principal_resolver().resolve(token).await {
                 Ok(principal) => Some(principal),
-                Err(error) => return Some(authentication_error_response(error)),
+                Err(error) => return Err(authentication_error_response(error)),
             },
             Ok(None) => None,
             Err(()) => {
-                return Some(authentication_error_response(
+                return Err(authentication_error_response(
                     AuthenticationError::InvalidCredential,
                 ));
             }
         };
 
-        match access_control
+        let bucket_id = request.resource.bucket_id.clone();
+        let action = request.action;
+        let decision = access_control
             .authorizer()
             .authorize(AuthorizationRequest {
-                principal,
+                principal: principal.clone(),
                 resource: request.resource,
-                action: request.action,
+                action,
             })
-            .await
-        {
-            Ok(AuthorizationDecision::Allow) => None,
-            Ok(AuthorizationDecision::Deny) => Some(StatusCode::FORBIDDEN.into_response()),
+            .await;
+        match decision {
+            Ok(AuthorizationDecision::Allow) => {}
+            Ok(AuthorizationDecision::Deny) => return Err(StatusCode::FORBIDDEN.into_response()),
             Ok(AuthorizationDecision::ConcealAsNotFound) => {
-                Some(StatusCode::NOT_FOUND.into_response())
+                return Err(StatusCode::NOT_FOUND.into_response());
             }
             Err(error) => {
                 error!(error = %error, "gateway authorization failed");
-                Some(StatusCode::SERVICE_UNAVAILABLE.into_response())
+                return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
             }
         }
+
+        let limits = match &self.quota_provider {
+            Some(provider) => provider.limits_for(&bucket_id).await,
+            None => TenantLimits::default(),
+        };
+        Ok(Some(RequestContext {
+            bucket_id,
+            class: usage_class(action),
+            principal: principal.as_ref().map(principal_ref),
+            limits,
+        }))
+    }
+
+    /// Enforces the tenant's admission limits. `Retry-After` accompanies every
+    /// retryable rejection; Ursula's own `503` backpressure semantics are
+    /// untouched.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the error is the terminal HTTP response, produced at most once per request"
+    )]
+    fn admit(&self, context: &RequestContext) -> Result<Option<LiveReadGuard>, AxumResponse> {
+        if self.quota_provider.is_none() {
+            return Ok(None);
+        }
+        if let Err(rejection) = self
+            .admission
+            .admit_request(&context.bucket_id, context.limits)
+        {
+            return Err(admission_rejection_response(rejection));
+        }
+        if context.class == UsageClass::LiveRead {
+            return self
+                .admission
+                .admit_live_read(&context.bucket_id, context.limits)
+                .map_err(admission_rejection_response);
+        }
+        Ok(None)
     }
 
     fn pick_upstream(&self) -> Option<&str> {
@@ -202,6 +322,7 @@ impl Gateway {
         upstream: &str,
         parts: &axum::http::request::Parts,
         body: bytes::Bytes,
+        tail: ResponseTail,
     ) -> Result<Response<Body>, GatewayError> {
         let path_and_query = parts
             .uri
@@ -231,11 +352,11 @@ impl Gateway {
                     path_and_query
                 );
                 let leader_resp = self.send_request(&leader_target, parts, body).await?;
-                return Self::build_response(leader_resp);
+                return Self::build_response(leader_resp, tail);
             }
         }
 
-        Self::build_response(upstream_resp)
+        Self::build_response(upstream_resp, tail)
     }
 
     /// Covers only response headers so SSE bodies stay open.
@@ -260,7 +381,10 @@ impl Gateway {
         .map_err(|e| GatewayError::Upstream(e.to_string()))
     }
 
-    fn build_response(upstream_resp: reqwest::Response) -> Result<Response<Body>, GatewayError> {
+    fn build_response(
+        upstream_resp: reqwest::Response,
+        tail: ResponseTail,
+    ) -> Result<Response<Body>, GatewayError> {
         let status = upstream_resp.status();
         let mut headers = copy_forwarded_headers(upstream_resp.headers(), false);
 
@@ -284,7 +408,10 @@ impl Gateway {
             *response_headers = headers;
         }
         response
-            .body(Body::from_stream(upstream_resp.bytes_stream()))
+            .body(Body::from_stream(CountedStream {
+                inner: upstream_resp.bytes_stream(),
+                tail,
+            }))
             .map_err(|e| GatewayError::ResponseBuild(e.to_string()))
     }
 
@@ -295,6 +422,105 @@ impl Gateway {
             .iter()
             .find(|u| location.starts_with(*u))
             .map(String::as_str)
+    }
+}
+
+/// Per-request context available once access control has classified and
+/// authorized the request.
+struct RequestContext {
+    bucket_id: String,
+    class: UsageClass,
+    principal: Option<PrincipalRef>,
+    limits: TenantLimits,
+}
+
+fn usage_class(action: Action) -> UsageClass {
+    match action {
+        Action::Append | Action::AppendAndClose | Action::Create | Action::CreateAndClose => {
+            UsageClass::Append
+        }
+        Action::Read | Action::Head | Action::ReadSnapshot => UsageClass::Read,
+        Action::Tail => UsageClass::LiveRead,
+        Action::Update
+        | Action::Delete
+        | Action::PublishSnapshot
+        | Action::DeleteSnapshot
+        | Action::AdministerBucket => UsageClass::Admin,
+    }
+}
+
+fn principal_ref(principal: &VerifiedPrincipal) -> PrincipalRef {
+    PrincipalRef {
+        issuer: principal.issuer.clone(),
+        subject: principal.subject.clone(),
+    }
+}
+
+fn admission_rejection_response(rejection: AdmissionRejection) -> AxumResponse {
+    match rejection {
+        AdmissionRejection::RateLimited { retry_after_secs } => {
+            let mut response = (
+                StatusCode::TOO_MANY_REQUESTS,
+                "tenant request rate limit exceeded",
+            )
+                .into_response();
+            if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                response.headers_mut().insert(RETRY_AFTER, value);
+            }
+            response
+        }
+        AdmissionRejection::LiveReadsExhausted => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "tenant live-read connection limit exceeded",
+        )
+            .into_response(),
+    }
+}
+
+/// Rides the response body: counts egress bytes and, on drop, records the
+/// request's usage and releases any live-read slot. Dropping happens whether
+/// the body completes, the client disconnects, or the response is discarded.
+struct ResponseTail {
+    meter: Option<EgressMeter>,
+    _live_guard: Option<LiveReadGuard>,
+}
+
+struct EgressMeter {
+    collector: Arc<UsageCollector>,
+    key: UsageKey,
+    request_bytes: u64,
+    response_bytes: u64,
+}
+
+impl Drop for EgressMeter {
+    fn drop(&mut self) {
+        self.collector
+            .record(self.key.clone(), 1, self.request_bytes, self.response_bytes);
+    }
+}
+
+struct CountedStream<S> {
+    inner: S,
+    tail: ResponseTail,
+}
+
+impl<S> futures_core::Stream for CountedStream<S>
+where S: futures_core::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin
+{
+    type Item = Result<bytes::Bytes, reqwest::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let polled = std::pin::Pin::new(&mut this.inner).poll_next(cx);
+        if let std::task::Poll::Ready(Some(Ok(chunk))) = &polled
+            && let Some(meter) = &mut this.tail.meter
+        {
+            meter.response_bytes = meter.response_bytes.saturating_add(chunk.len() as u64);
+        }
+        polled
     }
 }
 
@@ -335,7 +561,9 @@ fn classify_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<C
             (Some(stream.clone()), action)
         }
         [_bucket, stream] if *method == Method::GET => {
-            let action = if query_has_pair(uri, "live", "sse") {
+            // Any `live` mode (sse, long-poll) holds a server-side waiter, so
+            // both classify as Tail for authorization and live-read quotas.
+            let action = if query_has_live_mode(uri) {
                 Action::Tail
             } else {
                 Action::Read
@@ -394,12 +622,12 @@ fn decode_path_segment(segment: &str) -> Option<String> {
         .map(|decoded| decoded.into_owned())
 }
 
-fn query_has_pair(uri: &Uri, expected_name: &str, expected_value: &str) -> bool {
+fn query_has_live_mode(uri: &Uri) -> bool {
     uri.query().is_some_and(|query| {
         query.split('&').any(|pair| {
             let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
-            decode_path_segment(name).as_deref() == Some(expected_name)
-                && decode_path_segment(value).as_deref() == Some(expected_value)
+            decode_path_segment(name).as_deref() == Some("live")
+                && decode_path_segment(value).is_some_and(|value| !value.is_empty())
         })
     })
 }

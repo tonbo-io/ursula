@@ -13,6 +13,7 @@ description = "Ursula Gateway: routes client HTTP traffic while hiding internal 
 axum = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+futures-core = "0.3"
 http-body-util = "0.1"
 jsonwebtoken = { workspace = true }
 percent-encoding = "2"
@@ -27,6 +28,8 @@ ursula-observability = { workspace = true }
 rand = { workspace = true, features = ["thread_rng"] }
 
 [dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tokio-stream = { workspace = true }
 
 [lints]
