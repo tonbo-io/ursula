@@ -582,4 +582,71 @@ listen = "127.0.0.1:4437"
             assert_eq!(actual, expected, "preset {name}");
         }
     }
+    #[test]
+    fn s3_server_side_encryption_defaults_to_aes256() {
+        use crate::config::S3ServerSideEncryption;
+        use crate::config::UrsulaConfig;
+        let config: UrsulaConfig = toml::from_str(
+            r#"
+[storage.cold]
+backend = "s3"
+
+[storage.cold.s3]
+bucket = "my-bucket"
+"#,
+        )
+        .expect("valid config");
+        let s3 = config.storage.cold.s3.expect("s3 config");
+        assert_eq!(s3.server_side_encryption, S3ServerSideEncryption::Aes256);
+        assert_eq!(s3.kms_key_id, None);
+    }
+
+    #[test]
+    fn s3_server_side_encryption_parses_all_modes() {
+        use crate::config::S3ServerSideEncryption;
+        use crate::config::UrsulaConfig;
+        for (value, expected) in [
+            ("aes256", S3ServerSideEncryption::Aes256),
+            ("aws-kms", S3ServerSideEncryption::AwsKms),
+            ("none", S3ServerSideEncryption::None),
+        ] {
+            let toml = format!(
+                r#"
+[storage.cold]
+backend = "s3"
+
+[storage.cold.s3]
+bucket = "my-bucket"
+server_side_encryption = "{value}"
+"#
+            );
+            let config: UrsulaConfig = toml::from_str(&toml).expect("valid config");
+            let s3 = config.storage.cold.s3.expect("s3 config");
+            assert_eq!(s3.server_side_encryption, expected, "mode {value}");
+        }
+    }
+
+    #[test]
+    fn s3_kms_key_id_round_trips() {
+        use crate::config::S3ServerSideEncryption;
+        use crate::config::UrsulaConfig;
+        let config: UrsulaConfig = toml::from_str(
+            r#"
+[storage.cold]
+backend = "s3"
+
+[storage.cold.s3]
+bucket = "my-bucket"
+server_side_encryption = "aws-kms"
+kms_key_id = "arn:aws:kms:us-east-1:111122223333:key/test"
+"#,
+        )
+        .expect("valid config");
+        let s3 = config.storage.cold.s3.expect("s3 config");
+        assert_eq!(s3.server_side_encryption, S3ServerSideEncryption::AwsKms);
+        assert_eq!(
+            s3.kms_key_id.as_deref(),
+            Some("arn:aws:kms:us-east-1:111122223333:key/test")
+        );
+    }
 }

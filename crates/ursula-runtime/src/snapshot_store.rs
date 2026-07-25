@@ -476,6 +476,10 @@ mod s3 {
             {
                 builder = builder.session_token(token);
             }
+            // Backup/snapshot objects inherit the cold tier's encryption
+            // posture (#149).
+            let (builder, _encryption) = crate::cold_store::apply_s3_encryption(builder, s3)
+                .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
             let operator = crate::cold_store::with_s3_resilience(
                 Operator::new(builder)
                     .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?

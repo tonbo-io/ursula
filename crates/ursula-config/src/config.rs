@@ -366,6 +366,16 @@ pub struct S3Config {
     pub secret_access_key: Option<String>,
     /// Optional S3 session token.
     pub session_token: Option<String>,
+    /// Server-side encryption requested on every cold-tier object write.
+    ///
+    /// Defaults to `aes256` (SSE-S3): free on AWS S3 and the baseline for any
+    /// shared deployment. MinIO only honors it when a KMS/KES is configured —
+    /// set `none` explicitly for a MinIO deployment without one. `aws-kms`
+    /// uses the AWS-managed KMS key unless `kms_key_id` names a customer
+    /// managed key.
+    pub server_side_encryption: S3ServerSideEncryption,
+    /// Customer managed KMS key for `server_side_encryption = "aws-kms"`.
+    pub kms_key_id: Option<String>,
     /// Per-S3-operation timeout.
     pub timeout: HumanDuration,
     /// Max retries per S3 operation.
@@ -387,6 +397,8 @@ impl Default for S3Config {
             access_key_id: None,
             secret_access_key: None,
             session_token: None,
+            server_side_encryption: S3ServerSideEncryption::default(),
+            kms_key_id: None,
             timeout: HumanDuration::sec(10),
             max_retries: 3,
             probe_timeout: HumanDuration::sec(2),
@@ -394,6 +406,21 @@ impl Default for S3Config {
             heal_ticks: 2,
         }
     }
+}
+
+/// Server-side encryption mode for cold-tier S3 writes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum S3ServerSideEncryption {
+    /// SSE-S3 (`x-amz-server-side-encryption: AES256`). The default.
+    #[default]
+    #[serde(rename = "aes256")]
+    Aes256,
+    /// SSE-KMS; uses the AWS managed key unless `kms_key_id` is set.
+    AwsKms,
+    /// No server-side encryption header. Required for object stores that
+    /// reject the header (for example MinIO without a configured KMS).
+    None,
 }
 
 /// Cold-read cache sizing.

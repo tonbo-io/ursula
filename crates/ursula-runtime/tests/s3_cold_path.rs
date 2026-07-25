@@ -36,6 +36,13 @@ async fn s3_cold_path_flushes_reads_and_cleans_up_object() {
             access_key_id: std::env::var("URSULA_COLD_S3_ACCESS_KEY_ID").ok(),
             secret_access_key: std::env::var("URSULA_COLD_S3_SECRET_ACCESS_KEY").ok(),
             session_token: std::env::var("URSULA_COLD_S3_SESSION_TOKEN").ok(),
+            // SSE-S3 by default (#149); URSULA_COLD_S3_SSE=none opts out for
+            // MinIO targets without a configured KMS.
+            server_side_encryption: match std::env::var("URSULA_COLD_S3_SSE").ok().as_deref() {
+                Some("none") => ursula_config::S3ServerSideEncryption::None,
+                Some("aws-kms") => ursula_config::S3ServerSideEncryption::AwsKms,
+                _ => ursula_config::S3ServerSideEncryption::Aes256,
+            },
             ..Default::default()
         }),
         ..Default::default()

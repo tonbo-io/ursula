@@ -79,15 +79,21 @@ region = "us-east-1"
 # access_key_id = "AKIA..."
 # secret_access_key = "..."
 # session_token = "..."
+# server_side_encryption = "aes256"   # default; "aws-kms" or "none"
+# kms_key_id = "arn:aws:kms:..."      # customer managed key for "aws-kms"
 ```
 
 When `access_key_id` and `secret_access_key` are omitted, Ursula uses the standard AWS SDK credential chain (instance profile, environment, profile, and so on). Prefer that over static keys. Set `endpoint` for S3-compatible stores such as MinIO, R2, or TOS.
+
+Every cold-tier object write requests server-side encryption by default (`server_side_encryption = "aes256"`, i.e. SSE-S3) — free on AWS S3, and Raft snapshot uploads inherit the same setting. `aws-kms` switches to SSE-KMS, using the AWS managed key unless `kms_key_id` names a customer managed key. MinIO honors SSE headers only when a KMS/KES is configured; for a MinIO deployment without one, set `server_side_encryption = "none"` explicitly or writes fail with an SSE error.
 
 | Config key | Default | Purpose |
 | ---------- | ------- | ------- |
 | `storage.cold.backend` | `none` | `none`, `memory`, or `s3` |
 | `storage.cold.root` | none | Prefix prepended to every cold key. Use a date-stamped value for benchmark runs so cleanup can't touch production data |
 | `storage.cold.s3.bucket` | none | Required when `backend = "s3"` |
+| `storage.cold.s3.server_side_encryption` | `aes256` | SSE mode for every object write: `aes256` (SSE-S3), `aws-kms`, or `none` |
+| `storage.cold.s3.kms_key_id` | none | Customer managed KMS key; only valid with `aws-kms` |
 | `storage.cold.flush_interval` | `1s` | Background flush worker tick interval |
 | `storage.cold.flush_size` | `8MiB` | Target bytes flushed per group per tick |
 | `storage.cold.flush_max_concurrency` | `4` | Parallel cold writes in flight |

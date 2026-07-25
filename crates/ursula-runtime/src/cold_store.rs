@@ -37,6 +37,46 @@ pub(crate) const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 // object-key path.
 static COLD_CHUNK_SEQUENCE: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
 
+/// Applies the configured server-side encryption to an S3 builder and returns
+/// the label recorded in [`ColdStoreInfo`]. Shared by the cold store and the
+/// S3 snapshot store so backup objects inherit the same posture (#149).
+pub(crate) fn apply_s3_encryption(
+    builder: opendal::services::S3,
+    s3: &ursula_config::S3Config,
+) -> io::Result<(opendal::services::S3, &'static str)> {
+    use ursula_config::S3ServerSideEncryption;
+    match s3.server_side_encryption {
+        S3ServerSideEncryption::Aes256 => {
+            if s3.kms_key_id.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "s3.kms_key_id requires server_side_encryption = \"aws-kms\"",
+                ));
+            }
+            Ok((builder.server_side_encryption_with_s3_key(), "aes256"))
+        }
+        S3ServerSideEncryption::AwsKms => match s3.kms_key_id.as_deref() {
+            Some(key_id) if !key_id.trim().is_empty() => Ok((
+                builder.server_side_encryption_with_customer_managed_kms_key(key_id),
+                "aws-kms",
+            )),
+            _ => Ok((
+                builder.server_side_encryption_with_aws_managed_kms_key(),
+                "aws-kms",
+            )),
+        },
+        S3ServerSideEncryption::None => {
+            if s3.kms_key_id.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "s3.kms_key_id requires server_side_encryption = \"aws-kms\"",
+                ));
+            }
+            Ok((builder, "none"))
+        }
+    }
+}
+
 /// Wrap an S3 (opendal) operator with timeout and bounded-retry layers.
 ///
 /// 1. **Per-attempt timeout** ([`TimeoutLayer`], inner): a blackholed endpoint
@@ -235,6 +275,8 @@ pub struct ColdStoreInfo {
     pub bucket: Option<String>,
     pub region: Option<String>,
     pub endpoint: Option<String>,
+    /// Server-side encryption mode applied to object writes (S3 backend only).
+    pub encryption: Option<&'static str>,
 }
 
 impl ColdStore {
@@ -282,6 +324,7 @@ impl ColdStore {
             bucket: None,
             region: None,
             endpoint: None,
+            encryption: None,
         }))
     }
 
@@ -373,6 +416,7 @@ impl ColdStore {
         {
             builder = builder.session_token(session_token);
         }
+        let (builder, encryption) = apply_s3_encryption(builder, s3)?;
 
         Ok(Self::from_operator(
             with_s3_resilience(
@@ -388,6 +432,7 @@ impl ColdStore {
                 bucket: Some(bucket.to_owned()),
                 region: configured_region,
                 endpoint: configured_endpoint,
+                encryption: Some(encryption),
             },
         ))
     }
@@ -1327,6 +1372,60 @@ mod tests {
         assert_eq!(cache.max_bytes, 7 * 1024 * 1024);
         assert_eq!(cache.block_bytes, 512 * 1024);
         assert_eq!(cache.max_readahead_blocks, 3);
+    }
+
+    fn s3_test_config(
+        encryption: ursula_config::S3ServerSideEncryption,
+        kms_key_id: Option<&str>,
+    ) -> ColdConfig {
+        ColdConfig {
+            backend: ColdBackend::S3,
+            s3: Some(ursula_config::S3Config {
+                bucket: Some("test-bucket".to_owned()),
+                region: Some("us-east-1".to_owned()),
+                server_side_encryption: encryption,
+                kms_key_id: kms_key_id.map(str::to_owned),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn s3_store_defaults_to_sse_s3_and_reports_it() {
+        let store = ColdStore::try_new(&s3_test_config(
+            ursula_config::S3ServerSideEncryption::Aes256,
+            None,
+        ))
+        .expect("s3 cold store");
+        assert_eq!(store.info().encryption, Some("aes256"));
+    }
+
+    #[test]
+    fn s3_store_reports_kms_and_disabled_modes() {
+        let kms = ColdStore::try_new(&s3_test_config(
+            ursula_config::S3ServerSideEncryption::AwsKms,
+            Some("arn:aws:kms:us-east-1:111122223333:key/test"),
+        ))
+        .expect("s3 cold store with kms");
+        assert_eq!(kms.info().encryption, Some("aws-kms"));
+
+        let disabled = ColdStore::try_new(&s3_test_config(
+            ursula_config::S3ServerSideEncryption::None,
+            None,
+        ))
+        .expect("s3 cold store without sse");
+        assert_eq!(disabled.info().encryption, Some("none"));
+    }
+
+    #[test]
+    fn kms_key_without_kms_mode_is_rejected() {
+        let err = ColdStore::try_new(&s3_test_config(
+            ursula_config::S3ServerSideEncryption::Aes256,
+            Some("arn:aws:kms:us-east-1:111122223333:key/test"),
+        ))
+        .expect_err("kms key without aws-kms mode");
+        assert!(err.to_string().contains("aws-kms"), "got: {err}");
     }
 
     #[test]

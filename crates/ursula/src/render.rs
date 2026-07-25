@@ -384,6 +384,7 @@ pub(crate) fn render_cold_store_info(value: Option<&ColdStoreInfo>) -> Value {
             "bucket": null,
             "region": null,
             "endpoint": null,
+            "encryption": null,
         });
     };
     json!({
@@ -392,6 +393,7 @@ pub(crate) fn render_cold_store_info(value: Option<&ColdStoreInfo>) -> Value {
         "bucket": value.bucket,
         "region": value.region,
         "endpoint": value.endpoint,
+        "encryption": value.encryption,
     })
 }
 
