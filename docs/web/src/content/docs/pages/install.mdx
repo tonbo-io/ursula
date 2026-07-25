@@ -16,7 +16,7 @@ Both start the same in-memory, non-replicated node on port `4437`. Nothing is pe
 Every release publishes a multi-arch image to GHCR:
 
 ```bash
-docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.3.4
+docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.3.5
 ```
 
 The image runs as a non-root user and contains both `ursula` (the server) and `ursulactl` (the operator CLI). Images are published only from release tags, so pin the version you want to run.
