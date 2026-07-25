@@ -1,0 +1,66 @@
+"coldStorage":
+  "compaction":
+    "enabled": true
+    "maxStreamsPerPass": 64
+  "enabled": true
+"fullnameOverride": "ursula"
+"gateway":
+  "podDisruptionBudget":
+    "enabled": true
+  "replicaCount": 2
+"global":
+  "image":
+    "pullPolicy": "IfNotPresent"
+    "repository": "ghcr.io/tonbo-io/ursula"
+    "tag": "sha-2de400a"
+"indexer":
+  "enabled": true
+  "podDisruptionBudget":
+    "enabled": true
+  "replicaCount": 2
+  "s3":
+    "prefix": "indexes"
+  "serviceAccount":
+    "annotations":
+      "eks.amazonaws.com/role-arn": "arn:aws:iam::232814779190:role/ursula-chaos-jul21-eks-indexer"
+    "create": true
+    "name": "ursula-indexer"
+"persistence":
+  "enabled": true
+  "size": "50Gi"
+  "storageClassName": "gp3"
+"raft":
+  "groupCount": 256
+  "initMembershipPerGroup": false
+  "storageMode": "logDir"
+"s3":
+  "bucket": "ursula-chaos-jul21-232814779190-us-east-1"
+  "prefix": "storage"
+  "region": "us-east-1"
+"server":
+  "coreCount": 2
+  "replicaCount": 3
+  "resources":
+    "limits":
+      "ephemeral-storage": "4Gi"
+      "memory": "10Gi"
+    "requests":
+      "cpu": "1500m"
+      "ephemeral-storage": "2Gi"
+      "memory": "6Gi"
+  "scheduling":
+    "topologySpreadConstraints":
+    - "labelSelector":
+        "matchLabels":
+          "app.kubernetes.io/instance": "ursula"
+          "app.kubernetes.io/name": "ursula"
+      "maxSkew": 1
+      "topologyKey": "topology.kubernetes.io/zone"
+      "whenUnsatisfiable": "DoNotSchedule"
+"serviceAccount":
+  "annotations":
+    "eks.amazonaws.com/role-arn": "arn:aws:iam::232814779190:role/ursula-chaos-jul21-eks-storage"
+  "create": true
+  "name": "ursula-storage"
+"snapshotStore":
+  "backend": "s3"

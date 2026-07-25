@@ -1,0 +1,14 @@
+"image":
+  "repository": "ghcr.io/tonbo-io/ursula-chaos-agent"
+  "tag": "sha-879f089"
+"serviceAccount":
+  "create": true
+  "name": "ursula-chaos-agent"
+"statusS3Uri": "s3://ursula-chaos-status-tonbo/status.json"
+"target":
+  "headlessService": "ursula-headless"
+  "indexSourceBaseUrl": "http://ursula:4437"
+  "indexerUrl": "http://ursula-indexer:4493"
+  "namespace": "ursula"
+  "replicaCount": 3
+  "serverFullname": "ursula"
