@@ -42,6 +42,10 @@ pub struct StreamSnapshotEntry {
     #[serde(default)]
     pub record_index: Option<StreamRecordIndex>,
     pub integrity: StreamIntegritySnapshot,
+    /// Independent destructive-retention floor. `None` denotes a legacy
+    /// snapshot where the visible snapshot offset also implied retention.
+    #[serde(default)]
+    pub retained_offset: Option<u64>,
     pub visible_snapshot: Option<StreamVisibleSnapshot>,
     pub producer_states: Vec<ProducerSnapshot>,
 }

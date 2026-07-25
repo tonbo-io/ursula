@@ -17,6 +17,7 @@ use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamStateMachine;
 
 use super::GroupAckColdGcFuture;
+use super::GroupAdvanceRetentionFuture;
 use super::GroupAppendBatchFuture;
 use super::GroupAppendBatchResponse;
 use super::GroupAppendFuture;
@@ -58,6 +59,8 @@ use crate::cold_store::DEFAULT_CONTENT_TYPE;
 use crate::command::GroupSnapshot;
 use crate::command::GroupWriteCommand;
 use crate::request::AckColdGcResponse;
+use crate::request::AdvanceRetentionRequest;
+use crate::request::AdvanceRetentionResponse;
 use crate::request::AppendBatchRequest;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
@@ -407,6 +410,7 @@ impl InMemoryGroupEngine {
             }
             StreamResponse::SnapshotPublished {
                 snapshot_offset,
+                snapshot_digest,
                 record_range,
             } => {
                 self.commit_index += 1;
@@ -414,6 +418,21 @@ impl InMemoryGroupEngine {
                     PublishSnapshotResponse {
                         placement,
                         snapshot_offset,
+                        snapshot_digest,
+                        group_commit_index: self.commit_index,
+                        record_range,
+                    },
+                ))
+            }
+            StreamResponse::RetentionAdvanced {
+                retained_offset,
+                record_range,
+            } => {
+                self.commit_index += 1;
+                Ok(GroupWriteResponse::AdvanceRetention(
+                    AdvanceRetentionResponse {
+                        placement,
+                        retained_offset,
                         group_commit_index: self.commit_index,
                         record_range,
                     },
@@ -928,6 +947,10 @@ impl InMemoryGroupEngine {
         let stream_ttl_seconds = metadata.stream_ttl_seconds;
         let stream_expires_at_ms = metadata.stream_expires_at_ms;
         let _ = metadata;
+        let snapshot = self
+            .state_machine
+            .latest_snapshot(&request.stream_id)
+            .map_err(stream_response_error)?;
         Ok(HeadStreamResponse {
             placement,
             content_type,
@@ -936,11 +959,9 @@ impl InMemoryGroupEngine {
             closed,
             stream_ttl_seconds,
             stream_expires_at_ms,
-            snapshot_offset: self
-                .state_machine
-                .latest_snapshot(&request.stream_id)
-                .map_err(stream_response_error)?
-                .map(|snapshot| snapshot.offset),
+            snapshot_offset: snapshot.as_ref().map(|snapshot| snapshot.offset),
+            snapshot_digest: snapshot.map(|snapshot| snapshot.digest),
+            retained_offset: self.state_machine.retained_offset(&request.stream_id),
             integrity: self
                 .state_machine
                 .integrity_snapshot(&request.stream_id)
@@ -1281,6 +1302,23 @@ impl GroupEngine for InMemoryGroupEngine {
         })
     }
 
+    fn advance_retention<'a>(
+        &'a mut self,
+        request: AdvanceRetentionRequest,
+        placement: ShardPlacement,
+    ) -> GroupAdvanceRetentionFuture<'a> {
+        Box::pin(async move {
+            self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
+            let command = GroupWriteCommand::from(request);
+            match self.apply_committed_write(command, placement)? {
+                GroupWriteResponse::AdvanceRetention(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected advance retention write response: {other:?}"
+                ))),
+            }
+        })
+    }
+
     fn read_snapshot<'a>(
         &'a mut self,
         request: ReadSnapshotRequest,
@@ -1314,6 +1352,7 @@ impl GroupEngine for InMemoryGroupEngine {
                 snapshot_offset: snapshot.offset,
                 next_offset: snapshot.offset,
                 content_type: snapshot.content_type,
+                snapshot_digest: snapshot.digest,
                 payload: snapshot.payload,
                 up_to_date: snapshot.offset == tail_offset,
                 record_range: self
@@ -1817,6 +1856,7 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::AppendExternal { stream_id, .. }
         | StreamCommand::AppendBatch { stream_id, .. }
         | StreamCommand::PublishSnapshot { stream_id, .. }
+        | StreamCommand::AdvanceRetention { stream_id, .. }
         | StreamCommand::TouchStreamAccess { stream_id, .. }
         | StreamCommand::UpdateStreamAttrs { stream_id, .. }
         | StreamCommand::FlushCold { stream_id, .. }

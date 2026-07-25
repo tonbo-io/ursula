@@ -21,6 +21,8 @@ use crate::metrics::RaftSnapshotBuildSample;
 use crate::metrics::RaftWriteManySample;
 use crate::metrics::RuntimeMetricsInner;
 use crate::request::AckColdGcResponse;
+use crate::request::AdvanceRetentionRequest;
+use crate::request::AdvanceRetentionResponse;
 use crate::request::AppendBatchRequest;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
@@ -86,6 +88,8 @@ pub type GroupRequireLiveReadOwnerFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), GroupEngineError>> + Send + 'a>>;
 pub type GroupPublishSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = Result<PublishSnapshotResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupAdvanceRetentionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<AdvanceRetentionResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupReadSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ReadSnapshotResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupDeleteSnapshotFuture<'a> =
@@ -138,6 +142,7 @@ pub enum GroupWriteResponse {
     Append(AppendResponse),
     AppendBatch(GroupAppendBatchResponse),
     PublishSnapshot(PublishSnapshotResponse),
+    AdvanceRetention(AdvanceRetentionResponse),
     TouchStreamAccess(TouchStreamAccessResponse),
     UpdateStreamAttrs(UpdateStreamAttrsResponse),
     FlushCold(FlushColdResponse),
@@ -224,6 +229,19 @@ pub trait GroupEngine: Send + 'static {
         Box::pin(async move {
             Err(GroupEngineError::new(format!(
                 "snapshot publish is not supported for stream '{}'",
+                request.stream_id
+            )))
+        })
+    }
+
+    fn advance_retention<'a>(
+        &'a mut self,
+        request: AdvanceRetentionRequest,
+        _placement: ShardPlacement,
+    ) -> GroupAdvanceRetentionFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "retention advance is not supported for stream '{}'",
                 request.stream_id
             )))
         })
@@ -618,6 +636,7 @@ pub trait GroupEngine: Send + 'static {
                     snapshot_offset,
                     content_type,
                     payload,
+                    expected_digest,
                     now_ms,
                 } => self
                     .publish_snapshot(
@@ -626,12 +645,28 @@ pub trait GroupEngine: Send + 'static {
                             snapshot_offset,
                             content_type,
                             payload,
+                            expected_digest,
                             now_ms,
                         },
                         placement,
                     )
                     .await
                     .map(GroupWriteResponse::PublishSnapshot),
+                StreamCommand::AdvanceRetention {
+                    stream_id,
+                    retained_offset,
+                    now_ms,
+                } => self
+                    .advance_retention(
+                        AdvanceRetentionRequest {
+                            stream_id,
+                            retained_offset,
+                            now_ms,
+                        },
+                        placement,
+                    )
+                    .await
+                    .map(GroupWriteResponse::AdvanceRetention),
                 StreamCommand::TouchStreamAccess {
                     stream_id,
                     now_ms,

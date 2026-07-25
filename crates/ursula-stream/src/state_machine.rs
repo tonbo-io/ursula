@@ -45,6 +45,7 @@ use crate::model::HotPayloadSegment;
 use crate::model::MAX_STREAM_ATTRS_BYTES;
 use crate::model::ObjectPayloadRef;
 use crate::model::ProducerAppendRecord;
+use crate::model::ProducerReceipt;
 use crate::model::ProducerRequest;
 use crate::model::ProducerSnapshot;
 use crate::model::ProducerState;
@@ -106,6 +107,7 @@ struct StreamSlot {
     message_records: Vec<StreamMessageRecord>,
     record_index: Option<StreamRecordIndex>,
     integrity: StreamIntegrity,
+    retained_offset: u64,
     visible_snapshot: Option<StreamVisibleSnapshot>,
     producers: HashMap<String, ProducerState>,
 }
@@ -323,6 +325,7 @@ impl StreamStateMachine {
                 snapshot_offset,
                 content_type,
                 payload,
+                expected_digest,
                 now_ms,
             } => {
                 let response = self.publish_snapshot(
@@ -330,8 +333,18 @@ impl StreamStateMachine {
                     snapshot_offset,
                     content_type,
                     payload.into(),
+                    expected_digest,
                     now_ms,
                 );
+                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
+                response
+            }
+            StreamCommand::AdvanceRetention {
+                stream_id,
+                retained_offset,
+                now_ms,
+            } => {
+                let response = self.advance_retention(stream_id, retained_offset, now_ms);
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
             }
@@ -555,6 +568,14 @@ fn compare_stream_ids(left: &BucketStreamId, right: &BucketStreamId) -> std::cmp
     left.bucket_id
         .cmp(&right.bucket_id)
         .then_with(|| left.stream_id.cmp(&right.stream_id))
+}
+
+fn snapshot_digest(content_type: &str, payload: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(content_type.len() as u64).to_le_bytes());
+    hasher.update(content_type.as_bytes());
+    hasher.update(payload);
+    hasher.finalize().to_hex().to_string()
 }
 
 #[cfg(test)]

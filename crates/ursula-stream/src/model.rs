@@ -83,6 +83,20 @@ pub struct ProducerSnapshot {
     pub last_next_offset: u64,
     pub last_closed: bool,
     pub last_items: Vec<ProducerAppendRecord>,
+    /// Bounded exact response history for delayed retries. Missing in legacy
+    /// snapshots, which are restored with the last response as the sole
+    /// receipt.
+    #[serde(default)]
+    pub receipts: Vec<ProducerReceipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProducerReceipt {
+    pub producer_seq: u64,
+    pub start_offset: u64,
+    pub next_offset: u64,
+    pub closed: bool,
+    pub items: Vec<ProducerAppendRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +118,7 @@ pub(crate) struct ProducerState {
     pub(crate) last_next_offset: u64,
     pub(crate) last_closed: bool,
     pub(crate) last_items: Vec<ProducerAppendRecord>,
+    pub(crate) receipts: Vec<ProducerReceipt>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,6 +259,10 @@ pub struct StreamVisibleSnapshot {
     pub offset: u64,
     pub content_type: String,
     pub payload: Vec<u8>,
+    /// BLAKE3 digest over the content type and payload. Empty only when
+    /// decoding legacy snapshots; restore recomputes it.
+    #[serde(default)]
+    pub digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

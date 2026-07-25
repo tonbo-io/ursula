@@ -79,6 +79,7 @@ use ursula_raft::RaftGroupHandle;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGrpcService;
 use ursula_raft::raft_internal_proto;
+use ursula_runtime::AdvanceRetentionRequest;
 use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
@@ -123,6 +124,7 @@ use crate::render::insert_offset;
 use crate::render::insert_producer_ack;
 use crate::render::insert_producer_error_headers;
 use crate::render::insert_public_location;
+use crate::render::insert_snapshot_digest;
 use crate::render::insert_snapshot_offset;
 use crate::render::insert_static;
 use crate::render::insert_stream_error_headers;
@@ -165,6 +167,9 @@ const HEADER_STREAM_RECORD_MATCH: &str = "stream-record-match";
 const HEADER_STREAM_RECORD_NEXT: &str = "stream-record-next";
 const HEADER_STREAM_RECORD_START: &str = "stream-record-start";
 const HEADER_STREAM_SNAPSHOT_OFFSET: &str = "stream-snapshot-offset";
+const HEADER_STREAM_SNAPSHOT_DIGEST: &str = "stream-snapshot-digest";
+const HEADER_STREAM_SNAPSHOT_MATCH: &str = "stream-snapshot-match";
+const HEADER_STREAM_RETAINED_OFFSET: &str = "stream-retained-offset";
 const HEADER_STREAM_SSE_DATA_ENCODING: &str = "stream-sse-data-encoding";
 const HEADER_STREAM_ATTRS: &str = "stream-attrs";
 const HEADER_STREAM_SEQ: &str = "stream-seq";
@@ -1003,12 +1008,23 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         .route("/__ursula/metrics", get(metrics))
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route("/{bucket}", put(create_bucket))
-        .route("/{bucket}/{stream}/snapshot", get(read_latest_snapshot))
+        .route(
+            "/{bucket}/{stream}/snapshot",
+            get(read_latest_snapshot).put(publish_snapshot_at_record),
+        )
         .route(
             "/{bucket}/{stream}/snapshot/{snapshot_offset}",
             put(publish_snapshot)
                 .get(read_snapshot)
                 .delete(delete_snapshot),
+        )
+        .route(
+            "/{bucket}/{stream}/retention",
+            put(advance_retention_at_record),
+        )
+        .route(
+            "/{bucket}/{stream}/retention/{retained_offset}",
+            put(advance_retention),
         )
         .route("/{bucket}/{stream}/bootstrap", get(bootstrap_stream))
         .route(
@@ -2213,6 +2229,14 @@ pub(crate) async fn head_stream_by_id(
             if let Some(snapshot_offset) = response.snapshot_offset {
                 insert_snapshot_offset(&mut headers, snapshot_offset);
             }
+            if let Some(snapshot_digest) = response.snapshot_digest {
+                insert_snapshot_digest(&mut headers, &snapshot_digest);
+            }
+            insert_u64_header(
+                &mut headers,
+                HEADER_STREAM_RETAINED_OFFSET,
+                response.retained_offset,
+            );
             if let Some(record_range) = response.record_range {
                 insert_record_head_headers(&mut headers, record_range);
             }
@@ -2510,11 +2534,40 @@ pub(crate) async fn publish_snapshot(
         Err(response) => return *response,
     };
     let stream_id = BucketStreamId::new(bucket, stream);
+    publish_snapshot_by_offset(
+        state,
+        request_target(&uri),
+        stream_id,
+        snapshot_offset,
+        headers,
+        body,
+    )
+    .await
+}
+
+async fn publish_snapshot_by_offset(
+    state: HttpState,
+    request_target: String,
+    stream_id: BucketStreamId,
+    snapshot_offset: u64,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let expected_digest = match headers.get(HEADER_STREAM_SNAPSHOT_MATCH) {
+        Some(value) => match value.to_str() {
+            Ok(value) if !value.trim().is_empty() => Some(value.to_owned()),
+            _ => {
+                return (StatusCode::BAD_REQUEST, "invalid Stream-Snapshot-Match").into_response();
+            }
+        },
+        None => None,
+    };
     let request = PublishSnapshotRequest {
         stream_id,
         snapshot_offset,
         content_type: request_content_type(&headers),
-        payload: body.clone(),
+        payload: body,
+        expected_digest,
         now_ms: state.unix_time_ms(),
     };
     match state.runtime.publish_snapshot(request).await {
@@ -2522,14 +2575,158 @@ pub(crate) async fn publish_snapshot(
             let mut headers = HeaderMap::new();
             insert_default_response_headers(&mut headers);
             insert_snapshot_offset(&mut headers, response.snapshot_offset);
+            insert_snapshot_digest(&mut headers, &response.snapshot_digest);
             if let Some(record_range) = response.record_range {
                 insert_record_head_headers(&mut headers, record_range);
             }
             (StatusCode::NO_CONTENT, headers).into_response()
         }
-        Err(err) => {
-            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
+        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
+    }
+}
+
+pub(crate) async fn publish_snapshot_at_record(
+    State(state): State<HttpState>,
+    OriginalUri(uri): OriginalUri,
+    Path((bucket, stream)): Path<(String, String)>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    body: Bytes,
+) -> Response {
+    let query = match parse_query(raw_query.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
+    };
+    let Some(record) = query.get("record") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "record query parameter is required",
+        )
+            .into_response();
+    };
+    let record = match record.parse::<u64>() {
+        Ok(record) => record,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid record").into_response(),
+    };
+    let stream_id = BucketStreamId::new(bucket, stream);
+    let request_target = request_target(&uri);
+    let snapshot_offset =
+        match resolve_record_offset(&state, &stream_id, record, &request_target).await {
+            Ok(offset) => offset,
+            Err(response) => return response,
+        };
+    publish_snapshot_by_offset(
+        state,
+        request_target,
+        stream_id,
+        snapshot_offset,
+        headers,
+        body,
+    )
+    .await
+}
+
+async fn resolve_record_offset(
+    state: &HttpState,
+    stream_id: &BucketStreamId,
+    record: u64,
+    request_target: &str,
+) -> Result<u64, Response> {
+    match state
+        .runtime
+        .read_stream(ReadStreamRequest {
+            stream_id: stream_id.clone(),
+            offset: 0,
+            max_len: 1,
+            now_ms: state.unix_time_ms(),
+            record: Some(record),
+            max_records: Some(1),
+        })
+        .await
+    {
+        Ok(response) => Ok(response.offset),
+        Err(err) => Err(runtime_error_or_leader_redirect_async(state, err, request_target).await),
+    }
+}
+
+pub(crate) async fn advance_retention(
+    State(state): State<HttpState>,
+    OriginalUri(uri): OriginalUri,
+    Path((bucket, stream, retained_offset)): Path<(String, String, String)>,
+) -> Response {
+    let retained_offset = match parse_snapshot_offset(&retained_offset) {
+        Ok(offset) => offset,
+        Err(response) => return *response,
+    };
+    advance_retention_by_offset(
+        state,
+        request_target(&uri),
+        BucketStreamId::new(bucket, stream),
+        retained_offset,
+    )
+    .await
+}
+
+pub(crate) async fn advance_retention_at_record(
+    State(state): State<HttpState>,
+    OriginalUri(uri): OriginalUri,
+    Path((bucket, stream)): Path<(String, String)>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    let query = match parse_query(raw_query.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
+    };
+    let Some(record) = query.get("record") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "record query parameter is required",
+        )
+            .into_response();
+    };
+    let record = match record.parse::<u64>() {
+        Ok(record) => record,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid record").into_response(),
+    };
+    let stream_id = BucketStreamId::new(bucket, stream);
+    let request_target = request_target(&uri);
+    let retained_offset =
+        match resolve_record_offset(&state, &stream_id, record, &request_target).await {
+            Ok(offset) => offset,
+            Err(response) => return response,
+        };
+    advance_retention_by_offset(state, request_target, stream_id, retained_offset).await
+}
+
+async fn advance_retention_by_offset(
+    state: HttpState,
+    request_target: String,
+    stream_id: BucketStreamId,
+    retained_offset: u64,
+) -> Response {
+    match state
+        .runtime
+        .advance_retention(AdvanceRetentionRequest {
+            stream_id,
+            retained_offset,
+            now_ms: state.unix_time_ms(),
+        })
+        .await
+    {
+        Ok(response) => {
+            let mut headers = HeaderMap::new();
+            insert_default_response_headers(&mut headers);
+            insert_u64_header(
+                &mut headers,
+                HEADER_STREAM_RETAINED_OFFSET,
+                response.retained_offset,
+            );
+            if let Some(record_range) = response.record_range {
+                insert_record_head_headers(&mut headers, record_range);
+            }
+            (StatusCode::NO_CONTENT, headers).into_response()
         }
+        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
 
@@ -2565,6 +2762,9 @@ pub(crate) async fn read_latest_snapshot(
     let mut response_headers = HeaderMap::new();
     insert_default_response_headers(&mut response_headers);
     insert_snapshot_offset(&mut response_headers, snapshot_offset);
+    if let Some(snapshot_digest) = head.snapshot_digest {
+        insert_snapshot_digest(&mut response_headers, &snapshot_digest);
+    }
     if let Some(record_range) = head.record_range {
         insert_record_head_headers(&mut response_headers, record_range);
     }

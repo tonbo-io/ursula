@@ -152,6 +152,7 @@ impl StreamStateMachine {
         snapshot_offset: u64,
         content_type: String,
         payload: Vec<u8>,
+        expected_digest: Option<String>,
         now_ms: u64,
     ) -> StreamResponse {
         if let Err(response) = self.validate_stream_scope(&stream_id) {
@@ -198,6 +199,47 @@ impl StreamStateMachine {
                 tail_offset,
             );
         }
+        let digest = super::snapshot_digest(&content_type, &payload);
+        let current_snapshot = self
+            .stream_slot(&stream_id)
+            .and_then(|slot| slot.visible_snapshot.as_ref());
+        if let Some(expected_digest) = expected_digest.as_deref()
+            && current_snapshot.map(|snapshot| snapshot.digest.as_str()) != Some(expected_digest)
+        {
+            return StreamResponse::error_with_next_offset(
+                StreamErrorCode::SnapshotConflict,
+                "current snapshot digest does not match Stream-Snapshot-Match",
+                tail_offset,
+            );
+        }
+        if let Some(current) = current_snapshot {
+            if snapshot_offset < current.offset {
+                return StreamResponse::error_with_next_offset(
+                    StreamErrorCode::SnapshotConflict,
+                    format!(
+                        "snapshot offset {snapshot_offset} is older than latest snapshot offset {}",
+                        current.offset
+                    ),
+                    tail_offset,
+                );
+            }
+            if snapshot_offset == current.offset {
+                if current.digest == digest {
+                    return StreamResponse::SnapshotPublished {
+                        snapshot_offset,
+                        snapshot_digest: digest,
+                        record_range: self.record_range(&stream_id).ok().flatten(),
+                    };
+                }
+                return StreamResponse::error_with_next_offset(
+                    StreamErrorCode::SnapshotConflict,
+                    format!(
+                        "snapshot offset {snapshot_offset} already has a different payload digest"
+                    ),
+                    tail_offset,
+                );
+            }
+        }
         if !self.snapshot_offset_aligned(&stream_id, snapshot_offset, retained_offset) {
             return StreamResponse::error_with_next_offset(
                 StreamErrorCode::InvalidSnapshot,
@@ -208,37 +250,7 @@ impl StreamStateMachine {
             );
         }
 
-        let mut retained_record_index = self
-            .stream_slot(&stream_id)
-            .expect("stream existence checked before snapshot publish")
-            .record_index
-            .clone();
-        let record_range = if let Some(record_index) = retained_record_index.as_mut() {
-            if record_index
-                .retain_from_offset(snapshot_offset, tail_offset)
-                .is_err()
-            {
-                return StreamResponse::error_with_next_offset(
-                    StreamErrorCode::InvalidRecordBoundaries,
-                    format!(
-                        "snapshot offset {snapshot_offset} is not a retained record boundary for stream '{stream_id}'"
-                    ),
-                    tail_offset,
-                );
-            }
-            match record_index.range() {
-                Ok(range) => Some(range),
-                Err(_) => {
-                    return StreamResponse::error_with_next_offset(
-                        StreamErrorCode::InvalidRecordBoundaries,
-                        format!("stream '{stream_id}' has an invalid retained record index"),
-                        tail_offset,
-                    );
-                }
-            }
-        } else {
-            None
-        };
+        let record_range = self.record_range(&stream_id).ok().flatten();
 
         self.stream_slot_mut(&stream_id)
             .expect("stream existence checked before snapshot publish")
@@ -246,11 +258,107 @@ impl StreamStateMachine {
             offset: snapshot_offset,
             content_type,
             payload,
+            digest: digest.clone(),
         });
-        self.compact_retained_prefix(&stream_id, snapshot_offset, retained_record_index);
         StreamResponse::SnapshotPublished {
             snapshot_offset,
+            snapshot_digest: digest,
             record_range,
+        }
+    }
+
+    pub(super) fn advance_retention(
+        &mut self,
+        stream_id: BucketStreamId,
+        retained_offset: u64,
+        now_ms: u64,
+    ) -> StreamResponse {
+        if let Err(response) = self.validate_stream_scope(&stream_id) {
+            return response;
+        }
+        let Some(stream) = self.stream_metadata(&stream_id) else {
+            return StreamResponse::error(
+                StreamErrorCode::StreamNotFound,
+                format!("stream '{stream_id}' does not exist"),
+            );
+        };
+        if stream_is_expired(stream, now_ms) {
+            self.remove_stream_state(&stream_id);
+            return StreamResponse::error(
+                StreamErrorCode::StreamNotFound,
+                format!("stream '{stream_id}' does not exist"),
+            );
+        }
+        let current = self.earliest_retained_offset(&stream_id);
+        if retained_offset < current {
+            return StreamResponse::error_with_next_offset(
+                StreamErrorCode::SnapshotConflict,
+                format!(
+                    "retention offset {retained_offset} is older than current retained offset {current}"
+                ),
+                stream.tail_offset,
+            );
+        }
+        let Some(snapshot) = self
+            .stream_slot(&stream_id)
+            .and_then(|slot| slot.visible_snapshot.as_ref())
+        else {
+            return StreamResponse::error_with_next_offset(
+                StreamErrorCode::SnapshotConflict,
+                "retention requires a published checkpoint",
+                stream.tail_offset,
+            );
+        };
+        if retained_offset > snapshot.offset {
+            return StreamResponse::error_with_next_offset(
+                StreamErrorCode::SnapshotConflict,
+                format!(
+                    "retention offset {retained_offset} is beyond latest checkpoint offset {}",
+                    snapshot.offset
+                ),
+                stream.tail_offset,
+            );
+        }
+        if retained_offset == current {
+            return StreamResponse::RetentionAdvanced {
+                retained_offset,
+                record_range: self.record_range(&stream_id).ok().flatten(),
+            };
+        }
+        if !self.snapshot_offset_aligned(&stream_id, retained_offset, current) {
+            return StreamResponse::error_with_next_offset(
+                StreamErrorCode::InvalidSnapshot,
+                format!(
+                    "retention offset {retained_offset} is not aligned to a committed message boundary for stream '{stream_id}'"
+                ),
+                stream.tail_offset,
+            );
+        }
+        let mut retained_record_index = self
+            .stream_slot(&stream_id)
+            .expect("stream existence checked before retention")
+            .record_index
+            .clone();
+        if let Some(record_index) = retained_record_index.as_mut()
+            && record_index
+                .retain_from_offset(retained_offset, stream.tail_offset)
+                .is_err()
+        {
+            return StreamResponse::error_with_next_offset(
+                StreamErrorCode::InvalidRecordBoundaries,
+                format!(
+                    "retention offset {retained_offset} is not a retained record boundary for stream '{stream_id}'"
+                ),
+                stream.tail_offset,
+            );
+        }
+        self.stream_slot_mut(&stream_id)
+            .expect("stream existence checked before retention mutation")
+            .retained_offset = retained_offset;
+        self.compact_retained_prefix(&stream_id, retained_offset, retained_record_index);
+        StreamResponse::RetentionAdvanced {
+            retained_offset,
+            record_range: self.record_range(&stream_id).ok().flatten(),
         }
     }
 
@@ -440,8 +548,7 @@ impl StreamStateMachine {
 
     pub(super) fn earliest_retained_offset(&self, stream_id: &BucketStreamId) -> u64 {
         self.stream_slot(stream_id)
-            .and_then(|slot| slot.visible_snapshot.as_ref())
-            .map(|snapshot| snapshot.offset)
+            .map(|slot| slot.retained_offset)
             .unwrap_or(0)
     }
 

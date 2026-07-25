@@ -823,12 +823,24 @@ async fn bootstrap_reads_retained_updates_from_cold_chunk_after_snapshot() {
                 snapshot_offset: 3,
                 content_type: DEFAULT_CONTENT_TYPE.to_owned(),
                 payload: Bytes::from_static(b"abc-state"),
+                expected_digest: None,
                 now_ms: 0,
             },
             placement,
         )
         .await
         .expect("publish snapshot");
+    engine
+        .advance_retention(
+            AdvanceRetentionRequest {
+                stream_id: stream.clone(),
+                retained_offset: 3,
+                now_ms: 0,
+            },
+            placement,
+        )
+        .await
+        .expect("advance retention");
 
     let read = engine
         .read_stream(read_req(stream.clone(), 3, 2), placement)
@@ -3709,6 +3721,8 @@ impl GroupEngine for RecordingEngine {
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
                 snapshot_offset: None,
+                snapshot_digest: None,
+                retained_offset: 0,
                 integrity: empty_integrity(),
                 record_range: None,
             })

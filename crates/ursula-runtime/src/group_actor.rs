@@ -21,6 +21,8 @@ use crate::error::RuntimeError;
 use crate::metrics::GROUP_ACTOR_MAX_WRITE_BATCH;
 use crate::metrics::RuntimeMetricsInner;
 use crate::request::AckColdGcResponse;
+use crate::request::AdvanceRetentionRequest;
+use crate::request::AdvanceRetentionResponse;
 use crate::request::AppendBatchRequest;
 use crate::request::AppendBatchResponse;
 use crate::request::AppendExternalRequest;

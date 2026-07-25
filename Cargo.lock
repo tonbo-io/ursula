@@ -4421,6 +4421,7 @@ dependencies = [
 name = "ursula-stream"
 version = "0.3.3"
 dependencies = [
+ "blake3",
  "bytes",
  "criterion",
  "proptest",

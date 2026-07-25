@@ -7,6 +7,7 @@ use super::HashMap;
 use super::HotBuffer;
 use super::HotPayloadSegment;
 use super::ObjectPayloadRef;
+use super::ProducerReceipt;
 use super::ProducerSnapshot;
 use super::ProducerState;
 use super::StreamColdState;
@@ -70,6 +71,7 @@ impl StreamStateMachine {
                     integrity: slot
                         .integrity
                         .snapshot(self.earliest_retained_offset(&stream_id), tail_offset),
+                    retained_offset: Some(slot.retained_offset),
                     visible_snapshot: slot.visible_snapshot.clone(),
                     producer_states,
                 }
@@ -109,11 +111,20 @@ impl StreamStateMachine {
                     tail_offset: entry.metadata.tail_offset,
                 });
             }
-            let retained_offset = entry
-                .visible_snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.offset)
-                .unwrap_or(0);
+            let retained_offset = entry.retained_offset.unwrap_or_else(|| {
+                entry
+                    .visible_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.offset)
+                    .unwrap_or(0)
+            });
+            if retained_offset > entry.metadata.tail_offset {
+                return Err(StreamSnapshotError::SnapshotOffsetOutOfRange {
+                    stream_id,
+                    snapshot_offset: retained_offset,
+                    tail_offset: entry.metadata.tail_offset,
+                });
+            }
             if let Some(record_index) = entry.record_index.as_ref()
                 && record_index
                     .validate(retained_offset, entry.metadata.tail_offset)
@@ -163,7 +174,13 @@ impl StreamStateMachine {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
             }
             let producer_states = restore_producer_states(&stream_id, entry.producer_states)?;
-            let visible_snapshot = entry.visible_snapshot;
+            let visible_snapshot = entry.visible_snapshot.map(|mut snapshot| {
+                if snapshot.digest.is_empty() {
+                    snapshot.digest =
+                        super::snapshot_digest(&snapshot.content_type, &snapshot.payload);
+                }
+                snapshot
+            });
             let slot = StreamSlot {
                 metadata: entry.metadata,
                 attrs: normalize_stream_attrs(entry.attrs),
@@ -177,6 +194,7 @@ impl StreamStateMachine {
                 message_records: entry.message_records,
                 record_index: entry.record_index,
                 integrity,
+                retained_offset,
                 visible_snapshot,
                 producers: producer_states,
             };
@@ -203,6 +221,7 @@ fn producer_snapshot(states: &HashMap<String, ProducerState>) -> Vec<ProducerSna
             last_next_offset: state.last_next_offset,
             last_closed: state.last_closed,
             last_items: state.last_items.clone(),
+            receipts: state.receipts.clone(),
         })
         .collect::<Vec<_>>();
     producer_states.sort_by(|left, right| left.producer_id.cmp(&right.producer_id));
@@ -215,6 +234,17 @@ fn restore_producer_states(
 ) -> Result<HashMap<String, ProducerState>, StreamSnapshotError> {
     let mut states = HashMap::with_capacity(snapshots.len());
     for snapshot in snapshots {
+        let receipts = if snapshot.receipts.is_empty() {
+            vec![ProducerReceipt {
+                producer_seq: snapshot.producer_seq,
+                start_offset: snapshot.last_start_offset,
+                next_offset: snapshot.last_next_offset,
+                closed: snapshot.last_closed,
+                items: snapshot.last_items.clone(),
+            }]
+        } else {
+            snapshot.receipts
+        };
         if states
             .insert(snapshot.producer_id.clone(), ProducerState {
                 producer_epoch: snapshot.producer_epoch,
@@ -223,6 +253,7 @@ fn restore_producer_states(
                 last_next_offset: snapshot.last_next_offset,
                 last_closed: snapshot.last_closed,
                 last_items: snapshot.last_items,
+                receipts,
             })
             .is_some()
         {

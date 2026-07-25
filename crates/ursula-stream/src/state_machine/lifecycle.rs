@@ -10,6 +10,7 @@ use super::HotBuffer;
 use super::MAX_STREAM_ATTRS_BYTES;
 use super::ObjectPayloadRef;
 use super::ProducerAppendRecord;
+use super::ProducerReceipt;
 use super::ProducerRequest;
 use super::ProducerState;
 use super::StreamAttrs;
@@ -171,7 +172,14 @@ impl StreamStateMachine {
                 last_start_offset: last_item.start_offset,
                 last_next_offset: last_item.next_offset,
                 last_closed: last_item.closed,
-                last_items: vec![last_item],
+                last_items: vec![last_item.clone()],
+                receipts: vec![ProducerReceipt {
+                    producer_seq: producer.producer_seq,
+                    start_offset: last_item.start_offset,
+                    next_offset: last_item.next_offset,
+                    closed: last_item.closed,
+                    items: vec![last_item],
+                }],
             });
         }
         let stream_id = input.stream_id.clone();
@@ -183,6 +191,7 @@ impl StreamStateMachine {
             message_records,
             record_index,
             integrity,
+            retained_offset: 0,
             visible_snapshot: None,
             producers: producer_states,
         };
@@ -326,7 +335,14 @@ impl StreamStateMachine {
                 last_start_offset: last_item.start_offset,
                 last_next_offset: last_item.next_offset,
                 last_closed: last_item.closed,
-                last_items: vec![last_item],
+                last_items: vec![last_item.clone()],
+                receipts: vec![ProducerReceipt {
+                    producer_seq: producer.producer_seq,
+                    start_offset: last_item.start_offset,
+                    next_offset: last_item.next_offset,
+                    closed: last_item.closed,
+                    items: vec![last_item],
+                }],
             });
         }
         let stream_id = input.stream_id.clone();
@@ -338,6 +354,7 @@ impl StreamStateMachine {
             message_records,
             record_index,
             integrity,
+            retained_offset: 0,
             visible_snapshot: None,
             producers: producer_states,
         };

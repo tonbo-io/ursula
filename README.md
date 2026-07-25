@@ -134,10 +134,6 @@ On EC2 (3 × `c7g.4xlarge`, Raft quorum), Ursula sustains **35.2k appends/sec** 
 
 The `v0.1.x` line is a working prototype. Next on deck:
 
-- [ ] **`if-match` conditional append.**
-
-  Optimistic concurrency control on the append path. An `if-match: <offset>` header lets a writer commit only when the stream tip hasn't moved, so concurrent writers can coordinate without an external lock. The semantics need to land in Ursula's HTTP adapter and Raft state machine.
-
 - [ ] **Stateless WASM compute over streams.**
 
   A planned Ursula extension: bind a deterministic WASM module to a stream so the server can materialize per-stream state, enabling automatic compaction and `410 Gone` bootstrap recovery without application-side checkpointing.

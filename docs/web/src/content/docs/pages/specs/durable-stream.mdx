@@ -326,6 +326,7 @@ if epoch > state.epoch:
 # Same epoch: sequence validation
 if seq <= state.lastSeq:
   -> 204 No Content (duplicate, idempotent success)
+  -> Return the exact original byte and record ranges for this seq
 
 if seq == state.lastSeq + 1:
   -> Accept, update state.lastSeq = seq

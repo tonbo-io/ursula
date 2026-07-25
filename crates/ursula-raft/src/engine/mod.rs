@@ -20,6 +20,7 @@ use openraft::Raft;
 use openraft::RaftNetworkFactory;
 use openraft::rt::WatchReceiver;
 use openraft::storage::RaftLogStorage;
+use ursula_runtime::AdvanceRetentionRequest;
 use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
@@ -37,6 +38,7 @@ use ursula_runtime::DeleteStreamRequest;
 use ursula_runtime::FlushColdRequest;
 use ursula_runtime::GetStreamAttrsRequest;
 use ursula_runtime::GroupAckColdGcFuture;
+use ursula_runtime::GroupAdvanceRetentionFuture;
 use ursula_runtime::GroupAppendBatchFuture;
 use ursula_runtime::GroupAppendFuture;
 use ursula_runtime::GroupBootstrapStreamFuture;
@@ -817,6 +819,32 @@ impl GroupEngine for RaftGroupEngine {
                 GroupWriteResponse::PublishSnapshot(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
                     "unexpected publish snapshot write response: {other:?}"
+                ))),
+            }
+        })
+    }
+
+    fn advance_retention<'a>(
+        &'a mut self,
+        request: AdvanceRetentionRequest,
+        _placement: ShardPlacement,
+    ) -> GroupAdvanceRetentionFuture<'a> {
+        Box::pin(async move {
+            let command = GroupWriteCommand::from(request.clone());
+            if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
+                return match response {
+                    GroupWriteResponse::AdvanceRetention(response) => Ok(response),
+                    other => Err(GroupEngineError::new(format!(
+                        "unexpected advance retention write response: {other:?}"
+                    ))),
+                };
+            }
+            self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
+                .await?;
+            match self.write(GroupWriteCommand::from(request)).await? {
+                GroupWriteResponse::AdvanceRetention(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected advance retention write response: {other:?}"
                 ))),
             }
         })

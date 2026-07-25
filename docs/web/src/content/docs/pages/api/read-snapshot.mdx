@@ -20,7 +20,7 @@ api: "GET /{bucket}/{stream}/snapshot"
 | `307` | Redirect to `/{bucket}/{stream}/snapshot/{offset}`. |
 | `404` | Stream not found, expired, or no snapshot has been published. |
 
-Response headers include `Location`, `Stream-Next-Offset`, `Stream-Snapshot-Offset`, and `Stream-Up-To-Date`.
+Response headers include `Location`, `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, and `Stream-Up-To-Date`.
 
 ---
 
@@ -37,7 +37,7 @@ Response headers include `Location`, `Stream-Next-Offset`, `Stream-Snapshot-Offs
 | `200` | Snapshot blob returned. |
 | `404` | Stream, snapshot, or offset not found. |
 
-Response headers include `Content-Type`, `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Up-To-Date`, and `Stream-Closed`.
+Response headers include `Content-Type`, `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, `Stream-Up-To-Date`, and `Stream-Closed`.
 
 <RequestExample>
 ```bash Follow redirect to latest

@@ -31,6 +31,7 @@ pub use model::ExternalPayloadRef;
 pub use model::HotPayloadSegment;
 pub use model::ObjectPayloadRef;
 pub use model::ProducerAppendRecord;
+pub use model::ProducerReceipt;
 pub use model::ProducerRequest;
 pub use model::ProducerSnapshot;
 pub use model::StreamAttrs;
