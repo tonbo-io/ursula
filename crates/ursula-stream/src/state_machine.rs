@@ -638,6 +638,18 @@ fn stream_is_expired(stream: &StreamMetadata, now_ms: u64) -> bool {
     stream_expiry_at_ms(stream).is_some_and(|expires_at_ms| now_ms >= expires_at_ms)
 }
 
+fn stream_ttl_renewal_due(stream: &StreamMetadata, now_ms: u64) -> bool {
+    let Some(ttl_seconds) = stream.stream_ttl_seconds else {
+        return false;
+    };
+    if stream.stream_expires_at_ms.is_some() {
+        return false;
+    }
+    let ttl_ms = ttl_seconds.saturating_mul(1000);
+    let renewal_interval_ms = ttl_ms.div_ceil(4).max(1);
+    now_ms.saturating_sub(stream.last_ttl_touch_at_ms) >= renewal_interval_ms
+}
+
 fn renew_stream_ttl(stream: &mut StreamMetadata, now_ms: u64) {
     if stream.stream_ttl_seconds.is_some() && stream.stream_expires_at_ms.is_none() {
         stream.last_ttl_touch_at_ms = now_ms;

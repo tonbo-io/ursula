@@ -20,6 +20,7 @@ use super::StreamStateMachine;
 use super::StreamStatus;
 use super::StreamVisibleSnapshot;
 use super::stream_is_expired;
+use super::stream_ttl_renewal_due;
 use crate::RecordIndexError;
 use crate::StreamRecordIndex;
 use crate::StreamRecordRange;
@@ -115,9 +116,7 @@ impl StreamStateMachine {
         if stream_is_expired(stream, now_ms) {
             return Ok(true);
         }
-        Ok(renew_ttl
-            && stream.stream_ttl_seconds.is_some()
-            && stream.last_ttl_touch_at_ms != now_ms)
+        Ok(renew_ttl && stream_ttl_renewal_due(stream, now_ms))
     }
 
     pub fn hot_start_offset(&self, stream_id: &BucketStreamId) -> u64 {

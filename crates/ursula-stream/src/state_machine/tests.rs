@@ -2203,30 +2203,34 @@ fn stream_ttl_uses_sliding_access_window() {
         1_000
     );
     assert_eq!(
-        machine.access_requires_write(&stream_id, 1_500, true),
+        machine.access_requires_write(&stream_id, 1_249, true),
+        Ok(false)
+    );
+    assert_eq!(
+        machine.access_requires_write(&stream_id, 1_250, true),
         Ok(true)
     );
     assert_eq!(
-        machine.apply(touch_cmd(stream_id.clone(), 1_500)),
+        machine.apply(touch_cmd(stream_id.clone(), 1_250)),
         StreamResponse::Accessed {
             changed: true,
             expired: false,
         }
     );
 
-    assert!(machine.read_plan_at(&stream_id, 2, 16, 2_400).is_ok());
+    assert!(machine.read_plan_at(&stream_id, 2, 16, 2_149).is_ok());
     assert_eq!(
         machine.apply(append_cmd(stream_id.clone(), b"!", Append {
-            now_ms: 2_400,
+            now_ms: 2_149,
             ..Append::default()
         })),
         appended(2, 3)
     );
-    assert!(machine.head_at(&stream_id, 3_399).is_some());
-    assert!(machine.head_at(&stream_id, 3_400).is_none());
+    assert!(machine.head_at(&stream_id, 3_148).is_some());
+    assert!(machine.head_at(&stream_id, 3_149).is_none());
     assert_error_code(
         machine.apply(append_cmd(stream_id.clone(), b"late", Append {
-            now_ms: 3_401,
+            now_ms: 3_150,
             ..Append::default()
         })),
         StreamErrorCode::StreamNotFound,
