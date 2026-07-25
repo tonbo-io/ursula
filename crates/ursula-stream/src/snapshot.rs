@@ -3,6 +3,7 @@ use serde::Serialize;
 use ursula_shard::BucketStreamId;
 
 use crate::integrity::StreamIntegritySnapshot;
+use crate::model::BucketQuotaSnapshot;
 use crate::model::BucketUsageSnapshot;
 use crate::model::ColdChunkRef;
 use crate::model::ColdGcEntry;
@@ -27,6 +28,9 @@ pub struct StreamSnapshot {
     /// which case the monotonic counters restart from the restored gauges.
     #[serde(default)]
     pub bucket_usage: Vec<BucketUsageSnapshot>,
+    /// Per-bucket data-plane quota records. Absent in legacy snapshots.
+    #[serde(default)]
+    pub bucket_quotas: Vec<BucketQuotaSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

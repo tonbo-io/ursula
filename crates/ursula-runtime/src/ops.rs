@@ -296,6 +296,13 @@ macro_rules! runtime_operations {
                 handle { call bucket_usage(engine, metrics, placement) }
                 client { pub group fn bucket_usage }
             }
+            op SetBucketQuota {
+                fields { request: SetBucketQuotaRequest }
+                reply { response_tx: SetBucketQuotaResponse }
+                guard { none }
+                handle { call set_bucket_quota(engine, metrics, request, placement) }
+                client { pub group fn set_bucket_quota }
+            }
             op AckColdGc {
                 fields { up_to_seq: u64 }
                 reply { response_tx: AckColdGcResponse }

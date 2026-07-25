@@ -97,9 +97,32 @@ pub(crate) fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, Snaps
                 .into_iter()
                 .map(bucket_usage_from_proto)
                 .collect(),
+            bucket_quotas: header
+                .bucket_quotas
+                .into_iter()
+                .map(bucket_quota_from_proto)
+                .collect(),
         },
         stream_append_counts,
     })
+}
+
+fn bucket_quota_from_proto(value: proto::BucketQuotaV1) -> ursula_stream::BucketQuotaSnapshot {
+    ursula_stream::BucketQuotaSnapshot {
+        bucket_id: value.bucket_id,
+        quota: ursula_stream::BucketQuota {
+            max_streams: value.max_streams,
+            max_retained_bytes: value.max_retained_bytes,
+        },
+    }
+}
+
+fn bucket_quota_to_proto(value: ursula_stream::BucketQuotaSnapshot) -> proto::BucketQuotaV1 {
+    proto::BucketQuotaV1 {
+        bucket_id: value.bucket_id,
+        max_streams: value.quota.max_streams,
+        max_retained_bytes: value.quota.max_retained_bytes,
+    }
 }
 
 fn bucket_usage_from_proto(value: proto::BucketUsageV1) -> ursula_stream::BucketUsageSnapshot {
@@ -146,6 +169,7 @@ impl GroupSnapshotFrameIter {
             pending_cold_gc,
             next_cold_gc_seq,
             bucket_usage,
+            bucket_quotas,
         } = stream_snapshot;
         Self {
             header: Some(proto::SnapshotHeaderV1 {
@@ -156,6 +180,10 @@ impl GroupSnapshotFrameIter {
                 bucket_usage: bucket_usage
                     .into_iter()
                     .map(bucket_usage_to_proto)
+                    .collect(),
+                bucket_quotas: bucket_quotas
+                    .into_iter()
+                    .map(bucket_quota_to_proto)
                     .collect(),
             }),
             streams: streams.into_iter(),
@@ -651,6 +679,13 @@ mod tests {
                         stream_count: 2,
                     },
                 }],
+                bucket_quotas: vec![ursula_stream::BucketQuotaSnapshot {
+                    bucket_id: "bucket".to_owned(),
+                    quota: ursula_stream::BucketQuota {
+                        max_streams: Some(4),
+                        max_retained_bytes: Some(1024),
+                    },
+                }],
             },
             stream_append_counts: vec![StreamAppendCount {
                 stream_id: BucketStreamId {
@@ -686,6 +721,7 @@ mod tests {
                     buckets: Vec::new(),
                     next_cold_gc_seq: 0,
                     bucket_usage: Vec::new(),
+                    bucket_quotas: Vec::new(),
                 },
             )),
         })

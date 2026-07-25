@@ -84,6 +84,8 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
+use crate::request::SetBucketQuotaRequest;
+use crate::request::SetBucketQuotaResponse;
 use crate::request::UpdateStreamAttrsRequest;
 use crate::request::UpdateStreamAttrsResponse;
 use crate::rt::sync::Semaphore;
@@ -472,6 +474,27 @@ impl ShardRuntime {
             .collect::<Vec<_>>();
         report.sort_by(|left, right| left.bucket_id.cmp(&right.bucket_id));
         Ok(report)
+    }
+
+    /// Replicates one bucket's quota record to every Raft group so each
+    /// enforces the same local backstop. Serial like the other all-group
+    /// admin sweeps; quota changes are rare control-plane writes.
+    pub async fn set_bucket_quota_all_groups(
+        &self,
+        bucket_id: &str,
+        max_streams: Option<u64>,
+        max_retained_bytes: Option<u64>,
+    ) -> Result<(), RuntimeError> {
+        let group_count = self.shard_map.raft_group_count();
+        for group_id in 0..group_count {
+            self.set_bucket_quota(RaftGroupId(group_id), SetBucketQuotaRequest {
+                bucket_id: bucket_id.to_owned(),
+                max_streams,
+                max_retained_bytes,
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn flush_cold_all_groups_once(

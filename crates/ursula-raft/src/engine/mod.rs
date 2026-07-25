@@ -65,6 +65,7 @@ use ursula_runtime::GroupReadSnapshotFuture;
 use ursula_runtime::GroupReadStreamFuture;
 use ursula_runtime::GroupReadStreamParts;
 use ursula_runtime::GroupReadStreamPartsFuture;
+use ursula_runtime::GroupSetBucketQuotaFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
@@ -78,6 +79,7 @@ use ursula_runtime::PlanGroupColdFlushRequest;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::SetBucketQuotaRequest;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::StreamErrorCode;
 use ursula_runtime::TouchStreamAccessResponse;
@@ -887,6 +889,30 @@ impl GroupEngine for RaftGroupEngine {
                 GroupWriteResponse::ImportGroupState(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
                     "unexpected group state import response: {other:?}"
+                ))),
+            }
+        })
+    }
+
+    fn set_bucket_quota<'a>(
+        &'a mut self,
+        request: SetBucketQuotaRequest,
+        _placement: ShardPlacement,
+    ) -> GroupSetBucketQuotaFuture<'a> {
+        Box::pin(async move {
+            let command = GroupWriteCommand::from(request.clone());
+            if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
+                return match response {
+                    GroupWriteResponse::SetBucketQuota(response) => Ok(response),
+                    other => Err(GroupEngineError::new(format!(
+                        "unexpected set bucket quota write response: {other:?}"
+                    ))),
+                };
+            }
+            match self.write(GroupWriteCommand::from(request)).await? {
+                GroupWriteResponse::SetBucketQuota(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected set bucket quota write response: {other:?}"
                 ))),
             }
         })

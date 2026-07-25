@@ -16,6 +16,9 @@ pub enum StreamResponse {
     BucketDeleted {
         bucket_id: String,
     },
+    BucketQuotaSet {
+        bucket_id: String,
+    },
     Created {
         stream_id: BucketStreamId,
         next_offset: u64,
@@ -119,6 +122,7 @@ pub enum StreamErrorCode {
     ImportConflict,
     /// A state import payload failed snapshot validation.
     ImportInvalid,
+    QuotaExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

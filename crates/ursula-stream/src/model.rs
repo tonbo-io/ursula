@@ -297,3 +297,30 @@ pub struct BucketUsageSnapshot {
     pub bucket_id: String,
     pub usage: BucketUsage,
 }
+
+/// Per-bucket data-plane quota stored in replicated state. `None` means
+/// unlimited. Every Raft group stores the same record and enforces it
+/// against its own local [`BucketUsage`], so the cluster-wide bound is
+/// `limit × group_count`: an abuse backstop, not exact tenant accounting.
+/// Exact tenant-level enforcement happens at the gateway from aggregated
+/// usage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketQuota {
+    pub max_streams: Option<u64>,
+    pub max_retained_bytes: Option<u64>,
+}
+
+impl BucketQuota {
+    /// A quota with no limits carries no information; setting it clears the
+    /// stored record.
+    pub fn is_unlimited(&self) -> bool {
+        self.max_streams.is_none() && self.max_retained_bytes.is_none()
+    }
+}
+
+/// One bucket's quota as stored in a group or persisted in a snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketQuotaSnapshot {
+    pub bucket_id: String,
+    pub quota: BucketQuota,
+}

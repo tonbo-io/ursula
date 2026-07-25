@@ -68,6 +68,7 @@ impl StreamStateMachine {
         // counters remain; deleting the tenant namespace erases its ledger
         // entry in this group.
         self.bucket_usage.remove(bucket_id);
+        self.bucket_quotas.remove(bucket_id);
         StreamResponse::BucketDeleted {
             bucket_id: bucket_id.to_owned(),
         }
@@ -171,6 +172,10 @@ impl StreamStateMachine {
                     input.stream_id
                 ),
             );
+        }
+
+        if let Err(response) = self.check_create_quota(&input.stream_id.bucket_id, initial_len) {
+            return response;
         }
 
         let metadata = StreamMetadata {
@@ -329,6 +334,9 @@ impl StreamStateMachine {
         }
 
         let initial_len = input.initial_payload.payload_len;
+        if let Err(response) = self.check_create_quota(&input.stream_id.bucket_id, initial_len) {
+            return response;
+        }
         let metadata = StreamMetadata {
             stream_id: input.stream_id.clone(),
             content_type: input.content_type,

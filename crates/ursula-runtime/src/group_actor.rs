@@ -58,6 +58,8 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
+use crate::request::SetBucketQuotaRequest;
+use crate::request::SetBucketQuotaResponse;
 use crate::request::UpdateStreamAttrsRequest;
 use crate::request::UpdateStreamAttrsResponse;
 use crate::rt::sync::Semaphore;

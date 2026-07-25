@@ -35,6 +35,8 @@ use crate::command::StreamCommand;
 use crate::integrity::StreamIntegrity;
 use crate::model::AppendExternalInput;
 use crate::model::AppendStreamInput;
+use crate::model::BucketQuota;
+use crate::model::BucketQuotaSnapshot;
 use crate::model::BucketUsage;
 use crate::model::BucketUsageSnapshot;
 use crate::model::COLD_INDEX_PAGE_SPAN_BYTES;
@@ -102,6 +104,9 @@ pub struct StreamStateMachine {
     /// monotonic-versus-gauge split. Mutated only by the accounting helpers
     /// below so every counter change stays deterministic and auditable.
     bucket_usage: HashMap<String, BucketUsage>,
+    /// Per-bucket data-plane quota backstops enforced against this group's
+    /// local counters; see [`BucketQuota`] for the enforcement semantics.
+    bucket_quotas: HashMap<String, BucketQuota>,
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +196,117 @@ impl StreamStateMachine {
         let usage = self.usage_mut(bucket_id);
         usage.stream_count = usage.stream_count.saturating_sub(1);
         usage.retained_bytes = usage.retained_bytes.saturating_sub(retained_bytes);
+    }
+
+    /// Sets or clears the quota record for one bucket. Both limits `None`
+    /// removes the record so cleared quotas leave no residue in snapshots.
+    fn set_bucket_quota(
+        &mut self,
+        bucket_id: String,
+        max_streams: Option<u64>,
+        max_retained_bytes: Option<u64>,
+    ) -> StreamResponse {
+        if let Err(message) = validate_bucket_id(&bucket_id) {
+            return StreamResponse::error(StreamErrorCode::InvalidBucketId, message);
+        }
+        let quota = BucketQuota {
+            max_streams,
+            max_retained_bytes,
+        };
+        if quota.is_unlimited() {
+            self.bucket_quotas.remove(&bucket_id);
+        } else {
+            self.bucket_quotas.insert(bucket_id.clone(), quota);
+        }
+        StreamResponse::BucketQuotaSet { bucket_id }
+    }
+
+    /// Data-plane backstop for stream creation: this group's local stream
+    /// count and the incoming initial payload must fit under the bucket's
+    /// quota. Runs after the idempotent already-exists paths so replays of
+    /// accepted creates never fail retroactively.
+    fn check_create_quota(
+        &self,
+        bucket_id: &str,
+        initial_bytes: u64,
+    ) -> Result<(), StreamResponse> {
+        let Some(quota) = self.bucket_quotas.get(bucket_id) else {
+            return Ok(());
+        };
+        let usage = self
+            .bucket_usage
+            .get(bucket_id)
+            .copied()
+            .unwrap_or_default();
+        if let Some(max_streams) = quota.max_streams
+            && usage.stream_count >= max_streams
+        {
+            return Err(StreamResponse::error(
+                StreamErrorCode::QuotaExceeded,
+                format!(
+                    "bucket '{bucket_id}' stream-count quota exceeded in this group ({max_streams} max)"
+                ),
+            ));
+        }
+        self.check_retained_quota_inner(bucket_id, quota, &usage, initial_bytes)
+    }
+
+    /// Data-plane backstop for appends: the payload must fit under the
+    /// bucket's retained-bytes quota against this group's local gauge.
+    /// Producer-deduplicated retries return before this check, so an
+    /// accepted append replay can never fail retroactively.
+    fn check_append_quota(
+        &self,
+        bucket_id: &str,
+        payload_bytes: u64,
+    ) -> Result<(), StreamResponse> {
+        if payload_bytes == 0 {
+            return Ok(());
+        }
+        let Some(quota) = self.bucket_quotas.get(bucket_id) else {
+            return Ok(());
+        };
+        let usage = self
+            .bucket_usage
+            .get(bucket_id)
+            .copied()
+            .unwrap_or_default();
+        self.check_retained_quota_inner(bucket_id, quota, &usage, payload_bytes)
+    }
+
+    fn check_retained_quota_inner(
+        &self,
+        bucket_id: &str,
+        quota: &BucketQuota,
+        usage: &BucketUsage,
+        incoming_bytes: u64,
+    ) -> Result<(), StreamResponse> {
+        if let Some(max_retained) = quota.max_retained_bytes
+            && usage.retained_bytes.saturating_add(incoming_bytes) > max_retained
+        {
+            return Err(StreamResponse::error(
+                StreamErrorCode::QuotaExceeded,
+                format!(
+                    "bucket '{bucket_id}' retained-bytes quota exceeded in this group ({max_retained} max)"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Current per-bucket quotas for this group, sorted for deterministic
+    /// output.
+    pub fn bucket_quota_report(&self) -> Vec<BucketQuotaSnapshot> {
+        let mut report = self
+            .bucket_quotas
+            .iter()
+            .map(|(bucket_id, quota)| BucketQuotaSnapshot {
+                bucket_id: bucket_id.clone(),
+                quota: *quota,
+            })
+            .collect::<Vec<_>>();
+        report.sort_by(|left, right| left.bucket_id.cmp(&right.bucket_id));
+        report
     }
 
     /// Current per-bucket usage for this group, sorted for deterministic
@@ -458,6 +574,11 @@ impl StreamStateMachine {
             StreamCommand::PurgeBucket { bucket_id } => self.purge_bucket(&bucket_id),
             StreamCommand::AckColdGc { up_to_seq } => self.ack_cold_gc(up_to_seq),
             StreamCommand::ImportSnapshot { snapshot } => self.import_snapshot(*snapshot),
+            StreamCommand::SetBucketQuota {
+                bucket_id,
+                max_streams,
+                max_retained_bytes,
+            } => self.set_bucket_quota(bucket_id, max_streams, max_retained_bytes),
         }
     }
 }

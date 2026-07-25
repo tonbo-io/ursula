@@ -46,6 +46,7 @@ use super::GroupPurgeBucketFuture;
 use super::GroupReadSnapshotFuture;
 use super::GroupReadStreamFuture;
 use super::GroupReadStreamPartsFuture;
+use super::GroupSetBucketQuotaFuture;
 use super::GroupSnapshotFuture;
 use super::GroupTouchStreamAccessFuture;
 use super::GroupUpdateStreamAttrsFuture;
@@ -99,6 +100,8 @@ use crate::request::PurgeBucketResponse;
 use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
+use crate::request::SetBucketQuotaRequest;
+use crate::request::SetBucketQuotaResponse;
 use crate::request::StreamAppendCount;
 use crate::request::TouchStreamAccessResponse;
 use crate::request::UpdateStreamAttrsRequest;
@@ -428,6 +431,13 @@ impl InMemoryGroupEngine {
                         record_range,
                     },
                 ))
+            }
+            StreamResponse::BucketQuotaSet { .. } => {
+                self.commit_index += 1;
+                Ok(GroupWriteResponse::SetBucketQuota(SetBucketQuotaResponse {
+                    placement,
+                    group_commit_index: self.commit_index,
+                }))
             }
             StreamResponse::RetentionAdvanced {
                 retained_offset,
@@ -1368,6 +1378,22 @@ impl GroupEngine for InMemoryGroupEngine {
         })
     }
 
+    fn set_bucket_quota<'a>(
+        &'a mut self,
+        request: SetBucketQuotaRequest,
+        placement: ShardPlacement,
+    ) -> GroupSetBucketQuotaFuture<'a> {
+        Box::pin(async move {
+            let command = GroupWriteCommand::from(request);
+            match self.apply_committed_write(command, placement)? {
+                GroupWriteResponse::SetBucketQuota(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected set bucket quota write response: {other:?}"
+                ))),
+            }
+        })
+    }
+
     fn read_snapshot<'a>(
         &'a mut self,
         request: ReadSnapshotRequest,
@@ -1922,7 +1948,8 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::DeleteBucket { .. }
         | StreamCommand::PurgeBucket { .. }
         | StreamCommand::AckColdGc { .. }
-        | StreamCommand::ImportSnapshot { .. } => None,
+        | StreamCommand::ImportSnapshot { .. }
+        | StreamCommand::SetBucketQuota { .. } => None,
         StreamCommand::CreateStream { stream_id, .. }
         | StreamCommand::CreateExternal { stream_id, .. }
         | StreamCommand::Append { stream_id, .. }

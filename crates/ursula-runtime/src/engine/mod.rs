@@ -59,6 +59,8 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
+use crate::request::SetBucketQuotaRequest;
+use crate::request::SetBucketQuotaResponse;
 use crate::request::TouchStreamAccessResponse;
 use crate::request::UpdateStreamAttrsRequest;
 use crate::request::UpdateStreamAttrsResponse;
@@ -95,6 +97,8 @@ pub type GroupPublishSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = Result<PublishSnapshotResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupAdvanceRetentionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AdvanceRetentionResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupSetBucketQuotaFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<SetBucketQuotaResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupReadSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ReadSnapshotResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupDeleteSnapshotFuture<'a> =
@@ -157,6 +161,7 @@ pub enum GroupWriteResponse {
     AppendBatch(GroupAppendBatchResponse),
     PublishSnapshot(PublishSnapshotResponse),
     AdvanceRetention(AdvanceRetentionResponse),
+    SetBucketQuota(SetBucketQuotaResponse),
     TouchStreamAccess(TouchStreamAccessResponse),
     UpdateStreamAttrs(UpdateStreamAttrsResponse),
     FlushCold(FlushColdResponse),
@@ -283,6 +288,19 @@ pub trait GroupEngine: Send + 'static {
             Err(GroupEngineError::new(format!(
                 "group state import is not supported for group {}",
                 placement.raft_group_id.0
+            )))
+        })
+    }
+
+    fn set_bucket_quota<'a>(
+        &'a mut self,
+        request: SetBucketQuotaRequest,
+        _placement: ShardPlacement,
+    ) -> GroupSetBucketQuotaFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "bucket quotas are not supported for bucket '{}'",
+                request.bucket_id
             )))
         })
     }
@@ -794,6 +812,21 @@ pub trait GroupEngine: Send + 'static {
                     .import_group_state(ImportGroupStateRequest { snapshot }, placement)
                     .await
                     .map(GroupWriteResponse::ImportGroupState),
+                StreamCommand::SetBucketQuota {
+                    bucket_id,
+                    max_streams,
+                    max_retained_bytes,
+                } => self
+                    .set_bucket_quota(
+                        SetBucketQuotaRequest {
+                            bucket_id,
+                            max_streams,
+                            max_retained_bytes,
+                        },
+                        placement,
+                    )
+                    .await
+                    .map(GroupWriteResponse::SetBucketQuota),
                 StreamCommand::CreateBucket { .. } | StreamCommand::DeleteBucket { .. } => Err(
                     GroupEngineError::new("bucket commands are not valid group writes"),
                 ),
