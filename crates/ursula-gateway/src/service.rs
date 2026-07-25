@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,10 @@ use ursula_observability::serve::shutdown_signal;
 use crate::DEFAULT_MAX_REQUEST_BODY_BYTES;
 use crate::Gateway;
 use crate::GatewayConfig;
+use crate::auth::AccessControl;
+use crate::auth::jwt::JwtPrincipalResolver;
+use crate::auth::jwt::JwtValidationConfig;
+use crate::auth::policy::StaticPolicyAuthorizer;
 
 const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 3600;
 
@@ -22,6 +27,7 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
     init_options.default_directives = "ursula_gateway=info";
     let _observability = ursula_observability::init(init_options);
 
+    let installed_access_control = access_control(&args)?;
     let config = GatewayConfig {
         listen: args.listen,
         upstreams: args.upstream,
@@ -30,7 +36,12 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
         max_request_body_bytes: args.max_request_body_bytes,
     };
 
-    let gateway = Arc::new(Gateway::new(config.clone()));
+    let gateway = match installed_access_control {
+        Some(access_control) => {
+            Arc::new(Gateway::with_access_control(config.clone(), access_control))
+        }
+        None => Arc::new(Gateway::new(config.clone())),
+    };
 
     // Keep Axum's State extractor in the binary so the library handler stays
     // easy to call directly from tests.
@@ -60,6 +71,34 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Builds the opt-in access-control hooks from CLI arguments. All-absent means
+/// the gateway keeps its original trusted pass-through behavior.
+fn access_control(args: &GatewayArgs) -> Result<Option<AccessControl>, Box<dyn std::error::Error>> {
+    let Some(issuer) = args.auth_issuer.clone() else {
+        return Ok(None);
+    };
+    // clap's `requires` links make these present whenever the issuer is set.
+    let audience = args
+        .auth_audience
+        .clone()
+        .ok_or("--auth-audience is required with --auth-issuer")?;
+    let policy_path = args
+        .auth_policy
+        .as_ref()
+        .ok_or("--auth-policy is required with --auth-issuer")?;
+
+    let mut jwt_config = JwtValidationConfig::new(issuer, audience);
+    jwt_config.jwks_url = args.auth_jwks_url.clone();
+    let resolver = JwtPrincipalResolver::new(jwt_config)?;
+    let authorizer = StaticPolicyAuthorizer::from_file(policy_path)?;
+
+    tracing::info!(policy = %policy_path.display(), "gateway access control enabled");
+    Ok(Some(AccessControl::new(
+        Arc::new(resolver),
+        Arc::new(authorizer),
+    )))
+}
+
 #[derive(Args, Debug)]
 pub struct GatewayArgs {
     /// Address to bind the gateway server.
@@ -86,6 +125,25 @@ pub struct GatewayArgs {
     /// Maximum graceful shutdown drain time after SIGTERM/CTRL-C, in seconds.
     #[arg(long, default_value_t = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS)]
     graceful_shutdown_timeout: u64,
+
+    /// OAuth issuer URL expected in access-token `iss` claims. Setting this
+    /// enables gateway access control; leaving it unset keeps the original
+    /// trusted pass-through behavior.
+    #[arg(long, requires = "auth_audience", requires = "auth_policy")]
+    auth_issuer: Option<String>,
+
+    /// OAuth audience expected in access-token `aud` claims.
+    #[arg(long, requires = "auth_issuer")]
+    auth_audience: Option<String>,
+
+    /// Explicit JWKS document URL. Defaults to RFC 8414 metadata discovery
+    /// under the issuer.
+    #[arg(long, requires = "auth_issuer")]
+    auth_jwks_url: Option<String>,
+
+    /// TOML bucket policy file declaring owners and public-read visibility.
+    #[arg(long, requires = "auth_issuer")]
+    auth_policy: Option<PathBuf>,
 }
 
 #[cfg(test)]

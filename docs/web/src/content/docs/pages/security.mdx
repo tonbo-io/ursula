@@ -20,14 +20,40 @@ Handle the following outside Ursula:
 
 - **TLS / HTTPS.** The public listener serves plain HTTP. No built-in `rustls`.
 - **Inter-node encryption.** Peer gRPC (Raft heartbeats, append-entries, snapshots, and leader-read checks) runs over h2c. Peers must share a private network. Non-leader HTTP writes return a `307` redirect to the current group leader rather than being forwarded over gRPC.
-- **API authentication.** No bearer-token, API-key, mTLS, or signed-request validation on the public API. Any caller with network reach can create buckets, append, read, delete.
-- **Authorization / multi-tenancy.** No per-user, per-bucket, or per-scope ACLs. Enforce isolation upstream.
+- **API authentication on nodes.** Ursula nodes themselves accept any caller with network reach. Bearer-token validation is available as an opt-in feature of the gateway (see below); node listeners must stay on a private network either way.
+- **Authorization / multi-tenancy on nodes.** Nodes enforce no per-user, per-bucket, or per-scope ACLs. The gateway's opt-in access control provides a bucket-level tenant boundary; anything finer stays upstream.
 - **Admin endpoint isolation.** `/__ursula/metrics`, `/__ursula/flush-cold/*`, `/__ursula/raft/*`, and the public stream endpoints share the same listener with no auth gate.
 - **Per-client rate limiting.** A single noisy client can saturate a core's mailbox or a group's hot ring.
 - **Health/readiness endpoints.** No `/healthz` or `/readyz`. Use `/__ursula/metrics` as a process-alive probe (it serves only after the runtime initializes).
 - **At-rest encryption.** Hot ring is in memory. WAL and Raft log directories live on disk in plaintext. Use full-disk encryption at the host level.
 
 CORS is permissive (`Access-Control-Allow-Origin: *`). Restrict at the proxy for browser traffic.
+
+## Gateway access control (opt-in)
+
+A shared or internet-facing deployment can enable OAuth resource-server checks on `ursula gateway`. The feature is off by default; without the flags the gateway keeps its original trusted pass-through behavior.
+
+```bash
+ursula gateway \
+  --upstream http://ursula-0:4437 \
+  --auth-issuer https://issuer.example \
+  --auth-audience https://streams.example \
+  --auth-policy /etc/ursula/policy.toml
+```
+
+- **Authentication.** `Bearer` credentials are validated as RFC 9068 JWT access tokens: the header must declare `typ: at+jwt` (OIDC ID tokens are rejected), the signature must verify against the issuer's JWKS, and `iss`, `aud`, `sub`, `client_id`, `iat`, `exp`, and `jti` must all be present and valid. The JWKS location comes from `--auth-jwks-url` or RFC 8414 metadata discovery; keys are cached by `kid` and refetched on rotation.
+- **Tenant boundary.** The bucket is the top-level namespace and logical tenant boundary. The policy file declares each bucket's owners (issuer-qualified subjects) and whether anonymous reads are allowed:
+
+```toml
+[[bucket]]
+id = "tenant-a"
+public_read = true
+owners = [{ issuer = "https://issuer.example", subject = "user-1" }]
+```
+
+- **Concealment.** Unknown buckets, private buckets probed by strangers, and write attempts without ownership all answer the same `404` a missing resource would, so a private stream's existence is not observable.
+- **Credential termination.** The gateway strips `Authorization` before forwarding; upstream nodes never see end-user credentials and must remain on a private network.
+- **Anonymous public reads.** `public_read` grants exactly the read-only actions (read, head, tail, snapshot read) to unauthenticated callers — never writes, deletes, or bucket administration.
 
 ## Recommended deployment
 

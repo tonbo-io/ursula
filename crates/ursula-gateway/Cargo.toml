@@ -14,10 +14,12 @@ axum = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 http-body-util = "0.1"
+jsonwebtoken = { workspace = true }
 percent-encoding = "2"
-reqwest = { workspace = true, features = ["rustls-tls", "stream"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls", "stream"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "signal"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }

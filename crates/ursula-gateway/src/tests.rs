@@ -828,3 +828,111 @@ async fn gateway_preserves_public_snapshot_redirect_without_upstream_host() {
         "/bucket/stream/snapshot/00000000000000000003"
     );
 }
+
+// End-to-end shape of the #132/#133 tenant boundary: one shared gateway, a
+// static bucket policy, and two tenants whose credentials must not cross.
+mod tenant_boundary {
+    use super::*;
+    use crate::auth::policy::StaticPolicyAuthorizer;
+
+    const POLICY: &str = r#"
+        [[bucket]]
+        id = "tenant-a"
+        owners = [{ issuer = "https://issuer.example", subject = "user-1" }]
+
+        [[bucket]]
+        id = "tenant-public"
+        public_read = true
+    "#;
+
+    fn policy_gateway(upstream_url: &str) -> Gateway {
+        Gateway::with_access_control(
+            test_config(vec![upstream_url.to_owned()]),
+            AccessControl::new(
+                Arc::new(FixedPrincipalResolver::valid()),
+                Arc::new(StaticPolicyAuthorizer::from_toml_str(POLICY).expect("parse policy")),
+            ),
+        )
+    }
+
+    fn shared_upstream() -> Router {
+        Router::new()
+            .route("/tenant-a/orders", any(|| async { "tenant-a data" }))
+            .route("/tenant-b/orders", any(|| async { "tenant-b data" }))
+            .route("/tenant-public/orders", any(|| async { "public data" }))
+    }
+
+    async fn send(
+        gateway: &Gateway,
+        method: &str,
+        uri: &str,
+        bearer: Option<&str>,
+    ) -> axum::response::Response {
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(token) = bearer {
+            request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+        }
+        gateway
+            .handle(request.body(Body::empty()).expect("request"))
+            .await
+    }
+
+    #[tokio::test]
+    async fn owner_reaches_their_own_bucket() {
+        let upstream = spawn_upstream(shared_upstream()).await;
+        let gateway = policy_gateway(&upstream.url);
+
+        let response = send(&gateway, "GET", "/tenant-a/orders", Some("valid-token")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = send(&gateway, "POST", "/tenant-a/orders", Some("valid-token")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn credential_cannot_cross_into_another_tenant() {
+        let upstream = spawn_upstream(shared_upstream()).await;
+        let gateway = policy_gateway(&upstream.url);
+
+        // `valid-token` belongs to tenant-a's owner. tenant-b both exists
+        // upstream and is absent from the policy: either way the caller
+        // observes the same 404 surface.
+        let response = send(&gateway, "GET", "/tenant-b/orders", Some("valid-token")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = send(&gateway, "POST", "/tenant-b/orders", Some("valid-token")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn anonymous_reads_reach_only_public_buckets() {
+        let upstream = spawn_upstream(shared_upstream()).await;
+        let gateway = policy_gateway(&upstream.url);
+
+        let response = send(&gateway, "GET", "/tenant-public/orders", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // A private bucket conceals its existence from anonymous probes.
+        let response = send(&gateway, "GET", "/tenant-a/orders", None).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn public_visibility_grants_reads_but_never_writes() {
+        let upstream = spawn_upstream(shared_upstream()).await;
+        let gateway = policy_gateway(&upstream.url);
+
+        let response = send(&gateway, "POST", "/tenant-public/orders", None).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // A non-owner principal gets no more than the anonymous public grant.
+        let response = send(
+            &gateway,
+            "POST",
+            "/tenant-public/orders",
+            Some("valid-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}

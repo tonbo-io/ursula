@@ -44,6 +44,7 @@ criterion = "0.5"
 futures = "0.3"
 futures-util = "0.3"
 hdrhistogram = "7"
+jsonwebtoken = "9"
 madsim = "0.2.34"
 mimalloc = { version = "0.1", default-features = false }
 tikv-jemalloc-ctl = { version = "0.7", default-features = false }
