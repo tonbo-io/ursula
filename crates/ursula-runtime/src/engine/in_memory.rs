@@ -88,6 +88,8 @@ use crate::request::GetStreamAttrsResponse;
 use crate::request::GroupReadStreamParts;
 use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
+use crate::request::ImportGroupStateRequest;
+use crate::request::ImportGroupStateResponse;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -460,6 +462,17 @@ impl InMemoryGroupEngine {
                     UpdateStreamAttrsResponse {
                         placement,
                         changed,
+                        group_commit_index: self.commit_index,
+                    },
+                ))
+            }
+            StreamResponse::SnapshotImported { buckets, streams } => {
+                self.commit_index += 1;
+                Ok(GroupWriteResponse::ImportGroupState(
+                    ImportGroupStateResponse {
+                        placement,
+                        buckets,
+                        streams,
                         group_commit_index: self.commit_index,
                     },
                 ))
@@ -1326,6 +1339,22 @@ impl GroupEngine for InMemoryGroupEngine {
         })
     }
 
+    fn import_group_state<'a>(
+        &'a mut self,
+        request: ImportGroupStateRequest,
+        placement: ShardPlacement,
+    ) -> crate::GroupImportGroupStateFuture<'a> {
+        Box::pin(async move {
+            let command = GroupWriteCommand::from(StreamCommand::from(request));
+            match self.apply_committed_write(command, placement)? {
+                GroupWriteResponse::ImportGroupState(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected group state import response: {other:?}"
+                ))),
+            }
+        })
+    }
+
     fn read_snapshot<'a>(
         &'a mut self,
         request: ReadSnapshotRequest,
@@ -1860,7 +1889,8 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
     match command {
         StreamCommand::CreateBucket { .. }
         | StreamCommand::DeleteBucket { .. }
-        | StreamCommand::AckColdGc { .. } => None,
+        | StreamCommand::AckColdGc { .. }
+        | StreamCommand::ImportSnapshot { .. } => None,
         StreamCommand::CreateStream { stream_id, .. }
         | StreamCommand::CreateExternal { stream_id, .. }
         | StreamCommand::Append { stream_id, .. }

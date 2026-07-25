@@ -13,10 +13,12 @@
 //! - [`metrics`]: HTTP client for `/__ursula/metrics` and the admin endpoints.
 //! - [`observe`]: read-only status and cluster-wide readiness reporting.
 //! - [`plan`]: pure drain planning and per-node readiness checks.
+//! - [`backup`]: verifiable cluster backup, verification, and restore.
 //! - [`maintenance`]: node-maintenance verbs (drain, undrain, catch-up wait,
 //!   rejoin arming).
 //! - [`provider`]: cluster manifest loading and node addressing.
 
+pub mod backup;
 pub mod maintenance;
 pub mod metrics;
 pub mod observe;

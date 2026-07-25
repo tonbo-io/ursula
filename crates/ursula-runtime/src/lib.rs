@@ -89,6 +89,7 @@ pub use engine::GroupEngineMetrics;
 pub use engine::GroupFlushColdFuture;
 pub use engine::GroupGetStreamAttrsFuture;
 pub use engine::GroupHeadStreamFuture;
+pub use engine::GroupImportGroupStateFuture;
 pub use engine::GroupInfraError;
 pub use engine::GroupInstallSnapshotFuture;
 pub use engine::GroupLeaderHint;
@@ -145,6 +146,8 @@ pub use request::GroupReadStreamBody;
 pub use request::GroupReadStreamParts;
 pub use request::HeadStreamRequest;
 pub use request::HeadStreamResponse;
+pub use request::ImportGroupStateRequest;
+pub use request::ImportGroupStateResponse;
 pub use request::PlanColdFlushRequest;
 pub use request::PlanGroupColdFlushRequest;
 pub use request::PublishSnapshotRequest;
@@ -187,6 +190,7 @@ pub use ursula_stream::StreamErrorCode;
 pub use ursula_stream::StreamErrorContext;
 pub use ursula_stream::StreamIntegritySnapshot;
 pub use ursula_stream::StreamRecordRange;
+pub use ursula_stream::StreamSnapshot;
 
 #[cfg(test)]
 mod tests;

@@ -67,6 +67,13 @@ pub enum StreamResponse {
     ColdGcAcked {
         removed: u64,
     },
+    /// A whole-group state import accepted by [`StreamCommand::ImportSnapshot`].
+    ///
+    /// [`StreamCommand::ImportSnapshot`]: crate::StreamCommand::ImportSnapshot
+    SnapshotImported {
+        buckets: u64,
+        streams: u64,
+    },
     Error {
         code: StreamErrorCode,
         message: String,
@@ -101,6 +108,10 @@ pub enum StreamErrorCode {
     InvalidStreamAttrs,
     InvalidRecordBoundaries,
     RecordPreconditionFailed,
+    /// A state import targeted a group that already holds buckets or streams.
+    ImportConflict,
+    /// A state import payload failed snapshot validation.
+    ImportInvalid,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

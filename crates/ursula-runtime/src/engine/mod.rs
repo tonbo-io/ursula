@@ -49,6 +49,7 @@ use crate::request::GetStreamAttrsResponse;
 use crate::request::GroupReadStreamParts;
 use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
+use crate::request::ImportGroupStateRequest;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -111,6 +112,13 @@ pub type GroupAckColdGcFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AckColdGcResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupPlanColdGcFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<ColdGcEntry>, GroupEngineError>> + Send + 'a>>;
+pub type GroupImportGroupStateFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<crate::request::ImportGroupStateResponse, GroupEngineError>>
+            + Send
+            + 'a,
+    >,
+>;
 pub type GroupSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = Result<GroupSnapshot, GroupEngineError>> + Send + 'a>>;
 pub type GroupInstallSnapshotFuture<'a> =
@@ -153,6 +161,7 @@ pub enum GroupWriteResponse {
     CloseStream(CloseStreamResponse),
     DeleteStream(DeleteStreamResponse),
     AckColdGc(AckColdGcResponse),
+    ImportGroupState(crate::request::ImportGroupStateResponse),
     Batch(Vec<Result<GroupWriteResponse, GroupEngineError>>),
 }
 
@@ -255,6 +264,21 @@ pub trait GroupEngine: Send + 'static {
             Err(GroupEngineError::new(format!(
                 "retention advance is not supported for stream '{}'",
                 request.stream_id
+            )))
+        })
+    }
+
+    /// Restore path: replaces an empty group's state with a backup snapshot
+    /// as one replicated write. See `StreamCommand::ImportSnapshot`.
+    fn import_group_state<'a>(
+        &'a mut self,
+        _request: ImportGroupStateRequest,
+        placement: ShardPlacement,
+    ) -> GroupImportGroupStateFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "group state import is not supported for group {}",
+                placement.raft_group_id.0
             )))
         })
     }
@@ -748,6 +772,10 @@ pub trait GroupEngine: Send + 'static {
                     .ack_cold_gc(up_to_seq, placement)
                     .await
                     .map(GroupWriteResponse::AckColdGc),
+                StreamCommand::ImportSnapshot { snapshot } => self
+                    .import_group_state(ImportGroupStateRequest { snapshot }, placement)
+                    .await
+                    .map(GroupWriteResponse::ImportGroupState),
                 StreamCommand::CreateBucket { .. } | StreamCommand::DeleteBucket { .. } => Err(
                     GroupEngineError::new("bucket commands are not valid group writes"),
                 ),

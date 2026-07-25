@@ -49,6 +49,14 @@ impl From<StreamCommand> for GroupWriteCommand {
     }
 }
 
+impl From<crate::request::ImportGroupStateRequest> for StreamCommand {
+    fn from(request: crate::request::ImportGroupStateRequest) -> Self {
+        Self::ImportSnapshot {
+            snapshot: request.snapshot,
+        }
+    }
+}
+
 impl From<CreateStreamRequest> for StreamCommand {
     fn from(request: CreateStreamRequest) -> Self {
         Self::CreateStream {

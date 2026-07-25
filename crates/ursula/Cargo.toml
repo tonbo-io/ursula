@@ -36,6 +36,8 @@ openraft = { workspace = true }
 opentelemetry = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 serde = { workspace = true }
+rmp-serde = { workspace = true }
+blake3 = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true, optional = true }
 tikv-jemalloc-ctl = { workspace = true, optional = true }

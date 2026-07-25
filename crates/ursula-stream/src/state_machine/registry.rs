@@ -54,6 +54,10 @@ impl StreamRegistry {
         self.slot_mut(stream_id).map(|slot| &mut slot.metadata)
     }
 
+    pub(super) fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
     /// Stream ids of every live slot, in arbitrary order.
     pub(super) fn stream_ids(&self) -> impl Iterator<Item = &BucketStreamId> {
         self.keys.keys()
