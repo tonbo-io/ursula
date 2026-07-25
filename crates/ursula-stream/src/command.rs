@@ -125,6 +125,12 @@ pub enum StreamCommand {
     DeleteStream {
         stream_id: BucketStreamId,
     },
+    /// Administrator-triggered tenant offboarding: removes every stream in
+    /// the bucket, the bucket itself, and its usage ledger entry in this
+    /// group. Idempotent — purging an absent bucket reports zero removals.
+    PurgeBucket {
+        bucket_id: String,
+    },
     /// Confirms the leader's background worker has physically reclaimed every
     /// queued cold-GC entry with `seq <= up_to_seq`; removes them from the
     /// replicated queue. Idempotent under replay.
@@ -215,6 +221,7 @@ impl fmt::Display for StreamCommand {
             ),
             Self::Close { stream_id, .. } => write!(f, "close_stream:{stream_id}"),
             Self::DeleteStream { stream_id } => write!(f, "delete_stream:{stream_id}"),
+            Self::PurgeBucket { bucket_id } => write!(f, "purge_bucket:{bucket_id}"),
             Self::AckColdGc { up_to_seq } => write!(f, "ack_cold_gc:up_to_seq={up_to_seq}"),
             Self::ImportSnapshot { snapshot } => write!(
                 f,

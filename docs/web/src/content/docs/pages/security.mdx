@@ -29,6 +29,8 @@ Handle the following outside Ursula:
 
 CORS is permissive (`Access-Control-Allow-Origin: *`). Restrict at the proxy for browser traffic.
 
+Tenant offboarding has a first-class erasure path: the admin-plane [bucket purge endpoint](/docs/operations#tenant-offboarding-bucket-purge) removes a tenant's streams, bucket, usage entry, and cold objects idempotently, leaving other tenants untouched.
+
 ## Gateway access control (opt-in)
 
 A shared or internet-facing deployment can enable OAuth resource-server checks on `ursula gateway`. The feature is off by default; without the flags the gateway keeps its original trusted pass-through behavior.

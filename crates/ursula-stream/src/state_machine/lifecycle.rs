@@ -73,6 +73,36 @@ impl StreamStateMachine {
         }
     }
 
+    /// Tenant offboarding: removes every stream the bucket owns in this
+    /// group (each removal enqueues its cold-object prefixes for the GC
+    /// worker), then the bucket and its usage ledger entry. Unlike
+    /// [`Self::delete_bucket`] this does not require the bucket to be empty,
+    /// and purging an absent bucket succeeds with zero removals so a crashed
+    /// purge can be re-run to convergence.
+    pub(super) fn purge_bucket(&mut self, bucket_id: &str) -> StreamResponse {
+        if let Err(message) = validate_bucket_id(bucket_id) {
+            return StreamResponse::error(StreamErrorCode::InvalidBucketId, message);
+        }
+        let stream_ids = self
+            .registry
+            .stream_ids()
+            .filter(|stream_id| stream_id.bucket_id == bucket_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut removed_streams = 0u64;
+        for stream_id in stream_ids {
+            if self.remove_stream_state(&stream_id) {
+                removed_streams = removed_streams.saturating_add(1);
+            }
+        }
+        self.buckets.remove(bucket_id);
+        self.bucket_usage.remove(bucket_id);
+        StreamResponse::BucketPurged {
+            bucket_id: bucket_id.to_owned(),
+            removed_streams,
+        }
+    }
+
     pub(super) fn create_stream(&mut self, input: CreateStreamInput) -> StreamResponse {
         let attrs = normalize_stream_attrs(input.attrs.clone());
         if let Err(response) = self.validate_stream_scope(&input.stream_id) {

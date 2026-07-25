@@ -78,6 +78,22 @@ A node that lost its Raft log (disk replaced, data dir wiped) rejoins with a sho
 
 `POST /__ursula/cluster-probe` also exists on the client plane, but it is machinery rather than an operator surface: nodes send each other heartbeat-sized bodies through it to verify cluster-plane egress, and it bypasses ingress admission.
 
+## Tenant offboarding (bucket purge)
+
+`DELETE /__ursula/purge/{bucket}` (admin plane) erases one tenant bucket completely: every stream in every Raft group, the bucket itself, and its usage-ledger entry, followed by one immediate cold-GC pass that reclaims the streams' cold-object prefixes. The response is a completion report an operator can attest to:
+
+```bash
+curl -X DELETE http://127.0.0.1:4438/__ursula/purge/tenant-a
+# {"bucket":"tenant-a","removed_streams":12,"groups_with_streams":[0,3,5],"cold_gc_entries_reclaimed":12}
+```
+
+Semantics:
+
+- **Idempotent and resumable.** Purging an absent bucket returns the same report shape with zero counts. A purge interrupted mid-way converges on re-run: stream removal is a replicated command per group, and cold reclamation is a list-then-delete over object prefixes, so nothing depends on in-memory progress.
+- **Isolated.** Other buckets' streams, offsets, checksums, and snapshots are untouched; the purged bucket name conceals as not-found afterwards and may be recreated cleanly.
+- **Cold-GC interaction.** If the immediate GC pass fails (for example S3 is briefly unavailable), the entries stay queued and the background GC worker finishes reclamation; the purge itself is already durable at that point.
+- **Backups.** A purged tenant may persist inside backups taken before the purge until those backups age out; restore replays whatever the manifest contains. Deleting old backup sets is part of completing an offboarding with erasure obligations.
+
 ## Cleaning S3
 
 Cold data lives under the `storage.cold.root` prefix. Benchmark and test runs should use a date-stamped root so cleanup is one prefix delete with standard S3 tooling:

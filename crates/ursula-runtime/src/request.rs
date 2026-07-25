@@ -443,6 +443,13 @@ pub struct AckColdGcResponse {
     pub group_commit_index: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurgeBucketResponse {
+    pub placement: ShardPlacement,
+    pub removed_streams: u64,
+    pub group_commit_index: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlushColdRequest {
     pub stream_id: BucketStreamId,

@@ -54,6 +54,7 @@ use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
+use crate::request::PurgeBucketResponse;
 use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
@@ -110,6 +111,8 @@ pub type GroupDeleteStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<DeleteStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupAckColdGcFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AckColdGcResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupPurgeBucketFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<PurgeBucketResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupPlanColdGcFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<ColdGcEntry>, GroupEngineError>> + Send + 'a>>;
 pub type GroupImportGroupStateFuture<'a> = Pin<
@@ -161,6 +164,7 @@ pub enum GroupWriteResponse {
     CloseStream(CloseStreamResponse),
     DeleteStream(DeleteStreamResponse),
     AckColdGc(AckColdGcResponse),
+    PurgeBucket(PurgeBucketResponse),
     ImportGroupState(crate::request::ImportGroupStateResponse),
     Batch(Vec<Result<GroupWriteResponse, GroupEngineError>>),
 }
@@ -363,6 +367,16 @@ pub trait GroupEngine: Send + 'static {
         _placement: ShardPlacement,
     ) -> GroupAckColdGcFuture<'a> {
         Box::pin(async { Err(GroupEngineError::new("cold GC ack is not supported")) })
+    }
+
+    /// Replicated tenant offboarding: removes every stream in the bucket,
+    /// the bucket, and its usage entry in this group. Default unsupported.
+    fn purge_bucket<'a>(
+        &'a mut self,
+        _bucket_id: String,
+        _placement: ShardPlacement,
+    ) -> GroupPurgeBucketFuture<'a> {
+        Box::pin(async { Err(GroupEngineError::new("bucket purge is not supported")) })
     }
 
     /// Leader-local read of the front of the cold-GC queue for the background
@@ -772,6 +786,10 @@ pub trait GroupEngine: Send + 'static {
                     .ack_cold_gc(up_to_seq, placement)
                     .await
                     .map(GroupWriteResponse::AckColdGc),
+                StreamCommand::PurgeBucket { bucket_id } => self
+                    .purge_bucket(bucket_id, placement)
+                    .await
+                    .map(GroupWriteResponse::PurgeBucket),
                 StreamCommand::ImportSnapshot { snapshot } => self
                     .import_group_state(ImportGroupStateRequest { snapshot }, placement)
                     .await

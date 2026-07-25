@@ -303,6 +303,13 @@ macro_rules! runtime_operations {
                 handle { call ack_cold_gc(engine, up_to_seq, placement) }
                 client { group fn ack_cold_gc }
             }
+            op PurgeBucket {
+                fields { bucket_id: String }
+                reply { response_tx: PurgeBucketResponse }
+                guard { none }
+                handle { call purge_bucket(engine, bucket_id, placement) }
+                client { pub group fn purge_bucket }
+            }
             op Append {
                 fields { request: AppendRequest }
                 reply { response_tx: AppendResponse }

@@ -60,6 +60,7 @@ use ursula_runtime::GroupPlanColdFlushFuture;
 use ursula_runtime::GroupPlanColdGcFuture;
 use ursula_runtime::GroupPlanNextColdFlushBatchFuture;
 use ursula_runtime::GroupPublishSnapshotFuture;
+use ursula_runtime::GroupPurgeBucketFuture;
 use ursula_runtime::GroupReadSnapshotFuture;
 use ursula_runtime::GroupReadStreamFuture;
 use ursula_runtime::GroupReadStreamParts;
@@ -1069,6 +1070,26 @@ impl GroupEngine for RaftGroupEngine {
                 GroupWriteResponse::DeleteStream(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
                     "unexpected delete stream write response: {other:?}"
+                ))),
+            }
+        })
+    }
+
+    fn purge_bucket<'a>(
+        &'a mut self,
+        bucket_id: String,
+        _placement: ShardPlacement,
+    ) -> GroupPurgeBucketFuture<'a> {
+        Box::pin(async move {
+            match self
+                .write(GroupWriteCommand::Stream(StreamCommand::PurgeBucket {
+                    bucket_id,
+                }))
+                .await?
+            {
+                GroupWriteResponse::PurgeBucket(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected purge bucket write response: {other:?}"
                 ))),
             }
         })

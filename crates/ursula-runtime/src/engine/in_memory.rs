@@ -42,6 +42,7 @@ use super::GroupPlanColdFlushFuture;
 use super::GroupPlanColdGcFuture;
 use super::GroupPlanNextColdFlushBatchFuture;
 use super::GroupPublishSnapshotFuture;
+use super::GroupPurgeBucketFuture;
 use super::GroupReadSnapshotFuture;
 use super::GroupReadStreamFuture;
 use super::GroupReadStreamPartsFuture;
@@ -94,6 +95,7 @@ use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::PublishSnapshotResponse;
+use crate::request::PurgeBucketResponse;
 use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
@@ -539,6 +541,17 @@ impl InMemoryGroupEngine {
                 Ok(GroupWriteResponse::AckColdGc(AckColdGcResponse {
                     placement,
                     removed,
+                    group_commit_index: self.commit_index,
+                }))
+            }
+            StreamResponse::BucketPurged {
+                bucket_id: _,
+                removed_streams,
+            } => {
+                self.commit_index += 1;
+                Ok(GroupWriteResponse::PurgeBucket(PurgeBucketResponse {
+                    placement,
+                    removed_streams,
                     group_commit_index: self.commit_index,
                 }))
             }
@@ -1559,6 +1572,24 @@ impl GroupEngine for InMemoryGroupEngine {
         })
     }
 
+    fn purge_bucket<'a>(
+        &'a mut self,
+        bucket_id: String,
+        placement: ShardPlacement,
+    ) -> GroupPurgeBucketFuture<'a> {
+        Box::pin(async move {
+            match self.apply_committed_write(
+                GroupWriteCommand::Stream(StreamCommand::PurgeBucket { bucket_id }),
+                placement,
+            )? {
+                GroupWriteResponse::PurgeBucket(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected purge bucket write response: {other:?}"
+                ))),
+            }
+        })
+    }
+
     fn ack_cold_gc<'a>(
         &'a mut self,
         up_to_seq: u64,
@@ -1889,6 +1920,7 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
     match command {
         StreamCommand::CreateBucket { .. }
         | StreamCommand::DeleteBucket { .. }
+        | StreamCommand::PurgeBucket { .. }
         | StreamCommand::AckColdGc { .. }
         | StreamCommand::ImportSnapshot { .. } => None,
         StreamCommand::CreateStream { stream_id, .. }
