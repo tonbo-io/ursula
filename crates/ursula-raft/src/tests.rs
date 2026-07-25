@@ -70,14 +70,20 @@ type CommittedLeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::Lea
 type MetaLeaderId = <MetaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
 
 #[test]
-fn follower_forwards_record_cursor_beyond_its_applied_tail() {
+fn follower_forwards_stale_read_visibility_errors() {
     let invalid_boundary = GroupEngineError::stream(
         StreamErrorCode::InvalidRecordBoundaries,
         "record 4 is beyond record tail 2",
     );
-    assert!(should_forward_follower_read_error(false, &invalid_boundary));
-    assert!(!should_forward_follower_read_error(true, &invalid_boundary));
-    assert!(!should_forward_follower_read_error(
+    assert!(should_forward_stale_follower_read_error(
+        false,
+        &invalid_boundary
+    ));
+    assert!(!should_forward_stale_follower_read_error(
+        true,
+        &invalid_boundary
+    ));
+    assert!(should_forward_stale_follower_read_error(
         false,
         &GroupEngineError::stream(StreamErrorCode::StreamNotFound, "missing")
     ));

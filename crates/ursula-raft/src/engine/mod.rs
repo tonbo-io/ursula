@@ -116,11 +116,15 @@ pub struct RaftGroupEngine {
     pub(crate) cold_index_cache: Option<Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>>,
 }
 
-pub(crate) fn should_forward_follower_read_error(
+pub(crate) fn should_forward_stale_follower_read_error(
     is_leader: bool,
     error: &GroupEngineError,
 ) -> bool {
-    !is_leader && error.code() == Some(StreamErrorCode::InvalidRecordBoundaries)
+    !is_leader
+        && matches!(
+            error.code(),
+            Some(StreamErrorCode::InvalidRecordBoundaries | StreamErrorCode::StreamNotFound)
+        )
 }
 
 impl RaftGroupEngine {
@@ -766,17 +770,22 @@ impl GroupEngine for RaftGroupEngine {
     ) -> GroupReadStreamPartsFuture<'a> {
         Box::pin(async move {
             let original_request = request.clone();
-            if !self.raft.is_leader()
-                && self
+            if !self.raft.is_leader() {
+                match self
                     .access_requires_write(request.stream_id.clone(), request.now_ms, true)
-                    .await?
-            {
-                if let Some(leader_node) = self.current_leader_node().await {
-                    let response =
-                        forward_read_stream_to_leader(placement, &leader_node, request).await?;
-                    return Ok(GroupReadStreamParts::from_response(response));
+                    .await
+                {
+                    Ok(false) => {}
+                    Ok(true) | Err(_) => {
+                        if let Some(leader_node) = self.current_leader_node().await {
+                            let response =
+                                forward_read_stream_to_leader(placement, &leader_node, request)
+                                    .await?;
+                            return Ok(GroupReadStreamParts::from_response(response));
+                        }
+                        self.require_local_leader_for_read("read_stream").await?;
+                    }
                 }
-                self.require_local_leader_for_read("read_stream").await?;
             }
             let stream_id = request.stream_id.clone();
             if self.raft.is_leader() {
@@ -799,7 +808,9 @@ impl GroupEngine for RaftGroupEngine {
                 // already acknowledged. In that window, a read-after-write
                 // cursor is beyond only the follower's local tail. Forward
                 // instead of exposing a false permanent boundary error.
-                Err(error) if should_forward_follower_read_error(self.raft.is_leader(), &error) => {
+                Err(error)
+                    if should_forward_stale_follower_read_error(self.raft.is_leader(), &error) =>
+                {
                     if let Some(leader_node) = self.current_leader_node().await {
                         let response = forward_read_stream_to_leader(
                             placement,
