@@ -566,7 +566,10 @@ async fn gateway_follows_leader_redirect_for_get_request() {
     let (parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     let resp = gateway
-        .forward(&follower.url, &parts, body_bytes)
+        .forward(&follower.url, &parts, body_bytes, ResponseTail {
+            meter: None,
+            _live_guard: None,
+        })
         .await
         .unwrap();
 
@@ -592,7 +595,10 @@ async fn gateway_follows_leader_redirect_for_put_request() {
     let (parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     let resp = gateway
-        .forward(&follower.url, &parts, body_bytes)
+        .forward(&follower.url, &parts, body_bytes, ResponseTail {
+            meter: None,
+            _live_guard: None,
+        })
         .await
         .unwrap();
 
@@ -634,7 +640,10 @@ async fn gateway_returns_raft_redirect_when_leader_not_in_upstreams() {
     let (parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     let resp = gateway
-        .forward(&follower.url, &parts, body_bytes)
+        .forward(&follower.url, &parts, body_bytes, ResponseTail {
+            meter: None,
+            _live_guard: None,
+        })
         .await
         .unwrap();
 
@@ -682,7 +691,10 @@ async fn gateway_preserves_path_and_query_with_trailing_upstream_slash() {
     let (parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     let resp = gateway
-        .forward(&upstream_url, &parts, body_bytes)
+        .forward(&upstream_url, &parts, body_bytes, ResponseTail {
+            meter: None,
+            _live_guard: None,
+        })
         .await
         .unwrap();
 
@@ -705,7 +717,10 @@ async fn gateway_accepts_https_upstream_scheme() {
     let (parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     let err = gateway
-        .forward("https://127.0.0.1:1", &parts, body_bytes)
+        .forward("https://127.0.0.1:1", &parts, body_bytes, ResponseTail {
+            meter: None,
+            _live_guard: None,
+        })
         .await
         .unwrap_err();
 
@@ -751,7 +766,10 @@ async fn gateway_does_not_apply_response_header_timeout_to_sse_body() {
     let (parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     let mut resp = gateway
-        .forward(&upstream.url, &parts, body_bytes)
+        .forward(&upstream.url, &parts, body_bytes, ResponseTail {
+            meter: None,
+            _live_guard: None,
+        })
         .await
         .expect("forward SSE request");
 
@@ -818,7 +836,10 @@ async fn gateway_preserves_public_snapshot_redirect_without_upstream_host() {
     let (parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     let resp = gateway
-        .forward(&upstream.url, &parts, body_bytes)
+        .forward(&upstream.url, &parts, body_bytes, ResponseTail {
+            meter: None,
+            _live_guard: None,
+        })
         .await
         .unwrap();
 
@@ -934,5 +955,155 @@ mod tenant_boundary {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+// Gateway-half quota enforcement and usage accounting (#134/#135).
+mod admission_and_usage {
+    use super::*;
+    use crate::admission::StaticQuotaProvider;
+    use crate::auth::policy::StaticPolicyAuthorizer;
+    use crate::usage::UsageBatch;
+    use crate::usage::UsageClass;
+    use crate::usage::UsageCollector;
+    use crate::usage::UsageSink;
+    use crate::usage::UsageSinkFuture;
+
+    const POLICY: &str = r#"
+        [[bucket]]
+        id = "tenant-a"
+        owners = [{ issuer = "https://issuer.example", subject = "user-1" }]
+    "#;
+
+    const QUOTAS: &str = r#"
+        [[bucket]]
+        id = "tenant-a"
+        requests_per_sec = 2
+        max_request_body_bytes = 8
+    "#;
+
+    struct CapturingSink {
+        batches: Mutex<Vec<UsageBatch>>,
+    }
+
+    impl UsageSink for CapturingSink {
+        fn export<'a>(&'a self, batch: &'a UsageBatch) -> UsageSinkFuture<'a> {
+            self.batches
+                .lock()
+                .expect("batches lock")
+                .push(batch.clone());
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn quota_gateway(upstream_url: &str, collector: Arc<UsageCollector>) -> Gateway {
+        Gateway::with_access_control(
+            test_config(vec![upstream_url.to_owned()]),
+            AccessControl::new(
+                Arc::new(FixedPrincipalResolver::valid()),
+                Arc::new(StaticPolicyAuthorizer::from_toml_str(POLICY).expect("parse policy")),
+            ),
+        )
+        .with_quota_provider(Arc::new(
+            StaticQuotaProvider::from_toml_str(QUOTAS).expect("parse quotas"),
+        ))
+        .with_usage_collector(collector)
+    }
+
+    async fn send(
+        gateway: &Gateway,
+        method: &str,
+        uri: &str,
+        body: &'static str,
+    ) -> axum::response::Response {
+        gateway
+            .handle(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(AUTHORIZATION, "Bearer valid-token")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn rate_limit_rejects_with_retry_after_and_never_reaches_upstream() {
+        let upstream =
+            spawn_upstream(Router::new().route("/tenant-a/orders", any(|| async { "ok" }))).await;
+        let gateway = quota_gateway(&upstream.url, UsageCollector::new());
+
+        assert_eq!(
+            send(&gateway, "GET", "/tenant-a/orders", "").await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(&gateway, "GET", "/tenant-a/orders", "").await.status(),
+            StatusCode::OK
+        );
+        let limited = send(&gateway, "GET", "/tenant-a/orders", "").await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = limited
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("Retry-After header");
+        assert!(retry_after >= 1);
+    }
+
+    #[tokio::test]
+    async fn per_tenant_body_limit_rejects_oversized_appends() {
+        let upstream =
+            spawn_upstream(Router::new().route("/tenant-a/orders", any(|| async { "ok" }))).await;
+        let gateway = quota_gateway(&upstream.url, UsageCollector::new());
+
+        let oversized = send(&gateway, "POST", "/tenant-a/orders", "123456789").await;
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let allowed = send(&gateway, "POST", "/tenant-a/orders", "12345678").await;
+        assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn usage_counts_append_ingress_and_read_egress_per_principal() {
+        let upstream =
+            spawn_upstream(Router::new().route("/tenant-a/orders", any(|| async { "0123456789" })))
+                .await;
+        let collector = UsageCollector::new();
+        let gateway = quota_gateway(&upstream.url, Arc::clone(&collector));
+
+        let append = send(&gateway, "POST", "/tenant-a/orders", "12345678").await;
+        assert_eq!(append.status(), StatusCode::OK);
+        // Drain the response body so the meter observes completion.
+        let _ = append.into_body().collect().await.expect("append body");
+        let read = send(&gateway, "GET", "/tenant-a/orders", "").await;
+        let read_body = read.into_body().collect().await.expect("read body");
+        assert_eq!(read_body.to_bytes().len(), 10);
+
+        let sink = CapturingSink {
+            batches: Mutex::new(Vec::new()),
+        };
+        crate::usage::flush(&collector, &sink).await;
+        let batches = sink.batches.lock().expect("batches lock");
+        assert_eq!(batches.len(), 1);
+        let records = &batches[0].records;
+
+        let append_record = records
+            .iter()
+            .find(|record| record.key.class == UsageClass::Append)
+            .expect("append usage record");
+        assert_eq!(append_record.key.bucket_id, "tenant-a");
+        assert_eq!(append_record.counters.requests, 1);
+        assert_eq!(append_record.counters.request_bytes, 8);
+        let principal = append_record.key.principal.as_ref().expect("principal");
+        assert_eq!(principal.subject, "user-1");
+
+        let read_record = records
+            .iter()
+            .find(|record| record.key.class == UsageClass::Read)
+            .expect("read usage record");
+        assert_eq!(read_record.counters.response_bytes, 10);
     }
 }

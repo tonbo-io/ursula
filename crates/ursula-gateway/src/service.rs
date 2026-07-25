@@ -15,10 +15,13 @@ use ursula_observability::serve::shutdown_signal;
 use crate::DEFAULT_MAX_REQUEST_BODY_BYTES;
 use crate::Gateway;
 use crate::GatewayConfig;
+use crate::admission::StaticQuotaProvider;
 use crate::auth::AccessControl;
 use crate::auth::jwt::JwtPrincipalResolver;
 use crate::auth::jwt::JwtValidationConfig;
 use crate::auth::policy::StaticPolicyAuthorizer;
+use crate::usage::JsonlUsageSink;
+use crate::usage::UsageCollector;
 
 const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 3600;
 
@@ -36,12 +39,35 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
         max_request_body_bytes: args.max_request_body_bytes,
     };
 
-    let gateway = match installed_access_control {
-        Some(access_control) => {
-            Arc::new(Gateway::with_access_control(config.clone(), access_control))
-        }
-        None => Arc::new(Gateway::new(config.clone())),
+    let mut gateway = match installed_access_control {
+        Some(access_control) => Gateway::with_access_control(config.clone(), access_control),
+        None => Gateway::new(config.clone()),
     };
+
+    if let Some(policy_path) = &args.quota_policy {
+        let provider = StaticQuotaProvider::from_file(policy_path)?;
+        tracing::info!(policy = %policy_path.display(), "gateway quotas enabled");
+        gateway = gateway.with_quota_provider(Arc::new(provider));
+    }
+
+    let mut usage_shutdown = None;
+    let mut usage_exporter = None;
+    if let Some(usage_path) = &args.usage_log {
+        let sink = Arc::new(JsonlUsageSink::create(usage_path)?);
+        let collector = UsageCollector::new();
+        gateway = gateway.with_usage_collector(Arc::clone(&collector));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        usage_exporter = Some(tokio::spawn(crate::usage::run_exporter(
+            collector,
+            sink,
+            Duration::from_secs(args.usage_flush_secs),
+            shutdown_rx,
+        )));
+        usage_shutdown = Some(shutdown_tx);
+        tracing::info!(log = %usage_path.display(), "gateway usage accounting enabled");
+    }
+
+    let gateway = Arc::new(gateway);
 
     // Keep Axum's State extractor in the binary so the library handler stays
     // easy to call directly from tests.
@@ -67,6 +93,15 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some(Duration::from_secs(args.graceful_shutdown_timeout)),
     )
     .await?;
+
+    // Stop the exporter after the server drains so the final usage window is
+    // flushed rather than stranded.
+    if let Some(shutdown) = usage_shutdown {
+        drop(shutdown);
+    }
+    if let Some(exporter) = usage_exporter {
+        let _joined = exporter.await;
+    }
 
     Ok(())
 }
@@ -144,6 +179,20 @@ pub struct GatewayArgs {
     /// TOML bucket policy file declaring owners and public-read visibility.
     #[arg(long, requires = "auth_issuer")]
     auth_policy: Option<PathBuf>,
+
+    /// TOML per-tenant quota policy. Requires access control: limits are
+    /// keyed by the classified bucket resource.
+    #[arg(long, requires = "auth_issuer")]
+    quota_policy: Option<PathBuf>,
+
+    /// Append per-tenant usage batches to this JSONL file. Requires access
+    /// control for the same reason as quotas.
+    #[arg(long, requires = "auth_issuer")]
+    usage_log: Option<PathBuf>,
+
+    /// Interval between usage exports, in seconds.
+    #[arg(long, default_value_t = 30, requires = "usage_log")]
+    usage_flush_secs: u64,
 }
 
 #[cfg(test)]

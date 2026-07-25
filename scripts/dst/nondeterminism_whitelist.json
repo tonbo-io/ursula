@@ -82,5 +82,12 @@
     "snippet_contains": "SystemTime::now()",
     "reason": "test-only",
     "plan": "no action: the call is a #[cfg(test)] helper minting iat/exp claims for freshly signed test JWTs. jsonwebtoken validates exp/iat against the real wall clock internally, so the claims must come from the same clock. The gateway crate is not part of the madsim simulation surface; the production resolver path uses tokio::time::Instant only."
+  },
+  {
+    "category": "system_time_now",
+    "path": "crates/ursula-gateway/src/usage.rs",
+    "snippet_contains": "SystemTime::now()",
+    "reason": "wall-clock-usage-windows",
+    "plan": "no action: unix_time_ms() stamps usage-batch window boundaries, which are billing timestamps consumed by an external ledger and must reflect real wall-clock time. The gateway is not part of the madsim simulation surface; admission timing uses tokio::time::Instant."
   }
 ]
