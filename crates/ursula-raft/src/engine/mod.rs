@@ -116,6 +116,13 @@ pub struct RaftGroupEngine {
     pub(crate) cold_index_cache: Option<Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>>,
 }
 
+pub(crate) fn should_forward_follower_read_error(
+    is_leader: bool,
+    error: &GroupEngineError,
+) -> bool {
+    !is_leader && error.code() == Some(StreamErrorCode::InvalidRecordBoundaries)
+}
+
 impl RaftGroupEngine {
     pub async fn new_single_node(placement: ShardPlacement) -> Result<Self, GroupEngineError> {
         Self::new_single_node_with_optional_metrics(placement, None).await
@@ -785,7 +792,27 @@ impl GroupEngine for RaftGroupEngine {
                             .read_stream_plan_after_access(&read_request)
                     })
                 })
-                .await??;
+                .await?;
+            let plan = match plan {
+                Ok(plan) => plan,
+                // A follower may be behind a write that the leader has
+                // already acknowledged. In that window, a read-after-write
+                // cursor is beyond only the follower's local tail. Forward
+                // instead of exposing a false permanent boundary error.
+                Err(error) if should_forward_follower_read_error(self.raft.is_leader(), &error) => {
+                    if let Some(leader_node) = self.current_leader_node().await {
+                        let response = forward_read_stream_to_leader(
+                            placement,
+                            &leader_node,
+                            original_request,
+                        )
+                        .await?;
+                        return Ok(GroupReadStreamParts::from_response(response));
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
             let mut parts = GroupReadStreamParts::from_plan(
                 placement,
                 stream_id,
