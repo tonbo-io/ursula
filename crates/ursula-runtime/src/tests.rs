@@ -386,6 +386,8 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             deduplicated: false,
             producer: None,
             record_range: None,
+            stream_hot_bytes: 3,
+            group_hot_bytes: 3,
         })
     );
 
@@ -3834,6 +3836,8 @@ impl GroupEngine for RecordingEngine {
                 deduplicated: false,
                 producer: request.producer,
                 record_range: None,
+                stream_hot_bytes: 0,
+                group_hot_bytes: 0,
             })
         })
     }
@@ -3869,6 +3873,8 @@ impl GroupEngine for RecordingEngine {
                     deduplicated: false,
                     producer: None,
                     record_range: None,
+                    stream_hot_bytes: 0,
+                    group_hot_bytes: 0,
                 }));
             }
             Ok(GroupAppendBatchResponse { placement, items })

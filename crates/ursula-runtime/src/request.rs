@@ -166,6 +166,16 @@ pub struct ReadStreamRequest {
     pub max_records: Option<u64>,
 }
 
+impl ReadStreamRequest {
+    pub(crate) fn same_wait_plan(&self, other: &Self) -> bool {
+        self.stream_id == other.stream_id
+            && self.offset == other.offset
+            && self.max_len == other.max_len
+            && self.record == other.record
+            && self.max_records == other.max_records
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadStreamResponse {
     pub placement: ShardPlacement,
@@ -653,6 +663,10 @@ pub struct AppendResponse {
     pub deduplicated: bool,
     pub producer: Option<ProducerRequest>,
     pub record_range: Option<StreamRecordRange>,
+    #[serde(default)]
+    pub stream_hot_bytes: u64,
+    #[serde(default)]
+    pub group_hot_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

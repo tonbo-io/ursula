@@ -1296,16 +1296,13 @@ impl CoreWorker {
             stream = %request.stream_id.stream_id,
         ),
     )]
-    pub(crate) async fn apply_append(
+    pub(crate) async fn commit_append(
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,
-        read_materialization: Arc<Semaphore>,
-        read_watchers: &mut ReadWatchers,
         request: AppendRequest,
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> Result<AppendResponse, RuntimeError> {
-        let stream_id = request.stream_id.clone();
         let incoming_bytes = request.payload_len();
         let started_at = Instant::now();
         let exec_started_at = Instant::now();
@@ -1335,18 +1332,38 @@ impl CoreWorker {
                 placement.raft_group_id,
                 elapsed_ns(started_at),
             );
-            record_cold_hot_backlog(group, &metrics, stream_id.clone(), placement).await;
-            Self::notify_read_watchers(
-                group,
-                metrics,
-                read_materialization,
-                read_watchers,
-                &stream_id,
-                placement,
-            )
-            .await;
+            metrics.record_cold_hot_backlog(
+                placement.raft_group_id,
+                response.stream_hot_bytes,
+                response.group_hot_bytes,
+            );
         }
         Ok(response)
+    }
+
+    pub(crate) async fn finish_append(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        read_materialization: Arc<Semaphore>,
+        read_watchers: &mut ReadWatchers,
+        stream_id: BucketStreamId,
+        placement: ShardPlacement,
+    ) {
+        let started_at = Instant::now();
+        Self::notify_read_watchers(
+            group,
+            metrics.clone(),
+            read_materialization,
+            read_watchers,
+            &stream_id,
+            placement,
+        )
+        .await;
+        metrics.record_append_post_commit(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(started_at),
+        );
     }
 
     #[tracing::instrument(
@@ -1578,20 +1595,23 @@ impl CoreWorker {
         let Some(watchers) = read_watchers.remove(stream_id) else {
             return;
         };
+        let notify_started_at = Instant::now();
         metrics.record_read_watchers_removed(placement.core_id, watchers.len());
 
         let mut request_groups: Vec<(ReadStreamRequest, Vec<ReadWatcher>)> = Vec::new();
         for watcher in watchers {
-            if let Some((_, grouped)) = request_groups
+            if let Some((request, grouped)) = request_groups
                 .iter_mut()
-                .find(|(request, _)| *request == watcher.request)
+                .find(|(request, _)| request.same_wait_plan(&watcher.request))
             {
+                request.now_ms = request.now_ms.max(watcher.request.now_ms);
                 grouped.push(watcher);
             } else {
                 request_groups.push((watcher.request.clone(), vec![watcher]));
             }
         }
 
+        let replan_count = request_groups.len();
         let mut pending = Vec::new();
         for (request, watchers) in request_groups {
             let parts = group
@@ -1625,5 +1645,11 @@ impl CoreWorker {
                 .or_default()
                 .extend(pending);
         }
+        metrics.record_read_watcher_notify(
+            placement.core_id,
+            placement.raft_group_id,
+            replan_count,
+            elapsed_ns(notify_started_at),
+        );
     }
 }

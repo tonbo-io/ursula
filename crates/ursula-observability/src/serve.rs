@@ -12,6 +12,8 @@ use std::future::IntoFuture;
 use std::io;
 use std::time::Duration;
 
+use axum::serve::ListenerExt;
+
 /// Wait for a termination signal: SIGTERM or Ctrl-C (Ctrl-C only on
 /// non-unix). If the SIGTERM handler cannot be installed, falls back to
 /// Ctrl-C alone instead of failing.
@@ -57,6 +59,14 @@ pub async fn serve_until_shutdown(
     drain_timeout: Option<Duration>,
 ) -> io::Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let tcp_nodelay = std::env::var("URSULA_TCP_NODELAY")
+        .map(|value| !matches!(value.trim(), "0" | "false" | "off"))
+        .unwrap_or(true);
+    let listener = listener.tap_io(move |stream| {
+        if let Err(err) = stream.set_nodelay(tcp_nodelay) {
+            tracing::warn!(tcp_nodelay, "set TCP_NODELAY on accepted socket: {err}");
+        }
+    });
     let server = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             drop(shutdown_rx.await);

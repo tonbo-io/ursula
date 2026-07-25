@@ -203,3 +203,10 @@ codegen-units = 1
 debug = true
 inherits = "release"
 lto = "fat"
+
+[profile.performance]
+codegen-units = 1
+debug = 1
+inherits = "release"
+lto = "thin"
+opt-level = 3
