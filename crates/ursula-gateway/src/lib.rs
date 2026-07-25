@@ -83,6 +83,7 @@ struct GatewayMetrics {
     leader_cache_hits: AtomicU64,
     leader_cache_misses: AtomicU64,
     leader_cache_updates: AtomicU64,
+    leader_cache_evictions: AtomicU64,
     leader_redirects: AtomicU64,
     leader_redirect_ns: AtomicU64,
 }
@@ -93,6 +94,7 @@ struct GatewayMetricsSnapshot {
     leader_cache_hits: u64,
     leader_cache_misses: u64,
     leader_cache_updates: u64,
+    leader_cache_evictions: u64,
     leader_redirects: u64,
     leader_redirect_ns: u64,
     leader_cache_entries: usize,
@@ -421,6 +423,19 @@ impl Gateway {
             }
         }
 
+        // A cached leader can become a follower after an election. When that
+        // follower does not know the new leader yet, Ursula returns the
+        // explicit retryable 503 form instead of a 307. Do not replay the
+        // current request here: a generic write may not be idempotent. Evict
+        // only the matching cached route so the caller's next retry gets a
+        // fresh random/redirect lookup.
+        if upstream_resp.status() == StatusCode::SERVICE_UNAVAILABLE
+            && upstream_resp.headers().contains_key(RETRY_AFTER)
+            && let Some(key) = stream_affinity_key(&parts.uri)
+        {
+            self.forget_leader_if_matches(&key, upstream);
+        }
+
         Self::build_response(upstream_resp, tail)
     }
 
@@ -527,6 +542,19 @@ impl Gateway {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    fn forget_leader_if_matches(&self, key: &str, upstream: &str) {
+        let mut affinity = self
+            .leader_affinity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if affinity.get(key).is_some_and(|cached| cached == upstream) {
+            affinity.remove(key);
+            self.metrics
+                .leader_cache_evictions
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn metrics_snapshot(&self) -> GatewayMetricsSnapshot {
         let leader_cache_entries = self
             .leader_affinity
@@ -538,6 +566,7 @@ impl Gateway {
             leader_cache_hits: self.metrics.leader_cache_hits.load(Ordering::Relaxed),
             leader_cache_misses: self.metrics.leader_cache_misses.load(Ordering::Relaxed),
             leader_cache_updates: self.metrics.leader_cache_updates.load(Ordering::Relaxed),
+            leader_cache_evictions: self.metrics.leader_cache_evictions.load(Ordering::Relaxed),
             leader_redirects: self.metrics.leader_redirects.load(Ordering::Relaxed),
             leader_redirect_ns: self.metrics.leader_redirect_ns.load(Ordering::Relaxed),
             leader_cache_entries,

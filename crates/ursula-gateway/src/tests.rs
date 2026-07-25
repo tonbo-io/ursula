@@ -152,6 +152,45 @@ fn gateway_reuses_learned_stream_leader() {
     assert_eq!(metrics.leader_cache_entries, 1);
 }
 
+#[tokio::test]
+async fn gateway_evicts_cached_leader_on_retryable_leader_unknown_response() {
+    let stale = spawn_upstream(Router::new().route(
+        "/bucket/stream",
+        get(|| async {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(RETRY_AFTER.as_str(), "1")],
+                "leader unknown",
+            )
+        }),
+    ))
+    .await;
+    let gateway = Gateway::new(test_config(vec![stale.url.clone()]));
+    gateway.remember_leader("/bucket/stream".to_owned(), stale.url.clone());
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/bucket/stream")
+        .body(Body::empty())
+        .expect("request");
+    let (parts, body) = req.into_parts();
+    let body_bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .expect("request body");
+    let response = gateway
+        .forward(&stale.url, &parts, body_bytes, ResponseTail {
+            meter: None,
+            _live_guard: None,
+        })
+        .await
+        .expect("gateway response");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let metrics = gateway.metrics_snapshot();
+    assert_eq!(metrics.leader_cache_evictions, 1);
+    assert_eq!(metrics.leader_cache_entries, 0);
+}
+
 #[test]
 fn stream_affinity_key_ignores_subresource_and_internal_routes() {
     let append_batch: Uri = "/bucket/stream/append-batch".parse().expect("uri");
