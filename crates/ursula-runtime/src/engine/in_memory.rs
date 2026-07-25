@@ -274,6 +274,8 @@ impl InMemoryGroupEngine {
                     .entry(stream_id.clone())
                     .or_insert(0) += count;
             }
+            let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
+            let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
             let items = batch
                 .items
                 .into_iter()
@@ -308,6 +310,8 @@ impl InMemoryGroupEngine {
                             .map_err(|err| {
                                 GroupEngineError::new(format!("record range: {err:?}"))
                             })?,
+                        stream_hot_bytes,
+                        group_hot_bytes,
                     })
                 })
                 .collect();
@@ -399,6 +403,8 @@ impl InMemoryGroupEngine {
                     .state_machine
                     .record_range_for_append(&stream_id, offset, next_offset, producer.as_ref())
                     .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?;
+                let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
+                let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
                 let stream_append_count = self.stream_append_counts.entry(stream_id).or_insert(0);
                 if !deduplicated {
                     self.commit_index += 1;
@@ -414,6 +420,8 @@ impl InMemoryGroupEngine {
                     deduplicated,
                     producer,
                     record_range,
+                    stream_hot_bytes,
+                    group_hot_bytes,
                 }))
             }
             StreamResponse::SnapshotPublished {
@@ -832,6 +840,11 @@ impl InMemoryGroupEngine {
                 producer,
                 ..
             } => {
+                let stream_hot_bytes = self
+                    .state_machine
+                    .hot_payload_len(&stream_count_key)
+                    .unwrap_or(0);
+                let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
                 let stream_append_count = self
                     .stream_append_counts
                     .entry(stream_count_key.clone())
@@ -859,6 +872,8 @@ impl InMemoryGroupEngine {
                     deduplicated,
                     producer,
                     record_range,
+                    stream_hot_bytes,
+                    group_hot_bytes,
                 })
             }
             StreamResponse::Error {

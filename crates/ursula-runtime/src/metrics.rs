@@ -318,6 +318,14 @@ runtime_metrics! {
         core per_core_applied_mutations, group per_group_applied_mutations;
     sum mutation_apply_ns:
         core per_core_mutation_apply_ns, group per_group_mutation_apply_ns;
+    sum append_post_commit_ns:
+        core per_core_append_post_commit_ns, group per_group_append_post_commit_ns;
+    sum read_watcher_notify_calls:
+        core per_core_read_watcher_notify_calls, group per_group_read_watcher_notify_calls;
+    sum read_watcher_notify_ns:
+        core per_core_read_watcher_notify_ns, group per_group_read_watcher_notify_ns;
+    sum read_watcher_replans:
+        core per_core_read_watcher_replans, group per_group_read_watcher_replans;
     sum group_lock_wait_ns:
         core per_core_group_lock_wait_ns, group per_group_group_lock_wait_ns;
     sum group_engine_exec_ns:
@@ -459,6 +467,36 @@ impl RuntimeMetricsInner {
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
         self.per_core_group_engine_exec_ns[core_index].fetch_add_relaxed(exec_ns);
         self.per_group_group_engine_exec_ns[group_index].fetch_add_relaxed(exec_ns);
+    }
+
+    pub(crate) fn record_append_post_commit(
+        &self,
+        core_id: CoreId,
+        group_id: RaftGroupId,
+        elapsed_ns: u64,
+    ) {
+        let core_index = usize::from(core_id.0);
+        let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
+        self.per_core_append_post_commit_ns[core_index].fetch_add_relaxed(elapsed_ns);
+        self.per_group_append_post_commit_ns[group_index].fetch_add_relaxed(elapsed_ns);
+    }
+
+    pub(crate) fn record_read_watcher_notify(
+        &self,
+        core_id: CoreId,
+        group_id: RaftGroupId,
+        replans: usize,
+        elapsed_ns: u64,
+    ) {
+        let core_index = usize::from(core_id.0);
+        let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
+        let replans = u64::try_from(replans).unwrap_or(u64::MAX);
+        self.per_core_read_watcher_notify_calls[core_index].fetch_add_relaxed(1);
+        self.per_group_read_watcher_notify_calls[group_index].fetch_add_relaxed(1);
+        self.per_core_read_watcher_notify_ns[core_index].fetch_add_relaxed(elapsed_ns);
+        self.per_group_read_watcher_notify_ns[group_index].fetch_add_relaxed(elapsed_ns);
+        self.per_core_read_watcher_replans[core_index].fetch_add_relaxed(replans);
+        self.per_group_read_watcher_replans[group_index].fetch_add_relaxed(replans);
     }
 
     pub(crate) fn record_group_mailbox_enqueued(&self, group_id: RaftGroupId) {
@@ -748,7 +786,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 105] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 117] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -758,6 +796,18 @@ mod metric_manifest_tests {
         "mutation_apply_ns",
         "per_core_mutation_apply_ns",
         "per_group_mutation_apply_ns",
+        "append_post_commit_ns",
+        "per_core_append_post_commit_ns",
+        "per_group_append_post_commit_ns",
+        "read_watcher_notify_calls",
+        "per_core_read_watcher_notify_calls",
+        "per_group_read_watcher_notify_calls",
+        "read_watcher_notify_ns",
+        "per_core_read_watcher_notify_ns",
+        "per_group_read_watcher_notify_ns",
+        "read_watcher_replans",
+        "per_core_read_watcher_replans",
+        "per_group_read_watcher_replans",
         "group_lock_wait_ns",
         "per_core_group_lock_wait_ns",
         "per_group_group_lock_wait_ns",

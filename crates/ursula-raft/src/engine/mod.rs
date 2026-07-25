@@ -1261,8 +1261,6 @@ impl GroupEngine for RaftGroupEngine {
                     ))),
                 };
             }
-            self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
-                .await?;
             if admission.max_hot_bytes_per_group.is_some() {
                 self.with_state_machine({
                     let request = request.clone();

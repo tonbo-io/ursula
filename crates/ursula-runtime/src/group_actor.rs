@@ -605,6 +605,48 @@ impl GroupActor {
         ControlFlow::Continue(())
     }
 
+    async fn handle_append(
+        &mut self,
+        request: AppendRequest,
+        response_tx: oneshot::Sender<Result<AppendResponse, RuntimeError>>,
+        raft_uncommitted: Option<UncommittedBytesGuard>,
+    ) -> ControlFlow<()> {
+        let stream_id = request.stream_id.clone();
+        let response = CoreWorker::commit_append(
+            &mut self.engine,
+            self.metrics.clone(),
+            request,
+            self.placement,
+            self.cold_write_admission,
+        )
+        .await;
+        drop(raft_uncommitted);
+        match response {
+            Ok(response) => {
+                let deduplicated = response.deduplicated;
+                // Durability is established when the group engine returns.
+                // Wake/materialize blocked readers afterwards so a large fanout
+                // cannot inflate the writer's acknowledgement latency.
+                let _ = response_tx.send(Ok(response));
+                if !deduplicated {
+                    CoreWorker::finish_append(
+                        &mut self.engine,
+                        self.metrics.clone(),
+                        self.read_materialization.clone(),
+                        &mut self.read_watchers,
+                        stream_id,
+                        self.placement,
+                    )
+                    .await;
+                }
+            }
+            Err(err) => {
+                let _ = response_tx.send(Err(err));
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
     async fn handle_append_batch(
         &mut self,
         request: AppendBatchRequest,

@@ -3,6 +3,7 @@
 # build toolchain is pinned by rust-toolchain.toml and installed below.
 ARG RUST_VERSION=1.96.0
 FROM rust:${RUST_VERSION}-bookworm AS builder
+ARG CARGO_PROFILE=release
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -29,11 +30,11 @@ COPY crates/ ./crates/
 RUN --mount=type=cache,sharing=locked,target=/usr/local/cargo/registry \
   --mount=type=cache,sharing=locked,target=/usr/local/cargo/git \
   --mount=type=cache,sharing=locked,target=/ursula/target \
-  cargo build --release --locked --bin ursula --bin ursulactl \
-  && strip --strip-debug target/release/ursula \
-  && strip --strip-debug target/release/ursulactl \
-  && install -Dm755 target/release/ursula /usr/local/bin/ursula \
-  && install -Dm755 target/release/ursulactl /usr/local/bin/ursulactl
+  cargo build --profile "${CARGO_PROFILE}" --locked --bin ursula --bin ursulactl \
+  && strip --strip-debug "target/${CARGO_PROFILE}/ursula" \
+  && strip --strip-debug "target/${CARGO_PROFILE}/ursulactl" \
+  && install -Dm755 "target/${CARGO_PROFILE}/ursula" /usr/local/bin/ursula \
+  && install -Dm755 "target/${CARGO_PROFILE}/ursulactl" /usr/local/bin/ursulactl
 
 FROM debian:bookworm-slim AS runtime
 

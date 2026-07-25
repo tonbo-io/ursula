@@ -16,8 +16,12 @@
 //! - [`usage`]: opt-in per-tenant request/byte accounting and batch export.
 //! - [`service`]: command arguments and the long-running gateway service entrypoint.
 
+use std::collections::HashMap;
 use std::error::Error as _;
 use std::net::SocketAddr;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -37,6 +41,7 @@ use axum::response::IntoResponse;
 use axum::response::Response as AxumResponse;
 use percent_encoding::percent_decode_str;
 use rand::prelude::IndexedRandom;
+use tokio::time::Instant;
 use tracing::debug;
 use tracing::error;
 
@@ -68,7 +73,30 @@ const HEADER_URSULA_RAFT_LEADER_ID: &str = "x-ursula-raft-leader-id";
 const HEADER_STREAM_CLOSED: &str = "stream-closed";
 const MAX_LONG_POLL_TIMEOUT_MS: u64 = 60_000;
 const LONG_POLL_RESPONSE_HEADER_GRACE: Duration = Duration::from_secs(2);
+const GATEWAY_METRICS_PATH: &str = "/__ursula/gateway/metrics";
+const LEADER_AFFINITY_MAX_STREAMS: usize = 16_384;
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+struct GatewayMetrics {
+    requests: AtomicU64,
+    leader_cache_hits: AtomicU64,
+    leader_cache_misses: AtomicU64,
+    leader_cache_updates: AtomicU64,
+    leader_redirects: AtomicU64,
+    leader_redirect_ns: AtomicU64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct GatewayMetricsSnapshot {
+    requests: u64,
+    leader_cache_hits: u64,
+    leader_cache_misses: u64,
+    leader_cache_updates: u64,
+    leader_redirects: u64,
+    leader_redirect_ns: u64,
+    leader_cache_entries: usize,
+}
 
 #[derive(Clone, Debug)]
 pub struct GatewayConfig {
@@ -89,6 +117,8 @@ pub struct Gateway {
     quota_provider: Option<Arc<dyn QuotaProvider>>,
     admission: Arc<Admission>,
     usage: Option<Arc<UsageCollector>>,
+    leader_affinity: Arc<Mutex<HashMap<String, String>>>,
+    metrics: Arc<GatewayMetrics>,
 }
 
 impl std::fmt::Debug for Gateway {
@@ -117,6 +147,8 @@ impl Gateway {
             quota_provider: None,
             admission: Arc::new(Admission::default()),
             usage: None,
+            leader_affinity: Arc::new(Mutex::new(HashMap::new())),
+            metrics: Arc::new(GatewayMetrics::default()),
         }
     }
 
@@ -148,6 +180,10 @@ impl Gateway {
 
     pub async fn handle(&self, req: Request<Body>) -> AxumResponse {
         let (mut parts, body) = req.into_parts();
+        if parts.method == Method::GET && parts.uri.path() == GATEWAY_METRICS_PATH {
+            return axum::Json(self.metrics_snapshot()).into_response();
+        }
+        self.metrics.requests.fetch_add(1, Ordering::Relaxed);
 
         let context = match self.gate(&parts).await {
             Ok(context) => context,
@@ -189,7 +225,7 @@ impl Gateway {
             return StatusCode::PAYLOAD_TOO_LARGE.into_response();
         }
 
-        let upstream = match self.pick_upstream() {
+        let upstream = match self.pick_upstream(&parts.uri) {
             Some(u) => u,
             None => {
                 error!("no upstreams configured");
@@ -217,7 +253,7 @@ impl Gateway {
             _live_guard: live_guard,
         };
 
-        match self.forward(upstream, &parts, body_bytes, tail).await {
+        match self.forward(&upstream, &parts, body_bytes, tail).await {
             Ok(response) => response,
             Err(e) => {
                 error!(error = %e, "gateway request failed");
@@ -314,9 +350,25 @@ impl Gateway {
         Ok(None)
     }
 
-    fn pick_upstream(&self) -> Option<&str> {
+    fn pick_upstream(&self, uri: &Uri) -> Option<String> {
+        if let Some(key) = stream_affinity_key(uri)
+            && let Some(upstream) = self
+                .leader_affinity
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .cloned()
+        {
+            self.metrics
+                .leader_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+            return Some(upstream);
+        }
+        self.metrics
+            .leader_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
         let mut rng = rand::rng();
-        self.config.upstreams.choose(&mut rng).map(String::as_str)
+        self.config.upstreams.choose(&mut rng).cloned()
     }
 
     async fn forward(
@@ -333,6 +385,7 @@ impl Gateway {
             .unwrap_or("/");
         let target_url = format!("{}{}", upstream.trim_end_matches('/'), path_and_query);
 
+        let redirect_started_at = Instant::now();
         let upstream_resp = self.send_request(&target_url, parts, body.clone()).await?;
 
         // Raft leadership redirect: follow internally for all methods because
@@ -345,6 +398,12 @@ impl Gateway {
         {
             let response_headers = copy_forwarded_headers(upstream_resp.headers(), false);
             if let Some(leader_upstream) = self.resolve_leader_upstream(&response_headers) {
+                self.metrics
+                    .leader_redirects
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(key) = stream_affinity_key(&parts.uri) {
+                    self.remember_leader(key, leader_upstream.to_owned());
+                }
                 // Drop the follower response; it has no meaningful body.
                 drop(upstream_resp);
 
@@ -354,6 +413,10 @@ impl Gateway {
                     path_and_query
                 );
                 let leader_resp = self.send_request(&leader_target, parts, body).await?;
+                self.metrics.leader_redirect_ns.fetch_add(
+                    u64::try_from(redirect_started_at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
                 return Self::build_response(leader_resp, tail);
             }
         }
@@ -449,6 +512,47 @@ impl Gateway {
             .find(|u| location.starts_with(*u))
             .map(String::as_str)
     }
+
+    fn remember_leader(&self, key: String, upstream: String) {
+        let mut affinity = self
+            .leader_affinity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if affinity.len() >= LEADER_AFFINITY_MAX_STREAMS && !affinity.contains_key(&key) {
+            affinity.clear();
+        }
+        affinity.insert(key, upstream);
+        self.metrics
+            .leader_cache_updates
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn metrics_snapshot(&self) -> GatewayMetricsSnapshot {
+        let leader_cache_entries = self
+            .leader_affinity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        GatewayMetricsSnapshot {
+            requests: self.metrics.requests.load(Ordering::Relaxed),
+            leader_cache_hits: self.metrics.leader_cache_hits.load(Ordering::Relaxed),
+            leader_cache_misses: self.metrics.leader_cache_misses.load(Ordering::Relaxed),
+            leader_cache_updates: self.metrics.leader_cache_updates.load(Ordering::Relaxed),
+            leader_redirects: self.metrics.leader_redirects.load(Ordering::Relaxed),
+            leader_redirect_ns: self.metrics.leader_redirect_ns.load(Ordering::Relaxed),
+            leader_cache_entries,
+        }
+    }
+}
+
+fn stream_affinity_key(uri: &Uri) -> Option<String> {
+    let mut segments = uri.path().split('/').filter(|segment| !segment.is_empty());
+    let bucket = segments.next()?;
+    let stream = segments.next()?;
+    if bucket.starts_with("__ursula") {
+        return None;
+    }
+    Some(format!("/{bucket}/{stream}"))
 }
 
 /// Per-request context available once access control has classified and

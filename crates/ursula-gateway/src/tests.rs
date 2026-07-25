@@ -134,6 +134,36 @@ fn gateway_for_url(upstream_url: impl Into<String>) -> Arc<Gateway> {
     Arc::new(Gateway::new(test_config(vec![upstream_url.into()])))
 }
 
+#[test]
+fn gateway_reuses_learned_stream_leader() {
+    let gateway = Gateway::new(test_config(vec![
+        "http://follower.test".to_owned(),
+        "http://leader.test".to_owned(),
+    ]));
+    gateway.remember_leader("/bucket/stream".to_owned(), "http://leader.test".to_owned());
+
+    let uri: Uri = "/bucket/stream?live=long-poll".parse().expect("uri");
+    assert_eq!(
+        gateway.pick_upstream(&uri).as_deref(),
+        Some("http://leader.test")
+    );
+    let metrics = gateway.metrics_snapshot();
+    assert_eq!(metrics.leader_cache_hits, 1);
+    assert_eq!(metrics.leader_cache_entries, 1);
+}
+
+#[test]
+fn stream_affinity_key_ignores_subresource_and_internal_routes() {
+    let append_batch: Uri = "/bucket/stream/append-batch".parse().expect("uri");
+    let metrics: Uri = "/__ursula/gateway/metrics".parse().expect("uri");
+
+    assert_eq!(
+        stream_affinity_key(&append_batch).as_deref(),
+        Some("/bucket/stream")
+    );
+    assert_eq!(stream_affinity_key(&metrics), None);
+}
+
 fn gateway_with_response_header_timeout(
     upstream_url: impl Into<String>,
     response_header_timeout: Duration,
