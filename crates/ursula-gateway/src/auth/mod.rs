@@ -3,6 +3,14 @@
 //! Authentication adapters validate a bearer credential and normalize only
 //! standard OAuth access-token properties. Bucket selection stays explicit:
 //! neither an OAuth subject nor a provider-private claim selects a namespace.
+//!
+//! Module map:
+//!
+//! - [`jwt`]: RFC 9068 JWT access-token validation against a cached JWKS.
+//! - [`policy`]: static file-based bucket ownership and visibility policy.
+
+pub mod jwt;
+pub mod policy;
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -89,6 +97,17 @@ pub enum Action {
     ReadSnapshot,
     DeleteSnapshot,
     AdministerBucket,
+}
+
+impl Action {
+    /// Actions that only observe committed state. Anonymous public access, when
+    /// a policy grants it, is limited to exactly these.
+    pub fn is_read_only(self) -> bool {
+        matches!(
+            self,
+            Self::Read | Self::Head | Self::Tail | Self::ReadSnapshot
+        )
+    }
 }
 
 /// Two-level resource identity resolved independently from the credential.

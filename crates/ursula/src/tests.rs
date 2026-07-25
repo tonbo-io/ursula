@@ -5961,3 +5961,68 @@ mod commit_stall {
         assert_eq!(actions.len(), 1);
     }
 }
+
+// #132: bucket is the top-level tenant namespace. Two tenants using the same
+// bucket-local stream name must not observe each other through appends,
+// record-coordinate reads, snapshots, or retention.
+#[tokio::test]
+async fn tenant_buckets_isolate_identical_stream_names() {
+    let app = test_router();
+
+    for (bucket, payload) in [
+        ("tenant-a", r#"{"who":"a"}"#),
+        ("tenant-b", r#"{"who":"b"}"#),
+    ] {
+        let response = http_put(
+            &app,
+            &format!("/{bucket}/orders"),
+            &[(CONTENT_TYPE.as_str(), "application/json")],
+            Body::from(payload),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    // Each tenant reads back only its own record under the shared name.
+    for (bucket, expected) in [("tenant-a", "a"), ("tenant-b", "b")] {
+        let response = http_get(&app, &format!("/{bucket}/orders?record=0&max_records=10")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
+        let body = body_bytes(response).await;
+        let body = std::str::from_utf8(&body).expect("utf8 body");
+        assert!(
+            body.contains(&format!("\"who\":\"{expected}\"")),
+            "bucket {bucket} must see only its own record, got: {body}"
+        );
+    }
+
+    // Snapshot plus retention truncation on tenant-a must not affect
+    // tenant-b's readable history for the identically named stream.
+    let response = http_put(
+        &app,
+        "/tenant-a/orders/snapshot?record=1",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"count":1}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = http_put(
+        &app,
+        "/tenant-a/orders/retention?record=1",
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = http_get(&app, "/tenant-a/orders?record=0&max_records=1").await;
+    assert_eq!(response.status(), StatusCode::GONE);
+
+    let response = http_get(&app, "/tenant-b/orders?record=0&max_records=1").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_FIRST), "0");
+
+    // The snapshot namespace is tenant-scoped as well: tenant-b has none.
+    let response = http_get(&app, "/tenant-b/orders/snapshot").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
