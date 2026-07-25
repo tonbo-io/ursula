@@ -253,6 +253,27 @@ pub(super) async fn run_http_protocol_surface_inner(
         );
     }
 
+    let retained_read = send(
+        &app,
+        "GET",
+        &format!("{path}?offset=0&max_bytes=1"),
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(retained_read.status(), StatusCode::OK);
+    assert_eq!(&body_bytes(retained_read).await[..], b"a");
+
+    let advance_retention = send(
+        &app,
+        "PUT",
+        &format!("{path}/retention/00000000000000000001"),
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(advance_retention.status(), StatusCode::NO_CONTENT);
+
     let gone_read = send(
         &app,
         "GET",
