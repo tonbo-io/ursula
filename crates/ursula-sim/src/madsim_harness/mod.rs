@@ -58,6 +58,7 @@ use ursula_runtime::GetStreamAttrsRequest;
 use ursula_runtime::GroupAppendBatchFuture;
 use ursula_runtime::GroupAppendFuture;
 use ursula_runtime::GroupBootstrapStreamFuture;
+use ursula_runtime::GroupBucketUsageFuture;
 use ursula_runtime::GroupCloseStreamFuture;
 use ursula_runtime::GroupColdHotBacklogFuture;
 use ursula_runtime::GroupCreateStreamFuture;
@@ -1130,6 +1131,11 @@ impl GroupEngine for MadsimScopedGroupEngine {
     ) -> GroupCreateStreamFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
             self.inner.create_stream_external(request, placement).await
+        }))
+    }
+    fn bucket_usage<'a>(&'a mut self, placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
+        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
+            self.inner.bucket_usage(placement).await
         }))
     }
 
