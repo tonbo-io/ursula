@@ -289,6 +289,13 @@ macro_rules! runtime_operations {
                 handle { call plan_cold_gc(engine, max, placement) }
                 client { group fn plan_cold_gc }
             }
+            op BucketUsage {
+                fields {}
+                reply { response_tx: Vec<ursula_stream::BucketUsageSnapshot> }
+                guard { none }
+                handle { call bucket_usage(engine, metrics, placement) }
+                client { pub group fn bucket_usage }
+            }
             op AckColdGc {
                 fields { up_to_seq: u64 }
                 reply { response_tx: AckColdGcResponse }

@@ -225,6 +225,11 @@ impl StreamStateMachine {
                     next_offset,
                     &record_ends,
                 ));
+            self.usage_on_append(
+                &stream_id.bucket_id,
+                payload_len,
+                Self::appended_record_count(&record_ends, payload_len),
+            );
             StreamResponse::Appended {
                 offset,
                 next_offset,
@@ -405,6 +410,12 @@ impl StreamStateMachine {
                 next_offset,
                 &record_ends,
             ));
+        let appended_bytes = next_offset.saturating_sub(offset);
+        self.usage_on_append(
+            &stream_id.bucket_id,
+            appended_bytes,
+            Self::appended_record_count(&record_ends, appended_bytes),
+        );
         StreamResponse::Appended {
             offset,
             next_offset,
@@ -612,6 +623,15 @@ impl StreamStateMachine {
                     record_ends,
                 ));
         }
+        let mut appended_bytes: u64 = 0;
+        let mut appended_records: u64 = 0;
+        for (item, record_ends) in items.iter().zip(all_record_ends.iter()) {
+            let item_bytes = item.next_offset.saturating_sub(item.start_offset);
+            appended_bytes = appended_bytes.saturating_add(item_bytes);
+            appended_records = appended_records
+                .saturating_add(Self::appended_record_count(record_ends, item_bytes));
+        }
+        self.usage_on_append(&stream_id.bucket_id, appended_bytes, appended_records);
         Ok(StreamBatchAppend {
             items: items
                 .into_iter()

@@ -42,6 +42,7 @@ use ursula_runtime::GroupAdvanceRetentionFuture;
 use ursula_runtime::GroupAppendBatchFuture;
 use ursula_runtime::GroupAppendFuture;
 use ursula_runtime::GroupBootstrapStreamFuture;
+use ursula_runtime::GroupBucketUsageFuture;
 use ursula_runtime::GroupCloseStreamFuture;
 use ursula_runtime::GroupColdHotBacklogFuture;
 use ursula_runtime::GroupCompactColdFuture;
@@ -691,6 +692,19 @@ impl GroupEngine for RaftGroupEngine {
                         .engine
                         .head_stream_after_access(&request, placement)
                 })
+            })
+            .await?
+        })
+    }
+
+    fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
+        Box::pin(async move {
+            // Served from the local applied state machine, follower or
+            // leader: usage export tolerates replication lag, and a
+            // leadership requirement would break node-local aggregation
+            // whenever any group is led elsewhere.
+            self.with_state_machine(move |state_machine| {
+                Box::pin(async move { Ok(state_machine.engine.bucket_usage_report()) })
             })
             .await?
         })

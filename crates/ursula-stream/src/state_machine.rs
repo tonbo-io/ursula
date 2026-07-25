@@ -35,6 +35,8 @@ use crate::command::StreamCommand;
 use crate::integrity::StreamIntegrity;
 use crate::model::AppendExternalInput;
 use crate::model::AppendStreamInput;
+use crate::model::BucketUsage;
+use crate::model::BucketUsageSnapshot;
 use crate::model::COLD_INDEX_PAGE_SPAN_BYTES;
 use crate::model::ColdChunkRef;
 use crate::model::ColdFlushCandidate;
@@ -96,6 +98,10 @@ pub struct StreamStateMachine {
     buckets: HashSet<String>,
     registry: StreamRegistry,
     cold_gc: ColdGcQueue,
+    /// Per-bucket committed usage for this group; see [`BucketUsage`] for the
+    /// monotonic-versus-gauge split. Mutated only by the accounting helpers
+    /// below so every counter change stays deterministic and auditable.
+    bucket_usage: HashMap<String, BucketUsage>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +141,71 @@ impl StreamStateMachine {
 
     fn insert_stream_slot(&mut self, slot: StreamSlot) -> Option<StreamKey> {
         self.registry.insert(slot)
+    }
+
+    /// Records committed by one accepted append. JSON streams provide exact
+    /// canonical boundaries; a byte stream counts one message record per
+    /// non-empty append.
+    fn appended_record_count(record_ends: &[u64], payload_len: u64) -> u64 {
+        if !record_ends.is_empty() {
+            record_ends.len() as u64
+        } else if payload_len > 0 {
+            1
+        } else {
+            0
+        }
+    }
+
+    fn usage_mut(&mut self, bucket_id: &str) -> &mut BucketUsage {
+        self.bucket_usage.entry(bucket_id.to_owned()).or_default()
+    }
+
+    /// One accepted (non-deduplicated) append: monotonic counters grow and
+    /// the retained gauge grows by the same bytes.
+    fn usage_on_append(&mut self, bucket_id: &str, payload_bytes: u64, records: u64) {
+        let usage = self.usage_mut(bucket_id);
+        usage.committed_append_bytes = usage.committed_append_bytes.saturating_add(payload_bytes);
+        usage.committed_records = usage.committed_records.saturating_add(records);
+        usage.retained_bytes = usage.retained_bytes.saturating_add(payload_bytes);
+    }
+
+    /// A newly created stream, including any initial payload it was created
+    /// with.
+    fn usage_on_stream_created(&mut self, bucket_id: &str, initial_bytes: u64, records: u64) {
+        let usage = self.usage_mut(bucket_id);
+        usage.stream_count = usage.stream_count.saturating_add(1);
+        usage.committed_append_bytes = usage.committed_append_bytes.saturating_add(initial_bytes);
+        usage.committed_records = usage.committed_records.saturating_add(records);
+        usage.retained_bytes = usage.retained_bytes.saturating_add(initial_bytes);
+    }
+
+    /// Destructive retention reclaimed `reclaimed_bytes` of logical prefix.
+    fn usage_on_retention(&mut self, bucket_id: &str, reclaimed_bytes: u64) {
+        let usage = self.usage_mut(bucket_id);
+        usage.retained_bytes = usage.retained_bytes.saturating_sub(reclaimed_bytes);
+    }
+
+    /// A stream left the registry (delete or TTL expiry); its remaining
+    /// retained bytes leave the gauge with it.
+    fn usage_on_stream_removed(&mut self, bucket_id: &str, retained_bytes: u64) {
+        let usage = self.usage_mut(bucket_id);
+        usage.stream_count = usage.stream_count.saturating_sub(1);
+        usage.retained_bytes = usage.retained_bytes.saturating_sub(retained_bytes);
+    }
+
+    /// Current per-bucket usage for this group, sorted for deterministic
+    /// output.
+    pub fn bucket_usage_report(&self) -> Vec<BucketUsageSnapshot> {
+        let mut report = self
+            .bucket_usage
+            .iter()
+            .map(|(bucket_id, usage)| BucketUsageSnapshot {
+                bucket_id: bucket_id.clone(),
+                usage: *usage,
+            })
+            .collect::<Vec<_>>();
+        report.sort_by(|left, right| left.bucket_id.cmp(&right.bucket_id));
+        report
     }
 
     fn refresh_ttl_entry(&mut self, stream_id: &BucketStreamId) {

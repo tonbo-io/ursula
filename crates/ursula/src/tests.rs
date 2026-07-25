@@ -6026,3 +6026,117 @@ async fn tenant_buckets_isolate_identical_stream_names() {
     let response = http_get(&app, "/tenant-b/orders/snapshot").await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+// #135 data-plane half: committed usage counters aggregated across groups.
+#[tokio::test]
+async fn usage_endpoint_reports_per_bucket_committed_counters() {
+    let app = test_router();
+
+    for bucket in ["tenant-a", "tenant-b"] {
+        let response = http_put(
+            &app,
+            &format!("/{bucket}/orders"),
+            &[(CONTENT_TYPE.as_str(), "application/json")],
+            Body::from(r#"{"who":"a"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let usage_for = |report: &serde_json::Value, bucket: &str| -> serde_json::Value {
+        report["buckets"][bucket].clone()
+    };
+    let fetch_usage = || async {
+        let response = http_get(&app, "/__ursula/usage").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        serde_json::from_slice::<serde_json::Value>(&body).expect("usage JSON")
+    };
+
+    let created = fetch_usage().await;
+    let tenant_a_created = usage_for(&created, "tenant-a");
+    assert_eq!(tenant_a_created["stream_count"], 1);
+    assert!(
+        tenant_a_created["committed_append_bytes"]
+            .as_u64()
+            .expect("bytes")
+            > 0
+    );
+    assert_eq!(
+        tenant_a_created,
+        usage_for(&created, "tenant-b"),
+        "identical creations produce identical usage in both tenants"
+    );
+
+    // One accepted append, then a deduplicated producer retry of the same
+    // logical append: the retry must be invisible to every counter.
+    for _ in 0..2 {
+        let response = http_post(
+            &app,
+            "/tenant-a/orders",
+            &[
+                (CONTENT_TYPE.as_str(), "application/json"),
+                ("producer-id", "usage-writer"),
+                ("producer-epoch", "0"),
+                ("producer-seq", "0"),
+            ],
+            Body::from(r#"{"n":1}"#),
+        )
+        .await;
+        assert!(response.status().is_success());
+    }
+
+    let appended = fetch_usage().await;
+    let tenant_a = usage_for(&appended, "tenant-a");
+    assert!(
+        tenant_a["committed_append_bytes"].as_u64().expect("bytes")
+            > tenant_a_created["committed_append_bytes"]
+                .as_u64()
+                .expect("bytes"),
+        "the accepted append grew the committed counter"
+    );
+    assert_eq!(
+        tenant_a["committed_records"].as_u64().expect("records"),
+        tenant_a_created["committed_records"]
+            .as_u64()
+            .expect("records")
+            + 1,
+        "exactly one record committed despite the duplicate retry"
+    );
+    assert_eq!(
+        tenant_a["committed_append_bytes"], tenant_a["retained_bytes"],
+        "nothing reclaimed yet"
+    );
+    assert_eq!(
+        usage_for(&appended, "tenant-b"),
+        tenant_a_created,
+        "tenant-b is untouched by tenant-a's appends"
+    );
+
+    // Retention truncation shrinks the retained gauge but never the
+    // monotonic committed counters.
+    let response = http_put(
+        &app,
+        "/tenant-a/orders/snapshot?record=2",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"count":2}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = http_put(
+        &app,
+        "/tenant-a/orders/retention?record=2",
+        &[],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let truncated = fetch_usage().await;
+    let tenant_a_truncated = usage_for(&truncated, "tenant-a");
+    assert_eq!(
+        tenant_a_truncated["committed_append_bytes"], tenant_a["committed_append_bytes"],
+        "retention never rewinds the monotonic counter"
+    );
+    assert_eq!(tenant_a_truncated["retained_bytes"], 0);
+}

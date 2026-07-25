@@ -404,6 +404,41 @@ impl ShardRuntime {
         self.flush_cold_candidates_batch(candidates).await
     }
 
+    /// Sums per-bucket committed usage across every Raft group on this node.
+    ///
+    /// Groups are read serially from their local applied state (leader or
+    /// follower); usage export consumers tolerate replication lag, so this
+    /// never requires leadership and never blocks on quorum.
+    pub async fn bucket_usage_all_groups(
+        &self,
+    ) -> Result<Vec<ursula_stream::BucketUsageSnapshot>, RuntimeError> {
+        let mut merged: std::collections::HashMap<String, ursula_stream::BucketUsage> =
+            std::collections::HashMap::new();
+        let group_count = self.shard_map.raft_group_count();
+        for group_id in 0..group_count {
+            let report = self.bucket_usage(RaftGroupId(group_id)).await?;
+            for entry in report {
+                let usage = merged.entry(entry.bucket_id).or_default();
+                usage.committed_append_bytes = usage
+                    .committed_append_bytes
+                    .saturating_add(entry.usage.committed_append_bytes);
+                usage.committed_records = usage
+                    .committed_records
+                    .saturating_add(entry.usage.committed_records);
+                usage.retained_bytes = usage
+                    .retained_bytes
+                    .saturating_add(entry.usage.retained_bytes);
+                usage.stream_count = usage.stream_count.saturating_add(entry.usage.stream_count);
+            }
+        }
+        let mut report = merged
+            .into_iter()
+            .map(|(bucket_id, usage)| ursula_stream::BucketUsageSnapshot { bucket_id, usage })
+            .collect::<Vec<_>>();
+        report.sort_by(|left, right| left.bucket_id.cmp(&right.bucket_id));
+        Ok(report)
+    }
+
     pub async fn flush_cold_all_groups_once(
         &self,
         request: PlanGroupColdFlushRequest,

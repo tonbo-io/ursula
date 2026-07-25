@@ -64,6 +64,10 @@ impl StreamStateMachine {
             );
         }
         self.buckets.remove(bucket_id);
+        // The bucket must be empty to reach this point, so only the monotonic
+        // counters remain; deleting the tenant namespace erases its ledger
+        // entry in this group.
+        self.bucket_usage.remove(bucket_id);
         StreamResponse::BucketDeleted {
             bucket_id: bucket_id.to_owned(),
         }
@@ -204,6 +208,11 @@ impl StreamStateMachine {
                 ),
             );
         }
+        self.usage_on_stream_created(
+            &stream_id.bucket_id,
+            initial_len,
+            Self::appended_record_count(&input.record_ends, initial_len),
+        );
         StreamResponse::Created {
             stream_id: input.stream_id,
             next_offset: initial_len,
@@ -367,6 +376,11 @@ impl StreamStateMachine {
                 ),
             );
         }
+        self.usage_on_stream_created(
+            &stream_id.bucket_id,
+            initial_len,
+            Self::appended_record_count(&input.record_ends, initial_len),
+        );
         StreamResponse::Created {
             stream_id: input.stream_id,
             next_offset: initial_len,
@@ -514,6 +528,12 @@ impl StreamStateMachine {
         let Some(slot) = self.registry.remove(stream_id) else {
             return false;
         };
+        self.usage_on_stream_removed(
+            &stream_id.bucket_id,
+            slot.metadata
+                .tail_offset
+                .saturating_sub(slot.retained_offset),
+        );
         // The cold objects we wrote for this stream are now unreferenced.
         // Enqueue the whole prefix for the background GC worker to reclaim;
         // A prefix sweep is safe and keeps the queue O(streams), not O(chunks).
