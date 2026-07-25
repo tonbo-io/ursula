@@ -14,7 +14,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
-use std::time::Instant;
 
 use jsonwebtoken::Algorithm;
 use jsonwebtoken::DecodingKey;
@@ -24,6 +23,9 @@ use jsonwebtoken::decode_header;
 use jsonwebtoken::jwk::AlgorithmParameters;
 use jsonwebtoken::jwk::JwkSet;
 use serde::Deserialize;
+// tokio's Instant (not std's) so the DST scheduler can virtualize time if the
+// gateway ever joins the simulation surface.
+use tokio::time::Instant;
 
 use super::AuthenticationError;
 use super::PrincipalResolver;
