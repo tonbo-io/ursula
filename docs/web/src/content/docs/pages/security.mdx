@@ -25,7 +25,7 @@ Handle the following outside Ursula:
 - **Admin endpoint isolation.** `/__ursula/metrics`, `/__ursula/flush-cold/*`, `/__ursula/raft/*`, and the public stream endpoints share the same listener with no auth gate.
 - **Per-client rate limiting.** A single noisy client can saturate a core's mailbox or a group's hot ring.
 - **Health/readiness endpoints.** No `/healthz` or `/readyz`. Use `/__ursula/metrics` as a process-alive probe (it serves only after the runtime initializes).
-- **At-rest encryption.** Hot ring is in memory. WAL and Raft log directories live on disk in plaintext. Use full-disk encryption at the host level.
+- **At-rest encryption beyond the cold tier.** Cold-tier S3 writes (including Raft snapshots) request SSE-S3 by default (`storage.cold.s3.server_side_encryption`, switchable to `aws-kms` or `none`). The hot ring is in memory; WAL and Raft log directories live on disk in plaintext — use full-disk encryption at the host level. Per-tenant KMS keys and client-side encryption are out of scope.
 
 CORS is permissive (`Access-Control-Allow-Origin: *`). Restrict at the proxy for browser traffic.
 
