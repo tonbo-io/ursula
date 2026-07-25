@@ -3,7 +3,7 @@
 # build toolchain is pinned by rust-toolchain.toml and installed below.
 ARG RUST_VERSION=1.96.0
 FROM rust:${RUST_VERSION}-bookworm AS builder
-ARG CARGO_PROFILE=release
+ARG CARGO_PROFILE=performance
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
