@@ -926,6 +926,11 @@
           "minimum": 0,
           "description": "Optional raft uncommitted byte cap per group; 0 disables the cap."
         },
+        "snapshotLogsSinceLast": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Committed raft log entries per group between automatic snapshots."
+        },
         "maxInSnapshotLogToKeep": {
           "type": "integer",
           "minimum": 0,

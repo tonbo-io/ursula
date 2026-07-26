@@ -49,6 +49,7 @@ pub struct RaftEngineConfig {
     pub memory_bootstrap_marker_dir: Option<PathBuf>,
     pub grpc_reconnect_after_failures: u32,
     pub snapshot_build_max_concurrency: usize,
+    pub snapshot_logs_since_last: u64,
     pub max_in_snapshot_log_to_keep: u64,
 }
 
@@ -64,6 +65,7 @@ impl Default for RaftEngineConfig {
             memory_bootstrap_marker_dir: None,
             grpc_reconnect_after_failures: 8,
             snapshot_build_max_concurrency: 1,
+            snapshot_logs_since_last: 5_000,
             max_in_snapshot_log_to_keep: 64,
         }
     }
@@ -83,6 +85,7 @@ impl From<&ursula_config::RaftConfig> for RaftEngineConfig {
             grpc_reconnect_after_failures: u32::try_from(cfg.grpc_reconnect_after_failures)
                 .expect("config validation ensures grpc_reconnect_after_failures fits u32"),
             snapshot_build_max_concurrency: cfg.snapshot_build_max_concurrency,
+            snapshot_logs_since_last: cfg.snapshot_logs_since_last,
             max_in_snapshot_log_to_keep: cfg.max_in_snapshot_log_to_keep,
         }
     }
@@ -666,6 +669,10 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             // yielded and only a process restart recovers it).
             if self.engine_config.snapshot_drive_interval_ms > 0 {
                 raft_config.snapshot_policy = SnapshotPolicy::Never;
+            } else {
+                raft_config.snapshot_policy = SnapshotPolicy::LogsSinceLast(
+                    self.engine_config.snapshot_logs_since_last.max(1),
+                );
             }
             let config =
                 Arc::new(raft_config.validate().map_err(|err| {
@@ -848,12 +855,14 @@ mod tests {
     #[test]
     fn engine_config_uses_bounded_snapshot_log_retention() {
         let config = ursula_config::RaftConfig {
+            snapshot_logs_since_last: 20_000,
             max_in_snapshot_log_to_keep: 128,
             ..Default::default()
         };
 
         let engine_config = RaftEngineConfig::from(&config);
 
+        assert_eq!(engine_config.snapshot_logs_since_last, 20_000);
         assert_eq!(engine_config.max_in_snapshot_log_to_keep, 128);
     }
 }

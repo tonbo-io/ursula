@@ -364,6 +364,7 @@ container receives only chart-managed container settings plus explicit
 | `raft.storageMode` | `logDir` | Raft storage mode: `logDir` for durable logs, `memory` for ephemeral testing. |
 | `raft.logDir` | `/var/lib/ursula/raft` | Raft log directory mounted to the `raft-data` volume. |
 | `raft.maxUncommittedBytesPerGroup` | `null` | Optional per-group cap for raft-submitted but not-yet-applied payload bytes. Renders `raft.max_uncommitted_size_per_group` in the generated config when set; `0` disables the cap. |
+| `raft.snapshotLogsSinceLast` | `5000` | Committed log entries per group between automatic full-state snapshots. Higher values trade log memory for lower snapshot CPU and tail latency. |
 | `raft.maxInSnapshotLogToKeep` | `64` | Payload-bearing Raft log entries retained per group after snapshot coverage. Renders `raft.max_in_snapshot_log_to_keep`. |
 
 ### Persistence
