@@ -126,6 +126,7 @@ fn test_config(upstreams: Vec<String>) -> GatewayConfig {
         upstreams,
         response_header_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(1),
+        upstream_http2_prior_knowledge: true,
         max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
         raft_group_count: None,
     }
@@ -781,7 +782,15 @@ async fn gateway_handle_follows_leader_redirect_through_random_pick() {
 async fn gateway_preserves_path_and_query_with_trailing_upstream_slash() {
     let app = Router::new().route(
         "/bucket/stream",
-        get(|uri: Uri| async move { (StatusCode::OK, uri.to_string()) }),
+        get(|uri: Uri| async move {
+            (
+                StatusCode::OK,
+                uri.path_and_query()
+                    .map(axum::http::uri::PathAndQuery::as_str)
+                    .unwrap_or(uri.path())
+                    .to_owned(),
+            )
+        }),
     );
     let upstream = spawn_upstream(app).await;
     let upstream_url = format!("{}/", upstream.url);

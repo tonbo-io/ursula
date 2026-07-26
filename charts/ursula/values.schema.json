@@ -459,6 +459,10 @@
           "minimum": 1,
           "description": "Timeout for upstream response headers in seconds."
         },
+        "upstreamHttp2PriorKnowledge": {
+          "type": "boolean",
+          "description": "Use cleartext HTTP/2 for multiplexed gateway-to-Ursula connections."
+        },
         "maxRequestBodyBytes": {
           "type": "integer",
           "minimum": 1,
@@ -645,6 +649,7 @@
         "rustLog",
         "connectTimeoutSeconds",
         "responseHeaderTimeoutSeconds",
+        "upstreamHttp2PriorKnowledge",
         "maxRequestBodyBytes",
         "gracefulShutdownTimeoutSeconds",
         "extraArgs",

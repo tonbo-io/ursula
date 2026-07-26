@@ -69,6 +69,8 @@ spec:
             - {{ .Values.gateway.connectTimeoutSeconds | quote }}
             - --response-header-timeout
             - {{ .Values.gateway.responseHeaderTimeoutSeconds | quote }}
+            - --upstream-http2-prior-knowledge
+            - {{ .Values.gateway.upstreamHttp2PriorKnowledge | quote }}
             - --max-request-body-bytes
             - {{ .Values.gateway.maxRequestBodyBytes | int64 | quote }}
             - --raft-group-count
