@@ -26,7 +26,7 @@ enum Command {
     /// Run a stateful Ursula Durable Streams server node.
     Server(ServerArgs),
     /// Run the stateless public HTTP/SSE gateway.
-    Gateway(GatewayArgs),
+    Gateway(Box<GatewayArgs>),
     /// Run the rebuildable event-time indexer worker pool.
     Indexer(Box<IndexerArgs>),
 }
@@ -41,7 +41,7 @@ struct LegacyServerCli {
 async fn main() {
     let result = match parse_command() {
         Command::Server(args) => ursula::server::run(args).await,
-        Command::Gateway(args) => ursula_gateway::service::run(args).await,
+        Command::Gateway(args) => ursula_gateway::service::run(*args).await,
         Command::Indexer(args) => ursula_index::service::run(*args).await.map_err(Into::into),
     };
     if let Err(error) = result {
