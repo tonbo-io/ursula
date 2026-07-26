@@ -375,6 +375,7 @@ impl CoreWorker {
             };
             crate::rt::spawn(actor.run());
             self.groups.insert(placement.raft_group_id, GroupMailbox {
+                core_id: placement.core_id,
                 group_id: placement.raft_group_id,
                 tx,
                 metrics: self.metrics.clone(),
@@ -432,6 +433,7 @@ impl CoreWorker {
         };
         crate::rt::spawn(actor.run());
         self.groups.insert(placement.raft_group_id, GroupMailbox {
+            core_id: placement.core_id,
             group_id: placement.raft_group_id,
             tx,
             metrics: self.metrics.clone(),
