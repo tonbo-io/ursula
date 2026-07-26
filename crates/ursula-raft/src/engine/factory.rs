@@ -95,6 +95,18 @@ fn quorum_size(voter_count: usize) -> usize {
     (voter_count / 2) + 1
 }
 
+fn jittered_snapshot_logs_since_last(base: u64, placement: ShardPlacement, node_id: u64) -> u64 {
+    let base = base.max(1);
+    // Groups receiving a uniform workload otherwise cross the same snapshot
+    // threshold together on all replicas. Spread each group/replica over one
+    // additional base interval so snapshot CPU and memory-bandwidth work does
+    // not arrive as a node-wide burst. The mixer is deterministic because this
+    // value is operational scheduling only; it is not replicated state.
+    let seed = u64::from(placement.raft_group_id.0).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ node_id.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    base.saturating_add(seed % base)
+}
+
 async fn static_peer_reachable(address: &str, timeout: Duration) -> bool {
     let Ok(endpoint) = Endpoint::from_shared(address.to_owned()) else {
         return false;
@@ -670,9 +682,12 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             if self.engine_config.snapshot_drive_interval_ms > 0 {
                 raft_config.snapshot_policy = SnapshotPolicy::Never;
             } else {
-                raft_config.snapshot_policy = SnapshotPolicy::LogsSinceLast(
-                    self.engine_config.snapshot_logs_since_last.max(1),
-                );
+                raft_config.snapshot_policy =
+                    SnapshotPolicy::LogsSinceLast(jittered_snapshot_logs_since_last(
+                        self.engine_config.snapshot_logs_since_last,
+                        placement,
+                        self.node_id,
+                    ));
             }
             let config =
                 Arc::new(raft_config.validate().map_err(|err| {
@@ -739,6 +754,8 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+
+    use ursula_shard::ShardId;
 
     use super::*;
 
@@ -864,5 +881,40 @@ mod tests {
 
         assert_eq!(engine_config.snapshot_logs_since_last, 20_000);
         assert_eq!(engine_config.max_in_snapshot_log_to_keep, 128);
+    }
+
+    #[test]
+    fn automatic_snapshot_thresholds_are_bounded_and_spread() {
+        let placement = |group_id| ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(group_id),
+            raft_group_id: RaftGroupId(group_id),
+        };
+        let base = 5_000;
+        let thresholds = (0..32)
+            .flat_map(|group_id| {
+                (1..=3).map(move |node_id| {
+                    jittered_snapshot_logs_since_last(base, placement(group_id), node_id)
+                })
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert!(thresholds.iter().all(|value| *value >= base));
+        assert!(thresholds.iter().all(|value| *value < base * 2));
+        assert!(
+            thresholds.len() >= 80,
+            "group/replica thresholds should be well distributed"
+        );
+    }
+
+    #[test]
+    fn automatic_snapshot_threshold_handles_zero_base() {
+        let placement = ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: RaftGroupId(0),
+        };
+
+        assert_eq!(jittered_snapshot_logs_since_last(0, placement, 1), 1);
     }
 }
