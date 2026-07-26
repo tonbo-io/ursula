@@ -4256,7 +4256,7 @@ dependencies = [
 
 [[package]]
 name = "ursula"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "axum 0.8.9",
  "base64 0.22.1",
@@ -4292,7 +4292,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-bench"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4311,7 +4311,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-config"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "dirs",
  "serde",
@@ -4322,7 +4322,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-control"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "serde",
  "ursula-shard",
@@ -4330,7 +4330,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-ctl"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4354,7 +4354,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-gateway"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "axum 0.8.9",
  "bytes",
@@ -4378,7 +4378,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-index"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -4406,7 +4406,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-observability"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "axum 0.8.9",
  "criterion",
@@ -4421,7 +4421,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-proto"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "prost 0.13.5",
  "prost-build",
@@ -4431,7 +4431,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-raft"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "bitflags",
  "bytes",
@@ -4464,7 +4464,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-runtime"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "blake3",
  "bytes",
@@ -4488,7 +4488,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-shard"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -4497,7 +4497,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-sim"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "axum 0.8.9",
  "madsim",
@@ -4516,7 +4516,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-stream"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "blake3",
  "bytes",
