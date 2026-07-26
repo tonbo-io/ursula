@@ -14,7 +14,7 @@ The chart is designed for fresh static-membership clusters. It does not perform 
 - Run two or more indexer workers across zones when event-time query availability or ingestion capacity matters. Claims reduce duplicate work; immutable parts and manifest CAS remain the correctness boundary.
 - Give Ursula and the indexer pool separate workload identities with least-privilege access to non-overlapping S3 prefixes. Enable bucket versioning, encryption, lifecycle policy, access logging, and alerts for indexer readiness, blocked streams, source lag, task backlog, S3 errors, storage growth, and pod restarts.
 
-This topology removes single-pod compute failures from the normal request path, but it does not make chart upgrades an automated Raft operation. Persistent Raft groups make membership initialization idempotent across restarts, but voter count must not be changed in place and server rollouts must be performed deliberately with health checks between pods.
+This topology removes single-pod compute failures from the normal request path, but it does not make chart upgrades an automated Raft operation. Persistent Raft groups make membership initialization idempotent across restarts, but voter count must not be changed in place and server rollouts must be performed deliberately with health checks between pods. Set `server.updateStrategy=OnDelete` when an external operator or GitOps hook performs that sequence; this stages new pod templates without letting Kubernetes restart voters automatically.
 
 [`examples/production-eks.yaml`](examples/production-eks.yaml) is a concrete three-AZ starting point with durable gp3 volumes, S3 cold storage and snapshots, three gateways, separate workload identities, and a two-replica indexer worker pool. For a complete AWS prerequisite flow, use [`deploy/eks`](../../deploy/eks): `tofu apply` produces `generated-values.yaml` and a dedicated kubeconfig, after which deployment is one `helm install` and one `helm test`.
 
@@ -322,6 +322,7 @@ operationally safe restarts on an initialized cluster.
 | --- | --- | --- |
 | `server.replicaCount` | `3` | Fresh-cluster static voter pod count. Supported values are `1`, `3`, and `5`. Changing this on an initialized cluster is unsafe without the future operator workflow. |
 | `server.podManagementPolicy` | `Parallel` | StatefulSet pod management policy. `Parallel` starts all static voters without serializing on per-pod readiness. |
+| `server.updateStrategy` | `RollingUpdate` | StatefulSet update strategy. Use `OnDelete` only with an external controller that drains, restarts, catches up, and verifies one voter at a time. |
 | `server.ports.client` | `4437` | Ursula HTTP/admin process port. The client Service, headless peer Service, generated Raft peer URLs, and leader redirects target this port in the current chart. |
 | `server.service.enabled` | `true` | Render the internal client/admin Service. |
 | `server.service.type` | `ClusterIP` | Client/admin Service type. Allowed values are `ClusterIP`, `NodePort`, and `LoadBalancer`. |

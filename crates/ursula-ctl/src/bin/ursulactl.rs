@@ -45,6 +45,12 @@ enum Command {
     /// Arm one empty-log rejoin per group for a raft-memory node that lost its
     /// volatile log. Refused on disk-backed clusters.
     AllowRejoin(NodeArgs),
+    /// Prepare one node for an immediate platform restart. Memory-WAL clusters
+    /// arm stable-leader rejoin permissions; disk-WAL clusters need no action.
+    PrepareRestart(NodeArgs),
+    /// Strictly verify that every configured node is a voter in every group,
+    /// caught up, and observes a usable leader.
+    VerifyCluster(VerifyClusterArgs),
     /// Create a verifiable backup of every raft group into a local directory
     /// or `s3://bucket/prefix`.
     #[command(name = "backup-create")]
@@ -168,6 +174,23 @@ struct WaitArgs {
     lag_tolerance: u64,
 }
 
+#[derive(Args, Debug)]
+struct VerifyClusterArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// Seconds to wait for two consecutive strict-ready samples.
+    #[arg(long, default_value_t = 120)]
+    timeout_secs: u64,
+    #[arg(long, default_value_t = 2)]
+    poll_interval_secs: u64,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+    /// Allowed gap (in log indices) between applied and committed.
+    #[arg(long, default_value_t = 16)]
+    lag_tolerance: u64,
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     let _telemetry =
@@ -181,6 +204,8 @@ async fn main() -> Result<()> {
         Command::Undrain(args) => run_undrain_subcommand(args).await,
         Command::Wait(args) => run_wait_subcommand(args).await,
         Command::AllowRejoin(args) => run_allow_rejoin_subcommand(args).await,
+        Command::PrepareRestart(args) => run_prepare_restart_subcommand(args).await,
+        Command::VerifyCluster(args) => run_verify_cluster_subcommand(args).await,
         Command::BackupCreate(args) => run_backup_create_subcommand(args).await,
         Command::BackupVerify(args) => run_backup_verify_subcommand(args).await,
         Command::Restore(args) => run_restore_subcommand(args).await,
@@ -380,11 +405,57 @@ async fn run_allow_rejoin_subcommand(args: NodeArgs) -> Result<()> {
     if !allowed {
         bail!("empty-log rejoin is not applicable to this cluster");
     }
-    let snap = client.fetch_cluster(&nodes).await?;
-    ursula_ctl::arm_empty_rejoin(&nodes, target, &client, &snap).await?;
+    ursula_ctl::arm_empty_rejoin(
+        &nodes,
+        target,
+        &client,
+        &ursula_ctl::RejoinOptions::default(),
+    )
+    .await?;
     println!(
         "node {}: empty-log rejoin armed on every group leader",
         target.id
     );
+    Ok(())
+}
+
+async fn run_prepare_restart_subcommand(args: NodeArgs) -> Result<()> {
+    let nodes = load_nodes(&args.config).await?;
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let target = find_node(&nodes, args.node)?;
+    if ursula_ctl::resolve_restart_rejoin_policy(&client, &nodes).await? {
+        ursula_ctl::arm_empty_rejoin(
+            &nodes,
+            target,
+            &client,
+            &ursula_ctl::RejoinOptions::default(),
+        )
+        .await?;
+        println!(
+            "node {}: memory-WAL restart prepared on stable group leaders",
+            target.id
+        );
+    } else {
+        println!(
+            "node {}: disk-WAL restart needs no empty-log rejoin permission",
+            target.id
+        );
+    }
+    Ok(())
+}
+
+async fn run_verify_cluster_subcommand(args: VerifyClusterArgs) -> Result<()> {
+    let nodes = load_nodes(&args.config).await?;
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    ursula_ctl::wait_cluster_ready(
+        "strict cluster verification",
+        &nodes,
+        &client,
+        Duration::from_secs(args.timeout_secs),
+        Duration::from_secs(args.poll_interval_secs),
+        args.lag_tolerance,
+    )
+    .await?;
+    println!("cluster verified: {} node(s) fully ready", nodes.len());
     Ok(())
 }

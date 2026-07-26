@@ -7,6 +7,7 @@
 //! clusters, systemd for bare-metal hosts. A safe rolling restart runs these
 //! verbs around the platform's own restart, one node at a time.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::time::Duration;
 use std::time::Instant;
@@ -15,6 +16,8 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use futures_util::StreamExt;
+use futures_util::TryStreamExt;
 
 use crate::metrics::ClusterSnapshot;
 use crate::metrics::MetricsClient;
@@ -58,6 +61,28 @@ pub enum DrainOutcome {
     Aborted {
         reason: String,
     },
+}
+
+/// Bounds for arming an empty-log rejoin immediately before a memory-WAL
+/// process restart.
+#[derive(Debug, Clone)]
+pub struct RejoinOptions {
+    /// Total budget for retrying transient leader changes.
+    pub timeout: Duration,
+    /// Maximum number of leader admin requests in flight.
+    pub max_concurrency: usize,
+    /// Delay before retrying a snapshot that observed leader movement.
+    pub retry_interval: Duration,
+}
+
+impl Default for RejoinOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+            max_concurrency: 32,
+            retry_interval: Duration::from_millis(100),
+        }
+    }
 }
 
 /// Mark `target` as draining and transfer away every leadership it holds.
@@ -299,42 +324,125 @@ pub async fn wait_cluster_ready(
 }
 
 /// Ask every group's stable leader to accept one empty-log rejoin from
-/// `target`. This is the recovery permission a raft-memory node needs after
-/// losing its volatile log; leaders reject unsolicited empty rejoins.
+/// `target`, then prove that the same leaders still own those groups.
+///
+/// Permissions are leader-local OpenRaft state. A sequential 256-group loop
+/// takes long enough for the leadership balancer to move some groups after
+/// they were armed, silently invalidating the permission. Requests therefore
+/// run concurrently and the leader map is sampled again before success. Any
+/// movement retries the complete round so the platform can restart the target
+/// immediately after this function returns.
 pub async fn arm_empty_rejoin(
     nodes: &[NodeInfo],
     target: &NodeInfo,
     client: &MetricsClient,
-    snap: &ClusterSnapshot,
+    options: &RejoinOptions,
 ) -> Result<()> {
-    let group_ids = peer_reported_rejoin_groups(snap, target.id);
-    if group_ids.is_empty() {
-        bail!(
-            "no initialized raft group reported by a peer includes target node {}; \
-             cannot allow empty raft rejoin",
-            target.id
-        );
+    if options.max_concurrency == 0 {
+        bail!("rejoin max_concurrency must be positive");
     }
-    for group_id in group_ids {
-        let leader_id = stable_non_target_leader(snap, group_id, target.id)?;
-        let Some(leader) = nodes.iter().find(|node| node.id == leader_id) else {
+    let deadline = Instant::now() + options.timeout;
+    let mut last_error: anyhow::Error;
+    loop {
+        let before = client.fetch_cluster(nodes).await?;
+        let group_ids = peer_reported_rejoin_groups(&before, target.id);
+        if group_ids.is_empty() {
             bail!(
-                "leader node {} for group {} is not present in provider",
-                leader_id,
-                group_id
+                "no initialized raft group reported by a peer includes target node {}; \
+                 cannot allow empty raft rejoin",
+                target.id
             );
+        }
+        let plan = match rejoin_leader_plan(nodes, target.id, &before, &group_ids) {
+            Ok(plan) => plan,
+            Err(err) => {
+                last_error = err;
+                if Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(options.retry_interval).await;
+                continue;
+            }
         };
-        tracing::info!(
-            "allowing empty raft rejoin: target_node_id={} raft_group_id={} leader_node_id={}",
-            target.id,
-            group_id,
-            leader.id
-        );
-        client
-            .allow_next_revert(leader, group_id, target.id)
-            .await?;
+
+        let result = futures_util::stream::iter(plan.iter().map(|(group_id, leader)| async move {
+            tracing::debug!(
+                "allowing empty raft rejoin: target_node_id={} raft_group_id={} leader_node_id={}",
+                target.id,
+                group_id,
+                leader.id
+            );
+            client
+                .allow_next_revert(leader, *group_id, target.id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "allow target node {} to rejoin group {} through leader {}",
+                        target.id, group_id, leader.id
+                    )
+                })
+        }))
+        .buffer_unordered(options.max_concurrency)
+        .try_collect::<Vec<()>>()
+        .await;
+        if let Err(err) = result {
+            last_error = err;
+        } else {
+            let after = client.fetch_cluster(nodes).await?;
+            match rejoin_leader_plan(nodes, target.id, &after, &group_ids) {
+                Ok(after_plan)
+                    if plan.iter().all(|(group_id, leader)| {
+                        after_plan
+                            .get(group_id)
+                            .is_some_and(|after| after.id == leader.id)
+                    }) =>
+                {
+                    tracing::info!(
+                        "empty raft rejoin armed on stable leaders: target_node_id={} groups={}",
+                        target.id,
+                        plan.len()
+                    );
+                    return Ok(());
+                }
+                Ok(_) => {
+                    last_error = anyhow!(
+                        "one or more raft leaders changed while arming node {}",
+                        target.id
+                    );
+                }
+                Err(err) => last_error = err,
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(options.retry_interval).await;
     }
-    Ok(())
+    Err(last_error).context("empty-log rejoin did not reach a stable leader map")
+}
+
+fn rejoin_leader_plan<'a>(
+    nodes: &'a [NodeInfo],
+    target_node_id: u64,
+    snap: &ClusterSnapshot,
+    group_ids: &BTreeSet<u64>,
+) -> Result<BTreeMap<u64, &'a NodeInfo>> {
+    let mut plan = BTreeMap::new();
+    for group_id in group_ids {
+        let leader_id = stable_non_target_leader(snap, *group_id, target_node_id)?;
+        let leader = nodes
+            .iter()
+            .find(|node| node.id == leader_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "leader node {} for group {} is not present in provider",
+                    leader_id,
+                    group_id
+                )
+            })?;
+        plan.insert(*group_id, leader);
+    }
+    Ok(plan)
 }
 
 fn peer_reported_rejoin_groups(snap: &ClusterSnapshot, target_node_id: u64) -> BTreeSet<u64> {
@@ -375,6 +483,64 @@ pub async fn resolve_empty_rejoin_policy(
         ),
     }
     Ok(decision.allow(force))
+}
+
+/// Resolve restart preparation without guessing when the server is too old or
+/// unreachable to report its WAL backend.
+///
+/// Automated rollouts must fail closed here: treating an unknown memory-WAL
+/// cluster as disk-backed would recreate an amnesiac voter without first
+/// granting the leader-local rejoin permission.
+pub async fn resolve_restart_rejoin_policy(
+    client: &MetricsClient,
+    nodes: &[NodeInfo],
+) -> Result<bool> {
+    let snap = client.try_fetch_cluster(nodes).await;
+    if snap.per_node.len() != nodes.len() {
+        bail!(
+            "cannot prepare an automated restart because only {}/{} nodes reported metrics",
+            snap.per_node.len(),
+            nodes.len()
+        );
+    }
+    let backends: Vec<Option<&str>> = snap
+        .per_node
+        .iter()
+        .map(|v| v.wal_backend.as_deref())
+        .collect();
+    decide_restart_rejoin(&backends, nodes.len())
+}
+
+fn decide_restart_rejoin(backends: &[Option<&str>], expected_nodes: usize) -> Result<bool> {
+    if backends.len() != expected_nodes {
+        bail!(
+            "cannot prepare an automated restart because only {}/{} nodes reported metrics",
+            backends.len(),
+            expected_nodes
+        );
+    }
+    if backends.iter().any(Option::is_none) {
+        bail!(
+            "cannot prepare an automated restart because at least one node omitted wal_backend; \
+             refusing to guess whether empty-log rejoin is required"
+        );
+    }
+    let memory_count = backends
+        .iter()
+        .filter(|backend| **backend == Some("memory"))
+        .count();
+    let disk_count = backends
+        .iter()
+        .filter(|backend| **backend == Some("disk"))
+        .count();
+    match (memory_count, disk_count) {
+        (memory, 0) if memory == expected_nodes => Ok(true),
+        (0, disk) if disk == expected_nodes => Ok(false),
+        _ => bail!(
+            "cannot prepare an automated restart because nodes report inconsistent or unsupported \
+             WAL backends: {backends:?}"
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -711,6 +877,58 @@ mod tests {
                 .allow(true)
         );
         assert!(!decide_empty_rejoin(&[None], false).unwrap().allow(false));
+    }
+
+    #[test]
+    fn automated_restart_policy_fails_closed() {
+        assert!(decide_restart_rejoin(&[Some("memory"); 3], 3).unwrap());
+        assert!(!decide_restart_rejoin(&[Some("disk"); 3], 3).unwrap());
+        assert!(decide_restart_rejoin(&[Some("memory"), Some("disk")], 2).is_err());
+        assert!(decide_restart_rejoin(&[Some("memory"), None], 2).is_err());
+        assert!(decide_restart_rejoin(&[Some("memory")], 2).is_err());
+    }
+
+    #[test]
+    fn rejoin_plan_requires_a_stable_non_target_leader() {
+        let nodes = vec![n(1, "10.0.0.1"), n(2, "10.0.0.2"), n(3, "10.0.0.3")];
+        let groups = BTreeSet::from([7]);
+        let stable = ClusterSnapshot {
+            per_node: vec![
+                NodeMetricsView {
+                    node: nodes[1].clone(),
+                    groups: vec![group(7, 2, Some(2), 100, 100)],
+                    wal_backend: Some("memory".into()),
+                },
+                NodeMetricsView {
+                    node: nodes[2].clone(),
+                    groups: vec![group(7, 3, Some(2), 100, 100)],
+                    wal_backend: Some("memory".into()),
+                },
+            ],
+        };
+        assert_eq!(
+            rejoin_leader_plan(&nodes, 1, &stable, &groups)
+                .unwrap()
+                .get(&7)
+                .map(|node| node.id),
+            Some(2)
+        );
+
+        let conflicting = ClusterSnapshot {
+            per_node: vec![
+                NodeMetricsView {
+                    node: nodes[1].clone(),
+                    groups: vec![group(7, 2, Some(2), 100, 100)],
+                    wal_backend: Some("memory".into()),
+                },
+                NodeMetricsView {
+                    node: nodes[2].clone(),
+                    groups: vec![group(7, 3, Some(3), 100, 100)],
+                    wal_backend: Some("memory".into()),
+                },
+            ],
+        };
+        assert!(rejoin_leader_plan(&nodes, 1, &conflicting, &groups).is_err());
     }
 
     #[test]

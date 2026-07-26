@@ -27,6 +27,27 @@ def indexer_values() -> tuple[str, ...]:
 
 
 class HelmTemplateConfigTest(unittest.TestCase):
+    def test_server_update_strategy_defaults_to_rolling_update(self) -> None:
+        rendered = render_chart("--set", "s3.bucket=bkt")
+
+        self.assertIn(
+            "podManagementPolicy: Parallel\n  updateStrategy:\n    type: RollingUpdate",
+            rendered,
+        )
+
+    def test_server_update_strategy_can_stage_on_delete(self) -> None:
+        rendered = render_chart(
+            "--set",
+            "s3.bucket=bkt",
+            "--set",
+            "server.updateStrategy=OnDelete",
+        )
+
+        self.assertIn(
+            "podManagementPolicy: Parallel\n  updateStrategy:\n    type: OnDelete",
+            rendered,
+        )
+
     def test_every_deployment_role_uses_the_unified_ursula_binary(self) -> None:
         rendered = render_chart(
             *indexer_values(),
