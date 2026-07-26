@@ -44,7 +44,10 @@ class HelmTemplateConfigTest(unittest.TestCase):
         )
 
         self.assertIn(
-            "podManagementPolicy: Parallel\n  updateStrategy:\n    type: OnDelete",
+            "podManagementPolicy: Parallel\n  updateStrategy:\n    type: OnDelete\n"
+            "    # Clear a stale RollingUpdate partition when an existing release switches\n"
+            "    # to externally orchestrated OnDelete updates.\n"
+            "    rollingUpdate: null",
             rendered,
         )
 
