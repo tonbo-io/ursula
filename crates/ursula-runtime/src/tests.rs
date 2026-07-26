@@ -1316,12 +1316,13 @@ async fn queued_standard_appends_coalesce_without_reordering_responses() {
         }));
     }
 
-    for _ in 0..100 {
-        if runtime.metrics().snapshot().routed_requests >= 6 {
-            break;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while runtime.metrics().snapshot().routed_requests < 6 {
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
-    }
+    })
+    .await
+    .expect("queued appends routed");
     assert_eq!(runtime.metrics().snapshot().routed_requests, 6);
 
     factory.release.notify_one();
