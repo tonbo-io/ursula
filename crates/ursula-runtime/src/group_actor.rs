@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tracing::Instrument;
 use tracing::Span;
 use ursula_shard::BucketStreamId;
+use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::ColdFlushCandidate;
@@ -70,6 +71,7 @@ use crate::trace::Traced;
 
 #[derive(Clone)]
 pub(crate) struct GroupMailbox {
+    pub(crate) core_id: CoreId,
     pub(crate) group_id: RaftGroupId,
     pub(crate) tx: mpsc::Sender<Traced<GroupCommand>>,
     pub(crate) metrics: Arc<RuntimeMetricsInner>,
@@ -77,24 +79,29 @@ pub(crate) struct GroupMailbox {
 
 impl GroupMailbox {
     pub(crate) async fn send(&self, command: GroupCommand) -> Result<(), Box<GroupCommand>> {
-        self.metrics.record_group_mailbox_enqueued(self.group_id);
+        self.metrics
+            .record_group_mailbox_enqueued(self.core_id, self.group_id);
         // Capture the sender's span so the group actor can re-parent the work.
         match self.tx.try_send(Traced::capture(command)) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(command)) => {
-                self.metrics.record_group_mailbox_dequeued(self.group_id);
+                self.metrics
+                    .record_group_mailbox_dequeued(self.core_id, self.group_id);
                 self.metrics.record_group_mailbox_full(self.group_id);
-                self.metrics.record_group_mailbox_enqueued(self.group_id);
+                self.metrics
+                    .record_group_mailbox_enqueued(self.core_id, self.group_id);
                 match self.tx.send(command).await {
                     Ok(()) => Ok(()),
                     Err(err) => {
-                        self.metrics.record_group_mailbox_dequeued(self.group_id);
+                        self.metrics
+                            .record_group_mailbox_dequeued(self.core_id, self.group_id);
                         Err(Box::new(err.0.value))
                     }
                 }
             }
             Err(mpsc::error::TrySendError::Closed(command)) => {
-                self.metrics.record_group_mailbox_dequeued(self.group_id);
+                self.metrics
+                    .record_group_mailbox_dequeued(self.core_id, self.group_id);
                 Err(Box::new(command.value))
             }
         }
@@ -631,6 +638,18 @@ impl GroupActor {
         let mut batch = vec![(request, response_tx, raft_uncommitted)];
         let mut coalesced_parents = Vec::new();
         self.collect_append_commands(pending, &mut batch, &mut coalesced_parents);
+        // Under core-local pressure, give concurrently routed work one
+        // scheduler turn to reach this group. Unlike a timer-based linger,
+        // an idle append pays no delay and work on other cores cannot trigger
+        // the yield.
+        if batch.len() == 1
+            && self
+                .metrics
+                .core_has_queued_group_commands(self.placement.core_id)
+        {
+            tokio::task::yield_now().await;
+            self.collect_append_commands(pending, &mut batch, &mut coalesced_parents);
+        }
         if batch.len() > 1 {
             let span = tracing::debug_span!(
                 "core.append_many",
@@ -760,8 +779,10 @@ impl GroupActor {
             None => {
                 let command = self.rx.recv().await;
                 if command.is_some() {
-                    self.metrics
-                        .record_group_mailbox_dequeued(self.placement.raft_group_id);
+                    self.metrics.record_group_mailbox_dequeued(
+                        self.placement.core_id,
+                        self.placement.raft_group_id,
+                    );
                 }
                 command
             }
@@ -779,8 +800,10 @@ impl GroupActor {
                 Some(command) => Some(command),
                 None => match self.rx.try_recv() {
                     Ok(command) => {
-                        self.metrics
-                            .record_group_mailbox_dequeued(self.placement.raft_group_id);
+                        self.metrics.record_group_mailbox_dequeued(
+                            self.placement.core_id,
+                            self.placement.raft_group_id,
+                        );
                         Some(command)
                     }
                     Err(_) => None,
@@ -821,8 +844,10 @@ impl GroupActor {
                 Some(command) => Some(command),
                 None => match self.rx.try_recv() {
                     Ok(command) => {
-                        self.metrics
-                            .record_group_mailbox_dequeued(self.placement.raft_group_id);
+                        self.metrics.record_group_mailbox_dequeued(
+                            self.placement.core_id,
+                            self.placement.raft_group_id,
+                        );
                         Some(command)
                     }
                     Err(_) => None,

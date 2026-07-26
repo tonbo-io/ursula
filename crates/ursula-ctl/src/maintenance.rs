@@ -7,6 +7,7 @@
 //! clusters, systemd for bare-metal hosts. A safe rolling restart runs these
 //! verbs around the platform's own restart, one node at a time.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -306,35 +307,44 @@ pub async fn arm_empty_rejoin(
     client: &MetricsClient,
     snap: &ClusterSnapshot,
 ) -> Result<()> {
-    let Some(target_view) = snap.node(target.id) else {
+    let group_ids = peer_reported_rejoin_groups(snap, target.id);
+    if group_ids.is_empty() {
         bail!(
-            "target node {} missing from metrics; cannot allow empty raft rejoin",
+            "no initialized raft group reported by a peer includes target node {}; \
+             cannot allow empty raft rejoin",
             target.id
         );
-    };
-    for group in &target_view.groups {
-        if !group.voter_ids.contains(&target.id) {
-            continue;
-        }
-        let leader_id = stable_non_target_leader(snap, group.raft_group_id, target.id)?;
+    }
+    for group_id in group_ids {
+        let leader_id = stable_non_target_leader(snap, group_id, target.id)?;
         let Some(leader) = nodes.iter().find(|node| node.id == leader_id) else {
             bail!(
                 "leader node {} for group {} is not present in provider",
                 leader_id,
-                group.raft_group_id
+                group_id
             );
         };
         tracing::info!(
             "allowing empty raft rejoin: target_node_id={} raft_group_id={} leader_node_id={}",
             target.id,
-            group.raft_group_id,
+            group_id,
             leader.id
         );
         client
-            .allow_next_revert(leader, group.raft_group_id, target.id)
+            .allow_next_revert(leader, group_id, target.id)
             .await?;
     }
     Ok(())
+}
+
+fn peer_reported_rejoin_groups(snap: &ClusterSnapshot, target_node_id: u64) -> BTreeSet<u64> {
+    snap.per_node
+        .iter()
+        .filter(|view| view.node.id != target_node_id)
+        .flat_map(|view| &view.groups)
+        .filter(|group| group.voter_ids.contains(&target_node_id))
+        .map(|group| group.raft_group_id)
+        .collect()
 }
 
 /// Auto-derive the empty-log rejoin policy from the cluster's reported WAL
@@ -757,5 +767,38 @@ mod tests {
             err.to_string().contains("still reported as leader"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn empty_target_group_uses_peer_membership_for_rejoin() {
+        let mut empty_target_group = group(7, 1, None, 0, 0);
+        empty_target_group.voter_ids.clear();
+        empty_target_group.committed_index = None;
+        empty_target_group.last_applied_index = None;
+        let snapshot = ClusterSnapshot {
+            per_node: vec![
+                NodeMetricsView {
+                    node: n(1, "10.0.0.1"),
+                    groups: vec![empty_target_group],
+                    wal_backend: Some("memory".into()),
+                },
+                NodeMetricsView {
+                    node: n(2, "10.0.0.2"),
+                    groups: vec![group(7, 2, Some(2), 100, 100)],
+                    wal_backend: Some("memory".into()),
+                },
+                NodeMetricsView {
+                    node: n(3, "10.0.0.3"),
+                    groups: vec![group(7, 3, Some(2), 100, 100)],
+                    wal_backend: Some("memory".into()),
+                },
+            ],
+        };
+
+        assert_eq!(
+            peer_reported_rejoin_groups(&snapshot, 1),
+            [7].into_iter().collect()
+        );
+        assert_eq!(stable_non_target_leader(&snapshot, 7, 1).unwrap(), 2);
     }
 }
