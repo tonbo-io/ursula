@@ -499,8 +499,11 @@ impl StreamStateMachine {
         let slot = self
             .stream_slot_mut(&stream_id)
             .expect("stream existence checked before cold flush mutation");
+        let hot_bytes_before = u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64");
         slot.hot_buffer.flush_prefix(chunk.end_offset);
+        let hot_bytes_after = u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64");
         slot.cold.push_cold_chunk(chunk.clone());
+        self.remove_hot_payload_bytes(hot_bytes_before.saturating_sub(hot_bytes_after));
         if let Some(path) = shared_path {
             self.retain_shared_cold_object(&path);
         }
@@ -663,10 +666,13 @@ impl StreamStateMachine {
         let dropped_cold_paths = slot.cold.compact_before(retained_offset);
         self.release_shared_cold_objects(dropped_cold_paths, 0);
 
-        self.stream_slot_mut(stream_id)
-            .expect("stream existence checked before hot compact")
-            .hot_buffer
-            .discard_before(retained_offset);
+        let slot = self
+            .stream_slot_mut(stream_id)
+            .expect("stream existence checked before hot compact");
+        let hot_bytes_before = u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64");
+        slot.hot_buffer.discard_before(retained_offset);
+        let hot_bytes_after = u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64");
+        self.remove_hot_payload_bytes(hot_bytes_before.saturating_sub(hot_bytes_after));
     }
 
     pub(super) fn compact_message_records_before(

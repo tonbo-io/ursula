@@ -567,6 +567,9 @@ impl StreamStateMachine {
         let Some(slot) = self.registry.remove(stream_id) else {
             return false;
         };
+        self.remove_hot_payload_bytes(
+            u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64"),
+        );
         let shared_paths = slot
             .cold
             .shared_object_paths()
