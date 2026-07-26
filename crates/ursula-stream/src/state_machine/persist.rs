@@ -213,6 +213,12 @@ impl StreamStateMachine {
                 }
                 snapshot
             });
+            let shared_cold_paths = entry
+                .cold_chunks
+                .iter()
+                .filter(|chunk| chunk.shared_object)
+                .map(|chunk| chunk.s3_path.clone())
+                .collect::<Vec<_>>();
             let slot = StreamSlot {
                 metadata: entry.metadata,
                 attrs: normalize_stream_attrs(entry.attrs),
@@ -232,6 +238,9 @@ impl StreamStateMachine {
             };
             if machine.insert_stream_slot(slot).is_none() {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
+            }
+            for path in shared_cold_paths {
+                machine.retain_shared_cold_object(&path);
             }
         }
 
@@ -336,15 +345,23 @@ fn restore_producer_states(
 }
 
 fn valid_cold_chunk_ref(chunk: &ColdChunkRef) -> bool {
+    let logical_len = chunk.end_offset.saturating_sub(chunk.start_offset);
     chunk.end_offset > chunk.start_offset
         && !chunk.s3_path.trim().is_empty()
-        && chunk.object_size >= chunk.end_offset - chunk.start_offset
+        && chunk
+            .object_offset
+            .checked_add(logical_len)
+            .is_some_and(|end| end <= chunk.object_size)
 }
 
 fn valid_object_payload_ref(object: &ObjectPayloadRef) -> bool {
+    let logical_len = object.end_offset.saturating_sub(object.start_offset);
     object.end_offset > object.start_offset
         && !object.s3_path.trim().is_empty()
-        && object.object_size >= object.end_offset - object.start_offset
+        && object
+            .object_offset
+            .checked_add(logical_len)
+            .is_some_and(|end| end <= object.object_size)
 }
 
 fn hot_segments_match_payload(segments: &[HotPayloadSegment], payload_len: usize) -> bool {

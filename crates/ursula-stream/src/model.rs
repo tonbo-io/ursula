@@ -147,12 +147,14 @@ pub struct StreamRead {
 
 pub type ColdChunkRef = ColdChunkRefV1;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectPayloadRef {
     pub start_offset: u64,
     pub end_offset: u64,
     pub s3_path: String,
     pub object_size: u64,
+    #[serde(default)]
+    pub object_offset: u64,
 }
 
 impl From<&ColdChunkRef> for ObjectPayloadRef {
@@ -162,6 +164,7 @@ impl From<&ColdChunkRef> for ObjectPayloadRef {
             end_offset: chunk.end_offset,
             s3_path: chunk.s3_path.clone(),
             object_size: chunk.object_size,
+            object_offset: chunk.object_offset,
         }
     }
 }
@@ -205,6 +208,7 @@ pub struct ColdFlushCandidate {
     pub start_offset: u64,
     pub end_offset: u64,
     pub payload: Vec<u8>,
+    pub payload_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

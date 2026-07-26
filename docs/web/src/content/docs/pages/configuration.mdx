@@ -99,7 +99,9 @@ Every cold-tier object write requests server-side encryption by default (`server
 | `storage.cold.flush_max_concurrency` | `4` | Parallel cold writes in flight |
 | `storage.cold.max_hot_size_per_group` | `64MiB` | Backpressure ceiling: when a group's hot bytes exceed this, new writes get HTTP `503` until the flush catches up. Explicit `0` disables the cap |
 
-Flush defaults are conservative, so tune them under load. A typical benchmark profile drops the interval to `200ms`, raises concurrency to `32`, and bumps the per-group ceiling. Advanced deployments can split the flush threshold and batch size with `storage.cold.flush_min_hot_size` and `storage.cold.flush_max_size`, but the single `storage.cold.flush_size` knob is the normal path.
+Flush defaults are conservative, so tune them under load. A typical benchmark profile drops the interval to `200ms`, raises concurrency to `32`, and bumps the per-group ceiling. Advanced deployments can split the flush threshold and batch size with `storage.cold.flush_min_hot_size` and `storage.cold.flush_max_size`, but the single `storage.cold.flush_size` knob is the normal path. Once a group's accumulated hot payload reaches the threshold, Ursula packs eligible slices from that group into one immutable object up to the configured maximum; large single-stream slices keep the same direct-object layout.
+
+Raft snapshotting does not force a partial cold flush. Payload below the cold threshold stays in the bounded hot tail and is included in the next group snapshot, so a short snapshot interval does not turn small tails into small cold objects.
 
 Helm and the EC2 scripts map their deployment inputs onto these same keys, so this table applies to every deployment method.
 

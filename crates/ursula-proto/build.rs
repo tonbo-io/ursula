@@ -27,6 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "ColdChunkRefV1",
             "#[derive(serde::Serialize, serde::Deserialize)]",
         )
+        .type_attribute("ColdChunkRefV1", "#[serde(default)]")
         .compile_protos(&protos, &["proto"])?;
 
     Ok(())

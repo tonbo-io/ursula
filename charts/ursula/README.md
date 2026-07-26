@@ -398,7 +398,7 @@ container receives only chart-managed container settings plus explicit
 | `coldStorage.prefix` | `cold` | Cold object prefix below `s3.prefix`. |
 | `coldStorage.flush.intervalMs` | `1000` | Background cold flush interval in milliseconds. |
 | `coldStorage.flush.minHotBytes` | `8388608` | Skip flush below this hot byte threshold per group. |
-| `coldStorage.flush.maxBytes` | `8388608` | Maximum bytes flushed per group per tick. |
+| `coldStorage.flush.maxBytes` | `8388608` | Maximum bytes flushed into one group-scoped cold object per tick. |
 | `coldStorage.flush.maxConcurrency` | `4` | Maximum concurrent cold writes. |
 | `coldStorage.flush.maxHotBytesPerGroup` | `67108864` | Hot-byte backpressure ceiling per group; `0` disables the cap. |
 | `coldStorage.cache.maxSizeBytes` | `null` | Optional cold-read cache size override. Renders `storage.cold.cache.max_size`; `0` disables the cache, and omitted lets the runtime install its default cache. |

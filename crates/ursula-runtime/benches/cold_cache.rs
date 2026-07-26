@@ -192,6 +192,7 @@ async fn bench_store_with_config(
             end_offset: object_size,
             s3_path: path.to_owned(),
             object_size,
+            object_offset: 0,
         },
     }
 }

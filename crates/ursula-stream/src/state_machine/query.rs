@@ -268,6 +268,17 @@ impl StreamStateMachine {
         let hot_segments = slot.hot_buffer.read_segments(offset, next_offset);
         let cold_frontier = self.cold_frontier_offset(stream_id, retained_offset);
         let cold_index_end = next_offset.min(cold_frontier);
+        let mut direct_cold_ranges = self
+            .cold_chunks(stream_id)
+            .iter()
+            .map(|chunk| (chunk.start_offset, chunk.end_offset))
+            .chain(
+                self.external_segments(stream_id)
+                    .iter()
+                    .map(|object| (object.start_offset, object.end_offset)),
+            )
+            .collect::<Vec<_>>();
+        direct_cold_ranges.sort_unstable();
         let mut cursor = offset;
         for (hot_start, hot_segment) in &hot_segments {
             if cursor >= cold_index_end {
@@ -280,21 +291,23 @@ impl StreamStateMachine {
                 continue;
             }
             let gap_end = (*hot_start).min(cold_index_end);
-            push_cold_index_segments(
+            push_cold_index_segments_excluding(
                 &mut segments,
                 stream_id,
                 slot.cold.cold_generation(),
                 cursor,
                 gap_end,
+                &direct_cold_ranges,
             );
             cursor = cursor.max(hot_end);
         }
-        push_cold_index_segments(
+        push_cold_index_segments_excluding(
             &mut segments,
             stream_id,
             slot.cold.cold_generation(),
             cursor,
             cold_index_end,
+            &direct_cold_ranges,
         );
         for chunk in self.cold_chunks(stream_id) {
             let start = offset.max(chunk.start_offset);
@@ -431,6 +444,29 @@ fn push_cold_index_segments(
         ));
         cursor = segment_end;
     }
+}
+
+fn push_cold_index_segments_excluding(
+    segments: &mut Vec<(u64, StreamReadSegment)>,
+    stream_id: &BucketStreamId,
+    generation: u64,
+    start_offset: u64,
+    end_offset: u64,
+    exclusions: &[(u64, u64)],
+) {
+    let mut cursor = start_offset;
+    for (excluded_start, excluded_end) in exclusions {
+        if *excluded_end <= cursor || *excluded_start >= end_offset {
+            continue;
+        }
+        let gap_end = (*excluded_start).min(end_offset);
+        push_cold_index_segments(segments, stream_id, generation, cursor, gap_end);
+        cursor = cursor.max(*excluded_end);
+        if cursor >= end_offset {
+            return;
+        }
+    }
+    push_cold_index_segments(segments, stream_id, generation, cursor, end_offset);
 }
 
 fn segments_cover_range(

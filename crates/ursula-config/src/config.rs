@@ -460,7 +460,8 @@ pub struct RaftSnapshotConfig {
     /// external snapshot stores use a 5s manual-driver default. Explicit `0s`
     /// disables the manual driver and keeps openraft's default auto-policy.
     pub drive_interval: Option<HumanDuration>,
-    /// Max concurrent snapshot flushes.
+    /// Retained for configuration compatibility. Snapshot driving no longer
+    /// forces cold flushes; the cold worker owns flush concurrency.
     pub drive_flush_concurrency: usize,
 }
 

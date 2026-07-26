@@ -28,6 +28,7 @@ use ursula_stream::StreamStateMachine;
 
 use super::*;
 use crate::ColdReadCacheParams;
+use crate::cold_store::ColdStoreEvent;
 use crate::cold_store::DEFAULT_CONTENT_TYPE;
 use crate::core_worker::CoreWorker;
 use crate::core_worker::ReadWatcher;
@@ -400,6 +401,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
                     end_offset: 2,
                     s3_path: "s3://bucket/apply-command/000000".to_owned(),
                     object_size: 2,
+                    ..Default::default()
                 },
             }),
             placement,
@@ -480,6 +482,7 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
                     end_offset: 4,
                     s3_path: "benchcmp/cold-read/chunks/000000.bin".to_owned(),
                     object_size: 4,
+                    ..Default::default()
                 },
             },
             placement,
@@ -505,12 +508,14 @@ async fn cold_index_read_materializes_overlapping_flush_objects_once() {
         end_offset: 4,
         s3_path: "benchcmp/overlapping-cold-read/chunks/first.bin".to_owned(),
         object_size: 4,
+        ..Default::default()
     };
     let second = ColdChunkRef {
         start_offset: 2,
         end_offset: 6,
         s3_path: "benchcmp/overlapping-cold-read/chunks/second.bin".to_owned(),
         object_size: 4,
+        ..Default::default()
     };
     cold_store
         .write_chunk(&first.s3_path, b"abcd")
@@ -597,6 +602,7 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
                     end_offset: 4,
                     s3_path: live_path.to_owned(),
                     object_size: 4,
+                    ..Default::default()
                 },
             },
             placement,
@@ -613,6 +619,7 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
                     end_offset: 4,
                     s3_path: stale_path.to_owned(),
                     object_size: 4,
+                    ..Default::default()
                 },
             },
             placement,
@@ -649,18 +656,21 @@ async fn failed_cold_compaction_publish_rolls_back_index_replacement() {
         end_offset: 4,
         s3_path: "benchcmp/failed-compact-index/chunks/first.bin".to_owned(),
         object_size: 4,
+        ..Default::default()
     };
     let second = ColdChunkRef {
         start_offset: 4,
         end_offset: 8,
         s3_path: "benchcmp/failed-compact-index/chunks/second.bin".to_owned(),
         object_size: 4,
+        ..Default::default()
     };
     let replacement = ColdChunkRef {
         start_offset: 0,
         end_offset: 8,
         s3_path: "benchcmp/failed-compact-index/chunks/replacement.bin".to_owned(),
         object_size: 8,
+        ..Default::default()
     };
     for chunk in [&first, &second] {
         write_cold_chunk_index_pages(&page_store, &stream, chunk)
@@ -812,6 +822,7 @@ async fn bootstrap_reads_retained_updates_from_cold_chunk_after_snapshot() {
                     end_offset: 5,
                     s3_path: "benchcmp/cold-bootstrap/chunks/000000.bin".to_owned(),
                     object_size: 5,
+                    ..Default::default()
                 },
             },
             placement,
@@ -883,6 +894,7 @@ async fn cold_store_reads_only_requested_range() {
                 end_offset: 18,
                 s3_path: "benchcmp/cold-range/chunks/000000.bin".to_owned(),
                 object_size: 8,
+                ..Default::default()
             },
             12,
             3,
@@ -910,6 +922,7 @@ async fn cold_store_prefetches_sequential_stream_blocks() {
         end_offset: 16,
         s3_path: path.to_owned(),
         object_size: 16,
+        ..Default::default()
     };
 
     let first = cold_store
@@ -1992,6 +2005,7 @@ async fn flush_cold_publishes_chunk_metadata_on_owner_group() {
                 end_offset: 4,
                 s3_path: "s3://bucket/cold-runtime/000000".to_owned(),
                 object_size: 4,
+                ..Default::default()
             },
         })
         .await
@@ -2039,6 +2053,7 @@ async fn flush_cold_once_uploads_outside_group_and_reads_back() {
     let metrics = runtime.metrics().snapshot();
     assert_eq!(metrics.cold_flush_uploads, 1);
     assert_eq!(metrics.cold_flush_upload_bytes, 4);
+    assert_eq!(metrics.cold_pack_uploads, 0);
     assert_eq!(metrics.cold_flush_publishes, 1);
     assert_eq!(metrics.cold_flush_publish_bytes, 4);
     assert_eq!(metrics.cold_orphan_cleanup_attempts, 0);
@@ -2066,6 +2081,7 @@ async fn flush_cold_group_batch_once_publishes_multiple_chunks() {
             PlanGroupColdFlushRequest {
                 min_hot_bytes: 1,
                 max_flush_bytes: 1,
+                max_batch_bytes: 4,
             },
             4,
         )
@@ -2086,8 +2102,11 @@ async fn flush_cold_group_batch_once_publishes_multiple_chunks() {
     );
 
     let metrics = runtime.metrics().snapshot();
-    assert_eq!(metrics.cold_flush_uploads, 4);
+    assert_eq!(metrics.cold_flush_uploads, 1);
     assert_eq!(metrics.cold_flush_upload_bytes, 4);
+    assert_eq!(metrics.cold_pack_uploads, 1);
+    assert_eq!(metrics.cold_pack_bytes, 4);
+    assert_eq!(metrics.cold_pack_slices, 4);
     assert_eq!(metrics.cold_flush_publishes, 4);
     assert_eq!(metrics.cold_flush_publish_bytes, 4);
     assert_eq!(metrics.cold_hot_bytes, 0);
@@ -2103,7 +2122,21 @@ async fn flush_cold_group_batch_once_publishes_multiple_chunks() {
         .find(|entry| entry.metadata.stream_id == stream)
         .expect("stream snapshot");
     assert_eq!(entry.cold_frontier_offset, 4);
-    assert!(entry.cold_chunks.is_empty());
+    assert_eq!(entry.cold_chunks.len(), 4);
+    assert!(
+        entry
+            .cold_chunks
+            .iter()
+            .all(|chunk| chunk.shared_object && chunk.object_size == 4)
+    );
+    assert_eq!(
+        entry
+            .cold_chunks
+            .iter()
+            .map(|chunk| chunk.object_offset)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
     assert!(entry.payload.is_empty());
 
     let read = runtime
@@ -2112,6 +2145,144 @@ async fn flush_cold_group_batch_once_publishes_multiple_chunks() {
         .expect("read cold chunks");
     assert_eq!(read.payload, b"abcd");
     assert_eq!(read.next_offset, 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn packed_cold_object_survives_until_last_stream_is_deleted() {
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(RuntimeConfig::new(2, 8), cold_store.clone());
+    let group_id = RaftGroupId(3);
+    let first = stream_on_group(&runtime, group_id, "pack-first");
+    let second = stream_on_group(&runtime, group_id, "pack-second");
+    assert_ne!(first, second);
+    for (stream, payload) in [(&first, b"abcd".as_slice()), (&second, b"efgh".as_slice())] {
+        create_stream(&runtime, stream).await;
+        append_bytes(&runtime, stream, payload).await;
+    }
+
+    let flushed = runtime
+        .flush_cold_group_batch_once(
+            group_id,
+            PlanGroupColdFlushRequest {
+                min_hot_bytes: 4,
+                max_flush_bytes: 4,
+                max_batch_bytes: 8,
+            },
+            8,
+        )
+        .await
+        .expect("flush shared pack");
+    assert_eq!(flushed.len(), 2);
+    assert_eq!(runtime.metrics().snapshot().cold_flush_uploads, 1);
+
+    let snapshot = runtime
+        .snapshot_group(group_id)
+        .await
+        .expect("snapshot packed group");
+    let chunks = snapshot
+        .stream_snapshot
+        .streams
+        .iter()
+        .filter_map(|entry| entry.cold_chunks.first().cloned())
+        .collect::<Vec<_>>();
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].s3_path, chunks[1].s3_path);
+
+    runtime
+        .delete_stream(DeleteStreamRequest { stream_id: first })
+        .await
+        .expect("delete first packed stream");
+    runtime
+        .run_cold_gc_all_groups_once(256)
+        .await
+        .expect("gc first packed stream");
+    assert_eq!(
+        cold_store
+            .read_chunk_range(&chunks[1], chunks[1].start_offset, 4)
+            .await
+            .expect("shared pack remains readable"),
+        b"efgh"
+    );
+
+    runtime
+        .delete_stream(DeleteStreamRequest { stream_id: second })
+        .await
+        .expect("delete second packed stream");
+    runtime
+        .run_cold_gc_all_groups_once(256)
+        .await
+        .expect("gc final packed stream");
+    assert!(
+        cold_store
+            .read_chunk_range(&chunks[1], chunks[1].start_offset, 4)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_stale_packed_candidates_reclaim_unpublished_object() {
+    let cold_store = Arc::new(memory_cold_store());
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = events.clone();
+    cold_store.set_observer(move |event| {
+        observed.lock().expect("event mutex").push(event);
+    });
+    let runtime = spawn_with_cold_store(RuntimeConfig::new(2, 8), cold_store);
+    let group_id = RaftGroupId(3);
+    let streams = [
+        stream_on_group(&runtime, group_id, "stale-pack-first"),
+        stream_on_group(&runtime, group_id, "stale-pack-second"),
+    ];
+    for stream in &streams {
+        create_stream(&runtime, stream).await;
+        append_bytes(&runtime, stream, b"abcd").await;
+    }
+    let candidates = runtime
+        .plan_next_cold_flush_batch(
+            group_id,
+            PlanGroupColdFlushRequest {
+                min_hot_bytes: 4,
+                max_flush_bytes: 4,
+                max_batch_bytes: 8,
+            },
+            8,
+        )
+        .await
+        .expect("plan shared pack");
+    assert_eq!(candidates.len(), 2);
+
+    for stream in &streams {
+        runtime
+            .delete_stream(DeleteStreamRequest {
+                stream_id: stream.clone(),
+            })
+            .await
+            .expect("delete planned stream");
+        create_stream(&runtime, stream).await;
+        append_bytes(&runtime, stream, b"new!").await;
+    }
+    assert!(
+        runtime
+            .flush_cold_candidates_batch(candidates)
+            .await
+            .expect("stale pack is classified")
+            .is_empty()
+    );
+
+    let events = events.lock().expect("event mutex");
+    let written = events.iter().find_map(|event| match event {
+        ColdStoreEvent::WriteChunkComplete { path, .. } if path.starts_with("_packs/") => {
+            Some(path)
+        }
+        _ => None,
+    });
+    let deleted = events.iter().find_map(|event| match event {
+        ColdStoreEvent::DeleteChunkComplete { path } if path.starts_with("_packs/") => Some(path),
+        _ => None,
+    });
+    assert!(written.is_some());
+    assert_eq!(written, deleted);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2126,6 +2297,7 @@ async fn cold_gc_worker_physically_reclaims_deleted_stream_chunks() {
         end_offset: 4,
         s3_path: "benchcmp/cold-gc/chunks/000000.bin".to_owned(),
         object_size: 4,
+        ..Default::default()
     };
     cold_store
         .write_chunk(&chunk.s3_path, b"abcd")
@@ -2192,6 +2364,7 @@ async fn cold_compaction_preserves_reads_and_reclaims_inputs_after_grace() {
             end_offset: end,
             s3_path: format!("benchcmp/compact-runtime/chunks/{start}.bin"),
             object_size: end - start,
+            ..Default::default()
         };
         cold_store
             .write_chunk(&chunk.s3_path, payload)
@@ -2231,6 +2404,7 @@ async fn cold_compaction_preserves_reads_and_reclaims_inputs_after_grace() {
             end_offset: start + 4,
             s3_path: format!("benchcmp/compact-runtime/chunks/{start}.bin"),
             object_size: 4,
+            ..Default::default()
         };
         assert!(
             cold_store
@@ -2255,6 +2429,7 @@ async fn stale_cold_flush_batch_after_delete_recreate_is_classified_for_cleanup(
             PlanGroupColdFlushRequest {
                 min_hot_bytes: 18,
                 max_flush_bytes: 18,
+                max_batch_bytes: 18,
             },
             1,
         )
@@ -2579,6 +2754,7 @@ async fn flush_cold_group_once_selects_stream_inside_owner_group() {
         .flush_cold_group_once(group_id, PlanGroupColdFlushRequest {
             min_hot_bytes: 4,
             max_flush_bytes: 4,
+            max_batch_bytes: 4,
         })
         .await
         .expect("flush group")
@@ -2608,17 +2784,20 @@ async fn flush_cold_all_groups_once_bounded_flushes_multiple_groups() {
             PlanGroupColdFlushRequest {
                 min_hot_bytes: 4,
                 max_flush_bytes: 4,
+                max_batch_bytes: 8,
             },
             2,
         )
         .await
         .expect("flush all bounded");
-    assert_eq!(flushed, 2);
+    assert_eq!(flushed, 4);
     let metrics = runtime.metrics().snapshot();
     assert_eq!(metrics.cold_flush_uploads, 2);
-    assert_eq!(metrics.cold_flush_upload_bytes, 8);
-    assert_eq!(metrics.cold_flush_publishes, 2);
-    assert_eq!(metrics.cold_flush_publish_bytes, 8);
+    assert_eq!(metrics.cold_flush_upload_bytes, 12);
+    assert_eq!(metrics.cold_pack_uploads, 2);
+    assert_eq!(metrics.cold_pack_slices, 4);
+    assert_eq!(metrics.cold_flush_publishes, 4);
+    assert_eq!(metrics.cold_flush_publish_bytes, 12);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2661,6 +2840,7 @@ async fn repeated_cold_flush_keeps_hot_bytes_bounded_while_writes_continue() {
                 PlanGroupColdFlushRequest {
                     min_hot_bytes: 4,
                     max_flush_bytes: 4,
+                    max_batch_bytes: 4,
                 },
                 streams.len(),
             )
@@ -3083,6 +3263,7 @@ async fn background_cold_flush_skips_groups_that_cannot_accept_local_writes() {
             PlanGroupColdFlushRequest {
                 min_hot_bytes: 1,
                 max_flush_bytes: 1,
+                max_batch_bytes: 4,
             },
             4,
         )

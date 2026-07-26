@@ -165,6 +165,7 @@ async fn cold_path_publish(
                     end_offset: setup.candidate.end_offset,
                     s3_path: chunk_path,
                     object_size,
+                    ..Default::default()
                 },
             },
             placement(),
@@ -502,6 +503,7 @@ pub(super) async fn run_cold_write_delay_inner(
                     end_offset: setup.candidate.end_offset,
                     s3_path: chunk_path,
                     object_size,
+                    ..Default::default()
                 },
             },
             placement(),
@@ -573,6 +575,7 @@ pub(super) async fn run_cold_delete_fault_inner(
             PlanGroupColdFlushRequest {
                 min_hot_bytes: old_payload.len(),
                 max_flush_bytes: old_payload.len(),
+                max_batch_bytes: old_payload.len(),
             },
             1,
         )

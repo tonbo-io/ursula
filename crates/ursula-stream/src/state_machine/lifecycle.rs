@@ -353,6 +353,7 @@ impl StreamStateMachine {
             end_offset: initial_len,
             s3_path: input.initial_payload.s3_path,
             object_size: input.initial_payload.object_size,
+            object_offset: 0,
         };
         let mut cold = StreamColdState::default();
         cold.push_external_segment(object.clone());
@@ -566,6 +567,11 @@ impl StreamStateMachine {
         let Some(slot) = self.registry.remove(stream_id) else {
             return false;
         };
+        let shared_paths = slot
+            .cold
+            .shared_object_paths()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
         self.usage_on_stream_removed(
             &stream_id.bucket_id,
             slot.metadata
@@ -579,6 +585,7 @@ impl StreamStateMachine {
             self.cold_gc
                 .enqueue(ColdGcTarget::Stream(stream_id.clone()));
         }
+        self.release_shared_cold_objects(shared_paths, 0);
         true
     }
 

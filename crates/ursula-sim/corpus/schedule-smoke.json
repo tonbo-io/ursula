@@ -233,7 +233,7 @@
             "event": "runtime_raft_network_cold_write_delay_verified",
             "stream_count": 2,
             "delay_ms": 125,
-            "upload_count": 8,
+            "upload_count": 1,
             "publish_count": 8
           },
           {
@@ -244,7 +244,7 @@
             },
             "next_offset": 45,
             "flushed_count": 8,
-            "upload_count": 8,
+            "upload_count": 1,
             "publish_count": 8
           },
           {
@@ -255,7 +255,7 @@
             },
             "next_offset": 36,
             "flushed_count": 8,
-            "upload_count": 8,
+            "upload_count": 1,
             "publish_count": 8
           }
         ]
@@ -1740,9 +1740,9 @@
           },
           {
             "event": "runtime_cold_flush_completed",
-            "flushed_count": 2,
+            "flushed_count": 4,
             "upload_count": 2,
-            "publish_count": 2
+            "publish_count": 4
           },
           {
             "event": "runtime_cold_live_read_verified",
@@ -2400,7 +2400,7 @@
             },
             "next_offset": 18,
             "flushed_count": 3,
-            "upload_count": 3,
+            "upload_count": 1,
             "publish_count": 3
           }
         ]
@@ -2663,7 +2663,7 @@
             },
             "next_offset": 36,
             "flushed_count": 8,
-            "upload_count": 8,
+            "upload_count": 1,
             "publish_count": 8
           },
           {
@@ -2685,7 +2685,7 @@
             },
             "next_offset": 27,
             "flushed_count": 8,
-            "upload_count": 8,
+            "upload_count": 1,
             "publish_count": 8
           },
           {
@@ -3218,7 +3218,7 @@
             },
             "next_offset": 54,
             "flushed_count": 12,
-            "upload_count": 12,
+            "upload_count": 1,
             "publish_count": 12
           },
           {
@@ -3229,7 +3229,7 @@
             },
             "next_offset": 54,
             "flushed_count": 12,
-            "upload_count": 12,
+            "upload_count": 1,
             "publish_count": 12
           },
           {
@@ -3240,7 +3240,7 @@
             },
             "next_offset": 63,
             "flushed_count": 12,
-            "upload_count": 12,
+            "upload_count": 1,
             "publish_count": 12
           },
           {
@@ -3579,7 +3579,7 @@
             },
             "next_offset": 18,
             "flushed_count": 9,
-            "upload_count": 9,
+            "upload_count": 1,
             "publish_count": 9
           },
           {
@@ -3611,7 +3611,7 @@
             },
             "next_offset": 18,
             "flushed_count": 9,
-            "upload_count": 9,
+            "upload_count": 1,
             "publish_count": 9
           },
           {
@@ -3643,7 +3643,7 @@
             },
             "next_offset": 18,
             "flushed_count": 9,
-            "upload_count": 9,
+            "upload_count": 1,
             "publish_count": 9
           },
           {

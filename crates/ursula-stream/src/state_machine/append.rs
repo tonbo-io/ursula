@@ -399,6 +399,7 @@ impl StreamStateMachine {
             end_offset: next_offset,
             s3_path: payload.s3_path,
             object_size: payload.object_size,
+            object_offset: 0,
         };
         let slot = self
             .stream_slot_mut(&stream_id)

@@ -317,6 +317,9 @@ fn flush_cold_cmd(
             end_offset,
             s3_path: s3_path.to_owned(),
             object_size,
+            object_offset: 0,
+            shared_object: false,
+            payload_digest: String::new(),
         },
     }
 }
@@ -743,6 +746,23 @@ fn stream_command_decodes_pre_attrs_wal_records() {
 
     let decoded: StreamCommand =
         serde_json::from_value(value).expect("decode pre-attrs WAL record");
+    assert_eq!(decoded, command);
+}
+
+#[test]
+fn cold_flush_command_decodes_pre_pack_wal_records() {
+    let command = flush_cold_cmd(stream("legacy-cold-wal"), 0, 4, "legacy.bin", 4);
+    let mut value = serde_json::to_value(&command).expect("encode cold flush command");
+    let chunk = value
+        .get_mut("FlushCold")
+        .and_then(|variant| variant.get_mut("chunk"))
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("cold flush chunk");
+    assert!(chunk.remove("object_offset").is_some());
+    assert!(chunk.remove("shared_object").is_some());
+    assert!(chunk.remove("payload_digest").is_some());
+
+    let decoded: StreamCommand = serde_json::from_value(value).expect("decode pre-pack WAL record");
     assert_eq!(decoded, command);
 }
 
@@ -1187,6 +1207,61 @@ fn delete_stream_enqueues_cold_gc_then_ack_drains_it() {
 }
 
 #[test]
+fn shared_cold_object_is_reclaimed_after_last_stream_reference() {
+    let mut machine = machine();
+    let pack_path = "_packs/00000000/shared.bin";
+    for (id, object_offset) in [("pack-a", 0), ("pack-b", 4)] {
+        create_stream(&mut machine, id);
+        machine.apply(append_cmd(stream(id), b"abcd", Append::default()));
+        assert!(matches!(
+            machine.apply(StreamCommand::FlushCold {
+                stream_id: stream(id),
+                chunk: ColdChunkRef {
+                    start_offset: 0,
+                    end_offset: 4,
+                    s3_path: pack_path.to_owned(),
+                    object_size: 8,
+                    object_offset,
+                    shared_object: true,
+                    payload_digest: String::new(),
+                },
+            }),
+            StreamResponse::ColdFlushed { .. }
+        ));
+    }
+
+    let mut restored =
+        StreamStateMachine::restore(machine.snapshot()).expect("restore shared pack refs");
+    assert_eq!(
+        restored.apply(delete_cmd(stream("pack-a"))),
+        StreamResponse::Deleted
+    );
+    assert!(
+        restored
+            .pending_cold_gc_batch(16)
+            .iter()
+            .all(|entry| !matches!(
+                &entry.target,
+                ColdGcTarget::Paths(paths) if paths.iter().any(|path| path == pack_path)
+            ))
+    );
+
+    assert_eq!(
+        restored.apply(delete_cmd(stream("pack-b"))),
+        StreamResponse::Deleted
+    );
+    let shared_reclaims = restored
+        .pending_cold_gc_batch(16)
+        .into_iter()
+        .filter_map(|entry| match entry.target {
+            ColdGcTarget::Paths(paths) if paths.iter().any(|path| path == pack_path) => Some(paths),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(shared_reclaims, vec![vec![pack_path.to_owned()]]);
+}
+
+#[test]
 fn compact_cold_enqueues_inputs_with_gc_grace() {
     let mut machine = machine();
     create_stream(&mut machine, "compact");
@@ -1200,12 +1275,18 @@ fn compact_cold_enqueues_inputs_with_gc_grace() {
         end_offset: 4,
         object_size: 4,
         s3_path: "old-0".to_owned(),
+        object_offset: 0,
+        shared_object: false,
+        payload_digest: String::new(),
     };
     let second = ColdChunkRef {
         start_offset: 4,
         end_offset: 8,
         object_size: 4,
         s3_path: "old-1".to_owned(),
+        object_offset: 0,
+        shared_object: false,
+        payload_digest: String::new(),
     };
     assert!(matches!(
         machine.apply(StreamCommand::FlushCold {
@@ -1231,6 +1312,9 @@ fn compact_cold_enqueues_inputs_with_gc_grace() {
                 end_offset: 8,
                 object_size: 8,
                 s3_path: "replacement".to_owned(),
+                object_offset: 0,
+                shared_object: false,
+                payload_digest: String::new(),
             },
             gc_not_before_ms: 42,
         }),
@@ -1420,7 +1504,7 @@ fn plan_next_cold_flush_selects_deterministic_eligible_stream() {
     ));
 
     let candidate = machine
-        .plan_next_cold_flush_batch(4, 4, 1)
+        .plan_next_cold_flush_batch(4, 4, 4, 1)
         .expect("plan next cold flush")
         .into_iter()
         .next()
@@ -1443,23 +1527,55 @@ fn plan_next_cold_flush_drains_distributed_group_hot_bytes() {
 
     assert_eq!(
         machine
-            .plan_next_cold_flush_batch(4, 4, 1)
+            .plan_next_cold_flush_batch(4, 4, 4, 1)
             .expect("plan next cold flush")
             .len(),
         1
     );
     let candidates = machine
-        .plan_next_cold_flush_batch(5, 4, 1)
+        .plan_next_cold_flush_batch(5, 4, 4, 1)
         .expect("plan next cold flush");
     assert!(candidates.is_empty());
     let candidate = machine
-        .plan_next_cold_flush_batch(4, 4, 1)
+        .plan_next_cold_flush_batch(4, 4, 4, 1)
         .expect("plan next cold flush")
         .into_iter()
         .next()
         .expect("candidate");
     assert_eq!(candidate.stream_id, stream("a-cold"));
     assert_eq!(candidate.payload, b"aa");
+}
+
+#[test]
+fn plan_next_cold_flush_batch_drains_triggered_group_to_batch_target() {
+    let mut machine = machine();
+    create_stream(&mut machine, "pack-z");
+    create_stream(&mut machine, "pack-a");
+    for stream_name in ["pack-z", "pack-a"] {
+        assert!(matches!(
+            machine.apply(append_cmd(stream(stream_name), b"aa", Append::default())),
+            StreamResponse::Appended { .. }
+        ));
+    }
+
+    let candidates = machine
+        .plan_next_cold_flush_batch(4, 4, 4, 4)
+        .expect("plan group pack");
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.stream_id.clone())
+            .collect::<Vec<_>>(),
+        vec![stream("pack-a"), stream("pack-z")]
+    );
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.payload.len())
+            .sum::<usize>(),
+        4
+    );
 }
 
 #[test]
@@ -1476,7 +1592,7 @@ fn plan_next_cold_flush_batch_advances() {
     ));
 
     let candidates = machine
-        .plan_next_cold_flush_batch(1, 1, 4)
+        .plan_next_cold_flush_batch(1, 1, 4, 4)
         .expect("plan cold flush batch");
     assert_eq!(candidates.len(), 4);
     assert_eq!(
@@ -1590,7 +1706,7 @@ fn plan_next_cold_flush_skips_deleted_streams() {
     ));
 
     let candidate = machine
-        .plan_next_cold_flush_batch(4, 4, 1)
+        .plan_next_cold_flush_batch(4, 4, 4, 1)
         .expect("plan next cold flush")
         .into_iter()
         .next()
@@ -3289,10 +3405,20 @@ proptest! {
         }
 
         let candidates = machine
-            .plan_next_cold_flush_batch(min_hot_bytes, max_flush_bytes, max_candidates)
+            .plan_next_cold_flush_batch(
+                min_hot_bytes,
+                max_flush_bytes,
+                usize::MAX,
+                max_candidates,
+            )
             .expect("plan cold flush batch");
         let repeated_candidates = machine
-            .plan_next_cold_flush_batch(min_hot_bytes, max_flush_bytes, max_candidates)
+            .plan_next_cold_flush_batch(
+                min_hot_bytes,
+                max_flush_bytes,
+                usize::MAX,
+                max_candidates,
+            )
             .expect("repeat plan cold flush batch");
         prop_assert_eq!(candidates.as_slice(), repeated_candidates.as_slice());
 

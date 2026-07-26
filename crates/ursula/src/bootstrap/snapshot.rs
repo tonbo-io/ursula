@@ -3,7 +3,6 @@ use std::time::Duration;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGroupMetricsSnapshot;
-use ursula_runtime::PlanGroupColdFlushRequest;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::default_snapshot_store;
@@ -52,7 +51,6 @@ pub fn spawn_snapshot_driver(
     runtime: &ShardRuntime,
     registry: &RaftGroupHandleRegistry,
     snapshot_store: Option<SharedSnapshotStore>,
-    snapshot_cfg: &ursula_config::RaftSnapshotConfig,
     s3_cfg: Option<&ursula_config::S3Config>,
     interval_ms: usize,
 ) {
@@ -60,7 +58,6 @@ pub fn spawn_snapshot_driver(
         return;
     }
     let snapshot_store = snapshot_store.unwrap_or_else(default_snapshot_store);
-    let max_concurrency = snapshot_cfg.drive_flush_concurrency.max(1);
     let probe_timeout = Duration::from_millis(
         s3_cfg
             .map(|c| c.probe_timeout.as_duration().as_millis() as u64)
@@ -129,20 +126,6 @@ pub fn spawn_snapshot_driver(
                 yielded = false;
                 registry.clear_leadership_shed(LeadershipShedReason::SnapshotDriverS3);
                 reenable_elections_if_campaign_allowed(&registry, "s3-healthy: node S3 recovered");
-            }
-
-            if runtime.has_cold_store()
-                && let Err(err) = runtime
-                    .flush_cold_all_groups_once_bounded(
-                        PlanGroupColdFlushRequest {
-                            min_hot_bytes: 1,
-                            max_flush_bytes: 64 * 1024 * 1024,
-                        },
-                        max_concurrency,
-                    )
-                    .await
-            {
-                tracing::error!("snapshot driver flush error: {err}");
             }
 
             if !bad_tick

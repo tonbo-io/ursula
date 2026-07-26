@@ -59,6 +59,7 @@ pub fn spawn_cold_flush_worker_if_configured(
                     PlanGroupColdFlushRequest {
                         min_hot_bytes,
                         max_flush_bytes,
+                        max_batch_bytes: max_flush_bytes,
                     },
                     max_concurrency,
                 )
