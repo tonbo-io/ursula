@@ -154,12 +154,18 @@ pub fn spawn_runtime(
             &config.governance.cluster_probe,
         );
         commit_stall::spawn_commit_stall_watchdog(&registry, &config.governance.commit_stall);
-        cold_health::spawn_cold_health_gate(
-            &spawned.runtime,
-            &registry,
-            *node_id,
-            &config.governance.cold_health,
-        );
+        // Hot bytes are a cold-tier backlog signal only when a cold store can
+        // drain them. Memory-only clusters intentionally retain all payloads
+        // hot, so applying the cold-health watermark there would eventually
+        // make every voter shed leadership.
+        if spawned.runtime.has_cold_store() {
+            cold_health::spawn_cold_health_gate(
+                &spawned.runtime,
+                &registry,
+                *node_id,
+                &config.governance.cold_health,
+            );
+        }
     }
 
     Ok(spawned)
