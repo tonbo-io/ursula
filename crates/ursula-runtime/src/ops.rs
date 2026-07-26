@@ -321,7 +321,7 @@ macro_rules! runtime_operations {
                 fields { request: AppendRequest }
                 reply { response_tx: AppendResponse }
                 guard { raft_uncommitted }
-                handle { actor handle_append(request, response_tx, raft_uncommitted) }
+                handle { actor handle_append(request, response_tx, raft_uncommitted, pending) }
                 client {
                     pub stream fn append,
                     non_empty: payload,
