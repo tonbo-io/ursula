@@ -4374,6 +4374,7 @@ dependencies = [
  "toml",
  "tracing",
  "ursula-observability",
+ "ursula-shard",
 ]
 
 [[package]]

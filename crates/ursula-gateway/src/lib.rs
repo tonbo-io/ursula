@@ -44,6 +44,8 @@ use rand::prelude::IndexedRandom;
 use tokio::time::Instant;
 use tracing::debug;
 use tracing::error;
+use ursula_shard::BucketStreamId;
+use ursula_shard::StaticShardMap;
 
 pub mod admission;
 pub mod auth;
@@ -108,6 +110,10 @@ pub struct GatewayConfig {
     pub response_header_timeout: Duration,
     pub connect_timeout: Duration,
     pub max_request_body_bytes: usize,
+    /// Raft topology used to share one learned leader across every stream in
+    /// the same group. `None` preserves per-stream affinity for standalone
+    /// gateways that do not know the server topology.
+    pub raft_group_count: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -119,6 +125,7 @@ pub struct Gateway {
     quota_provider: Option<Arc<dyn QuotaProvider>>,
     admission: Arc<Admission>,
     usage: Option<Arc<UsageCollector>>,
+    shard_map: Option<StaticShardMap>,
     leader_affinity: Arc<Mutex<HashMap<String, String>>>,
     metrics: Arc<GatewayMetrics>,
 }
@@ -135,6 +142,9 @@ impl std::fmt::Debug for Gateway {
 
 impl Gateway {
     pub fn new(config: GatewayConfig) -> Self {
+        let shard_map = config
+            .raft_group_count
+            .and_then(|group_count| StaticShardMap::new(1, group_count).ok());
         let client = reqwest::Client::builder()
             .connect_timeout(config.connect_timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -149,6 +159,7 @@ impl Gateway {
             quota_provider: None,
             admission: Arc::new(Admission::default()),
             usage: None,
+            shard_map,
             leader_affinity: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(GatewayMetrics::default()),
         }
@@ -353,7 +364,7 @@ impl Gateway {
     }
 
     fn pick_upstream(&self, uri: &Uri) -> Option<String> {
-        if let Some(key) = stream_affinity_key(uri)
+        if let Some(key) = stream_affinity_key(uri, self.shard_map.as_ref())
             && let Some(upstream) = self
                 .leader_affinity
                 .lock()
@@ -403,7 +414,7 @@ impl Gateway {
                 self.metrics
                     .leader_redirects
                     .fetch_add(1, Ordering::Relaxed);
-                if let Some(key) = stream_affinity_key(&parts.uri) {
+                if let Some(key) = stream_affinity_key(&parts.uri, self.shard_map.as_ref()) {
                     self.remember_leader(key, leader_upstream.to_owned());
                 }
                 // Drop the follower response; it has no meaningful body.
@@ -431,7 +442,7 @@ impl Gateway {
         // fresh random/redirect lookup.
         if upstream_resp.status() == StatusCode::SERVICE_UNAVAILABLE
             && upstream_resp.headers().contains_key(RETRY_AFTER)
-            && let Some(key) = stream_affinity_key(&parts.uri)
+            && let Some(key) = stream_affinity_key(&parts.uri, self.shard_map.as_ref())
         {
             self.forget_leader_if_matches(&key, upstream);
         }
@@ -574,12 +585,16 @@ impl Gateway {
     }
 }
 
-fn stream_affinity_key(uri: &Uri) -> Option<String> {
+fn stream_affinity_key(uri: &Uri, shard_map: Option<&StaticShardMap>) -> Option<String> {
     let mut segments = uri.path().split('/').filter(|segment| !segment.is_empty());
-    let bucket = segments.next()?;
-    let stream = segments.next()?;
+    let bucket = percent_decode_str(segments.next()?).decode_utf8().ok()?;
+    let stream = percent_decode_str(segments.next()?).decode_utf8().ok()?;
     if bucket.starts_with("__ursula") {
         return None;
+    }
+    if let Some(shard_map) = shard_map {
+        let placement = shard_map.locate(&BucketStreamId::new(bucket, stream));
+        return Some(format!("group:{}", placement.raft_group_id.0));
     }
     Some(format!("/{bucket}/{stream}"))
 }

@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +38,7 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
         response_header_timeout: Duration::from_secs(args.response_header_timeout),
         connect_timeout: Duration::from_secs(args.connect_timeout),
         max_request_body_bytes: args.max_request_body_bytes,
+        raft_group_count: args.raft_group_count.map(NonZeroUsize::get),
     };
 
     let mut gateway = match installed_access_control {
@@ -156,6 +158,11 @@ pub struct GatewayArgs {
     /// Maximum request body bytes buffered for leader-redirect replay.
     #[arg(long, default_value_t = DEFAULT_MAX_REQUEST_BODY_BYTES)]
     max_request_body_bytes: usize,
+
+    /// Number of Raft groups in the upstream Ursula cluster. When set, leader
+    /// affinity is shared by every stream that hashes to the same group.
+    #[arg(long)]
+    raft_group_count: Option<NonZeroUsize>,
 
     /// Maximum graceful shutdown drain time after SIGTERM/CTRL-C, in seconds.
     #[arg(long, default_value_t = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS)]

@@ -71,6 +71,8 @@ spec:
             - {{ .Values.gateway.responseHeaderTimeoutSeconds | quote }}
             - --max-request-body-bytes
             - {{ .Values.gateway.maxRequestBodyBytes | int64 | quote }}
+            - --raft-group-count
+            - {{ .Values.raft.groupCount | int | quote }}
             - --graceful-shutdown-timeout
             - {{ .Values.gateway.gracefulShutdownTimeoutSeconds | quote }}
             {{- range $upstreams }}

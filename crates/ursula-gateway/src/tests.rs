@@ -127,6 +127,7 @@ fn test_config(upstreams: Vec<String>) -> GatewayConfig {
         response_header_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(1),
         max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
+        raft_group_count: None,
     }
 }
 
@@ -197,10 +198,44 @@ fn stream_affinity_key_ignores_subresource_and_internal_routes() {
     let metrics: Uri = "/__ursula/gateway/metrics".parse().expect("uri");
 
     assert_eq!(
-        stream_affinity_key(&append_batch).as_deref(),
+        stream_affinity_key(&append_batch, None).as_deref(),
         Some("/bucket/stream")
     );
-    assert_eq!(stream_affinity_key(&metrics), None);
+    assert_eq!(stream_affinity_key(&metrics, None), None);
+}
+
+#[test]
+fn group_affinity_key_is_shared_by_streams_in_the_same_group() {
+    let shard_map = StaticShardMap::new(1, 16).expect("valid shard map");
+    let first: Uri = "/bucket/stream-1".parse().expect("uri");
+    let first_key = stream_affinity_key(&first, Some(&shard_map)).expect("first key");
+    let second = (2..10_000)
+        .map(|index| {
+            format!("/bucket/stream-{index}")
+                .parse::<Uri>()
+                .expect("uri")
+        })
+        .find(|uri| stream_affinity_key(uri, Some(&shard_map)).as_ref() == Some(&first_key))
+        .expect("stream in same group");
+
+    assert_ne!(first.path(), second.path());
+    assert_eq!(
+        stream_affinity_key(&second, Some(&shard_map)).as_deref(),
+        Some(first_key.as_str())
+    );
+
+    let mut config = test_config(vec![
+        "http://follower.test".to_owned(),
+        "http://leader.test".to_owned(),
+    ]);
+    config.raft_group_count = Some(16);
+    let gateway = Gateway::new(config);
+    gateway.remember_leader(first_key, "http://leader.test".to_owned());
+    assert_eq!(
+        gateway.pick_upstream(&second).as_deref(),
+        Some("http://leader.test")
+    );
+    assert_eq!(gateway.metrics_snapshot().leader_cache_hits, 1);
 }
 
 fn gateway_with_response_header_timeout(
