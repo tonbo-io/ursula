@@ -37,6 +37,10 @@ server:
   replicaCount: 3
   # StatefulSet pod management policy. Parallel avoids readiness-gated bootstrap serialization.
   podManagementPolicy: Parallel
+  # RollingUpdate lets Kubernetes replace pods automatically. OnDelete stages
+  # new templates without restarting voters so an external graceful-rollout
+  # controller can drain and replace exactly one pod at a time.
+  updateStrategy: RollingUpdate
   ports:
     # Ursula public client-plane HTTP port (stream reads/writes). The mutating
     # admin plane binds to pod loopback (127.0.0.1:4438) and is intentionally

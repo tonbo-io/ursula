@@ -146,6 +146,11 @@
           "enum": ["OrderedReady", "Parallel"],
           "description": "StatefulSet pod management policy."
         },
+        "updateStrategy": {
+          "type": "string",
+          "enum": ["RollingUpdate", "OnDelete"],
+          "description": "StatefulSet update strategy. OnDelete stages templates for an external graceful-rollout controller."
+        },
         "ports": {
           "type": "object",
           "additionalProperties": false,
@@ -254,6 +259,7 @@
       "required": [
         "replicaCount",
         "podManagementPolicy",
+        "updateStrategy",
         "ports",
         "service",
         "headlessService",

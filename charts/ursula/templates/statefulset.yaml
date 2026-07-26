@@ -16,6 +16,8 @@ spec:
   serviceName: {{ include "ursula.headlessServiceName" . }}
   replicas: {{ $replicaCount }}
   podManagementPolicy: {{ .Values.server.podManagementPolicy }}
+  updateStrategy:
+    type: {{ .Values.server.updateStrategy }}
   selector:
     matchLabels:
       {{- include "ursula.selectorLabels" . | nindent 6 }}
