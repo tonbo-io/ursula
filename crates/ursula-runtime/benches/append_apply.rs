@@ -5,7 +5,13 @@ use criterion::Throughput;
 use criterion::black_box;
 use criterion::criterion_group;
 use criterion::criterion_main;
+use ursula_runtime::GroupWriteCommand;
+use ursula_runtime::InMemoryGroupEngine;
 use ursula_shard::BucketStreamId;
+use ursula_shard::CoreId;
+use ursula_shard::RaftGroupId;
+use ursula_shard::ShardId;
+use ursula_shard::ShardPlacement;
 use ursula_stream::ProducerRequest;
 use ursula_stream::StreamCommand;
 use ursula_stream::StreamResponse;
@@ -17,6 +23,7 @@ const PAYLOAD_BYTES: usize = 256;
 const STREAM_COUNT: usize = 1024;
 const RECORD_COUNT: usize = 100_000;
 const JSON_RECORD: &[u8] = b"{\"value\":1}\n";
+const CARDINALITY_APPEND_COUNT: usize = 256;
 
 fn append_apply_benches(c: &mut Criterion) {
     let payload = vec![7; PAYLOAD_BYTES];
@@ -135,6 +142,78 @@ fn record_coordinate_benches(c: &mut Criterion) {
         );
     });
     group.finish();
+}
+
+fn unrelated_stream_cardinality_benches(c: &mut Criterion) {
+    let placement = ShardPlacement {
+        core_id: CoreId(0),
+        shard_id: ShardId(0),
+        raft_group_id: RaftGroupId(0),
+    };
+    let mut group = c.benchmark_group("unrelated_stream_cardinality");
+    group.throughput(Throughput::Elements(
+        u64::try_from(CARDINALITY_APPEND_COUNT).expect("append count fits u64"),
+    ));
+
+    for stream_count in [1, 16_384] {
+        let engine = setup_group_engine(stream_count, placement);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(stream_count),
+            &stream_count,
+            |b, _| {
+                b.iter_batched(
+                    || engine.clone(),
+                    |mut engine| {
+                        for _ in 0..CARDINALITY_APPEND_COUNT {
+                            let response = engine
+                                .apply_committed_write(
+                                    GroupWriteCommand::Stream(StreamCommand::Append {
+                                        stream_id: stream_id(0),
+                                        content_type: Some(CONTENT_TYPE.to_owned()),
+                                        payload: bytes::Bytes::from_static(b"x"),
+                                        close_after: false,
+                                        stream_seq: None,
+                                        producer: None,
+                                        now_ms: 0,
+                                        record_match: None,
+                                    }),
+                                    placement,
+                                )
+                                .expect("append applies");
+                            black_box(response);
+                        }
+                    },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+fn setup_group_engine(stream_count: usize, placement: ShardPlacement) -> InMemoryGroupEngine {
+    let mut engine = InMemoryGroupEngine::default();
+    for stream_index in 0..stream_count {
+        let response = engine
+            .apply_committed_write(
+                GroupWriteCommand::Stream(StreamCommand::CreateStream {
+                    stream_id: stream_id(stream_index),
+                    content_type: CONTENT_TYPE.to_owned(),
+                    initial_payload: bytes::Bytes::new(),
+                    close_after: false,
+                    stream_seq: None,
+                    producer: None,
+                    stream_ttl_seconds: None,
+                    stream_expires_at_ms: None,
+                    attrs: None,
+                    now_ms: 0,
+                }),
+                placement,
+            )
+            .expect("stream create applies");
+        black_box(response);
+    }
+    engine
 }
 
 fn setup_record_machine(record_count: usize) -> (StreamStateMachine, BucketStreamId) {
@@ -362,5 +441,10 @@ fn stream_id(index: usize) -> BucketStreamId {
     BucketStreamId::new("benchcmp", format!("append-{index}"))
 }
 
-criterion_group!(benches, append_apply_benches, record_coordinate_benches);
+criterion_group!(
+    benches,
+    append_apply_benches,
+    record_coordinate_benches,
+    unrelated_stream_cardinality_benches
+);
 criterion_main!(benches);

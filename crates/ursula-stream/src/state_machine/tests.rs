@@ -1745,6 +1745,15 @@ fn hot_payload_byte_metrics_follow_cold_flush() {
     );
     assert_eq!(machine.hot_payload_len(&stream("hot-a")), Ok(1));
     assert_eq!(machine.total_hot_payload_bytes(), 3);
+
+    let mut restored =
+        StreamStateMachine::restore(machine.snapshot()).expect("restore hot payload gauge");
+    assert_eq!(restored.total_hot_payload_bytes(), 3);
+    assert_eq!(
+        restored.apply(delete_cmd(stream("hot-b"))),
+        StreamResponse::Deleted
+    );
+    assert_eq!(restored.total_hot_payload_bytes(), 1);
 }
 
 #[test]

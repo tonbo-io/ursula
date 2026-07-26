@@ -99,6 +99,9 @@ new_key_type! {
 pub struct StreamStateMachine {
     buckets: HashSet<String>,
     registry: StreamRegistry,
+    /// Group-wide hot payload gauge. Kept incrementally so append admission
+    /// and responses do not scan every stream in the group.
+    hot_payload_bytes: u64,
     cold_gc: ColdGcQueue,
     /// Live logical references to group-scoped shared cold objects. This is
     /// derived from per-stream cold refs when snapshots are restored.
@@ -178,7 +181,18 @@ impl StreamStateMachine {
     }
 
     fn insert_stream_slot(&mut self, slot: StreamSlot) -> Option<StreamKey> {
-        self.registry.insert(slot)
+        let hot_payload_bytes = u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64");
+        let key = self.registry.insert(slot)?;
+        self.hot_payload_bytes = self.hot_payload_bytes.saturating_add(hot_payload_bytes);
+        Some(key)
+    }
+
+    fn add_hot_payload_bytes(&mut self, bytes: u64) {
+        self.hot_payload_bytes = self.hot_payload_bytes.saturating_add(bytes);
+    }
+
+    fn remove_hot_payload_bytes(&mut self, bytes: u64) {
+        self.hot_payload_bytes = self.hot_payload_bytes.saturating_sub(bytes);
     }
 
     /// Records committed by one accepted append. JSON streams provide exact

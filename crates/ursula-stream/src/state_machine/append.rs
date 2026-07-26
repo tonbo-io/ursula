@@ -231,6 +231,7 @@ impl StreamStateMachine {
                     next_offset,
                     &record_ends,
                 ));
+            self.add_hot_payload_bytes(payload_len);
             self.usage_on_append(
                 &stream_id.bucket_id,
                 payload_len,
@@ -650,6 +651,7 @@ impl StreamStateMachine {
             appended_records = appended_records
                 .saturating_add(Self::appended_record_count(record_ends, item_bytes));
         }
+        self.add_hot_payload_bytes(appended_bytes);
         self.usage_on_append(&stream_id.bucket_id, appended_bytes, appended_records);
         Ok(StreamBatchAppend {
             items: items
