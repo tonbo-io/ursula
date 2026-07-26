@@ -330,8 +330,7 @@ runtime_metrics! {
         core per_core_group_lock_wait_ns, group per_group_group_lock_wait_ns;
     sum group_engine_exec_ns:
         core per_core_group_engine_exec_ns, group per_group_group_engine_exec_ns;
-    sum group_mailbox_depth:
-        core per_core_group_mailbox_depth, group per_group_group_mailbox_depth;
+    sum group_mailbox_depth: group per_group_group_mailbox_depth;
     max group_mailbox_max_depth: group per_group_group_mailbox_max_depth;
     sum group_mailbox_full_events: group per_group_group_mailbox_full_events;
     sum raft_write_many_batches:
@@ -500,8 +499,7 @@ impl RuntimeMetricsInner {
         self.per_group_read_watcher_replans[group_index].fetch_add_relaxed(replans);
     }
 
-    pub(crate) fn record_group_mailbox_enqueued(&self, core_id: CoreId, group_id: RaftGroupId) {
-        self.per_core_group_mailbox_depth[usize::from(core_id.0)].fetch_add_relaxed(1);
+    pub(crate) fn record_group_mailbox_enqueued(&self, group_id: RaftGroupId) {
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
         let depth = self.per_group_group_mailbox_depth[group_index]
             .fetch_add_relaxed(1)
@@ -509,14 +507,9 @@ impl RuntimeMetricsInner {
         self.per_group_group_mailbox_max_depth[group_index].fetch_max_relaxed(depth);
     }
 
-    pub(crate) fn record_group_mailbox_dequeued(&self, core_id: CoreId, group_id: RaftGroupId) {
-        self.per_core_group_mailbox_depth[usize::from(core_id.0)].fetch_sub_saturating_relaxed(1);
+    pub(crate) fn record_group_mailbox_dequeued(&self, group_id: RaftGroupId) {
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
         self.per_group_group_mailbox_depth[group_index].fetch_sub_saturating_relaxed(1);
-    }
-
-    pub(crate) fn core_has_queued_group_commands(&self, core_id: CoreId) -> bool {
-        self.per_core_group_mailbox_depth[usize::from(core_id.0)].load_relaxed() > 0
     }
 
     pub(crate) fn record_group_mailbox_full(&self, group_id: RaftGroupId) {
@@ -793,7 +786,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 118] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 117] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -822,7 +815,6 @@ mod metric_manifest_tests {
         "per_core_group_engine_exec_ns",
         "per_group_group_engine_exec_ns",
         "group_mailbox_depth",
-        "per_core_group_mailbox_depth",
         "per_group_group_mailbox_depth",
         "group_mailbox_max_depth",
         "per_group_group_mailbox_max_depth",

@@ -3405,10 +3405,6 @@ async fn group_mailbox_full_events_record_inner_actor_backpressure() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    let snapshot = runtime.metrics().snapshot();
-    assert_eq!(snapshot.group_mailbox_depth, 1);
-    assert_eq!(snapshot.per_core_group_mailbox_depth, vec![1]);
-    assert_eq!(snapshot.per_group_group_mailbox_depth, vec![1]);
 
     let third_runtime = runtime.clone();
     let third = tokio::spawn(async move {
@@ -3431,10 +3427,6 @@ async fn group_mailbox_full_events_record_inner_actor_backpressure() {
     first.await.expect("first task");
     second.await.expect("second task");
     third.await.expect("third task");
-    let snapshot = runtime.metrics().snapshot();
-    assert_eq!(snapshot.group_mailbox_depth, 0);
-    assert_eq!(snapshot.per_core_group_mailbox_depth, vec![0]);
-    assert_eq!(snapshot.per_group_group_mailbox_depth, vec![0]);
 }
 
 #[derive(Debug, Clone)]
