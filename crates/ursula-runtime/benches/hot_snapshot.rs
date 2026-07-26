@@ -13,6 +13,7 @@ use ursula_stream::StreamStateMachine;
 
 const CONTENT_TYPE: &str = "application/octet-stream";
 const STREAMS: usize = 128;
+const HIGH_CARDINALITY_STREAMS: usize = 16_384;
 const CHUNKS_PER_STREAM: usize = 64;
 const CHUNK_BYTES: usize = 1024;
 
@@ -41,6 +42,16 @@ fn hot_snapshot_benches(c: &mut Criterion) {
         );
     }
 
+    group.finish();
+
+    let machine = build_high_cardinality_machine();
+    let mut group = c.benchmark_group("high_cardinality_snapshot");
+    group.throughput(Throughput::Elements(
+        u64::try_from(HIGH_CARDINALITY_STREAMS).expect("stream count fits u64"),
+    ));
+    group.bench_function("short_streams", |b| {
+        b.iter(|| black_box(machine.snapshot()));
+    });
     group.finish();
 }
 
@@ -143,6 +154,36 @@ fn build_machine(scenario: SnapshotScenario) -> StreamStateMachine {
         }
     }
 
+    machine
+}
+
+fn build_high_cardinality_machine() -> StreamStateMachine {
+    let mut machine = StreamStateMachine::new();
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateBucket {
+            bucket_id: "high-cardinality".to_owned(),
+        }),
+        StreamResponse::BucketCreated { .. }
+    ));
+    for stream_index in 0..HIGH_CARDINALITY_STREAMS {
+        let stream_id =
+            BucketStreamId::new("high-cardinality", format!("snapshot-{stream_index:05}"));
+        assert!(matches!(
+            machine.apply(StreamCommand::CreateStream {
+                stream_id,
+                content_type: CONTENT_TYPE.to_owned(),
+                initial_payload: bytes::Bytes::new(),
+                close_after: false,
+                stream_seq: None,
+                producer: None,
+                stream_ttl_seconds: None,
+                stream_expires_at_ms: None,
+                attrs: None,
+                now_ms: 0,
+            }),
+            StreamResponse::Created { .. }
+        ));
+    }
     machine
 }
 
