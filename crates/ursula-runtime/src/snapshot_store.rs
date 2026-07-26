@@ -309,10 +309,7 @@ impl SnapshotStore for InlineSnapshotStore {
         chunks: SnapshotBytesIterator,
     ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
         Box::pin(async move {
-            let mut bytes = Vec::new();
-            for chunk in chunks {
-                bytes.extend_from_slice(chunk?.as_ref());
-            }
+            let bytes = collect_inline_snapshot(chunks).await?;
             Ok(SnapshotLocation::Inline { bytes })
         })
     }
@@ -331,6 +328,34 @@ impl SnapshotStore for InlineSnapshotStore {
     fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
         Box::pin(async move { Ok(()) })
     }
+}
+
+#[cfg(not(madsim))]
+async fn collect_inline_snapshot(
+    chunks: SnapshotBytesIterator,
+) -> Result<Vec<u8>, SnapshotStoreError> {
+    tokio::task::spawn_blocking(move || collect_snapshot_chunks(chunks))
+        .await
+        .map_err(|err| {
+            SnapshotStoreError::Io(io::Error::other(format!(
+                "join inline snapshot encoder: {err}"
+            )))
+        })?
+}
+
+#[cfg(madsim)]
+async fn collect_inline_snapshot(
+    chunks: SnapshotBytesIterator,
+) -> Result<Vec<u8>, SnapshotStoreError> {
+    collect_snapshot_chunks(chunks)
+}
+
+fn collect_snapshot_chunks(chunks: SnapshotBytesIterator) -> Result<Vec<u8>, SnapshotStoreError> {
+    let mut bytes = Vec::new();
+    for chunk in chunks {
+        bytes.extend_from_slice(chunk?.as_ref());
+    }
+    Ok(bytes)
 }
 
 #[cfg(not(madsim))]
@@ -956,6 +981,28 @@ mod tests {
         let bytes = store.download(&loc).await.unwrap();
         assert_eq!(bytes, b"hello world");
         store.delete(&loc).await.unwrap();
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn inline_iterator_is_consumed_off_the_async_worker() {
+        let store = InlineSnapshotStore;
+        let caller = std::thread::current().id();
+        let (thread_tx, thread_rx) = std::sync::mpsc::channel();
+        let chunks = Box::new(std::iter::once_with(move || {
+            thread_tx.send(std::thread::current().id()).unwrap();
+            Ok(Bytes::from_static(b"snapshot"))
+        }));
+
+        let location = store
+            .upload_iter(test_key(0, "offloaded"), chunks)
+            .await
+            .unwrap();
+
+        assert_ne!(thread_rx.recv().unwrap(), caller);
+        assert_eq!(location, SnapshotLocation::Inline {
+            bytes: b"snapshot".to_vec()
+        });
     }
 
     #[tokio::test]
