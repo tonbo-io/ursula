@@ -414,6 +414,30 @@ pub trait GroupEngine: Send + 'static {
         admission: ColdWriteAdmission,
     ) -> GroupAppendFuture<'a>;
 
+    /// Applies independent ordinary appends through one group-engine call.
+    ///
+    /// Each request retains its own producer, CAS, close, and stream-sequence
+    /// semantics. Engines without a native multi-write path fall back to
+    /// applying the requests in order.
+    fn append_many<'a>(
+        &'a mut self,
+        requests: Vec<AppendRequest>,
+        placement: ShardPlacement,
+        admission: ColdWriteAdmission,
+    ) -> GroupWriteBatchFuture<'a> {
+        Box::pin(async move {
+            let mut responses = Vec::with_capacity(requests.len());
+            for request in requests {
+                let response = self
+                    .append(request, placement, admission)
+                    .await
+                    .map(GroupWriteResponse::Append);
+                responses.push(response);
+            }
+            Ok(responses)
+        })
+    }
+
     fn append_external<'a>(
         &'a mut self,
         request: AppendExternalRequest,

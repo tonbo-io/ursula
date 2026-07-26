@@ -445,6 +445,26 @@ impl RaftGroupStateMachine {
         Ok(())
     }
 
+    pub async fn check_append_many_cold_admission(
+        &mut self,
+        requests: Vec<AppendRequest>,
+        placement: ShardPlacement,
+        admission: ColdWriteAdmission,
+    ) -> Result<(), GroupEngineError> {
+        let _ = placement;
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let stream_id = requests[0].stream_id.clone();
+        let incoming_bytes = requests
+            .iter()
+            .map(|request| u64::try_from(request.payload.len()).expect("payload len fits u64"))
+            .sum();
+        self.engine
+            .check_cold_write_admission_bytes(&stream_id, admission, incoming_bytes)?;
+        Ok(())
+    }
+
     pub async fn check_append_batch_cold_admission(
         &mut self,
         request: AppendBatchRequest,

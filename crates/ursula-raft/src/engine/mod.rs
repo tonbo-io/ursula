@@ -1283,6 +1283,56 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
+    fn append_many<'a>(
+        &'a mut self,
+        requests: Vec<AppendRequest>,
+        placement: ShardPlacement,
+        admission: ColdWriteAdmission,
+    ) -> GroupWriteBatchFuture<'a> {
+        Box::pin(async move {
+            if requests.is_empty() {
+                return Ok(Vec::new());
+            }
+            let command = GroupWriteCommand::Batch {
+                commands: requests.iter().cloned().map(StreamCommand::from).collect(),
+            };
+            if let Some(response) = self
+                .forward_write_to_leader_if_follower(command.clone())
+                .await?
+            {
+                return match response {
+                    GroupWriteResponse::Batch(responses) => Ok(responses),
+                    other => Err(GroupEngineError::new(format!(
+                        "unexpected append-many write response: {other:?}"
+                    ))),
+                };
+            }
+            if admission.max_hot_bytes_per_group.is_some() {
+                self.with_state_machine({
+                    let requests = requests.clone();
+                    move |state_machine| {
+                        Box::pin(async move {
+                            state_machine
+                                .check_append_many_cold_admission(requests, placement, admission)
+                                .await
+                        })
+                    }
+                })
+                .await??;
+            }
+            let mut responses = self.write_commands(vec![command]).await?;
+            let response = responses.pop().ok_or_else(|| {
+                GroupEngineError::new("OpenRaft append many returned no response")
+            })?;
+            match response? {
+                GroupWriteResponse::Batch(responses) => Ok(responses),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected append-many write response: {other:?}"
+                ))),
+            }
+        })
+    }
+
     fn append_batch<'a>(
         &'a mut self,
         request: AppendBatchRequest,

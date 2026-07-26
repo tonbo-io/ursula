@@ -110,6 +110,22 @@ pub(crate) type AppendBatchEntry = (
     Option<UncommittedBytesGuard>,
 );
 
+pub(crate) type AppendEntry = (
+    AppendRequest,
+    oneshot::Sender<Result<AppendResponse, RuntimeError>>,
+    Option<UncommittedBytesGuard>,
+);
+
+pub(crate) struct PendingAppend {
+    pub(crate) stream_id: BucketStreamId,
+    pub(crate) incoming_bytes: u64,
+    pub(crate) response_tx: oneshot::Sender<Result<AppendResponse, RuntimeError>>,
+    pub(crate) started_at: Instant,
+    /// Released when this pending entry resolves (success or error).
+    #[allow(dead_code)]
+    pub(crate) raft_uncommitted: Option<UncommittedBytesGuard>,
+}
+
 pub(crate) struct PendingAppendBatch {
     pub(crate) stream_id: BucketStreamId,
     pub(crate) incoming_bytes: u64,
@@ -610,7 +626,40 @@ impl GroupActor {
         request: AppendRequest,
         response_tx: oneshot::Sender<Result<AppendResponse, RuntimeError>>,
         raft_uncommitted: Option<UncommittedBytesGuard>,
+        pending: &mut VecDeque<Traced<GroupCommand>>,
     ) -> ControlFlow<()> {
+        let mut batch = vec![(request, response_tx, raft_uncommitted)];
+        let mut coalesced_parents = Vec::new();
+        self.collect_append_commands(pending, &mut batch, &mut coalesced_parents);
+        if batch.len() > 1 {
+            let span = tracing::debug_span!(
+                "core.append_many",
+                group = self.placement.raft_group_id.0,
+                batch = batch.len(),
+            );
+            for parent in &coalesced_parents {
+                span.follows_from(parent);
+            }
+            let (requests, pending_batch) = CoreWorker::prepare_append_requests(batch);
+            CoreWorker::apply_prepared_append_requests(
+                &mut self.engine,
+                AppendBatchRuntime {
+                    metrics: self.metrics.clone(),
+                    read_materialization: self.read_materialization.clone(),
+                    placement: self.placement,
+                },
+                &mut self.read_watchers,
+                pending_batch,
+                requests,
+                self.cold_write_admission,
+            )
+            .instrument(span)
+            .await;
+            return ControlFlow::Continue(());
+        }
+        let Some((request, response_tx, raft_uncommitted)) = batch.pop() else {
+            return ControlFlow::Continue(());
+        };
         let stream_id = request.stream_id.clone();
         let response = CoreWorker::commit_append(
             &mut self.engine,
@@ -743,6 +792,46 @@ impl GroupActor {
                 Some(Traced {
                     value:
                         GroupCommand::AppendBatch {
+                            request,
+                            response_tx,
+                            raft_uncommitted,
+                        },
+                    parent,
+                }) => {
+                    batch.push((request, response_tx, raft_uncommitted));
+                    coalesced_parents.push(parent);
+                }
+                Some(other) => {
+                    pending.push_front(other);
+                    break;
+                }
+                None => break,
+            }
+        }
+    }
+
+    pub(crate) fn collect_append_commands(
+        &mut self,
+        pending: &mut VecDeque<Traced<GroupCommand>>,
+        batch: &mut Vec<AppendEntry>,
+        coalesced_parents: &mut Vec<Span>,
+    ) {
+        while batch.len() < GROUP_ACTOR_MAX_WRITE_BATCH {
+            let command = match pending.pop_front() {
+                Some(command) => Some(command),
+                None => match self.rx.try_recv() {
+                    Ok(command) => {
+                        self.metrics
+                            .record_group_mailbox_dequeued(self.placement.raft_group_id);
+                        Some(command)
+                    }
+                    Err(_) => None,
+                },
+            };
+            match command {
+                Some(Traced {
+                    value:
+                        GroupCommand::Append {
                             request,
                             response_tx,
                             raft_uncommitted,
