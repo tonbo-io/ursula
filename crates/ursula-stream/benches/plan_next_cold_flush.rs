@@ -36,6 +36,7 @@ fn plan_next_cold_flush_benches(c: &mut Criterion) {
                         let result = machine.plan_next_cold_flush_batch(
                             MIN_HOT_BYTES,
                             MAX_FLUSH_BYTES,
+                            usize::MAX,
                             MAX_CANDIDATES,
                         );
                         let _ = black_box(result);

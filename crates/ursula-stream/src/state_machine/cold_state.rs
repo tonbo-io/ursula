@@ -25,6 +25,9 @@ impl StreamColdState {
 
     pub(super) fn push_cold_chunk(&mut self, chunk: ColdChunkRef) {
         self.cold_frontier = chunk.end_offset;
+        if chunk.shared_object {
+            self.cold_chunks.push(chunk);
+        }
     }
 
     pub(super) fn push_external_segment(&mut self, object: ObjectPayloadRef) {
@@ -61,6 +64,13 @@ impl StreamColdState {
         self.external_segments
             .retain(|object| object.end_offset > retained_offset);
         dropped_cold_paths
+    }
+
+    pub(super) fn shared_object_paths(&self) -> impl Iterator<Item = &str> {
+        self.cold_chunks
+            .iter()
+            .filter(|chunk| chunk.shared_object)
+            .map(|chunk| chunk.s3_path.as_str())
     }
 
     pub(super) fn cold_frontier_offset(&self, retained_offset: u64) -> u64 {

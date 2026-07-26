@@ -3899,6 +3899,7 @@ async fn static_grpc_raft_durable_cold_flush_replicates_manifest() {
             PlanGroupColdFlushRequest {
                 min_hot_bytes: 4,
                 max_flush_bytes: 4,
+                max_batch_bytes: payload.len(),
             },
             8,
         )

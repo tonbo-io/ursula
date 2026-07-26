@@ -10,6 +10,7 @@ readme.workspace = true
 description = "Per-core actor runtime for Ursula: hot ring, cold-tier flush, and the replaceable group-engine boundary."
 
 [dependencies]
+blake3 = { workspace = true }
 bytes = { workspace = true, features = ["serde"] }
 crossbeam-utils = { workspace = true }
 futures-util = { workspace = true }

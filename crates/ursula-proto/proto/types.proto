@@ -24,6 +24,12 @@ message ColdChunkRefV1 {
   uint64 end_offset = 2;
   string s3_path = 3;
   uint64 object_size = 4;
+  // Byte offset of this stream slice inside the physical object.
+  uint64 object_offset = 5;
+  // Shared objects may contain slices from more than one stream.
+  bool shared_object = 6;
+  // BLAKE3 digest of this logical slice. Empty on legacy references.
+  string payload_digest = 7;
 }
 
 message ShardPlacementV1 {

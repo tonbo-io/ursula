@@ -70,7 +70,12 @@ fn plan_next_cold_flush_alloc_benches(c: &mut Criterion) {
         // Single-shot memory measurement printed to stderr.
         let m = machine.clone();
         let (alloc_before, current_before) = snapshot();
-        let result = m.plan_next_cold_flush_batch(MIN_HOT_BYTES, MAX_FLUSH_BYTES, MAX_CANDIDATES);
+        let result = m.plan_next_cold_flush_batch(
+            MIN_HOT_BYTES,
+            MAX_FLUSH_BYTES,
+            usize::MAX,
+            MAX_CANDIDATES,
+        );
         black_box(&result);
         let (alloc_after_plan, current_after_plan) = snapshot();
         drop(result);
@@ -98,6 +103,7 @@ fn plan_next_cold_flush_alloc_benches(c: &mut Criterion) {
                         let result = machine.plan_next_cold_flush_batch(
                             MIN_HOT_BYTES,
                             MAX_FLUSH_BYTES,
+                            usize::MAX,
                             MAX_CANDIDATES,
                         );
                         black_box(&result);

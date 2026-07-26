@@ -439,6 +439,7 @@ fn object_ref_from_proto(object: proto::ObjectPayloadRefV1) -> ObjectPayloadRef 
         end_offset: object.end_offset,
         s3_path: object.s3_path,
         object_size: object.object_size,
+        object_offset: 0,
     }
 }
 

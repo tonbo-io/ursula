@@ -523,6 +523,8 @@ pub struct PlanColdFlushRequest {
 pub struct PlanGroupColdFlushRequest {
     pub min_hot_bytes: usize,
     pub max_flush_bytes: usize,
+    /// Maximum aggregate payload bytes returned by one group planning pass.
+    pub max_batch_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

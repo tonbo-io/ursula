@@ -135,6 +135,7 @@ fn build_machine(scenario: SnapshotScenario) -> StreamStateMachine {
                         end_offset: cold_bytes,
                         s3_path: format!("{stream_id}/chunks/000000.bin"),
                         object_size: cold_bytes,
+                        ..Default::default()
                     },
                 }),
                 StreamResponse::ColdFlushed { .. }

@@ -178,6 +178,9 @@ fn decode_page(key: &ColdIndexPageKey, bytes: &[u8]) -> io::Result<ColdIndexPage
             end_offset: body.read_u64()?,
             object_size: body.read_u64()?,
             s3_path: body.read_string()?,
+            object_offset: 0,
+            shared_object: false,
+            payload_digest: String::new(),
         });
     }
     let external_segment_count = body.read_u32()?;
@@ -196,6 +199,7 @@ fn decode_page(key: &ColdIndexPageKey, bytes: &[u8]) -> io::Result<ColdIndexPage
             end_offset: body.read_u64()?,
             object_size: body.read_u64()?,
             s3_path: body.read_string()?,
+            object_offset: 0,
         });
     }
     if body.remaining() != 0 {
@@ -420,6 +424,7 @@ pub async fn write_external_segment_index_pages<S: ColdIndexPageStore + ?Sized>(
         end_offset: start_offset.saturating_add(payload.payload_len),
         s3_path: payload.s3_path.clone(),
         object_size: payload.object_size,
+        object_offset: 0,
     };
     write_object_index_pages(store, stream_id, object).await
 }
@@ -918,6 +923,7 @@ mod tests {
                 end_offset,
                 s3_path: format!("benchcmp/cold-index/chunks/{start_offset:020}.bin"),
                 object_size: end_offset - start_offset,
+                ..Default::default()
             }],
             external_segments: Vec::new(),
         }
@@ -952,18 +958,21 @@ mod tests {
             end_offset: 128,
             s3_path: "benchcmp/cold-index/chunks/first.bin".to_owned(),
             object_size: 128,
+            ..Default::default()
         };
         let stale = ColdChunkRef {
             start_offset: 0,
             end_offset: 128,
             s3_path: "benchcmp/cold-index/chunks/stale.bin".to_owned(),
             object_size: 128,
+            ..Default::default()
         };
         let newer = ColdChunkRef {
             start_offset: 0,
             end_offset: 128,
             s3_path: "benchcmp/cold-index/chunks/newer.bin".to_owned(),
             object_size: 128,
+            ..Default::default()
         };
         write_cold_chunk_index_pages(&store, &stream_id, &first)
             .await
@@ -1000,18 +1009,21 @@ mod tests {
             end_offset: 64,
             s3_path: "benchcmp/cold-index/chunks/first.bin".to_owned(),
             object_size: 64,
+            ..Default::default()
         };
         let second = ColdChunkRef {
             start_offset: 64,
             end_offset: 128,
             s3_path: "benchcmp/cold-index/chunks/second.bin".to_owned(),
             object_size: 64,
+            ..Default::default()
         };
         let replacement = ColdChunkRef {
             start_offset: 0,
             end_offset: 128,
             s3_path: "benchcmp/cold-index/chunks/compacted.bin".to_owned(),
             object_size: 128,
+            ..Default::default()
         };
         for chunk in [&first, &second] {
             write_cold_chunk_index_pages(&store, &stream_id, chunk)
@@ -1054,6 +1066,7 @@ mod tests {
             end_offset: 128,
             s3_path: "benchcmp/cold-index/chunks/first.bin".to_owned(),
             object_size: 128,
+            ..Default::default()
         };
         write_cold_chunk_index_pages(store.as_ref(), &stream_id, &first)
             .await
@@ -1077,6 +1090,7 @@ mod tests {
             end_offset: 256,
             s3_path: "benchcmp/cold-index/chunks/second.bin".to_owned(),
             object_size: 128,
+            ..Default::default()
         };
         write_cold_chunk_index_pages(store.as_ref(), &stream_id, &second)
             .await
@@ -1103,6 +1117,7 @@ mod tests {
             end_offset: 300,
             s3_path: "benchcmp/cold-index/external/00000000000000000256.bin".to_owned(),
             object_size: 44,
+            ..Default::default()
         });
         let bytes = encode_page(&key, &page);
         assert!(bytes.starts_with(COLD_INDEX_PAGE_MAGIC));
@@ -1198,6 +1213,7 @@ mod tests {
                 end_offset: index * 2 + 2,
                 object_size: 2,
                 s3_path: format!("old-{index}"),
+                ..Default::default()
             })
             .collect::<Vec<_>>();
         for chunk in &chunks {
@@ -1213,6 +1229,7 @@ mod tests {
             end_offset: 8,
             object_size: 8,
             s3_path: "replacement".to_owned(),
+            ..Default::default()
         };
         assert!(
             replace_cold_chunk_index_pages(&store, &stream_id, &selected, &replacement)

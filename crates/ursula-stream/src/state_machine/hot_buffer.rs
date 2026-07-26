@@ -188,6 +188,12 @@ impl HotBuffer {
         false
     }
 
+    pub(super) fn digest_prefix(&self, start_offset: u64, end_offset: u64) -> Option<String> {
+        let len = usize::try_from(end_offset.checked_sub(start_offset)?).ok()?;
+        let (_, planned_end, payload) = self.plan_cold_flush_from(start_offset, len, len)?;
+        (planned_end == end_offset).then(|| blake3::hash(&payload).to_hex().to_string())
+    }
+
     pub(super) fn flush_prefix(&mut self, end_offset: u64) {
         while self
             .chunks

@@ -246,7 +246,7 @@ backend = "inline"
 # snapshots are built automatically.  Set to "0s" to disable the driver.
 # drive_interval = "60s"
 
-# Max concurrent group cold-flushes during a snapshot drive pass.
+# Compatibility-only; cold flush concurrency is configured under storage.cold.
 # drive_flush_concurrency = 4
 
 # Root directory for local snapshot store.  Required when backend = "local".

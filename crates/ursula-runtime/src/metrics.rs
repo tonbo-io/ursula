@@ -17,7 +17,7 @@ use crate::request::ColdWriteAdmission;
 use crate::rt::time::Instant;
 
 pub(crate) const GROUP_ACTOR_MAX_WRITE_BATCH: usize = 64;
-pub(crate) const COLD_FLUSH_GROUP_BATCH_MAX_CHUNKS: usize = 64;
+pub(crate) const COLD_FLUSH_GROUP_BATCH_MAX_CHUNKS: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeMetrics {
@@ -370,6 +370,9 @@ runtime_metrics! {
     counter cold_flush_uploads;
     counter cold_flush_upload_bytes;
     counter cold_flush_upload_ns;
+    counter cold_pack_uploads;
+    counter cold_pack_bytes;
+    counter cold_pack_slices;
     counter cold_flush_publishes;
     counter cold_flush_publish_bytes;
     counter cold_flush_publish_ns;
@@ -605,6 +608,12 @@ impl RuntimeMetricsInner {
         self.cold_flush_upload_ns.fetch_add_relaxed(upload_ns);
     }
 
+    pub(crate) fn record_cold_pack(&self, bytes: u64, slices: u64) {
+        self.cold_pack_uploads.fetch_add_relaxed(1);
+        self.cold_pack_bytes.fetch_add_relaxed(bytes);
+        self.cold_pack_slices.fetch_add_relaxed(slices);
+    }
+
     pub(crate) fn record_cold_publish(&self, bytes: u64, publish_ns: u64) {
         self.cold_flush_publishes.fetch_add_relaxed(1);
         self.cold_flush_publish_bytes.fetch_add_relaxed(bytes);
@@ -786,7 +795,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 117] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 120] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -886,6 +895,9 @@ mod metric_manifest_tests {
         "cold_flush_uploads",
         "cold_flush_upload_bytes",
         "cold_flush_upload_ns",
+        "cold_pack_uploads",
+        "cold_pack_bytes",
+        "cold_pack_slices",
         "cold_flush_publishes",
         "cold_flush_publish_bytes",
         "cold_flush_publish_ns",

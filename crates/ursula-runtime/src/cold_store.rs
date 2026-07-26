@@ -646,6 +646,7 @@ impl ColdStore {
             end_offset: chunk.end_offset,
             s3_path: chunk.s3_path.clone(),
             object_size: chunk.object_size,
+            object_offset: chunk.object_offset,
         };
         self.read_object_range(&object, read_start_offset, len)
             .await
@@ -708,7 +709,12 @@ impl ColdStore {
                 ),
             ));
         }
-        let object_start = read_start_offset - object.start_offset;
+        let object_start = object
+            .object_offset
+            .checked_add(read_start_offset - object.start_offset)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "cold read range overflow")
+            })?;
         let object_end = object_start.checked_add(len_u64).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "cold read range overflow")
         })?;
@@ -1280,6 +1286,12 @@ pub fn new_cold_chunk_path(
     format!(
         "{stream_id}/chunks/{start_offset:016x}-{end_offset:016x}-{unix_nanos:032x}-{sequence:016x}.bin"
     )
+}
+
+pub fn new_cold_pack_path(raft_group_id: u32) -> String {
+    let unix_nanos = cold_object_unix_nanos();
+    let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("_packs/{raft_group_id:08x}/{unix_nanos:032x}-{sequence:016x}.bin")
 }
 
 /// The prefix under which all of a stream's cold chunks live. Cold objects are

@@ -123,7 +123,6 @@ pub fn spawn_runtime(
             &spawned.runtime,
             &registry,
             snapshot_store,
-            &config.storage.snapshot,
             config.storage.cold.s3.as_ref(),
             snapshot_drive_interval_ms,
         );

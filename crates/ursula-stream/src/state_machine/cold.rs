@@ -48,11 +48,13 @@ impl StreamStateMachine {
         else {
             return Ok(None);
         };
+        let payload_digest = blake3::hash(&payload).to_hex().to_string();
         Ok(Some(ColdFlushCandidate {
             stream_id: stream_id.clone(),
             start_offset,
             end_offset,
             payload,
+            payload_digest,
         }))
     }
 
@@ -104,13 +106,32 @@ impl StreamStateMachine {
         &self,
         min_hot_bytes: usize,
         max_flush_bytes: usize,
+        max_batch_bytes: usize,
         max_candidates: usize,
     ) -> Result<Vec<ColdFlushCandidate>, StreamResponse> {
-        if max_candidates == 0 || max_flush_bytes == 0 {
+        if max_candidates == 0 || max_flush_bytes == 0 || max_batch_bytes == 0 {
             return Ok(Vec::new());
         }
         let mut planned_flush_offsets: HashMap<BucketStreamId, u64> = HashMap::new();
         let mut candidates = Vec::with_capacity(max_candidates);
+        let mut batch_bytes = 0usize;
+        let initial_group_hot_bytes = self
+            .registry
+            .stream_ids()
+            .map(|stream_id| {
+                u64::try_from(
+                    self.stream_slot(stream_id)
+                        .map(|slot| {
+                            slot.hot_buffer
+                                .remaining_len_from(self.hot_start_offset(stream_id))
+                        })
+                        .unwrap_or(0),
+                )
+                .expect("len fits u64")
+            })
+            .sum::<u64>();
+        let drain_group =
+            initial_group_hot_bytes >= u64::try_from(min_hot_bytes).unwrap_or(u64::MAX);
         while candidates.len() < max_candidates {
             let start_for = |stream_id: &BucketStreamId| -> u64 {
                 planned_flush_offsets
@@ -133,15 +154,25 @@ impl StreamStateMachine {
                 .sum();
             let candidate = self.plan_next_cold_flush_from_start(
                 start_for,
-                min_hot_bytes,
+                if drain_group { 1 } else { min_hot_bytes },
                 max_flush_bytes,
                 group_hot_bytes,
             )?;
             let Some(candidate) = candidate else {
                 break;
             };
+            let Some(next_batch_bytes) = batch_bytes.checked_add(candidate.payload.len()) else {
+                break;
+            };
+            if !candidates.is_empty() && next_batch_bytes > max_batch_bytes {
+                break;
+            }
             planned_flush_offsets.insert(candidate.stream_id.clone(), candidate.end_offset);
+            batch_bytes = next_batch_bytes;
             candidates.push(candidate);
+            if batch_bytes >= max_batch_bytes {
+                break;
+            }
         }
         Ok(candidates)
     }
@@ -402,6 +433,25 @@ impl StreamStateMachine {
                 stream.tail_offset,
             );
         }
+        let logical_size = chunk.end_offset.saturating_sub(chunk.start_offset);
+        if chunk
+            .object_offset
+            .checked_add(logical_size)
+            .is_none_or(|end| end > chunk.object_size)
+        {
+            return StreamResponse::error_with_next_offset(
+                StreamErrorCode::InvalidColdFlush,
+                "cold chunk slice is outside the physical object",
+                stream.tail_offset,
+            );
+        }
+        if !chunk.shared_object && chunk.object_offset != 0 {
+            return StreamResponse::error_with_next_offset(
+                StreamErrorCode::InvalidColdFlush,
+                "exclusive cold chunks must start at physical object offset zero",
+                stream.tail_offset,
+            );
+        }
         if chunk.end_offset > stream.tail_offset {
             return StreamResponse::error_with_next_offset_and_context(
                 StreamErrorCode::InvalidColdFlush,
@@ -432,11 +482,28 @@ impl StreamStateMachine {
                 vec![StreamErrorContext::StaleColdFlushCandidate],
             );
         }
+        if !chunk.payload_digest.is_empty()
+            && hot_buffer
+                .digest_prefix(chunk.start_offset, chunk.end_offset)
+                .as_deref()
+                != Some(chunk.payload_digest.as_str())
+        {
+            return StreamResponse::error_with_next_offset_and_context(
+                StreamErrorCode::InvalidColdFlush,
+                format!("cold chunk payload for stream '{stream_id}' is stale"),
+                stream.tail_offset,
+                vec![StreamErrorContext::StaleColdFlushCandidate],
+            );
+        }
+        let shared_path = chunk.shared_object.then(|| chunk.s3_path.clone());
         let slot = self
             .stream_slot_mut(&stream_id)
             .expect("stream existence checked before cold flush mutation");
         slot.hot_buffer.flush_prefix(chunk.end_offset);
         slot.cold.push_cold_chunk(chunk.clone());
+        if let Some(path) = shared_path {
+            self.retain_shared_cold_object(&path);
+        }
         self.compact_message_records_before(
             &stream_id,
             self.earliest_retained_offset(&stream_id),
@@ -594,10 +661,7 @@ impl StreamStateMachine {
         slot.record_index = retained_record_index;
         slot.integrity.evict_before(retained_offset);
         let dropped_cold_paths = slot.cold.compact_before(retained_offset);
-        if !dropped_cold_paths.is_empty() {
-            self.cold_gc
-                .enqueue(ColdGcTarget::Paths(dropped_cold_paths));
-        }
+        self.release_shared_cold_objects(dropped_cold_paths, 0);
 
         self.stream_slot_mut(stream_id)
             .expect("stream existence checked before hot compact")

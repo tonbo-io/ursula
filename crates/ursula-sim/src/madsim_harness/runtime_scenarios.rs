@@ -1443,11 +1443,12 @@ pub(super) async fn run_runtime_raft_network_inner(
         } else {
             None
         };
+        let max_flush_candidates = expected_streams.len() * 4;
         let flush_request = PlanGroupColdFlushRequest {
             min_hot_bytes: 1,
             max_flush_bytes: 8,
+            max_batch_bytes: max_flush_candidates.saturating_mul(8),
         };
-        let max_flush_candidates = expected_streams.len() * 4;
         if let Some(old_leader_id) = failover_target_node_id {
             trace.push(SimEvent::RuntimeRaftNetworkLeaderFailoverStageReached {
                 stage: "cold_flush_started_after_failover".to_owned(),
@@ -1637,7 +1638,7 @@ pub(super) async fn run_runtime_raft_network_inner(
             None
         };
         let metrics = runtime.metrics().snapshot();
-        assert_eq!(metrics.cold_flush_uploads, flushed_responses.len() as u64);
+        assert_eq!(metrics.cold_flush_uploads, 1);
         assert_eq!(metrics.cold_flush_publishes, flushed_responses.len() as u64);
         if let (Some(delay_ms), Some(consumed)) =
             (delay_cold_write_ms, cold_write_delay_consumed.as_ref())
@@ -2061,17 +2062,18 @@ pub(super) async fn run_runtime_cold_flush_worker_inner(
             PlanGroupColdFlushRequest {
                 min_hot_bytes: 4,
                 max_flush_bytes: 4,
+                max_batch_bytes: 8,
             },
             2,
         )
         .await
         .expect("flush cold chunks through hosted runtime actor API");
-    assert_eq!(flushed, streams.len());
+    assert_eq!(flushed, streams.len() * 2);
     let metrics = runtime.metrics().snapshot();
     assert_eq!(metrics.cold_flush_uploads, streams.len() as u64);
-    assert_eq!(metrics.cold_flush_upload_bytes, 4 * streams.len() as u64);
-    assert_eq!(metrics.cold_flush_publishes, streams.len() as u64);
-    assert_eq!(metrics.cold_flush_publish_bytes, 4 * streams.len() as u64);
+    assert_eq!(metrics.cold_flush_upload_bytes, 6 * streams.len() as u64);
+    assert_eq!(metrics.cold_flush_publishes, flushed as u64);
+    assert_eq!(metrics.cold_flush_publish_bytes, 6 * streams.len() as u64);
     trace.push(SimEvent::RuntimeColdFlushCompleted {
         flushed_count: flushed,
         upload_count: metrics.cold_flush_uploads,
@@ -2180,6 +2182,7 @@ pub(super) async fn run_runtime_seeded_interleaving_inner(
                 PlanGroupColdFlushRequest {
                     min_hot_bytes: 4,
                     max_flush_bytes: 4,
+                    max_batch_bytes: 4,
                 },
                 flush_group_limit,
             )
@@ -2302,6 +2305,7 @@ pub(super) async fn run_runtime_seeded_interleaving_inner(
                 PlanGroupColdFlushRequest {
                     min_hot_bytes: 4,
                     max_flush_bytes: 4,
+                    max_batch_bytes: 4,
                 },
                 4,
             )

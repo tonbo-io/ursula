@@ -1749,7 +1749,9 @@ impl GroupEngine for InMemoryGroupEngine {
     ) -> GroupFlushColdFuture<'a> {
         Box::pin(async move {
             let mut index_rollback = None;
-            if let Some(cold_store) = self.cold_store.as_ref() {
+            if !request.chunk.shared_object
+                && let Some(cold_store) = self.cold_store.as_ref()
+            {
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
                 let rollback = write_cold_chunk_index_pages_with_rollback(
                     &store,
@@ -1863,6 +1865,7 @@ impl GroupEngine for InMemoryGroupEngine {
                 .plan_next_cold_flush_batch(
                     request.min_hot_bytes,
                     request.max_flush_bytes,
+                    request.max_batch_bytes,
                     max_candidates,
                 )
                 .map_err(stream_response_error)

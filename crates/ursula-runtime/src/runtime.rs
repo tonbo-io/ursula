@@ -30,6 +30,7 @@ use crate::cold_store::ColdStoreHandle;
 use crate::cold_store::ColdStoreInfo;
 use crate::cold_store::cold_chunk_prefix;
 use crate::cold_store::new_cold_chunk_path;
+use crate::cold_store::new_cold_pack_path;
 use crate::command::GroupSnapshot;
 use crate::core_worker::CoreCommand;
 use crate::core_worker::CoreMailbox;
@@ -375,6 +376,9 @@ impl ShardRuntime {
             end_offset: candidate.end_offset,
             s3_path: path.clone(),
             object_size,
+            object_offset: 0,
+            shared_object: false,
+            payload_digest: candidate.payload_digest,
         };
         let publish_started_at = Instant::now();
         let publish = self
@@ -397,6 +401,9 @@ impl ShardRuntime {
         &self,
         candidates: Vec<ColdFlushCandidate>,
     ) -> Result<Vec<FlushColdResponse>, RuntimeError> {
+        if candidates.len() > 1 {
+            return self.flush_cold_candidates_pack(candidates).await;
+        }
         let mut responses = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             match self.flush_cold_candidate(candidate).await {
@@ -404,6 +411,105 @@ impl ShardRuntime {
                 Err(err) if is_stale_cold_flush_candidate_error(&err) => {}
                 Err(err) => return Err(err),
             }
+        }
+        Ok(responses)
+    }
+
+    async fn flush_cold_candidates_pack(
+        &self,
+        candidates: Vec<ColdFlushCandidate>,
+    ) -> Result<Vec<FlushColdResponse>, RuntimeError> {
+        let Some(cold_store) = self.cold_store.as_ref() else {
+            return Err(RuntimeError::ColdStoreConfig {
+                message: "cold backend must be configured before flushing cold chunks".to_owned(),
+            });
+        };
+        let first = candidates
+            .first()
+            .expect("packed cold flush requires at least two candidates");
+        let placement = self.shard_map.locate(&first.stream_id);
+        if candidates
+            .iter()
+            .any(|candidate| self.shard_map.locate(&candidate.stream_id) != placement)
+        {
+            return Err(RuntimeError::ColdStoreConfig {
+                message: "packed cold flush candidates must belong to one Raft group".to_owned(),
+            });
+        }
+        let payload_len = candidates.iter().try_fold(0usize, |total, candidate| {
+            total.checked_add(candidate.payload.len())
+        });
+        let Some(payload_len) = payload_len else {
+            return Err(RuntimeError::ColdStoreConfig {
+                message: "packed cold flush payload size overflow".to_owned(),
+            });
+        };
+        let mut payload = Vec::with_capacity(payload_len);
+        let mut object_offsets = Vec::with_capacity(candidates.len());
+        for candidate in &candidates {
+            object_offsets.push(u64::try_from(payload.len()).expect("pack offset fits u64"));
+            payload.extend_from_slice(&candidate.payload);
+        }
+        let path = new_cold_pack_path(placement.raft_group_id.0);
+        let upload_started_at = Instant::now();
+        let object_size = match cold_store.write_chunk(&path, &payload).await {
+            Ok(object_size) => object_size,
+            Err(err) => {
+                self.metrics.record_cold_flush_write_error();
+                return Err(RuntimeError::ColdStoreIo {
+                    message: err.to_string(),
+                });
+            }
+        };
+        self.metrics
+            .record_cold_upload(object_size, elapsed_ns(upload_started_at));
+        self.metrics.record_cold_pack(
+            object_size,
+            u64::try_from(candidates.len()).expect("candidate count fits u64"),
+        );
+
+        let mut responses = Vec::with_capacity(candidates.len());
+        let mut published = 0usize;
+        for (candidate, object_offset) in candidates.into_iter().zip(object_offsets) {
+            let logical_size = candidate.end_offset.saturating_sub(candidate.start_offset);
+            let publish_started_at = Instant::now();
+            let publish = self
+                .flush_cold(FlushColdRequest {
+                    stream_id: candidate.stream_id,
+                    chunk: ColdChunkRef {
+                        start_offset: candidate.start_offset,
+                        end_offset: candidate.end_offset,
+                        s3_path: path.clone(),
+                        object_size,
+                        object_offset,
+                        shared_object: true,
+                        payload_digest: candidate.payload_digest,
+                    },
+                })
+                .await;
+            match publish {
+                Ok(response) => {
+                    published = published.saturating_add(1);
+                    self.metrics
+                        .record_cold_publish(logical_size, elapsed_ns(publish_started_at));
+                    responses.push(response);
+                }
+                Err(err) if is_stale_cold_flush_candidate_error(&err) => {}
+                // A transport or leadership error may happen after the Raft
+                // commit became durable. Never delete the pack on an
+                // ambiguous response; a later orphan sweep may prove it
+                // unreferenced, while eager deletion could corrupt a
+                // successfully published slice.
+                Err(err) => return Err(err),
+            }
+        }
+        if published == 0 {
+            cold_store
+                .delete_chunk(&path)
+                .await
+                .map_err(|err| RuntimeError::ColdStoreIo {
+                    message: err.to_string(),
+                })?;
         }
         Ok(responses)
     }
@@ -667,6 +773,9 @@ impl ShardRuntime {
                 end_offset: last.end_offset,
                 object_size,
                 s3_path: path,
+                object_offset: 0,
+                shared_object: false,
+                payload_digest: blake3::hash(&payload).to_hex().to_string(),
             };
             let replacement_path = replacement.s3_path.clone();
             let gc_not_before_ms = unix_time_ms().saturating_add(gc_grace_ms);

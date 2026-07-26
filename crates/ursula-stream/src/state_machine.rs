@@ -100,6 +100,9 @@ pub struct StreamStateMachine {
     buckets: HashSet<String>,
     registry: StreamRegistry,
     cold_gc: ColdGcQueue,
+    /// Live logical references to group-scoped shared cold objects. This is
+    /// derived from per-stream cold refs when snapshots are restored.
+    shared_cold_object_refs: HashMap<String, u64>,
     /// Per-bucket committed usage for this group; see [`BucketUsage`] for the
     /// monotonic-versus-gauge split. Mutated only by the accounting helpers
     /// below so every counter change stays deterministic and auditable.
@@ -138,6 +141,36 @@ impl StreamStateMachine {
 
     fn stream_metadata(&self, stream_id: &BucketStreamId) -> Option<&StreamMetadata> {
         self.registry.metadata(stream_id)
+    }
+
+    fn retain_shared_cold_object(&mut self, path: &str) {
+        let refs = self
+            .shared_cold_object_refs
+            .entry(path.to_owned())
+            .or_default();
+        *refs = refs.saturating_add(1);
+    }
+
+    fn release_shared_cold_objects(
+        &mut self,
+        paths: impl IntoIterator<Item = String>,
+        not_before_ms: u64,
+    ) {
+        let mut reclaim = Vec::new();
+        for path in paths {
+            let Some(refs) = self.shared_cold_object_refs.get_mut(&path) else {
+                continue;
+            };
+            *refs = refs.saturating_sub(1);
+            if *refs == 0 {
+                self.shared_cold_object_refs.remove(&path);
+                reclaim.push(path);
+            }
+        }
+        if !reclaim.is_empty() {
+            self.cold_gc
+                .enqueue_after(ColdGcTarget::Paths(reclaim), not_before_ms);
+        }
     }
 
     fn stream_metadata_mut(&mut self, stream_id: &BucketStreamId) -> Option<&mut StreamMetadata> {
