@@ -3909,6 +3909,14 @@ async fn static_grpc_raft_durable_cold_flush_replicates_manifest() {
         flushed.len() >= 2,
         "batch cold flush should publish multiple chunks"
     );
+    assert!(
+        cold_store
+            .list_cold_index_pages()
+            .await
+            .expect("list cold index pages")
+            .is_empty(),
+        "shared pack slices must not create per-stream cold-index pages"
+    );
 
     for node in &nodes {
         wait_raft_state_machine_payload(

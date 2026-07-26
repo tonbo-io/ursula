@@ -1440,7 +1440,9 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupFlushColdFuture<'a> {
         Box::pin(async move {
-            if let Some(cold_store) = self.cold_store.as_ref() {
+            if !request.chunk.shared_object
+                && let Some(cold_store) = self.cold_store.as_ref()
+            {
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
                 write_cold_chunk_index_pages(&store, &request.stream_id, &request.chunk)
                     .await
