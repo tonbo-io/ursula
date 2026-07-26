@@ -130,6 +130,8 @@ raft:
   logDir: /var/lib/ursula/raft
   # Optional cap for uncommitted payload bytes per group.
   maxUncommittedBytesPerGroup: null
+  # Committed log entries per group between automatic full-state snapshots.
+  snapshotLogsSinceLast: 5000
   # Payload-bearing log entries retained per group after snapshot coverage.
   maxInSnapshotLogToKeep: 64
 

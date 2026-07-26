@@ -164,6 +164,10 @@ pub struct RaftConfig {
     pub snapshot_build_max_concurrency: usize,
     /// Max concurrent snapshot installs across all groups on this node.
     pub snapshot_install_max_concurrency: usize,
+    /// Committed Raft log entries per group between automatic snapshots.
+    /// Larger values reduce full-state snapshot CPU and tail-latency spikes at
+    /// the cost of retaining more log entries for recovery.
+    pub snapshot_logs_since_last: u64,
     /// Maximum number of payload-bearing Raft log entries retained per group
     /// after they are covered by a snapshot.
     pub max_in_snapshot_log_to_keep: u64,
@@ -191,6 +195,7 @@ impl Default for RaftConfig {
             grpc_reconnect_after_failures: 8,
             snapshot_build_max_concurrency: 1,
             snapshot_install_max_concurrency: 1,
+            snapshot_logs_since_last: 5_000,
             max_in_snapshot_log_to_keep: 64,
         }
     }
