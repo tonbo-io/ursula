@@ -68,6 +68,28 @@ ursula gateway ... \
 - **Quotas** (`--quota-policy`): per-bucket request rate (429 with `Retry-After`), concurrent live-read connections, and request body size. Limits are gateway-process-local; a horizontally scaled deployment multiplies effective limits by replica count. Ursula's own `503` backpressure semantics are unchanged. Data-plane quotas (stream count, retained bytes) are enforced inside Ursula as per-group backstops: `PUT /__ursula/quota/{bucket}` replicates `max_streams` / `max_retained_bytes` records to every Raft group, and each group rejects creates/appends that would exceed the limits against its local counters with `429` (no `Retry-After`: these are capacity caps, not rate limits). Because a bucket's streams hash across groups, the cluster-wide bound is `limit x group_count` - an abuse backstop; exact tenant-level enforcement belongs to the gateway, which reads aggregated `/__ursula/usage`.
 - **Usage** (`--usage-log`): per-tenant request, ingress, and egress byte counters aggregated by `(bucket, principal, action class)` and appended as sequence-numbered JSONL batches on `--usage-flush-secs` intervals. A failing sink delays reporting (batches queue and merge) but never blocks requests or drops counts. Egress is counted from actually streamed bytes, including SSE bodies. Committed-truth counters (append bytes surviving retries, retained bytes) come from Ursula's replicated state and are a separate, complementary ledger.
 
+### Cross-origin reads (opt-in)
+
+`public_read` is only nominally public until the origin answers CORS: without it, browser JavaScript cannot read a public stream cross-origin. Allowed origins are deployment policy, so nothing is sent unless you list them.
+
+```bash
+ursula gateway ... \
+  --cors-allowed-origin https://app.example.com \
+  --cors-allowed-origin https://studio.example.com
+```
+
+Pass `*` instead to allow any origin.
+
+Three properties are deliberate:
+
+- **Credentials are never allowed.** Ursula authenticates from an `Authorization` header the caller sets explicitly, which CORS does not treat as credentials, and no cookies are involved. So `*` grants no ambient access — a cross-origin page must still present its own bearer token.
+- **`Access-Control-Expose-Headers: *`.** A read carries its continuation in response headers (`stream-next-offset`, `stream-record-next`, `stream-cursor`), and a browser cannot see those without exposure — an unexposed client can read one page and never advance. The wildcard is only honoured while credentials stay disallowed, which is the second reason they are.
+- **Preflight never consults the resource.** `OPTIONS` arrives without `Authorization`, so a per-bucket answer would tell an unauthenticated caller whether a private bucket exists. The preflight reply is identical for every path and is produced before authorization runs, which keeps concealment intact.
+
+<Note>
+`EventSource` cannot set request headers, so a browser cannot open an SSE tail on a **private** stream with it. Use `fetch` with a `ReadableStream` and an `Authorization` header. `EventSource` is fine for `public_read` streams.
+</Note>
+
 ## Recommended deployment
 
 ```

@@ -129,6 +129,7 @@ fn test_config(upstreams: Vec<String>) -> GatewayConfig {
         upstream_http2_prior_knowledge: true,
         max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
         raft_group_count: None,
+        cors_allowed_origins: Vec::new(),
     }
 }
 
@@ -1260,5 +1261,103 @@ mod admission_and_usage {
             .find(|record| record.key.class == UsageClass::Read)
             .expect("read usage record");
         assert_eq!(read_record.counters.response_bytes, 10);
+    }
+}
+
+mod cors {
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::http::StatusCode;
+
+    use super::test_config;
+    use crate::Gateway;
+
+    const ALLOW_ORIGIN: &str = "access-control-allow-origin";
+    const ALLOW_CREDENTIALS: &str = "access-control-allow-credentials";
+    const EXPOSE_HEADERS: &str = "access-control-expose-headers";
+
+    fn gateway(origins: &[&str]) -> Gateway {
+        let mut config = test_config(vec!["http://upstream.invalid".to_owned()]);
+        config.cors_allowed_origins = origins.iter().map(|origin| (*origin).to_owned()).collect();
+        Gateway::new(config)
+    }
+
+    fn preflight(uri: &str, origin: &str) -> Request<Body> {
+        Request::builder()
+            .method("OPTIONS")
+            .uri(uri)
+            .header("origin", origin)
+            .header("access-control-request-method", "GET")
+            .header("access-control-request-headers", "authorization")
+            .body(Body::empty())
+            .expect("request")
+    }
+
+    /// The property that keeps #133's concealment intact. A preflight arrives
+    /// without `Authorization`, so if the reply differed between a real bucket
+    /// and a missing one it would be an unauthenticated existence oracle. The
+    /// policy is never given the path, but assert the observable behaviour so a
+    /// future refactor cannot quietly make it path-dependent.
+    #[tokio::test]
+    async fn preflight_cannot_distinguish_an_existing_bucket_from_a_missing_one() {
+        let gateway = gateway(&["https://app.example"]);
+
+        let existing = gateway
+            .handle(preflight("/ten_real/stream", "https://app.example"))
+            .await;
+        let missing = gateway
+            .handle(preflight("/ten_absent/stream", "https://app.example"))
+            .await;
+
+        assert_eq!(existing.status(), StatusCode::NO_CONTENT);
+        assert_eq!(existing.status(), missing.status());
+        assert_eq!(existing.headers(), missing.headers());
+    }
+
+    #[tokio::test]
+    async fn preflight_from_an_unlisted_origin_carries_no_cors_headers() {
+        let gateway = gateway(&["https://app.example"]);
+
+        let response = gateway
+            .handle(preflight("/ten_real/stream", "https://evil.example"))
+            .await;
+
+        assert!(response.headers().get(ALLOW_ORIGIN).is_none());
+    }
+
+    /// `Expose-Headers: *` is what lets a browser read `stream-next-offset` and
+    /// the rest of the protocol headers, so a client can paginate at all. It is
+    /// only honoured while credentials stay disallowed.
+    #[tokio::test]
+    async fn credentials_are_never_allowed_so_the_expose_wildcard_holds() {
+        let gateway = gateway(&["*"]);
+
+        let response = gateway
+            .handle(preflight("/ten_real/stream", "https://any.example"))
+            .await;
+
+        assert_eq!(
+            response
+                .headers()
+                .get(ALLOW_ORIGIN)
+                .and_then(|value| value.to_str().ok()),
+            Some("*")
+        );
+        assert!(response.headers().get(ALLOW_CREDENTIALS).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_gateway_adds_nothing() {
+        let gateway = gateway(&[]);
+
+        let response = gateway
+            .handle(preflight("/ten_real/stream", "https://app.example"))
+            .await;
+
+        assert!(response.headers().get(ALLOW_ORIGIN).is_none());
+        assert!(response.headers().get(EXPOSE_HEADERS).is_none());
+        // Without CORS the request falls through to normal routing rather than
+        // being short-circuited as a preflight.
+        assert_ne!(response.status(), StatusCode::NO_CONTENT);
     }
 }

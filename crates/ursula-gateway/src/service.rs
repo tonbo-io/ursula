@@ -40,6 +40,7 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
         upstream_http2_prior_knowledge: args.upstream_http2_prior_knowledge,
         max_request_body_bytes: args.max_request_body_bytes,
         raft_group_count: args.raft_group_count.map(NonZeroUsize::get),
+        cors_allowed_origins: args.cors_allowed_origin.clone(),
     };
 
     let mut gateway = match installed_access_control {
@@ -205,6 +206,14 @@ pub struct GatewayArgs {
     /// Interval between usage exports, in seconds.
     #[arg(long, default_value_t = 30, requires = "usage_log")]
     usage_flush_secs: u64,
+
+    /// Origin allowed to read across origins. Repeat per origin, or pass `*`.
+    /// Unset disables CORS, which leaves anonymous `public_read` buckets
+    /// unreachable from browser JavaScript. Credentials are never allowed, so
+    /// `*` grants no ambient access: a cross-origin caller must still present
+    /// its own bearer token.
+    #[arg(long, value_name = "ORIGIN")]
+    cors_allowed_origin: Vec<String>,
 }
 
 #[cfg(test)]
