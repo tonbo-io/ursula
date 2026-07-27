@@ -56,12 +56,19 @@ use crate::types::UrsulaVoteResponse;
 
 pub(crate) static GRPC_LEADER_CHANNELS: OnceLock<Mutex<BTreeMap<String, Channel>>> =
     OnceLock::new();
+static GRPC_RAFT_CHANNELS: OnceLock<Mutex<BTreeMap<String, SharedRaftChannel>>> = OnceLock::new();
 static GRPC_ZSTD_ENDPOINTS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 use crate::registry::LeadershipShedFlag;
 use crate::registry::LeadershipShedState;
 use crate::registry::RaftGroupHandleRegistry;
 
 pub(crate) type RaftClient = raft_internal_proto::raft_internal_client::RaftInternalClient<Channel>;
+
+#[derive(Clone)]
+struct SharedRaftChannel {
+    generation: u64,
+    channel: Channel,
+}
 
 pub const RAFT_GRPC_APPEND_PATH: &str = "/ursula.raft.v1.RaftInternal/Append";
 pub const RAFT_GRPC_VOTE_PATH: &str = "/ursula.raft.v1.RaftInternal/Vote";
@@ -483,11 +490,12 @@ pub struct GrpcRaftNetwork {
     target: u64,
     endpoint: String,
     client: Result<RaftClient, String>,
+    channel_generation: u64,
     /// Streak of consecutive RPC failures on this channel. Reset to 0 on the
-    /// next successful RPC. When it crosses `reconnect_threshold` we drop the
-    /// underlying HTTP/2 channel and rebuild a fresh one — tonic's
-    /// `connect_lazy` keeps a stuck channel forever otherwise (the TCP socket
-    /// stays open, the HTTP/2 streams stay borked, no auto-heal).
+    /// next successful RPC. When it crosses `reconnect_threshold` we replace
+    /// the process-wide HTTP/2 channel generation — tonic's `connect_lazy`
+    /// keeps a stuck channel forever otherwise (the TCP socket stays open, the
+    /// HTTP/2 streams stay borked, no auto-heal).
     consecutive_failures: u32,
     reconnect_threshold: u32,
 }
@@ -498,6 +506,7 @@ impl Debug for GrpcRaftNetwork {
             .field("raft_group_id", &self.raft_group_id)
             .field("target", &self.target)
             .field("endpoint", &self.endpoint)
+            .field("channel_generation", &self.channel_generation)
             .field("consecutive_failures", &self.consecutive_failures)
             .field("reconnect_threshold", &self.reconnect_threshold)
             .finish()
@@ -516,12 +525,13 @@ impl GrpcRaftNetwork {
         reconnect_threshold: u32,
     ) -> Self {
         let endpoint = normalize_grpc_endpoint(address.into());
-        let client = build_client(&endpoint);
+        let (client, channel_generation) = shared_raft_client(&endpoint, None);
         Self {
             raft_group_id,
             target,
             endpoint,
             client,
+            channel_generation,
             consecutive_failures: 0,
             reconnect_threshold,
         }
@@ -534,9 +544,11 @@ impl GrpcRaftNetwork {
     }
 
     /// Increment the failure streak. If we cross the threshold, drop the
-    /// stuck channel and build a fresh one — the next RPC call gets a new
-    /// HTTP/2 connection. We also reset the counter so the freshly-built
-    /// channel gets a full grace period before any further rebuild.
+    /// stuck shared channel and build a fresh one — the next RPC call gets a
+    /// new HTTP/2 connection. If another group already rebuilt this endpoint,
+    /// adopt that newer generation instead of creating another connection.
+    /// We also reset the counter so the replacement channel gets a full grace
+    /// period before any further rebuild.
     fn note_failure(&mut self, route: &str) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         if self.consecutive_failures >= self.reconnect_threshold {
@@ -547,7 +559,10 @@ impl GrpcRaftNetwork {
                 self.consecutive_failures,
                 route,
             );
-            self.client = build_client(&self.endpoint);
+            let (client, generation) =
+                shared_raft_client(&self.endpoint, Some(self.channel_generation));
+            self.client = client;
+            self.channel_generation = generation;
             self.consecutive_failures = 0;
         }
     }
@@ -672,17 +687,62 @@ impl GrpcRaftNetwork {
     }
 }
 
-/// Construct a fresh tonic client over a lazy channel. Called both during
-/// initial `new` and during reconnect when the channel is detected stuck.
-fn build_client(endpoint: &str) -> Result<RaftClient, String> {
-    Endpoint::from_shared(endpoint.to_owned())
-        .map(|ep| {
-            RaftClient::new(ep.connect_lazy())
-                .accept_compressed(CompressionEncoding::Zstd)
-                .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
-                .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
-        })
-        .map_err(|err| format!("invalid raft gRPC endpoint {endpoint}: {err}"))
+fn raft_client(channel: Channel) -> RaftClient {
+    RaftClient::new(channel)
+        .accept_compressed(CompressionEncoding::Zstd)
+        .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
+}
+
+/// Return the process-wide HTTP/2 channel for a Raft peer.
+///
+/// OpenRaft constructs one network client per group and peer. Without this
+/// pool, every group creates its own TCP connection even though tonic channels
+/// can multiplex all of those RPCs over one HTTP/2 connection.
+///
+/// `observed_generation` is `None` for a new group, which always adopts the
+/// current shared channel. A reconnect passes the generation it was using: if
+/// another group has already replaced that generation, it adopts the newer
+/// channel; otherwise it performs exactly one process-wide replacement.
+fn shared_raft_client(
+    endpoint: &str,
+    observed_generation: Option<u64>,
+) -> (Result<RaftClient, String>, u64) {
+    let parsed = match Endpoint::from_shared(endpoint.to_owned()) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            return (
+                Err(format!("invalid raft gRPC endpoint {endpoint}: {err}")),
+                0,
+            );
+        }
+    };
+    let channels = GRPC_RAFT_CHANNELS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut channels = match channels.lock() {
+        Ok(channels) => channels,
+        Err(err) => {
+            return (
+                Err(format!(
+                    "raft gRPC channel pool lock poisoned for {endpoint}: {err}"
+                )),
+                0,
+            );
+        }
+    };
+    if let Some(shared) = channels.get(endpoint)
+        && observed_generation.is_none_or(|generation| generation != shared.generation)
+    {
+        return (Ok(raft_client(shared.channel.clone())), shared.generation);
+    }
+    let generation = channels
+        .get(endpoint)
+        .map_or(1, |shared| shared.generation.saturating_add(1));
+    let channel = parsed.connect_lazy();
+    channels.insert(endpoint.to_owned(), SharedRaftChannel {
+        generation,
+        channel: channel.clone(),
+    });
+    (Ok(raft_client(channel)), generation)
 }
 
 fn grpc_endpoint_accepts_zstd(endpoint: &str) -> bool {
@@ -815,6 +875,15 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
 mod reconnect_tests {
     use super::*;
 
+    fn remove_shared_channel(endpoint: &str) {
+        if let Ok(mut channels) = GRPC_RAFT_CHANNELS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+        {
+            channels.remove(endpoint);
+        }
+    }
+
     fn fresh_network(threshold: u32) -> GrpcRaftNetwork {
         let mut net = GrpcRaftNetwork::new(RaftGroupId(0), 2, "http://127.0.0.1:9999");
         // Override threshold so tests don't depend on the env var
@@ -868,6 +937,47 @@ mod reconnect_tests {
         // rebuild grace period), and the client should still be valid.
         assert_eq!(net.consecutive_failures, 0);
         assert!(net.client.is_ok(), "channel should be rebuilt cleanly");
+    }
+
+    #[tokio::test]
+    async fn networks_share_one_channel_generation_per_endpoint() {
+        let endpoint = "http://127.0.0.1:32197";
+        remove_shared_channel(endpoint);
+        let first = GrpcRaftNetwork::new(RaftGroupId(1), 2, endpoint);
+        let second = GrpcRaftNetwork::new(RaftGroupId(2), 2, endpoint);
+
+        assert_eq!(first.channel_generation, 1);
+        assert_eq!(second.channel_generation, first.channel_generation);
+        let channel_count = GRPC_RAFT_CHANNELS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .ok()
+            .map(|channels| usize::from(channels.contains_key(endpoint)));
+        assert_eq!(channel_count, Some(1));
+    }
+
+    #[tokio::test]
+    async fn stale_network_adopts_rebuilt_generation_without_replacing_it_again() {
+        let endpoint = "http://127.0.0.1:32198";
+        remove_shared_channel(endpoint);
+        let mut first = GrpcRaftNetwork::with_threshold(RaftGroupId(1), 2, endpoint, 1);
+        let mut stale = GrpcRaftNetwork::with_threshold(RaftGroupId(2), 2, endpoint, 1);
+        let original_generation = first.channel_generation;
+
+        first.note_failure("Append");
+        assert_eq!(
+            first.channel_generation,
+            original_generation.saturating_add(1)
+        );
+
+        stale.note_failure("Append");
+        assert_eq!(stale.channel_generation, first.channel_generation);
+        let pooled_generation = GRPC_RAFT_CHANNELS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .ok()
+            .and_then(|channels| channels.get(endpoint).map(|shared| shared.generation));
+        assert_eq!(pooled_generation, Some(first.channel_generation));
     }
 
     #[tokio::test]
