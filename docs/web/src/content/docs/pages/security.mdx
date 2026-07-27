@@ -56,6 +56,7 @@ owners = [{ issuer = "https://issuer.example", subject = "user-1" }]
 - **Concealment.** Unknown buckets, private buckets probed by strangers, and write attempts without ownership all answer the same `404` a missing resource would, so a private stream's existence is not observable.
 - **Credential termination.** The gateway strips `Authorization` before forwarding; upstream nodes never see end-user credentials and must remain on a private network.
 - **Anonymous public reads.** `public_read` grants exactly the read-only actions (read, head, tail, snapshot read) to unauthenticated callers — never writes, deletes, or bucket administration.
+- **Subscriptions do not outlive their credential.** A live tail is one long-lived request, so a single admission check at connection time would turn a short-lived token into an unbounded read. The gateway ends an SSE subscription at the credential's `exp` with a final `event: credential-expired` frame, so a client can tell expiry from end-of-stream and re-authenticate. Anonymous reads on `public_read` buckets have no credential and so no deadline. Note that this bounds duration, not revocation: a token revoked before its `exp` keeps an open subscription until then.
 
 An access-controlled gateway can additionally enable per-tenant admission limits and usage accounting:
 

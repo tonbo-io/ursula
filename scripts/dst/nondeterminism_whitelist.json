@@ -89,5 +89,12 @@
     "snippet_contains": "SystemTime::now()",
     "reason": "wall-clock-usage-windows",
     "plan": "no action: unix_time_ms() stamps usage-batch window boundaries, which are billing timestamps consumed by an external ledger and must reflect real wall-clock time. The gateway is not part of the madsim simulation surface; admission timing uses tokio::time::Instant."
+  },
+  {
+    "category": "system_time_now",
+    "path": "crates/ursula-gateway/src/lib.rs",
+    "snippet_contains": "SystemTime::now()",
+    "reason": "gateway-not-in-sim-surface",
+    "plan": "no action: converting a credential's absolute `exp` (unix seconds) into a `tokio::time::sleep` deadline requires reading the wall clock exactly once, and there is no relative lifetime available at that point. The read happens only for responses that stream indefinitely and only when a credential was presented; the resulting timer is a tokio::time::Instant, so tests drive it with paused time. The gateway crate is not part of the madsim simulation surface, so this cannot perturb simulated core scheduling. Deliberately placed here rather than in auth/jwt.rs, which is already whitelisted by path and would have absorbed the decision silently."
   }
 ]

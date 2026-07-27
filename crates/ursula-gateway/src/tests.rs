@@ -181,10 +181,7 @@ async fn gateway_evicts_cached_leader_on_retryable_leader_unknown_response() {
         .await
         .expect("request body");
     let response = gateway
-        .forward(&stale.url, &parts, body_bytes, ResponseTail {
-            meter: None,
-            _live_guard: None,
-        })
+        .forward(&stale.url, &parts, body_bytes, ResponseTail::default())
         .await
         .expect("gateway response");
 
@@ -672,10 +669,7 @@ async fn gateway_follows_leader_redirect_for_get_request() {
     let (parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     let resp = gateway
-        .forward(&follower.url, &parts, body_bytes, ResponseTail {
-            meter: None,
-            _live_guard: None,
-        })
+        .forward(&follower.url, &parts, body_bytes, ResponseTail::default())
         .await
         .unwrap();
 
@@ -701,10 +695,7 @@ async fn gateway_follows_leader_redirect_for_put_request() {
     let (parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     let resp = gateway
-        .forward(&follower.url, &parts, body_bytes, ResponseTail {
-            meter: None,
-            _live_guard: None,
-        })
+        .forward(&follower.url, &parts, body_bytes, ResponseTail::default())
         .await
         .unwrap();
 
@@ -746,10 +737,7 @@ async fn gateway_returns_raft_redirect_when_leader_not_in_upstreams() {
     let (parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     let resp = gateway
-        .forward(&follower.url, &parts, body_bytes, ResponseTail {
-            meter: None,
-            _live_guard: None,
-        })
+        .forward(&follower.url, &parts, body_bytes, ResponseTail::default())
         .await
         .unwrap();
 
@@ -805,10 +793,7 @@ async fn gateway_preserves_path_and_query_with_trailing_upstream_slash() {
     let (parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     let resp = gateway
-        .forward(&upstream_url, &parts, body_bytes, ResponseTail {
-            meter: None,
-            _live_guard: None,
-        })
+        .forward(&upstream_url, &parts, body_bytes, ResponseTail::default())
         .await
         .unwrap();
 
@@ -831,10 +816,12 @@ async fn gateway_accepts_https_upstream_scheme() {
     let (parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     let err = gateway
-        .forward("https://127.0.0.1:1", &parts, body_bytes, ResponseTail {
-            meter: None,
-            _live_guard: None,
-        })
+        .forward(
+            "https://127.0.0.1:1",
+            &parts,
+            body_bytes,
+            ResponseTail::default(),
+        )
         .await
         .unwrap_err();
 
@@ -880,10 +867,7 @@ async fn gateway_does_not_apply_response_header_timeout_to_sse_body() {
     let (parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     let mut resp = gateway
-        .forward(&upstream.url, &parts, body_bytes, ResponseTail {
-            meter: None,
-            _live_guard: None,
-        })
+        .forward(&upstream.url, &parts, body_bytes, ResponseTail::default())
         .await
         .expect("forward SSE request");
 
@@ -992,10 +976,7 @@ async fn gateway_preserves_public_snapshot_redirect_without_upstream_host() {
     let (parts, body) = req.into_parts();
     let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
     let resp = gateway
-        .forward(&upstream.url, &parts, body_bytes, ResponseTail {
-            meter: None,
-            _live_guard: None,
-        })
+        .forward(&upstream.url, &parts, body_bytes, ResponseTail::default())
         .await
         .unwrap();
 
@@ -1359,5 +1340,175 @@ mod cors {
         // Without CORS the request falls through to normal routing rather than
         // being short-circuited as a preflight.
         assert_ne!(response.status(), StatusCode::NO_CONTENT);
+    }
+}
+
+mod credential_deadline {
+    use std::convert::Infallible;
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use http_body_util::BodyExt;
+    use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    use super::ResponseTail;
+    use super::gateway_for_url;
+    use super::spawn_upstream;
+
+    /// An upstream that keeps sending SSE events forever, so the only thing that
+    /// can end the response is the gateway.
+    fn endless_sse() -> Router {
+        Router::new().route(
+            "/bucket/stream",
+            get(|| async {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tokio::spawn(async move {
+                    loop {
+                        if tx
+                            .send(bytes::Bytes::from_static(b"event: data\ndata: tick\n\n"))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                });
+                (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    Body::from_stream(ReceiverStream::new(rx).map(Ok::<_, Infallible>)),
+                )
+            }),
+        )
+    }
+
+    fn json_upstream() -> Router {
+        Router::new().route(
+            "/bucket/stream",
+            get(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/x-ndjson")],
+                    Body::from("{\"record\":1}\n"),
+                )
+            }),
+        )
+    }
+
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the unix epoch")
+            .as_secs()
+    }
+
+    async fn forward_with(
+        upstream_url: &str,
+        tail: ResponseTail,
+    ) -> axum::response::Response<Body> {
+        let gateway = gateway_for_url(upstream_url.to_owned());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/bucket/stream")
+            .body(Body::empty())
+            .expect("build request");
+        let (parts, body) = req.into_parts();
+        let body_bytes = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("request body");
+        gateway
+            .forward(upstream_url, &parts, body_bytes, tail)
+            .await
+            .expect("forward request")
+    }
+
+    /// The point of #203: a subscription must not outlive the credential that
+    /// authorized it, and the client must be able to tell that is why it ended.
+    #[tokio::test]
+    async fn an_sse_subscription_ends_with_a_named_event_when_the_credential_expires() {
+        let upstream = spawn_upstream(endless_sse()).await;
+        let response = forward_with(&upstream.url, ResponseTail {
+            credential_expires_at: Some(unix_now()),
+            ..ResponseTail::default()
+        })
+        .await;
+
+        // Bounded on purpose. The upstream never ends, so if the deadline is not
+        // armed this collect would hang — and a hang in CI is a worse signal than
+        // a failure, since it reads as flakiness rather than a missing feature.
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the deadline must end the stream rather than leave it open")
+        .expect("collect the terminated stream");
+        let body = String::from_utf8_lossy(&body);
+
+        assert!(
+            body.contains("event: credential-expired"),
+            "the stream must say why it ended, not just stop: {body:?}"
+        );
+        assert!(
+            body.ends_with("\n\n"),
+            "the terminal frame must be a complete SSE event: {body:?}"
+        );
+    }
+
+    /// Anonymous public reads carry no credential, so they have no deadline. This
+    /// is the regression that would silently break `public_read` tails.
+    #[tokio::test]
+    async fn an_anonymous_subscription_is_not_given_a_deadline() {
+        let upstream = spawn_upstream(endless_sse()).await;
+        let response = forward_with(&upstream.url, ResponseTail::default()).await;
+
+        // One frame, not the whole body: the upstream never ends, and that it
+        // keeps going is the property under test.
+        let mut response = response;
+        let first = response
+            .body_mut()
+            .frame()
+            .await
+            .expect("first frame")
+            .expect("first frame ok")
+            .into_data()
+            .expect("first frame is data");
+        let first = String::from_utf8_lossy(&first);
+
+        assert!(
+            first.contains("data: tick"),
+            "an anonymous tail should receive upstream data, not a terminal frame: {first:?}"
+        );
+        assert!(
+            !first.contains("credential-expired"),
+            "no credential means no deadline: {first:?}"
+        );
+    }
+
+    /// A credential lapsing mid-transfer must not truncate a body the client is
+    /// already committed to reading; only indefinite streams get a deadline.
+    #[tokio::test]
+    async fn a_non_streaming_response_is_never_truncated() {
+        let upstream = spawn_upstream(json_upstream()).await;
+        let response = forward_with(&upstream.url, ResponseTail {
+            credential_expires_at: Some(unix_now()),
+            ..ResponseTail::default()
+        })
+        .await;
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("collect body");
+
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "{\"record\":1}\n",
+            "an already-expired credential must not rewrite a finite response"
+        );
     }
 }

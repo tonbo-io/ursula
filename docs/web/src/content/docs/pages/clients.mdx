@@ -106,7 +106,7 @@ Two things to know once it is on:
   const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader();
   ```
 
-  Treat any termination as a reconnect signal rather than end of stream: re-read from the last `Stream-Next-Offset` you saw. A long tail will outlive a short-lived token, so refresh the credential and reconnect on your own schedule.
+  A subscription ends when its credential expires, and says so: the final frame is `event: credential-expired`. Treat it as a reconnect signal rather than end of stream — refresh the token and re-read from the last `Stream-Next-Offset` you saw. Any other termination deserves the same handling.
 
 ## Notes for client implementers
 
