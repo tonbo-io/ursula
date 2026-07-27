@@ -60,6 +60,33 @@ impl UrsulaConfig {
                 "storage.cold.compaction_target_size must not exceed compaction_max_size".into(),
             ));
         }
+        self.validate_cold_health_watermarks()?;
+        Ok(())
+    }
+
+    fn validate_cold_health_watermarks(&self) -> Result<(), ValidationError> {
+        let low = self.governance.cold_health.hot_size_low.as_bytes();
+        let high = self.governance.cold_health.hot_size_high.as_bytes();
+        let flush_min = self.storage.cold.flush_min_hot_size().as_bytes();
+        if low >= high {
+            return Err(ValidationError::Other(
+                "governance.cold_health.hot_size_low must be lower than hot_size_high".into(),
+            ));
+        }
+        if high <= flush_min {
+            return Err(ValidationError::Other(format!(
+                "governance.cold_health.hot_size_high ({high} bytes) must exceed storage.cold.flush_min_hot_size ({flush_min} bytes) so normal flushing can start before leadership shedding",
+            )));
+        }
+        if let Some(max_hot) = self.storage.cold.max_hot_size_per_group
+            && max_hot.as_bytes() > 0
+            && high >= max_hot.as_bytes()
+        {
+            return Err(ValidationError::Other(format!(
+                "governance.cold_health.hot_size_high ({high} bytes) must be lower than storage.cold.max_hot_size_per_group ({} bytes)",
+                max_hot.as_bytes(),
+            )));
+        }
         Ok(())
     }
 
@@ -165,5 +192,36 @@ impl UrsulaConfig {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::UrsulaConfig;
+    use crate::human::HumanSize;
+
+    #[test]
+    fn cold_health_watermarks_leave_room_between_flush_and_backpressure() {
+        let mut config = UrsulaConfig::default();
+        config.raft.node_id = 1;
+        config.storage.cold.flush_min_hot_size = Some(HumanSize::mib(8));
+        config.storage.cold.max_hot_size_per_group = Some(HumanSize::mib(64));
+        config.governance.cold_health.hot_size_low = HumanSize::mib(32);
+        config.governance.cold_health.hot_size_high = HumanSize::mib(48);
+        config.validate().expect("valid cold-health window");
+
+        config.governance.cold_health.hot_size_low = HumanSize::mib(4);
+        config.governance.cold_health.hot_size_high = HumanSize::mib(8);
+        let error = config
+            .validate()
+            .expect_err("shedding at the flush threshold must be rejected");
+        assert!(error.to_string().contains("normal flushing can start"));
+
+        config.governance.cold_health.hot_size_low = HumanSize::mib(32);
+        config.governance.cold_health.hot_size_high = HumanSize::mib(64);
+        let error = config
+            .validate()
+            .expect_err("shedding at the backpressure cliff must be rejected");
+        assert!(error.to_string().contains("max_hot_size_per_group"));
     }
 }

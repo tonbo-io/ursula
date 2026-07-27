@@ -64,6 +64,8 @@ impl From<Preset> for UrsulaConfig {
                 config.storage.cold.flush_size = HumanSize::mib(4);
                 config.storage.cold.flush_max_concurrency = 2;
                 config.storage.cold.max_hot_size_per_group = Some(HumanSize::mib(8));
+                config.governance.cold_health.hot_size_high = HumanSize::mib(7);
+                config.governance.cold_health.hot_size_low = HumanSize::mib(5);
                 config.storage.cold.cache = Some(ColdCacheConfig {
                     max_size: HumanSize::mib(64),
                     block_size: HumanSize::mib(1),
@@ -78,6 +80,8 @@ impl From<Preset> for UrsulaConfig {
                 config.storage.cold.flush_size = HumanSize::mib(4);
                 config.storage.cold.flush_max_concurrency = 2;
                 config.storage.cold.max_hot_size_per_group = Some(HumanSize::mib(16));
+                config.governance.cold_health.hot_size_high = HumanSize::mib(12);
+                config.governance.cold_health.hot_size_low = HumanSize::mib(8);
                 config.storage.cold.cache = Some(ColdCacheConfig {
                     max_size: HumanSize::mib(64),
                     block_size: HumanSize::mib(1),
@@ -92,6 +96,8 @@ impl From<Preset> for UrsulaConfig {
                 config.storage.cold.flush_size = HumanSize::mib(8);
                 config.storage.cold.flush_max_concurrency = 4;
                 config.storage.cold.max_hot_size_per_group = Some(HumanSize::mib(64));
+                config.governance.cold_health.hot_size_high = HumanSize::mib(48);
+                config.governance.cold_health.hot_size_low = HumanSize::mib(32);
                 config.storage.cold.cache = Some(ColdCacheConfig {
                     max_size: HumanSize::mib(256),
                     block_size: HumanSize::mib(1),
@@ -106,6 +112,8 @@ impl From<Preset> for UrsulaConfig {
                 config.storage.cold.flush_size = HumanSize::mib(16);
                 config.storage.cold.flush_max_concurrency = 8;
                 config.storage.cold.max_hot_size_per_group = Some(HumanSize::mib(128));
+                config.governance.cold_health.hot_size_high = HumanSize::mib(96);
+                config.governance.cold_health.hot_size_low = HumanSize::mib(64);
                 config.storage.cold.cache = Some(ColdCacheConfig {
                     max_size: HumanSize::mib(512),
                     block_size: HumanSize::mib(1),
