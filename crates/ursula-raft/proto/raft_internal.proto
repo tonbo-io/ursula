@@ -22,6 +22,27 @@ message RaftRpcAckV1 {
   bytes payload = 1;
 }
 
+// A process-wide peer stream multiplexes independent OpenRaft Append RPCs from
+// every group. request_id is transport-local correlation only; it never enters
+// the replicated state machine or changes per-group ordering.
+message RaftAppendStreamRequestV1 {
+  uint64 request_id = 1;
+  RaftRpcEnvelopeV1 envelope = 2;
+}
+
+message RaftAppendStreamErrorV1 {
+  int32 code = 1;
+  string message = 2;
+}
+
+message RaftAppendStreamResponseV1 {
+  uint64 request_id = 1;
+  oneof result {
+    RaftRpcAckV1 ack = 2;
+    RaftAppendStreamErrorV1 error = 3;
+  }
+}
+
 message RaftFullSnapshotRequestV1 {
   uint32 raft_group_id = 1;
   uint64 node_id = 2;
@@ -96,6 +117,7 @@ message GroupReadResponseV1 {
 
 service RaftInternal {
   rpc Append(RaftRpcEnvelopeV1) returns (RaftRpcAckV1);
+  rpc AppendStream(stream RaftAppendStreamRequestV1) returns (stream RaftAppendStreamResponseV1);
   rpc Vote(RaftRpcEnvelopeV1) returns (RaftRpcAckV1);
   rpc FullSnapshot(RaftFullSnapshotRequestV1) returns (RaftFullSnapshotAckV1);
   rpc GroupWrite(GroupWriteRequestV1) returns (GroupWriteResponseV1);

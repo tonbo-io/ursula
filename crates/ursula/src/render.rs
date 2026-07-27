@@ -22,6 +22,8 @@ use chrono::Utc;
 use serde_json::Value;
 use serde_json::json;
 use ursula_raft::RaftGroupMetricsSnapshot;
+use ursula_raft::RaftGrpcMetricsSnapshot;
+use ursula_raft::raft_grpc_metrics_snapshot;
 use ursula_runtime::AppendResponse;
 use ursula_runtime::BootstrapStreamResponse;
 use ursula_runtime::ColdStoreInfo;
@@ -361,6 +363,8 @@ pub(crate) fn render_metrics(
         active_groups: usize,
         #[serde(flatten)]
         http: &'a HttpMetricsSnapshot,
+        #[serde(flatten)]
+        raft_grpc: &'a RaftGrpcMetricsSnapshot,
         mailbox_depths: &'a [usize],
         mailbox_capacities: &'a [usize],
         cold_store: Value,
@@ -379,11 +383,13 @@ pub(crate) fn render_metrics(
         .filter(|appends| **appends > 0)
         .count();
 
+    let raft_grpc = raft_grpc_metrics_snapshot();
     let view = MetricsView {
         runtime: &snapshot,
         active_cores,
         active_groups,
         http: &http,
+        raft_grpc: &raft_grpc,
         mailbox_depths: &mailbox.depths,
         mailbox_capacities: &mailbox.capacities,
         cold_store: render_cold_store_info(cold_store),

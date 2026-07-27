@@ -1715,6 +1715,16 @@ async fn metrics_expose_per_core_and_group_append_distribution() {
     assert!(body.contains("\"group_mailbox_full_events\":0"));
     assert!(body.contains("\"per_group_group_mailbox_full_events\":["));
     assert!(body.contains("\"raft_write_many_batches\":0"));
+    assert!(body.contains("\"raft_grpc_append_unary_calls\":"));
+    assert!(body.contains("\"raft_grpc_append_stream_sessions_opened\":"));
+    assert!(body.contains("\"raft_grpc_append_stream_session_failures\":"));
+    assert!(body.contains("\"raft_grpc_append_stream_requests\":"));
+    assert!(body.contains("\"raft_grpc_append_stream_responses\":"));
+    assert!(body.contains("\"raft_grpc_append_stream_fallbacks\":"));
+    assert!(body.contains("\"raft_grpc_append_stream_request_bytes\":"));
+    assert!(body.contains("\"raft_grpc_append_stream_response_bytes\":"));
+    assert!(body.contains("\"raft_grpc_append_stream_inflight\":"));
+    assert!(body.contains("\"raft_grpc_append_stream_inflight_max\":"));
     assert!(body.contains("\"per_core_raft_write_many_batches\":[0,0]"));
     assert!(body.contains("\"per_group_raft_write_many_batches\":["));
     assert!(body.contains("\"raft_write_many_commands\":0"));

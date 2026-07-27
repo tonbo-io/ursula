@@ -228,6 +228,17 @@ starts three Ursula HTTP routers, warms four groups on each node, initializes
 node 1 with three voters for every group, writes streams placed on all four
 groups through node 1, and waits until the replicated payloads are readable
 from every runtime.
+
+AppendEntries transport is multiplexed process-wide per peer. A node first
+uses the unary Append RPC and learns `x-ursula-raft-append-stream: v1` from a
+successful response. It then sends every group's independent AppendEntries
+request over one long-lived bidirectional gRPC stream, correlating responses by
+a transport-local request id. There is no batching delay and one slow group
+does not block another group's response. Vote and snapshot traffic remain
+unary. A peer that does not advertise the capability continues on unary Append,
+which makes mixed-version rolling upgrades safe without changing OpenRaft's
+per-request timeout, retry, ordering, or acknowledgement semantics.
+
 `ursula` now exposes this static cluster shape through the typed config file:
 `raft.node_id`, `[[raft.peers]]`, `raft.wal.backend`, and
 `raft.init_membership` / `raft.init_membership_per_group`. It warms every group
