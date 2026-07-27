@@ -3,10 +3,16 @@ use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::Cursor;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
+use futures_util::Stream;
+use futures_util::StreamExt;
 use openraft::BasicNode;
 use openraft::OptionalSend;
 use openraft::RaftNetworkFactory;
@@ -24,6 +30,9 @@ use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
 use prost::Message;
 use serde::de::DeserializeOwned;
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::codec::CompressionEncoding;
 use tonic::metadata::MetadataMap;
 use tonic::metadata::MetadataValue;
@@ -58,6 +67,19 @@ pub(crate) static GRPC_LEADER_CHANNELS: OnceLock<Mutex<BTreeMap<String, Channel>
     OnceLock::new();
 static GRPC_RAFT_CHANNELS: OnceLock<Mutex<BTreeMap<String, SharedRaftChannel>>> = OnceLock::new();
 static GRPC_ZSTD_ENDPOINTS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+static GRPC_APPEND_STREAM_ENDPOINTS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+static GRPC_APPEND_SESSIONS: OnceLock<Mutex<BTreeMap<String, SharedAppendSession>>> =
+    OnceLock::new();
+static GRPC_APPEND_UNARY_CALLS: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_SESSIONS_OPENED: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_SESSION_FAILURES: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_RESPONSES: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_REQUEST_BYTES: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_INFLIGHT: AtomicU64 = AtomicU64::new(0);
+static GRPC_APPEND_STREAM_INFLIGHT_MAX: AtomicU64 = AtomicU64::new(0);
 use crate::registry::LeadershipShedFlag;
 use crate::registry::LeadershipShedState;
 use crate::registry::RaftGroupHandleRegistry;
@@ -70,7 +92,53 @@ struct SharedRaftChannel {
     channel: Channel,
 }
 
+#[derive(Clone)]
+struct SharedAppendSession {
+    generation: u64,
+    sender: mpsc::UnboundedSender<AppendStreamCall>,
+}
+
+struct AppendStreamCall {
+    envelope: raft_internal_proto::RaftRpcEnvelopeV1,
+    response: oneshot::Sender<Result<raft_internal_proto::RaftRpcAckV1, tonic::Status>>,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct RaftGrpcMetricsSnapshot {
+    pub raft_grpc_append_unary_calls: u64,
+    pub raft_grpc_append_stream_sessions_opened: u64,
+    pub raft_grpc_append_stream_session_failures: u64,
+    pub raft_grpc_append_stream_requests: u64,
+    pub raft_grpc_append_stream_responses: u64,
+    pub raft_grpc_append_stream_fallbacks: u64,
+    pub raft_grpc_append_stream_request_bytes: u64,
+    pub raft_grpc_append_stream_response_bytes: u64,
+    pub raft_grpc_append_stream_inflight: u64,
+    pub raft_grpc_append_stream_inflight_max: u64,
+}
+
+pub fn raft_grpc_metrics_snapshot() -> RaftGrpcMetricsSnapshot {
+    RaftGrpcMetricsSnapshot {
+        raft_grpc_append_unary_calls: GRPC_APPEND_UNARY_CALLS.load(Ordering::Relaxed),
+        raft_grpc_append_stream_sessions_opened: GRPC_APPEND_STREAM_SESSIONS_OPENED
+            .load(Ordering::Relaxed),
+        raft_grpc_append_stream_session_failures: GRPC_APPEND_STREAM_SESSION_FAILURES
+            .load(Ordering::Relaxed),
+        raft_grpc_append_stream_requests: GRPC_APPEND_STREAM_REQUESTS.load(Ordering::Relaxed),
+        raft_grpc_append_stream_responses: GRPC_APPEND_STREAM_RESPONSES.load(Ordering::Relaxed),
+        raft_grpc_append_stream_fallbacks: GRPC_APPEND_STREAM_FALLBACKS.load(Ordering::Relaxed),
+        raft_grpc_append_stream_request_bytes: GRPC_APPEND_STREAM_REQUEST_BYTES
+            .load(Ordering::Relaxed),
+        raft_grpc_append_stream_response_bytes: GRPC_APPEND_STREAM_RESPONSE_BYTES
+            .load(Ordering::Relaxed),
+        raft_grpc_append_stream_inflight: GRPC_APPEND_STREAM_INFLIGHT.load(Ordering::Relaxed),
+        raft_grpc_append_stream_inflight_max: GRPC_APPEND_STREAM_INFLIGHT_MAX
+            .load(Ordering::Relaxed),
+    }
+}
+
 pub const RAFT_GRPC_APPEND_PATH: &str = "/ursula.raft.v1.RaftInternal/Append";
+pub const RAFT_GRPC_APPEND_STREAM_PATH: &str = "/ursula.raft.v1.RaftInternal/AppendStream";
 pub const RAFT_GRPC_VOTE_PATH: &str = "/ursula.raft.v1.RaftInternal/Vote";
 pub const RAFT_GRPC_FULL_SNAPSHOT_PATH: &str = "/ursula.raft.v1.RaftInternal/FullSnapshot";
 pub const RAFT_GRPC_GROUP_WRITE_PATH: &str = "/ursula.raft.v1.RaftInternal/GroupWrite";
@@ -79,6 +147,8 @@ pub const RAFT_GRPC_TRANSFER_LEADER_PATH: &str = "/ursula.raft.v1.RaftInternal/T
 pub const RAFT_GRPC_MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const RAFT_GRPC_PROTOCOL_VERSION: u32 = 1;
 const RAFT_GRPC_ACCEPT_REQUEST_COMPRESSION: &str = "x-ursula-raft-accept-compression";
+const RAFT_GRPC_APPEND_STREAM_CAPABILITY: &str = "x-ursula-raft-append-stream";
+const RAFT_GRPC_APPEND_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const RAFT_GRPC_ZSTD_MIN_MESSAGE_BYTES: usize = 1024;
 
 fn raft_grpc_response<T>(message: T) -> tonic::Response<T> {
@@ -86,6 +156,10 @@ fn raft_grpc_response<T>(message: T) -> tonic::Response<T> {
     response.metadata_mut().insert(
         RAFT_GRPC_ACCEPT_REQUEST_COMPRESSION,
         MetadataValue::from_static("zstd"),
+    );
+    response.metadata_mut().insert(
+        RAFT_GRPC_APPEND_STREAM_CAPABILITY,
+        MetadataValue::from_static("v1"),
     );
     response
 }
@@ -164,28 +238,103 @@ pub fn raft_grpc_service(
     .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
 }
 
+async fn handle_append_envelope(
+    registry: RaftGroupHandleRegistry,
+    envelope: raft_internal_proto::RaftRpcEnvelopeV1,
+) -> Result<raft_internal_proto::RaftRpcAckV1, tonic::Status> {
+    let raft_group_id =
+        validate_raft_rpc_preamble(&registry, envelope.protocol_version, envelope.raft_group_id)?;
+    let request: UrsulaAppendEntriesRequest =
+        decode_rpc_payload(&envelope.payload, "raft append request")?;
+    let response = registry
+        .append_entries(raft_group_id, request)
+        .await
+        .map_err(|err| tonic::Status::internal(err.to_string()))?;
+    Ok(raft_internal_proto::RaftRpcAckV1 {
+        payload: encode_wire(&response),
+    })
+}
+
 #[tonic::async_trait]
 impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService {
+    type AppendStreamStream = Pin<
+        Box<
+            dyn Stream<
+                    Item = Result<raft_internal_proto::RaftAppendStreamResponseV1, tonic::Status>,
+                > + Send
+                + 'static,
+        >,
+    >;
+
     async fn append(
         &self,
         request: tonic::Request<raft_internal_proto::RaftRpcEnvelopeV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftRpcAckV1>, tonic::Status> {
-        let envelope = request.into_inner();
-        let raft_group_id = validate_raft_rpc_preamble(
-            &self.registry,
-            envelope.protocol_version,
-            envelope.raft_group_id,
-        )?;
-        let request: UrsulaAppendEntriesRequest =
-            decode_rpc_payload(&envelope.payload, "raft append request")?;
-        let response = self
-            .registry
-            .append_entries(raft_group_id, request)
-            .await
-            .map_err(|err| tonic::Status::internal(err.to_string()))?;
-        Ok(raft_grpc_response(raft_internal_proto::RaftRpcAckV1 {
-            payload: encode_wire(&response),
-        }))
+        let ack = handle_append_envelope(self.registry.clone(), request.into_inner()).await?;
+        Ok(raft_grpc_response(ack))
+    }
+
+    async fn append_stream(
+        &self,
+        request: tonic::Request<tonic::Streaming<raft_internal_proto::RaftAppendStreamRequestV1>>,
+    ) -> Result<tonic::Response<Self::AppendStreamStream>, tonic::Status> {
+        let registry = self.registry.clone();
+        let shutdown = registry.subscribe_transport_shutdown();
+        let requests = futures_util::stream::unfold(
+            (request.into_inner(), shutdown),
+            |(mut requests, mut shutdown)| async move {
+                if *shutdown.borrow() {
+                    return None;
+                }
+                tokio::select! {
+                    biased;
+                    changed = shutdown.changed() => {
+                        let _ = changed;
+                        None
+                    }
+                    request = requests.next() => {
+                        request.map(|request| (request, (requests, shutdown)))
+                    }
+                }
+            },
+        );
+        let responses = requests
+            .map(move |request| {
+                let registry = registry.clone();
+                async move {
+                    let request = request?;
+                    let request_id = request.request_id;
+                    let result = match request.envelope {
+                        Some(envelope) => match handle_append_envelope(registry, envelope).await {
+                            Ok(ack) => Some(
+                                raft_internal_proto::raft_append_stream_response_v1::Result::Ack(
+                                    ack,
+                                ),
+                            ),
+                            Err(status) => Some(
+                                raft_internal_proto::raft_append_stream_response_v1::Result::Error(
+                                    raft_internal_proto::RaftAppendStreamErrorV1 {
+                                        code: status.code() as i32,
+                                        message: status.message().to_owned(),
+                                    },
+                                ),
+                            ),
+                        },
+                        None => Some(
+                            raft_internal_proto::raft_append_stream_response_v1::Result::Error(
+                                raft_internal_proto::RaftAppendStreamErrorV1 {
+                                    code: tonic::Code::InvalidArgument as i32,
+                                    message: "append stream request is missing its envelope"
+                                        .to_owned(),
+                                },
+                            ),
+                        ),
+                    };
+                    Ok(raft_internal_proto::RaftAppendStreamResponseV1 { request_id, result })
+                }
+            })
+            .buffer_unordered(64);
+        Ok(raft_grpc_response(Box::pin(responses)))
     }
 
     async fn vote(
@@ -658,6 +807,7 @@ impl GrpcRaftNetwork {
         match send(client, request).await {
             Ok(response) => {
                 observe_grpc_compression_support(&self.endpoint, response.metadata());
+                observe_grpc_append_stream_support(&self.endpoint, response.metadata());
                 self.note_success();
                 Ok(response.into_inner())
             }
@@ -670,6 +820,73 @@ impl GrpcRaftNetwork {
                 Err(mapped)
             }
         }
+    }
+
+    async fn try_append_stream(
+        &self,
+        envelope: raft_internal_proto::RaftRpcEnvelopeV1,
+        option: RPCOption,
+    ) -> Result<raft_internal_proto::RaftRpcAckV1, tonic::Status> {
+        let client = self
+            .client()
+            .map_err(|err| tonic::Status::unavailable(err.to_string()))?;
+        let sender = shared_append_session(&self.endpoint, self.channel_generation, client)
+            .map_err(tonic::Status::unavailable)?;
+        let (response_sender, response_receiver) = oneshot::channel();
+        sender
+            .send(AppendStreamCall {
+                envelope,
+                response: response_sender,
+            })
+            .map_err(|_| tonic::Status::unavailable("raft append stream is closed"))?;
+        match tokio::time::timeout(option.hard_ttl(), response_receiver).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(tonic::Status::unavailable(
+                "raft append stream closed without a response",
+            )),
+            Err(_) => Err(tonic::Status::deadline_exceeded(
+                "raft append stream exceeded the OpenRaft hard TTL",
+            )),
+        }
+    }
+
+    async fn append_rpc(
+        &mut self,
+        envelope: raft_internal_proto::RaftRpcEnvelopeV1,
+        option: RPCOption,
+    ) -> Result<raft_internal_proto::RaftRpcAckV1, RPCError<UrsulaRaftTypeConfig>> {
+        if grpc_endpoint_supports_append_stream(&self.endpoint) {
+            match self
+                .try_append_stream(envelope.clone(), option.clone())
+                .await
+            {
+                Ok(ack) => {
+                    self.note_success();
+                    return Ok(ack);
+                }
+                Err(status)
+                    if status.code() == tonic::Code::Unimplemented
+                        || !grpc_endpoint_supports_append_stream(&self.endpoint) =>
+                {
+                    forget_grpc_append_stream_support(&self.endpoint);
+                    GRPC_APPEND_STREAM_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(status) => {
+                    let mapped = self.map_tonic_status("AppendStream", status);
+                    self.note_failure("AppendStream");
+                    return Err(mapped);
+                }
+            }
+        }
+
+        GRPC_APPEND_UNARY_CALLS.fetch_add(1, Ordering::Relaxed);
+        self.call(
+            "Append",
+            envelope,
+            option,
+            |mut client, request| async move { client.append(request).await },
+        )
+        .await
     }
 
     /// Decode the MessagePack payload of an envelope-style ack.
@@ -752,6 +969,13 @@ fn grpc_endpoint_accepts_zstd(endpoint: &str) -> bool {
         .is_ok_and(|endpoints| endpoints.contains(endpoint))
 }
 
+fn grpc_endpoint_supports_append_stream(endpoint: &str) -> bool {
+    GRPC_APPEND_STREAM_ENDPOINTS
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .is_ok_and(|endpoints| endpoints.contains(endpoint))
+}
+
 fn observe_grpc_compression_support(endpoint: &str, metadata: &MetadataMap) {
     let accepts_zstd = metadata
         .get(RAFT_GRPC_ACCEPT_REQUEST_COMPRESSION)
@@ -772,12 +996,196 @@ fn observe_grpc_compression_support(endpoint: &str, metadata: &MetadataMap) {
     }
 }
 
+fn observe_grpc_append_stream_support(endpoint: &str, metadata: &MetadataMap) {
+    let supports_append_stream = metadata
+        .get(RAFT_GRPC_APPEND_STREAM_CAPABILITY)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("v1"));
+    if !supports_append_stream {
+        return;
+    }
+    if let Ok(mut endpoints) = GRPC_APPEND_STREAM_ENDPOINTS
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+    {
+        endpoints.insert(endpoint.to_owned());
+    }
+}
+
 fn forget_grpc_compression_support(endpoint: &str) {
     if let Ok(mut endpoints) = GRPC_ZSTD_ENDPOINTS
         .get_or_init(|| Mutex::new(BTreeSet::new()))
         .lock()
     {
         endpoints.remove(endpoint);
+    }
+}
+
+fn forget_grpc_append_stream_support(endpoint: &str) {
+    if let Ok(mut endpoints) = GRPC_APPEND_STREAM_ENDPOINTS
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+    {
+        endpoints.remove(endpoint);
+    }
+}
+
+fn shared_append_session(
+    endpoint: &str,
+    generation: u64,
+    client: RaftClient,
+) -> Result<mpsc::UnboundedSender<AppendStreamCall>, String> {
+    let sessions = GRPC_APPEND_SESSIONS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut sessions = sessions
+        .lock()
+        .map_err(|err| format!("raft append session pool lock poisoned for {endpoint}: {err}"))?;
+    if let Some(session) = sessions.get(endpoint)
+        && session.generation == generation
+        && !session.sender.is_closed()
+    {
+        return Ok(session.sender.clone());
+    }
+
+    let (sender, receiver) = mpsc::unbounded_channel();
+    tokio::spawn(run_append_session(endpoint.to_owned(), client, receiver));
+    sessions.insert(endpoint.to_owned(), SharedAppendSession {
+        generation,
+        sender: sender.clone(),
+    });
+    Ok(sender)
+}
+
+async fn run_append_session(
+    endpoint: String,
+    mut client: RaftClient,
+    mut calls: mpsc::UnboundedReceiver<AppendStreamCall>,
+) {
+    let (wire_sender, wire_receiver) = mpsc::channel(1024);
+    let response = tokio::time::timeout(
+        RAFT_GRPC_APPEND_STREAM_CONNECT_TIMEOUT,
+        client.append_stream(tonic::Request::new(ReceiverStream::new(wire_receiver))),
+    )
+    .await;
+    let mut responses = match response {
+        Ok(Ok(response)) => {
+            observe_grpc_compression_support(&endpoint, response.metadata());
+            observe_grpc_append_stream_support(&endpoint, response.metadata());
+            GRPC_APPEND_STREAM_SESSIONS_OPENED.fetch_add(1, Ordering::Relaxed);
+            response.into_inner()
+        }
+        Ok(Err(status)) => {
+            if status.code() == tonic::Code::Unimplemented {
+                forget_grpc_append_stream_support(&endpoint);
+            }
+            GRPC_APPEND_STREAM_SESSION_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        Err(_) => {
+            GRPC_APPEND_STREAM_SESSION_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+
+    let mut wire_sender = Some(wire_sender);
+    let mut pending = BTreeMap::<
+        u64,
+        oneshot::Sender<Result<raft_internal_proto::RaftRpcAckV1, tonic::Status>>,
+    >::new();
+    let mut next_request_id = 1_u64;
+    let mut accepting = true;
+
+    loop {
+        let pending_before_retain = pending.len();
+        pending.retain(|_, response| !response.is_closed());
+        let cancelled = pending_before_retain.saturating_sub(pending.len()) as u64;
+        GRPC_APPEND_STREAM_INFLIGHT.fetch_sub(cancelled, Ordering::Relaxed);
+        if !accepting && pending.is_empty() {
+            break;
+        }
+        tokio::select! {
+            call = calls.recv(), if accepting => {
+                let Some(call) = call else {
+                    accepting = false;
+                    wire_sender.take();
+                    continue;
+                };
+                let request_id = next_request_id;
+                next_request_id = next_request_id.saturating_add(1);
+                let request_bytes = call.envelope.encoded_len() as u64;
+                pending.insert(request_id, call.response);
+                let inflight = GRPC_APPEND_STREAM_INFLIGHT
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                GRPC_APPEND_STREAM_INFLIGHT_MAX.fetch_max(inflight, Ordering::Relaxed);
+                GRPC_APPEND_STREAM_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                GRPC_APPEND_STREAM_REQUEST_BYTES.fetch_add(request_bytes, Ordering::Relaxed);
+                let request = raft_internal_proto::RaftAppendStreamRequestV1 {
+                    request_id,
+                    envelope: Some(call.envelope),
+                };
+                let sent = match wire_sender.as_ref() {
+                    Some(sender) => sender.send(request).await.is_ok(),
+                    None => false,
+                };
+                if !sent {
+                    if let Some(response) = pending.remove(&request_id) {
+                        GRPC_APPEND_STREAM_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+                        let _ = response.send(Err(tonic::Status::unavailable(
+                            "raft append stream request channel closed",
+                        )));
+                    }
+                    accepting = false;
+                    wire_sender.take();
+                }
+            }
+            response = responses.message() => {
+                match response {
+                    Ok(Some(response)) => {
+                        let Some(reply) = pending.remove(&response.request_id) else {
+                            continue;
+                        };
+                        GRPC_APPEND_STREAM_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+                        GRPC_APPEND_STREAM_RESPONSES.fetch_add(1, Ordering::Relaxed);
+                        GRPC_APPEND_STREAM_RESPONSE_BYTES.fetch_add(
+                            response.encoded_len() as u64,
+                            Ordering::Relaxed,
+                        );
+                        let result = match response.result {
+                            Some(raft_internal_proto::raft_append_stream_response_v1::Result::Ack(ack)) => Ok(ack),
+                            Some(raft_internal_proto::raft_append_stream_response_v1::Result::Error(error)) => {
+                                Err(tonic::Status::new(
+                                    tonic::Code::from_i32(error.code),
+                                    error.message,
+                                ))
+                            }
+                            None => Err(tonic::Status::internal(
+                                "raft append stream response is missing its result",
+                            )),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    Ok(None) => {
+                        GRPC_APPEND_STREAM_SESSION_FAILURES.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                    Err(status) => {
+                        if status.code() == tonic::Code::Unimplemented {
+                            forget_grpc_append_stream_support(&endpoint);
+                        }
+                        GRPC_APPEND_STREAM_SESSION_FAILURES.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let abandoned = pending.len() as u64;
+    GRPC_APPEND_STREAM_INFLIGHT.fetch_sub(abandoned, Ordering::Relaxed);
+    for (_, response) in pending {
+        let _ = response.send(Err(tonic::Status::unavailable(
+            "raft append stream closed before the peer replied",
+        )));
     }
 }
 
@@ -801,14 +1209,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
         option: RPCOption,
     ) -> Result<UrsulaAppendEntriesResponse, RPCError<UrsulaRaftTypeConfig>> {
         let envelope = self.append_envelope(rpc);
-        let ack = self
-            .call(
-                "Append",
-                envelope,
-                option,
-                |mut client, request| async move { client.append(request).await },
-            )
-            .await?;
+        let ack = self.append_rpc(envelope, option).await?;
         self.decode_rpc_ack("Append", &ack.payload)
     }
 
@@ -873,6 +1274,10 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
 
 #[cfg(test)]
 mod reconnect_tests {
+    use std::time::Duration;
+
+    use tokio_stream::wrappers::TcpListenerStream;
+
     use super::*;
 
     fn remove_shared_channel(endpoint: &str) {
@@ -889,6 +1294,24 @@ mod reconnect_tests {
         // Override threshold so tests don't depend on the env var
         net.reconnect_threshold = threshold;
         net
+    }
+
+    async fn spawn_append_stream_server()
+    -> (String, RaftGroupHandleRegistry, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test raft grpc listener");
+        let address = listener.local_addr().expect("read test listener address");
+        let registry = RaftGroupHandleRegistry::default();
+        let service_registry = registry.clone();
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(raft_grpc_service(service_registry))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .expect("serve test raft grpc");
+        });
+        (format!("http://{address}"), registry, task)
     }
 
     #[test]
@@ -915,6 +1338,95 @@ mod reconnect_tests {
                 .and_then(|value| value.to_str().ok()),
             Some("zstd")
         );
+        assert_eq!(
+            response
+                .metadata()
+                .get(RAFT_GRPC_APPEND_STREAM_CAPABILITY)
+                .and_then(|value| value.to_str().ok()),
+            Some("v1")
+        );
+    }
+
+    #[test]
+    fn append_stream_capability_is_learned_and_forgotten() {
+        let endpoint = "http://127.0.0.1:32196";
+        forget_grpc_append_stream_support(endpoint);
+        assert!(!grpc_endpoint_supports_append_stream(endpoint));
+
+        let response = raft_grpc_response(());
+        observe_grpc_append_stream_support(endpoint, response.metadata());
+        assert!(grpc_endpoint_supports_append_stream(endpoint));
+
+        forget_grpc_append_stream_support(endpoint);
+        assert!(!grpc_endpoint_supports_append_stream(endpoint));
+    }
+
+    #[tokio::test]
+    async fn groups_share_one_append_stream_and_receive_independent_errors() {
+        let (endpoint, _registry, server) = spawn_append_stream_server().await;
+        remove_shared_channel(&endpoint);
+        forget_grpc_append_stream_support(&endpoint);
+
+        let first = GrpcRaftNetwork::new(RaftGroupId(1), 2, endpoint.clone());
+        let second = GrpcRaftNetwork::new(RaftGroupId(2), 2, endpoint.clone());
+        let envelope = |raft_group_id| raft_internal_proto::RaftRpcEnvelopeV1 {
+            raft_group_id,
+            node_id: 2,
+            protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+            payload: Vec::new().into(),
+        };
+        let option = RPCOption::new(Duration::from_secs(2));
+        let (first_result, second_result) = tokio::join!(
+            first.try_append_stream(envelope(1), option.clone()),
+            second.try_append_stream(envelope(2), option),
+        );
+
+        assert_eq!(
+            first_result.expect_err("missing group should fail").code(),
+            tonic::Code::NotFound
+        );
+        assert_eq!(
+            second_result
+                .expect_err("second missing group should fail")
+                .code(),
+            tonic::Code::NotFound
+        );
+        let shared_generation = GRPC_APPEND_SESSIONS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("append session pool lock")
+            .get(&endpoint)
+            .map(|session| session.generation);
+        assert_eq!(shared_generation, Some(first.channel_generation));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn node_transport_shutdown_closes_append_stream() {
+        let (endpoint, registry, server) = spawn_append_stream_server().await;
+        let channel = Endpoint::from_shared(endpoint)
+            .expect("valid endpoint")
+            .connect()
+            .await
+            .expect("connect to test server");
+        let mut client =
+            raft_internal_proto::raft_internal_client::RaftInternalClient::new(channel);
+        let (_sender, receiver) = mpsc::channel(1);
+        let response = client
+            .append_stream(tonic::Request::new(ReceiverStream::new(receiver)))
+            .await
+            .expect("open append stream");
+        let mut responses = response.into_inner();
+
+        registry.shutdown_transport();
+
+        let closed = tokio::time::timeout(Duration::from_secs(2), responses.message())
+            .await
+            .expect("append stream should close promptly")
+            .expect("stream shutdown should not be an RPC error");
+        assert!(closed.is_none());
+        server.abort();
     }
 
     #[tokio::test]

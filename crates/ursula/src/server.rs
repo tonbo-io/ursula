@@ -210,7 +210,7 @@ async fn serve(
     let admin_listen: SocketAddr = config.server.admin_listen.parse()?;
 
     let shutdown = Arc::new(Notify::new());
-    spawn_shutdown_signal_task(shutdown.clone());
+    spawn_shutdown_signal_task(shutdown.clone(), state.raft_registry().cloned());
 
     let admin_app = crate::admin_router(state.clone());
     let admin_listener = tokio::net::TcpListener::bind(admin_listen).await?;
@@ -281,12 +281,18 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 /// into one graceful-shutdown notification. A second signal, or the grace
 /// deadline expiring, exits immediately: quorum replication and the WAL make
 /// abrupt exit safe for acknowledged data, so the escape hatch stays cheap.
-fn spawn_shutdown_signal_task(shutdown: Arc<Notify>) {
+fn spawn_shutdown_signal_task(
+    shutdown: Arc<Notify>,
+    raft_registry: Option<ursula_raft::RaftGroupHandleRegistry>,
+) {
     tokio::spawn(async move {
         shutdown_signal().await;
         tracing::info!(
             "received shutdown signal; draining listeners (forced exit after {SHUTDOWN_GRACE:?})"
         );
+        if let Some(registry) = raft_registry {
+            registry.shutdown_transport();
+        }
         shutdown.notify_waiters();
         tokio::select! {
             () = shutdown_signal() => {

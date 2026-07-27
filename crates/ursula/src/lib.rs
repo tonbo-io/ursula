@@ -74,6 +74,7 @@ use tower_http::compression::predicate::SizeAbove;
 use ursula_raft::LeadershipShedFlag;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::RAFT_GRPC_APPEND_PATH;
+use ursula_raft::RAFT_GRPC_APPEND_STREAM_PATH;
 use ursula_raft::RAFT_GRPC_FULL_SNAPSHOT_PATH;
 use ursula_raft::RAFT_GRPC_GROUP_READ_PATH;
 use ursula_raft::RAFT_GRPC_GROUP_WRITE_PATH;
@@ -623,11 +624,22 @@ impl HttpRaftGrpcService {
 
 #[tonic::async_trait]
 impl raft_internal_proto::raft_internal_server::RaftInternal for HttpRaftGrpcService {
+    type AppendStreamStream =
+        <RaftGrpcService as raft_internal_proto::raft_internal_server::RaftInternal>::AppendStreamStream;
+
     async fn append(
         &self,
         request: tonic::Request<raft_internal_proto::RaftRpcEnvelopeV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftRpcAckV1>, tonic::Status> {
         raft_internal_proto::raft_internal_server::RaftInternal::append(&self.raft, request).await
+    }
+
+    async fn append_stream(
+        &self,
+        request: tonic::Request<tonic::Streaming<raft_internal_proto::RaftAppendStreamRequestV1>>,
+    ) -> Result<tonic::Response<Self::AppendStreamStream>, tonic::Status> {
+        raft_internal_proto::raft_internal_server::RaftInternal::append_stream(&self.raft, request)
+            .await
     }
 
     async fn vote(
@@ -832,6 +844,10 @@ pub fn cluster_router_from_state(state: HttpState) -> Router {
     Router::new()
         .route_service(
             RAFT_GRPC_APPEND_PATH,
+            raft_grpc_service(state.clone(), raft_registry.clone()),
+        )
+        .route_service(
+            RAFT_GRPC_APPEND_STREAM_PATH,
             raft_grpc_service(state.clone(), raft_registry.clone()),
         )
         .route_service(

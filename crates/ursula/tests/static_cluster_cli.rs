@@ -146,6 +146,39 @@ async fn cli_static_grpc_raft_cluster_forwards_follower_writes() {
     .await;
     assert_eq!(payload, b"cli-forward-payload");
 
+    let mut stream_sessions = 0_u64;
+    let mut stream_requests = 0_u64;
+    for (_, base_url) in &peers {
+        let metrics: serde_json::Value = client
+            .get(format!("{base_url}/__ursula/metrics"))
+            .send()
+            .await
+            .expect("request cluster metrics")
+            .error_for_status()
+            .expect("cluster metrics status")
+            .json()
+            .await
+            .expect("decode cluster metrics");
+        stream_sessions = stream_sessions.saturating_add(
+            metrics["raft_grpc_append_stream_sessions_opened"]
+                .as_u64()
+                .unwrap_or(0),
+        );
+        stream_requests = stream_requests.saturating_add(
+            metrics["raft_grpc_append_stream_requests"]
+                .as_u64()
+                .unwrap_or(0),
+        );
+    }
+    assert!(
+        stream_sessions > 0,
+        "the static cluster should open a multiplexed append stream"
+    );
+    assert!(
+        stream_requests > 0,
+        "the static cluster should replicate through the append stream"
+    );
+
     drop(children);
 }
 

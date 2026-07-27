@@ -33,6 +33,7 @@ use openraft::rt::WatchReceiver;
 use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
 use openraft::type_config::alias::SnapshotOf as TypeConfigSnapshotOf;
+use tokio::sync::watch;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::SnapshotLocation;
@@ -819,6 +820,7 @@ pub struct RaftGroupHandleRegistry {
     groups: Arc<Mutex<BTreeMap<u32, Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>>>>,
     dynamic_hosted_groups: Arc<Mutex<BTreeSet<RaftGroupId>>>,
     leadership_shed: LeadershipShedFlag,
+    transport_shutdown: watch::Sender<bool>,
     snapshot_store: Arc<Mutex<SharedSnapshotStore>>,
     snapshot_build: Arc<Mutex<SnapshotBuildCoordinator>>,
     snapshot_install: SnapshotInstallCoordinator,
@@ -826,10 +828,12 @@ pub struct RaftGroupHandleRegistry {
 
 impl Default for RaftGroupHandleRegistry {
     fn default() -> Self {
+        let (transport_shutdown, _) = watch::channel(false);
         Self {
             groups: Arc::new(Mutex::new(BTreeMap::new())),
             dynamic_hosted_groups: Arc::new(Mutex::new(BTreeSet::new())),
             leadership_shed: Arc::new(AtomicU8::new(0)),
+            transport_shutdown,
             snapshot_store: Arc::new(Mutex::new(default_snapshot_store())),
             snapshot_build: Arc::new(Mutex::new(SnapshotBuildCoordinator::new(1))),
             snapshot_install: SnapshotInstallCoordinator::new(1),
@@ -856,6 +860,18 @@ impl Drop for PrefetchedSnapshotGuard {
 }
 
 impl RaftGroupHandleRegistry {
+    /// Stops long-lived Raft transport sessions before the node server exits.
+    ///
+    /// This lets peers reconnect promptly instead of retaining a stream backed
+    /// by a node instance that is already shutting down.
+    pub fn shutdown_transport(&self) {
+        self.transport_shutdown.send_replace(true);
+    }
+
+    pub(crate) fn subscribe_transport_shutdown(&self) -> watch::Receiver<bool> {
+        self.transport_shutdown.subscribe()
+    }
+
     pub fn register(
         &self,
         placement: ShardPlacement,
