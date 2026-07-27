@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -1183,6 +1184,84 @@ async fn json_mode_normalizes_appends_and_reads_ndjson() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn finite_json_reads_negotiate_gzip_without_compressing_sse() {
+    let app = test_router();
+    let value = "a".repeat(4_096);
+    let append_body = format!(r#"[{{"value":"{value}"}}]"#);
+    let expected_body = format!("{{\"value\":\"{value}\"}}\n");
+
+    let response = http_put(
+        &app,
+        "/benchcmp/compressed-json",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = http_post(
+        &app,
+        "/benchcmp/compressed-json",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(append_body),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = send(
+        &app,
+        "GET",
+        "/benchcmp/compressed-json",
+        &[("accept-encoding", "gzip")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header_str(&response, axum::http::header::CONTENT_ENCODING),
+        "gzip"
+    );
+    assert!(
+        header_str(&response, axum::http::header::VARY)
+            .split(',')
+            .any(|value| value.trim().eq_ignore_ascii_case("accept-encoding"))
+    );
+    let compressed = body_bytes(response).await;
+    assert!(compressed.len() < expected_body.len() / 4);
+    let mut decoder = flate2::read::GzDecoder::new(compressed.as_ref());
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded).expect("decode gzip body");
+    assert_eq!(decoded, expected_body.as_bytes());
+
+    let response = http_get(&app, "/benchcmp/compressed-json").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_ENCODING)
+            .is_none()
+    );
+    assert_eq!(body_bytes(response).await, expected_body.as_bytes());
+
+    let response = send(
+        &app,
+        "GET",
+        "/benchcmp/compressed-json?record=now&live=sse",
+        &[("accept-encoding", "gzip")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_str(&response, CONTENT_TYPE), "text/event-stream");
+    assert!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_ENCODING)
+            .is_none()
+    );
 }
 
 #[tokio::test]

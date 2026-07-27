@@ -46,6 +46,7 @@ use axum::http::Method;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::http::Uri;
+use axum::http::Version;
 #[cfg(feature = "jemalloc-prof")]
 use axum::http::header::CONTENT_DISPOSITION;
 use axum::http::header::CONTENT_LENGTH;
@@ -66,6 +67,10 @@ use chrono::DateTime;
 use futures_util::stream;
 use openraft::BasicNode;
 use openraft::rt::WatchReceiver;
+use tower_http::compression::CompressionLayer;
+use tower_http::compression::CompressionLevel;
+use tower_http::compression::predicate::Predicate;
+use tower_http::compression::predicate::SizeAbove;
 use ursula_raft::LeadershipShedFlag;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::RAFT_GRPC_APPEND_PATH;
@@ -1021,6 +1026,30 @@ async fn clear_maintenance_drain(State(state): State<HttpState>) -> Response {
 }
 
 pub fn client_router_with_admission(state: HttpState, admission: IngressAdmission) -> Router {
+    let finite_record_response =
+        |_status: StatusCode,
+         _version: Version,
+         headers: &HeaderMap,
+         _extensions: &axum::http::Extensions| {
+            headers
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|content_type| {
+                    let media_type = content_type
+                        .split(';')
+                        .next()
+                        .unwrap_or(content_type)
+                        .trim();
+                    media_type == "application/json"
+                        || media_type == "application/x-ndjson"
+                        || media_type == "application/vnd.durable-stream-records+ndjson"
+                })
+        };
+    let response_compression = CompressionLayer::new()
+        .gzip(true)
+        .quality(CompressionLevel::Fastest)
+        .compress_when(SizeAbove::new(256).and(finite_record_response));
+
     Router::new()
         .route("/__ursula/metrics", get(metrics))
         .route("/__ursula/usage", get(bucket_usage))
@@ -1068,6 +1097,7 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
             admission,
             ingress_admission_middleware,
         ))
+        .layer(response_compression)
         .with_state(state)
 }
 

@@ -805,6 +805,62 @@ async fn gateway_preserves_path_and_query_with_trailing_upstream_slash() {
 }
 
 #[tokio::test]
+async fn gateway_forwards_response_content_encoding_without_decoding() {
+    const GZIP_HELLO: &[u8] = &[
+        31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 203, 72, 205, 201, 201, 7, 0, 134, 166, 16, 54, 5, 0, 0, 0,
+    ];
+    let app = Router::new().route(
+        "/bucket/stream",
+        get(|headers: HeaderMap| async move {
+            let accept_encoding = headers
+                .get("accept-encoding")
+                .cloned()
+                .unwrap_or_else(|| "missing".parse().expect("static header"));
+            (
+                StatusCode::OK,
+                [
+                    (
+                        "content-type",
+                        "application/x-ndjson".parse().expect("static header"),
+                    ),
+                    ("content-encoding", "gzip".parse().expect("static header")),
+                    ("x-seen-accept-encoding", accept_encoding),
+                ],
+                bytes::Bytes::from_static(GZIP_HELLO),
+            )
+        }),
+    );
+    let upstream = spawn_upstream(app).await;
+    let gateway = gateway_for_url(upstream.url.clone());
+    let req = Request::builder()
+        .method("GET")
+        .uri("/bucket/stream")
+        .header("accept-encoding", "gzip")
+        .body(Body::empty())
+        .expect("build request");
+
+    let (parts, body) = req.into_parts();
+    let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    let response = gateway
+        .forward(&upstream.url, &parts, body_bytes, ResponseTail::default())
+        .await
+        .expect("forward compressed response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("content-encoding").unwrap(), "gzip");
+    assert_eq!(
+        response.headers().get("x-seen-accept-encoding").unwrap(),
+        "gzip"
+    );
+    assert_eq!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("compressed body"),
+        GZIP_HELLO
+    );
+}
+
+#[tokio::test]
 async fn gateway_accepts_https_upstream_scheme() {
     let gateway = gateway_for_url("https://127.0.0.1:1");
     let req = Request::builder()
