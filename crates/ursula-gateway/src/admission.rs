@@ -19,6 +19,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use tokio::time::Duration;
 use tokio::time::Instant;
 
 pub type QuotaFuture<'a> = Pin<Box<dyn Future<Output = TenantLimits> + Send + 'a>>;
@@ -155,10 +156,45 @@ struct RateBucket {
     refilled_at: Instant,
 }
 
+/// Prune once the tracked set grows past this. A trigger, not a hard cap:
+/// dropping *active* state would reset a tenant's limiter mid-flight, which is a
+/// rate-limit bypass rather than a memory fix. If a deployment genuinely serves
+/// more concurrently active Buckets than this, the set stays larger.
+const PRUNE_ABOVE_TRACKED_BUCKETS: usize = 10_000;
+
+/// Idle threshold for reclaiming a rate bucket.
+///
+/// Safe by construction, not by tuning. A bucket refills at `rate` per second
+/// and is capped at `rate`, so any entry untouched for a full second is already
+/// back at maximum tokens. Recreating it therefore grants exactly what refill
+/// would have produced — eviction beyond one second of idleness is
+/// indistinguishable from retention, and this threshold is far beyond that.
+const RATE_BUCKET_IDLE_TTL: Duration = Duration::from_secs(60);
+
 #[derive(Default)]
 struct AdmissionState {
     rate: HashMap<String, RateBucket>,
     live_reads: HashMap<String, u32>,
+}
+
+impl AdmissionState {
+    /// Reclaim rate buckets no request has touched recently.
+    ///
+    /// Without this the map holds one entry per Bucket the process has ever
+    /// served, so resident memory tracks distinct Buckets ever seen rather than
+    /// Buckets currently active — unbounded on a service where accounts create
+    /// their own Buckets.
+    ///
+    /// Only runs once the set is large, so the `retain` scan is amortised across
+    /// the insertions that grew it.
+    fn prune_idle_rate_buckets(&mut self, now: Instant) {
+        if self.rate.len() <= PRUNE_ABOVE_TRACKED_BUCKETS {
+            return;
+        }
+        self.rate.retain(|_bucket_id, bucket| {
+            now.saturating_duration_since(bucket.refilled_at) < RATE_BUCKET_IDLE_TTL
+        });
+    }
 }
 
 /// Enforces [`TenantLimits`] with in-memory state. State is per gateway
@@ -199,17 +235,22 @@ impl Admission {
         let elapsed = now.saturating_duration_since(bucket.refilled_at);
         bucket.tokens = (bucket.tokens + elapsed.as_secs_f64() * rate).min(rate);
         bucket.refilled_at = now;
-        if bucket.tokens >= 1.0 {
+        let outcome = if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
-            return Ok(());
-        }
-        let deficit = (1.0 - bucket.tokens).max(0.0);
-        #[expect(
-            clippy::cast_sign_loss,
-            reason = "deficit and rate are both clamped non-negative above"
-        )]
-        let retry_after_secs = (deficit / rate).ceil().max(1.0) as u64;
-        Err(AdmissionRejection::RateLimited { retry_after_secs })
+            Ok(())
+        } else {
+            let deficit = (1.0 - bucket.tokens).max(0.0);
+            #[expect(
+                clippy::cast_sign_loss,
+                reason = "deficit and rate are both clamped non-negative above"
+            )]
+            let retry_after_secs = (deficit / rate).ceil().max(1.0) as u64;
+            Err(AdmissionRejection::RateLimited { retry_after_secs })
+        };
+        // After deciding, so the decision never depends on whether this call
+        // happened to be the one that triggered a scan.
+        state.prune_idle_rate_buckets(now);
+        outcome
     }
 
     /// Reserves one live-read slot; the returned guard releases it when the
@@ -351,5 +392,128 @@ mod tests {
             std::task::Poll::Ready(value) => value,
             std::task::Poll::Pending => unreachable!("static provider resolves immediately"),
         }
+    }
+}
+
+#[cfg(test)]
+impl Admission {
+    /// Tracked rate buckets. Exists for the eviction tests: the point of the
+    /// change is a number that stops growing, which is not observable from the
+    /// admission decision itself.
+    pub(crate) fn tracked_rate_buckets(&self) -> usize {
+        self.lock().rate.len()
+    }
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::Admission;
+    use super::PRUNE_ABOVE_TRACKED_BUCKETS;
+    use super::TenantLimits;
+
+    fn limits(rate: u32) -> TenantLimits {
+        TenantLimits {
+            requests_per_sec: Some(rate),
+            ..TenantLimits::default()
+        }
+    }
+
+    /// Fills the tracked set past the prune trigger. Every entry is touched at
+    /// the current instant, so none is prunable yet.
+    fn fill_past_trigger(admission: &Admission) {
+        for index in 0..=PRUNE_ABOVE_TRACKED_BUCKETS {
+            assert!(
+                admission
+                    .admit_request(&format!("bucket-{index}"), limits(10))
+                    .is_ok(),
+                "a first request against a fresh bucket must be admitted"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_rate_buckets_are_reclaimed() {
+        let admission = Admission::default();
+        fill_past_trigger(&admission);
+        assert_eq!(
+            admission.tracked_rate_buckets(),
+            PRUNE_ABOVE_TRACKED_BUCKETS + 1,
+            "nothing should be prunable while every entry was just touched"
+        );
+
+        tokio::time::advance(super::RATE_BUCKET_IDLE_TTL + std::time::Duration::from_secs(1)).await;
+        admission
+            .admit_request("late-arrival", limits(10))
+            .expect("a fresh bucket is admitted");
+
+        assert_eq!(
+            admission.tracked_rate_buckets(),
+            1,
+            "every idle entry should be gone, leaving only the request that triggered the scan"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_active_bucket_survives_the_scan() {
+        let admission = Admission::default();
+        fill_past_trigger(&admission);
+
+        tokio::time::advance(super::RATE_BUCKET_IDLE_TTL + std::time::Duration::from_secs(1)).await;
+        // Touched after the idle window, so this one is still in use.
+        admission
+            .admit_request("bucket-0", limits(10))
+            .expect("an active bucket stays within its rate");
+        admission
+            .admit_request("late-arrival", limits(10))
+            .expect("a fresh bucket is admitted");
+
+        assert_eq!(
+            admission.tracked_rate_buckets(),
+            2,
+            "pruning must not drop state for a bucket that is still sending traffic"
+        );
+    }
+
+    /// The property that makes eviction safe rather than a rate-limit bypass.
+    ///
+    /// A bucket refills at `rate` per second capped at `rate`, so an entry idle
+    /// for longer than a second is already back at full tokens. Recreating it
+    /// must therefore grant exactly what retention would have granted — assert
+    /// the two are indistinguishable rather than trusting the reasoning.
+    #[tokio::test(start_paused = true)]
+    async fn a_returning_bucket_gets_no_more_than_refill_would_have_given() {
+        const RATE: u32 = 5;
+
+        fn burst_after_idling(admission: &Admission, bucket_id: &str) -> u32 {
+            let mut admitted = 0;
+            while admission.admit_request(bucket_id, limits(RATE)).is_ok() {
+                admitted += 1;
+                assert!(admitted <= RATE * 2, "burst did not converge");
+            }
+            admitted
+        }
+
+        // Retained: the tracked set stays below the trigger, so nothing is pruned.
+        let retained = Admission::default();
+        let initial_burst = burst_after_idling(&retained, "kept");
+        assert_eq!(initial_burst, RATE);
+        tokio::time::advance(super::RATE_BUCKET_IDLE_TTL + std::time::Duration::from_secs(1)).await;
+        let after_retention = burst_after_idling(&retained, "kept");
+
+        // Evicted: the same bucket, but pruned out while it was idle.
+        let evicted = Admission::default();
+        assert_eq!(burst_after_idling(&evicted, "kept"), RATE);
+        fill_past_trigger(&evicted);
+        tokio::time::advance(super::RATE_BUCKET_IDLE_TTL + std::time::Duration::from_secs(1)).await;
+        evicted
+            .admit_request("prune-trigger", limits(10))
+            .expect("a fresh bucket is admitted");
+        let after_eviction = burst_after_idling(&evicted, "kept");
+
+        assert_eq!(after_retention, RATE);
+        assert_eq!(
+            after_eviction, after_retention,
+            "eviction must not hand back a larger burst than refill would have"
+        );
     }
 }
