@@ -264,6 +264,12 @@ gateway:
     # TLS configuration rendered into spec.tls. Referenced Secrets must already exist.
     tls: []
 
+  # Origins allowed to read across origins, or a single "*". Empty sends no CORS
+  # headers at all, which leaves anonymous public_read buckets unreachable from
+  # browser JavaScript. Credentials are never allowed, so "*" grants no ambient
+  # access: a cross-origin caller must still present its own bearer token.
+  corsAllowedOrigins: []
+
   # Manual upstream URLs. When empty, the chart auto-generates upstreams from
   # Ursula server pod DNS through the headless Service.
   upstreams: []

@@ -464,6 +464,11 @@
           },
           "required": ["enabled", "className", "annotations", "labels", "hosts", "tls"]
         },
+        "corsAllowedOrigins": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Origins allowed to read across origins, or a single \"*\". Empty disables CORS."
+        },
         "upstreams": {
           "type": "array",
           "description": "Manual upstream URLs. When empty, upstreams are auto-generated from Ursula headless Service pod DNS.",
