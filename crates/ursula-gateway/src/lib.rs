@@ -18,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::error::Error as _;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
@@ -299,6 +300,7 @@ impl Gateway {
                 })
             }),
             _live_guard: live_guard,
+            credential_expires_at: context.as_ref().and_then(|ctx| ctx.credential_expires_at),
         };
 
         match self.forward(&upstream, &parts, body_bytes, tail).await {
@@ -367,6 +369,7 @@ impl Gateway {
         Ok(Some(RequestContext {
             bucket_id,
             class: usage_class(action),
+            credential_expires_at: principal.as_ref().map(|principal| principal.expires_at),
             principal: principal.as_ref().map(principal_ref),
             limits,
         }))
@@ -553,6 +556,30 @@ impl Gateway {
             }
         }
 
+        // Computed before `headers` moves into the response. Only responses that
+        // stream indefinitely get a deadline: cutting a normal read short because
+        // its credential lapsed mid-transfer would corrupt a body the client is
+        // already committed to reading.
+        let deadline = tail.credential_expires_at.and_then(|expires_at| {
+            let streams_indefinitely = headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"));
+            if !streams_indefinitely {
+                return None;
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_secs();
+            Some(CredentialDeadline {
+                sleep: Box::pin(tokio::time::sleep(Duration::from_secs(
+                    expires_at.saturating_sub(now),
+                ))),
+                terminal_emitted: false,
+            })
+        });
+
         let mut response = Response::builder().status(status);
         if let Some(response_headers) = response.headers_mut() {
             *response_headers = headers;
@@ -561,6 +588,7 @@ impl Gateway {
             .body(Body::from_stream(CountedStream {
                 inner: upstream_resp.bytes_stream(),
                 tail,
+                deadline,
             }))
             .map_err(|e| GatewayError::ResponseBuild(e.to_string()))
     }
@@ -641,6 +669,9 @@ struct RequestContext {
     class: UsageClass,
     principal: Option<PrincipalRef>,
     limits: TenantLimits,
+    /// `exp` of the presented credential. `None` for anonymous public reads,
+    /// which have no credential and therefore no deadline.
+    credential_expires_at: Option<u64>,
 }
 
 fn usage_class(action: Action) -> UsageClass {
@@ -689,9 +720,13 @@ fn admission_rejection_response(rejection: AdmissionRejection) -> AxumResponse {
 /// Rides the response body: counts egress bytes and, on drop, records the
 /// request's usage and releases any live-read slot. Dropping happens whether
 /// the body completes, the client disconnects, or the response is discarded.
+#[derive(Default)]
 struct ResponseTail {
     meter: Option<EgressMeter>,
     _live_guard: Option<LiveReadGuard>,
+    /// Unix seconds at which the credential that authorized this request stops
+    /// being valid. Only consulted for responses that stream indefinitely.
+    credential_expires_at: Option<u64>,
 }
 
 struct EgressMeter {
@@ -708,9 +743,27 @@ impl Drop for EgressMeter {
     }
 }
 
+/// Terminal SSE frame for a subscription cut short by credential expiry.
+///
+/// Named rather than a bare stream end: a client cannot otherwise tell "the
+/// stream is over" from "your credential ran out", and the correct response
+/// differs — the second one means re-authenticate and resume from the last
+/// `Stream-Next-Offset`.
+const CREDENTIAL_EXPIRED_EVENT: &[u8] =
+    b"event: credential-expired\ndata: {\"reason\":\"credential_expired\"}\n\n";
+
+/// Deadline state for a stream that must not outlive its credential.
+struct CredentialDeadline {
+    sleep: std::pin::Pin<Box<tokio::time::Sleep>>,
+    terminal_emitted: bool,
+}
+
 struct CountedStream<S> {
     inner: S,
     tail: ResponseTail,
+    /// Armed only for responses that stream indefinitely, so a normal read is
+    /// never truncated by a credential that expires while it is in flight.
+    deadline: Option<CredentialDeadline>,
 }
 
 impl<S> futures_core::Stream for CountedStream<S>
@@ -723,6 +776,20 @@ where S: futures_core::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unp
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if let Some(deadline) = &mut this.deadline {
+            if deadline.terminal_emitted {
+                return std::task::Poll::Ready(None);
+            }
+            if deadline.sleep.as_mut().poll(cx).is_ready() {
+                // Emit the terminal frame and stop reading upstream: forwarding
+                // further data would be serving a request whose authorization
+                // has lapsed.
+                deadline.terminal_emitted = true;
+                return std::task::Poll::Ready(Some(Ok(bytes::Bytes::from_static(
+                    CREDENTIAL_EXPIRED_EVENT,
+                ))));
+            }
+        }
         let polled = std::pin::Pin::new(&mut this.inner).poll_next(cx);
         if let std::task::Poll::Ready(Some(Ok(chunk))) = &polled
             && let Some(meter) = &mut this.tail.meter
