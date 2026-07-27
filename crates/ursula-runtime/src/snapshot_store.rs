@@ -18,14 +18,8 @@ use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-#[cfg(not(madsim))]
-use std::sync::atomic::AtomicU64;
-#[cfg(not(madsim))]
-use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
-#[cfg(not(madsim))]
-use crossbeam_utils::CachePadded;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -49,25 +43,13 @@ impl SnapshotReferenceConfig {
 
 /// Identifier the store uses to derive a key/path for a snapshot blob.
 ///
-/// `snapshot_id` is the openraft-provided id (group + leader + log index),
-/// guaranteed unique per snapshot build attempt.
+/// `snapshot_id` is the openraft-provided id (group + leader + log index).
+/// Repeated builds at the same applied index may reuse it, so stores must not
+/// treat it as a unique physical-object identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SnapshotKey {
     pub raft_group_id: u32,
     pub snapshot_id: String,
-}
-
-// Only the S3 store (cfg(not(madsim))) derives object keys; gate the helper
-// so madsim builds stay dead-code-free.
-#[cfg(not(madsim))]
-fn unique_snapshot_leaf(snapshot_id: &str) -> String {
-    static COUNTER: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
-    let nonce_nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let nonce_seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{snapshot_id}-{nonce_nanos:032}-{nonce_seq:020}.snap")
 }
 
 /// Where a snapshot blob lives. Carried in [`SnapshotPointer`] over openraft.
@@ -94,6 +76,11 @@ pub enum SnapshotLocation {
         /// Compression applied to the S3 object body.
         #[serde(default)]
         compression: SnapshotCompression,
+        /// The object key is content-addressed and may be referenced by
+        /// several replicas or snapshot pointers. Shared objects must only be
+        /// removed by reference-aware pruning.
+        #[serde(default)]
+        shared_object: bool,
     },
 }
 
@@ -361,10 +348,13 @@ fn collect_snapshot_chunks(chunks: SnapshotBytesIterator) -> Result<Vec<u8>, Sna
 #[cfg(not(madsim))]
 mod s3 {
     use std::collections::HashSet;
+    use std::io;
+    use std::io::Write;
     use std::time::Duration;
     use std::time::SystemTime;
 
     use bytes::Bytes;
+    use opendal::ErrorKind;
     use opendal::Operator;
     use opendal::Scheme;
 
@@ -376,7 +366,6 @@ mod s3 {
     use super::SnapshotStore;
     use super::SnapshotStoreError;
     use super::SnapshotStoreFuture;
-    use super::unique_snapshot_leaf;
 
     const S3_SNAPSHOT_ZSTD_LEVEL: i32 = 3;
     const S3_SNAPSHOT_GC_GRACE: Duration = Duration::from_secs(60 * 60);
@@ -452,6 +441,17 @@ mod s3 {
                 .map_err(|err| SnapshotStoreError::Backend(err.to_string()))
         }
 
+        #[cfg(test)]
+        pub(crate) async fn delete_raw_for_tests(
+            &self,
+            key: &str,
+        ) -> Result<(), SnapshotStoreError> {
+            self.operator
+                .delete(key)
+                .await
+                .map_err(|err| SnapshotStoreError::Backend(err.to_string()))
+        }
+
         /// Build an S3 snapshot store from a [`ColdConfig`].
         /// Snapshot blobs share the cold bucket/credentials and use `prefix`
         /// (defaults to `snapshots`) for separation.
@@ -515,19 +515,12 @@ mod s3 {
             Ok(Self::new(operator, prefix))
         }
 
-        /// Build a per-attempt-unique S3 key. The openraft `snapshot_id` is
-        /// derived from `last_applied_log_id`, so two builds during an
-        /// apply-idle window compute the SAME snapshot_id. If the S3 key also
-        /// matched, two distinct published pointers could alias one physical
-        /// object. A nanosecond + per-process counter suffix keeps the physical
-        /// S3 key unique per upload attempt without changing the openraft-visible
-        /// snapshot_id.
-        fn object_key(&self, key: &SnapshotKey) -> String {
+        fn object_key(&self, key: &SnapshotKey, digest: blake3::Hash) -> String {
             format!(
-                "{}/group-{}/{}",
+                "{}/group-{}/objects/{}.snap",
                 self.prefix,
                 key.raft_group_id,
-                unique_snapshot_leaf(&key.snapshot_id),
+                digest.to_hex(),
             )
         }
 
@@ -541,6 +534,94 @@ mod s3 {
                 self.group_prefix(raft_group_id)
             )
         }
+
+        async fn write_content_once(
+            &self,
+            object_key: &str,
+            stored_bytes: Vec<u8>,
+        ) -> Result<u64, SnapshotStoreError> {
+            let stored_size_bytes = stored_bytes.len() as u64;
+            if self
+                .operator
+                .info()
+                .full_capability()
+                .write_with_if_not_exists
+            {
+                match self
+                    .operator
+                    .write_with(object_key, stored_bytes)
+                    .if_not_exists(true)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
+                        ) =>
+                    {
+                        let metadata =
+                            self.operator.stat(object_key).await.map_err(|stat_error| {
+                                SnapshotStoreError::Backend(format!(
+                                    "stat shared s3 snapshot after create race: {stat_error}"
+                                ))
+                            })?;
+                        if metadata.content_length() != stored_size_bytes {
+                            return Err(SnapshotStoreError::Integrity(format!(
+                                "shared s3 snapshot {object_key} size {} != expected {stored_size_bytes}",
+                                metadata.content_length()
+                            )));
+                        }
+                    }
+                    Err(err) => return Err(SnapshotStoreError::Backend(err.to_string())),
+                }
+            } else {
+                // The production S3 backend supports conditional creation. This
+                // fallback keeps capability-limited test backends useful.
+                match self.operator.stat(object_key).await {
+                    Ok(metadata) => {
+                        if metadata.content_length() != stored_size_bytes {
+                            return Err(SnapshotStoreError::Integrity(format!(
+                                "shared snapshot {object_key} size {} != expected {stored_size_bytes}",
+                                metadata.content_length()
+                            )));
+                        }
+                    }
+                    Err(err) if matches!(err.kind(), ErrorKind::NotFound) => {
+                        self.operator
+                            .write(object_key, stored_bytes)
+                            .await
+                            .map_err(|write_error| {
+                                SnapshotStoreError::Backend(write_error.to_string())
+                            })?;
+                    }
+                    Err(err) => return Err(SnapshotStoreError::Backend(err.to_string())),
+                }
+            }
+            Ok(stored_size_bytes)
+        }
+    }
+
+    fn compress_snapshot_chunks(
+        chunks: SnapshotBytesIterator,
+    ) -> Result<(Vec<u8>, u64, blake3::Hash), SnapshotStoreError> {
+        let mut size_bytes = 0u64;
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), S3_SNAPSHOT_ZSTD_LEVEL)
+            .map_err(|err| SnapshotStoreError::Backend(format!("compress s3 snapshot: {err}")))?;
+        for chunk in chunks {
+            let chunk = chunk?;
+            size_bytes = size_bytes.checked_add(chunk.len() as u64).ok_or_else(|| {
+                SnapshotStoreError::Integrity("s3 snapshot size overflows u64".to_owned())
+            })?;
+            encoder.write_all(&chunk).map_err(|err| {
+                SnapshotStoreError::Backend(format!("compress s3 snapshot: {err}"))
+            })?;
+        }
+        let stored_bytes = encoder.finish().map_err(|err| {
+            SnapshotStoreError::Backend(format!("finish s3 snapshot compression: {err}"))
+        })?;
+        let digest = blake3::hash(&stored_bytes);
+        Ok((stored_bytes, size_bytes, digest))
     }
 
     impl SnapshotStore for S3SnapshotStore {
@@ -550,22 +631,19 @@ mod s3 {
             bytes: Bytes,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
             Box::pin(async move {
-                let object_key = self.object_key(&key);
                 let size_bytes = bytes.len() as u64;
                 let stored_bytes =
                     zstd::bulk::compress(&bytes, S3_SNAPSHOT_ZSTD_LEVEL).map_err(|err| {
                         SnapshotStoreError::Backend(format!("compress s3 snapshot: {err}"))
                     })?;
-                let stored_size_bytes = stored_bytes.len() as u64;
-                self.operator
-                    .write(&object_key, stored_bytes)
-                    .await
-                    .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
+                let object_key = self.object_key(&key, blake3::hash(&stored_bytes));
+                let stored_size_bytes = self.write_content_once(&object_key, stored_bytes).await?;
                 Ok(SnapshotLocation::S3 {
                     key: object_key,
                     size_bytes,
                     stored_size_bytes: Some(stored_size_bytes),
                     compression: SnapshotCompression::Zstd,
+                    shared_object: true,
                 })
             })
         }
@@ -576,34 +654,22 @@ mod s3 {
             chunks: SnapshotBytesIterator,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
             Box::pin(async move {
-                let object_key = self.object_key(&key);
-                let mut size_bytes = 0u64;
-                let mut writer = self
-                    .operator
-                    .writer(&object_key)
+                let encoded = tokio::task::spawn_blocking(move || compress_snapshot_chunks(chunks))
                     .await
-                    .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
-                for chunk in chunks {
-                    let chunk = chunk?;
-                    size_bytes = size_bytes.checked_add(chunk.len() as u64).ok_or_else(|| {
-                        SnapshotStoreError::Integrity(format!(
-                            "s3 snapshot {object_key} size overflows u64"
-                        ))
-                    })?;
-                    writer
-                        .write(chunk)
-                        .await
-                        .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
-                }
-                writer
-                    .close()
-                    .await
-                    .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
+                    .map_err(|err| {
+                        SnapshotStoreError::Io(io::Error::other(format!(
+                            "join s3 snapshot encoder: {err}"
+                        )))
+                    })??;
+                let (stored_bytes, size_bytes, digest) = encoded;
+                let object_key = self.object_key(&key, digest);
+                let stored_size_bytes = self.write_content_once(&object_key, stored_bytes).await?;
                 Ok(SnapshotLocation::S3 {
                     key: object_key,
                     size_bytes,
-                    stored_size_bytes: Some(size_bytes),
-                    compression: SnapshotCompression::None,
+                    stored_size_bytes: Some(stored_size_bytes),
+                    compression: SnapshotCompression::Zstd,
+                    shared_object: true,
                 })
             })
         }
@@ -666,9 +732,15 @@ mod s3 {
 
         fn delete<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
             Box::pin(async move {
-                let SnapshotLocation::S3 { key, .. } = location else {
+                let SnapshotLocation::S3 {
+                    key, shared_object, ..
+                } = location
+                else {
                     return Ok(());
                 };
+                if *shared_object {
+                    return Ok(());
+                }
                 match self.operator.delete(key).await {
                     Ok(()) => Ok(()),
                     Err(err) if matches!(err.kind(), opendal::ErrorKind::NotFound) => Ok(()),
@@ -1050,6 +1122,24 @@ mod tests {
         assert_eq!(back.location.size_hint(), 12345);
     }
 
+    #[test]
+    fn pointer_decode_defaults_legacy_s3_objects_to_unshared() {
+        let bytes = br#"{
+            "snapshot_id":"group-7-2-500",
+            "location":{
+                "kind":"s3",
+                "key":"snapshots/group-7/legacy.snap",
+                "size_bytes":123,
+                "compression":"none"
+            }
+        }"#;
+        let pointer = SnapshotPointer::decode(bytes).unwrap();
+        assert!(matches!(pointer.location, SnapshotLocation::S3 {
+            shared_object: false,
+            ..
+        }));
+    }
+
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn s3_memory_roundtrip() {
@@ -1063,10 +1153,12 @@ mod tests {
                 size_bytes,
                 stored_size_bytes,
                 compression,
+                shared_object,
             } => {
-                assert!(key.starts_with("snapshots/group-3/"));
+                assert!(key.starts_with("snapshots/group-3/objects/"));
                 assert_eq!(*size_bytes, payload.len() as u64);
                 assert_eq!(*compression, SnapshotCompression::Zstd);
+                assert!(*shared_object);
                 assert!(stored_size_bytes.is_some());
                 assert!(stored_size_bytes.unwrap() < *size_bytes);
             }
@@ -1074,13 +1166,36 @@ mod tests {
         }
         let bytes = store.download(&loc).await.unwrap();
         assert_eq!(bytes, payload);
+        // A content-addressed object may already be referenced by another
+        // replica. Eager local cleanup must not remove it.
         store.delete(&loc).await.unwrap();
-        assert!(matches!(
-            store.download(&loc).await,
-            Err(SnapshotStoreError::NotFound(_))
-        ));
-        // Second delete is a no-op.
+        assert_eq!(store.download(&loc).await.unwrap(), payload);
         store.delete(&loc).await.unwrap();
+    }
+
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_iterator_upload_is_compressed_and_offloaded() {
+        let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
+        let caller = std::thread::current().id();
+        let (thread_tx, thread_rx) = std::sync::mpsc::channel();
+        let chunks = Box::new(std::iter::once_with(move || {
+            thread_tx.send(std::thread::current().id()).unwrap();
+            Ok(Bytes::from(vec![b'x'; 64 * 1024]))
+        }));
+
+        let location = store
+            .upload_iter(test_key(9, "group-9-T1-N1-1"), chunks)
+            .await
+            .unwrap();
+
+        assert_ne!(thread_rx.recv().unwrap(), caller);
+        assert_eq!(location.compression(), SnapshotCompression::Zstd);
+        assert!(location.stored_size_hint() < location.size_hint());
+        assert_eq!(store.download(&location).await.unwrap(), vec![
+            b'x';
+            64 * 1024
+        ]);
     }
 
     #[cfg(not(madsim))]
@@ -1104,38 +1219,36 @@ mod tests {
             size_bytes: b"legacy body".len() as u64,
             stored_size_bytes: None,
             compression: SnapshotCompression::None,
+            shared_object: false,
         };
         assert_eq!(store.download(&legacy).await.unwrap(), b"legacy body");
     }
 
     #[cfg(not(madsim))]
     #[tokio::test]
-    async fn s3_two_uploads_with_same_snapshot_id_get_different_keys() {
-        // Regression for the 2026-05-31 wedge: snapshot_id is derived from
-        // last_applied_log_id, so two builds during apply-idle compute the
-        // same id. The S3 object key must still be unique per attempt so
-        // distinct published pointers never alias one physical object.
+    async fn s3_snapshot_keys_are_content_addressed() {
         let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
         let key1 = test_key(4, "group-4-T18-N3-264150");
         let key2 = test_key(4, "group-4-T18-N3-264150");
+        let key3 = test_key(4, "group-4-T18-N3-264151");
         let loc1 = store.upload(key1, b"body1".to_vec().into()).await.unwrap();
         let loc2 = store.upload(key2, b"body2".to_vec().into()).await.unwrap();
-        let (k1, k2) = match (&loc1, &loc2) {
-            (SnapshotLocation::S3 { key: k1, .. }, SnapshotLocation::S3 { key: k2, .. }) => {
-                (k1.clone(), k2.clone())
-            }
+        let loc3 = store.upload(key3, b"body1".to_vec().into()).await.unwrap();
+        let (k1, k2, k3) = match (&loc1, &loc2, &loc3) {
+            (
+                SnapshotLocation::S3 { key: k1, .. },
+                SnapshotLocation::S3 { key: k2, .. },
+                SnapshotLocation::S3 { key: k3, .. },
+            ) => (k1.clone(), k2.clone(), k3.clone()),
             _ => panic!("expected S3 locations"),
         };
-        assert_ne!(k1, k2, "same snapshot_id must yield distinct S3 keys");
-        // Both stay independently readable — deleting one must not nuke the
-        // other (the self-GC failure mode).
+        assert_ne!(k1, k2, "different bytes must never alias");
+        assert_eq!(k1, k3, "identical bytes in one group must share an object");
         assert_eq!(store.download(&loc1).await.unwrap(), b"body1");
         assert_eq!(store.download(&loc2).await.unwrap(), b"body2");
+        assert_eq!(store.download(&loc3).await.unwrap(), b"body1");
         store.delete(&loc1).await.unwrap();
-        assert!(matches!(
-            store.download(&loc1).await,
-            Err(SnapshotStoreError::NotFound(_))
-        ));
+        assert_eq!(store.download(&loc3).await.unwrap(), b"body1");
         assert_eq!(store.download(&loc2).await.unwrap(), b"body2");
     }
 
@@ -1150,7 +1263,10 @@ mod tests {
         // Same location, after an out-of-band delete: must report missing so
         // the snapshot build path can fail fast instead of publishing a
         // pointer to a 404.
-        store.delete(&loc).await.unwrap();
+        let SnapshotLocation::S3 { key, .. } = &loc else {
+            panic!("expected S3 location")
+        };
+        store.delete_raw_for_tests(key).await.unwrap();
         let err = store.verify_uploaded(&loc).await.unwrap_err();
         assert!(
             matches!(err, SnapshotStoreError::NotFound(_)),
