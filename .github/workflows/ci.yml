@@ -40,11 +40,15 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v4
 
+      - name: Create disposable Kubernetes cluster
+        uses: helm/kind-action@v1.14.0
+
       - name: Validate Helm chart
         run: |
           helm lint charts/ursula
           helm template ursula charts/ursula --namespace ursula -f charts/ursula/examples/production-eks.yaml >/dev/null
           python3 scripts/helm_template_test.py
+          sh scripts/helm_ondelete_upgrade_test.sh
           helm lint charts/ursula-chaos
           helm template ursula-chaos charts/ursula-chaos --namespace ursula >/dev/null
           python3 scripts/chaos_helm_template_test.py

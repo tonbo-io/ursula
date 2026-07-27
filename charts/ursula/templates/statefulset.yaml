@@ -18,11 +18,6 @@ spec:
   podManagementPolicy: {{ .Values.server.podManagementPolicy }}
   updateStrategy:
     type: {{ .Values.server.updateStrategy }}
-    {{- if eq .Values.server.updateStrategy "OnDelete" }}
-    # Clear a stale RollingUpdate partition when an existing release switches
-    # to externally orchestrated OnDelete updates.
-    rollingUpdate: null
-    {{- end }}
   selector:
     matchLabels:
       {{- include "ursula.selectorLabels" . | nindent 6 }}

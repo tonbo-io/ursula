@@ -33,7 +33,9 @@ url = { workspace = true, features = ["serde"] }
 ursula-observability = { workspace = true }
 
 [dev-dependencies]
+axum = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["net", "sync"] }
 
 [lints.clippy]
 wildcard_imports = "deny"

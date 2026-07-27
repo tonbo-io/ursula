@@ -41,6 +41,22 @@ server:
   # new templates without restarting voters so an external graceful-rollout
   # controller can drain and replace exactly one pod at a time.
   updateStrategy: RollingUpdate
+  # Helm pre-upgrade migration used only when updateStrategy=OnDelete. It
+  # removes a live StatefulSet's defaulted/stale rollingUpdate fields before
+  # Helm changes the strategy type.
+  onDeleteMigration:
+    # Disable only when a GitOps PreSync hook performs the same patch.
+    enabled: true
+    image:
+      repository: registry.k8s.io/kubectl
+      tag: v1.33.3
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 20m
+        memory: 32Mi
+      limits:
+        memory: 64Mi
   ports:
     # Ursula public client-plane HTTP port (stream reads/writes). The mutating
     # admin plane binds to pod loopback (127.0.0.1:4438) and is intentionally

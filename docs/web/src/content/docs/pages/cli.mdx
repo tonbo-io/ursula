@@ -12,8 +12,10 @@ A safe rolling restart wraps the platform's restart in these verbs, one node at 
 
 ```bash
 ursulactl drain --config manifest.json --node 3
+ursulactl prepare-restart --config manifest.json --node 3
 kubectl delete pod ursula-2        # the platform restarts the pod
 ursulactl wait --config manifest.json --node 3
+ursulactl verify-cluster --config manifest.json
 ursulactl undrain --config manifest.json --node 3
 ```
 
@@ -28,11 +30,13 @@ The naive procedure of "restart followers, then leader" does **not** wait for `a
 | Verb | Effect |
 |------|--------|
 | `drain --node N` | Mark the node draining and transfer away every leadership it holds. The mark persists (the node attracts no leaderships) until `undrain`. `--dry-run` prints the transfer plan |
+| `prepare-restart --node N` | After `drain`, detect the cluster WAL backend and arm stable non-target leaders for one empty-log rejoin when memory WAL requires it. Disk-WAL clusters need no rejoin permission |
 | `undrain --node N` | Clear the drain mark so the node may hold leaderships again |
 | `wait --node N` | Block until the node is a voter in every group and within `--lag-tolerance` of peers. Progress-gated: a node that keeps advancing is never timed out |
 | `allow-rejoin --node N` | Arm one empty-log rejoin per group for a raft-memory node that lost its volatile log. Refused on disk-backed clusters |
 | `status` | Per-node group counts and leadership distribution |
 | `wait-ready` | Block until every node reports the expected group count and every group has a leader |
+| `verify-cluster` | Require every configured voter to be present and caught up in two consecutive samples before the next rollout step |
 
 Mutating verbs exit `0` on success and `2` on an abort (drain timeout, no safe transfer target, catch-up stall). Anything else is a configuration or transport error with a single-line, machine-greppable message.
 
@@ -105,7 +109,7 @@ Per-node fields, all optional except `id`:
 
 ## Restarting raft-memory nodes
 
-On clusters running the volatile `raft.wal.backend = "memory"`, a restarted node rejoins with an **empty** log, and group leaders refuse that log reversion unless it was explicitly permitted. Run `allow-rejoin --node N` after the drain and before the restart: it asks every group's stable leader to accept one empty-log rejoin from the target. The verb derives applicability from each node's reported `wal_backend` and refuses on disk-backed clusters, where an empty rejoin means a wiped node the leader must reject.
+On clusters running the volatile `raft.wal.backend = "memory"`, a restarted node rejoins with an **empty** log, and group leaders refuse that log reversion unless it was explicitly permitted. Run `prepare-restart --node N` after the drain and before the restart: it detects the reported WAL backend and asks every group's stable leader to accept one empty-log rejoin from the target when memory WAL requires it. It fails closed when nodes omit or disagree on their backend. Disk-WAL clusters report that no permission is needed. `allow-rejoin` remains the explicit recovery verb, not the normal rolling-restart step.
 
 The permission must land on the node that is leader at that moment, since the endpoint answers `409 Conflict` from any other node (ursulactl resolves leadership per group and handles this). A node that is the membership initializer for some groups additionally refuses to start at all after losing its volatile log (the bootstrap-marker guard). That recovery is an explicit operator reset on the host, outside ursulactl's reach.
 
