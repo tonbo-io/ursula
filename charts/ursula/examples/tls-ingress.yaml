@@ -1,0 +1,56 @@
+# One HTTPS domain in front of the gateway, with voters and the admin plane
+# private. This is the topology Ursula supports: TLS terminates at the ingress,
+# never in Ursula (see /docs/security).
+#
+#   helm install ursula charts/ursula -f examples/tls-ingress.yaml \
+#     --set s3.bucket=my-bucket
+#
+# Layer it on top of a sizing example such as production-eks.yaml; this file
+# changes only what exposure requires.
+
+server:
+  service:
+    # ClusterIP, not LoadBalancer. Voters speak the client plane on a private
+    # network only; the gateway is the single external entrypoint. The mutating
+    # admin plane binds to pod loopback and is not in any Service at all.
+    type: ClusterIP
+
+gateway:
+  enabled: true
+  replicaCount: 2
+
+  service:
+    # The Ingress targets this Service, so it stays internal too. Exposing both
+    # an ingress and a LoadBalancer would leave a second, plaintext door open.
+    type: ClusterIP
+
+  # Origins allowed to read across origins. `public_read` buckets are
+  # unreachable from browser JavaScript until this is set; drop it if no browser
+  # client exists. See /docs/security#cross-origin-reads-opt-in.
+  corsAllowedOrigins:
+    - https://app.example.com
+
+  ingress:
+    enabled: true
+    className: nginx
+    annotations:
+      # A certificate issuer, so the referenced Secret is created and renewed
+      # rather than hand-installed. Adjust to your controller and issuer.
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      # Live tails are long-lived responses. A controller that buffers or times
+      # them out turns SSE into a stream that appears to stall and then drop.
+      nginx.ingress.kubernetes.io/proxy-buffering: "off"
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+      # Non-leader writes answer 307 to the current leader. The client must
+      # follow it, so the controller must not rewrite or swallow redirects.
+      nginx.ingress.kubernetes.io/proxy-redirect-from: "off"
+    hosts:
+      - host: streams.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: streams-example-com-tls
+        hosts:
+          - streams.example.com
