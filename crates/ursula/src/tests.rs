@@ -342,11 +342,17 @@ struct StaticGrpcTestNode {
 
 impl StaticGrpcTestNode {
     async fn shutdown(mut self) {
+        self.registry.shutdown_transport();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        self.server.abort();
-        let _ = self.server.await;
+        if tokio::time::timeout(Duration::from_secs(5), &mut self.server)
+            .await
+            .is_err()
+        {
+            self.server.abort();
+            let _ = self.server.await;
+        }
     }
 }
 

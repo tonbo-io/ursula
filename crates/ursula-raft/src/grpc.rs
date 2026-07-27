@@ -279,8 +279,26 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<tonic::Streaming<raft_internal_proto::RaftAppendStreamRequestV1>>,
     ) -> Result<tonic::Response<Self::AppendStreamStream>, tonic::Status> {
         let registry = self.registry.clone();
-        let responses = request
-            .into_inner()
+        let shutdown = registry.subscribe_transport_shutdown();
+        let requests = futures_util::stream::unfold(
+            (request.into_inner(), shutdown),
+            |(mut requests, mut shutdown)| async move {
+                if *shutdown.borrow() {
+                    return None;
+                }
+                tokio::select! {
+                    biased;
+                    changed = shutdown.changed() => {
+                        let _ = changed;
+                        None
+                    }
+                    request = requests.next() => {
+                        request.map(|request| (request, (requests, shutdown)))
+                    }
+                }
+            },
+        );
+        let responses = requests
             .map(move |request| {
                 let registry = registry.clone();
                 async move {
@@ -1278,19 +1296,22 @@ mod reconnect_tests {
         net
     }
 
-    async fn spawn_append_stream_server() -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_append_stream_server()
+    -> (String, RaftGroupHandleRegistry, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test raft grpc listener");
         let address = listener.local_addr().expect("read test listener address");
+        let registry = RaftGroupHandleRegistry::default();
+        let service_registry = registry.clone();
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(raft_grpc_service(RaftGroupHandleRegistry::default()))
+                .add_service(raft_grpc_service(service_registry))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .expect("serve test raft grpc");
         });
-        (format!("http://{address}"), task)
+        (format!("http://{address}"), registry, task)
     }
 
     #[test]
@@ -1342,7 +1363,7 @@ mod reconnect_tests {
 
     #[tokio::test]
     async fn groups_share_one_append_stream_and_receive_independent_errors() {
-        let (endpoint, server) = spawn_append_stream_server().await;
+        let (endpoint, _registry, server) = spawn_append_stream_server().await;
         remove_shared_channel(&endpoint);
         forget_grpc_append_stream_support(&endpoint);
 
@@ -1378,6 +1399,33 @@ mod reconnect_tests {
             .map(|session| session.generation);
         assert_eq!(shared_generation, Some(first.channel_generation));
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn node_transport_shutdown_closes_append_stream() {
+        let (endpoint, registry, server) = spawn_append_stream_server().await;
+        let channel = Endpoint::from_shared(endpoint)
+            .expect("valid endpoint")
+            .connect()
+            .await
+            .expect("connect to test server");
+        let mut client =
+            raft_internal_proto::raft_internal_client::RaftInternalClient::new(channel);
+        let (_sender, receiver) = mpsc::channel(1);
+        let response = client
+            .append_stream(tonic::Request::new(ReceiverStream::new(receiver)))
+            .await
+            .expect("open append stream");
+        let mut responses = response.into_inner();
+
+        registry.shutdown_transport();
+
+        let closed = tokio::time::timeout(Duration::from_secs(2), responses.message())
+            .await
+            .expect("append stream should close promptly")
+            .expect("stream shutdown should not be an RPC error");
+        assert!(closed.is_none());
         server.abort();
     }
 
