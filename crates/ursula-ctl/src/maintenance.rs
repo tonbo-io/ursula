@@ -317,7 +317,12 @@ pub async fn wait_cluster_ready(
             tracing::debug!("{phase}: not ready: {}", unready.join("; "));
         }
         if Instant::now() >= deadline {
-            bail!("{phase} timeout after {timeout:?}: {}", unready.join("; "));
+            let diagnostic = if unready.is_empty() {
+                format!("cluster was ready for {ready_streak}/2 required consecutive sample(s)")
+            } else {
+                unready.join("; ")
+            };
+            bail!("{phase} timeout after {timeout:?}: {diagnostic}");
         }
         tokio::time::sleep(poll_interval).await;
     }
@@ -741,10 +746,111 @@ pub(crate) fn format_unready(report: &crate::plan::ReadinessReport) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use axum::Json;
+    use axum::Router;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use axum::routing::post;
+    use serde_json::json;
+
     use super::*;
     use crate::metrics::NodeMetricsView;
     use crate::metrics::RaftGroupView;
     use crate::provider::NodeInfo;
+
+    #[derive(Clone, Copy)]
+    enum LeaderScenario {
+        DriftOnce,
+        AlwaysDrift,
+        Stable,
+    }
+
+    struct MockCluster {
+        scenario: LeaderScenario,
+        metrics_fetches: AtomicUsize,
+        armed_on_nodes: Mutex<Vec<u64>>,
+    }
+
+    #[derive(Clone)]
+    struct MockNode {
+        node_id: u64,
+        cluster: Arc<MockCluster>,
+    }
+
+    async fn mock_metrics(State(state): State<MockNode>) -> Json<serde_json::Value> {
+        let fetch = state.cluster.metrics_fetches.fetch_add(1, Ordering::SeqCst);
+        let sample = fetch / 3;
+        let leader = match state.cluster.scenario {
+            LeaderScenario::DriftOnce if sample == 0 => 2,
+            LeaderScenario::DriftOnce => 3,
+            LeaderScenario::AlwaysDrift if sample.is_multiple_of(2) => 2,
+            LeaderScenario::AlwaysDrift => 3,
+            LeaderScenario::Stable => 2,
+        };
+        Json(json!({
+            "wal_backend": "memory",
+            "raft_groups": [{
+                "raft_group_id": 7,
+                "node_id": state.node_id,
+                "current_leader": leader,
+                "committed_index": 100,
+                "last_applied_index": 100,
+                "voter_ids": [1, 2, 3],
+                "learner_ids": []
+            }]
+        }))
+    }
+
+    async fn mock_arm(State(state): State<MockNode>) -> StatusCode {
+        state
+            .cluster
+            .armed_on_nodes
+            .lock()
+            .unwrap()
+            .push(state.node_id);
+        StatusCode::OK
+    }
+
+    async fn mock_cluster(scenario: LeaderScenario) -> (Vec<NodeInfo>, Arc<MockCluster>) {
+        let cluster = Arc::new(MockCluster {
+            scenario,
+            metrics_fetches: AtomicUsize::new(0),
+            armed_on_nodes: Mutex::new(Vec::new()),
+        });
+        let mut nodes = Vec::new();
+        for node_id in 1..=3 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let state = MockNode {
+                node_id,
+                cluster: Arc::clone(&cluster),
+            };
+            let app = Router::new()
+                .route("/__ursula/metrics", get(mock_metrics))
+                .route(
+                    "/__ursula/raft/{group_id}/nodes/{node_id}/allow-next-revert",
+                    post(mock_arm),
+                )
+                .with_state(state);
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let url = url::Url::parse(&format!("http://{address}")).unwrap();
+            nodes.push(NodeInfo {
+                id: node_id,
+                admin_url: url.clone(),
+                host: address.to_string(),
+                http_url: Some(url),
+            });
+        }
+        (nodes, cluster)
+    }
 
     fn n(id: u64, host: &str) -> NodeInfo {
         NodeInfo {
@@ -753,6 +859,73 @@ mod tests {
             host: host.to_owned(),
             http_url: Some(url::Url::parse(&format!("http://{host}:8080")).unwrap()),
         }
+    }
+
+    #[tokio::test]
+    async fn rejoin_retries_the_complete_round_after_leader_drift() {
+        let (nodes, cluster) = mock_cluster(LeaderScenario::DriftOnce).await;
+        arm_empty_rejoin(
+            &nodes,
+            &nodes[0],
+            &MetricsClient::new(Duration::from_secs(1)).unwrap(),
+            &RejoinOptions {
+                timeout: Duration::from_secs(1),
+                max_concurrency: 2,
+                retry_interval: Duration::from_millis(1),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*cluster.armed_on_nodes.lock().unwrap(), vec![2, 3]);
+        assert_eq!(cluster.metrics_fetches.load(Ordering::SeqCst), 12);
+    }
+
+    #[tokio::test]
+    async fn rejoin_fails_when_the_leader_map_never_stabilizes() {
+        let (nodes, cluster) = mock_cluster(LeaderScenario::AlwaysDrift).await;
+        let error = arm_empty_rejoin(
+            &nodes,
+            &nodes[0],
+            &MetricsClient::new(Duration::from_secs(1)).unwrap(),
+            &RejoinOptions {
+                timeout: Duration::from_millis(40),
+                max_concurrency: 2,
+                retry_interval: Duration::from_millis(1),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("empty-log rejoin did not reach a stable leader map"),
+            "{error:#}"
+        );
+        assert!(!cluster.armed_on_nodes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cluster_verification_timeout_explains_a_single_ready_sample() {
+        let (nodes, _) = mock_cluster(LeaderScenario::Stable).await;
+        let error = wait_cluster_ready(
+            "strict cluster verification",
+            &nodes,
+            &MetricsClient::new(Duration::from_secs(1)).unwrap(),
+            Duration::ZERO,
+            Duration::from_millis(1),
+            0,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cluster was ready for 1/2 required consecutive sample(s)"),
+            "{error:#}"
+        );
     }
 
     fn group(

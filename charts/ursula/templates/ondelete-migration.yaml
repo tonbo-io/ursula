@@ -1,0 +1,109 @@
+{{- if and (eq .Values.server.updateStrategy "OnDelete") .Values.server.onDeleteMigration.enabled }}
+{{- $name := printf "%s-ondelete-migration" (include "ursula.fullname" .) | trunc 63 | trimSuffix "-" -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ondelete-migration
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ondelete-migration
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+rules:
+  - apiGroups:
+      - apps
+    resources:
+      - statefulsets
+    resourceNames:
+      - {{ include "ursula.fullname" . }}
+    verbs:
+      - get
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ondelete-migration
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ondelete-migration
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        {{- include "ursula.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ondelete-migration
+    spec:
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: true
+      restartPolicy: Never
+      securityContext:
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: "{{ .Values.server.onDeleteMigration.image.repository }}:{{ .Values.server.onDeleteMigration.image.tag }}"
+          imagePullPolicy: {{ .Values.server.onDeleteMigration.image.pullPolicy }}
+          command:
+            - kubectl
+          args:
+            - patch
+            - statefulset
+            - {{ include "ursula.fullname" . | quote }}
+            - --type=merge
+            - --patch={"spec":{"updateStrategy":{"rollingUpdate":null}}}
+          resources:
+            {{- toYaml .Values.server.onDeleteMigration.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsGroup: 65532
+            runAsNonRoot: true
+            runAsUser: 65532
+{{- end }}

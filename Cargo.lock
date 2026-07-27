@@ -4334,6 +4334,7 @@ name = "ursula-ctl"
 version = "0.3.22"
 dependencies = [
  "anyhow",
+ "axum 0.8.9",
  "blake3",
  "clap",
  "futures-util",

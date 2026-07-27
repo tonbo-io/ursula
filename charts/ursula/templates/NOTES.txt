@@ -52,3 +52,16 @@ Static membership warning:
   server.replicaCount controls the initial voter set for a fresh cluster. Changing it
   on an initialized cluster is not safe Raft voter reconfiguration. Use the
   future Ursula operator for safe learner add, voter promotion, and voter removal.
+{{- if eq .Values.server.updateStrategy "OnDelete" }}
+
+OnDelete rollout warning:
+  Helm has staged the new StatefulSet pod template, but Kubernetes will not
+  replace any Ursula voter automatically. Your external rollout controller must
+  drain, prepare-restart, delete, wait, verify-cluster, and undrain one voter at
+  a time. Until that sequence finishes, helm status can be deployed while pods
+  still run the previous image.
+
+  Inspect staged and running images:
+    kubectl -n {{ .Release.Namespace }} get statefulset {{ include "ursula.fullname" . }} -o jsonpath='{.spec.template.spec.containers[?(@.name=="ursula")].image}{"\n"}'
+    kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/name={{ include "ursula.name" . }},app.kubernetes.io/instance={{ .Release.Name }} -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[?(@.name=="ursula")].image}{"\n"}{end}'
+{{- end }}

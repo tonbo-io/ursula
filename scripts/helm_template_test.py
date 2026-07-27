@@ -34,8 +34,9 @@ class HelmTemplateConfigTest(unittest.TestCase):
             "podManagementPolicy: Parallel\n  updateStrategy:\n    type: RollingUpdate",
             rendered,
         )
+        self.assertNotIn("app.kubernetes.io/component: ondelete-migration", rendered)
 
-    def test_server_update_strategy_can_stage_on_delete(self) -> None:
+    def test_server_update_strategy_stages_on_delete_with_migration_hook(self) -> None:
         rendered = render_chart(
             "--set",
             "s3.bucket=bkt",
@@ -44,12 +45,29 @@ class HelmTemplateConfigTest(unittest.TestCase):
         )
 
         self.assertIn(
-            "podManagementPolicy: Parallel\n  updateStrategy:\n    type: OnDelete\n"
-            "    # Clear a stale RollingUpdate partition when an existing release switches\n"
-            "    # to externally orchestrated OnDelete updates.\n"
-            "    rollingUpdate: null",
+            "podManagementPolicy: Parallel\n  updateStrategy:\n    type: OnDelete\n  selector:",
             rendered,
         )
+        self.assertIn("kind: Job\nmetadata:\n  name: test-ursula-ondelete-migration", rendered)
+        self.assertIn('"helm.sh/hook": pre-upgrade', rendered)
+        self.assertIn(
+            '- --patch={"spec":{"updateStrategy":{"rollingUpdate":null}}}',
+            rendered,
+        )
+        self.assertIn("resourceNames:\n      - test-ursula", rendered)
+
+    def test_gitops_can_disable_the_duplicate_on_delete_migration(self) -> None:
+        rendered = render_chart(
+            "--set",
+            "s3.bucket=bkt",
+            "--set",
+            "server.updateStrategy=OnDelete",
+            "--set",
+            "server.onDeleteMigration.enabled=false",
+        )
+
+        self.assertIn("updateStrategy:\n    type: OnDelete", rendered)
+        self.assertNotIn("app.kubernetes.io/component: ondelete-migration", rendered)
 
     def test_every_deployment_role_uses_the_unified_ursula_binary(self) -> None:
         rendered = render_chart(

@@ -151,6 +151,39 @@
           "enum": ["RollingUpdate", "OnDelete"],
           "description": "StatefulSet update strategy. OnDelete stages templates for an external graceful-rollout controller."
         },
+        "onDeleteMigration": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Helm pre-upgrade migration that clears live rollingUpdate state before switching to OnDelete.",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "image": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "tag": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "pullPolicy": {
+                  "type": "string",
+                  "enum": ["Always", "IfNotPresent", "Never"]
+                }
+              },
+              "required": ["repository", "tag", "pullPolicy"]
+            },
+            "resources": {
+              "type": "object"
+            }
+          },
+          "required": ["enabled", "image", "resources"]
+        },
         "ports": {
           "type": "object",
           "additionalProperties": false,
@@ -260,6 +293,7 @@
         "replicaCount",
         "podManagementPolicy",
         "updateStrategy",
+        "onDeleteMigration",
         "ports",
         "service",
         "headlessService",
