@@ -86,6 +86,28 @@ es.addEventListener("data", (e) => console.log(e.data));
 </Tab>
 </Tabs>
 
+## From a browser
+
+The examples above assume same-origin access. A page served from a different origin than the gateway needs the gateway to allow that origin — see [cross-origin reads](/docs/security#cross-origin-reads-opt-in):
+
+```bash
+ursula gateway ... --cors-allowed-origin https://app.example.com
+```
+
+Two things to know once it is on:
+
+- **Read your continuation headers.** The gateway sends `Access-Control-Expose-Headers: *`, so `Stream-Next-Offset` and friends are readable. Without exposure a browser can read one page and never advance, which looks like the stream ending. If a `fetch` succeeds but `response.headers.get("stream-next-offset")` is `null`, the origin is not allowing your origin.
+- **`EventSource` cannot send `Authorization`.** It has no header API, so it only works against `public_read` streams. For a private live tail, use `fetch` and read the body:
+
+  ```ts
+  const response = await fetch(`${base}/${bucket}/hello?offset=-1&live=sse`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader();
+  ```
+
+  Treat any termination as a reconnect signal rather than end of stream: re-read from the last `Stream-Next-Offset` you saw. A long tail will outlive a short-lived token, so refresh the credential and reconnect on your own schedule.
+
 ## Notes for client implementers
 
 - After every read and append, the server returns `Stream-Next-Offset`. Track it. Use it as the `offset` query parameter on the next read. Don't construct offsets manually. They're opaque.

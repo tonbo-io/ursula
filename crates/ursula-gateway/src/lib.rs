@@ -49,6 +49,7 @@ use ursula_shard::StaticShardMap;
 
 pub mod admission;
 pub mod auth;
+pub mod cors;
 pub mod service;
 pub mod usage;
 
@@ -117,6 +118,11 @@ pub struct GatewayConfig {
     /// the same group. `None` preserves per-stream affinity for standalone
     /// gateways that do not know the server topology.
     pub raft_group_count: Option<usize>,
+    /// Origins allowed to read across origins, or a single `*`. Empty disables
+    /// CORS entirely, leaving responses byte-identical to a deployment without
+    /// it. Anonymous `public_read` buckets are unreachable from browser
+    /// JavaScript until this is set.
+    pub cors_allowed_origins: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -131,6 +137,7 @@ pub struct Gateway {
     shard_map: Option<StaticShardMap>,
     leader_affinity: Arc<Mutex<HashMap<String, String>>>,
     metrics: Arc<GatewayMetrics>,
+    cors: Option<crate::cors::CorsPolicy>,
 }
 
 impl std::fmt::Debug for Gateway {
@@ -158,6 +165,7 @@ impl Gateway {
             .build()
             .expect("static gateway reqwest client config should be valid");
         let response_header_timeout = config.response_header_timeout;
+        let cors = crate::cors::CorsPolicy::new(config.cors_allowed_origins.clone());
         Self {
             config,
             client,
@@ -169,6 +177,7 @@ impl Gateway {
             shard_map,
             leader_affinity: Arc::new(Mutex::new(HashMap::new())),
             metrics: Arc::new(GatewayMetrics::default()),
+            cors,
         }
     }
 
@@ -199,6 +208,25 @@ impl Gateway {
     }
 
     pub async fn handle(&self, req: Request<Body>) -> AxumResponse {
+        let Some(policy) = self.cors.clone() else {
+            return self.handle_inner(req).await;
+        };
+        let (parts, body) = req.into_parts();
+        // Answered before `gate`, and identically for every path: a preflight
+        // carries no `Authorization`, so a per-resource reply would tell an
+        // unauthenticated caller whether a private bucket exists.
+        if crate::cors::CorsPolicy::is_preflight(&parts.method, &parts.headers)
+            && let Some(response) = policy.preflight_response(&parts.headers)
+        {
+            return response;
+        }
+        let request_headers = parts.headers.clone();
+        let mut response = self.handle_inner(Request::from_parts(parts, body)).await;
+        policy.decorate(response.headers_mut(), &request_headers);
+        response
+    }
+
+    async fn handle_inner(&self, req: Request<Body>) -> AxumResponse {
         let (mut parts, body) = req.into_parts();
         if parts.method == Method::GET && parts.uri.path() == GATEWAY_METRICS_PATH {
             return axum::Json(self.metrics_snapshot()).into_response();
