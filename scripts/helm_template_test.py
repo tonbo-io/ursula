@@ -51,10 +51,25 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertIn("kind: Job\nmetadata:\n  name: test-ursula-ondelete-migration", rendered)
         self.assertIn('"helm.sh/hook": pre-upgrade', rendered)
         self.assertIn(
+            '"helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed',
+            rendered,
+        )
+        self.assertIn(
             '- --patch={"spec":{"updateStrategy":{"rollingUpdate":null}}}',
             rendered,
         )
         self.assertIn("resourceNames:\n      - test-ursula", rendered)
+        job_pod = re.search(
+            r"kind: Job\n.*?template:\n    metadata:\n      labels:\n"
+            r"(?P<labels>.*?)    spec:",
+            rendered,
+            re.S,
+        )
+        self.assertIsNotNone(job_pod)
+        pod_labels = job_pod.group("labels")
+        self.assertIn("app.kubernetes.io/component: ondelete-migration", pod_labels)
+        self.assertNotIn("app.kubernetes.io/name:", pod_labels)
+        self.assertNotIn("app.kubernetes.io/instance:", pod_labels)
 
     def test_gitops_can_disable_the_duplicate_on_delete_migration(self) -> None:
         rendered = render_chart(
