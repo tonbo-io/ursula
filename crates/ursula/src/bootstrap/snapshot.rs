@@ -20,6 +20,7 @@ pub(crate) fn resolve_snapshot_drive_interval_ms(
 pub(crate) fn next_snapshot_to_drive(
     snapshots: &[RaftGroupMetricsSnapshot],
     next_pos: usize,
+    logs_since_last: u64,
 ) -> Option<(usize, &RaftGroupMetricsSnapshot)> {
     if snapshots.is_empty() {
         return None;
@@ -31,19 +32,26 @@ pub(crate) fn next_snapshot_to_drive(
         .cycle()
         .skip(start)
         .take(snapshots.len())
-        .find(|(_, snapshot)| should_drive_snapshot_for_group(snapshot))
+        .find(|(_, snapshot)| should_drive_snapshot_for_group(snapshot, logs_since_last))
 }
 
-pub(crate) fn should_drive_snapshot_for_group(snapshot: &RaftGroupMetricsSnapshot) -> bool {
+pub(crate) fn should_drive_snapshot_for_group(
+    snapshot: &RaftGroupMetricsSnapshot,
+    logs_since_last: u64,
+) -> bool {
     // An empty in-memory raft node has no applied state yet; triggering a
     // manual snapshot there publishes a `group-X-empty` object that cannot be a
     // valid recovery source for an existing group.
     let Some(last_applied) = snapshot.last_applied else {
         return false;
     };
-    snapshot
-        .snapshot
-        .is_none_or(|current| current.index < last_applied.index)
+    let Some(current) = snapshot.snapshot else {
+        // Establish the first recoverable external snapshot as soon as a group
+        // has applied state. Subsequent snapshots must amortize the configured
+        // number of replicated logs.
+        return true;
+    };
+    last_applied.index.saturating_sub(current.index) >= logs_since_last.max(1)
 }
 
 /// Config-driven snapshot driver. Reads parameters from typed config.
@@ -53,6 +61,7 @@ pub fn spawn_snapshot_driver(
     snapshot_store: Option<SharedSnapshotStore>,
     s3_cfg: Option<&ursula_config::S3Config>,
     interval_ms: usize,
+    logs_since_last: u64,
 ) {
     if interval_ms == 0 {
         return;
@@ -130,7 +139,7 @@ pub fn spawn_snapshot_driver(
 
             if !bad_tick
                 && let Some((pos, snapshot)) =
-                    next_snapshot_to_drive(&snaps, next_snapshot_drive_pos)
+                    next_snapshot_to_drive(&snaps, next_snapshot_drive_pos, logs_since_last)
             {
                 next_snapshot_drive_pos = pos.wrapping_add(1);
                 if let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) {

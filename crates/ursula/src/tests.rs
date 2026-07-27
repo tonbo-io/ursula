@@ -5283,12 +5283,29 @@ mod snapshot_driver {
     }
 
     #[test]
-    fn snapshot_driver_only_snapshots_applied_work_past_current_snapshot() {
-        assert!(!should_drive_snapshot_for_group(&snap(None, None)));
-        assert!(should_drive_snapshot_for_group(&snap(Some(42), None)));
-        assert!(should_drive_snapshot_for_group(&snap(Some(42), Some(41))));
-        assert!(!should_drive_snapshot_for_group(&snap(Some(42), Some(42))));
-        assert!(!should_drive_snapshot_for_group(&snap(Some(42), Some(43))));
+    fn snapshot_driver_amortizes_applied_work_after_the_first_snapshot() {
+        assert!(!should_drive_snapshot_for_group(&snap(None, None), 5));
+        assert!(should_drive_snapshot_for_group(&snap(Some(42), None), 5));
+        assert!(!should_drive_snapshot_for_group(
+            &snap(Some(42), Some(41)),
+            5
+        ));
+        assert!(!should_drive_snapshot_for_group(
+            &snap(Some(46), Some(42)),
+            5
+        ));
+        assert!(should_drive_snapshot_for_group(
+            &snap(Some(47), Some(42)),
+            5
+        ));
+        assert!(!should_drive_snapshot_for_group(
+            &snap(Some(42), Some(42)),
+            5
+        ));
+        assert!(!should_drive_snapshot_for_group(
+            &snap(Some(42), Some(43)),
+            5
+        ));
     }
 
     #[test]
@@ -5315,15 +5332,17 @@ mod snapshot_driver {
             snap_with_group(2, Some(42), Some(41)),
         ];
 
-        let first = next_snapshot_to_drive(&snapshots, 0).expect("first due snapshot");
+        let first = next_snapshot_to_drive(&snapshots, 0, 1).expect("first due snapshot");
         assert_eq!(first.0, 1);
         assert_eq!(first.1.raft_group_id, 1);
 
-        let second = next_snapshot_to_drive(&snapshots, first.0 + 1).expect("second due snapshot");
+        let second =
+            next_snapshot_to_drive(&snapshots, first.0 + 1, 1).expect("second due snapshot");
         assert_eq!(second.0, 2);
         assert_eq!(second.1.raft_group_id, 2);
 
-        let wrapped = next_snapshot_to_drive(&snapshots, second.0 + 1).expect("wrapped snapshot");
+        let wrapped =
+            next_snapshot_to_drive(&snapshots, second.0 + 1, 1).expect("wrapped snapshot");
         assert_eq!(wrapped.0, 1);
         assert_eq!(wrapped.1.raft_group_id, 1);
     }

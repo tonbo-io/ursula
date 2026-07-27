@@ -125,6 +125,7 @@ pub fn spawn_runtime(
             snapshot_store,
             config.storage.cold.s3.as_ref(),
             snapshot_drive_interval_ms,
+            config.raft.snapshot_logs_since_last,
         );
         leadership::spawn_leadership_balancer(
             &registry,
