@@ -1238,6 +1238,7 @@ mod tests {
                 size_bytes: 1,
                 stored_size_bytes: Some(1),
                 compression: ursula_runtime::SnapshotCompression::None,
+                shared_object: false,
             },
         };
         TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
