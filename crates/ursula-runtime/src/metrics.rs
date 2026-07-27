@@ -383,7 +383,11 @@ runtime_metrics! {
     counter cold_gc_errors;
     counter cold_flush_write_errors;
     sum cold_hot_bytes: group per_group_cold_hot_bytes;
-    max cold_hot_group_bytes_max: group per_group_cold_hot_bytes_max;
+    // Current largest per-group backlog. Cold-health consumes this gauge and
+    // must be able to recover after a flush. The separate per-group `*_max`
+    // series remains the lifetime high-water mark for diagnostics.
+    max cold_hot_group_bytes_max: group per_group_cold_hot_bytes_current_max;
+    max cold_hot_group_bytes_high_watermark: group per_group_cold_hot_bytes_max;
     counter cold_hot_stream_bytes_max;
     sum cold_backpressure_events:
         core per_core_cold_backpressure_events, group per_group_cold_backpressure_events;
@@ -640,6 +644,7 @@ impl RuntimeMetricsInner {
     ) {
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
         self.per_group_cold_hot_bytes[group_index].store_relaxed(group_hot_bytes);
+        self.per_group_cold_hot_bytes_current_max[group_index].store_relaxed(group_hot_bytes);
         self.per_group_cold_hot_bytes_max[group_index].fetch_max_relaxed(group_hot_bytes);
         self.cold_hot_stream_bytes_max
             .fetch_max_relaxed(stream_hot_bytes);
@@ -795,7 +800,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 120] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 122] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -910,6 +915,8 @@ mod metric_manifest_tests {
         "cold_hot_bytes",
         "per_group_cold_hot_bytes",
         "cold_hot_group_bytes_max",
+        "per_group_cold_hot_bytes_current_max",
+        "cold_hot_group_bytes_high_watermark",
         "per_group_cold_hot_bytes_max",
         "cold_hot_stream_bytes_max",
         "cold_backpressure_events",

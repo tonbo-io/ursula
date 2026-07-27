@@ -591,8 +591,11 @@ impl Default for ColdHealthConfig {
             interval: HumanDuration::sec(2),
             unhealthy_ticks: 3,
             heal_ticks: 5,
-            hot_size_high: HumanSize::mib(7),
-            hot_size_low: HumanSize::mib(4),
+            // Leave the normal 8 MiB cold-flush threshold enough room to run.
+            // The old 7 MiB watermark forced leadership shedding before a
+            // group became eligible for its first flush.
+            hot_size_high: HumanSize::mib(48),
+            hot_size_low: HumanSize::mib(32),
             errors_per_tick_high: 1,
         }
     }

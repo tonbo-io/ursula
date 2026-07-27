@@ -2519,7 +2519,13 @@ async fn cold_write_admission_rejects_new_bytes_until_flush_catches_up() {
         .await
         .expect("flush once")
         .expect("candidate flushed");
-    assert_eq!(runtime.metrics().snapshot().cold_hot_bytes, 0);
+    let metrics_after_flush = runtime.metrics().snapshot();
+    assert_eq!(metrics_after_flush.cold_hot_bytes, 0);
+    assert_eq!(metrics_after_flush.cold_hot_group_bytes_max, 0);
+    assert_eq!(
+        metrics_after_flush.per_group_cold_hot_bytes_max[group_index], 4,
+        "the diagnostic high-water mark remains monotonic"
+    );
 
     append_bytes(&runtime, &stream, b"e").await;
     let read = runtime
