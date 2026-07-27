@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::Cursor;
@@ -21,7 +22,11 @@ use openraft::error::Unreachable;
 use openraft::network::RPCOption;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
+use prost::Message;
 use serde::de::DeserializeOwned;
+use tonic::codec::CompressionEncoding;
+use tonic::metadata::MetadataMap;
+use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 use tracing::Instrument;
@@ -51,6 +56,7 @@ use crate::types::UrsulaVoteResponse;
 
 pub(crate) static GRPC_LEADER_CHANNELS: OnceLock<Mutex<BTreeMap<String, Channel>>> =
     OnceLock::new();
+static GRPC_ZSTD_ENDPOINTS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 use crate::registry::LeadershipShedFlag;
 use crate::registry::LeadershipShedState;
 use crate::registry::RaftGroupHandleRegistry;
@@ -65,6 +71,17 @@ pub const RAFT_GRPC_GROUP_READ_PATH: &str = "/ursula.raft.v1.RaftInternal/GroupR
 pub const RAFT_GRPC_TRANSFER_LEADER_PATH: &str = "/ursula.raft.v1.RaftInternal/TransferLeader";
 pub const RAFT_GRPC_MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const RAFT_GRPC_PROTOCOL_VERSION: u32 = 1;
+const RAFT_GRPC_ACCEPT_REQUEST_COMPRESSION: &str = "x-ursula-raft-accept-compression";
+const RAFT_GRPC_ZSTD_MIN_MESSAGE_BYTES: usize = 1024;
+
+fn raft_grpc_response<T>(message: T) -> tonic::Response<T> {
+    let mut response = tonic::Response::new(message);
+    response.metadata_mut().insert(
+        RAFT_GRPC_ACCEPT_REQUEST_COMPRESSION,
+        MetadataValue::from_static("zstd"),
+    );
+    response
+}
 
 #[derive(Debug)]
 pub(crate) struct GrpcRpcError {
@@ -135,6 +152,7 @@ pub fn raft_grpc_service(
     raft_internal_proto::raft_internal_server::RaftInternalServer::new(RaftGrpcService::new(
         registry,
     ))
+    .accept_compressed(CompressionEncoding::Zstd)
     .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
     .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
 }
@@ -158,7 +176,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .append_entries(raft_group_id, request)
             .await
             .map_err(|err| tonic::Status::internal(err.to_string()))?;
-        Ok(tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
+        Ok(raft_grpc_response(raft_internal_proto::RaftRpcAckV1 {
             payload: encode_wire(&response),
         }))
     }
@@ -180,7 +198,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .vote(raft_group_id, request)
             .await
             .map_err(|err| tonic::Status::internal(err.to_string()))?;
-        Ok(tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
+        Ok(raft_grpc_response(raft_internal_proto::RaftRpcAckV1 {
             payload: encode_wire(&response),
         }))
     }
@@ -208,7 +226,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .install_full_snapshot(raft_group_id, vote, snapshot)
             .await
             .map_err(|err| tonic::Status::internal(err.to_string()))?;
-        Ok(tonic::Response::new(
+        Ok(raft_grpc_response(
             raft_internal_proto::RaftFullSnapshotAckV1 {
                 response: encode_wire(&response),
             },
@@ -256,7 +274,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     },
                 })
                 .collect();
-            Ok(tonic::Response::new(
+            Ok(raft_grpc_response(
                 raft_internal_proto::GroupWriteResponseV1 { results },
             ))
         }
@@ -288,7 +306,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .handle_transfer_leader(raft_group_id, openraft_request)
             .await
             .map_err(|err| tonic::Status::internal(err.to_string()))?;
-        Ok(tonic::Response::new(
+        Ok(raft_grpc_response(
             raft_internal_proto::RaftTransferLeaderAckV1 {},
         ))
     }
@@ -385,7 +403,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     payload: encode_wire(&err),
                 },
             };
-            Ok(tonic::Response::new(response))
+            Ok(raft_grpc_response(response))
         }
         .instrument(span)
         .await
@@ -611,16 +629,27 @@ impl GrpcRaftNetwork {
         send: impl FnOnce(RaftClient, tonic::Request<Req>) -> Fut,
     ) -> Result<Resp, RPCError<UrsulaRaftTypeConfig>>
     where
+        Req: Message,
         Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
     {
+        let use_zstd = request.encoded_len() >= RAFT_GRPC_ZSTD_MIN_MESSAGE_BYTES
+            && grpc_endpoint_accepts_zstd(&self.endpoint);
         let mut request = tonic::Request::new(request);
         self.apply_rpc_timeout(&mut request, option);
-        match send(self.client()?, request).await {
+        let mut client = self.client()?;
+        if use_zstd {
+            client = client.send_compressed(CompressionEncoding::Zstd);
+        }
+        match send(client, request).await {
             Ok(response) => {
+                observe_grpc_compression_support(&self.endpoint, response.metadata());
                 self.note_success();
                 Ok(response.into_inner())
             }
             Err(err) => {
+                if use_zstd && err.code() == tonic::Code::Unimplemented {
+                    forget_grpc_compression_support(&self.endpoint);
+                }
                 let mapped = self.map_tonic_status(route, err);
                 self.note_failure(route);
                 Err(mapped)
@@ -649,10 +678,47 @@ fn build_client(endpoint: &str) -> Result<RaftClient, String> {
     Endpoint::from_shared(endpoint.to_owned())
         .map(|ep| {
             RaftClient::new(ep.connect_lazy())
+                .accept_compressed(CompressionEncoding::Zstd)
                 .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
         })
         .map_err(|err| format!("invalid raft gRPC endpoint {endpoint}: {err}"))
+}
+
+fn grpc_endpoint_accepts_zstd(endpoint: &str) -> bool {
+    GRPC_ZSTD_ENDPOINTS
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .is_ok_and(|endpoints| endpoints.contains(endpoint))
+}
+
+fn observe_grpc_compression_support(endpoint: &str, metadata: &MetadataMap) {
+    let accepts_zstd = metadata
+        .get(RAFT_GRPC_ACCEPT_REQUEST_COMPRESSION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|encoding| encoding.trim().eq_ignore_ascii_case("zstd"))
+        });
+    if !accepts_zstd {
+        return;
+    }
+    if let Ok(mut endpoints) = GRPC_ZSTD_ENDPOINTS
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+    {
+        endpoints.insert(endpoint.to_owned());
+    }
+}
+
+fn forget_grpc_compression_support(endpoint: &str) {
+    if let Ok(mut endpoints) = GRPC_ZSTD_ENDPOINTS
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+    {
+        endpoints.remove(endpoint);
+    }
 }
 
 pub(crate) fn normalize_grpc_endpoint(address: String) -> String {
@@ -754,6 +820,32 @@ mod reconnect_tests {
         // Override threshold so tests don't depend on the env var
         net.reconnect_threshold = threshold;
         net
+    }
+
+    #[test]
+    fn compression_capability_is_learned_and_forgotten() {
+        let endpoint = "http://127.0.0.1:32199";
+        forget_grpc_compression_support(endpoint);
+        assert!(!grpc_endpoint_accepts_zstd(endpoint));
+
+        let response = raft_grpc_response(());
+        observe_grpc_compression_support(endpoint, response.metadata());
+        assert!(grpc_endpoint_accepts_zstd(endpoint));
+
+        forget_grpc_compression_support(endpoint);
+        assert!(!grpc_endpoint_accepts_zstd(endpoint));
+    }
+
+    #[test]
+    fn compression_capability_metadata_is_explicit() {
+        let response = raft_grpc_response(());
+        assert_eq!(
+            response
+                .metadata()
+                .get(RAFT_GRPC_ACCEPT_REQUEST_COMPRESSION)
+                .and_then(|value| value.to_str().ok()),
+            Some("zstd")
+        );
     }
 
     #[tokio::test]

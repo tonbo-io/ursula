@@ -674,6 +674,7 @@ fn raft_grpc_service(
     raft_internal_proto::raft_internal_server::RaftInternalServer::new(HttpRaftGrpcService::new(
         registry, state,
     ))
+    .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
     .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
     .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
 }
