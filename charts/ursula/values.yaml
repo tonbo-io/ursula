@@ -246,6 +246,9 @@ gateway:
     type: ClusterIP
     # Gateway Service port.
     port: 4437
+    # Prefer a topologically local gateway endpoint when supported by the
+    # cluster. Use PreferSameZone on Kubernetes 1.35+ multi-AZ clusters.
+    trafficDistribution: ""
     # Gateway Service annotations.
     annotations: {}
 

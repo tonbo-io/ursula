@@ -141,6 +141,31 @@ class HelmTemplateConfigTest(unittest.TestCase):
             rendered,
         )
 
+    def test_gateway_can_prefer_same_zone_service_endpoints(self) -> None:
+        rendered = render_chart(
+            "--set",
+            "s3.bucket=bkt",
+            "--set",
+            "gateway.service.trafficDistribution=PreferSameZone",
+        )
+
+        gateway_service = re.search(
+            r"kind: Service\nmetadata:\n  name: test-ursula-gateway\n.*?"
+            r"spec:\n(?P<spec>.*?)(?:\n---|\Z)",
+            rendered,
+            re.S,
+        )
+        self.assertIsNotNone(gateway_service)
+        self.assertIn(
+            'trafficDistribution: "PreferSameZone"',
+            gateway_service.group("spec"),
+        )
+
+    def test_gateway_omits_empty_traffic_distribution(self) -> None:
+        rendered = render_chart("--set", "s3.bucket=bkt")
+
+        self.assertNotIn("trafficDistribution:", rendered)
+
     def test_max_uncommitted_value_uses_single_raft_table(self) -> None:
         config = render_config("--set", "raft.maxUncommittedBytesPerGroup=8388608", "--set", "s3.bucket=bkt")
 

@@ -369,13 +369,18 @@
               "maximum": 65535,
               "description": "Gateway Service port."
             },
+            "trafficDistribution": {
+              "type": "string",
+              "enum": ["", "PreferClose", "PreferSameZone", "PreferSameNode"],
+              "description": "Optional Kubernetes Service traffic distribution preference. PreferSameZone requires Kubernetes 1.35 or a cluster that enables the corresponding feature gate."
+            },
             "annotations": {
               "type": "object",
               "description": "Gateway Service annotations.",
               "additionalProperties": { "type": "string" }
             }
           },
-          "required": ["type", "port", "annotations"]
+          "required": ["type", "port", "trafficDistribution", "annotations"]
         },
         "ingress": {
           "type": "object",

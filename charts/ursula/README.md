@@ -430,6 +430,7 @@ container receives only chart-managed container settings plus explicit
 | `gateway.ports.http` | `4437` | Gateway HTTP process listen port. |
 | `gateway.service.type` | `ClusterIP` | Gateway Service type. |
 | `gateway.service.port` | `4437` | Gateway Service port. |
+| `gateway.service.trafficDistribution` | `""` | Optional Kubernetes Service traffic preference. Set `PreferSameZone` on Kubernetes 1.35+ multi-AZ clusters to keep client-to-gateway traffic zonal when a local endpoint is ready. |
 | `gateway.service.annotations` | `{}` | Gateway Service annotations. |
 | `gateway.ingress.enabled` | `false` | Render an Ingress resource for the gateway Service. |
 | `gateway.ingress.className` | `""` | Optional IngressClass name rendered as `spec.ingressClassName`. |

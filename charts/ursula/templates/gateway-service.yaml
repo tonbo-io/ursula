@@ -11,6 +11,9 @@ metadata:
   {{- end }}
 spec:
   type: {{ .Values.gateway.service.type }}
+  {{- with .Values.gateway.service.trafficDistribution }}
+  trafficDistribution: {{ . | quote }}
+  {{- end }}
   ports:
     - name: gateway
       port: {{ .Values.gateway.service.port }}
