@@ -94,7 +94,6 @@ struct SharedRaftChannel {
 
 #[derive(Clone)]
 struct SharedAppendSession {
-    generation: u64,
     sender: mpsc::UnboundedSender<AppendStreamCall>,
 }
 
@@ -830,8 +829,8 @@ impl GrpcRaftNetwork {
         let client = self
             .client()
             .map_err(|err| tonic::Status::unavailable(err.to_string()))?;
-        let sender = shared_append_session(&self.endpoint, self.channel_generation, client)
-            .map_err(tonic::Status::unavailable)?;
+        let sender =
+            shared_append_session(&self.endpoint, client).map_err(tonic::Status::unavailable)?;
         let (response_sender, response_receiver) = oneshot::channel();
         sender
             .send(AppendStreamCall {
@@ -1030,9 +1029,16 @@ fn forget_grpc_append_stream_support(endpoint: &str) {
     }
 }
 
+/// Return the one healthy Append stream for this peer endpoint.
+///
+/// The stream lifetime is intentionally independent of the unary channel
+/// generation. OpenRaft keeps one network object per group, so after any
+/// channel rebuild those objects temporarily observe different generations.
+/// Keying the stream by each object's generation makes them replace one
+/// another on nearly every Append call. A live stream is already proof that
+/// its underlying channel works; replace it only after its sender closes.
 fn shared_append_session(
     endpoint: &str,
-    generation: u64,
     client: RaftClient,
 ) -> Result<mpsc::UnboundedSender<AppendStreamCall>, String> {
     let sessions = GRPC_APPEND_SESSIONS.get_or_init(|| Mutex::new(BTreeMap::new()));
@@ -1040,7 +1046,6 @@ fn shared_append_session(
         .lock()
         .map_err(|err| format!("raft append session pool lock poisoned for {endpoint}: {err}"))?;
     if let Some(session) = sessions.get(endpoint)
-        && session.generation == generation
         && !session.sender.is_closed()
     {
         return Ok(session.sender.clone());
@@ -1049,7 +1054,6 @@ fn shared_append_session(
     let (sender, receiver) = mpsc::unbounded_channel();
     tokio::spawn(run_append_session(endpoint.to_owned(), client, receiver));
     sessions.insert(endpoint.to_owned(), SharedAppendSession {
-        generation,
         sender: sender.clone(),
     });
     Ok(sender)
@@ -1367,7 +1371,7 @@ mod reconnect_tests {
         remove_shared_channel(&endpoint);
         forget_grpc_append_stream_support(&endpoint);
 
-        let first = GrpcRaftNetwork::new(RaftGroupId(1), 2, endpoint.clone());
+        let mut first = GrpcRaftNetwork::new(RaftGroupId(1), 2, endpoint.clone());
         let second = GrpcRaftNetwork::new(RaftGroupId(2), 2, endpoint.clone());
         let envelope = |raft_group_id| raft_internal_proto::RaftRpcEnvelopeV1 {
             raft_group_id,
@@ -1391,13 +1395,46 @@ mod reconnect_tests {
                 .code(),
             tonic::Code::NotFound
         );
-        let shared_generation = GRPC_APPEND_SESSIONS
+        let shared_session_open = GRPC_APPEND_SESSIONS
             .get_or_init(|| Mutex::new(BTreeMap::new()))
             .lock()
             .expect("append session pool lock")
             .get(&endpoint)
-            .map(|session| session.generation);
-        assert_eq!(shared_generation, Some(first.channel_generation));
+            .is_some_and(|session| !session.sender.is_closed());
+        assert!(shared_session_open);
+
+        let original_sender = GRPC_APPEND_SESSIONS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("append session pool lock")
+            .get(&endpoint)
+            .expect("shared append session")
+            .sender
+            .clone();
+        let original_generation = first.channel_generation;
+        for _ in 0..first.reconnect_threshold {
+            first.note_failure("test channel replacement");
+        }
+        assert_ne!(first.channel_generation, original_generation);
+        let result = first
+            .try_append_stream(envelope(1), RPCOption::new(Duration::from_secs(2)))
+            .await;
+        assert_eq!(
+            result.expect_err("missing group should still fail").code(),
+            tonic::Code::NotFound
+        );
+        let replacement_sender = GRPC_APPEND_SESSIONS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("append session pool lock")
+            .get(&endpoint)
+            .expect("shared append session")
+            .sender
+            .clone();
+        assert!(
+            original_sender.same_channel(&replacement_sender),
+            "a unary channel generation change must not replace a healthy append stream"
+        );
 
         server.abort();
     }
