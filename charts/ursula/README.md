@@ -18,6 +18,8 @@ This topology removes single-pod compute failures from the normal request path, 
 
 [`examples/production-eks.yaml`](examples/production-eks.yaml) is a concrete three-AZ starting point with durable gp3 volumes, S3 cold storage and snapshots, three gateways, separate workload identities, and a two-replica indexer worker pool. For a complete AWS prerequisite flow, use [`deploy/eks`](../../deploy/eks): `tofu apply` produces `generated-values.yaml` and a dedicated kubeconfig, after which deployment is one `helm install` and one `helm test`.
 
+[`examples/tls-ingress.yaml`](examples/tls-ingress.yaml) is the exposure half: one HTTPS domain terminating at the ingress, with voters and the admin plane private. Layer it on top of a sizing example. Ursula never terminates TLS itself — see the security guide for why, and for the ingress settings that live tails and leader redirects depend on.
+
 ## Build A Local Image
 
 ```bash
