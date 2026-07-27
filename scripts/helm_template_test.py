@@ -26,6 +26,32 @@ def indexer_values() -> tuple[str, ...]:
     )
 
 
+def hook_annotations(rendered: str) -> dict[tuple[str, str], dict[str, str]]:
+    """Map every rendered Helm hook to its own ``helm.sh/*`` annotations.
+
+    Keyed by ``(kind, metadata.name)`` so a caller asserts per resource. A
+    substring search over the whole render cannot do that: it passes as soon as
+    any single resource carries the expected annotation, which is how a hook
+    group can be half-configured and still look green.
+
+    Stdlib only, deliberately. CI runs this file with a bare ``python3`` and
+    installs nothing, so a YAML parser is not available to assume.
+    """
+    resources: dict[tuple[str, str], dict[str, str]] = {}
+    for document in re.split(r"^---$", rendered, flags=re.M):
+        kind = re.search(r"^kind: (?P<kind>\S+)$", document, re.M)
+        metadata = re.search(r"^metadata:\n(?P<block>(?:[ \t].*\n?)*)", document, re.M)
+        if not kind or not metadata:
+            continue
+        block = metadata.group("block")
+        annotations = dict(re.findall(r'^ {4}"(helm\.sh/[^"]+)": (.+)$', block, re.M))
+        if "helm.sh/hook" not in annotations:
+            continue
+        name = re.search(r"^ {2}name: (?P<name>\S+)$", block, re.M)
+        resources[(kind.group("kind"), name.group("name") if name else "")] = annotations
+    return resources
+
+
 class HelmTemplateConfigTest(unittest.TestCase):
     def test_server_update_strategy_defaults_to_rolling_update(self) -> None:
         rendered = render_chart("--set", "s3.bucket=bkt")
@@ -49,11 +75,26 @@ class HelmTemplateConfigTest(unittest.TestCase):
             rendered,
         )
         self.assertIn("kind: Job\nmetadata:\n  name: test-ursula-ondelete-migration", rendered)
-        self.assertIn('"helm.sh/hook": pre-upgrade', rendered)
-        self.assertIn(
-            '"helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed',
-            rendered,
+
+        # Per resource, not once across the whole render: the hook only cleans
+        # up after itself if every object it creates carries the policy, and a
+        # missing Role or ServiceAccount leaves the Job unable to run at all.
+        migration = {
+            (kind, name): annotations
+            for (kind, name), annotations in hook_annotations(rendered).items()
+            if name == "test-ursula-ondelete-migration"
+        }
+        self.assertEqual(
+            {kind for kind, _ in migration},
+            {"ServiceAccount", "Role", "RoleBinding", "Job"},
         )
+        for (kind, name), annotations in sorted(migration.items()):
+            with self.subTest(kind=kind, name=name):
+                self.assertEqual(annotations["helm.sh/hook"], "pre-upgrade")
+                self.assertEqual(
+                    annotations["helm.sh/hook-delete-policy"],
+                    "before-hook-creation,hook-succeeded,hook-failed",
+                )
         self.assertIn(
             '- --patch={"spec":{"updateStrategy":{"rollingUpdate":null}}}',
             rendered,
