@@ -161,6 +161,17 @@ pub(crate) fn insert_content_type(headers: &mut HeaderMap, content_type: &str) {
 pub(crate) fn insert_default_response_headers(headers: &mut HeaderMap) {
     insert_static(headers, HEADER_X_CONTENT_TYPE_OPTIONS, "nosniff");
     insert_static(headers, HEADER_CROSS_ORIGIN_RESOURCE_POLICY, "cross-origin");
+    // A stream read carries an `ETag` and no cache directive would make it
+    // *heuristically* cacheable, so a shared cache could store private stream
+    // bytes and serve them on a URL match. Default to refusing storage and let
+    // a path opt into something weaker after this call — the SSE handler does
+    // exactly that with `no-cache`.
+    //
+    // This also forecloses caching a `public_read` stream at a CDN, which would
+    // be a legitimate thing to want. Relaxing it belongs to the gateway: it is
+    // the only layer that knows a bucket is public, whereas a node serves
+    // whatever reaches it and cannot tell private bytes from public ones.
+    insert_cache_control(headers, "no-store");
 }
 
 pub(crate) fn insert_cache_control(headers: &mut HeaderMap, value: &'static str) {
@@ -818,4 +829,44 @@ pub(crate) fn sse_safe_line(line: &str) -> String {
     line.chars()
         .filter(|ch| *ch != '\r' && *ch != '\0')
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::HeaderMap;
+    use axum::http::header::CACHE_CONTROL;
+
+    use super::insert_cache_control;
+    use super::insert_default_response_headers;
+
+    /// Every response path calls this helper, so pinning the set here is what
+    /// makes a newly added path inherit the defaults rather than quietly ship
+    /// without them.
+    #[test]
+    fn default_headers_refuse_storage_and_sniffing() {
+        let mut headers = HeaderMap::new();
+
+        insert_default_response_headers(&mut headers);
+
+        assert_eq!(headers.get(CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+        assert_eq!(
+            headers.get("cross-origin-resource-policy").unwrap(),
+            "cross-origin"
+        );
+    }
+
+    /// The SSE handler needs `no-cache`, not `no-store`, and gets it by calling
+    /// the default helper first and overriding after. Reversing that order would
+    /// silently restore `no-store` on live tails, so the contract is asserted
+    /// rather than left to call-site discipline.
+    #[test]
+    fn a_later_cache_directive_overrides_the_default() {
+        let mut headers = HeaderMap::new();
+
+        insert_default_response_headers(&mut headers);
+        insert_cache_control(&mut headers, "no-cache");
+
+        assert_eq!(headers.get(CACHE_CONTROL).unwrap(), "no-cache");
+    }
 }
