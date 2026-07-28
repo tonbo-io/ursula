@@ -37,7 +37,6 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
         upstreams: args.upstream,
         response_header_timeout: Duration::from_secs(args.response_header_timeout),
         connect_timeout: Duration::from_secs(args.connect_timeout),
-        upstream_http2_prior_knowledge: args.upstream_http2_prior_knowledge,
         max_request_body_bytes: args.max_request_body_bytes,
         raft_group_count: args.raft_group_count.map(NonZeroUsize::get),
         cors_allowed_origins: args.cors_allowed_origin.clone(),
@@ -156,10 +155,6 @@ pub struct GatewayArgs {
     /// TCP connect timeout per upstream attempt in seconds.
     #[arg(long, default_value_t = 5)]
     connect_timeout: u64,
-
-    /// Use cleartext HTTP/2 for multiplexed connections to Ursula nodes.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-    upstream_http2_prior_knowledge: bool,
 
     /// Maximum request body bytes buffered for leader-redirect replay.
     #[arg(long, default_value_t = DEFAULT_MAX_REQUEST_BODY_BYTES)]

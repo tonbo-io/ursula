@@ -126,7 +126,6 @@ fn test_config(upstreams: Vec<String>) -> GatewayConfig {
         upstreams,
         response_header_timeout: Duration::from_secs(5),
         connect_timeout: Duration::from_secs(1),
-        upstream_http2_prior_knowledge: true,
         max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
         raft_group_count: None,
         cors_allowed_origins: Vec::new(),
