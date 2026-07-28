@@ -1,0 +1,75 @@
+name: Benchmark Docker Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Source tag in the benchmark-vX.Y.Z form
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+
+concurrency:
+  group: benchmark-docker-image-${{ inputs.source_tag }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  docker:
+    name: ARM64 benchmark image
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate source tag
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          [[ "$SOURCE_TAG" =~ ^benchmark-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+
+      - name: Checkout immutable source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_tag }}
+          fetch-depth: 0
+
+      - name: Verify version and source tag
+        id: source
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          version="${SOURCE_TAG#benchmark-v}"
+          test "$(git rev-list -n 1 "$SOURCE_TAG")" = "$(git rev-parse HEAD)"
+          cargo_version="$(awk -F ' *= *' '$1 == "version" {gsub(/"/, "", $2); print $2; exit}' Cargo.toml)"
+          chart_version="$(awk '$1 == "version:" {print $2; exit}' charts/ursula/Chart.yaml)"
+          test "$cargo_version" = "$version"
+          test "$chart_version" = "$version"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      - name: Set up Depot
+        uses: depot/setup-action@v1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish ARM64 benchmark image
+        uses: depot/build-push-action@v1
+        with:
+          project: ls2d88cjpz
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:benchmark-${{ steps.source.outputs.version }}
+          provenance: true
+          sbom: true
