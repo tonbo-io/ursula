@@ -81,6 +81,7 @@ data:
     cat > "${config_path}" <<EOF
     [server]
     listen = "0.0.0.0:{{ $clientPort }}"
+    admin_listen = {{ .Values.server.adminListen | quote }}
 
     [runtime]
     core_count = {{ .Values.server.coreCount }}

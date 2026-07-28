@@ -58,11 +58,12 @@ server:
       limits:
         memory: 64Mi
   ports:
-    # Ursula public client-plane HTTP port (stream reads/writes). The mutating
-    # admin plane binds to pod loopback (127.0.0.1:4438) and is intentionally
-    # not exposed as a container port or Service; reach it with
-    # `kubectl port-forward <pod> 4438:4438` and point ursulactl at it.
+    # Ursula public client-plane HTTP port (stream reads/writes).
     client: 4437
+  # The mutating admin plane stays on pod loopback by default. A trusted
+  # in-cluster operator or chaos controller may opt in to a pod-reachable bind
+  # such as 0.0.0.0:4438; the chart never adds it to a Service.
+  adminListen: 127.0.0.1:4438
   service:
     # Render the internal client Service.
     enabled: true

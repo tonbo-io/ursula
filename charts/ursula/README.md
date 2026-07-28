@@ -327,11 +327,12 @@ operationally safe restarts on an initialized cluster.
 | `server.updateStrategy` | `RollingUpdate` | StatefulSet update strategy. Use `OnDelete` only with an external controller that drains, prepares, restarts, catches up, and verifies one voter at a time. Helm clears stale `rollingUpdate` state with a pre-upgrade migration hook. |
 | `server.onDeleteMigration.enabled` | `true` | Run the Helm pre-upgrade migration when using `OnDelete`. Disable when a GitOps PreSync hook performs the equivalent patch. |
 | `server.onDeleteMigration.image` | `registry.k8s.io/kubectl:v1.33.3` | Kubectl image used by the Helm pre-upgrade migration when switching an existing StatefulSet to `OnDelete`. |
-| `server.ports.client` | `4437` | Ursula HTTP/admin process port. The client Service, headless peer Service, generated Raft peer URLs, and leader redirects target this port in the current chart. |
-| `server.service.enabled` | `true` | Render the internal client/admin Service. |
-| `server.service.type` | `ClusterIP` | Client/admin Service type. Allowed values are `ClusterIP`, `NodePort`, and `LoadBalancer`. |
-| `server.service.port` | `4437` | Client/admin Service port. |
-| `server.service.annotations` | `{}` | Client/admin Service annotations. |
+| `server.ports.client` | `4437` | Ursula client-plane process port. The client Service, headless peer Service, generated Raft peer URLs, and leader redirects target this port. |
+| `server.adminListen` | `127.0.0.1:4438` | Mutating admin-plane listen address. Keep the loopback default for normal deployments and use `kubectl port-forward`; a trusted in-cluster operator may opt in to `0.0.0.0:4438`. The chart never exposes this port through a Service. |
+| `server.service.enabled` | `true` | Render the internal client Service. |
+| `server.service.type` | `ClusterIP` | Client Service type. Allowed values are `ClusterIP`, `NodePort`, and `LoadBalancer`. |
+| `server.service.port` | `4437` | Client Service port. |
+| `server.service.annotations` | `{}` | Client Service annotations. |
 | `server.headlessService.annotations` | `{}` | Headless peer Service annotations. The headless Service targets `server.ports.client` and uses `publishNotReadyAddresses: true` for stable peer DNS during bootstrap. |
 | `server.podAnnotations` | `{}` | Extra annotations applied to Ursula server pods. |
 | `server.podLabels` | `{}` | Extra labels applied to Ursula server pods. Must not set selector labels `app.kubernetes.io/name` or `app.kubernetes.io/instance`; the chart fails rendering if those keys are used. |

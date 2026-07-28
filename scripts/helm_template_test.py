@@ -166,6 +166,21 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
         self.assertNotIn("trafficDistribution:", rendered)
 
+    def test_admin_plane_defaults_to_loopback(self) -> None:
+        config = render_config("--set", "s3.bucket=bkt")
+
+        self.assertEqual(tomllib.loads(config)["server"]["admin_listen"], "127.0.0.1:4438")
+
+    def test_admin_plane_can_bind_for_trusted_in_cluster_operator(self) -> None:
+        config = render_config(
+            "--set",
+            "s3.bucket=bkt",
+            "--set",
+            "server.adminListen=0.0.0.0:4438",
+        )
+
+        self.assertEqual(tomllib.loads(config)["server"]["admin_listen"], "0.0.0.0:4438")
+
     def test_max_uncommitted_value_uses_single_raft_table(self) -> None:
         config = render_config("--set", "raft.maxUncommittedBytesPerGroup=8388608", "--set", "s3.bucket=bkt")
 
