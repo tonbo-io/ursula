@@ -26,6 +26,15 @@ message RaftRpcAckV1 {
 // every group. request_id is transport-local correlation only; it never enters
 // the replicated state machine or changes per-group ordering.
 message RaftAppendStreamRequestV1 {
+  // Legacy single-item fields retained for rolling compatibility with 0.3.31.
+  uint64 request_id = 1;
+  RaftRpcEnvelopeV1 envelope = 2;
+  // A v2-capable peer drains already-queued calls into one transport frame.
+  // Each item remains an independent OpenRaft RPC with its own correlation id.
+  repeated RaftAppendStreamRequestItemV1 batch = 3;
+}
+
+message RaftAppendStreamRequestItemV1 {
   uint64 request_id = 1;
   RaftRpcEnvelopeV1 envelope = 2;
 }
@@ -36,6 +45,16 @@ message RaftAppendStreamErrorV1 {
 }
 
 message RaftAppendStreamResponseV1 {
+  // Legacy single-item fields retained for rolling compatibility with 0.3.31.
+  uint64 request_id = 1;
+  oneof result {
+    RaftRpcAckV1 ack = 2;
+    RaftAppendStreamErrorV1 error = 3;
+  }
+  repeated RaftAppendStreamResponseItemV1 batch = 4;
+}
+
+message RaftAppendStreamResponseItemV1 {
   uint64 request_id = 1;
   oneof result {
     RaftRpcAckV1 ack = 2;
