@@ -1389,6 +1389,24 @@ mod reconnect_tests {
 
     use super::*;
 
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct LegacyAppendStreamRequest {
+        #[prost(uint64, tag = "1")]
+        request_id: u64,
+        #[prost(message, optional, tag = "2")]
+        envelope: Option<raft_internal_proto::RaftRpcEnvelopeV1>,
+        #[prost(message, repeated, tag = "3")]
+        batch: Vec<raft_internal_proto::RaftAppendStreamRequestItem>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct LegacyAppendStreamResponse {
+        #[prost(uint64, tag = "1")]
+        request_id: u64,
+        #[prost(message, repeated, tag = "4")]
+        batch: Vec<raft_internal_proto::RaftAppendStreamResponseItem>,
+    }
+
     fn remove_shared_channel(endpoint: &str) {
         if let Ok(mut channels) = GRPC_RAFT_CHANNELS
             .get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -1443,6 +1461,45 @@ mod reconnect_tests {
                 entries: 1,
             }
         );
+    }
+
+    #[test]
+    fn batched_append_stream_preserves_032_wire_field_numbers() {
+        let item = raft_internal_proto::RaftAppendStreamRequestItem {
+            request_id: 7,
+            envelope: Some(raft_internal_proto::RaftRpcEnvelopeV1 {
+                raft_group_id: 3,
+                node_id: 2,
+                protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+                payload: vec![1, 2, 3].into(),
+            }),
+        };
+        let current_request = raft_internal_proto::RaftAppendStreamRequest { items: vec![item] };
+        let legacy_request =
+            LegacyAppendStreamRequest::decode(current_request.encode_to_vec().as_slice())
+                .expect("0.3.32 request shape decodes current batch");
+        assert_eq!(legacy_request.batch.len(), 1);
+        assert_eq!(legacy_request.batch[0].request_id, 7);
+
+        let legacy_response = LegacyAppendStreamResponse {
+            request_id: 0,
+            batch: vec![raft_internal_proto::RaftAppendStreamResponseItem {
+                request_id: 7,
+                result: Some(
+                    raft_internal_proto::raft_append_stream_response_item::Result::Ack(
+                        raft_internal_proto::RaftRpcAckV1 {
+                            payload: vec![4, 5, 6].into(),
+                        },
+                    ),
+                ),
+            }],
+        };
+        let current_response = raft_internal_proto::RaftAppendStreamResponse::decode(
+            legacy_response.encode_to_vec().as_slice(),
+        )
+        .expect("current response shape decodes 0.3.32 batch");
+        assert_eq!(current_response.items.len(), 1);
+        assert_eq!(current_response.items[0].request_id, 7);
     }
 
     async fn spawn_append_stream_server()
