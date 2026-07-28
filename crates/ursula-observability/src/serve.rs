@@ -59,12 +59,9 @@ pub async fn serve_until_shutdown(
     drain_timeout: Option<Duration>,
 ) -> io::Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let tcp_nodelay = std::env::var("URSULA_TCP_NODELAY")
-        .map(|value| !matches!(value.trim(), "0" | "false" | "off"))
-        .unwrap_or(true);
-    let listener = listener.tap_io(move |stream| {
-        if let Err(err) = stream.set_nodelay(tcp_nodelay) {
-            tracing::warn!(tcp_nodelay, "set TCP_NODELAY on accepted socket: {err}");
+    let listener = listener.tap_io(|stream| {
+        if let Err(err) = stream.set_nodelay(true) {
+            tracing::warn!("set TCP_NODELAY on accepted socket: {err}");
         }
     });
     let server = axum::serve(listener, app)

@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::Cursor;
@@ -35,8 +34,6 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::codec::CompressionEncoding;
-use tonic::metadata::MetadataMap;
-use tonic::metadata::MetadataValue;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 use tracing::Instrument;
@@ -67,7 +64,6 @@ use crate::types::UrsulaVoteResponse;
 pub(crate) static GRPC_LEADER_CHANNELS: OnceLock<Mutex<BTreeMap<String, Channel>>> =
     OnceLock::new();
 static GRPC_RAFT_CHANNELS: OnceLock<Mutex<BTreeMap<String, SharedRaftChannel>>> = OnceLock::new();
-static GRPC_ZSTD_ENDPOINTS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 static GRPC_APPEND_SESSIONS: OnceLock<Mutex<BTreeMap<String, SharedAppendSession>>> =
     OnceLock::new();
 static GRPC_APPEND_STREAM_SESSIONS_OPENED: AtomicU64 = AtomicU64::new(0);
@@ -230,19 +226,9 @@ pub const RAFT_GRPC_GROUP_READ_PATH: &str = "/ursula.raft.v1.RaftInternal/GroupR
 pub const RAFT_GRPC_TRANSFER_LEADER_PATH: &str = "/ursula.raft.v1.RaftInternal/TransferLeader";
 pub const RAFT_GRPC_MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 pub(crate) const RAFT_GRPC_PROTOCOL_VERSION: u32 = 1;
-const RAFT_GRPC_ACCEPT_REQUEST_COMPRESSION: &str = "x-ursula-raft-accept-compression";
 const RAFT_GRPC_APPEND_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const RAFT_GRPC_APPEND_STREAM_MAX_BATCH_ITEMS: usize = 32;
 const RAFT_GRPC_ZSTD_MIN_MESSAGE_BYTES: usize = 1024;
-
-fn raft_grpc_response<T>(message: T) -> tonic::Response<T> {
-    let mut response = tonic::Response::new(message);
-    response.metadata_mut().insert(
-        RAFT_GRPC_ACCEPT_REQUEST_COMPRESSION,
-        MetadataValue::from_static("zstd"),
-    );
-    response
-}
 
 #[derive(Debug)]
 pub(crate) struct GrpcRpcError {
@@ -395,7 +381,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RaftRpcEnvelopeV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftRpcAckV1>, tonic::Status> {
         let ack = handle_append_envelope(self.registry.clone(), request.into_inner()).await?;
-        Ok(raft_grpc_response(ack))
+        Ok(tonic::Response::new(ack))
     }
 
     async fn append_stream(
@@ -440,7 +426,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 }
             })
             .buffer_unordered(64);
-        Ok(raft_grpc_response(Box::pin(responses)))
+        Ok(tonic::Response::new(Box::pin(responses)))
     }
 
     async fn vote(
@@ -460,7 +446,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .vote(raft_group_id, request)
             .await
             .map_err(|err| tonic::Status::internal(err.to_string()))?;
-        Ok(raft_grpc_response(raft_internal_proto::RaftRpcAckV1 {
+        Ok(tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
             payload: encode_wire(&response),
         }))
     }
@@ -488,7 +474,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .install_full_snapshot(raft_group_id, vote, snapshot)
             .await
             .map_err(|err| tonic::Status::internal(err.to_string()))?;
-        Ok(raft_grpc_response(
+        Ok(tonic::Response::new(
             raft_internal_proto::RaftFullSnapshotAckV1 {
                 response: encode_wire(&response),
             },
@@ -536,7 +522,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     },
                 })
                 .collect();
-            Ok(raft_grpc_response(
+            Ok(tonic::Response::new(
                 raft_internal_proto::GroupWriteResponseV1 { results },
             ))
         }
@@ -568,7 +554,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .handle_transfer_leader(raft_group_id, openraft_request)
             .await
             .map_err(|err| tonic::Status::internal(err.to_string()))?;
-        Ok(raft_grpc_response(
+        Ok(tonic::Response::new(
             raft_internal_proto::RaftTransferLeaderAckV1 {},
         ))
     }
@@ -665,7 +651,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     payload: encode_wire(&err),
                 },
             };
-            Ok(raft_grpc_response(response))
+            Ok(tonic::Response::new(response))
         }
         .instrument(span)
         .await
@@ -902,8 +888,7 @@ impl GrpcRaftNetwork {
         Req: Message,
         Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
     {
-        let use_zstd = request.encoded_len() >= RAFT_GRPC_ZSTD_MIN_MESSAGE_BYTES
-            && grpc_endpoint_accepts_zstd(&self.endpoint);
+        let use_zstd = request.encoded_len() >= RAFT_GRPC_ZSTD_MIN_MESSAGE_BYTES;
         let mut request = tonic::Request::new(request);
         self.apply_rpc_timeout(&mut request, option);
         let mut client = self.client()?;
@@ -912,14 +897,10 @@ impl GrpcRaftNetwork {
         }
         match send(client, request).await {
             Ok(response) => {
-                observe_grpc_compression_support(&self.endpoint, response.metadata());
                 self.note_success();
                 Ok(response.into_inner())
             }
             Err(err) => {
-                if use_zstd && err.code() == tonic::Code::Unimplemented {
-                    forget_grpc_compression_support(&self.endpoint);
-                }
                 let mapped = self.map_tonic_status(route, err);
                 self.note_failure(route);
                 Err(mapped)
@@ -1046,42 +1027,6 @@ fn shared_raft_client(
     (Ok(raft_client(channel)), generation)
 }
 
-fn grpc_endpoint_accepts_zstd(endpoint: &str) -> bool {
-    GRPC_ZSTD_ENDPOINTS
-        .get_or_init(|| Mutex::new(BTreeSet::new()))
-        .lock()
-        .is_ok_and(|endpoints| endpoints.contains(endpoint))
-}
-
-fn observe_grpc_compression_support(endpoint: &str, metadata: &MetadataMap) {
-    let accepts_zstd = metadata
-        .get(RAFT_GRPC_ACCEPT_REQUEST_COMPRESSION)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|encoding| encoding.trim().eq_ignore_ascii_case("zstd"))
-        });
-    if !accepts_zstd {
-        return;
-    }
-    if let Ok(mut endpoints) = GRPC_ZSTD_ENDPOINTS
-        .get_or_init(|| Mutex::new(BTreeSet::new()))
-        .lock()
-    {
-        endpoints.insert(endpoint.to_owned());
-    }
-}
-
-fn forget_grpc_compression_support(endpoint: &str) {
-    if let Ok(mut endpoints) = GRPC_ZSTD_ENDPOINTS
-        .get_or_init(|| Mutex::new(BTreeSet::new()))
-        .lock()
-    {
-        endpoints.remove(endpoint);
-    }
-}
-
 /// Return the one healthy Append stream for this peer endpoint.
 ///
 /// The stream lifetime is intentionally independent of the unary channel
@@ -1105,7 +1050,7 @@ fn shared_append_session(
     }
 
     let (sender, receiver) = mpsc::unbounded_channel();
-    tokio::spawn(run_append_session(endpoint.to_owned(), client, receiver));
+    tokio::spawn(run_append_session(client, receiver));
     sessions.insert(endpoint.to_owned(), SharedAppendSession {
         sender: sender.clone(),
     });
@@ -1128,7 +1073,6 @@ fn collect_append_stream_frame(
 }
 
 async fn run_append_session(
-    endpoint: String,
     mut client: RaftClient,
     mut calls: mpsc::UnboundedReceiver<AppendStreamCall>,
 ) {
@@ -1141,7 +1085,6 @@ async fn run_append_session(
     .await;
     let mut responses = match response {
         Ok(Ok(response)) => {
-            observe_grpc_compression_support(&endpoint, response.metadata());
             GRPC_APPEND_STREAM_SESSIONS_OPENED.fetch_add(1, Ordering::Relaxed);
             response.into_inner()
         }
@@ -1376,6 +1319,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
 
 #[cfg(test)]
 mod reconnect_tests {
+    use std::collections::BTreeSet;
     use std::time::Duration;
 
     use openraft::Entry;
@@ -1518,32 +1462,6 @@ mod reconnect_tests {
                 .expect("serve test raft grpc");
         });
         (format!("http://{address}"), registry, task)
-    }
-
-    #[test]
-    fn compression_capability_is_learned_and_forgotten() {
-        let endpoint = "http://127.0.0.1:32199";
-        forget_grpc_compression_support(endpoint);
-        assert!(!grpc_endpoint_accepts_zstd(endpoint));
-
-        let response = raft_grpc_response(());
-        observe_grpc_compression_support(endpoint, response.metadata());
-        assert!(grpc_endpoint_accepts_zstd(endpoint));
-
-        forget_grpc_compression_support(endpoint);
-        assert!(!grpc_endpoint_accepts_zstd(endpoint));
-    }
-
-    #[test]
-    fn compression_capability_metadata_is_explicit() {
-        let response = raft_grpc_response(());
-        assert_eq!(
-            response
-                .metadata()
-                .get(RAFT_GRPC_ACCEPT_REQUEST_COMPRESSION)
-                .and_then(|value| value.to_str().ok()),
-            Some("zstd")
-        );
     }
 
     #[test]

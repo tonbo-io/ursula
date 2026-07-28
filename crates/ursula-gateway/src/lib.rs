@@ -111,9 +111,6 @@ pub struct GatewayConfig {
     /// Covers only response headers so SSE bodies stay open.
     pub response_header_timeout: Duration,
     pub connect_timeout: Duration,
-    /// Use cleartext HTTP/2 for gateway-to-Ursula traffic so concurrent
-    /// requests share multiplexed upstream connections.
-    pub upstream_http2_prior_knowledge: bool,
     pub max_request_body_bytes: usize,
     /// Raft topology used to share one learned leader across every stream in
     /// the same group. `None` preserves per-stream affinity for standalone
@@ -156,13 +153,9 @@ impl Gateway {
         let shard_map = config
             .raft_group_count
             .and_then(|group_count| StaticShardMap::new(1, group_count).ok());
-        let mut client_builder = reqwest::Client::builder()
+        let client = reqwest::Client::builder()
             .connect_timeout(config.connect_timeout)
-            .redirect(reqwest::redirect::Policy::none());
-        if config.upstream_http2_prior_knowledge {
-            client_builder = client_builder.http2_prior_knowledge();
-        }
-        let client = client_builder
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("static gateway reqwest client config should be valid");
         let response_header_timeout = config.response_header_timeout;

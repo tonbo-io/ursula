@@ -287,8 +287,6 @@ gateway:
   connectTimeoutSeconds: 5
   # Timeout for upstream response headers in seconds.
   responseHeaderTimeoutSeconds: 30
-  # Ursula nodes accept h2c; multiplex concurrent gateway traffic per upstream.
-  upstreamHttp2PriorKnowledge: false
   # Maximum request body bytes the gateway buffers for leader-redirect replay.
   maxRequestBodyBytes: 33554432
   # Maximum graceful shutdown drain time after SIGTERM, in seconds.
