@@ -26,10 +26,14 @@ message RaftRpcAckV1 {
 // every group. request_id is transport-local correlation only; it never enters
 // the replicated state machine or changes per-group ordering.
 message RaftAppendStreamRequest {
+  // Keep the former v2 batch field number so a 0.4 client can replicate to a
+  // 0.3.32 voter during a graceful mixed-version rollout. The 0.4 runtime has
+  // no single-item branch.
+  reserved 1, 2;
   // One peer stream drains already-queued OpenRaft Append RPCs from every
   // group into a transport frame. Items keep independent correlation ids and
   // per-group ordering.
-  repeated RaftAppendStreamRequestItem items = 1;
+  repeated RaftAppendStreamRequestItem items = 3;
 }
 
 message RaftAppendStreamRequestItem {
@@ -43,7 +47,10 @@ message RaftAppendStreamError {
 }
 
 message RaftAppendStreamResponse {
-  repeated RaftAppendStreamResponseItem items = 1;
+  // Field 4 was the 0.3.32 batch response. Preserving the number is sufficient
+  // for rolling interoperability without preserving its legacy code path.
+  reserved 1, 2, 3;
+  repeated RaftAppendStreamResponseItem items = 4;
 }
 
 message RaftAppendStreamResponseItem {
