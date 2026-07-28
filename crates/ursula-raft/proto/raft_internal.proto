@@ -25,40 +25,32 @@ message RaftRpcAckV1 {
 // A process-wide peer stream multiplexes independent OpenRaft Append RPCs from
 // every group. request_id is transport-local correlation only; it never enters
 // the replicated state machine or changes per-group ordering.
-message RaftAppendStreamRequestV1 {
-  // Legacy single-item fields retained for rolling compatibility with 0.3.31.
-  uint64 request_id = 1;
-  RaftRpcEnvelopeV1 envelope = 2;
-  // A v2-capable peer drains already-queued calls into one transport frame.
-  // Each item remains an independent OpenRaft RPC with its own correlation id.
-  repeated RaftAppendStreamRequestItemV1 batch = 3;
+message RaftAppendStreamRequest {
+  // One peer stream drains already-queued OpenRaft Append RPCs from every
+  // group into a transport frame. Items keep independent correlation ids and
+  // per-group ordering.
+  repeated RaftAppendStreamRequestItem items = 1;
 }
 
-message RaftAppendStreamRequestItemV1 {
+message RaftAppendStreamRequestItem {
   uint64 request_id = 1;
   RaftRpcEnvelopeV1 envelope = 2;
 }
 
-message RaftAppendStreamErrorV1 {
+message RaftAppendStreamError {
   int32 code = 1;
   string message = 2;
 }
 
-message RaftAppendStreamResponseV1 {
-  // Legacy single-item fields retained for rolling compatibility with 0.3.31.
-  uint64 request_id = 1;
-  oneof result {
-    RaftRpcAckV1 ack = 2;
-    RaftAppendStreamErrorV1 error = 3;
-  }
-  repeated RaftAppendStreamResponseItemV1 batch = 4;
+message RaftAppendStreamResponse {
+  repeated RaftAppendStreamResponseItem items = 1;
 }
 
-message RaftAppendStreamResponseItemV1 {
+message RaftAppendStreamResponseItem {
   uint64 request_id = 1;
   oneof result {
     RaftRpcAckV1 ack = 2;
-    RaftAppendStreamErrorV1 error = 3;
+    RaftAppendStreamError error = 3;
   }
 }
 
@@ -136,7 +128,7 @@ message GroupReadResponseV1 {
 
 service RaftInternal {
   rpc Append(RaftRpcEnvelopeV1) returns (RaftRpcAckV1);
-  rpc AppendStream(stream RaftAppendStreamRequestV1) returns (stream RaftAppendStreamResponseV1);
+  rpc AppendStream(stream RaftAppendStreamRequest) returns (stream RaftAppendStreamResponse);
   rpc Vote(RaftRpcEnvelopeV1) returns (RaftRpcAckV1);
   rpc FullSnapshot(RaftFullSnapshotRequestV1) returns (RaftFullSnapshotAckV1);
   rpc GroupWrite(GroupWriteRequestV1) returns (GroupWriteResponseV1);

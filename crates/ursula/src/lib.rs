@@ -636,7 +636,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for HttpRaftGrpcSer
 
     async fn append_stream(
         &self,
-        request: tonic::Request<tonic::Streaming<raft_internal_proto::RaftAppendStreamRequestV1>>,
+        request: tonic::Request<tonic::Streaming<raft_internal_proto::RaftAppendStreamRequest>>,
     ) -> Result<tonic::Response<Self::AppendStreamStream>, tonic::Status> {
         raft_internal_proto::raft_internal_server::RaftInternal::append_stream(&self.raft, request)
             .await
