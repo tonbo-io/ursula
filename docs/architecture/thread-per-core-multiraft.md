@@ -229,16 +229,7 @@ node 1 with three voters for every group, writes streams placed on all four
 groups through node 1, and waits until the replicated payloads are readable
 from every runtime.
 
-AppendEntries transport is multiplexed process-wide per peer. Every group's
-independent AppendEntries request enters one long-lived bidirectional gRPC
-stream. The sender drains calls that are already queued into a ZSTD-compressed
-frame of at most 32 items; it adds no batching delay. Each item keeps a
-transport-local request id and receives an independent result, so one group
-does not inherit another group's ordering, commit index, or acknowledgement.
-Vote and snapshot traffic remain unary. The unary Append server method remains
-only as the bounded upgrade bridge for a 0.3.32 voter contacting a 0.4 voter;
-the 0.4 client has one AppendStream path and carries no legacy single-item
-frame, capability probe, or unary fallback state.
+AppendEntries transport is multiplexed process-wide per peer. Every group's independent AppendEntries request enters one long-lived bidirectional gRPC stream. The sender drains calls that are already queued into a ZSTD-compressed frame of at most 32 items; it adds no batching delay. Each item keeps a transport-local request id and receives an independent result, so one group does not inherit another group's ordering, commit index, or acknowledgement. Vote and snapshot traffic remain unary. The unary Append server method remains only as the bounded upgrade bridge for a 0.3.32 voter contacting a 0.4 voter; the 0.4 client has one AppendStream path and carries no legacy single-item frame, capability probe, or unary fallback state.
 
 `ursula` now exposes this static cluster shape through the typed config file:
 `raft.node_id`, `[[raft.peers]]`, `raft.wal.backend`, and
