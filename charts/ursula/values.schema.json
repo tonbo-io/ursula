@@ -220,6 +220,11 @@
         "podLabels": { "type": "object", "additionalProperties": { "type": "string" } },
         "rustLog": { "type": "string" },
         "coreCount": { "type": "integer", "minimum": 1 },
+        "externalPayloadMinBytes": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Optional payload threshold in bytes for external cold-store staging. Null uses Ursula's built-in default."
+        },
         "extraArgs": { "type": "array", "items": { "type": "string" } },
         "extraEnv": { "type": "array", "items": { "type": "object" } },
         "extraEnvFrom": { "type": "array", "items": { "type": "object" } },

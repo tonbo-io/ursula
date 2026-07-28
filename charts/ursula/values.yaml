@@ -84,6 +84,9 @@ server:
   rustLog: "ursula=info,ursula_runtime=info,ursula_raft=info"
   # Number of Ursula runtime cores. Tune based on CPU requests/limits.
   coreCount: 4
+  # Optional payload threshold for staging records directly in cold storage.
+  # Leave null to use Ursula's built-in 1 MiB default.
+  externalPayloadMinBytes: null
   # Extra CLI args appended after the generated Ursula args.
   extraArgs: []
   # Extra container environment entries for Ursula.

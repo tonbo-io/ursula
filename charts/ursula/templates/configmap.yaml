@@ -85,6 +85,9 @@ data:
 
     [runtime]
     core_count = {{ .Values.server.coreCount }}
+{{- if not (eq .Values.server.externalPayloadMinBytes nil) }}
+    external_payload_min_size = "{{ .Values.server.externalPayloadMinBytes | int64 }}"
+{{- end }}
 
     [raft]
     group_count = {{ .Values.raft.groupCount }}
