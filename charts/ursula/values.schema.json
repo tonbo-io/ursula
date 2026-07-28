@@ -192,6 +192,11 @@
           },
           "required": ["client"]
         },
+        "adminListen": {
+          "type": "string",
+          "pattern": "^[^:]+:[0-9]+$",
+          "description": "Admin-plane listen address. Defaults to pod loopback; use a pod-reachable address only for a trusted in-cluster operator."
+        },
         "service": {
           "type": "object",
           "additionalProperties": false,
@@ -295,6 +300,7 @@
         "updateStrategy",
         "onDeleteMigration",
         "ports",
+        "adminListen",
         "service",
         "headlessService",
         "podAnnotations",
