@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,6 +41,7 @@ pub async fn run(args: GatewayArgs) -> Result<(), Box<dyn std::error::Error>> {
         max_request_body_bytes: args.max_request_body_bytes,
         raft_group_count: args.raft_group_count.map(NonZeroUsize::get),
         cors_allowed_origins: args.cors_allowed_origin.clone(),
+        usage_chunk_bytes: args.usage_chunk_bytes.map(NonZeroU64::get),
     };
 
     let mut gateway = match installed_access_control {
@@ -201,6 +203,18 @@ pub struct GatewayArgs {
     /// Interval between usage exports, in seconds.
     #[arg(long, default_value_t = 30, requires = "usage_log")]
     usage_flush_secs: u64,
+
+    /// Count append bytes in units of this size, as `ceil(bytes / unit)` with
+    /// a minimum of one, and report the sum as `chunks`. Unset leaves that
+    /// counter at zero.
+    ///
+    /// For deployments that charge per write unit rather than per byte. The
+    /// size is a pricing choice — 10 KB and 25 KB are both in use — so this
+    /// crate does not pick one. A batched append costs proportionally less
+    /// than the same records sent one at a time, which is the point: batching
+    /// is cheaper to serve.
+    #[arg(long, value_name = "BYTES", requires = "usage_log")]
+    usage_chunk_bytes: Option<NonZeroU64>,
 
     /// Origin allowed to read across origins. Repeat per origin, or pass `*`.
     /// Unset disables CORS, which leaves anonymous `public_read` buckets

@@ -121,6 +121,15 @@ pub struct GatewayConfig {
     /// it. Anonymous `public_read` buckets are unreachable from browser
     /// JavaScript until this is set.
     pub cors_allowed_origins: Vec<String>,
+    /// Unit size for [`UsageCounters::chunks`]. `None` leaves the counter at
+    /// zero, which is right for any deployment not billing per unit.
+    ///
+    /// An append is counted as `ceil(bytes / unit)`, never below one, so a
+    /// batched write costs proportionally less than the same records sent
+    /// individually. That is not an accident of the accounting: batching is
+    /// cheaper to serve, and a unit large enough to hold several records is
+    /// how the price says so.
+    pub usage_chunk_bytes: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -288,6 +297,15 @@ impl Gateway {
                         body_bytes.len() as u64
                     } else {
                         0
+                    },
+                    // Only appends carry a unit count. A read costs bytes out,
+                    // which `response_bytes` already carries, and charging it a
+                    // write unit would double-count the same request.
+                    chunks: match (ctx.class, self.config.usage_chunk_bytes) {
+                        (UsageClass::Append, Some(unit)) => {
+                            crate::usage::chunks_for(body_bytes.len() as u64, unit)
+                        }
+                        _ => 0,
                     },
                     response_bytes: 0,
                 })
@@ -727,12 +745,18 @@ struct EgressMeter {
     key: UsageKey,
     request_bytes: u64,
     response_bytes: u64,
+    chunks: u64,
 }
 
 impl Drop for EgressMeter {
     fn drop(&mut self) {
-        self.collector
-            .record(self.key.clone(), 1, self.request_bytes, self.response_bytes);
+        self.collector.record(
+            self.key.clone(),
+            1,
+            self.request_bytes,
+            self.response_bytes,
+            self.chunks,
+        );
     }
 }
 

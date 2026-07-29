@@ -129,6 +129,7 @@ fn test_config(upstreams: Vec<String>) -> GatewayConfig {
         max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
         raft_group_count: None,
         cors_allowed_origins: Vec::new(),
+        usage_chunk_bytes: None,
     }
 }
 
@@ -1189,16 +1190,37 @@ mod admission_and_usage {
     }
 
     fn quota_gateway(upstream_url: &str, collector: Arc<UsageCollector>) -> Gateway {
+        chunked_quota_gateway(upstream_url, collector, None)
+    }
+
+    fn chunked_quota_gateway(
+        upstream_url: &str,
+        collector: Arc<UsageCollector>,
+        usage_chunk_bytes: Option<u64>,
+    ) -> Gateway {
+        metered_gateway(upstream_url, collector, usage_chunk_bytes).with_quota_provider(Arc::new(
+            StaticQuotaProvider::from_toml_str(QUOTAS).expect("parse quotas"),
+        ))
+    }
+
+    /// Access control and usage, no quotas. Counting units needs several
+    /// appends of differing sizes, which the shared quota policy's two
+    /// requests per second and eight-byte body would reject before the meter
+    /// ever saw them.
+    fn metered_gateway(
+        upstream_url: &str,
+        collector: Arc<UsageCollector>,
+        usage_chunk_bytes: Option<u64>,
+    ) -> Gateway {
+        let mut config = test_config(vec![upstream_url.to_owned()]);
+        config.usage_chunk_bytes = usage_chunk_bytes;
         Gateway::with_access_control(
-            test_config(vec![upstream_url.to_owned()]),
+            config,
             AccessControl::new(
                 Arc::new(FixedPrincipalResolver::valid()),
                 Arc::new(StaticPolicyAuthorizer::from_toml_str(POLICY).expect("parse policy")),
             ),
         )
-        .with_quota_provider(Arc::new(
-            StaticQuotaProvider::from_toml_str(QUOTAS).expect("parse quotas"),
-        ))
         .with_usage_collector(collector)
     }
 
@@ -1297,6 +1319,51 @@ mod admission_and_usage {
             .find(|record| record.key.class == UsageClass::Read)
             .expect("read usage record");
         assert_eq!(read_record.counters.response_bytes, 10);
+        // No unit size configured, so nothing to count.
+        assert_eq!(append_record.counters.chunks, 0);
+        assert_eq!(read_record.counters.chunks, 0);
+    }
+
+    #[tokio::test]
+    async fn appends_count_in_units_and_reads_never_do() {
+        let upstream =
+            spawn_upstream(Router::new().route("/tenant-a/orders", any(|| async { "0123456789" })))
+                .await;
+        let collector = UsageCollector::new();
+        // A four-byte unit keeps the arithmetic legible: 8 bytes is exactly
+        // two units, 9 is three, and an empty append is still one.
+        let gateway = metered_gateway(&upstream.url, Arc::clone(&collector), Some(4));
+
+        for body in ["12345678", "123456789", ""] {
+            let append = send(&gateway, "POST", "/tenant-a/orders", body).await;
+            assert_eq!(append.status(), StatusCode::OK);
+            let _ = append.into_body().collect().await.expect("append body");
+        }
+        let read = send(&gateway, "GET", "/tenant-a/orders", "").await;
+        let _ = read.into_body().collect().await.expect("read body");
+
+        let sink = CapturingSink {
+            batches: Mutex::new(Vec::new()),
+        };
+        crate::usage::flush(&collector, &sink).await;
+        let batches = sink.batches.lock().expect("batches lock");
+        let records = &batches[0].records;
+
+        let append_record = records
+            .iter()
+            .find(|record| record.key.class == UsageClass::Append)
+            .expect("append usage record");
+        assert_eq!(append_record.counters.requests, 3);
+        assert_eq!(append_record.counters.request_bytes, 17);
+        assert_eq!(append_record.counters.chunks, 2 + 3 + 1);
+
+        // A read already pays through `response_bytes`; charging it a write
+        // unit as well would bill the same request twice.
+        let read_record = records
+            .iter()
+            .find(|record| record.key.class == UsageClass::Read)
+            .expect("read usage record");
+        assert_eq!(read_record.counters.chunks, 0);
     }
 }
 
