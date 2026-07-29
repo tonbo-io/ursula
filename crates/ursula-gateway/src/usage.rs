@@ -59,6 +59,19 @@ pub struct UsageCounters {
     pub requests: u64,
     pub request_bytes: u64,
     pub response_bytes: u64,
+    /// Append bytes counted in fixed-size units, `ceil(bytes / unit)` with a
+    /// minimum of one, summed per request. Zero unless the gateway was given a
+    /// unit size.
+    ///
+    /// Recorded per request rather than derived later because it cannot be
+    /// derived later: two appends of 5 KiB and 25 KiB and two of 10 KiB and
+    /// 20 KiB agree on both `requests` and `request_bytes` while owing four
+    /// units and three. A biller that charges per unit therefore has to be
+    /// given the sum, not the ingredients.
+    ///
+    /// The unit is an operator's choice, not this crate's: 10 KB and 25 KB are
+    /// both in use in the wild.
+    pub chunks: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -93,6 +106,17 @@ pub trait UsageSink: Send + Sync {
 #[derive(Debug, thiserror::Error)]
 #[error("usage sink unavailable: {0}")]
 pub struct UsageSinkError(pub String);
+
+/// Counts `bytes` in units of `unit`, rounding up, never below one.
+///
+/// An empty request still costs a unit: the floor is what makes the count a
+/// billable quantity rather than a byte total by another name.
+pub fn chunks_for(bytes: u64, unit: u64) -> u64 {
+    if unit == 0 {
+        return 0;
+    }
+    bytes.div_ceil(unit).max(1)
+}
 
 /// Appends each batch as one JSON line. The self-hosted default: cheap,
 /// greppable, and a workable ingestion point for an external biller.
@@ -151,7 +175,14 @@ impl UsageCollector {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub fn record(&self, key: UsageKey, requests: u64, request_bytes: u64, response_bytes: u64) {
+    pub fn record(
+        &self,
+        key: UsageKey,
+        requests: u64,
+        request_bytes: u64,
+        response_bytes: u64,
+        chunks: u64,
+    ) {
         let now = unix_time_ms();
         let mut state = self.lock();
         state.window_start_unix_ms.get_or_insert(now);
@@ -159,6 +190,7 @@ impl UsageCollector {
         counters.requests = counters.requests.saturating_add(requests);
         counters.request_bytes = counters.request_bytes.saturating_add(request_bytes);
         counters.response_bytes = counters.response_bytes.saturating_add(response_bytes);
+        counters.chunks = counters.chunks.saturating_add(chunks);
     }
 
     /// Moves the current window into the pending queue. Returns whether any
@@ -224,6 +256,7 @@ fn merge_oldest(pending: &mut VecDeque<UsageBatch>) {
         counters.response_bytes = counters
             .response_bytes
             .saturating_add(record.counters.response_bytes);
+        counters.chunks = counters.chunks.saturating_add(record.counters.chunks);
     }
     next.records = merged
         .into_iter()
@@ -327,12 +360,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn chunks_round_up_and_never_reach_zero() {
+        assert_eq!(chunks_for(0, 10_000), 1);
+        assert_eq!(chunks_for(1, 10_000), 1);
+        assert_eq!(chunks_for(10_000, 10_000), 1);
+        assert_eq!(chunks_for(10_001, 10_000), 2);
+        assert_eq!(chunks_for(1_000_000, 10_000), 100);
+        // No unit configured is not a free deployment, it is one that does not
+        // count units at all.
+        assert_eq!(chunks_for(10_001, 0), 0);
+    }
+
+    #[test]
+    fn the_unit_count_is_not_recoverable_from_the_aggregate() {
+        // The reason this counter has to exist. Both tenants issue two appends
+        // totalling 30 KiB, so `requests` and `request_bytes` cannot tell them
+        // apart, and they owe different amounts.
+        let unit = 10 * 1024;
+        let split = chunks_for(5 * 1024, unit) + chunks_for(25 * 1024, unit);
+        let even = chunks_for(10 * 1024, unit) + chunks_for(20 * 1024, unit);
+
+        assert_eq!(split, 4);
+        assert_eq!(even, 3);
+    }
+
+    #[tokio::test]
+    async fn chunks_accumulate_per_key_and_survive_merging() {
+        let collector = UsageCollector::new();
+        let unit = 10 * 1024;
+        collector.record(
+            key("tenant-a", UsageClass::Append),
+            1,
+            5 * 1024,
+            0,
+            chunks_for(5 * 1024, unit),
+        );
+        collector.record(
+            key("tenant-a", UsageClass::Append),
+            1,
+            25 * 1024,
+            0,
+            chunks_for(25 * 1024, unit),
+        );
+
+        let sink = FlakySink::new(true);
+        flush(&collector, &sink).await;
+        let batches = sink.exported.lock().expect("exported lock").clone();
+        let record = batches[0]
+            .records
+            .iter()
+            .find(|record| record.key.class == UsageClass::Append)
+            .expect("append record");
+
+        assert_eq!(record.counters.requests, 2);
+        assert_eq!(record.counters.request_bytes, 30 * 1024);
+        assert_eq!(record.counters.chunks, 4);
+    }
+
     #[tokio::test]
     async fn counters_aggregate_by_key_and_drain_into_sequenced_batches() {
         let collector = UsageCollector::new();
-        collector.record(key("tenant-a", UsageClass::Append), 1, 100, 0);
-        collector.record(key("tenant-a", UsageClass::Append), 1, 50, 0);
-        collector.record(key("tenant-a", UsageClass::Read), 1, 0, 900);
+        collector.record(key("tenant-a", UsageClass::Append), 1, 100, 0, 0);
+        collector.record(key("tenant-a", UsageClass::Append), 1, 50, 0, 0);
+        collector.record(key("tenant-a", UsageClass::Read), 1, 0, 900, 0);
 
         let sink = FlakySink::new(true);
         flush(&collector, &sink).await;
@@ -356,11 +447,11 @@ mod tests {
         let collector = UsageCollector::new();
         let sink = FlakySink::new(false);
 
-        collector.record(key("tenant-a", UsageClass::Append), 1, 10, 0);
+        collector.record(key("tenant-a", UsageClass::Append), 1, 10, 0, 0);
         flush(&collector, &sink).await;
         assert!(sink.exported.lock().expect("lock").is_empty());
 
-        collector.record(key("tenant-a", UsageClass::Append), 1, 20, 0);
+        collector.record(key("tenant-a", UsageClass::Append), 1, 20, 0, 0);
         sink.healthy.store(true, Ordering::Relaxed);
         flush(&collector, &sink).await;
 
@@ -380,7 +471,7 @@ mod tests {
     async fn overflow_merges_batches_without_losing_counts() {
         let collector = UsageCollector::new();
         for _ in 0..(MAX_PENDING_BATCHES + 8) {
-            collector.record(key("tenant-a", UsageClass::Append), 1, 1, 0);
+            collector.record(key("tenant-a", UsageClass::Append), 1, 1, 0, 0);
             collector.rotate();
         }
         let pending_len = collector.lock().pending.len();
@@ -403,7 +494,7 @@ mod tests {
         let path = dir.path().join("usage.jsonl");
         let sink = JsonlUsageSink::create(&path).expect("create sink");
         let collector = UsageCollector::new();
-        collector.record(key("tenant-a", UsageClass::Read), 1, 0, 42);
+        collector.record(key("tenant-a", UsageClass::Read), 1, 0, 42, 0);
         flush(&collector, &sink).await;
 
         let contents = std::fs::read_to_string(&path).expect("read usage log");
