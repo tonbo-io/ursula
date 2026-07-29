@@ -73,6 +73,7 @@ pub use engine::GroupAdvanceRetentionFuture;
 pub use engine::GroupAppendBatchFuture;
 pub use engine::GroupAppendBatchResponse;
 pub use engine::GroupAppendFuture;
+pub use engine::GroupAppendManyFuture;
 pub use engine::GroupBootstrapStreamFuture;
 pub use engine::GroupBucketUsageFuture;
 pub use engine::GroupCloseStreamFuture;

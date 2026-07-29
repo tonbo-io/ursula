@@ -35,6 +35,8 @@ use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::GroupSnapshot;
+use ursula_runtime::GroupWriteCommand;
+use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::HeadStreamResponse;
 use ursula_runtime::InMemoryGroupEngine;
@@ -444,6 +446,46 @@ impl RaftGroupStateMachine {
             u64::try_from(request.payload.len()).expect("payload len fits u64"),
         )?;
         Ok(())
+    }
+
+    pub async fn plan_append_many_cold_admission(
+        &mut self,
+        requests: Vec<AppendRequest>,
+        placement: ShardPlacement,
+        admission: ColdWriteAdmission,
+    ) -> Result<Vec<Result<(), GroupEngineError>>, GroupEngineError> {
+        let mut preview = self.engine.clone();
+        let mut plan = Vec::with_capacity(requests.len());
+        for request in requests {
+            let mut candidate = preview.clone();
+            let response = candidate
+                .apply_committed_write(GroupWriteCommand::from(request.clone()), placement);
+            let response = match response {
+                Ok(GroupWriteResponse::Append(response)) => response,
+                Ok(other) => {
+                    return Err(GroupEngineError::new(format!(
+                        "unexpected append-many preview response: {other:?}"
+                    )));
+                }
+                Err(err) => {
+                    plan.push(Err(err));
+                    continue;
+                }
+            };
+            if !response.deduplicated
+                && let Err(err) = preview.check_cold_write_admission_bytes(
+                    &request.stream_id,
+                    admission,
+                    request.payload_len(),
+                )
+            {
+                plan.push(Err(err));
+                continue;
+            }
+            preview = candidate;
+            plan.push(Ok(()));
+        }
+        Ok(plan)
     }
 
     pub async fn check_append_batch_cold_admission(

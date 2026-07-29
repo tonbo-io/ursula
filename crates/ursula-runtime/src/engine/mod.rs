@@ -67,6 +67,13 @@ use crate::request::UpdateStreamAttrsResponse;
 
 pub type GroupAppendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AppendResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupAppendManyFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Vec<Result<AppendResponse, GroupEngineError>>, GroupEngineError>>
+            + Send
+            + 'a,
+    >,
+>;
 pub type GroupAppendBatchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<GroupAppendBatchResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupFlushColdFuture<'a> =
@@ -413,6 +420,21 @@ pub trait GroupEngine: Send + 'static {
         placement: ShardPlacement,
         admission: ColdWriteAdmission,
     ) -> GroupAppendFuture<'a>;
+
+    fn append_many<'a>(
+        &'a mut self,
+        requests: Vec<AppendRequest>,
+        placement: ShardPlacement,
+        admission: ColdWriteAdmission,
+    ) -> GroupAppendManyFuture<'a> {
+        Box::pin(async move {
+            let mut responses = Vec::with_capacity(requests.len());
+            for request in requests {
+                responses.push(self.append(request, placement, admission).await);
+            }
+            Ok(responses)
+        })
+    }
 
     fn append_external<'a>(
         &'a mut self,

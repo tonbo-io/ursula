@@ -24,6 +24,7 @@ use ursula_runtime::AdvanceRetentionRequest;
 use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
+use ursula_runtime::AppendResponse;
 use ursula_runtime::BootstrapStreamRequest;
 use ursula_runtime::CloseStreamRequest;
 use ursula_runtime::ColdIndexPageCache;
@@ -41,6 +42,7 @@ use ursula_runtime::GroupAckColdGcFuture;
 use ursula_runtime::GroupAdvanceRetentionFuture;
 use ursula_runtime::GroupAppendBatchFuture;
 use ursula_runtime::GroupAppendFuture;
+use ursula_runtime::GroupAppendManyFuture;
 use ursula_runtime::GroupBootstrapStreamFuture;
 use ursula_runtime::GroupBucketUsageFuture;
 use ursula_runtime::GroupCloseStreamFuture;
@@ -125,6 +127,26 @@ pub(crate) fn should_forward_stale_follower_read_error(
             error.code(),
             Some(StreamErrorCode::InvalidRecordBoundaries | StreamErrorCode::StreamNotFound)
         )
+}
+
+fn append_many_responses(
+    response: GroupWriteResponse,
+) -> Result<Vec<Result<AppendResponse, GroupEngineError>>, GroupEngineError> {
+    let GroupWriteResponse::Batch(responses) = response else {
+        return Err(GroupEngineError::new(format!(
+            "unexpected append-many response: {response:?}"
+        )));
+    };
+    Ok(responses
+        .into_iter()
+        .map(|response| match response {
+            Ok(GroupWriteResponse::Append(response)) => Ok(response),
+            Ok(other) => Err(GroupEngineError::new(format!(
+                "unexpected append-many item response: {other:?}"
+            ))),
+            Err(err) => Err(err),
+        })
+        .collect())
 }
 
 impl RaftGroupEngine {
@@ -1280,6 +1302,85 @@ impl GroupEngine for RaftGroupEngine {
                     "unexpected append write response: {other:?}"
                 ))),
             }
+        })
+    }
+
+    fn append_many<'a>(
+        &'a mut self,
+        requests: Vec<AppendRequest>,
+        placement: ShardPlacement,
+        admission: ColdWriteAdmission,
+    ) -> GroupAppendManyFuture<'a> {
+        Box::pin(async move {
+            if requests.is_empty() {
+                return Ok(Vec::new());
+            }
+            let forwarded_command = GroupWriteCommand::Batch {
+                commands: requests.iter().cloned().map(StreamCommand::from).collect(),
+            };
+            if let Some(response) = self
+                .forward_write_to_leader_if_follower(forwarded_command)
+                .await?
+            {
+                return append_many_responses(response);
+            }
+            let plan = if admission.max_hot_bytes_per_group.is_some() {
+                self.with_state_machine({
+                    let requests = requests.clone();
+                    move |state_machine| {
+                        Box::pin(async move {
+                            state_machine
+                                .plan_append_many_cold_admission(requests, placement, admission)
+                                .await
+                        })
+                    }
+                })
+                .await??
+            } else {
+                (0..requests.len()).map(|_| Ok(())).collect()
+            };
+            let commands = requests
+                .into_iter()
+                .zip(&plan)
+                .filter_map(|(request, planned)| {
+                    planned.is_ok().then(|| StreamCommand::from(request))
+                })
+                .collect::<Vec<_>>();
+            if commands.is_empty() {
+                return Ok(plan
+                    .into_iter()
+                    .map(|planned| {
+                        planned.and_then(|()| {
+                            Err(GroupEngineError::new(
+                                "append-many admission plan lost a successful command",
+                            ))
+                        })
+                    })
+                    .collect());
+            }
+            let command = GroupWriteCommand::Batch { commands };
+            let mut responses = self.write_commands(vec![command]).await?;
+            let response = responses.pop().ok_or_else(|| {
+                GroupEngineError::new("OpenRaft append many returned no response")
+            })?;
+            let mut committed = append_many_responses(response?)?.into_iter();
+            let merged = plan
+                .into_iter()
+                .map(|planned| match planned {
+                    Ok(()) => committed.next().unwrap_or_else(|| {
+                        Err(GroupEngineError::new(
+                            "append-many response omitted a successful command",
+                        ))
+                    }),
+                    Err(err) => Err(err),
+                })
+                .collect::<Vec<_>>();
+            if committed.next().is_some() {
+                return Err(GroupEngineError::new(
+                    "append-many response included an unexpected command",
+                ));
+            }
+            Ok(merged)
         })
     }
 

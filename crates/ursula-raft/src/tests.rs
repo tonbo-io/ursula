@@ -2042,6 +2042,148 @@ async fn raft_group_engine_cold_admission_coalesces_append_batch_many_into_one_r
     engine.shutdown().await.expect("shutdown raft group engine");
 }
 
+#[tokio::test]
+async fn raft_group_engine_coalesces_standard_appends_into_one_raft_entry() {
+    let mut engine = RaftGroupEngine::new_single_node(placement())
+        .await
+        .expect("create raft group engine");
+    let stream_id = bsid("raft-group-engine-append-many");
+
+    engine
+        .create_stream(
+            CreateStreamRequest::new(stream_id.clone(), "application/octet-stream"),
+            placement(),
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("create stream");
+    let before_batch_log_index = engine
+        .raft_handle()
+        .metrics()
+        .borrow_watched()
+        .last_log_index
+        .expect("create stream should append a raft log entry");
+
+    let responses = engine
+        .append_many(
+            vec![
+                AppendRequest::from_bytes(stream_id.clone(), b"ab".as_slice()),
+                AppendRequest::from_bytes(stream_id.clone(), b"cd".as_slice()),
+                AppendRequest::from_bytes(stream_id.clone(), b"ef".as_slice()),
+            ],
+            placement(),
+            ColdWriteAdmission {
+                max_hot_bytes_per_group: Some(1024 * 1024),
+            },
+        )
+        .await
+        .expect("append many with cold admission");
+
+    assert_eq!(responses.len(), 3);
+    for (index, response) in responses.into_iter().enumerate() {
+        let response = response.expect("append response");
+        assert_eq!(response.start_offset, u64::try_from(index * 2).unwrap());
+    }
+
+    let after_batch_log_index = engine
+        .raft_handle()
+        .metrics()
+        .borrow_watched()
+        .last_log_index
+        .expect("append many should append a raft log entry");
+    assert_eq!(after_batch_log_index, before_batch_log_index + 1);
+
+    let read = engine
+        .read_stream(read_req(stream_id, 16), placement())
+        .await
+        .expect("read coalesced appends");
+    assert_eq!(read.payload, b"abcdef");
+    engine.shutdown().await.expect("shutdown raft group engine");
+}
+
+#[tokio::test]
+async fn raft_group_engine_append_many_preserves_independent_guards() {
+    let mut engine = RaftGroupEngine::new_single_node(placement())
+        .await
+        .expect("create raft group engine");
+    let first_stream = bsid("raft-append-many-guards-a");
+    let second_stream = bsid("raft-append-many-guards-b");
+    for stream_id in [&first_stream, &second_stream] {
+        engine
+            .create_stream(
+                CreateStreamRequest::new(stream_id.clone(), "application/json"),
+                placement(),
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("create stream");
+    }
+
+    let producer = ProducerRequest {
+        producer_id: "writer-a".to_owned(),
+        producer_epoch: 0,
+        producer_seq: 0,
+    };
+    let mut initial = AppendRequest::from_bytes(first_stream.clone(), b"{\"id\":1}\n".as_slice());
+    initial.content_type = "application/json".to_owned();
+    initial.producer = Some(producer.clone());
+    engine
+        .append(initial.clone(), placement(), ColdWriteAdmission::default())
+        .await
+        .expect("initial producer append");
+
+    let mut stale_match =
+        AppendRequest::from_bytes(first_stream.clone(), b"{\"id\":2}\n".as_slice());
+    stale_match.content_type = "application/json".to_owned();
+    stale_match.record_match = Some(0);
+    let mut independent =
+        AppendRequest::from_bytes(second_stream.clone(), b"{\"id\":3}\n".as_slice());
+    independent.content_type = "application/json".to_owned();
+    let responses = engine
+        .append_many(
+            vec![initial, stale_match, independent],
+            placement(),
+            ColdWriteAdmission {
+                max_hot_bytes_per_group: Some(18),
+            },
+        )
+        .await
+        .expect("append many");
+
+    assert_eq!(responses.len(), 3);
+    assert!(
+        responses[0]
+            .as_ref()
+            .expect("deduplicated retry")
+            .deduplicated
+    );
+    assert_eq!(
+        responses[1]
+            .as_ref()
+            .expect_err("stale record match")
+            .code(),
+        Some(StreamErrorCode::RecordPreconditionFailed)
+    );
+    assert!(
+        !responses[2]
+            .as_ref()
+            .expect("independent append")
+            .deduplicated
+    );
+
+    let first = engine
+        .read_stream(read_req(first_stream, 64), placement())
+        .await
+        .expect("read first stream");
+    assert_eq!(first.payload, b"{\"id\":1}\n");
+    let second = engine
+        .read_stream(read_req(second_stream, 64), placement())
+        .await
+        .expect("read second stream");
+    assert_eq!(second.payload, b"{\"id\":3}\n");
+    engine.shutdown().await.expect("shutdown raft group engine");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raft_metrics_count_logical_commands_inside_coalesced_batches() {
     let runtime = ShardRuntime::spawn_with_engine_factory(
@@ -2117,6 +2259,58 @@ async fn raft_metrics_count_logical_commands_inside_coalesced_batches() {
         .collect::<Vec<_>>();
     chunks.sort();
     assert_eq!(chunks, vec![b"ab".to_vec(), b"cd".to_vec(), b"ef".to_vec()]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raft_runtime_coalesces_concurrent_standard_appends() {
+    const APPENDS: usize = 64;
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        RuntimeConfig::new(1, 1).with_cold_max_hot_bytes_per_group(Some(1024 * 1024)),
+        RaftGroupEngineFactory,
+    )
+    .expect("spawn raft runtime");
+    let stream_id = bsid("raft-standard-append-coalescing");
+
+    runtime
+        .create_stream(create_req(stream_id.clone()))
+        .await
+        .expect("create stream");
+    let before = runtime.metrics().snapshot();
+
+    let tasks = (0..APPENDS)
+        .map(|index| {
+            let runtime = runtime.clone();
+            let stream_id = stream_id.clone();
+            tokio::spawn(async move {
+                runtime
+                    .append(AppendRequest::from_bytes(stream_id, vec![
+                        u8::try_from(index).unwrap(),
+                    ]))
+                    .await
+                    .expect("standard append")
+            })
+        })
+        .collect::<Vec<_>>();
+    for task in tasks {
+        task.await.expect("append task");
+    }
+
+    let after = runtime.metrics().snapshot();
+    let batches = after.raft_write_many_batches - before.raft_write_many_batches;
+    let commands = after.raft_write_many_commands - before.raft_write_many_commands;
+    let logical = after.raft_write_many_logical_commands - before.raft_write_many_logical_commands;
+    assert_eq!(logical, u64::try_from(APPENDS).unwrap());
+    assert_eq!(commands, batches);
+    assert!(
+        commands < logical,
+        "concurrent standard appends should share at least one raft entry: batches={batches}, commands={commands}, logical={logical}"
+    );
+
+    let read = runtime
+        .read_stream(read_req(stream_id, APPENDS))
+        .await
+        .expect("read standard appends");
+    assert_eq!(read.payload.len(), APPENDS);
 }
 
 #[tokio::test]

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -21,9 +22,11 @@ use crate::engine::GroupEngineMetrics;
 use crate::engine::GroupWriteResponse;
 use crate::error::RuntimeError;
 use crate::group_actor::AppendBatchEntry;
+use crate::group_actor::AppendEntry;
 use crate::group_actor::GroupActor;
 use crate::group_actor::GroupCommand;
 use crate::group_actor::GroupMailbox;
+use crate::group_actor::PendingAppend;
 use crate::group_actor::PendingAppendBatch;
 use crate::metrics::RuntimeMetricsInner;
 use crate::metrics::append_batch_payload_bytes;
@@ -1286,61 +1289,6 @@ impl CoreWorker {
         Ok(response)
     }
 
-    #[tracing::instrument(
-        name = "core.append",
-        level = "debug",
-        skip_all,
-        fields(
-            group = placement.raft_group_id.0,
-            bucket = %request.stream_id.bucket_id,
-            stream = %request.stream_id.stream_id,
-        ),
-    )]
-    pub(crate) async fn commit_append(
-        group: &mut Box<dyn GroupEngine>,
-        metrics: Arc<RuntimeMetricsInner>,
-        request: AppendRequest,
-        placement: ShardPlacement,
-        admission: ColdWriteAdmission,
-    ) -> Result<AppendResponse, RuntimeError> {
-        let incoming_bytes = request.payload_len();
-        let started_at = Instant::now();
-        let exec_started_at = Instant::now();
-        let response = group
-            .append(request, placement, admission)
-            .await
-            .map_err(|err| {
-                record_cold_backpressure_error(
-                    &metrics,
-                    placement,
-                    incoming_bytes,
-                    admission,
-                    &err,
-                );
-                RuntimeError::group_engine(placement, err)
-            })?;
-        metrics.record_group_engine_exec(
-            placement.core_id,
-            placement.raft_group_id,
-            elapsed_ns(exec_started_at),
-        );
-
-        if !response.deduplicated {
-            metrics.record_append(placement.core_id, placement.raft_group_id);
-            metrics.record_applied_mutation(
-                placement.core_id,
-                placement.raft_group_id,
-                elapsed_ns(started_at),
-            );
-            metrics.record_cold_hot_backlog(
-                placement.raft_group_id,
-                response.stream_hot_bytes,
-                response.group_hot_bytes,
-            );
-        }
-        Ok(response)
-    }
-
     pub(crate) async fn finish_append(
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,
@@ -1364,6 +1312,126 @@ impl CoreWorker {
             placement.raft_group_id,
             elapsed_ns(started_at),
         );
+    }
+
+    pub(crate) fn prepare_append_requests(
+        batch: Vec<AppendEntry>,
+    ) -> (Vec<AppendRequest>, Vec<PendingAppend>) {
+        let mut requests = Vec::with_capacity(batch.len());
+        let mut pending = Vec::with_capacity(batch.len());
+        for (request, response_tx, raft_uncommitted) in batch {
+            pending.push(PendingAppend {
+                stream_id: request.stream_id.clone(),
+                incoming_bytes: request.payload_len(),
+                response_tx,
+                started_at: Instant::now(),
+                raft_uncommitted,
+            });
+            requests.push(request);
+        }
+        (requests, pending)
+    }
+
+    pub(crate) async fn apply_prepared_append_requests(
+        group: &mut Box<dyn GroupEngine>,
+        runtime: AppendBatchRuntime,
+        read_watchers: &mut ReadWatchers,
+        pending: Vec<PendingAppend>,
+        requests: Vec<AppendRequest>,
+        admission: ColdWriteAdmission,
+    ) {
+        let exec_started_at = Instant::now();
+        let responses = group
+            .append_many(requests, runtime.placement, admission)
+            .await
+            .map_err(|err| RuntimeError::group_engine(runtime.placement, err));
+        runtime.metrics.record_group_engine_exec(
+            runtime.placement.core_id,
+            runtime.placement.raft_group_id,
+            elapsed_ns(exec_started_at),
+        );
+        let placement = runtime.placement;
+        let responses = match responses {
+            Ok(responses) => responses,
+            Err(err) => {
+                for pending in pending {
+                    if let RuntimeError::GroupEngine { error, .. } = &err {
+                        record_cold_backpressure_error(
+                            &runtime.metrics,
+                            placement,
+                            pending.incoming_bytes,
+                            admission,
+                            error,
+                        );
+                    }
+                    let _ = pending.response_tx.send(Err(err.clone()));
+                }
+                return;
+            }
+        };
+        if responses.len() != pending.len() {
+            let err = RuntimeError::GroupEngine {
+                core_id: placement.core_id,
+                raft_group_id: placement.raft_group_id,
+                error: GroupEngineError::new(format!(
+                    "coalesced append response count {} does not match request count {}",
+                    responses.len(),
+                    pending.len()
+                )),
+            };
+            for pending in pending {
+                let _ = pending.response_tx.send(Err(err.clone()));
+            }
+            return;
+        }
+
+        let mut changed_streams = HashSet::new();
+        for (pending, response) in pending.into_iter().zip(responses) {
+            match response {
+                Ok(response) => {
+                    if !response.deduplicated {
+                        runtime
+                            .metrics
+                            .record_append(placement.core_id, placement.raft_group_id);
+                        runtime.metrics.record_applied_mutation(
+                            placement.core_id,
+                            placement.raft_group_id,
+                            elapsed_ns(pending.started_at),
+                        );
+                        runtime.metrics.record_cold_hot_backlog(
+                            placement.raft_group_id,
+                            response.stream_hot_bytes,
+                            response.group_hot_bytes,
+                        );
+                        changed_streams.insert(pending.stream_id.clone());
+                    }
+                    let _ = pending.response_tx.send(Ok(response));
+                }
+                Err(error) => {
+                    record_cold_backpressure_error(
+                        &runtime.metrics,
+                        placement,
+                        pending.incoming_bytes,
+                        admission,
+                        &error,
+                    );
+                    let _ = pending
+                        .response_tx
+                        .send(Err(RuntimeError::group_engine(placement, error)));
+                }
+            }
+        }
+        for stream_id in changed_streams {
+            Self::finish_append(
+                group,
+                runtime.metrics.clone(),
+                runtime.read_materialization.clone(),
+                read_watchers,
+                stream_id,
+                placement,
+            )
+            .await;
+        }
     }
 
     #[tracing::instrument(
