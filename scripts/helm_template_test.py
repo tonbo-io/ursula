@@ -279,6 +279,33 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
         self.assertEqual(parsed["storage"]["cold"]["max_hot_size_per_group"], "0")
 
+    def test_cold_pressure_hot_bytes_are_rendered(self) -> None:
+        config = render_config(
+            "--set",
+            "coldStorage.enabled=true",
+            "--set",
+            "coldStorage.flush.pressureHotBytes=33554432",
+            "--set",
+            "s3.bucket=bkt",
+        )
+        parsed = tomllib.loads(config)
+
+        self.assertEqual(parsed["storage"]["cold"]["flush_pressure_hot_size"], "33554432")
+
+    def test_snapshot_pressure_limits_are_rendered(self) -> None:
+        config = render_config(
+            "--set",
+            "raft.snapshotPressureUnpurgedLogs=32768",
+            "--set",
+            "raft.snapshotPressureMaxGroupsPerTick=8",
+            "--set",
+            "s3.bucket=bkt",
+        )
+        parsed = tomllib.loads(config)
+
+        self.assertEqual(parsed["raft"]["snapshot_pressure_unpurged_logs"], 32768)
+        self.assertEqual(parsed["raft"]["snapshot_pressure_max_groups_per_tick"], 8)
+
     def test_snapshot_s3_renders_complete_config(self) -> None:
         config = render_config("--set", "snapshotStore.backend=s3", "--set", "s3.bucket=bkt")
         parsed = tomllib.loads(config)

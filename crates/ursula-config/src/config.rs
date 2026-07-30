@@ -168,6 +168,13 @@ pub struct RaftConfig {
     /// Larger values reduce full-state snapshot CPU and tail-latency spikes at
     /// the cost of retaining more log entries for recovery.
     pub snapshot_logs_since_last: u64,
+    /// Aggregate unpurged Raft log entries on one node that trigger a
+    /// pressure snapshot pass. This bounds memory-WAL growth when traffic is
+    /// spread across many groups and no individual group reaches
+    /// `snapshot_logs_since_last`.
+    pub snapshot_pressure_unpurged_logs: u64,
+    /// Maximum groups snapshotted by one pressure pass.
+    pub snapshot_pressure_max_groups_per_tick: usize,
     /// Maximum number of payload-bearing Raft log entries retained per group
     /// after they are covered by a snapshot.
     pub max_in_snapshot_log_to_keep: u64,
@@ -196,6 +203,8 @@ impl Default for RaftConfig {
             snapshot_build_max_concurrency: 1,
             snapshot_install_max_concurrency: 1,
             snapshot_logs_since_last: 5_000,
+            snapshot_pressure_unpurged_logs: 65_536,
+            snapshot_pressure_max_groups_per_tick: 16,
             max_in_snapshot_log_to_keep: 64,
         }
     }
@@ -286,6 +295,10 @@ pub struct ColdConfig {
     /// Minimum hot bytes a group must have before it is eligible for flush.
     /// Falls back to [`flush_size`](Self::flush_size) when unset.
     pub flush_min_hot_size: Option<HumanSize>,
+    /// Aggregate hot bytes across locally led groups that activate a pressure
+    /// flush. A pressure pass allows undersized groups to flush without
+    /// changing their independent state ownership. `0` disables the fallback.
+    pub flush_pressure_hot_size: HumanSize,
     /// Upper bound on bytes flushed per group per pass.
     /// Falls back to [`flush_size`](Self::flush_size) when unset.
     pub flush_max_size: Option<HumanSize>,
@@ -340,6 +353,7 @@ impl Default for ColdConfig {
             flush_interval: HumanDuration::sec(1),
             flush_size: HumanSize::mib(8),
             flush_min_hot_size: None,
+            flush_pressure_hot_size: HumanSize::mib(128),
             flush_max_size: None,
             flush_max_concurrency: 4,
             compaction_enabled: false,

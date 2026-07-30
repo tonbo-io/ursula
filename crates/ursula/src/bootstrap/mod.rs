@@ -40,8 +40,10 @@ mod test_reexports {
     pub(crate) use super::leadership::plan_leadership_balance;
     pub(crate) use super::leadership::plan_leadership_balance_with_eligible_nodes;
     pub(crate) use super::snapshot::next_snapshot_to_drive;
+    pub(crate) use super::snapshot::pressure_snapshot_groups;
     pub(crate) use super::snapshot::resolve_snapshot_drive_interval_ms;
     pub(crate) use super::snapshot::should_drive_snapshot_for_group;
+    pub(crate) use super::snapshot::unpurged_log_entries;
     pub(crate) use super::util::leader_counts;
     pub(crate) use super::util::prioritized_transfer_targets;
     pub(crate) use super::util::reenable_elections_if_campaign_allowed;

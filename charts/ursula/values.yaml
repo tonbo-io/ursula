@@ -189,6 +189,11 @@ raft:
   maxUncommittedBytesPerGroup: null
   # Committed log entries per group between automatic full-state snapshots.
   snapshotLogsSinceLast: 5000
+  # Aggregate unpurged raft entries per node that trigger pressure snapshots.
+  # This bounds memory-WAL growth when traffic is spread across many groups.
+  snapshotPressureUnpurgedLogs: 65536
+  # Maximum groups snapshotted in one pressure pass.
+  snapshotPressureMaxGroupsPerTick: 16
   # Payload-bearing log entries retained per group after snapshot coverage.
   maxInSnapshotLogToKeep: 64
 
@@ -238,6 +243,9 @@ coldStorage:
   flush:
     intervalMs: 1000
     minHotBytes: 8388608
+    # Drain undersized groups when locally led aggregate hot bytes reach this watermark.
+    # This bounds memory with many groups without lowering the normal 8 MiB object target.
+    pressureHotBytes: 134217728
     maxBytes: 8388608
     maxConcurrency: 4
     maxHotBytesPerGroup: 67108864

@@ -54,6 +54,49 @@ pub(crate) fn should_drive_snapshot_for_group(
     last_applied.index.saturating_sub(current.index) >= logs_since_last.max(1)
 }
 
+pub(crate) fn unpurged_log_entries(snapshot: &RaftGroupMetricsSnapshot) -> u64 {
+    let Some(last_log_index) = snapshot.last_log_index else {
+        return 0;
+    };
+    snapshot.purged.map_or_else(
+        || last_log_index.saturating_add(1),
+        |purged| last_log_index.saturating_sub(purged.index),
+    )
+}
+
+fn snapshot_advance_entries(snapshot: &RaftGroupMetricsSnapshot) -> u64 {
+    let Some(last_applied) = snapshot.last_applied else {
+        return 0;
+    };
+    snapshot.snapshot.map_or_else(
+        || last_applied.index.saturating_add(1),
+        |current| last_applied.index.saturating_sub(current.index),
+    )
+}
+
+pub(crate) fn pressure_snapshot_groups(
+    snapshots: &[RaftGroupMetricsSnapshot],
+    max_groups: usize,
+) -> Vec<&RaftGroupMetricsSnapshot> {
+    let mut candidates = snapshots
+        .iter()
+        .filter_map(|snapshot| {
+            let advance = snapshot_advance_entries(snapshot);
+            (advance > 0).then_some((advance, snapshot))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by(|(left_advance, left), (right_advance, right)| {
+        right_advance
+            .cmp(left_advance)
+            .then_with(|| left.raft_group_id.cmp(&right.raft_group_id))
+    });
+    candidates
+        .into_iter()
+        .take(max_groups)
+        .map(|(_, snapshot)| snapshot)
+        .collect()
+}
+
 /// Config-driven snapshot driver. Reads parameters from typed config.
 pub fn spawn_snapshot_driver(
     runtime: &ShardRuntime,
@@ -62,6 +105,8 @@ pub fn spawn_snapshot_driver(
     s3_cfg: Option<&ursula_config::S3Config>,
     interval_ms: usize,
     logs_since_last: u64,
+    pressure_unpurged_logs: u64,
+    pressure_max_groups_per_tick: usize,
 ) {
     if interval_ms == 0 {
         return;
@@ -137,15 +182,43 @@ pub fn spawn_snapshot_driver(
                 reenable_elections_if_campaign_allowed(&registry, "s3-healthy: node S3 recovered");
             }
 
-            if !bad_tick
-                && let Some((pos, snapshot)) =
+            if !bad_tick {
+                let unpurged_logs = snaps
+                    .iter()
+                    .map(unpurged_log_entries)
+                    .fold(0u64, u64::saturating_add);
+                if unpurged_logs >= pressure_unpurged_logs.max(1) {
+                    let candidates =
+                        pressure_snapshot_groups(&snaps, pressure_max_groups_per_tick.max(1));
+                    let mut triggered = 0u64;
+                    for snapshot in candidates {
+                        let gid = snapshot.raft_group_id;
+                        let Some(raft) = registry.get(RaftGroupId(gid)) else {
+                            continue;
+                        };
+                        match raft.trigger().snapshot().await {
+                            Ok(()) => triggered = triggered.saturating_add(1),
+                            Err(err) => tracing::error!(
+                                "snapshot pressure driver trigger group {gid} error: {err}"
+                            ),
+                        }
+                    }
+                    runtime.metrics().record_raft_snapshot_pressure(triggered);
+                    tracing::info!(
+                        unpurged_logs,
+                        pressure_unpurged_logs,
+                        triggered,
+                        "raft snapshot pressure pass completed"
+                    );
+                } else if let Some((pos, snapshot)) =
                     next_snapshot_to_drive(&snaps, next_snapshot_drive_pos, logs_since_last)
-            {
-                next_snapshot_drive_pos = pos.wrapping_add(1);
-                if let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) {
-                    let gid = snapshot.raft_group_id;
-                    if let Err(err) = raft.trigger().snapshot().await {
-                        tracing::error!("snapshot driver trigger group {gid} error: {err}");
+                {
+                    next_snapshot_drive_pos = pos.wrapping_add(1);
+                    if let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) {
+                        let gid = snapshot.raft_group_id;
+                        if let Err(err) = raft.trigger().snapshot().await {
+                            tracing::error!("snapshot driver trigger group {gid} error: {err}");
+                        }
                     }
                 }
             }

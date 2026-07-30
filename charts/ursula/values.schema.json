@@ -1661,6 +1661,16 @@
           "minimum": 1,
           "description": "Committed raft log entries per group between automatic snapshots."
         },
+        "snapshotPressureUnpurgedLogs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Aggregate unpurged raft entries per node that trigger pressure snapshots."
+        },
+        "snapshotPressureMaxGroupsPerTick": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum groups snapshotted in one pressure pass."
+        },
         "maxInSnapshotLogToKeep": {
           "type": "integer",
           "minimum": 0,
@@ -1778,6 +1788,11 @@
               "type": "integer",
               "minimum": 1,
               "description": "Skip flush below this hot byte threshold per group."
+            },
+            "pressureHotBytes": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Aggregate hot bytes across locally led groups that trigger draining undersized groups; 0 disables pressure flushing."
             },
             "maxBytes": {
               "type": "integer",

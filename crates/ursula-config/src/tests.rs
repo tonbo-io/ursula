@@ -179,18 +179,24 @@ snapshot_build_max_concurrency = 2
     fn raft_snapshot_log_retention_is_bounded_and_configurable() {
         let default = UrsulaConfig::default();
         assert_eq!(default.raft.snapshot_logs_since_last, 5_000);
+        assert_eq!(default.raft.snapshot_pressure_unpurged_logs, 65_536);
+        assert_eq!(default.raft.snapshot_pressure_max_groups_per_tick, 16);
         assert_eq!(default.raft.max_in_snapshot_log_to_keep, 64);
 
         let config: UrsulaConfig = toml::from_str(
             r#"
 [raft]
 snapshot_logs_since_last = 20000
+snapshot_pressure_unpurged_logs = 131072
+snapshot_pressure_max_groups_per_tick = 32
 max_in_snapshot_log_to_keep = 128
 "#,
         )
         .expect("max_in_snapshot_log_to_keep parses");
 
         assert_eq!(config.raft.snapshot_logs_since_last, 20_000);
+        assert_eq!(config.raft.snapshot_pressure_unpurged_logs, 131_072);
+        assert_eq!(config.raft.snapshot_pressure_max_groups_per_tick, 32);
         assert_eq!(config.raft.max_in_snapshot_log_to_keep, 128);
     }
 

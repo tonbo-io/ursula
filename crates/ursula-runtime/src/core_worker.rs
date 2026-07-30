@@ -1056,6 +1056,10 @@ impl CoreWorker {
         max_candidates: usize,
     ) -> Result<Vec<ColdFlushCandidate>, RuntimeError> {
         if !group.accepts_local_writes() {
+            // The aggregate pressure gauge represents only groups currently
+            // led by this node. Clear values left behind by leadership moves
+            // so a former leader cannot keep activating empty pressure passes.
+            metrics.record_cold_hot_backlog(placement.raft_group_id, 0, 0);
             return Ok(Vec::new());
         }
         let exec_started_at = Instant::now();

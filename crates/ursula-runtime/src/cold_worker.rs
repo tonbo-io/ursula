@@ -5,6 +5,22 @@
 use crate::PlanGroupColdFlushRequest;
 use crate::ShardRuntime;
 
+fn effective_min_hot_bytes(
+    normal_min_hot_bytes: usize,
+    observed_hot_bytes: u64,
+    pressure_hot_bytes: u64,
+) -> (usize, bool) {
+    let pressure_active = pressure_hot_bytes > 0 && observed_hot_bytes >= pressure_hot_bytes;
+    (
+        if pressure_active {
+            1
+        } else {
+            normal_min_hot_bytes
+        },
+        pressure_active,
+    )
+}
+
 /// Start the periodic same-stream cold chunk compactor when explicitly enabled.
 pub fn spawn_cold_compaction_worker_if_configured(
     runtime: &ShardRuntime,
@@ -50,14 +66,19 @@ pub fn spawn_cold_flush_worker_if_configured(
         .expect("config validation ensures flush sizes fit usize");
     let max_flush_bytes = usize::try_from(config.flush_max_size().as_bytes())
         .expect("config validation ensures flush sizes fit usize");
+    let pressure_hot_bytes = config.flush_pressure_hot_size.as_bytes();
     let max_concurrency = config.flush_max_concurrency.max(1);
     let runtime = runtime.clone();
     tokio::spawn(async move {
         loop {
-            if let Err(err) = runtime
+            let metrics = runtime.metrics();
+            let observed_hot_bytes = metrics.inner.cold_hot_bytes();
+            let (pass_min_hot_bytes, pressure_active) =
+                effective_min_hot_bytes(min_hot_bytes, observed_hot_bytes, pressure_hot_bytes);
+            match runtime
                 .flush_cold_all_groups_once_bounded(
                     PlanGroupColdFlushRequest {
-                        min_hot_bytes,
+                        min_hot_bytes: pass_min_hot_bytes,
                         max_flush_bytes,
                         max_batch_bytes: max_flush_bytes,
                     },
@@ -65,7 +86,19 @@ pub fn spawn_cold_flush_worker_if_configured(
                 )
                 .await
             {
-                tracing::error!("cold flush worker error: {err}");
+                Ok(flushed) if pressure_active => {
+                    metrics.inner.record_cold_pressure_flush(flushed);
+                    if flushed > 0 {
+                        tracing::info!(
+                            observed_hot_bytes,
+                            pressure_hot_bytes,
+                            flushed,
+                            "cold pressure flush pass completed"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => tracing::error!("cold flush worker error: {err}"),
             }
             tokio::time::sleep(interval).await;
         }
@@ -91,4 +124,21 @@ pub fn spawn_cold_gc_worker_if_configured(
             tokio::time::sleep(interval).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_min_hot_bytes;
+
+    #[test]
+    fn pressure_flush_activates_at_the_aggregate_watermark() {
+        assert_eq!(effective_min_hot_bytes(8, 127, 128), (8, false));
+        assert_eq!(effective_min_hot_bytes(8, 128, 128), (1, true));
+        assert_eq!(effective_min_hot_bytes(8, 129, 128), (1, true));
+    }
+
+    #[test]
+    fn zero_pressure_watermark_disables_the_fallback() {
+        assert_eq!(effective_min_hot_bytes(8, u64::MAX, 0), (8, false));
+    }
 }

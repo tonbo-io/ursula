@@ -23,6 +23,7 @@
 {{- $hasS3Credentials := include "ursula.hasS3Credentials" . -}}
 {{- $coldFlushIntervalMs := .Values.coldStorage.flush.intervalMs | int64 -}}
 {{- $coldFlushMinHotBytes := .Values.coldStorage.flush.minHotBytes | int64 -}}
+{{- $coldFlushPressureHotBytes := .Values.coldStorage.flush.pressureHotBytes | int64 -}}
 {{- $coldFlushMaxBytes := .Values.coldStorage.flush.maxBytes | int64 -}}
 {{- $coldFlushMaxConcurrency := .Values.coldStorage.flush.maxConcurrency | int64 -}}
 {{- $coldMaxHotBytesPerGroup := .Values.coldStorage.flush.maxHotBytesPerGroup | int64 -}}
@@ -91,6 +92,8 @@ data:
     init_membership = {{ .Values.raft.initMembership }}
     init_membership_per_group = {{ .Values.raft.initMembershipPerGroup }}
     snapshot_logs_since_last = {{ .Values.raft.snapshotLogsSinceLast }}
+    snapshot_pressure_unpurged_logs = {{ .Values.raft.snapshotPressureUnpurgedLogs }}
+    snapshot_pressure_max_groups_per_tick = {{ .Values.raft.snapshotPressureMaxGroupsPerTick }}
     max_in_snapshot_log_to_keep = {{ .Values.raft.maxInSnapshotLogToKeep }}
 {{- if not (eq .Values.raft.maxUncommittedBytesPerGroup nil) }}
     max_uncommitted_size_per_group = "{{ .Values.raft.maxUncommittedBytesPerGroup }}"
@@ -118,6 +121,7 @@ data:
     flush_interval = "{{ $coldFlushIntervalMs }}ms"
     flush_size = "{{ $coldFlushMaxBytes }}"
     flush_min_hot_size = "{{ $coldFlushMinHotBytes }}"
+    flush_pressure_hot_size = "{{ $coldFlushPressureHotBytes }}"
     flush_max_size = "{{ $coldFlushMaxBytes }}"
     flush_max_concurrency = {{ $coldFlushMaxConcurrency }}
     max_hot_size_per_group = "{{ $coldMaxHotBytesPerGroup }}"

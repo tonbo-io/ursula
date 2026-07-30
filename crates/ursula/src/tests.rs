@@ -5367,10 +5367,13 @@ mod cold_health {
 
 mod snapshot_driver {
     use ursula_raft::RaftGroupMetricsSnapshot;
+    use ursula_raft::RaftLogProgressSnapshot;
 
     use crate::bootstrap::next_snapshot_to_drive;
+    use crate::bootstrap::pressure_snapshot_groups;
     use crate::bootstrap::resolve_snapshot_drive_interval_ms;
     use crate::bootstrap::should_drive_snapshot_for_group;
+    use crate::bootstrap::unpurged_log_entries;
 
     fn snap_with_group(
         raft_group_id: u32,
@@ -5455,6 +5458,36 @@ mod snapshot_driver {
             next_snapshot_to_drive(&snapshots, second.0 + 1, 1).expect("wrapped snapshot");
         assert_eq!(wrapped.0, 1);
         assert_eq!(wrapped.1.raft_group_id, 1);
+    }
+
+    #[test]
+    fn snapshot_driver_counts_unpurged_logs() {
+        assert_eq!(unpurged_log_entries(&snap(Some(99), None)), 100);
+
+        let mut partially_purged = snap(Some(99), Some(80));
+        partially_purged.purged = Some(RaftLogProgressSnapshot { term: 1, index: 63 });
+        assert_eq!(unpurged_log_entries(&partially_purged), 36);
+
+        assert_eq!(unpurged_log_entries(&snap(None, None)), 0);
+    }
+
+    #[test]
+    fn snapshot_pressure_prioritizes_largest_reclaimable_groups() {
+        let snapshots = vec![
+            snap_with_group(0, Some(90), Some(80)),
+            snap_with_group(1, Some(150), Some(50)),
+            snap_with_group(2, Some(75), None),
+            snap_with_group(3, Some(42), Some(42)),
+        ];
+
+        let selected = pressure_snapshot_groups(&snapshots, 2);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|snapshot| snapshot.raft_group_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 }
 
