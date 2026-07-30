@@ -1,0 +1,215 @@
+{{- if and (eq .Values.server.updateStrategy "OnDelete") .Values.server.gracefulRollout.enabled }}
+{{- $name := printf "%s-graceful-rollout" (include "ursula.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- $sts := include "ursula.fullname" . -}}
+{{- $adminPort := (splitList ":" .Values.server.adminListen) | last -}}
+{{- $expectedGroups := default .Values.raft.groupCount .Values.server.gracefulRollout.expectedGroups -}}
+{{/*
+Graceful voter rollout.
+
+`updateStrategy: OnDelete` stages a new pod template without replacing any
+pod, which is the only way to keep a Raft quorum: Kubernetes has no idea which
+voter is safe to lose, and rolling two before either has caught up loses the
+majority. This job is what makes OnDelete finish. It drains one node, replaces
+it, waits for it to rejoin and catch up, verifies the cluster, and only then
+moves to the next.
+
+## Hook phase, and why both annotations are here
+
+Under Helm this is `post-upgrade`, because the script waits for the
+StatefulSet to already carry the target image before it touches anything. A
+`pre-upgrade` hook would spin until it timed out against the old template.
+
+Under Argo CD it is a `Sync` hook rather than the `PostSync` that Argo would
+infer from `post-upgrade`, and the difference is not cosmetic. PostSync waits
+for the application to become healthy, and a StatefulSet under OnDelete does
+not become healthy until its pods are replaced. Replacing them is this job.
+The two would wait for each other forever.
+
+Argo reads its own annotation in preference to the Helm one, so a single
+template serves both. On Flux, or plain `helm upgrade`, the Argo annotation is
+inert metadata.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+    app.kubernetes.io/component: graceful-rollout
+  annotations:
+    "helm.sh/hook": post-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "argocd.argoproj.io/hook": Sync
+    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded
+    "argocd.argoproj.io/sync-wave": "-1"
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+    app.kubernetes.io/component: graceful-rollout
+  annotations:
+    "helm.sh/hook": post-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "argocd.argoproj.io/hook": Sync
+    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded
+    "argocd.argoproj.io/sync-wave": "-1"
+rules:
+  # Read pod state, and delete exactly one at a time to replace it.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "delete"]
+  # The admin plane binds pod loopback by default, so reaching it means
+  # forwarding a port rather than calling a Service.
+  - apiGroups: [""]
+    resources: ["pods/portforward"]
+    verbs: ["create"]
+  # Rollout progress, so an interrupted run resumes at the node it left rather
+  # than draining one that was already done.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+    app.kubernetes.io/component: graceful-rollout
+  annotations:
+    "helm.sh/hook": post-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "argocd.argoproj.io/hook": Sync
+    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded
+    "argocd.argoproj.io/sync-wave": "-1"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+    app.kubernetes.io/component: graceful-rollout
+  annotations:
+    "helm.sh/hook": post-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "argocd.argoproj.io/hook": Sync
+    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded
+    "argocd.argoproj.io/sync-wave": "-1"
+data:
+  graceful-rollout.sh: |
+{{ .Files.Get "files/graceful-rollout.sh" | indent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+    app.kubernetes.io/component: graceful-rollout
+  annotations:
+    "helm.sh/hook": post-upgrade
+    "helm.sh/hook-weight": "0"
+    # `hook-failed` is deliberately absent. A rollout that stopped partway is
+    # exactly when the logs are worth having, and `before-hook-creation` still
+    # clears the previous attempt on the next upgrade.
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "argocd.argoproj.io/hook": Sync
+    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ .Values.server.gracefulRollout.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "ursula.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: graceful-rollout
+    spec:
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: true
+      restartPolicy: Never
+      initContainers:
+        # The rollout runs from the Ursula image, because it needs `ursulactl`
+        # to drain and verify. That image has no `kubectl`, so one is copied in
+        # rather than adding it to the server image, which every node runs.
+        - name: copy-kubectl
+          image: {{ printf "%s:%s" .Values.server.gracefulRollout.kubectlImage.repository .Values.server.gracefulRollout.kubectlImage.tag | quote }}
+          imagePullPolicy: {{ .Values.server.gracefulRollout.kubectlImage.pullPolicy }}
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              cp /usr/bin/kubectl /tools/kubectl
+          volumeMounts:
+            - name: tools
+              mountPath: /tools
+      containers:
+        - name: rollout
+          image: {{ include "ursula.image" . | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              export PATH="/tools:${PATH}"
+              exec /bin/sh /opt/rollout/graceful-rollout.sh
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: STATEFULSET
+              value: {{ $sts | quote }}
+            - name: REPLICAS
+              value: {{ .Values.server.replicaCount | quote }}
+            # What `ursulactl verify-cluster` expects to find. Wrong here and
+            # every verification either passes vacuously or never passes.
+            - name: EXPECTED_GROUPS
+              value: {{ $expectedGroups | quote }}
+            # Templated rather than derived from `ursulactl --version` at run
+            # time. The chart knows the tag it is deploying; the binary only
+            # knows what it was built as, and the two are not the same fact.
+            - name: TARGET_IMAGE
+              value: {{ include "ursula.image" . | quote }}
+            - name: CTL
+              value: /usr/local/bin/ursulactl
+            - name: CLIENT_PORT
+              value: {{ .Values.server.ports.client | quote }}
+            - name: ADMIN_PORT
+              value: {{ $adminPort | quote }}
+          resources:
+            {{- toYaml .Values.server.gracefulRollout.resources | nindent 12 }}
+          volumeMounts:
+            - name: tools
+              mountPath: /tools
+              readOnly: true
+            - name: rollout
+              mountPath: /opt/rollout
+              readOnly: true
+      volumes:
+        - name: tools
+          emptyDir: {}
+        - name: rollout
+          configMap:
+            name: {{ $name }}
+            defaultMode: 0555
+{{- end }}
