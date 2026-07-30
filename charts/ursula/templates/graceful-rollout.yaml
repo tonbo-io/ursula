@@ -39,9 +39,9 @@ metadata:
   annotations:
     "helm.sh/hook": post-upgrade
     "helm.sh/hook-weight": "-10"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
     "argocd.argoproj.io/hook": Sync
-    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded
+    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded,HookFailed
     "argocd.argoproj.io/sync-wave": "-1"
 automountServiceAccountToken: true
 ---
@@ -55,9 +55,9 @@ metadata:
   annotations:
     "helm.sh/hook": post-upgrade
     "helm.sh/hook-weight": "-10"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
     "argocd.argoproj.io/hook": Sync
-    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded
+    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded,HookFailed
     "argocd.argoproj.io/sync-wave": "-1"
 rules:
   # Read pod state, and delete exactly one at a time to replace it.
@@ -88,9 +88,9 @@ metadata:
   annotations:
     "helm.sh/hook": post-upgrade
     "helm.sh/hook-weight": "-10"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
     "argocd.argoproj.io/hook": Sync
-    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded
+    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded,HookFailed
     "argocd.argoproj.io/sync-wave": "-1"
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -111,9 +111,9 @@ metadata:
   annotations:
     "helm.sh/hook": post-upgrade
     "helm.sh/hook-weight": "-10"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
     "argocd.argoproj.io/hook": Sync
-    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded
+    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded,HookFailed
     "argocd.argoproj.io/sync-wave": "-1"
 data:
   graceful-rollout.sh: |
@@ -129,19 +129,15 @@ metadata:
   annotations:
     "helm.sh/hook": post-upgrade
     "helm.sh/hook-weight": "0"
-    # `hook-failed` is deliberately absent. A rollout that stopped partway is
-    # exactly when the logs are worth having, and `before-hook-creation` still
-    # clears the previous attempt on the next upgrade.
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
     "argocd.argoproj.io/hook": Sync
-    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded
+    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded,HookFailed
 spec:
   backoffLimit: 0
   activeDeadlineSeconds: {{ .Values.server.gracefulRollout.activeDeadlineSeconds }}
   template:
     metadata:
       labels:
-        {{- include "ursula.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: graceful-rollout
     spec:
       serviceAccountName: {{ $name }}

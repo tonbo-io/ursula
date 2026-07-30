@@ -196,6 +196,45 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertIn("updateStrategy:\n    type: OnDelete", rendered)
         self.assertNotIn("app.kubernetes.io/component: ondelete-migration", rendered)
 
+    def test_graceful_rollout_hook_does_not_match_the_server_pdb(self) -> None:
+        rendered = render_chart(
+            "--set",
+            "s3.bucket=bkt",
+            "--set",
+            "server.updateStrategy=OnDelete",
+            "--set",
+            "server.gracefulRollout.enabled=true",
+        )
+
+        rollout = {
+            (kind, name): annotations
+            for (kind, name), annotations in hook_annotations(rendered).items()
+            if name == "test-ursula-graceful-rollout"
+        }
+        self.assertEqual(
+            {kind for kind, _ in rollout},
+            {"ServiceAccount", "Role", "RoleBinding", "ConfigMap", "Job"},
+        )
+        for (kind, name), annotations in sorted(rollout.items()):
+            with self.subTest(kind=kind, name=name):
+                self.assertEqual(
+                    annotations["helm.sh/hook-delete-policy"],
+                    "before-hook-creation,hook-succeeded,hook-failed",
+                )
+
+        job = re.search(
+            r"kind: Job\nmetadata:\n  name: test-ursula-graceful-rollout\n"
+            r".*?template:\n    metadata:\n      labels:\n"
+            r"(?P<labels>.*?)    spec:",
+            rendered,
+            re.S,
+        )
+        self.assertIsNotNone(job)
+        pod_labels = job.group("labels")
+        self.assertIn("app.kubernetes.io/component: graceful-rollout", pod_labels)
+        self.assertNotIn("app.kubernetes.io/name:", pod_labels)
+        self.assertNotIn("app.kubernetes.io/instance:", pod_labels)
+
     def test_every_deployment_role_uses_the_unified_ursula_binary(self) -> None:
         rendered = render_chart(
             *indexer_values(),
