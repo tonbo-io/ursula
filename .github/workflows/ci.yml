@@ -24,6 +24,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      # Before anything slow. A release tag publishes every chart at the tag's
+      # version and each publish workflow refuses one that disagrees, so this
+      # is the last place a forgotten bump costs a commit instead of a release.
+      - name: Release versions agree
+        run: ./scripts/check-release-versions.sh
+
       - name: Install OpenTofu
         uses: opentofu/setup-opentofu@v1
         with:
