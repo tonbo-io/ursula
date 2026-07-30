@@ -57,6 +57,33 @@ server:
         memory: 32Mi
       limits:
         memory: 64Mi
+  # Post-upgrade job that finishes what OnDelete deliberately leaves undone.
+  # OnDelete stages a new pod template and replaces nothing, because Kubernetes
+  # cannot know which voter is safe to lose; this drains one node, replaces it,
+  # waits for it to rejoin and catch up, verifies the cluster, and only then
+  # moves on. Without it an OnDelete upgrade never reaches the new image.
+  gracefulRollout:
+    # Off by default: it is only meaningful with updateStrategy=OnDelete, and
+    # it needs RBAC to delete pods and forward ports.
+    enabled: false
+    # Groups `ursulactl verify-cluster` should find. Defaults to raft.groupCount.
+    expectedGroups: null
+    # Ceiling for the whole rollout, not one node. Draining and catching up a
+    # lagging voter can take a long time, and cutting it short mid-rollout
+    # leaves the cluster on mixed versions.
+    activeDeadlineSeconds: 7200
+    # The rollout runs from the Ursula image for `ursulactl`, and copies a
+    # kubectl in from here rather than adding one to the server image.
+    kubectlImage:
+      repository: alpine/k8s
+      tag: 1.33.3
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        memory: 256Mi
   ports:
     # Ursula public client-plane HTTP port (stream reads/writes).
     client: 4437
