@@ -17,6 +17,39 @@ def render_chart(*values: str) -> str:
     return subprocess.check_output(["helm", "template", "test", "charts/ursula", *values], text=True)
 
 
+def deployment_contract_values() -> tuple[str, ...]:
+    return (
+        "--namespace",
+        "ursula",
+        "--set",
+        "deploymentContract.expectedNamespace=ursula",
+        "--set",
+        "deploymentContract.serverServiceAccountName=ursula-storage",
+        "--set",
+        "deploymentContract.serverRoleArn=arn:aws:iam::123456789012:role/server",
+        "--set",
+        "deploymentContract.serverS3Prefix=server-data",
+        "--set",
+        "deploymentContract.indexerServiceAccountName=ursula-indexer",
+        "--set",
+        "deploymentContract.indexerRoleArn=arn:aws:iam::123456789012:role/indexer",
+        "--set",
+        "deploymentContract.indexerS3Prefix=index-data",
+        "--set",
+        "serviceAccount.name=ursula-storage",
+        "--set",
+        "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=arn:aws:iam::123456789012:role/server",
+        "--set",
+        "s3.prefix=server-data",
+        "--set",
+        "indexer.serviceAccount.name=ursula-indexer",
+        "--set",
+        "indexer.serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=arn:aws:iam::123456789012:role/indexer",
+        "--set",
+        "indexer.s3.prefix=index-data",
+    )
+
+
 def indexer_values() -> tuple[str, ...]:
     return (
         "--set",
@@ -53,6 +86,44 @@ def hook_annotations(rendered: str) -> dict[tuple[str, str], dict[str, str]]:
 
 
 class HelmTemplateConfigTest(unittest.TestCase):
+    def test_matching_deployment_contract_renders(self) -> None:
+        render_chart(*deployment_contract_values())
+
+    def test_deployment_contract_rejects_namespace_drift(self) -> None:
+        values = list(deployment_contract_values())
+        values[1] = "another-namespace"
+
+        result = subprocess.run(
+            ["helm", "template", "test", "charts/ursula", *values],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            'deploymentContract expected namespace "ursula", but Helm is rendering namespace "another-namespace"',
+            result.stderr,
+        )
+
+    def test_deployment_contract_rejects_role_drift(self) -> None:
+        values = list(deployment_contract_values())
+        role_index = values.index("serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=arn:aws:iam::123456789012:role/server")
+        values[role_index] = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=arn:aws:iam::123456789012:role/wrong"
+
+        result = subprocess.run(
+            ["helm", "template", "test", "charts/ursula", *values],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "deploymentContract serverRoleArn does not match serviceAccount.annotations[eks.amazonaws.com/role-arn]",
+            result.stderr,
+        )
+
     def test_server_update_strategy_defaults_to_rolling_update(self) -> None:
         rendered = render_chart("--set", "s3.bucket=bkt")
 

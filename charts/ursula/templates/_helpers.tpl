@@ -242,6 +242,11 @@ accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 {{- $fullname := include "ursula.fullname" . -}}
 {{- $headless := include "ursula.headlessServiceName" . -}}
 {{- $namespace := .Release.Namespace -}}
+{{- $contract := .Values.deploymentContract -}}
+{{- $serverServiceAccountName := include "ursula.serviceAccountName" . -}}
+{{- $serverRoleArn := index .Values.serviceAccount.annotations "eks.amazonaws.com/role-arn" | default "" | toString -}}
+{{- $indexerServiceAccountName := include "ursula.indexerServiceAccountName" . -}}
+{{- $indexerRoleArn := index .Values.indexer.serviceAccount.annotations "eks.amazonaws.com/role-arn" | default "" | toString -}}
 {{- $replicaCount := .Values.server.replicaCount | int -}}
 {{- $coreCount := .Values.server.coreCount | int -}}
 {{- $clientPort := .Values.server.ports.client | int -}}
@@ -253,6 +258,27 @@ accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 {{- include "ursula.validateDnsLabel" (dict "name" "fullname" "value" $fullname) -}}
 {{- include "ursula.validateDnsLabel" (dict "name" "headlessServiceName" "value" $headless) -}}
 {{- include "ursula.validateDnsName" (dict "name" "clusterDomain" "value" $clusterDomain) -}}
+{{- if and $contract.expectedNamespace (ne ($contract.expectedNamespace | toString) $namespace) -}}
+{{- fail (printf "deploymentContract expected namespace %q, but Helm is rendering namespace %q" $contract.expectedNamespace $namespace) -}}
+{{- end -}}
+{{- if and $contract.serverServiceAccountName (ne ($contract.serverServiceAccountName | toString) $serverServiceAccountName) -}}
+{{- fail (printf "deploymentContract expected server ServiceAccount %q, but chart resolves %q" $contract.serverServiceAccountName $serverServiceAccountName) -}}
+{{- end -}}
+{{- if and $contract.serverRoleArn (ne ($contract.serverRoleArn | toString) $serverRoleArn) -}}
+{{- fail "deploymentContract serverRoleArn does not match serviceAccount.annotations[eks.amazonaws.com/role-arn]" -}}
+{{- end -}}
+{{- if and $contract.serverS3Prefix (ne ($contract.serverS3Prefix | toString) (.Values.s3.prefix | toString)) -}}
+{{- fail (printf "deploymentContract expected server S3 prefix %q, but s3.prefix is %q" $contract.serverS3Prefix .Values.s3.prefix) -}}
+{{- end -}}
+{{- if and .Values.indexer.enabled $contract.indexerServiceAccountName (ne ($contract.indexerServiceAccountName | toString) $indexerServiceAccountName) -}}
+{{- fail (printf "deploymentContract expected indexer ServiceAccount %q, but chart resolves %q" $contract.indexerServiceAccountName $indexerServiceAccountName) -}}
+{{- end -}}
+{{- if and .Values.indexer.enabled $contract.indexerRoleArn (ne ($contract.indexerRoleArn | toString) $indexerRoleArn) -}}
+{{- fail "deploymentContract indexerRoleArn does not match indexer.serviceAccount.annotations[eks.amazonaws.com/role-arn]" -}}
+{{- end -}}
+{{- if and .Values.indexer.enabled $contract.indexerS3Prefix (ne ($contract.indexerS3Prefix | toString) (.Values.indexer.s3.prefix | toString)) -}}
+{{- fail (printf "deploymentContract expected indexer S3 prefix %q, but indexer.s3.prefix is %q" $contract.indexerS3Prefix .Values.indexer.s3.prefix) -}}
+{{- end -}}
 {{- range $i := until $replicaCount -}}
 {{- $podName := printf "%s-%d" $fullname $i -}}
 {{- include "ursula.validateDnsLabel" (dict "name" "generated pod DNS label" "value" $podName) -}}
