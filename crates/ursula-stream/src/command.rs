@@ -78,6 +78,20 @@ pub enum StreamCommand {
         producer: Option<ProducerRequest>,
         now_ms: u64,
     },
+    /// Applies a reducer result that was materialized by the current group
+    /// owner. Followers never execute guest code: they atomically append the
+    /// resulting records and advance the opaque reducer state.
+    ApplyReduction {
+        stream_id: BucketStreamId,
+        module_id: String,
+        expected_version: u64,
+        #[serde(default)]
+        create_if_missing: bool,
+        #[serde(with = "serde_bytes")]
+        state: Vec<u8>,
+        payload: Bytes,
+        now_ms: u64,
+    },
     PublishSnapshot {
         stream_id: BucketStreamId,
         snapshot_offset: u64,
@@ -187,6 +201,17 @@ impl fmt::Display for StreamCommand {
                 payloads,
                 ..
             } => write!(f, "append_batch:{stream_id}:{} items", payloads.len()),
+            Self::ApplyReduction {
+                stream_id,
+                module_id,
+                expected_version,
+                payload,
+                ..
+            } => write!(
+                f,
+                "apply_reduction:{stream_id}:{module_id}:v{expected_version}:{} bytes",
+                payload.len()
+            ),
             Self::PublishSnapshot {
                 stream_id,
                 snapshot_offset,

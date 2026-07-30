@@ -86,6 +86,12 @@ data:
     [runtime]
     core_count = {{ .Values.server.coreCount }}
 
+{{- range $index, $module := .Values.reducers.modules }}
+    [[reducers.modules]]
+    id = {{ $module.id | quote }}
+    path = {{ printf "/etc/ursula/reducers/%d.wasm" $index | quote }}
+{{- end }}
+
     [raft]
     group_count = {{ .Values.raft.groupCount }}
     init_membership = {{ .Values.raft.initMembership }}

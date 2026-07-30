@@ -28,6 +28,8 @@ use crate::request::AppendBatchResponse;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
 use crate::request::AppendResponse;
+#[cfg(feature = "wasm-reducers")]
+use crate::request::ApplyReductionRequest;
 use crate::request::BootstrapStreamRequest;
 use crate::request::BootstrapStreamResponse;
 use crate::request::CloseStreamRequest;
@@ -58,6 +60,10 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
+#[cfg(feature = "wasm-reducers")]
+use crate::request::ReduceRequest;
+#[cfg(feature = "wasm-reducers")]
+use crate::request::ReduceResponse;
 use crate::request::SetBucketQuotaRequest;
 use crate::request::SetBucketQuotaResponse;
 use crate::request::UpdateStreamAttrsRequest;
@@ -555,6 +561,10 @@ pub(crate) struct GroupActor {
     pub(crate) cold_write_admission: ColdWriteAdmission,
     pub(crate) live_read_max_waiters_per_core: Option<u64>,
     pub(crate) read_materialization: Arc<Semaphore>,
+    #[cfg(feature = "wasm-reducers")]
+    pub(crate) reducer_catalog: Option<Arc<ursula_wasm::ReducerCatalog>>,
+    #[cfg(feature = "wasm-reducers")]
+    pub(crate) reducer_runtime: Option<ursula_wasm::ReducerRuntime>,
 }
 
 impl GroupActor {
@@ -688,6 +698,155 @@ impl GroupActor {
         ControlFlow::Continue(())
     }
 
+    #[cfg(feature = "wasm-reducers")]
+    async fn handle_reduce(
+        &mut self,
+        request: ReduceRequest,
+        response_tx: oneshot::Sender<Result<ReduceResponse, RuntimeError>>,
+    ) -> ControlFlow<()> {
+        let result = self.reduce_inner(request).await;
+        match result {
+            Ok((stream_id, response)) => {
+                let _ = response_tx.send(Ok(response));
+                CoreWorker::finish_append(
+                    &mut self.engine,
+                    self.metrics.clone(),
+                    self.read_materialization.clone(),
+                    &mut self.read_watchers,
+                    stream_id,
+                    self.placement,
+                )
+                .await;
+            }
+            Err(error) => {
+                let _ = response_tx.send(Err(error));
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    #[cfg(feature = "wasm-reducers")]
+    async fn reduce_inner(
+        &mut self,
+        request: ReduceRequest,
+    ) -> Result<(BucketStreamId, ReduceResponse), RuntimeError> {
+        self.engine
+            .require_local_write_owner(self.placement)
+            .await
+            .map_err(|error| RuntimeError::group_engine(self.placement, error))?;
+        if self.reducer_runtime.is_none() {
+            let catalog = self.reducer_catalog.as_ref().ok_or_else(|| {
+                RuntimeError::group_engine(
+                    self.placement,
+                    crate::engine::GroupEngineError::new("WebAssembly reducers are not configured"),
+                )
+            })?;
+            self.reducer_runtime = Some(
+                catalog
+                    .runtime(ursula_wasm::ReducerLimits::default())
+                    .map_err(|error| {
+                        RuntimeError::group_engine(
+                            self.placement,
+                            crate::engine::GroupEngineError::new(error.to_string()),
+                        )
+                    })?,
+            );
+        }
+        let runtime = self.reducer_runtime.as_mut().ok_or_else(|| {
+            RuntimeError::group_engine(
+                self.placement,
+                crate::engine::GroupEngineError::new("WebAssembly reducer runtime is unavailable"),
+            )
+        })?;
+        let input = self
+            .engine
+            .reducer_input(
+                request.stream_id.clone(),
+                request.create_if_missing,
+                self.placement,
+            )
+            .await
+            .map_err(|error| RuntimeError::group_engine(self.placement, error))?;
+        if !ursula_stream::is_json_record_content_type(&input.content_type) {
+            return Err(RuntimeError::group_engine(
+                self.placement,
+                crate::engine::GroupEngineError::new(format!(
+                    "reducer stream '{}' must use a JSON record content type",
+                    request.stream_id
+                )),
+            ));
+        }
+        let (expected_version, current_state) = match input.state {
+            Some(state) if state.module_id == request.module_id => (state.version, state.value),
+            Some(state) => {
+                return Err(RuntimeError::group_engine(
+                    self.placement,
+                    crate::engine::GroupEngineError::stream(
+                        ursula_stream::StreamErrorCode::ReducerModuleMismatch,
+                        format!(
+                            "stream '{}' reducer module is '{}', not '{}'",
+                            request.stream_id, state.module_id, request.module_id
+                        ),
+                    ),
+                ));
+            }
+            None => (0, Vec::new()),
+        };
+        let context = ursula_wasm::ReducerContext {
+            bucket: request.stream_id.bucket_id.clone(),
+            stream: request.stream_id.stream_id.clone(),
+            next_offset: input.next_offset,
+            next_record: input.next_record,
+            now_ms: request.now_ms,
+        };
+        let reduced = runtime
+            .reduce(
+                &request.module_id,
+                &current_state,
+                &request.intent,
+                &context,
+            )
+            .map_err(|error| {
+                RuntimeError::group_engine(
+                    self.placement,
+                    crate::engine::GroupEngineError::new(error.to_string()),
+                )
+            })?;
+        let payload = encode_reducer_records(&reduced.records).map_err(|message| {
+            RuntimeError::group_engine(
+                self.placement,
+                crate::engine::GroupEngineError::new(message),
+            )
+        })?;
+        let stream_id = request.stream_id;
+        let applied = self
+            .engine
+            .apply_reduction(
+                ApplyReductionRequest {
+                    stream_id: stream_id.clone(),
+                    module_id: request.module_id,
+                    expected_version,
+                    create_if_missing: request.create_if_missing,
+                    state: reduced.state,
+                    payload: payload.into(),
+                    now_ms: request.now_ms,
+                },
+                self.placement,
+                self.cold_write_admission,
+            )
+            .await
+            .map_err(|error| RuntimeError::group_engine(self.placement, error))?;
+        Ok((stream_id, ReduceResponse {
+            placement: applied.placement,
+            start_offset: applied.start_offset,
+            next_offset: applied.next_offset,
+            reducer_version: applied.reducer_version,
+            group_commit_index: applied.group_commit_index,
+            record_range: applied.record_range,
+            response: reduced.response,
+        }))
+    }
+
     #[cfg(madsim)]
     async fn handle_shutdown_engine(
         &mut self,
@@ -760,4 +919,17 @@ impl GroupActor {
             }
         }
     }
+}
+
+#[cfg(feature = "wasm-reducers")]
+fn encode_reducer_records(records: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    let mut payload = Vec::new();
+    for record in records {
+        let value = serde_json::from_slice::<serde_json::Value>(record)
+            .map_err(|error| format!("reducer returned invalid JSON record: {error}"))?;
+        serde_json::to_writer(&mut payload, &value)
+            .map_err(|error| format!("failed to encode reducer JSON record: {error}"))?;
+        payload.push(b'\n');
+    }
+    Ok(payload)
 }

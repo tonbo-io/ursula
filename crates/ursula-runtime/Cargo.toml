@@ -9,6 +9,9 @@ homepage.workspace = true
 readme.workspace = true
 description = "Per-core actor runtime for Ursula: hot ring, cold-tier flush, and the replaceable group-engine boundary."
 
+[features]
+wasm-reducers = ["dep:ursula-wasm"]
+
 [dependencies]
 blake3 = { workspace = true }
 bytes = { workspace = true, features = ["serde"] }
@@ -24,6 +27,7 @@ tracing = { workspace = true }
 ursula-config = { workspace = true }
 ursula-shard = { workspace = true }
 ursula-stream = { workspace = true }
+ursula-wasm = { workspace = true, optional = true }
 zstd = { workspace = true }
 
 [target.'cfg(madsim)'.dependencies]

@@ -38,6 +38,7 @@ pub use model::ProducerAppendRecord;
 pub use model::ProducerReceipt;
 pub use model::ProducerRequest;
 pub use model::ProducerSnapshot;
+pub use model::ReducerState;
 pub use model::StreamAttrs;
 pub use model::StreamBatchAppend;
 pub use model::StreamBatchAppendItem;

@@ -6,6 +6,7 @@ use super::ColdChunkRef;
 use super::HotPayloadSegment;
 use super::ObjectPayloadRef;
 use super::ProducerRequest;
+use super::ReducerState;
 use super::StreamAttrs;
 use super::StreamBootstrapPlan;
 use super::StreamErrorCode;
@@ -93,6 +94,11 @@ impl StreamStateMachine {
     pub fn stream_attrs(&self, stream_id: &BucketStreamId) -> Option<&StreamAttrs> {
         self.stream_slot(stream_id)
             .and_then(|slot| slot.attrs.as_ref())
+    }
+
+    pub fn reducer_state(&self, stream_id: &BucketStreamId) -> Option<&ReducerState> {
+        self.stream_slot(stream_id)
+            .and_then(|slot| slot.reducer_state.as_ref())
     }
 
     pub fn head_at(&mut self, stream_id: &BucketStreamId, now_ms: u64) -> Option<&StreamMetadata> {

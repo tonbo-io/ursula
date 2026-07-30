@@ -55,6 +55,8 @@ fn test_config(
         cold_max_hot_bytes_per_group: None,
         raft_max_uncommitted_bytes_per_group: None,
         live_read_max_waiters_per_core: Some(65_536),
+        #[cfg(feature = "wasm-reducers")]
+        reducer_catalog: None,
     }
 }
 

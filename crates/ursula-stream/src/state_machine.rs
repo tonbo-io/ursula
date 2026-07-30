@@ -53,6 +53,7 @@ use crate::model::ProducerReceipt;
 use crate::model::ProducerRequest;
 use crate::model::ProducerSnapshot;
 use crate::model::ProducerState;
+use crate::model::ReducerState;
 use crate::model::StreamAttrs;
 use crate::model::StreamBatchAppend;
 use crate::model::StreamBatchAppendItem;
@@ -86,6 +87,7 @@ mod hot_buffer;
 mod lifecycle;
 mod persist;
 mod query;
+mod reducer;
 mod registry;
 mod ttl;
 
@@ -127,6 +129,7 @@ struct StreamSlot {
     retained_offset: u64,
     visible_snapshot: Option<StreamVisibleSnapshot>,
     producers: HashMap<String, ProducerState>,
+    reducer_state: Option<ReducerState>,
 }
 
 impl StreamStateMachine {
@@ -551,6 +554,27 @@ impl StreamStateMachine {
                         }),
                     Err(response) => response,
                 };
+                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
+                response
+            }
+            StreamCommand::ApplyReduction {
+                stream_id,
+                module_id,
+                expected_version,
+                create_if_missing,
+                state,
+                payload,
+                now_ms,
+            } => {
+                let response = self.apply_reduction(
+                    stream_id,
+                    module_id,
+                    expected_version,
+                    create_if_missing,
+                    state,
+                    payload,
+                    now_ms,
+                );
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
             }

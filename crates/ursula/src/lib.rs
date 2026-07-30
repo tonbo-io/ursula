@@ -107,6 +107,7 @@ use ursula_runtime::ProducerRequest;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::ReduceRequest;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::StreamAttrs;
@@ -177,6 +178,8 @@ const HEADER_STREAM_SNAPSHOT_OFFSET: &str = "stream-snapshot-offset";
 const HEADER_STREAM_SNAPSHOT_DIGEST: &str = "stream-snapshot-digest";
 const HEADER_STREAM_SNAPSHOT_MATCH: &str = "stream-snapshot-match";
 const HEADER_STREAM_RETAINED_OFFSET: &str = "stream-retained-offset";
+const HEADER_URSULA_REDUCER_VERSION: &str = "ursula-reducer-version";
+const HEADER_URSULA_REDUCER_CREATE: &str = "ursula-reducer-create";
 const HEADER_STREAM_SSE_DATA_ENCODING: &str = "stream-sse-data-encoding";
 const HEADER_STREAM_ATTRS: &str = "stream-attrs";
 const HEADER_STREAM_SEQ: &str = "stream-seq";
@@ -1108,6 +1111,7 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
                 .head(head_stream),
         )
         .route("/{bucket}/{stream}/append-batch", post(append_batch))
+        .route("/{bucket}/{stream}/reduce/{module}", post(reduce_stream))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
             admission,
@@ -2328,6 +2332,54 @@ pub(crate) async fn append_batch(
     insert_content_type(&mut headers, "application/json");
     let body = render_batch_results(&response.items);
     (StatusCode::OK, headers, body).into_response()
+}
+
+#[tracing::instrument(
+    name = "http.reduce_stream",
+    skip_all,
+    fields(bucket = %bucket, stream = %stream, module = %module, bytes = body.len()),
+)]
+pub(crate) async fn reduce_stream(
+    State(state): State<HttpState>,
+    OriginalUri(uri): OriginalUri,
+    Path((bucket, stream, module)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let stream_id = BucketStreamId::new(bucket, stream);
+    let response = match state
+        .runtime
+        .reduce(ReduceRequest {
+            stream_id,
+            module_id: module,
+            intent: body.to_vec(),
+            create_if_missing: headers
+                .get(HEADER_URSULA_REDUCER_CREATE)
+                .and_then(|value| value.to_str().ok())
+                == Some("true"),
+            now_ms: state.unix_time_ms(),
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return runtime_error_or_leader_redirect_async(&state, error, &request_target(&uri))
+                .await;
+        }
+    };
+    let mut headers = HeaderMap::new();
+    insert_default_response_headers(&mut headers);
+    insert_content_type(&mut headers, DEFAULT_CONTENT_TYPE);
+    insert_offset(&mut headers, response.next_offset);
+    insert_u64_header(
+        &mut headers,
+        HEADER_URSULA_REDUCER_VERSION,
+        response.reducer_version,
+    );
+    if let Some(record_range) = response.record_range {
+        insert_record_operation_headers(&mut headers, record_range);
+    }
+    (StatusCode::OK, headers, response.response).into_response()
 }
 
 pub(crate) async fn delete_stream(

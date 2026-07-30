@@ -129,6 +129,12 @@ spec:
               mountPath: /tmp
             - name: raft-data
               mountPath: {{ .Values.raft.logDir }}
+            {{- range $index, $module := .Values.reducers.modules }}
+            - name: {{ printf "reducer-%d" $index }}
+              mountPath: {{ printf "/etc/ursula/reducers/%d.wasm" $index }}
+              subPath: module.wasm
+              readOnly: true
+            {{- end }}
       volumes:
         - name: entrypoint
           configMap:
@@ -138,6 +144,14 @@ spec:
           emptyDir: {}
         - name: tmp
           emptyDir: {}
+        {{- range $index, $module := .Values.reducers.modules }}
+        - name: {{ printf "reducer-%d" $index }}
+          configMap:
+            name: {{ $module.configMap.name | quote }}
+            items:
+              - key: {{ $module.configMap.key | quote }}
+                path: module.wasm
+        {{- end }}
         {{- if not .Values.persistence.enabled }}
         - name: raft-data
           emptyDir: {}

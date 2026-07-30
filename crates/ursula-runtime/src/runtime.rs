@@ -19,6 +19,8 @@ use ursula_stream::ColdChunkRef;
 use ursula_stream::ColdFlushCandidate;
 use ursula_stream::ColdGcEntry;
 use ursula_stream::ColdGcTarget;
+#[cfg(feature = "wasm-reducers")]
+use ursula_wasm::ReducerCatalog;
 
 use crate::admission::RaftUncommittedAdmission;
 use crate::admission::RaftUncommittedBytesTracker;
@@ -85,6 +87,10 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
+#[cfg(feature = "wasm-reducers")]
+use crate::request::ReduceRequest;
+#[cfg(feature = "wasm-reducers")]
+use crate::request::ReduceResponse;
 use crate::request::SetBucketQuotaRequest;
 use crate::request::SetBucketQuotaResponse;
 use crate::request::UpdateStreamAttrsRequest;
@@ -107,6 +113,8 @@ pub struct RuntimeConfig {
     /// before in-memory queues grow unbounded.
     pub raft_max_uncommitted_bytes_per_group: Option<u64>,
     pub live_read_max_waiters_per_core: Option<u64>,
+    #[cfg(feature = "wasm-reducers")]
+    pub reducer_catalog: Option<Arc<ReducerCatalog>>,
 }
 
 impl RuntimeConfig {
@@ -123,6 +131,8 @@ impl RuntimeConfig {
             cold_max_hot_bytes_per_group: None,
             raft_max_uncommitted_bytes_per_group: None,
             live_read_max_waiters_per_core: Some(65_536),
+            #[cfg(feature = "wasm-reducers")]
+            reducer_catalog: None,
         }
     }
 
@@ -138,6 +148,12 @@ impl RuntimeConfig {
 
     pub fn with_live_read_max_waiters_per_core(mut self, value: Option<u64>) -> Self {
         self.live_read_max_waiters_per_core = value;
+        self
+    }
+
+    #[cfg(feature = "wasm-reducers")]
+    pub fn with_reducer_catalog(mut self, value: Option<Arc<ReducerCatalog>>) -> Self {
+        self.reducer_catalog = value;
         self
     }
 
@@ -223,6 +239,8 @@ impl ShardRuntime {
                 raft_uncommitted_bytes: raft_uncommitted_bytes.clone(),
                 live_read_max_waiters_per_core: config.live_read_max_waiters_per_core,
                 read_materialization: read_materialization.clone(),
+                #[cfg(feature = "wasm-reducers")]
+                reducer_catalog: config.reducer_catalog.clone(),
             };
             spawn_core_worker(config.threading, worker)?;
             mailboxes.push(CoreMailbox { core_id, tx });

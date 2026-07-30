@@ -38,6 +38,11 @@ pub enum StreamResponse {
         deduplicated: bool,
         producer: Option<ProducerRequest>,
     },
+    Reduced {
+        offset: u64,
+        next_offset: u64,
+        reducer_version: u64,
+    },
     Closed {
         next_offset: u64,
         deduplicated: bool,
@@ -118,6 +123,8 @@ pub enum StreamErrorCode {
     InvalidStreamAttrs,
     InvalidRecordBoundaries,
     RecordPreconditionFailed,
+    ReducerModuleMismatch,
+    ReducerVersionMismatch,
     /// A state import targeted a group that already holds buckets or streams.
     ImportConflict,
     /// A state import payload failed snapshot validation.

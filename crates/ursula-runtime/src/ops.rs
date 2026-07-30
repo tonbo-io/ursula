@@ -355,6 +355,14 @@ macro_rules! runtime_operations {
                     admit: append_batch_payload_bytes(&request)
                 }
             }
+            #[cfg(feature = "wasm-reducers")]
+            op Reduce {
+                fields { request: ReduceRequest }
+                reply { response_tx: ReduceResponse }
+                guard { none }
+                handle { actor handle_reduce(request, response_tx) }
+                client { pub stream fn reduce }
+            }
             op SnapshotGroup {
                 fields {}
                 reply { response_tx: GroupSnapshot }

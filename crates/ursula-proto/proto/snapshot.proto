@@ -59,6 +59,13 @@ message StreamSnapshotEntryV1 {
   optional uint64 first_record = 14;
   repeated uint64 record_offsets = 15;
   optional uint64 retained_offset = 16;
+  ReducerStateV1 reducer_state = 17;
+}
+
+message ReducerStateV1 {
+  string module_id = 1;
+  uint64 version = 2;
+  bytes value = 3;
 }
 
 message StreamMetadataV1 {

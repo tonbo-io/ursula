@@ -8,6 +8,7 @@ use ursula_shard::ShardPlacement;
 use ursula_stream::ColdChunkRef;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::ProducerRequest;
+use ursula_stream::ReducerState;
 use ursula_stream::StreamAttrs;
 use ursula_stream::StreamIntegritySnapshot;
 use ursula_stream::StreamReadPlan;
@@ -154,6 +155,61 @@ pub struct UpdateStreamAttrsResponse {
     pub placement: ShardPlacement,
     pub changed: bool,
     pub group_commit_index: u64,
+}
+
+#[cfg(feature = "wasm-reducers")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReduceRequest {
+    pub stream_id: BucketStreamId,
+    pub module_id: String,
+    pub intent: Vec<u8>,
+    pub create_if_missing: bool,
+    pub now_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReducerInputState {
+    pub state: Option<ReducerState>,
+    pub content_type: String,
+    pub next_offset: u64,
+    pub next_record: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyReductionRequest {
+    pub stream_id: BucketStreamId,
+    pub module_id: String,
+    pub expected_version: u64,
+    pub create_if_missing: bool,
+    #[serde(with = "serde_bytes")]
+    pub state: Vec<u8>,
+    pub payload: Bytes,
+    pub now_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyReductionResponse {
+    pub placement: ShardPlacement,
+    pub start_offset: u64,
+    pub next_offset: u64,
+    pub reducer_version: u64,
+    pub group_commit_index: u64,
+    pub record_range: Option<StreamRecordRange>,
+    pub stream_hot_bytes: u64,
+    pub group_hot_bytes: u64,
+}
+
+#[cfg(feature = "wasm-reducers")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReduceResponse {
+    pub placement: ShardPlacement,
+    pub start_offset: u64,
+    pub next_offset: u64,
+    pub reducer_version: u64,
+    pub group_commit_index: u64,
+    pub record_range: Option<StreamRecordRange>,
+    #[serde(with = "serde_bytes")]
+    pub response: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -14,7 +14,9 @@ members = [
     "crates/ursula-observability",
     "crates/ursula-gateway",
     "crates/ursula-index",
+    "crates/ursula-wasm",
 ]
+exclude = ["crates/ursula-wasm/tests/fixtures/reducer-guest"]
 resolver = "3"
 
 [workspace.package]
@@ -56,7 +58,7 @@ opentelemetry = "0.30"
 opentelemetry_sdk = { version = "0.30", features = ["metrics"] }
 opentelemetry-otlp = { version = "0.30", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"] }
 parquet = { version = "59.1.0", default-features = false, features = ["arrow", "async", "zstd"] }
-foyer = { version = "0.22.3", features = ["nightly"] }
+foyer = "0.22.3"
 openraft = { version = "0.10.0-alpha.21", default-features = false, features = ["tokio-rt", "type-alias", "serde"] }
 openraft-rt = "0.10.0-alpha.21"
 pin-project-lite = "0.2"
@@ -87,6 +89,7 @@ tracing = "0.1"
 tracing-opentelemetry = "0.31"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+wasmtime = { version = "47.0.2", default-features = false, features = ["component-model", "cranelift", "pooling-allocator", "runtime", "std"] }
 ursula = { path = "crates/ursula", version = "0.4.1-alpha.2" }
 ursula-config = { path = "crates/ursula-config", version = "0.4.1-alpha.2" }
 ursula-control = { path = "crates/ursula-control", version = "0.4.1-alpha.2" }
@@ -98,6 +101,7 @@ ursula-raft = { path = "crates/ursula-raft", version = "0.4.1-alpha.2" }
 ursula-runtime = { path = "crates/ursula-runtime", version = "0.4.1-alpha.2" }
 ursula-shard = { path = "crates/ursula-shard", version = "0.4.1-alpha.2" }
 ursula-stream = { path = "crates/ursula-stream", version = "0.4.1-alpha.2" }
+ursula-wasm = { path = "crates/ursula-wasm", version = "0.4.1-alpha.2" }
 ursula-observability = { path = "crates/ursula-observability", version = "0.4.1-alpha.2" }
 yaml_serde = "0.10"
 zstd = "0.13"

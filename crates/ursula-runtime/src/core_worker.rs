@@ -145,6 +145,8 @@ pub(crate) struct CoreWorker {
     pub(crate) raft_uncommitted_bytes: SharedRaftUncommittedBytes,
     pub(crate) live_read_max_waiters_per_core: Option<u64>,
     pub(crate) read_materialization: Arc<Semaphore>,
+    #[cfg(feature = "wasm-reducers")]
+    pub(crate) reducer_catalog: Option<Arc<ursula_wasm::ReducerCatalog>>,
 }
 
 #[derive(Clone)]
@@ -370,6 +372,10 @@ impl CoreWorker {
                 cold_write_admission: self.cold_write_admission,
                 live_read_max_waiters_per_core: self.live_read_max_waiters_per_core,
                 read_materialization: self.read_materialization.clone(),
+                #[cfg(feature = "wasm-reducers")]
+                reducer_catalog: self.reducer_catalog.clone(),
+                #[cfg(feature = "wasm-reducers")]
+                reducer_runtime: None,
             };
             crate::rt::spawn(actor.run());
             self.groups.insert(placement.raft_group_id, GroupMailbox {
@@ -427,6 +433,10 @@ impl CoreWorker {
             cold_write_admission: self.cold_write_admission,
             live_read_max_waiters_per_core: self.live_read_max_waiters_per_core,
             read_materialization: self.read_materialization.clone(),
+            #[cfg(feature = "wasm-reducers")]
+            reducer_catalog: self.reducer_catalog.clone(),
+            #[cfg(feature = "wasm-reducers")]
+            reducer_runtime: None,
         };
         crate::rt::spawn(actor.run());
         self.groups.insert(placement.raft_group_id, GroupMailbox {

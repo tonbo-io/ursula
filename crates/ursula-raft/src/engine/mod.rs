@@ -24,6 +24,7 @@ use ursula_runtime::AdvanceRetentionRequest;
 use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
+use ursula_runtime::ApplyReductionRequest;
 use ursula_runtime::BootstrapStreamRequest;
 use ursula_runtime::CloseStreamRequest;
 use ursula_runtime::ColdIndexPageCache;
@@ -41,6 +42,7 @@ use ursula_runtime::GroupAckColdGcFuture;
 use ursula_runtime::GroupAdvanceRetentionFuture;
 use ursula_runtime::GroupAppendBatchFuture;
 use ursula_runtime::GroupAppendFuture;
+use ursula_runtime::GroupApplyReductionFuture;
 use ursula_runtime::GroupBootstrapStreamFuture;
 use ursula_runtime::GroupBucketUsageFuture;
 use ursula_runtime::GroupCloseStreamFuture;
@@ -65,6 +67,7 @@ use ursula_runtime::GroupReadSnapshotFuture;
 use ursula_runtime::GroupReadStreamFuture;
 use ursula_runtime::GroupReadStreamParts;
 use ursula_runtime::GroupReadStreamPartsFuture;
+use ursula_runtime::GroupReducerInputFuture;
 use ursula_runtime::GroupSetBucketQuotaFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
@@ -614,6 +617,26 @@ impl GroupEngine for RaftGroupEngine {
         self.raft.is_leader()
     }
 
+    fn require_local_write_owner<'a>(
+        &'a mut self,
+        _placement: ShardPlacement,
+    ) -> ursula_runtime::GroupRequireLiveReadOwnerFuture<'a> {
+        Box::pin(async move {
+            if self.raft.is_leader() {
+                return Ok(());
+            }
+            let leader_id = self.raft.current_leader().await;
+            let leader_node = self.current_leader_node().await;
+            let self_id = self.raft.metrics().borrow_watched().id;
+            Err(group_engine_forward_to_leader_error(
+                "WebAssembly reducer has to run on the local leader runtime",
+                leader_id,
+                leader_node.as_ref(),
+                self_id,
+            ))
+        })
+    }
+
     fn create_stream<'a>(
         &'a mut self,
         request: CreateStreamRequest,
@@ -851,6 +874,71 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> ursula_runtime::GroupRequireLiveReadOwnerFuture<'a> {
         Box::pin(async move { self.require_local_leader_for_read("live_read").await })
+    }
+
+    fn reducer_input<'a>(
+        &'a mut self,
+        stream_id: BucketStreamId,
+        create_if_missing: bool,
+        placement: ShardPlacement,
+    ) -> GroupReducerInputFuture<'a> {
+        Box::pin(async move {
+            self.require_local_leader_for_read("reducer_input").await?;
+            self.with_state_machine(move |state_machine| {
+                Box::pin(async move {
+                    state_machine
+                        .engine
+                        .reducer_input(stream_id, create_if_missing, placement)
+                        .await
+                })
+            })
+            .await?
+        })
+    }
+
+    fn apply_reduction<'a>(
+        &'a mut self,
+        request: ApplyReductionRequest,
+        _placement: ShardPlacement,
+        admission: ColdWriteAdmission,
+    ) -> GroupApplyReductionFuture<'a> {
+        Box::pin(async move {
+            let command = GroupWriteCommand::from(request.clone());
+            if let Some(response) = self
+                .forward_write_to_leader_if_follower(command.clone())
+                .await?
+            {
+                return match response {
+                    GroupWriteResponse::ApplyReduction(response) => Ok(response),
+                    other => Err(GroupEngineError::new(format!(
+                        "unexpected reducer apply response: {other:?}"
+                    ))),
+                };
+            }
+            if admission.max_hot_bytes_per_group.is_some() {
+                let incoming_bytes =
+                    u64::try_from(request.payload.len()).expect("payload len fits u64");
+                self.with_state_machine({
+                    let stream_id = request.stream_id.clone();
+                    move |state_machine| {
+                        Box::pin(async move {
+                            state_machine.engine.check_cold_write_admission_bytes(
+                                &stream_id,
+                                admission,
+                                incoming_bytes,
+                            )
+                        })
+                    }
+                })
+                .await??;
+            }
+            match self.write(command).await? {
+                GroupWriteResponse::ApplyReduction(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected reducer apply response: {other:?}"
+                ))),
+            }
+        })
     }
 
     fn publish_snapshot<'a>(

@@ -121,6 +121,14 @@ pub(crate) struct ProducerState {
     pub(crate) receipts: Vec<ProducerReceipt>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReducerState {
+    pub module_id: String,
+    pub version: u64,
+    #[serde(with = "serde_bytes")]
+    pub value: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamBatchAppend {
     pub items: Vec<StreamBatchAppendItem>,

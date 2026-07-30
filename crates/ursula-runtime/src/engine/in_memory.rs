@@ -21,6 +21,7 @@ use super::GroupAdvanceRetentionFuture;
 use super::GroupAppendBatchFuture;
 use super::GroupAppendBatchResponse;
 use super::GroupAppendFuture;
+use super::GroupApplyReductionFuture;
 use super::GroupBootstrapStreamFuture;
 use super::GroupBucketUsageFuture;
 use super::GroupCloseStreamFuture;
@@ -46,6 +47,7 @@ use super::GroupPurgeBucketFuture;
 use super::GroupReadSnapshotFuture;
 use super::GroupReadStreamFuture;
 use super::GroupReadStreamPartsFuture;
+use super::GroupReducerInputFuture;
 use super::GroupSetBucketQuotaFuture;
 use super::GroupSnapshotFuture;
 use super::GroupTouchStreamAccessFuture;
@@ -68,6 +70,8 @@ use crate::request::AppendBatchRequest;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
 use crate::request::AppendResponse;
+use crate::request::ApplyReductionRequest;
+use crate::request::ApplyReductionResponse;
 use crate::request::BootstrapStreamRequest;
 use crate::request::BootstrapStreamResponse;
 use crate::request::BootstrapUpdate;
@@ -100,6 +104,7 @@ use crate::request::PurgeBucketResponse;
 use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
+use crate::request::ReducerInputState;
 use crate::request::SetBucketQuotaRequest;
 use crate::request::SetBucketQuotaResponse;
 use crate::request::StreamAppendCount;
@@ -419,6 +424,32 @@ impl InMemoryGroupEngine {
                     closed,
                     deduplicated,
                     producer,
+                    record_range,
+                    stream_hot_bytes,
+                    group_hot_bytes,
+                }))
+            }
+            StreamResponse::Reduced {
+                offset,
+                next_offset,
+                reducer_version,
+            } => {
+                let stream_id = require_response_stream_id(stream_id, "reduced")?;
+                let record_range = self
+                    .state_machine
+                    .record_range_for_append(&stream_id, offset, next_offset, None)
+                    .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?;
+                let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
+                let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
+                let stream_append_count = self.stream_append_counts.entry(stream_id).or_insert(0);
+                self.commit_index = self.commit_index.saturating_add(1);
+                *stream_append_count = stream_append_count.saturating_add(1);
+                Ok(GroupWriteResponse::ApplyReduction(ApplyReductionResponse {
+                    placement,
+                    start_offset: offset,
+                    next_offset,
+                    reducer_version,
+                    group_commit_index: self.commit_index,
                     record_range,
                     stream_hot_bytes,
                     group_hot_bytes,
@@ -1343,6 +1374,61 @@ impl GroupEngine for InMemoryGroupEngine {
         })
     }
 
+    fn reducer_input<'a>(
+        &'a mut self,
+        stream_id: BucketStreamId,
+        create_if_missing: bool,
+        _placement: ShardPlacement,
+    ) -> GroupReducerInputFuture<'a> {
+        Box::pin(async move {
+            let Some(metadata) = self.state_machine.head(&stream_id) else {
+                if create_if_missing {
+                    return Ok(ReducerInputState {
+                        state: None,
+                        content_type: "application/json".to_owned(),
+                        next_offset: 0,
+                        next_record: 0,
+                    });
+                }
+                return Err(GroupEngineError::stream(
+                    StreamErrorCode::StreamNotFound,
+                    format!("stream '{stream_id}' does not exist"),
+                ));
+            };
+            let record_range = self
+                .state_machine
+                .record_range(&stream_id)
+                .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?;
+            Ok(ReducerInputState {
+                state: self.state_machine.reducer_state(&stream_id).cloned(),
+                content_type: metadata.content_type.clone(),
+                next_offset: metadata.tail_offset,
+                next_record: record_range.map_or(0, |range| range.next_record),
+            })
+        })
+    }
+
+    fn apply_reduction<'a>(
+        &'a mut self,
+        request: ApplyReductionRequest,
+        placement: ShardPlacement,
+        admission: ColdWriteAdmission,
+    ) -> GroupApplyReductionFuture<'a> {
+        Box::pin(async move {
+            self.check_cold_write_admission_bytes(
+                &request.stream_id,
+                admission,
+                u64::try_from(request.payload.len()).expect("payload len fits u64"),
+            )?;
+            match self.apply_committed_write(GroupWriteCommand::from(request), placement)? {
+                GroupWriteResponse::ApplyReduction(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected reducer apply response: {other:?}"
+                ))),
+            }
+        })
+    }
+
     fn publish_snapshot<'a>(
         &'a mut self,
         request: PublishSnapshotRequest,
@@ -1973,6 +2059,7 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::Append { stream_id, .. }
         | StreamCommand::AppendExternal { stream_id, .. }
         | StreamCommand::AppendBatch { stream_id, .. }
+        | StreamCommand::ApplyReduction { stream_id, .. }
         | StreamCommand::PublishSnapshot { stream_id, .. }
         | StreamCommand::AdvanceRetention { stream_id, .. }
         | StreamCommand::TouchStreamAccess { stream_id, .. }

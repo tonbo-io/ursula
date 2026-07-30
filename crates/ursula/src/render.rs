@@ -63,6 +63,7 @@ pub(crate) fn runtime_error_status(err: &RuntimeError) -> StatusCode {
         | RuntimeError::SnapshotPlacementMismatch { .. } => StatusCode::BAD_REQUEST,
         RuntimeError::InvalidConfig(_)
         | RuntimeError::ColdStoreConfig { .. }
+        | RuntimeError::ReducerConfig { .. }
         | RuntimeError::StaticMembershipConfig { .. }
         | RuntimeError::ColdStoreIo { .. }
         | RuntimeError::MailboxClosed { .. } => StatusCode::INTERNAL_SERVER_ERROR,
@@ -97,6 +98,9 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         | StreamErrorCode::ProducerSeqConflict
         | StreamErrorCode::ImportConflict => StatusCode::CONFLICT,
         StreamErrorCode::RecordPreconditionFailed => StatusCode::PRECONDITION_FAILED,
+        StreamErrorCode::ReducerModuleMismatch | StreamErrorCode::ReducerVersionMismatch => {
+            StatusCode::CONFLICT
+        }
         StreamErrorCode::ProducerEpochStale => StatusCode::FORBIDDEN,
         StreamErrorCode::OffsetOutOfRange => StatusCode::RANGE_NOT_SATISFIABLE,
         StreamErrorCode::InvalidBucketId

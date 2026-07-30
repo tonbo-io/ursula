@@ -30,6 +30,10 @@ serviceAccount:
   # Keep Kubernetes API tokens out of pods by default.
   automountServiceAccountToken: false
 
+reducers:
+  # Prebuilt WebAssembly components mounted from existing ConfigMaps.
+  modules: []
+
 server:
   # Number of Ursula pods to start for a fresh static-membership cluster.
   # Supported fresh-install values are 1, 3, and 5. Changing this value on an

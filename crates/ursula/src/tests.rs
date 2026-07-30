@@ -4871,6 +4871,101 @@ fn test_router() -> Router {
     )
 }
 
+fn reducer_test_router(component: std::path::PathBuf) -> Router {
+    let mut config = test_config(1, 1);
+    config
+        .reducers
+        .modules
+        .push(ursula_config::ReducerModuleConfig {
+            id: "workflow-test".to_string(),
+            path: component,
+        });
+    router(
+        spawn_runtime(&config, Persistence::InMemory, Topology::SingleNode {
+            raft_group_count: 1,
+        })
+        .expect("runtime")
+        .runtime,
+    )
+}
+
+#[tokio::test]
+#[ignore = "build and componentize the reducer guest fixture first"]
+async fn wasm_reducer_commits_state_and_records_through_http() {
+    let component = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "../ursula-wasm/tests/fixtures/reducer-guest/target/ursula-reducer-test.component.wasm",
+    );
+    let app = reducer_test_router(component);
+    let response = http_put(
+        &app,
+        "/reducers/bootstrap",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    for (intent, expected_sequence, expected_record) in [("first", 1, 0), ("second", 2, 1)] {
+        let response = http_post(
+            &app,
+            "/reducers/run-1/reduce/workflow-test",
+            if expected_sequence == 1 {
+                &[(HEADER_URSULA_REDUCER_CREATE, "true")]
+            } else {
+                &[]
+            },
+            Body::from(intent),
+        )
+        .await;
+        if response.status() != StatusCode::OK {
+            let status = response.status();
+            let body = body_bytes(response).await;
+            panic!(
+                "reducer request failed with {status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        assert_eq!(
+            header_str(&response, HEADER_URSULA_REDUCER_VERSION),
+            expected_sequence.to_string()
+        );
+        assert_eq!(
+            header_str(&response, HEADER_STREAM_RECORD_START),
+            expected_record.to_string()
+        );
+        assert_eq!(
+            header_str(&response, HEADER_STREAM_RECORD_NEXT),
+            expected_sequence.to_string()
+        );
+        let body = body_bytes(response).await;
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).expect("reducer response"),
+            serde_json::json!({"sequence": expected_sequence})
+        );
+    }
+
+    let response = http_get(&app, "/reducers/run-1?record=0&max_records=10").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    let records = std::str::from_utf8(&body)
+        .expect("records utf8")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("record json"))
+        .collect::<Vec<_>>();
+    assert_eq!(records, vec![
+        serde_json::json!({
+            "type": "wasm_transition",
+            "sequence": 1,
+            "intent": "first",
+        }),
+        serde_json::json!({
+            "type": "wasm_transition",
+            "sequence": 2,
+            "intent": "second",
+        }),
+    ]);
+}
+
 #[tokio::test]
 async fn client_router_does_not_serve_cluster_plane_via_grpc_service() {
     // The gRPC path `/ursula.raft.v1.RaftInternal/Append` has the same shape

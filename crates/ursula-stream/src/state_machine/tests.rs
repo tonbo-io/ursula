@@ -147,6 +147,83 @@ fn usage_counts_json_records_and_survives_snapshot_restore() {
     assert_eq!(usage.retained_bytes, 16);
 }
 
+#[test]
+fn reducer_transition_is_atomic_versioned_and_snapshot_persistent() {
+    let mut machine = machine();
+    assert!(matches!(
+        machine.apply(create_cmd(stream("reducer"), Create {
+            content_type: "application/json",
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+
+    let apply = |expected_version, module_id: &str, state: &[u8], payload: &[u8]| {
+        StreamCommand::ApplyReduction {
+            stream_id: stream("reducer"),
+            module_id: module_id.to_owned(),
+            expected_version,
+            create_if_missing: false,
+            state: state.to_vec(),
+            payload: bytes::Bytes::copy_from_slice(payload),
+            now_ms: 7,
+        }
+    };
+    assert_eq!(
+        machine.apply(apply(0, "workflow", b"state-1", b"{\"event\":1}\n")),
+        StreamResponse::Reduced {
+            offset: 0,
+            next_offset: 12,
+            reducer_version: 1,
+        }
+    );
+
+    let committed = machine.snapshot();
+    assert!(matches!(
+        machine.apply(apply(0, "workflow", b"stale", b"{\"event\":2}\n")),
+        StreamResponse::Error {
+            code: StreamErrorCode::ReducerVersionMismatch,
+            ..
+        }
+    ));
+    assert_eq!(
+        machine.snapshot(),
+        committed,
+        "a stale transition changes neither records nor reducer state"
+    );
+    assert!(matches!(
+        machine.apply(apply(1, "other", b"wrong-module", b"{\"event\":2}\n")),
+        StreamResponse::Error {
+            code: StreamErrorCode::ReducerModuleMismatch,
+            ..
+        }
+    ));
+    assert_eq!(
+        machine.snapshot(),
+        committed,
+        "a module mismatch changes neither records nor reducer state"
+    );
+
+    let mut restored =
+        StreamStateMachine::restore(committed).expect("reducer snapshot restores cleanly");
+    assert_eq!(
+        restored.reducer_state(&stream("reducer")),
+        Some(&ReducerState {
+            module_id: "workflow".to_owned(),
+            version: 1,
+            value: b"state-1".to_vec(),
+        })
+    );
+    assert_eq!(
+        restored.apply(apply(1, "workflow", b"state-2", b"{\"event\":2}\n")),
+        StreamResponse::Reduced {
+            offset: 12,
+            next_offset: 24,
+            reducer_version: 2,
+        }
+    );
+}
+
 /// A fresh state machine with the shared `benchcmp` bucket created.
 fn machine() -> StreamStateMachine {
     let mut machine = StreamStateMachine::new();
@@ -1933,6 +2010,7 @@ fn snapshot_entry(
         integrity: empty_integrity(),
         visible_snapshot: None,
         producer_states,
+        reducer_state: None,
     }
 }
 

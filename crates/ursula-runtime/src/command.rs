@@ -10,6 +10,7 @@ use crate::request::AdvanceRetentionRequest;
 use crate::request::AppendBatchRequest;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
+use crate::request::ApplyReductionRequest;
 use crate::request::CloseStreamRequest;
 use crate::request::CompactColdRequest;
 use crate::request::CreateStreamExternalRequest;
@@ -146,6 +147,20 @@ impl From<AppendBatchRequest> for StreamCommand {
     }
 }
 
+impl From<ApplyReductionRequest> for StreamCommand {
+    fn from(request: ApplyReductionRequest) -> Self {
+        Self::ApplyReduction {
+            stream_id: request.stream_id,
+            module_id: request.module_id,
+            expected_version: request.expected_version,
+            create_if_missing: request.create_if_missing,
+            state: request.state,
+            payload: request.payload,
+            now_ms: request.now_ms,
+        }
+    }
+}
+
 impl From<PublishSnapshotRequest> for StreamCommand {
     fn from(request: PublishSnapshotRequest) -> Self {
         Self::PublishSnapshot {
@@ -235,6 +250,7 @@ group_write_from_request!(
     AppendRequest,
     AppendExternalRequest,
     AppendBatchRequest,
+    ApplyReductionRequest,
     PublishSnapshotRequest,
     AdvanceRetentionRequest,
     SetBucketQuotaRequest,

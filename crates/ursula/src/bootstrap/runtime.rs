@@ -16,6 +16,7 @@ use ursula_runtime::snapshot_store_from_config;
 use ursula_runtime::spawn_cold_compaction_worker_if_configured;
 use ursula_runtime::spawn_cold_flush_worker_if_configured;
 use ursula_runtime::spawn_cold_gc_worker_if_configured;
+use ursula_wasm::ReducerCatalog;
 
 use crate::bootstrap::cold_health;
 use crate::bootstrap::commit_stall;
@@ -50,6 +51,29 @@ pub fn spawn_runtime(
             let bytes = s.as_bytes();
             if bytes == 0 { None } else { Some(bytes) }
         });
+    if !config.reducers.modules.is_empty() {
+        let modules = config
+            .reducers
+            .modules
+            .iter()
+            .map(|module| {
+                std::fs::read(&module.path)
+                    .map(|bytes| (module.id.clone(), bytes))
+                    .map_err(|error| RuntimeError::ReducerConfig {
+                        message: format!(
+                            "read reducer module '{}' from '{}': {error}",
+                            module.id,
+                            module.path.display()
+                        ),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let catalog =
+            ReducerCatalog::compile(modules).map_err(|error| RuntimeError::ReducerConfig {
+                message: error.to_string(),
+            })?;
+        runtime_config.reducer_catalog = Some(Arc::new(catalog));
+    }
     let default_voters = if config.raft.peers.is_empty() {
         std::collections::BTreeSet::from([config.raft.node_id])
     } else {

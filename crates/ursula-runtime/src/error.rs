@@ -40,6 +40,8 @@ pub enum RuntimeError {
     EmptyAppend,
     #[error("invalid cold store config: {message}")]
     ColdStoreConfig { message: String },
+    #[error("invalid WebAssembly reducer config: {message}")]
+    ReducerConfig { message: String },
     #[error("invalid static Raft membership config: {message}")]
     StaticMembershipConfig { message: String },
     #[error("cold store IO error: {message}")]

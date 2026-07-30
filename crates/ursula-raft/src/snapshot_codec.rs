@@ -19,6 +19,7 @@ use ursula_stream::ObjectPayloadRef;
 use ursula_stream::ProducerAppendRecord;
 use ursula_stream::ProducerReceipt;
 use ursula_stream::ProducerSnapshot;
+use ursula_stream::ReducerState;
 use ursula_stream::StreamAttrs;
 use ursula_stream::StreamIntegritySnapshot;
 use ursula_stream::StreamMessageRecord;
@@ -279,6 +280,7 @@ fn stream_to_proto(
         first_record,
         record_offsets,
         retained_offset: entry.retained_offset,
+        reducer_state: entry.reducer_state.map(reducer_state_to_proto),
     })
 }
 
@@ -345,7 +347,24 @@ fn stream_from_proto(
             .into_iter()
             .map(producer_from_proto)
             .collect(),
+        reducer_state: entry.reducer_state.map(reducer_state_from_proto),
     })
+}
+
+fn reducer_state_to_proto(state: ReducerState) -> proto::ReducerStateV1 {
+    proto::ReducerStateV1 {
+        module_id: state.module_id,
+        version: state.version,
+        value: state.value.into(),
+    }
+}
+
+fn reducer_state_from_proto(state: proto::ReducerStateV1) -> ReducerState {
+    ReducerState {
+        module_id: state.module_id,
+        version: state.version,
+        value: state.value.to_vec(),
+    }
 }
 
 fn metadata_to_proto(metadata: StreamMetadata) -> proto::StreamMetadataV1 {
@@ -654,6 +673,7 @@ fn required<T>(value: Option<T>, field: &str) -> Result<T, SnapshotStoreError> {
 #[cfg(test)]
 mod tests {
     use ursula_shard::BucketStreamId;
+    use ursula_stream::ReducerState;
 
     use super::*;
 
@@ -705,6 +725,73 @@ mod tests {
 
         let decoded = decode_group_snapshot(&bytes).expect("decode frames");
 
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn reducer_state_round_trips_in_stream_frame() {
+        let mut machine = ursula_stream::StreamStateMachine::new();
+        assert!(matches!(
+            machine.apply(ursula_stream::StreamCommand::CreateBucket {
+                bucket_id: "bucket".to_owned(),
+            }),
+            ursula_stream::StreamResponse::BucketCreated { .. }
+        ));
+        let stream_id = BucketStreamId::new("bucket", "run");
+        assert!(matches!(
+            machine.apply(ursula_stream::StreamCommand::CreateStream {
+                stream_id: stream_id.clone(),
+                content_type: "application/json".to_owned(),
+                initial_payload: bytes::Bytes::new(),
+                close_after: false,
+                stream_seq: None,
+                producer: None,
+                stream_ttl_seconds: None,
+                stream_expires_at_ms: None,
+                attrs: None,
+                now_ms: 0,
+            }),
+            ursula_stream::StreamResponse::Created { .. }
+        ));
+        assert!(matches!(
+            machine.apply(ursula_stream::StreamCommand::ApplyReduction {
+                stream_id,
+                module_id: "workflow".to_owned(),
+                expected_version: 0,
+                create_if_missing: false,
+                state: b"opaque-state".to_vec(),
+                payload: bytes::Bytes::from_static(b"{\"event\":1}\n"),
+                now_ms: 1,
+            }),
+            ursula_stream::StreamResponse::Reduced { .. }
+        ));
+        let snapshot = GroupSnapshot {
+            placement: ShardPlacement {
+                core_id: CoreId(0),
+                shard_id: ShardId(0),
+                raft_group_id: RaftGroupId(7),
+            },
+            group_commit_index: 42,
+            stream_snapshot: machine.snapshot(),
+            stream_append_counts: Vec::new(),
+        };
+
+        let bytes = group_snapshot_frames(snapshot.clone())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("encode frames")
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let decoded = decode_group_snapshot(&bytes).expect("decode frames");
+
+        assert_eq!(
+            decoded.stream_snapshot.streams[0].reducer_state,
+            Some(ReducerState {
+                module_id: "workflow".to_owned(),
+                version: 1,
+                value: b"opaque-state".to_vec(),
+            })
+        );
         assert_eq!(decoded, snapshot);
     }
 

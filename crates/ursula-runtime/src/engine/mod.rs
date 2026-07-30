@@ -28,6 +28,8 @@ use crate::request::AppendBatchRequest;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
 use crate::request::AppendResponse;
+use crate::request::ApplyReductionRequest;
+use crate::request::ApplyReductionResponse;
 use crate::request::BootstrapStreamRequest;
 use crate::request::BootstrapStreamResponse;
 use crate::request::CloseStreamRequest;
@@ -59,6 +61,7 @@ use crate::request::ReadSnapshotRequest;
 use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
+use crate::request::ReducerInputState;
 use crate::request::SetBucketQuotaRequest;
 use crate::request::SetBucketQuotaResponse;
 use crate::request::TouchStreamAccessResponse;
@@ -69,6 +72,10 @@ pub type GroupAppendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AppendResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupAppendBatchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<GroupAppendBatchResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupApplyReductionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ApplyReductionResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupReducerInputFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ReducerInputState, GroupEngineError>> + Send + 'a>>;
 pub type GroupFlushColdFuture<'a> =
     Pin<Box<dyn Future<Output = Result<FlushColdResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupCompactColdFuture<'a> =
@@ -159,6 +166,7 @@ pub enum GroupWriteResponse {
     CreateStream(CreateStreamResponse),
     Append(AppendResponse),
     AppendBatch(GroupAppendBatchResponse),
+    ApplyReduction(ApplyReductionResponse),
     PublishSnapshot(PublishSnapshotResponse),
     AdvanceRetention(AdvanceRetentionResponse),
     SetBucketQuota(SetBucketQuotaResponse),
@@ -177,6 +185,13 @@ pub enum GroupWriteResponse {
 pub trait GroupEngine: Send + 'static {
     fn accepts_local_writes(&self) -> bool {
         true
+    }
+
+    fn require_local_write_owner<'a>(
+        &'a mut self,
+        _placement: ShardPlacement,
+    ) -> GroupRequireLiveReadOwnerFuture<'a> {
+        Box::pin(async { Ok(()) })
     }
 
     fn create_stream<'a>(
@@ -232,6 +247,33 @@ pub trait GroupEngine: Send + 'static {
         request: ReadStreamRequest,
         placement: ShardPlacement,
     ) -> GroupReadStreamFuture<'a>;
+
+    fn reducer_input<'a>(
+        &'a mut self,
+        stream_id: BucketStreamId,
+        _create_if_missing: bool,
+        _placement: ShardPlacement,
+    ) -> GroupReducerInputFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "reducer state read is not supported for stream '{stream_id}'"
+            )))
+        })
+    }
+
+    fn apply_reduction<'a>(
+        &'a mut self,
+        request: ApplyReductionRequest,
+        _placement: ShardPlacement,
+        _admission: ColdWriteAdmission,
+    ) -> GroupApplyReductionFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "reducer apply is not supported for stream '{}'",
+                request.stream_id
+            )))
+        })
+    }
 
     fn read_stream_parts<'a>(
         &'a mut self,
@@ -699,6 +741,30 @@ pub trait GroupEngine: Send + 'static {
                     )
                     .await
                     .map(GroupWriteResponse::AppendBatch),
+                StreamCommand::ApplyReduction {
+                    stream_id,
+                    module_id,
+                    expected_version,
+                    create_if_missing,
+                    state,
+                    payload,
+                    now_ms,
+                } => self
+                    .apply_reduction(
+                        ApplyReductionRequest {
+                            stream_id,
+                            module_id,
+                            expected_version,
+                            create_if_missing,
+                            state,
+                            payload,
+                            now_ms,
+                        },
+                        placement,
+                        ColdWriteAdmission::default(),
+                    )
+                    .await
+                    .map(GroupWriteResponse::ApplyReduction),
                 StreamCommand::PublishSnapshot {
                     stream_id,
                     snapshot_offset,

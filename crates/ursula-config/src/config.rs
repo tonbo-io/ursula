@@ -49,6 +49,21 @@ pub struct UrsulaConfig {
     pub storage: StorageConfig,
     pub governance: GovernanceConfig,
     pub observability: ObservabilityConfig,
+    pub reducers: ReducerConfig,
+}
+
+/// Pure in-process WebAssembly reducer modules loaded at server startup.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReducerConfig {
+    pub modules: Vec<ReducerModuleConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReducerModuleConfig {
+    pub id: String,
+    pub path: PathBuf,
 }
 
 /// HTTP server binding and admission settings.

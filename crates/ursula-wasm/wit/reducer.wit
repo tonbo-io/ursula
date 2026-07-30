@@ -1,0 +1,22 @@
+package tonbo:ursula-reducer@0.1.0;
+
+interface types {
+  record context {
+    bucket: string,
+    stream-id: string,
+    next-offset: u64,
+    next-record: u64,
+    now-ms: u64,
+  }
+
+  record reduction {
+    state: list<u8>,
+    records: list<list<u8>>,
+    response: list<u8>,
+  }
+}
+
+world reducer {
+  use types.{context, reduction};
+  export reduce: func(state: list<u8>, intent: list<u8>, context: context) -> result<reduction, string>;
+}

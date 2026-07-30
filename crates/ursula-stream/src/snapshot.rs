@@ -10,6 +10,7 @@ use crate::model::ColdGcEntry;
 use crate::model::HotPayloadSegment;
 use crate::model::ObjectPayloadRef;
 use crate::model::ProducerSnapshot;
+use crate::model::ReducerState;
 use crate::model::StreamAttrs;
 use crate::model::StreamMessageRecord;
 use crate::model::StreamMetadata;
@@ -57,6 +58,8 @@ pub struct StreamSnapshotEntry {
     pub retained_offset: Option<u64>,
     pub visible_snapshot: Option<StreamVisibleSnapshot>,
     pub producer_states: Vec<ProducerSnapshot>,
+    #[serde(default)]
+    pub reducer_state: Option<ReducerState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

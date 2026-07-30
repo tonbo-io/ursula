@@ -74,6 +74,7 @@ impl StreamStateMachine {
                     retained_offset: Some(slot.retained_offset),
                     visible_snapshot: slot.visible_snapshot.clone(),
                     producer_states,
+                    reducer_state: slot.reducer_state.clone(),
                 }
             })
             .collect::<Vec<_>>();
@@ -235,6 +236,7 @@ impl StreamStateMachine {
                 retained_offset,
                 visible_snapshot,
                 producers: producer_states,
+                reducer_state: entry.reducer_state,
             };
             if machine.insert_stream_slot(slot).is_none() {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));

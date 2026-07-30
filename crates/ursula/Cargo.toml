@@ -52,8 +52,9 @@ ursula-gateway = { workspace = true }
 ursula-index = { workspace = true }
 ursula-observability = { workspace = true, features = ["otlp"] }
 ursula-raft = { workspace = true }
-ursula-runtime = { workspace = true }
+ursula-runtime = { workspace = true, features = ["wasm-reducers"] }
 ursula-shard = { workspace = true }
+ursula-wasm = { workspace = true }
 
 [target.'cfg(madsim)'.dependencies]
 madsim = { workspace = true }

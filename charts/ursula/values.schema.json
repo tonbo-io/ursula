@@ -77,6 +77,47 @@
     }
   ],
   "properties": {
+    "reducers": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "modules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "configMap"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "configMap": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "name",
+                  "key"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "key": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "global": {
       "type": "object",
       "additionalProperties": false,
@@ -1894,6 +1935,7 @@
     "nameOverride",
     "fullnameOverride",
     "serviceAccount",
+    "reducers",
     "server",
     "gateway",
     "indexer",
