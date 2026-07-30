@@ -225,10 +225,15 @@ impl InMemoryGroupEngine {
                     StreamCommand::CompactCold { stream_id, .. } => Some(stream_id.clone()),
                     _ => None,
                 };
-                if let StreamCommand::CreateStream { stream_id, .. }
-                | StreamCommand::CreateExternal { stream_id, .. } = &command
-                {
-                    ensure_bucket_exists(&mut self.state_machine, stream_id)?;
+                match &command {
+                    StreamCommand::CreateStream { stream_id, .. }
+                    | StreamCommand::CreateExternal { stream_id, .. }
+                    | StreamCommand::ApplyReduction {
+                        stream_id,
+                        create_if_missing: true,
+                        ..
+                    } => ensure_bucket_exists(&mut self.state_machine, stream_id)?,
+                    _ => {}
                 }
                 let response = self.state_machine.apply(command);
                 let response = self.group_response_from_stream(

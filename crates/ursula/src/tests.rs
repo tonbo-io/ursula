@@ -4896,14 +4896,6 @@ async fn wasm_reducer_commits_state_and_records_through_http() {
         "../ursula-wasm/tests/fixtures/reducer-guest/target/ursula-reducer-test.component.wasm",
     );
     let app = reducer_test_router(component);
-    let response = http_put(
-        &app,
-        "/reducers/bootstrap",
-        &[(CONTENT_TYPE.as_str(), "application/json")],
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::CREATED);
 
     for (intent, expected_sequence, expected_record) in [("first", 1, 0), ("second", 2, 1)] {
         let response = http_post(
