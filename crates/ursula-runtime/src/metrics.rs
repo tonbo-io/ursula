@@ -24,6 +24,13 @@ pub struct RuntimeMetrics {
     pub(crate) inner: Arc<RuntimeMetricsInner>,
 }
 
+impl RuntimeMetrics {
+    /// Records one aggregate Raft-log pressure snapshot pass.
+    pub fn record_raft_snapshot_pressure(&self, groups: u64) {
+        self.inner.record_raft_snapshot_pressure(groups);
+    }
+}
+
 /// Declares every runtime metric once and expands the four sections that were
 /// previously hand-replicated per metric: the `RuntimeMetricsInner` counter
 /// fields, `RuntimeMetricsInner::new`, the `RuntimeMetrics::snapshot`
@@ -382,6 +389,10 @@ runtime_metrics! {
     counter cold_gc_reclaimed;
     counter cold_gc_errors;
     counter cold_flush_write_errors;
+    counter cold_pressure_flush_passes;
+    counter cold_pressure_flush_candidates;
+    counter raft_snapshot_pressure_passes;
+    counter raft_snapshot_pressure_groups;
     sum cold_hot_bytes: group per_group_cold_hot_bytes;
     // Current largest per-group backlog. Cold-health consumes this gauge and
     // must be able to recover after a flush. The separate per-group `*_max`
@@ -428,6 +439,19 @@ impl RuntimeMetricsInner {
 
     pub(crate) fn record_mailbox_full(&self, core_id: CoreId) {
         self.per_core_mailbox_full_events[usize::from(core_id.0)].fetch_add_relaxed(1);
+    }
+
+    pub(crate) fn cold_hot_bytes(&self) -> u64 {
+        self.per_group_cold_hot_bytes
+            .iter()
+            .map(PaddedAtomicU64::load_relaxed)
+            .sum()
+    }
+
+    pub(crate) fn record_cold_pressure_flush(&self, candidates: usize) {
+        self.cold_pressure_flush_passes.fetch_add_relaxed(1);
+        self.cold_pressure_flush_candidates
+            .fetch_add_relaxed(u64::try_from(candidates).unwrap_or(u64::MAX));
     }
 
     pub(crate) fn record_append(&self, core_id: CoreId, group_id: RaftGroupId) {
@@ -610,6 +634,11 @@ impl RuntimeMetricsInner {
         self.cold_flush_uploads.fetch_add_relaxed(1);
         self.cold_flush_upload_bytes.fetch_add_relaxed(bytes);
         self.cold_flush_upload_ns.fetch_add_relaxed(upload_ns);
+    }
+
+    fn record_raft_snapshot_pressure(&self, groups: u64) {
+        self.raft_snapshot_pressure_passes.fetch_add_relaxed(1);
+        self.raft_snapshot_pressure_groups.fetch_add_relaxed(groups);
     }
 
     pub(crate) fn record_cold_pack(&self, bytes: u64, slices: u64) {
@@ -800,7 +829,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 122] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 126] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -912,6 +941,10 @@ mod metric_manifest_tests {
         "cold_gc_reclaimed",
         "cold_gc_errors",
         "cold_flush_write_errors",
+        "cold_pressure_flush_passes",
+        "cold_pressure_flush_candidates",
+        "raft_snapshot_pressure_passes",
+        "raft_snapshot_pressure_groups",
         "cold_hot_bytes",
         "per_group_cold_hot_bytes",
         "cold_hot_group_bytes_max",

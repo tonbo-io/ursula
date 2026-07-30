@@ -6,11 +6,7 @@ use ursula::server::ServerArgs;
 use ursula_gateway::service::GatewayArgs;
 use ursula_index::service::IndexerArgs;
 
-#[cfg(not(feature = "jemalloc-prof"))]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-#[cfg(feature = "jemalloc-prof")]
+#[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

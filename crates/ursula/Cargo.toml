@@ -10,18 +10,21 @@ readme.workspace = true
 description = "Ursula deployment binary: Durable Streams server, gateway, and event-time indexer."
 
 [features]
-default = ["release-max-info"]
+default = ["jemalloc", "release-max-info"]
 # Compile out trace!/debug! in release builds to keep the hot path free. Drop
 # it (`--no-default-features --features tokio-console`) when using tokio-console.
 release-max-info = ["ursula-observability/release-max-info"]
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]
+jemalloc = [
+    "dep:tikv-jemallocator",
+    "tikv-jemallocator/unprefixed_malloc_on_supported_platforms",
+]
 jemalloc-prof = [
+    "jemalloc",
     "dep:tempfile",
     "dep:tikv-jemalloc-ctl",
-    "dep:tikv-jemallocator",
     "tikv-jemalloc-ctl/profiling",
     "tikv-jemallocator/profiling",
-    "tikv-jemallocator/unprefixed_malloc_on_supported_platforms",
 ]
 
 [dependencies]
@@ -31,7 +34,6 @@ chrono = { workspace = true }
 clap = { workspace = true }
 console-subscriber = { workspace = true, optional = true }
 futures-util = { workspace = true }
-mimalloc = { workspace = true }
 openraft = { workspace = true }
 opentelemetry = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls"] }
