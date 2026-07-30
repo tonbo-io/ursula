@@ -105,23 +105,6 @@ pub fn spawn_cold_flush_worker_if_configured(
     });
 }
 
-#[cfg(test)]
-mod tests {
-    use super::effective_min_hot_bytes;
-
-    #[test]
-    fn pressure_flush_activates_at_the_aggregate_watermark() {
-        assert_eq!(effective_min_hot_bytes(8, 127, 128), (8, false));
-        assert_eq!(effective_min_hot_bytes(8, 128, 128), (1, true));
-        assert_eq!(effective_min_hot_bytes(8, 129, 128), (1, true));
-    }
-
-    #[test]
-    fn zero_pressure_watermark_disables_the_fallback() {
-        assert_eq!(effective_min_hot_bytes(8, u64::MAX, 0), (8, false));
-    }
-}
-
 /// Start the periodic cold-gc worker if the configured interval is non-zero.
 pub fn spawn_cold_gc_worker_if_configured(
     runtime: &ShardRuntime,
@@ -141,4 +124,21 @@ pub fn spawn_cold_gc_worker_if_configured(
             tokio::time::sleep(interval).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_min_hot_bytes;
+
+    #[test]
+    fn pressure_flush_activates_at_the_aggregate_watermark() {
+        assert_eq!(effective_min_hot_bytes(8, 127, 128), (8, false));
+        assert_eq!(effective_min_hot_bytes(8, 128, 128), (1, true));
+        assert_eq!(effective_min_hot_bytes(8, 129, 128), (1, true));
+    }
+
+    #[test]
+    fn zero_pressure_watermark_disables_the_fallback() {
+        assert_eq!(effective_min_hot_bytes(8, u64::MAX, 0), (8, false));
+    }
 }
