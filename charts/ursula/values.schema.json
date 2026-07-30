@@ -144,6 +144,43 @@
       "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
       "description": "Override the full generated release name."
     },
+    "deploymentContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional infrastructure-generated identity and S3 contract checked during Helm rendering.",
+      "properties": {
+        "expectedNamespace": {
+          "type": "string"
+        },
+        "serverServiceAccountName": {
+          "type": "string"
+        },
+        "serverRoleArn": {
+          "type": "string"
+        },
+        "serverS3Prefix": {
+          "type": "string"
+        },
+        "indexerServiceAccountName": {
+          "type": "string"
+        },
+        "indexerRoleArn": {
+          "type": "string"
+        },
+        "indexerS3Prefix": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "expectedNamespace",
+        "serverServiceAccountName",
+        "serverRoleArn",
+        "serverS3Prefix",
+        "indexerServiceAccountName",
+        "indexerRoleArn",
+        "indexerS3Prefix"
+      ]
+    },
     "serviceAccount": {
       "type": "object",
       "description": "ServiceAccount identity for server, gateway, and test pods.",
@@ -1893,6 +1930,7 @@
     "global",
     "nameOverride",
     "fullnameOverride",
+    "deploymentContract",
     "serviceAccount",
     "server",
     "gateway",
