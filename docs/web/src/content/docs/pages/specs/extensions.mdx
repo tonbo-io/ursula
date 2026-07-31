@@ -152,9 +152,41 @@ For example, `/workflow/run-42/journal` and `/workflow/run-42/queue` have the sa
 - Within one bucket, streams with the same `affinity_key` MUST route to the same Raft group.
 - Streams with different affinity keys MAY still share a Raft group. Clients MUST NOT infer isolation, group IDs, or physical placement from different keys.
 - Path affinity changes placement only. It does not by itself make separate HTTP operations atomic.
-- `append-batch`, `attrs`, `bootstrap`, `retention`, and `snapshot` are reserved local stream IDs under an affinity path because those names identify stream subresources on the two-segment form.
+- `$transaction`, `append-batch`, `attrs`, `bootstrap`, `retention`, and `snapshot` are reserved local stream IDs under an affinity path because those names identify affinity-level operations or stream subresources on the two-segment form.
 
 Responses for a stream addressed through the affinity form MUST advertise `path-affinity-v1` in `Stream-Extensions`. Responses for ordinary two-segment stream URLs MUST NOT advertise it merely because the server supports the extension.
+
+### 1.8. Group-local Append Transaction
+
+The `group-append-transaction-v1` extension atomically appends to existing streams that share one path affinity key:
+
+```
+POST /{bucket_id}/{affinity_key}/$transaction
+Content-Type: application/json
+
+{
+  "operations": [
+    {
+      "stream": "journal",
+      "content_type": "application/json",
+      "payload_base64": "eyJ0eXBlIjoic3RlcF9jb21taXR0ZWQifQo=",
+      "record_match": 44
+    },
+    {
+      "stream": "queue",
+      "content_type": "application/json",
+      "payload_base64": "eyJ0eXBlIjoiYWNrIn0K",
+      "record_match": 9
+    }
+  ]
+}
+```
+
+The server MUST commit every operation in one Raft entry or commit none of them. A failed content-type check, producer check, sequence check, record precondition, quota check, closed-stream check, or missing-stream check MUST leave every targeted stream unchanged. The endpoint does not create streams, accept empty append payloads, or coordinate across affinity keys. The first version permits at most 64 operations and a 32 MiB request body.
+
+Each operation accepts `stream`, `content_type`, `payload_base64`, and the optional fields `close_after`, `stream_seq`, `producer`, and `record_match`. `producer` uses the same `producer_id`, `producer_epoch`, and `producer_seq` fields as the producer extension. Payload bytes use standard padded base64 so the transaction envelope can carry arbitrary stream content without JSON reinterpretation.
+
+The response is `200 OK` with a JSON array of append acknowledgements in request order. Any operation failure returns the normal Durable Streams error status for that failure, such as `412 Precondition Failed`, and no operation is visible. Responses MUST advertise both `path-affinity-v1` and `group-append-transaction-v1` in `Stream-Extensions`.
 
 ---
 

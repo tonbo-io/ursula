@@ -21,6 +21,7 @@ use super::GroupAdvanceRetentionFuture;
 use super::GroupAppendBatchFuture;
 use super::GroupAppendBatchResponse;
 use super::GroupAppendFuture;
+use super::GroupAppendTransactionFuture;
 use super::GroupBootstrapStreamFuture;
 use super::GroupBucketUsageFuture;
 use super::GroupCloseStreamFuture;
@@ -68,6 +69,8 @@ use crate::request::AppendBatchRequest;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
 use crate::request::AppendResponse;
+use crate::request::AppendTransactionRequest;
+use crate::request::AppendTransactionResponse;
 use crate::request::BootstrapStreamRequest;
 use crate::request::BootstrapStreamResponse;
 use crate::request::BootstrapUpdate;
@@ -161,7 +164,52 @@ impl InMemoryGroupEngine {
                     .map(|command| self.apply_stream_command(command, placement))
                     .collect(),
             )),
+            GroupWriteCommand::Transaction { commands } => {
+                self.apply_append_transaction(commands, placement)
+            }
         }
+    }
+
+    fn apply_append_transaction(
+        &mut self,
+        commands: Vec<StreamCommand>,
+        placement: ShardPlacement,
+    ) -> Result<GroupWriteResponse, GroupEngineError> {
+        let commit_index = self.commit_index;
+        let mut append_counts = HashMap::new();
+        let mut stream_ids = Vec::with_capacity(commands.len());
+        for command in &commands {
+            let Some(stream_id) = command_stream_id(command) else {
+                return Err(GroupEngineError::new(
+                    "append transaction contains a command without a stream",
+                ));
+            };
+            append_counts.entry(stream_id.clone()).or_insert_with(|| {
+                self.stream_append_counts
+                    .get(&stream_id)
+                    .copied()
+                    .unwrap_or(0)
+            });
+            stream_ids.push(stream_id);
+        }
+        let responses = match self.state_machine.append_transaction(commands) {
+            Ok(responses) => responses,
+            Err(response) => return Err(stream_response_error(response)),
+        };
+        let mut group_responses = Vec::with_capacity(responses.len());
+        for (stream_id, response) in stream_ids.into_iter().zip(responses) {
+            match self.append_response_from_stream(stream_id, response, placement) {
+                Ok(response) => group_responses.push(Ok(GroupWriteResponse::Append(response))),
+                Err(err) => {
+                    self.commit_index = commit_index;
+                    for (stream_id, count) in append_counts {
+                        self.stream_append_counts.insert(stream_id, count);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Ok(GroupWriteResponse::Batch(group_responses))
     }
 
     /// Applies one canonical [`StreamCommand`] to the deterministic state
@@ -831,6 +879,15 @@ impl InMemoryGroupEngine {
             now_ms,
             record_match,
         });
+        self.append_response_from_stream(stream_count_key, response, placement)
+    }
+
+    fn append_response_from_stream(
+        &mut self,
+        stream_id: BucketStreamId,
+        response: StreamResponse,
+        placement: ShardPlacement,
+    ) -> Result<AppendResponse, GroupEngineError> {
         match response {
             StreamResponse::Appended {
                 offset,
@@ -840,23 +897,15 @@ impl InMemoryGroupEngine {
                 producer,
                 ..
             } => {
-                let stream_hot_bytes = self
-                    .state_machine
-                    .hot_payload_len(&stream_count_key)
-                    .unwrap_or(0);
+                let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
                 let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
                 let stream_append_count = self
                     .stream_append_counts
-                    .entry(stream_count_key.clone())
+                    .entry(stream_id.clone())
                     .or_insert(0);
                 let record_range = self
                     .state_machine
-                    .record_range_for_append(
-                        &stream_count_key,
-                        offset,
-                        next_offset,
-                        producer.as_ref(),
-                    )
+                    .record_range_for_append(&stream_id, offset, next_offset, producer.as_ref())
                     .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?;
                 if !deduplicated {
                     self.commit_index += 1;
@@ -1678,6 +1727,50 @@ impl GroupEngine for InMemoryGroupEngine {
                     "unexpected append write response: {other:?}"
                 ))),
             }
+        })
+    }
+
+    fn append_transaction<'a>(
+        &'a mut self,
+        request: AppendTransactionRequest,
+        placement: ShardPlacement,
+        admission: ColdWriteAdmission,
+    ) -> GroupAppendTransactionFuture<'a> {
+        Box::pin(async move {
+            let Some(first) = request.operations.first() else {
+                return Err(GroupEngineError::new(
+                    "append transaction must contain at least one operation",
+                ));
+            };
+            self.check_cold_write_admission_bytes(
+                &first.stream_id,
+                admission,
+                request.payload_bytes(),
+            )?;
+            let command = GroupWriteCommand::Transaction {
+                commands: request
+                    .operations
+                    .into_iter()
+                    .map(StreamCommand::from)
+                    .collect(),
+            };
+            let GroupWriteResponse::Batch(items) =
+                self.apply_committed_write(command, placement)?
+            else {
+                return Err(GroupEngineError::new(
+                    "unexpected append transaction write response",
+                ));
+            };
+            let items = items
+                .into_iter()
+                .map(|item| match item? {
+                    GroupWriteResponse::Append(response) => Ok(response),
+                    other => Err(GroupEngineError::new(format!(
+                        "unexpected append transaction item response: {other:?}"
+                    ))),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(AppendTransactionResponse { placement, items })
         })
     }
 

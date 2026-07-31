@@ -96,6 +96,14 @@ impl HotBuffer {
         });
     }
 
+    pub(super) fn append_checkpoint(&self) -> usize {
+        self.chunks.len()
+    }
+
+    pub(super) fn rollback_appends(&mut self, checkpoint: usize) {
+        self.chunks.truncate(checkpoint);
+    }
+
     pub(super) fn plan_cold_flush_from(
         &self,
         from_offset: u64,

@@ -32,6 +32,7 @@ use serde_json::json;
 use ursula_control::ControlCommand;
 use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendRequest;
+use ursula_runtime::AppendTransactionRequest;
 use ursula_runtime::CloseStreamRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
@@ -1974,6 +1975,84 @@ async fn raft_group_engine_applies_batched_runtime_writes() {
         .await
         .expect("read batched write");
     assert_eq!(read.payload, b"abcd");
+    engine.shutdown().await.expect("shutdown raft group engine");
+}
+
+#[tokio::test]
+async fn raft_group_engine_commits_append_transaction_as_one_entry_and_rolls_back_failures() {
+    let mut engine = RaftGroupEngine::new_single_node(placement())
+        .await
+        .expect("create raft group engine");
+    let journal =
+        ursula_shard::BucketStreamId::with_affinity("benchcmp", "run-42", "transaction-journal");
+    let queue =
+        ursula_shard::BucketStreamId::with_affinity("benchcmp", "run-42", "transaction-queue");
+    for stream_id in [&journal, &queue] {
+        engine
+            .create_stream(
+                CreateStreamRequest::new(stream_id.clone(), "application/octet-stream"),
+                placement(),
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("create transaction stream");
+    }
+    let before_log_index = engine
+        .raft_handle()
+        .metrics()
+        .borrow_watched()
+        .last_log_index
+        .expect("stream creates append raft entries");
+
+    let response = engine
+        .append_transaction(
+            AppendTransactionRequest {
+                operations: vec![
+                    AppendRequest::from_bytes(journal.clone(), b"journal".to_vec()),
+                    AppendRequest::from_bytes(queue.clone(), b"queue".to_vec()),
+                ],
+            },
+            placement(),
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("append transaction");
+    assert_eq!(response.items.len(), 2);
+    let after_log_index = engine
+        .raft_handle()
+        .metrics()
+        .borrow_watched()
+        .last_log_index
+        .expect("transaction appends a raft entry");
+    assert_eq!(after_log_index, before_log_index + 1);
+
+    let mut incompatible = AppendRequest::from_bytes(queue.clone(), b"rejected".to_vec());
+    incompatible.content_type = "text/plain".to_owned();
+    let error = engine
+        .append_transaction(
+            AppendTransactionRequest {
+                operations: vec![
+                    AppendRequest::from_bytes(journal.clone(), b"rolled-back".to_vec()),
+                    incompatible,
+                ],
+            },
+            placement(),
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect_err("content type mismatch aborts transaction");
+    assert_eq!(error.code(), Some(StreamErrorCode::ContentTypeMismatch));
+
+    let journal_read = engine
+        .read_stream(read_req(journal, 64), placement())
+        .await
+        .expect("read journal");
+    let queue_read = engine
+        .read_stream(read_req(queue, 64), placement())
+        .await
+        .expect("read queue");
+    assert_eq!(journal_read.payload, b"journal");
+    assert_eq!(queue_read.payload, b"queue");
     engine.shutdown().await.expect("shutdown raft group engine");
 }
 

@@ -59,6 +59,8 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
 use axum::routing::put;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 pub use bootstrap::Persistence;
 pub use bootstrap::SpawnedRuntime;
 pub use bootstrap::Topology;
@@ -90,6 +92,7 @@ use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::AppendResponse;
+use ursula_runtime::AppendTransactionRequest;
 use ursula_runtime::BootstrapStreamRequest;
 use ursula_runtime::CloseStreamRequest;
 use ursula_runtime::CreateStreamExternalRequest;
@@ -185,6 +188,7 @@ const HEADER_STREAM_TTL: &str = "stream-ttl";
 const HEADER_STREAM_UP_TO_DATE: &str = "stream-up-to-date";
 const JSON_RECORD_COORDINATES_EXTENSION: &str = "json-record-coordinates-v1";
 const PATH_AFFINITY_EXTENSION: &str = "path-affinity-v1";
+const GROUP_APPEND_TRANSACTION_EXTENSION: &str = "group-append-transaction-v1";
 const HEADER_PRODUCER_ID: &str = "producer-id";
 const HEADER_PRODUCER_EPOCH: &str = "producer-epoch";
 const HEADER_PRODUCER_SEQ: &str = "producer-seq";
@@ -215,6 +219,34 @@ pub(crate) struct StreamPath {
     #[serde(default)]
     affinity: Option<String>,
     stream: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct AffinityPath {
+    bucket: String,
+    affinity: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AppendTransactionHttpRequest {
+    operations: Vec<AppendTransactionHttpOperation>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AppendTransactionHttpOperation {
+    stream: String,
+    content_type: String,
+    payload_base64: String,
+    #[serde(default)]
+    close_after: bool,
+    #[serde(default)]
+    stream_seq: Option<String>,
+    #[serde(default)]
+    producer: Option<ProducerRequest>,
+    #[serde(default)]
+    record_match: Option<u64>,
 }
 
 impl StreamPath {
@@ -1015,12 +1047,25 @@ async fn ingress_admission_middleware(
 }
 
 async fn path_affinity_extension_middleware(request: Request<Body>, next: Next) -> Response {
-    let affinity_path = is_path_affinity_uri(request.uri());
+    let transaction_path = is_group_append_transaction_uri(request.uri());
+    let affinity_path = transaction_path || is_path_affinity_uri(request.uri());
     let mut response = next.run(request).await;
     if affinity_path {
         insert_extension_token(response.headers_mut(), PATH_AFFINITY_EXTENSION);
     }
+    if transaction_path {
+        insert_extension_token(response.headers_mut(), GROUP_APPEND_TRANSACTION_EXTENSION);
+    }
     response
+}
+
+fn is_group_append_transaction_uri(uri: &Uri) -> bool {
+    let segments = uri
+        .path()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    matches!(segments.as_slice(), [bucket, _affinity, "$transaction"] if !bucket.starts_with("__ursula"))
 }
 
 fn is_path_affinity_uri(uri: &Uri) -> bool {
@@ -1203,6 +1248,10 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
                 .head(head_stream),
         )
         .route("/{bucket}/{stream}/append-batch", post(append_batch))
+        .route(
+            "/{bucket}/{affinity}/$transaction",
+            post(append_transaction),
+        )
         .route(
             "/{bucket}/{affinity}/{stream}/snapshot",
             get(read_latest_snapshot).put(publish_snapshot_at_record),
@@ -2462,6 +2511,94 @@ pub(crate) async fn append_batch(
     insert_content_type(&mut headers, "application/json");
     let body = render_batch_results(&response.items);
     (StatusCode::OK, headers, body).into_response()
+}
+
+#[tracing::instrument(
+    name = "http.append_transaction",
+    skip_all,
+    fields(bucket = %path.bucket, affinity = %path.affinity, bytes = body.len()),
+)]
+pub(crate) async fn append_transaction(
+    State(state): State<HttpState>,
+    OriginalUri(uri): OriginalUri,
+    Path(path): Path<AffinityPath>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !render::is_json_content_type(&request_content_type(&headers)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "append transaction body must be application/json",
+        )
+            .into_response();
+    }
+    let transaction = match serde_json::from_slice::<AppendTransactionHttpRequest>(&body) {
+        Ok(transaction) => transaction,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("invalid append transaction JSON: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let now_ms = state.unix_time_ms();
+    let mut operations = Vec::with_capacity(transaction.operations.len());
+    for operation in transaction.operations {
+        let payload = match BASE64_STANDARD.decode(operation.payload_base64) {
+            Ok(payload) => Bytes::from(payload),
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid payload_base64 for '{}': {err}", operation.stream),
+                )
+                    .into_response();
+            }
+        };
+        let payload = match normalize_http_write_payload(&operation.content_type, payload, false) {
+            Ok(payload) => payload,
+            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        };
+        operations.push(AppendRequest {
+            stream_id: BucketStreamId::with_affinity(
+                path.bucket.clone(),
+                path.affinity.clone(),
+                operation.stream,
+            ),
+            content_type: operation.content_type,
+            payload,
+            close_after: operation.close_after,
+            stream_seq: operation.stream_seq,
+            producer: operation.producer,
+            now_ms,
+            record_match: operation.record_match,
+        });
+    }
+    let response = match state
+        .runtime
+        .append_transaction(AppendTransactionRequest { operations })
+        .await
+    {
+        Ok(response) => response,
+        Err(err) => {
+            return runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri))
+                .await;
+        }
+    };
+    let body = match serde_json::to_vec(&response.items) {
+        Ok(body) => body,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("render append transaction JSON: {err}"),
+            )
+                .into_response();
+        }
+    };
+    let mut response_headers = HeaderMap::new();
+    insert_default_response_headers(&mut response_headers);
+    insert_content_type(&mut response_headers, "application/json");
+    (StatusCode::OK, response_headers, body).into_response()
 }
 
 pub(crate) async fn delete_stream(

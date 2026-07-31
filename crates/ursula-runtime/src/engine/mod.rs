@@ -28,6 +28,8 @@ use crate::request::AppendBatchRequest;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
 use crate::request::AppendResponse;
+use crate::request::AppendTransactionRequest;
+use crate::request::AppendTransactionResponse;
 use crate::request::BootstrapStreamRequest;
 use crate::request::BootstrapStreamResponse;
 use crate::request::CloseStreamRequest;
@@ -69,6 +71,8 @@ pub type GroupAppendFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AppendResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupAppendBatchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<GroupAppendBatchResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupAppendTransactionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<AppendTransactionResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupFlushColdFuture<'a> =
     Pin<Box<dyn Future<Output = Result<FlushColdResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupCompactColdFuture<'a> =
@@ -453,6 +457,19 @@ pub trait GroupEngine: Send + 'static {
         })
     }
 
+    fn append_transaction<'a>(
+        &'a mut self,
+        _request: AppendTransactionRequest,
+        _placement: ShardPlacement,
+        _admission: ColdWriteAdmission,
+    ) -> GroupAppendTransactionFuture<'a> {
+        Box::pin(async {
+            Err(GroupEngineError::new(
+                "append transactions are not supported by this group engine",
+            ))
+        })
+    }
+
     fn flush_cold<'a>(
         &'a mut self,
         request: FlushColdRequest,
@@ -547,6 +564,9 @@ pub trait GroupEngine: Send + 'static {
                         }
                         Ok(GroupWriteResponse::Batch(batched))
                     }
+                    GroupWriteCommand::Transaction { .. } => Err(GroupEngineError::new(
+                        "append transactions require an atomic group engine",
+                    )),
                 };
                 responses.push(response);
             }

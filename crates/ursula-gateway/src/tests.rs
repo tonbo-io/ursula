@@ -207,6 +207,7 @@ fn stream_affinity_key_ignores_subresource_and_internal_routes() {
 fn stream_affinity_key_uses_the_middle_path_segment() {
     let journal: Uri = "/bucket/run-42/journal".parse().expect("uri");
     let queue: Uri = "/bucket/run-42/queue/append-batch".parse().expect("uri");
+    let transaction: Uri = "/bucket/run-42/$transaction".parse().expect("uri");
     let unrelated: Uri = "/bucket/run-43/queue".parse().expect("uri");
 
     assert_eq!(
@@ -218,6 +219,10 @@ fn stream_affinity_key_uses_the_middle_path_segment() {
     assert_eq!(
         stream_affinity_key(&journal, Some(&shard_map)),
         stream_affinity_key(&queue, Some(&shard_map))
+    );
+    assert_eq!(
+        stream_affinity_key(&journal, Some(&shard_map)),
+        stream_affinity_key(&transaction, Some(&shard_map))
     );
     assert_ne!(
         stream_affinity_key(&journal, None),
@@ -402,6 +407,12 @@ fn request_classifier_maps_durable_stream_routes_to_bucket_resources() {
             "/owner-a/run-42/journal/retention?record=3",
             Action::Update,
             Some("run-42/journal"),
+        ),
+        (
+            "POST",
+            "/owner-a/run-42/$transaction",
+            Action::Append,
+            Some("run-42/$transaction"),
         ),
     ];
 

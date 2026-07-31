@@ -275,7 +275,9 @@ pub(crate) async fn write_commands_on_raft(
 
 pub(crate) fn logical_group_write_command_count(command: &GroupWriteCommand) -> usize {
     match command {
-        GroupWriteCommand::Batch { commands } => commands.len(),
+        GroupWriteCommand::Batch { commands } | GroupWriteCommand::Transaction { commands } => {
+            commands.len()
+        }
         GroupWriteCommand::Stream(_) => 1,
     }
 }

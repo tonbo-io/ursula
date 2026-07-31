@@ -614,6 +614,79 @@ fn producer(id: &str, epoch: u64, seq: u64) -> ProducerRequest {
     }
 }
 
+#[test]
+fn append_transaction_rolls_back_every_stream_on_precondition_failure() {
+    let mut machine = machine();
+    let first = BucketStreamId::with_affinity("benchcmp", "run-42", "journal");
+    let second = BucketStreamId::with_affinity("benchcmp", "run-42", "queue");
+    for stream_id in [&first, &second] {
+        assert!(matches!(
+            machine.apply(create_cmd(stream_id.clone(), Create {
+                content_type: "application/json",
+                ..Create::default()
+            })),
+            StreamResponse::Created { .. }
+        ));
+    }
+    let before = machine.snapshot();
+    let first_append = StreamCommand::Append {
+        stream_id: first.clone(),
+        content_type: Some("application/json".to_owned()),
+        payload: bytes::Bytes::from_static(b"{\"event\":1}\n"),
+        close_after: false,
+        stream_seq: None,
+        producer: None,
+        now_ms: 0,
+        record_match: Some(0),
+    };
+    let second_append = StreamCommand::Append {
+        stream_id: second.clone(),
+        content_type: Some("application/json".to_owned()),
+        payload: bytes::Bytes::from_static(b"{\"event\":2}\n"),
+        close_after: false,
+        stream_seq: None,
+        producer: None,
+        now_ms: 0,
+        record_match: Some(1),
+    };
+
+    let error = machine
+        .append_transaction(vec![first_append, second_append])
+        .expect_err("stale record match must abort the transaction");
+
+    assert!(matches!(error, StreamResponse::Error {
+        code: StreamErrorCode::RecordPreconditionFailed,
+        ..
+    }));
+    assert_eq!(machine.snapshot(), before);
+    assert_eq!(machine.head(&first).expect("first stream").tail_offset, 0);
+    assert_eq!(machine.head(&second).expect("second stream").tail_offset, 0);
+}
+
+#[test]
+fn append_transaction_commits_all_streams_together() {
+    let mut machine = machine();
+    let first = BucketStreamId::with_affinity("benchcmp", "run-42", "journal");
+    let second = BucketStreamId::with_affinity("benchcmp", "run-42", "queue");
+    for stream_id in [&first, &second] {
+        assert!(matches!(
+            machine.apply(create_cmd(stream_id.clone(), Create::default())),
+            StreamResponse::Created { .. }
+        ));
+    }
+
+    let responses = machine
+        .append_transaction(vec![
+            append_cmd(first.clone(), b"journal", Append::default()),
+            append_cmd(second.clone(), b"queue", Append::default()),
+        ])
+        .expect("transaction commits");
+
+    assert_eq!(responses.len(), 2);
+    assert_eq!(machine.head(&first).expect("first stream").tail_offset, 7);
+    assert_eq!(machine.head(&second).expect("second stream").tail_offset, 5);
+}
+
 fn empty_integrity() -> StreamIntegritySnapshot {
     let empty = setsum::Setsum::default().hexdigest();
     StreamIntegritySnapshot {
