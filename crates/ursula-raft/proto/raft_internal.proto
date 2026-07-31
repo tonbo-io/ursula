@@ -115,6 +115,7 @@ message GroupReadRequestV1 {
     ReadStreamReadV1 read_stream = 8;
     GetStreamAttrsReadV1 get_stream_attrs = 9;
   }
+  optional string affinity_key = 10;
 }
 
 message HeadStreamReadV1 {}

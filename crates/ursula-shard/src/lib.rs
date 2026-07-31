@@ -12,16 +12,28 @@ pub struct ShardId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct RaftGroupId(pub u32);
 
-/// Stable two-level resource identity.
+/// Returns whether a local stream ID collides with a two-segment stream
+/// subresource when used in the three-segment path-affinity form.
+pub fn is_reserved_affinity_stream_id(stream_id: &str) -> bool {
+    matches!(
+        stream_id,
+        "append-batch" | "attrs" | "bootstrap" | "retention" | "snapshot"
+    )
+}
+
+/// Stable resource identity with optional path affinity.
 ///
 /// `bucket_id` is the top-level namespace and logical tenant boundary;
-/// `stream_id` identifies one Durable Stream inside that namespace. Hosted
-/// deployments keep tenant membership and bucket visibility policy outside the
-/// replicated stream state.
+/// `stream_id` identifies one Durable Stream inside that namespace. When
+/// `affinity_key` is present, every stream with the same bucket and affinity
+/// hashes to the same Raft group. Hosted deployments keep tenant membership and
+/// bucket visibility policy outside the replicated stream state.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BucketStreamId {
     pub bucket_id: String,
     pub stream_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity_key: Option<String>,
 }
 
 impl BucketStreamId {
@@ -29,6 +41,19 @@ impl BucketStreamId {
         Self {
             bucket_id: bucket_id.into(),
             stream_id: stream_id.into(),
+            affinity_key: None,
+        }
+    }
+
+    pub fn with_affinity(
+        bucket_id: impl Into<String>,
+        affinity_key: impl Into<String>,
+        stream_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            bucket_id: bucket_id.into(),
+            stream_id: stream_id.into(),
+            affinity_key: Some(affinity_key.into()),
         }
     }
 }
@@ -38,6 +63,7 @@ impl From<BucketStreamId> for ursula_proto::BucketStreamIdV1 {
         Self {
             bucket_id: stream_id.bucket_id,
             stream_id: stream_id.stream_id,
+            affinity_key: stream_id.affinity_key,
         }
     }
 }
@@ -47,6 +73,7 @@ impl From<&BucketStreamId> for ursula_proto::BucketStreamIdV1 {
         Self {
             bucket_id: stream_id.bucket_id.clone(),
             stream_id: stream_id.stream_id.clone(),
+            affinity_key: stream_id.affinity_key.clone(),
         }
     }
 }
@@ -56,13 +83,18 @@ impl From<ursula_proto::BucketStreamIdV1> for BucketStreamId {
         Self {
             bucket_id: stream_id.bucket_id,
             stream_id: stream_id.stream_id,
+            affinity_key: stream_id.affinity_key,
         }
     }
 }
 
 impl fmt::Display for BucketStreamId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.bucket_id, self.stream_id)
+        if let Some(affinity_key) = &self.affinity_key {
+            write!(f, "{}/{affinity_key}/{}", self.bucket_id, self.stream_id)
+        } else {
+            write!(f, "{}/{}", self.bucket_id, self.stream_id)
+        }
     }
 }
 
@@ -118,7 +150,7 @@ impl StaticShardMap {
     }
 
     pub fn locate(&self, stream_id: &BucketStreamId) -> ShardPlacement {
-        let hash = fnv1a64_stream_id(stream_id);
+        let hash = fnv1a64_routing_key(stream_id);
         let raft_group = (hash % u64::from(self.raft_group_count)) as u32;
         let core = (u64::from(raft_group) % u64::from(self.core_count)) as u16;
         ShardPlacement {
@@ -129,7 +161,7 @@ impl StaticShardMap {
     }
 }
 
-fn fnv1a64_stream_id(stream_id: &BucketStreamId) -> u64 {
+fn fnv1a64_routing_key(stream_id: &BucketStreamId) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -140,7 +172,11 @@ fn fnv1a64_stream_id(stream_id: &BucketStreamId) -> u64 {
     }
     hash ^= u64::from(b'/');
     hash = hash.wrapping_mul(PRIME);
-    for byte in stream_id.stream_id.as_bytes() {
+    let local_routing_key = stream_id
+        .affinity_key
+        .as_deref()
+        .unwrap_or(&stream_id.stream_id);
+    for byte in local_routing_key.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(PRIME);
     }
@@ -172,12 +208,36 @@ mod tests {
 
     #[test]
     fn bucket_stream_id_round_trips_through_shared_proto() {
-        let stream = BucketStreamId::new("agents", "session-42");
+        let stream = BucketStreamId::with_affinity("agents", "run-42", "queue");
         let proto = ursula_proto::BucketStreamIdV1::from(&stream);
 
         assert_eq!(proto.bucket_id, "agents");
-        assert_eq!(proto.stream_id, "session-42");
+        assert_eq!(proto.affinity_key.as_deref(), Some("run-42"));
+        assert_eq!(proto.stream_id, "queue");
         assert_eq!(BucketStreamId::from(proto), stream);
+    }
+
+    #[test]
+    fn affinity_routes_sibling_streams_to_the_same_group() {
+        let map = StaticShardMap::new(4, 64).expect("valid shard map");
+        let journal = BucketStreamId::with_affinity("agents", "run-42", "journal");
+        let queue = BucketStreamId::with_affinity("agents", "run-42", "queue");
+
+        assert_ne!(journal, queue);
+        assert_eq!(map.locate(&journal), map.locate(&queue));
+    }
+
+    #[test]
+    fn streams_without_affinity_remain_independently_distributed() {
+        let map = StaticShardMap::new(4, 64).expect("valid shard map");
+        let first = BucketStreamId::new("agents", "run-42-journal");
+        let first_placement = map.locate(&first);
+        let second = (0..10_000)
+            .map(|index| BucketStreamId::new("agents", format!("stream-{index}")))
+            .find(|stream| map.locate(stream) != first_placement)
+            .expect("independent streams reach another placement");
+
+        assert_ne!(map.locate(&first), map.locate(&second));
     }
 
     #[test]

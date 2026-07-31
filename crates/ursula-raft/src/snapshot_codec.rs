@@ -692,6 +692,7 @@ mod tests {
                 stream_id: BucketStreamId {
                     bucket_id: "bucket".to_owned(),
                     stream_id: "stream".to_owned(),
+                    affinity_key: None,
                 },
                 append_count: 3,
             }],

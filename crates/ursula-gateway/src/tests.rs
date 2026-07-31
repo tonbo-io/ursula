@@ -204,6 +204,34 @@ fn stream_affinity_key_ignores_subresource_and_internal_routes() {
 }
 
 #[test]
+fn stream_affinity_key_uses_the_middle_path_segment() {
+    let journal: Uri = "/bucket/run-42/journal".parse().expect("uri");
+    let queue: Uri = "/bucket/run-42/queue/append-batch".parse().expect("uri");
+    let unrelated: Uri = "/bucket/run-43/queue".parse().expect("uri");
+
+    assert_eq!(
+        stream_affinity_key(&journal, None).as_deref(),
+        Some("/bucket/run-42/journal")
+    );
+
+    let shard_map = StaticShardMap::new(1, 64).expect("valid shard map");
+    assert_eq!(
+        stream_affinity_key(&journal, Some(&shard_map)),
+        stream_affinity_key(&queue, Some(&shard_map))
+    );
+    assert_ne!(
+        stream_affinity_key(&journal, None),
+        stream_affinity_key(&unrelated, None)
+    );
+
+    let ungrouped_snapshot: Uri = "/bucket/run-42/snapshot/0001".parse().expect("uri");
+    assert_eq!(
+        stream_affinity_key(&ungrouped_snapshot, None).as_deref(),
+        Some("/bucket/run-42")
+    );
+}
+
+#[test]
 fn group_affinity_key_is_shared_by_streams_in_the_same_group() {
     let shard_map = StaticShardMap::new(1, 16).expect("valid shard map");
     let first: Uri = "/bucket/stream-1".parse().expect("uri");
@@ -350,6 +378,30 @@ fn request_classifier_maps_durable_stream_routes_to_bucket_resources() {
             "/owner-a/orders/snapshot/42",
             Action::PublishSnapshot,
             Some("orders"),
+        ),
+        (
+            "POST",
+            "/owner-a/run-42/queue",
+            Action::Append,
+            Some("run-42/queue"),
+        ),
+        (
+            "GET",
+            "/owner-a/run-42/journal?record=now&live=sse",
+            Action::Tail,
+            Some("run-42/journal"),
+        ),
+        (
+            "PUT",
+            "/owner-a/run-42/journal/snapshot/42",
+            Action::PublishSnapshot,
+            Some("run-42/journal"),
+        ),
+        (
+            "PUT",
+            "/owner-a/run-42/journal/retention?record=3",
+            Action::Update,
+            Some("run-42/journal"),
         ),
     ];
 

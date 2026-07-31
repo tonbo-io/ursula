@@ -151,6 +151,7 @@ pub(crate) async fn forward_group_read_to_leader(
         stream_id: stream_id.stream_id,
         now_ms,
         read: Some(read),
+        affinity_key: stream_id.affinity_key,
     });
     // Carry this request's trace context to the leader so the forwarded read
     // joins the originating trace. No-op when no propagator is installed.

@@ -47,6 +47,7 @@ use tracing::debug;
 use tracing::error;
 use ursula_shard::BucketStreamId;
 use ursula_shard::StaticShardMap;
+use ursula_shard::is_reserved_affinity_stream_id;
 
 pub mod admission;
 pub mod auth;
@@ -662,15 +663,24 @@ impl Gateway {
 fn stream_affinity_key(uri: &Uri, shard_map: Option<&StaticShardMap>) -> Option<String> {
     let mut segments = uri.path().split('/').filter(|segment| !segment.is_empty());
     let bucket = percent_decode_str(segments.next()?).decode_utf8().ok()?;
-    let stream = percent_decode_str(segments.next()?).decode_utf8().ok()?;
+    let second = percent_decode_str(segments.next()?).decode_utf8().ok()?;
     if bucket.starts_with("__ursula") {
         return None;
     }
+    let third = segments
+        .next()
+        .and_then(|segment| percent_decode_str(segment).decode_utf8().ok());
+    let stream_id = match third {
+        Some(stream) if !is_reserved_affinity_stream_id(stream.as_ref()) => {
+            BucketStreamId::with_affinity(bucket.as_ref(), second.as_ref(), stream.as_ref())
+        }
+        _ => BucketStreamId::new(bucket.as_ref(), second.as_ref()),
+    };
     if let Some(shard_map) = shard_map {
-        let placement = shard_map.locate(&BucketStreamId::new(bucket, stream));
+        let placement = shard_map.locate(&stream_id);
         return Some(format!("group:{}", placement.raft_group_id.0));
     }
-    Some(format!("/{bucket}/{stream}"))
+    Some(format!("/{stream_id}"))
 }
 
 /// Per-request context available once access control has classified and
@@ -835,67 +845,77 @@ fn classify_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<C
         return None;
     }
 
-    let (stream_id, action) = match segments.as_slice() {
-        [_bucket] if *method == Method::PUT => (None, Action::AdministerBucket),
-        [_bucket, stream] if *method == Method::PUT => {
-            let action = if closes_stream(headers) {
+    if segments.len() == 1 && *method == Method::PUT {
+        return Some(ClassifiedRequest {
+            resource: Resource {
+                bucket_id,
+                stream_id: None,
+            },
+            action: Action::AdministerBucket,
+        });
+    }
+
+    let stream = segments.get(1)?;
+    let grouped = segments
+        .get(2)
+        .is_some_and(|segment| !is_reserved_affinity_stream_id(segment));
+    let (stream_id, suffix) = if grouped {
+        (
+            format!("{stream}/{}", segments.get(2)?),
+            segments.get(3..).unwrap_or_default(),
+        )
+    } else {
+        (stream.clone(), segments.get(2..).unwrap_or_default())
+    };
+
+    let action = match suffix {
+        [] if *method == Method::PUT => {
+            if closes_stream(headers) {
                 Action::CreateAndClose
             } else {
                 Action::Create
-            };
-            (Some(stream.clone()), action)
+            }
         }
-        [_bucket, stream] if *method == Method::POST => {
-            let action = if closes_stream(headers) {
+        [] if *method == Method::POST => {
+            if closes_stream(headers) {
                 Action::AppendAndClose
             } else {
                 Action::Append
-            };
-            (Some(stream.clone()), action)
+            }
         }
-        [_bucket, stream] if *method == Method::GET => {
+        [] if *method == Method::GET => {
             // Any `live` mode (sse, long-poll) holds a server-side waiter, so
             // both classify as Tail for authorization and live-read quotas.
-            let action = if query_has_live_mode(uri) {
+            if query_has_live_mode(uri) {
                 Action::Tail
             } else {
                 Action::Read
-            };
-            (Some(stream.clone()), action)
+            }
         }
-        [_bucket, stream] if *method == Method::HEAD => (Some(stream.clone()), Action::Head),
-        [_bucket, stream] if *method == Method::DELETE => (Some(stream.clone()), Action::Delete),
-        [_bucket, stream, suffix] if suffix == "attrs" && *method == Method::PUT => {
-            (Some(stream.clone()), Action::Update)
+        [] if *method == Method::HEAD => Action::Head,
+        [] if *method == Method::DELETE => Action::Delete,
+        [suffix] if suffix == "attrs" && *method == Method::PUT => Action::Update,
+        [suffix] if suffix == "attrs" && *method == Method::GET => Action::Head,
+        [suffix] if suffix == "bootstrap" && *method == Method::GET => Action::Read,
+        [suffix] if suffix == "append-batch" && *method == Method::POST => Action::Append,
+        [suffix] if suffix == "snapshot" && *method == Method::GET => Action::ReadSnapshot,
+        [suffix] if suffix == "snapshot" && *method == Method::PUT => Action::PublishSnapshot,
+        [suffix] if suffix == "retention" && *method == Method::PUT => Action::Update,
+        [suffix, _offset] if suffix == "snapshot" && *method == Method::PUT => {
+            Action::PublishSnapshot
         }
-        [_bucket, stream, suffix] if suffix == "attrs" && *method == Method::GET => {
-            (Some(stream.clone()), Action::Head)
+        [suffix, _offset] if suffix == "snapshot" && *method == Method::GET => Action::ReadSnapshot,
+        [suffix, _offset] if suffix == "snapshot" && *method == Method::DELETE => {
+            Action::DeleteSnapshot
         }
-        [_bucket, stream, suffix] if suffix == "bootstrap" && *method == Method::GET => {
-            (Some(stream.clone()), Action::Read)
-        }
-        [_bucket, stream, suffix] if suffix == "append-batch" && *method == Method::POST => {
-            (Some(stream.clone()), Action::Append)
-        }
-        [_bucket, stream, suffix] if suffix == "snapshot" && *method == Method::GET => {
-            (Some(stream.clone()), Action::ReadSnapshot)
-        }
-        [_bucket, stream, suffix, _offset] if suffix == "snapshot" && *method == Method::PUT => {
-            (Some(stream.clone()), Action::PublishSnapshot)
-        }
-        [_bucket, stream, suffix, _offset] if suffix == "snapshot" && *method == Method::GET => {
-            (Some(stream.clone()), Action::ReadSnapshot)
-        }
-        [_bucket, stream, suffix, _offset] if suffix == "snapshot" && *method == Method::DELETE => {
-            (Some(stream.clone()), Action::DeleteSnapshot)
-        }
+        [suffix, _offset] if suffix == "retention" && *method == Method::PUT => Action::Update,
         _ => return None,
     };
 
     Some(ClassifiedRequest {
         resource: Resource {
             bucket_id,
-            stream_id,
+            stream_id: Some(stream_id),
         },
         action,
     })

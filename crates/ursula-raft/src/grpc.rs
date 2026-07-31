@@ -591,7 +591,14 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     ))
                 }),
             };
-            let stream_id = BucketStreamId::new(request.bucket_id, request.stream_id);
+            let stream_id = match request.affinity_key {
+                Some(affinity_key) => BucketStreamId::with_affinity(
+                    request.bucket_id,
+                    affinity_key,
+                    request.stream_id,
+                ),
+                None => BucketStreamId::new(request.bucket_id, request.stream_id),
+            };
             let result = match required(request.read, "group_read.read")
                 .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?
             {
