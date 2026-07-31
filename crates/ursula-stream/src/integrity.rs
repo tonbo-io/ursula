@@ -105,16 +105,31 @@ fn record_setsum(
     let mut setsum = Setsum::default();
     let start = start_offset.to_le_bytes();
     let end = end_offset.to_le_bytes();
-    let mut item = vec![
-        b"ursula-stream-record-v1".as_slice(),
-        stream_id.bucket_id.as_bytes(),
-        b"\0",
-        stream_id.stream_id.as_bytes(),
-        b"\0",
-        &start,
-        &end,
-        kind,
-    ];
+    let mut item = if let Some(affinity_key) = &stream_id.affinity_key {
+        vec![
+            b"ursula-stream-record-v2".as_slice(),
+            stream_id.bucket_id.as_bytes(),
+            b"\0",
+            affinity_key.as_bytes(),
+            b"\0",
+            stream_id.stream_id.as_bytes(),
+            b"\0",
+            &start,
+            &end,
+            kind,
+        ]
+    } else {
+        vec![
+            b"ursula-stream-record-v1".as_slice(),
+            stream_id.bucket_id.as_bytes(),
+            b"\0",
+            stream_id.stream_id.as_bytes(),
+            b"\0",
+            &start,
+            &end,
+            kind,
+        ]
+    };
     item.extend_from_slice(pieces);
     setsum.insert_vectored(&item);
     setsum

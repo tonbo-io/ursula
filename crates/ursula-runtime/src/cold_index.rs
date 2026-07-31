@@ -18,7 +18,7 @@ use crate::cold_store::ColdStoreHandle;
 pub type ColdIndexPageStoreFuture<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;
 
 const COLD_INDEX_PAGE_MAGIC: &[u8; 8] = b"UCIDX001";
-const COLD_INDEX_PAGE_VERSION: u16 = 1;
+const COLD_INDEX_PAGE_VERSION: u16 = 2;
 const COLD_INDEX_ENTRY_COLD_CHUNK: u8 = 1;
 const COLD_INDEX_ENTRY_EXTERNAL_SEGMENT: u8 = 2;
 const FNV64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -34,17 +34,14 @@ pub struct ColdIndexPageKey {
 impl ColdIndexPageKey {
     pub fn path(&self) -> String {
         format!(
-            "{}/{}/cold-index/{:020}/{:020}.idx",
-            self.stream_id.bucket_id, self.stream_id.stream_id, self.generation, self.page_id
+            "{}/cold-index/{:020}/{:020}.idx",
+            self.stream_id, self.generation, self.page_id
         )
     }
 }
 
 pub fn cold_index_prefix(stream_id: &BucketStreamId) -> String {
-    format!(
-        "{}/{}/cold-index/",
-        stream_id.bucket_id, stream_id.stream_id
-    )
+    format!("{stream_id}/cold-index/")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +68,13 @@ pub struct ColdIndexPageRollback {
 fn encode_page(key: &ColdIndexPageKey, page: &ColdIndexPage) -> Vec<u8> {
     let mut body = Vec::new();
     put_string(&mut body, &key.stream_id.bucket_id);
+    match &key.stream_id.affinity_key {
+        Some(affinity_key) => {
+            put_u8(&mut body, 1);
+            put_string(&mut body, affinity_key);
+        }
+        None => put_u8(&mut body, 0),
+    }
     put_string(&mut body, &key.stream_id.stream_id);
     put_u64(&mut body, key.generation);
     put_u64(&mut body, key.page_id);
@@ -122,7 +126,7 @@ fn decode_page(key: &ColdIndexPageKey, bytes: &[u8]) -> io::Result<ColdIndexPage
         ));
     }
     let version = cursor.read_u16()?;
-    if version != COLD_INDEX_PAGE_VERSION {
+    if !matches!(version, 1 | COLD_INDEX_PAGE_VERSION) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported cold index page version {version}"),
@@ -147,10 +151,25 @@ fn decode_page(key: &ColdIndexPageKey, bytes: &[u8]) -> io::Result<ColdIndexPage
 
     let mut body = Cursor::new(body);
     let bucket_id = body.read_string()?;
+    let affinity_key = if version >= 2 {
+        match body.read_u8()? {
+            0 => None,
+            1 => Some(body.read_string()?),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cold index page has invalid affinity marker",
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let stream_id = body.read_string()?;
     let generation = body.read_u64()?;
     let page_id = body.read_u64()?;
     if bucket_id != key.stream_id.bucket_id
+        || affinity_key != key.stream_id.affinity_key
         || stream_id != key.stream_id.stream_id
         || generation != key.generation
         || page_id != key.page_id
@@ -1137,6 +1156,34 @@ mod tests {
         };
         let err = decode_page(&wrong_key, &bytes).expect_err("key mismatch");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn affinity_is_part_of_the_page_path_and_binary_identity() {
+        let key = ColdIndexPageKey {
+            stream_id: BucketStreamId::with_affinity("benchcmp", "run-42", "journal"),
+            generation: 7,
+            page_id: 42,
+        };
+        assert_eq!(
+            key.path(),
+            "benchcmp/run-42/journal/cold-index/00000000000000000007/00000000000000000042.idx"
+        );
+
+        let page = page(0, 10);
+        let bytes = encode_page(&key, &page);
+        assert_eq!(decode_page(&key, &bytes).expect("decode page"), page);
+
+        let wrong_key = ColdIndexPageKey {
+            stream_id: BucketStreamId::with_affinity("benchcmp", "run-43", "journal"),
+            ..key
+        };
+        assert_eq!(
+            decode_page(&wrong_key, &bytes)
+                .expect_err("affinity mismatch")
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[tokio::test]

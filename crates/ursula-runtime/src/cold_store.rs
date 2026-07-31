@@ -307,6 +307,11 @@ impl ColdStore {
             left.stream_id
                 .bucket_id
                 .cmp(&right.stream_id.bucket_id)
+                .then_with(|| {
+                    left.stream_id
+                        .affinity_key
+                        .cmp(&right.stream_id.affinity_key)
+                })
                 .then_with(|| left.stream_id.stream_id.cmp(&right.stream_id.stream_id))
                 .then_with(|| left.generation.cmp(&right.generation))
                 .then_with(|| left.page_id.cmp(&right.page_id))
@@ -1009,21 +1014,31 @@ impl ColdStore {
 }
 
 fn parse_cold_index_page_path(path: &str) -> Option<ColdIndexPageKey> {
-    let mut parts = path.split('/');
-    let bucket_id = parts.next()?;
-    let stream_id = parts.next()?;
-    if parts.next()? != "cold-index" {
-        return None;
-    }
-    let generation = parts.next()?.parse().ok()?;
-    let page_id = parts.next()?.strip_suffix(".idx")?.parse().ok()?;
-    if parts.next().is_some() || bucket_id.is_empty() || stream_id.is_empty() {
+    let parts = path.split('/').collect::<Vec<_>>();
+    let (stream_id, generation, page_id) = match parts.as_slice() {
+        [bucket, stream, "cold-index", generation, page] => {
+            (BucketStreamId::new(*bucket, *stream), *generation, *page)
+        }
+        [bucket, affinity, stream, "cold-index", generation, page] => (
+            BucketStreamId::with_affinity(*bucket, *affinity, *stream),
+            *generation,
+            *page,
+        ),
+        _ => return None,
+    };
+    if stream_id.bucket_id.is_empty()
+        || stream_id
+            .affinity_key
+            .as_ref()
+            .is_some_and(String::is_empty)
+        || stream_id.stream_id.is_empty()
+    {
         return None;
     }
     Some(ColdIndexPageKey {
-        stream_id: BucketStreamId::new(bucket_id, stream_id),
-        generation,
-        page_id,
+        stream_id,
+        generation: generation.parse().ok()?,
+        page_id: page_id.strip_suffix(".idx")?.parse().ok()?,
     })
 }
 
@@ -1320,9 +1335,11 @@ pub fn reset_cold_chunk_sequence_for_sim() {
 mod tests {
     use bytes::Bytes;
     use ursula_config::config::ColdBackend;
+    use ursula_shard::BucketStreamId;
 
     use super::ColdReadCache;
     use super::ColdStore;
+    use super::parse_cold_index_page_path;
     use crate::ColdConfig;
     use crate::ColdReadCacheParams;
 
@@ -1332,6 +1349,24 @@ mod tests {
             .as_ref()
             .map(|cache| cache.config)
             .expect("read cache")
+    }
+
+    #[test]
+    fn cold_index_paths_preserve_optional_affinity() {
+        let plain = parse_cold_index_page_path(
+            "benchcmp/journal/cold-index/00000000000000000007/00000000000000000042.idx",
+        )
+        .expect("plain path");
+        assert_eq!(plain.stream_id, BucketStreamId::new("benchcmp", "journal"));
+
+        let grouped = parse_cold_index_page_path(
+            "benchcmp/run-42/journal/cold-index/00000000000000000007/00000000000000000042.idx",
+        )
+        .expect("grouped path");
+        assert_eq!(
+            grouped.stream_id,
+            BucketStreamId::with_affinity("benchcmp", "run-42", "journal")
+        );
     }
 
     #[test]

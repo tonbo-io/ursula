@@ -114,6 +114,7 @@ use ursula_runtime::UpdateStreamAttrsRequest;
 use ursula_runtime::new_external_payload_path;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
+use ursula_shard::is_reserved_affinity_stream_id;
 
 use crate::bootstrap::reenable_elections_if_campaign_allowed;
 use crate::render::apply_record_envelope;
@@ -183,6 +184,7 @@ const HEADER_STREAM_SEQ: &str = "stream-seq";
 const HEADER_STREAM_TTL: &str = "stream-ttl";
 const HEADER_STREAM_UP_TO_DATE: &str = "stream-up-to-date";
 const JSON_RECORD_COORDINATES_EXTENSION: &str = "json-record-coordinates-v1";
+const PATH_AFFINITY_EXTENSION: &str = "path-affinity-v1";
 const HEADER_PRODUCER_ID: &str = "producer-id";
 const HEADER_PRODUCER_EPOCH: &str = "producer-epoch";
 const HEADER_PRODUCER_SEQ: &str = "producer-seq";
@@ -206,6 +208,72 @@ const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_HTTP_INFLIGHT_BODY_BYTES: usize = MAX_HTTP_BODY_BYTES * 8;
 const DEFAULT_LONG_POLL_TIMEOUT_MS: u64 = 1_000;
 const MAX_LONG_POLL_TIMEOUT_MS: u64 = 60_000;
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct StreamPath {
+    bucket: String,
+    #[serde(default)]
+    affinity: Option<String>,
+    stream: String,
+}
+
+impl StreamPath {
+    fn into_stream_id(self) -> BucketStreamId {
+        match self.affinity {
+            Some(affinity) => BucketStreamId::with_affinity(self.bucket, affinity, self.stream),
+            None => BucketStreamId::new(self.bucket, self.stream),
+        }
+    }
+
+    fn stream_id(&self) -> BucketStreamId {
+        match &self.affinity {
+            Some(affinity) => BucketStreamId::with_affinity(
+                self.bucket.clone(),
+                affinity.clone(),
+                self.stream.clone(),
+            ),
+            None => BucketStreamId::new(self.bucket.clone(), self.stream.clone()),
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct SnapshotPath {
+    bucket: String,
+    #[serde(default)]
+    affinity: Option<String>,
+    stream: String,
+    snapshot_offset: String,
+}
+
+impl SnapshotPath {
+    fn into_parts(self) -> (BucketStreamId, String) {
+        let stream_id = match self.affinity {
+            Some(affinity) => BucketStreamId::with_affinity(self.bucket, affinity, self.stream),
+            None => BucketStreamId::new(self.bucket, self.stream),
+        };
+        (stream_id, self.snapshot_offset)
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct RetentionPath {
+    bucket: String,
+    #[serde(default)]
+    affinity: Option<String>,
+    stream: String,
+    retained_offset: String,
+}
+
+impl RetentionPath {
+    fn into_parts(self) -> (BucketStreamId, String) {
+        let stream_id = match self.affinity {
+            Some(affinity) => BucketStreamId::with_affinity(self.bucket, affinity, self.stream),
+            None => BucketStreamId::new(self.bucket, self.stream),
+        };
+        (stream_id, self.retained_offset)
+    }
+}
 
 struct CreateStreamHttpResponseInput<'a> {
     response: CreateStreamResponse,
@@ -791,6 +859,10 @@ fn admin_ops_router(state: HttpState) -> Router {
             "/__ursula/flush-cold/{bucket}/{stream}",
             post(flush_cold_stream),
         )
+        .route(
+            "/__ursula/flush-cold/{bucket}/{affinity}/{stream}",
+            post(flush_cold_stream),
+        )
         .route("/__ursula/backup/info", get(backup_info))
         .route(
             "/__ursula/backup/group/{raft_group_id}",
@@ -940,6 +1012,29 @@ async fn ingress_admission_middleware(
     };
 
     next.run(request).await
+}
+
+async fn path_affinity_extension_middleware(request: Request<Body>, next: Next) -> Response {
+    let affinity_path = is_path_affinity_uri(request.uri());
+    let mut response = next.run(request).await;
+    if affinity_path {
+        insert_extension_token(response.headers_mut(), PATH_AFFINITY_EXTENSION);
+    }
+    response
+}
+
+fn is_path_affinity_uri(uri: &Uri) -> bool {
+    let mut segments = uri.path().split('/').filter(|segment| !segment.is_empty());
+    let Some(bucket) = segments.next() else {
+        return false;
+    };
+    let Some(_affinity) = segments.next() else {
+        return false;
+    };
+    let Some(stream) = segments.next() else {
+        return false;
+    };
+    !bucket.starts_with("__ursula") && !is_reserved_affinity_stream_id(stream)
 }
 
 fn request_write_body_bytes(request: &Request<Body>) -> Option<u64> {
@@ -1108,7 +1203,46 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
                 .head(head_stream),
         )
         .route("/{bucket}/{stream}/append-batch", post(append_batch))
+        .route(
+            "/{bucket}/{affinity}/{stream}/snapshot",
+            get(read_latest_snapshot).put(publish_snapshot_at_record),
+        )
+        .route(
+            "/{bucket}/{affinity}/{stream}/snapshot/{snapshot_offset}",
+            put(publish_snapshot)
+                .get(read_snapshot)
+                .delete(delete_snapshot),
+        )
+        .route(
+            "/{bucket}/{affinity}/{stream}/retention",
+            put(advance_retention_at_record),
+        )
+        .route(
+            "/{bucket}/{affinity}/{stream}/retention/{retained_offset}",
+            put(advance_retention),
+        )
+        .route(
+            "/{bucket}/{affinity}/{stream}/bootstrap",
+            get(bootstrap_stream),
+        )
+        .route(
+            "/{bucket}/{affinity}/{stream}/attrs",
+            put(update_stream_attrs).get(get_stream_attrs),
+        )
+        .route(
+            "/{bucket}/{affinity}/{stream}",
+            put(create_stream)
+                .post(append_stream)
+                .get(read_stream)
+                .delete(delete_stream)
+                .head(head_stream),
+        )
+        .route(
+            "/{bucket}/{affinity}/{stream}/append-batch",
+            post(append_batch),
+        )
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+        .layer(middleware::from_fn(path_affinity_extension_middleware))
         .layer(middleware::from_fn_with_state(
             admission,
             ingress_admission_middleware,
@@ -1523,7 +1657,7 @@ fn heap_profile_has_samples(profile: &[u8]) -> bool {
 pub(crate) async fn flush_cold_stream(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
-    Path((bucket, stream)): Path<(String, String)>,
+    Path(path): Path<StreamPath>,
     RawQuery(raw_query): RawQuery,
 ) -> Response {
     let query = match parse_query(raw_query.as_deref()) {
@@ -1538,7 +1672,7 @@ pub(crate) async fn flush_cold_stream(
         .get("max_bytes")
         .and_then(|raw| raw.parse::<usize>().ok())
         .unwrap_or(8 * 1024 * 1024);
-    let stream_id = BucketStreamId::new(bucket, stream);
+    let stream_id = path.into_stream_id();
     match state
         .runtime
         .flush_cold_once(PlanColdFlushRequest {
@@ -2044,11 +2178,11 @@ fn resolve_raft_group(
 pub(crate) async fn create_stream(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
-    Path((bucket, stream)): Path<(String, String)>,
+    Path(path): Path<StreamPath>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let stream_id = BucketStreamId::new(bucket, stream);
+    let stream_id = path.into_stream_id();
     create_stream_by_id(state, request_target(&uri), stream_id, headers, body).await
 }
 
@@ -2143,11 +2277,11 @@ pub(crate) async fn create_stream_external_by_id(
 pub(crate) async fn append_stream(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
-    Path((bucket, stream)): Path<(String, String)>,
+    Path(path): Path<StreamPath>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let stream_id = BucketStreamId::new(bucket, stream);
+    let stream_id = path.into_stream_id();
     append_stream_by_id(state, request_target(&uri), stream_id, headers, body).await
 }
 
@@ -2259,12 +2393,12 @@ pub(crate) async fn append_stream_external_by_id(
 #[tracing::instrument(
     name = "http.append_batch",
     skip_all,
-    fields(bucket = %bucket, stream = %stream, bytes = body.len(), payloads = tracing::field::Empty),
+    fields(bucket = %path.bucket, affinity = ?path.affinity, stream = %path.stream, bytes = body.len(), payloads = tracing::field::Empty),
 )]
 pub(crate) async fn append_batch(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
-    Path((bucket, stream)): Path<(String, String)>,
+    Path(path): Path<StreamPath>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -2289,7 +2423,7 @@ pub(crate) async fn append_batch(
             .into_response();
     }
 
-    let stream_id = BucketStreamId::new(bucket, stream);
+    let stream_id = path.into_stream_id();
     let content_type = request_content_type(&headers);
     let payloads = match payloads
         .into_iter()
@@ -2333,9 +2467,9 @@ pub(crate) async fn append_batch(
 pub(crate) async fn delete_stream(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
-    Path((bucket, stream)): Path<(String, String)>,
+    Path(path): Path<StreamPath>,
 ) -> Response {
-    let stream_id = BucketStreamId::new(bucket, stream);
+    let stream_id = path.into_stream_id();
     delete_stream_by_id(state, request_target(&uri), stream_id).await
 }
 
@@ -2361,7 +2495,7 @@ pub(crate) async fn delete_stream_by_id(
 pub(crate) async fn update_stream_attrs(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
-    Path((bucket, stream)): Path<(String, String)>,
+    Path(path): Path<StreamPath>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -2390,7 +2524,7 @@ pub(crate) async fn update_stream_attrs(
                 .into_response();
         }
     };
-    let stream_id = BucketStreamId::new(bucket, stream);
+    let stream_id = path.into_stream_id();
     match state
         .runtime
         .update_stream_attrs(UpdateStreamAttrsRequest {
@@ -2414,9 +2548,9 @@ pub(crate) async fn update_stream_attrs(
 pub(crate) async fn get_stream_attrs(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
-    Path((bucket, stream)): Path<(String, String)>,
+    Path(path): Path<StreamPath>,
 ) -> Response {
-    let stream_id = BucketStreamId::new(bucket, stream);
+    let stream_id = path.into_stream_id();
     match state
         .runtime
         .get_stream_attrs(GetStreamAttrsRequest {
@@ -2452,9 +2586,9 @@ pub(crate) async fn get_stream_attrs(
 pub(crate) async fn head_stream(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
-    Path((bucket, stream)): Path<(String, String)>,
+    Path(path): Path<StreamPath>,
 ) -> Response {
-    let stream_id = BucketStreamId::new(bucket, stream);
+    let stream_id = path.into_stream_id();
     head_stream_by_id(state, request_target(&uri), stream_id).await
 }
 
@@ -2552,11 +2686,21 @@ pub(crate) async fn head_stream_by_id(
 }
 
 fn insert_record_extension(headers: &mut HeaderMap) {
-    insert_static(
-        headers,
-        HEADER_STREAM_EXTENSIONS,
-        JSON_RECORD_COORDINATES_EXTENSION,
-    );
+    insert_extension_token(headers, JSON_RECORD_COORDINATES_EXTENSION);
+}
+
+fn insert_extension_token(headers: &mut HeaderMap, token: &'static str) {
+    let value = match headers
+        .get(HEADER_STREAM_EXTENSIONS)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(existing) if existing.split(',').any(|item| item.trim() == token) => return,
+        Some(existing) => format!("{existing}, {token}"),
+        None => token.to_owned(),
+    };
+    if let Ok(value) = HeaderValue::from_str(&value) {
+        headers.insert(HEADER_STREAM_EXTENSIONS, value);
+    }
 }
 
 fn insert_record_operation_headers(
@@ -2588,11 +2732,11 @@ fn insert_record_head_headers(
 pub(crate) async fn read_stream(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
-    Path((bucket, stream)): Path<(String, String)>,
+    Path(path): Path<StreamPath>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> Response {
-    let stream_id = BucketStreamId::new(bucket, stream);
+    let stream_id = path.into_stream_id();
     read_stream_by_id(state, request_target(&uri), stream_id, headers, raw_query).await
 }
 
@@ -2822,20 +2966,20 @@ async fn read_record_start(
 #[tracing::instrument(
     name = "http.snapshot_publish",
     skip_all,
-    fields(bucket = %bucket, stream = %stream, snapshot_offset = %snapshot_offset, bytes = body.len()),
+    fields(bucket = %path.bucket, affinity = ?path.affinity, stream = %path.stream, snapshot_offset = %path.snapshot_offset, bytes = body.len()),
 )]
 pub(crate) async fn publish_snapshot(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
-    Path((bucket, stream, snapshot_offset)): Path<(String, String, String)>,
+    Path(path): Path<SnapshotPath>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let (stream_id, snapshot_offset) = path.into_parts();
     let snapshot_offset = match parse_snapshot_offset(&snapshot_offset) {
         Ok(offset) => offset,
         Err(response) => return *response,
     };
-    let stream_id = BucketStreamId::new(bucket, stream);
     publish_snapshot_by_offset(
         state,
         request_target(&uri),
@@ -2890,7 +3034,7 @@ async fn publish_snapshot_by_offset(
 pub(crate) async fn publish_snapshot_at_record(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
-    Path((bucket, stream)): Path<(String, String)>,
+    Path(path): Path<StreamPath>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
     body: Bytes,
@@ -2910,7 +3054,7 @@ pub(crate) async fn publish_snapshot_at_record(
         Ok(record) => record,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid record").into_response(),
     };
-    let stream_id = BucketStreamId::new(bucket, stream);
+    let stream_id = path.into_stream_id();
     let request_target = request_target(&uri);
     let snapshot_offset =
         match resolve_record_offset(&state, &stream_id, record, &request_target).await {
@@ -2954,25 +3098,20 @@ async fn resolve_record_offset(
 pub(crate) async fn advance_retention(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
-    Path((bucket, stream, retained_offset)): Path<(String, String, String)>,
+    Path(path): Path<RetentionPath>,
 ) -> Response {
+    let (stream_id, retained_offset) = path.into_parts();
     let retained_offset = match parse_snapshot_offset(&retained_offset) {
         Ok(offset) => offset,
         Err(response) => return *response,
     };
-    advance_retention_by_offset(
-        state,
-        request_target(&uri),
-        BucketStreamId::new(bucket, stream),
-        retained_offset,
-    )
-    .await
+    advance_retention_by_offset(state, request_target(&uri), stream_id, retained_offset).await
 }
 
 pub(crate) async fn advance_retention_at_record(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
-    Path((bucket, stream)): Path<(String, String)>,
+    Path(path): Path<StreamPath>,
     RawQuery(raw_query): RawQuery,
 ) -> Response {
     let query = match parse_query(raw_query.as_deref()) {
@@ -2990,7 +3129,7 @@ pub(crate) async fn advance_retention_at_record(
         Ok(record) => record,
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid record").into_response(),
     };
-    let stream_id = BucketStreamId::new(bucket, stream);
+    let stream_id = path.into_stream_id();
     let request_target = request_target(&uri);
     let retained_offset =
         match resolve_record_offset(&state, &stream_id, record, &request_target).await {
@@ -3035,15 +3174,15 @@ async fn advance_retention_by_offset(
 #[tracing::instrument(
     name = "http.snapshot_read_latest",
     skip_all,
-    fields(bucket = %bucket, stream = %stream),
+    fields(bucket = %path.bucket, affinity = ?path.affinity, stream = %path.stream),
 )]
 pub(crate) async fn read_latest_snapshot(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
-    Path((bucket, stream)): Path<(String, String)>,
+    Path(path): Path<StreamPath>,
     headers: HeaderMap,
 ) -> Response {
-    let stream_id = BucketStreamId::new(bucket.clone(), stream.clone());
+    let stream_id = path.stream_id();
     let head = match state
         .runtime
         .head_stream(HeadStreamRequest {
@@ -3070,26 +3209,35 @@ pub(crate) async fn read_latest_snapshot(
     if let Some(record_range) = head.record_range {
         insert_record_head_headers(&mut response_headers, record_range);
     }
-    let path = format!("/{bucket}/{stream}/snapshot/{snapshot_offset:020}");
-    insert_public_location(&mut response_headers, &headers, &path);
+    let snapshot_path = match &path.affinity {
+        Some(affinity) => format!(
+            "/{}/{affinity}/{}/snapshot/{snapshot_offset:020}",
+            path.bucket, path.stream
+        ),
+        None => format!(
+            "/{}/{}/snapshot/{snapshot_offset:020}",
+            path.bucket, path.stream
+        ),
+    };
+    insert_public_location(&mut response_headers, &headers, &snapshot_path);
     (StatusCode::TEMPORARY_REDIRECT, response_headers).into_response()
 }
 
 #[tracing::instrument(
     name = "http.snapshot_read",
     skip_all,
-    fields(bucket = %bucket, stream = %stream, snapshot_offset = %snapshot_offset),
+    fields(bucket = %path.bucket, affinity = ?path.affinity, stream = %path.stream, snapshot_offset = %path.snapshot_offset),
 )]
 pub(crate) async fn read_snapshot(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
-    Path((bucket, stream, snapshot_offset)): Path<(String, String, String)>,
+    Path(path): Path<SnapshotPath>,
 ) -> Response {
+    let (stream_id, snapshot_offset) = path.into_parts();
     let snapshot_offset = match parse_snapshot_offset(&snapshot_offset) {
         Ok(offset) => offset,
         Err(response) => return *response,
     };
-    let stream_id = BucketStreamId::new(bucket, stream);
     match state
         .runtime
         .read_snapshot(ReadSnapshotRequest {
@@ -3109,18 +3257,18 @@ pub(crate) async fn read_snapshot(
 #[tracing::instrument(
     name = "http.snapshot_delete",
     skip_all,
-    fields(bucket = %bucket, stream = %stream, snapshot_offset = %snapshot_offset),
+    fields(bucket = %path.bucket, affinity = ?path.affinity, stream = %path.stream, snapshot_offset = %path.snapshot_offset),
 )]
 pub(crate) async fn delete_snapshot(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
-    Path((bucket, stream, snapshot_offset)): Path<(String, String, String)>,
+    Path(path): Path<SnapshotPath>,
 ) -> Response {
+    let (stream_id, snapshot_offset) = path.into_parts();
     let snapshot_offset = match parse_snapshot_offset(&snapshot_offset) {
         Ok(offset) => offset,
         Err(response) => return *response,
     };
-    let stream_id = BucketStreamId::new(bucket, stream);
     match state
         .runtime
         .delete_snapshot(DeleteSnapshotRequest {
@@ -3144,7 +3292,7 @@ pub(crate) async fn delete_snapshot(
 pub(crate) async fn bootstrap_stream(
     State(state): State<HttpState>,
     OriginalUri(uri): OriginalUri,
-    Path((bucket, stream)): Path<(String, String)>,
+    Path(path): Path<StreamPath>,
     RawQuery(raw_query): RawQuery,
 ) -> Response {
     let query = match parse_query(raw_query.as_deref()) {
@@ -3158,7 +3306,7 @@ pub(crate) async fn bootstrap_stream(
         )
             .into_response();
     }
-    let stream_id = BucketStreamId::new(bucket, stream);
+    let stream_id = path.into_stream_id();
     match state
         .runtime
         .bootstrap_stream(BootstrapStreamRequest {

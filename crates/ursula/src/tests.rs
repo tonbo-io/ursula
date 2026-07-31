@@ -484,6 +484,42 @@ async fn create_append_read_and_head_match_perf_compare_subset() {
 }
 
 #[tokio::test]
+async fn path_affinity_keeps_sibling_streams_independent_and_advertises_extension() {
+    let app = test_router();
+
+    for (stream, payload) in [("journal", "event"), ("queue", "message")] {
+        let response = http_put(
+            &app,
+            &format!("/benchcmp/run-42/{stream}"),
+            &[(CONTENT_TYPE.as_str(), "text/plain")],
+            Body::from(payload),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            header_str(&response, HEADER_STREAM_EXTENSIONS),
+            PATH_AFFINITY_EXTENSION
+        );
+    }
+
+    let response = http_get(&app, "/benchcmp/run-42/journal").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_EXTENSIONS),
+        PATH_AFFINITY_EXTENSION
+    );
+    assert_eq!(&body_bytes(response).await[..], b"event");
+
+    let response = http_get(&app, "/benchcmp/run-42/queue").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(&body_bytes(response).await[..], b"message");
+
+    let response = http_head(&app, "/benchcmp/ungrouped").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert!(response.headers().get(HEADER_STREAM_EXTENSIONS).is_none());
+}
+
+#[tokio::test]
 async fn stream_attrs_can_be_updated_and_read_over_http() {
     let app = test_router();
 
@@ -2829,11 +2865,11 @@ async fn static_grpc_follower_serves_replicated_catch_up_read_without_leader_pro
         .timeout(Duration::from_secs(5))
         .build()
         .expect("build reqwest client");
-    let stream = BucketStreamId::new("benchcmp", "follower-local-read");
+    let stream = BucketStreamId::with_affinity("benchcmp", "run-42", "follower-local-read");
     let leader_base = peers[0].1.as_str();
     let follower_base = peers[1].1.as_str();
     let create = http_client
-        .put(format!("{leader_base}/benchcmp/follower-local-read"))
+        .put(format!("{leader_base}/benchcmp/run-42/follower-local-read"))
         .header(CONTENT_TYPE, "text/plain")
         .body("read-without-leader")
         .send()
@@ -2855,7 +2891,9 @@ async fn static_grpc_follower_serves_replicated_catch_up_read_without_leader_pro
     leader.shutdown().await;
 
     let read = http_client
-        .get(format!("{follower_base}/benchcmp/follower-local-read"))
+        .get(format!(
+            "{follower_base}/benchcmp/run-42/follower-local-read"
+        ))
         .send()
         .await
         .expect("send follower local read after leader proxy is unavailable");

@@ -5,6 +5,7 @@ package ursula.durable.v1;
 message BucketStreamIdV1 {
   string bucket_id = 1;
   string stream_id = 2;
+  optional string affinity_key = 3;
 }
 
 message ProducerRequestV1 {
