@@ -520,6 +520,79 @@ async fn path_affinity_keeps_sibling_streams_independent_and_advertises_extensio
 }
 
 #[tokio::test]
+async fn group_append_transaction_is_atomic_over_http() {
+    let app = test_router();
+    for stream in ["journal", "queue"] {
+        let response = http_put(
+            &app,
+            &format!("/benchcmp/run-42/{stream}"),
+            &[(CONTENT_TYPE.as_str(), "application/json")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let committed = json!({
+        "operations": [
+            {
+                "stream": "journal",
+                "content_type": "application/json",
+                "payload_base64": "eyJldmVudCI6MX0K",
+                "record_match": 0
+            },
+            {
+                "stream": "queue",
+                "content_type": "application/json",
+                "payload_base64": "eyJldmVudCI6Mn0K",
+                "record_match": 0
+            }
+        ]
+    });
+    let response = http_post(
+        &app,
+        "/benchcmp/run-42/$transaction",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(serde_json::to_vec(&committed).expect("serialize transaction")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let extensions = header_str(&response, HEADER_STREAM_EXTENSIONS);
+    assert!(extensions.contains(PATH_AFFINITY_EXTENSION));
+    assert!(extensions.contains(GROUP_APPEND_TRANSACTION_EXTENSION));
+
+    let rejected = json!({
+        "operations": [
+            {
+                "stream": "journal",
+                "content_type": "application/json",
+                "payload_base64": "eyJldmVudCI6M30K",
+                "record_match": 1
+            },
+            {
+                "stream": "queue",
+                "content_type": "application/json",
+                "payload_base64": "eyJldmVudCI6NH0K",
+                "record_match": 99
+            }
+        ]
+    });
+    let response = http_post(
+        &app,
+        "/benchcmp/run-42/$transaction",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(serde_json::to_vec(&rejected).expect("serialize transaction")),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+
+    let journal = body_bytes(http_get(&app, "/benchcmp/run-42/journal").await).await;
+    let queue = body_bytes(http_get(&app, "/benchcmp/run-42/queue").await).await;
+    assert_eq!(&journal[..], b"{\"event\":1}\n");
+    assert_eq!(&queue[..], b"{\"event\":2}\n");
+}
+
+#[tokio::test]
 async fn stream_attrs_can_be_updated_and_read_over_http() {
     let app = test_router();
 

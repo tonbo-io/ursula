@@ -677,6 +677,25 @@ pub struct AppendBatchResponse {
     pub items: Vec<Result<AppendResponse, RuntimeError>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendTransactionRequest {
+    pub operations: Vec<AppendRequest>,
+}
+
+impl AppendTransactionRequest {
+    pub fn payload_bytes(&self) -> u64 {
+        self.operations.iter().fold(0_u64, |total, operation| {
+            total.saturating_add(operation.payload_len())
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendTransactionResponse {
+    pub placement: ShardPlacement,
+    pub items: Vec<AppendResponse>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamAppendCount {
     pub stream_id: BucketStreamId,

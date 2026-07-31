@@ -671,6 +671,9 @@ fn stream_affinity_key(uri: &Uri, shard_map: Option<&StaticShardMap>) -> Option<
         .next()
         .and_then(|segment| percent_decode_str(segment).decode_utf8().ok());
     let stream_id = match third {
+        Some(stream) if stream.as_ref() == "$transaction" => {
+            BucketStreamId::with_affinity(bucket.as_ref(), second.as_ref(), "$transaction")
+        }
         Some(stream) if !is_reserved_affinity_stream_id(stream.as_ref()) => {
             BucketStreamId::with_affinity(bucket.as_ref(), second.as_ref(), stream.as_ref())
         }
@@ -852,6 +855,22 @@ fn classify_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<C
                 stream_id: None,
             },
             action: Action::AdministerBucket,
+        });
+    }
+
+    if segments.len() == 3
+        && segments
+            .get(2)
+            .is_some_and(|segment| segment == "$transaction")
+        && *method == Method::POST
+    {
+        let affinity = segments.get(1)?;
+        return Some(ClassifiedRequest {
+            resource: Resource {
+                bucket_id,
+                stream_id: Some(format!("{}/$transaction", affinity)),
+            },
+            action: Action::Append,
         });
     }
 

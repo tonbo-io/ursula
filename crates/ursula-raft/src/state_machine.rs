@@ -22,6 +22,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_runtime::AppendBatchRequest;
 use ursula_runtime::AppendRequest;
+use ursula_runtime::AppendTransactionRequest;
 use ursula_runtime::BootstrapStreamRequest;
 use ursula_runtime::BootstrapStreamResponse;
 use ursula_runtime::ColdFlushCandidate;
@@ -484,6 +485,24 @@ impl RaftGroupStateMachine {
             .sum();
         self.engine
             .check_cold_write_admission_bytes(&stream_id, admission, incoming_bytes)?;
+        Ok(())
+    }
+
+    pub async fn check_append_transaction_cold_admission(
+        &mut self,
+        request: AppendTransactionRequest,
+        placement: ShardPlacement,
+        admission: ColdWriteAdmission,
+    ) -> Result<(), GroupEngineError> {
+        let _ = placement;
+        let Some(first) = request.operations.first() else {
+            return Ok(());
+        };
+        self.engine.check_cold_write_admission_bytes(
+            &first.stream_id,
+            admission,
+            request.payload_bytes(),
+        )?;
         Ok(())
     }
 

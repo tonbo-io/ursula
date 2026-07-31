@@ -30,8 +30,9 @@ pub struct GroupSnapshot {
 }
 
 /// Replicated group-level write envelope around the canonical
-/// [`StreamCommand`]: either one per-stream command, or an atomic batch of
-/// them applied as a single raft entry. This enum (serde-encoded) is the raft
+/// [`StreamCommand`]: one command, a throughput batch with independent item
+/// results, or an all-or-none append transaction. Batch and transaction
+/// envelopes each occupy one Raft entry. This enum (serde-encoded) is the Raft
 /// log payload; there is no separate wire mirror.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[expect(
@@ -42,6 +43,7 @@ pub struct GroupSnapshot {
 pub enum GroupWriteCommand {
     Stream(StreamCommand),
     Batch { commands: Vec<StreamCommand> },
+    Transaction { commands: Vec<StreamCommand> },
 }
 
 impl From<StreamCommand> for GroupWriteCommand {
@@ -249,6 +251,9 @@ impl fmt::Display for GroupWriteCommand {
         match self {
             Self::Stream(command) => command.fmt(f),
             Self::Batch { commands } => write!(f, "batch:{} commands", commands.len()),
+            Self::Transaction { commands } => {
+                write!(f, "transaction:{} commands", commands.len())
+            }
         }
     }
 }

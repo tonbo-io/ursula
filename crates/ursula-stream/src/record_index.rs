@@ -153,6 +153,14 @@ impl StreamRecordIndex {
         prepared.range
     }
 
+    pub(crate) fn append_checkpoint(&self) -> usize {
+        self.record_offsets.len()
+    }
+
+    pub(crate) fn rollback_appends(&mut self, checkpoint: usize) {
+        self.record_offsets.truncate(checkpoint);
+    }
+
     pub fn offset_for(&self, record: u64, tail_offset: u64) -> Result<u64, RecordIndexError> {
         let range = self.range()?;
         if record < range.first_record {

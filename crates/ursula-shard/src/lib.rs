@@ -17,7 +17,7 @@ pub struct RaftGroupId(pub u32);
 pub fn is_reserved_affinity_stream_id(stream_id: &str) -> bool {
     matches!(
         stream_id,
-        "append-batch" | "attrs" | "bootstrap" | "retention" | "snapshot"
+        "$transaction" | "append-batch" | "attrs" | "bootstrap" | "retention" | "snapshot"
     )
 }
 

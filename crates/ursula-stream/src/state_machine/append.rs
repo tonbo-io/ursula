@@ -3,6 +3,8 @@
 use super::AppendExternalInput;
 use super::AppendStreamInput;
 use super::BucketStreamId;
+use super::BucketUsage;
+use super::HashMap;
 use super::ObjectPayloadRef;
 use super::ProducerAppendRecord;
 use super::ProducerReceipt;
@@ -10,8 +12,10 @@ use super::ProducerRequest;
 use super::ProducerState;
 use super::StreamBatchAppend;
 use super::StreamBatchAppendItem;
+use super::StreamCommand;
 use super::StreamErrorCode;
 use super::StreamErrorContext;
+use super::StreamIntegrity;
 use super::StreamMetadata;
 use super::StreamResponse;
 use super::StreamStateMachine;
@@ -22,7 +26,172 @@ use super::renew_stream_ttl;
 use super::validate_external_payload_ref;
 use super::validate_producer_request;
 
+struct StreamAppendUndo {
+    metadata: StreamMetadata,
+    hot_checkpoint: usize,
+    message_records_len: usize,
+    record_checkpoint: Option<usize>,
+    integrity: StreamIntegrity,
+    producers: HashMap<String, Option<ProducerState>>,
+}
+
 impl StreamStateMachine {
+    pub fn append_transaction(
+        &mut self,
+        commands: Vec<StreamCommand>,
+    ) -> Result<Vec<StreamResponse>, StreamResponse> {
+        let Some(StreamCommand::Append {
+            stream_id: first_stream,
+            ..
+        }) = commands.first()
+        else {
+            return Err(StreamResponse::error(
+                StreamErrorCode::InvalidStreamId,
+                "append transaction must contain at least one append command",
+            ));
+        };
+        let Some(first_affinity) = first_stream.affinity_key.as_deref() else {
+            return Err(StreamResponse::error(
+                StreamErrorCode::InvalidStreamId,
+                "append transaction streams must use path affinity",
+            ));
+        };
+        let mut stream_undo = HashMap::<BucketStreamId, StreamAppendUndo>::new();
+        let mut bucket_undo = HashMap::<String, Option<BucketUsage>>::new();
+        for command in &commands {
+            let StreamCommand::Append {
+                stream_id,
+                producer,
+                now_ms,
+                ..
+            } = command
+            else {
+                return Err(StreamResponse::error(
+                    StreamErrorCode::InvalidStreamId,
+                    "append transaction contains a non-append command",
+                ));
+            };
+            if stream_id.bucket_id != first_stream.bucket_id
+                || stream_id.affinity_key.as_deref() != Some(first_affinity)
+            {
+                return Err(StreamResponse::error(
+                    StreamErrorCode::InvalidStreamId,
+                    "append transaction streams must share one bucket and affinity key",
+                ));
+            }
+            let Some(slot) = self.stream_slot(stream_id) else {
+                return Err(StreamResponse::error(
+                    StreamErrorCode::StreamNotFound,
+                    format!("stream '{stream_id}' does not exist"),
+                ));
+            };
+            if super::stream_is_expired(&slot.metadata, *now_ms) {
+                return Err(StreamResponse::error(
+                    StreamErrorCode::StreamNotFound,
+                    format!("stream '{stream_id}' does not exist"),
+                ));
+            }
+            bucket_undo
+                .entry(stream_id.bucket_id.clone())
+                .or_insert_with(|| self.bucket_usage.get(&stream_id.bucket_id).copied());
+            let undo = stream_undo
+                .entry(stream_id.clone())
+                .or_insert_with(|| StreamAppendUndo {
+                    metadata: slot.metadata.clone(),
+                    hot_checkpoint: slot.hot_buffer.append_checkpoint(),
+                    message_records_len: slot.message_records.len(),
+                    record_checkpoint: slot
+                        .record_index
+                        .as_ref()
+                        .map(crate::StreamRecordIndex::append_checkpoint),
+                    integrity: slot.integrity.clone(),
+                    producers: HashMap::new(),
+                });
+            if let Some(producer) = producer {
+                undo.producers
+                    .entry(producer.producer_id.clone())
+                    .or_insert_with(|| slot.producers.get(&producer.producer_id).cloned());
+            }
+        }
+
+        let hot_payload_bytes = self.hot_payload_bytes;
+        let mut responses = Vec::with_capacity(commands.len());
+        for command in commands {
+            let StreamCommand::Append {
+                stream_id,
+                content_type,
+                payload,
+                close_after,
+                stream_seq,
+                producer,
+                now_ms,
+                record_match,
+            } = command
+            else {
+                unreachable!("transaction commands validated before mutation");
+            };
+            let response = self.append_borrowed(AppendStreamInput {
+                stream_id,
+                content_type: content_type.as_deref(),
+                payload: &payload,
+                close_after,
+                stream_seq,
+                producer,
+                now_ms,
+                record_match,
+            });
+            if matches!(response, StreamResponse::Error { .. }) {
+                self.rollback_append_transaction(stream_undo, bucket_undo, hot_payload_bytes);
+                return Err(response);
+            }
+            responses.push(response);
+        }
+        Ok(responses)
+    }
+
+    fn rollback_append_transaction(
+        &mut self,
+        stream_undo: HashMap<BucketStreamId, StreamAppendUndo>,
+        bucket_undo: HashMap<String, Option<BucketUsage>>,
+        hot_payload_bytes: u64,
+    ) {
+        self.hot_payload_bytes = hot_payload_bytes;
+        for (bucket_id, usage) in bucket_undo {
+            match usage {
+                Some(usage) => {
+                    self.bucket_usage.insert(bucket_id, usage);
+                }
+                None => {
+                    self.bucket_usage.remove(&bucket_id);
+                }
+            }
+        }
+        for (stream_id, undo) in stream_undo {
+            let Some(slot) = self.stream_slot_mut(&stream_id) else {
+                continue;
+            };
+            slot.metadata = undo.metadata;
+            slot.hot_buffer.rollback_appends(undo.hot_checkpoint);
+            slot.message_records.truncate(undo.message_records_len);
+            if let (Some(index), Some(checkpoint)) =
+                (slot.record_index.as_mut(), undo.record_checkpoint)
+            {
+                index.rollback_appends(checkpoint);
+            }
+            slot.integrity = undo.integrity;
+            for (producer_id, producer) in undo.producers {
+                match producer {
+                    Some(producer) => {
+                        slot.producers.insert(producer_id, producer);
+                    }
+                    None => {
+                        slot.producers.remove(&producer_id);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn append_borrowed(&mut self, input: AppendStreamInput<'_>) -> StreamResponse {
         let AppendStreamInput {
             stream_id,

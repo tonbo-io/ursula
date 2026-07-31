@@ -328,6 +328,13 @@ macro_rules! runtime_operations {
                     admit: request.payload_len()
                 }
             }
+            op AppendTransaction {
+                fields { request: AppendTransactionRequest }
+                reply { response_tx: AppendTransactionResponse }
+                guard { raft_uncommitted }
+                handle { actor handle_append_transaction(request, response_tx, raft_uncommitted) }
+                client { none }
+            }
             op AppendExternal {
                 fields { request: AppendExternalRequest }
                 reply { response_tx: AppendResponse }

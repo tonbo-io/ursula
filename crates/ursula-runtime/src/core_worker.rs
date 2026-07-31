@@ -38,6 +38,8 @@ use crate::request::AppendBatchResponse;
 use crate::request::AppendExternalRequest;
 use crate::request::AppendRequest;
 use crate::request::AppendResponse;
+use crate::request::AppendTransactionRequest;
+use crate::request::AppendTransactionResponse;
 use crate::request::BootstrapStreamRequest;
 use crate::request::BootstrapStreamResponse;
 use crate::request::CloseStreamRequest;
@@ -1368,6 +1370,54 @@ impl CoreWorker {
             placement.raft_group_id,
             elapsed_ns(started_at),
         );
+    }
+
+    pub(crate) async fn commit_append_transaction(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        request: AppendTransactionRequest,
+        placement: ShardPlacement,
+        admission: ColdWriteAdmission,
+    ) -> Result<AppendTransactionResponse, RuntimeError> {
+        let incoming_bytes = request.payload_bytes();
+        let started_at = Instant::now();
+        let exec_started_at = Instant::now();
+        let response = group
+            .append_transaction(request, placement, admission)
+            .await
+            .map_err(|err| {
+                record_cold_backpressure_error(
+                    &metrics,
+                    placement,
+                    incoming_bytes,
+                    admission,
+                    &err,
+                );
+                RuntimeError::group_engine(placement, err)
+            })?;
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(exec_started_at),
+        );
+        for item in &response.items {
+            if !item.deduplicated {
+                metrics.record_append(placement.core_id, placement.raft_group_id);
+                metrics.record_cold_hot_backlog(
+                    placement.raft_group_id,
+                    item.stream_hot_bytes,
+                    item.group_hot_bytes,
+                );
+            }
+        }
+        if response.items.iter().any(|item| !item.deduplicated) {
+            metrics.record_applied_mutation(
+                placement.core_id,
+                placement.raft_group_id,
+                elapsed_ns(started_at),
+            );
+        }
+        Ok(response)
     }
 
     #[tracing::instrument(

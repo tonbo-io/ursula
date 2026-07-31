@@ -59,6 +59,7 @@ const JSON_READ_CONTENT_TYPE: &str = "application/x-ndjson";
 pub(crate) fn runtime_error_status(err: &RuntimeError) -> StatusCode {
     match err {
         RuntimeError::EmptyAppend
+        | RuntimeError::InvalidAppendTransaction { .. }
         | RuntimeError::InvalidRaftGroup { .. }
         | RuntimeError::SnapshotPlacementMismatch { .. } => StatusCode::BAD_REQUEST,
         RuntimeError::InvalidConfig(_)
