@@ -11,7 +11,9 @@
 //! `(bucket, principal, action class)`. A background exporter drains them on
 //! an interval into cursor-bearing [`UsageBatch`]es and hands them to a
 //! [`UsageSink`]. A failing sink delays reporting — batches queue and merge —
-//! but never blocks request handling and never drops acknowledged counts.
+//! but never blocks request handling or drops counters while the process stays
+//! alive. This queue is operational telemetry, not the durable financial
+//! ledger; committed-write truth is exported from replicated Ursula state.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -23,7 +25,7 @@ use serde::Serialize;
 
 /// Highest number of pending batches kept while a sink is unavailable.
 /// Beyond this the two oldest batches merge, so memory stays bounded while
-/// counts are still never dropped.
+/// counters remain intact inside this process.
 const MAX_PENDING_BATCHES: usize = 64;
 
 /// Coarse action classes for usage telemetry; finer distinctions stay in traces.
