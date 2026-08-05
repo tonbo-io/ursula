@@ -6387,7 +6387,9 @@ async fn usage_endpoint_reports_per_bucket_committed_counters() {
         "exactly one record committed despite the duplicate retry"
     );
     assert_eq!(
-        tenant_a["committed_write_units_10kib"].as_u64().expect("units"),
+        tenant_a["committed_write_units_10kib"]
+            .as_u64()
+            .expect("units"),
         tenant_a_created["committed_write_units_10kib"]
             .as_u64()
             .expect("units")
