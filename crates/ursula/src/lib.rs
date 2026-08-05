@@ -1461,6 +1461,7 @@ pub(crate) async fn bucket_usage(State(state): State<HttpState>) -> Response {
                         serde_json::json!({
                             "committed_append_bytes": entry.usage.committed_append_bytes,
                             "committed_records": entry.usage.committed_records,
+                            "committed_write_units_10kib": entry.usage.committed_write_units_10kib,
                             "retained_bytes": entry.usage.retained_bytes,
                             "stream_count": entry.usage.stream_count,
                         }),

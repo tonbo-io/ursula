@@ -391,8 +391,9 @@ pub trait GroupEngine: Send + 'static {
         Box::pin(async { Err(GroupEngineError::new("cold GC ack is not supported")) })
     }
 
-    /// Replicated tenant offboarding: removes every stream in the bucket,
-    /// the bucket, and its usage entry in this group. Default unsupported.
+    /// Replicated tenant offboarding: removes every stream in the bucket, the
+    /// bucket, and its quota in this group. Monotonic aggregate usage remains
+    /// available to asynchronous accounting readers. Default unsupported.
     fn purge_bucket<'a>(
         &'a mut self,
         _bucket_id: String,

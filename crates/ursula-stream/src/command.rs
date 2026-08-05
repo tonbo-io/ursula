@@ -126,8 +126,9 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
     },
     /// Administrator-triggered tenant offboarding: removes every stream in
-    /// the bucket, the bucket itself, and its usage ledger entry in this
-    /// group. Idempotent — purging an absent bucket reports zero removals.
+    /// the bucket, the bucket itself, and its quota in this group. Monotonic
+    /// aggregate usage is retained for asynchronous accounting. Idempotent —
+    /// purging an absent bucket reports zero removals.
     PurgeBucket {
         bucket_id: String,
     },

@@ -64,10 +64,10 @@ impl StreamStateMachine {
             );
         }
         self.buckets.remove(bucket_id);
-        // The bucket must be empty to reach this point, so only the monotonic
-        // counters remain; deleting the tenant namespace erases its ledger
-        // entry in this group.
-        self.bucket_usage.remove(bucket_id);
+        // The content namespace is gone, but committed counters are a
+        // monotonic accounting ledger. Keep the zero-gauge entry so a write
+        // followed by deletion cannot disappear before an external meter has
+        // observed it. Recreating the same bucket continues the counter.
         self.bucket_quotas.remove(bucket_id);
         StreamResponse::BucketDeleted {
             bucket_id: bucket_id.to_owned(),
@@ -76,7 +76,9 @@ impl StreamStateMachine {
 
     /// Tenant offboarding: removes every stream the bucket owns in this
     /// group (each removal enqueues its cold-object prefixes for the GC
-    /// worker), then the bucket and its usage ledger entry. Unlike
+    /// worker), then the bucket and its quota. The aggregate usage ledger is
+    /// retained with zero gauges until an external accounting system has had
+    /// a chance to observe its monotonic counters. Unlike
     /// [`Self::delete_bucket`] this does not require the bucket to be empty,
     /// and purging an absent bucket succeeds with zero removals so a crashed
     /// purge can be re-run to convergence.
@@ -97,7 +99,7 @@ impl StreamStateMachine {
             }
         }
         self.buckets.remove(bucket_id);
-        self.bucket_usage.remove(bucket_id);
+        self.bucket_quotas.remove(bucket_id);
         StreamResponse::BucketPurged {
             bucket_id: bucket_id.to_owned(),
             removed_streams,

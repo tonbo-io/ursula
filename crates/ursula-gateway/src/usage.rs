@@ -11,7 +11,9 @@
 //! `(bucket, principal, action class)`. A background exporter drains them on
 //! an interval into cursor-bearing [`UsageBatch`]es and hands them to a
 //! [`UsageSink`]. A failing sink delays reporting — batches queue and merge —
-//! but never blocks request handling and never drops acknowledged counts.
+//! but never blocks request handling or drops counters while the process stays
+//! alive. This queue is operational telemetry, not the durable financial
+//! ledger; committed-write truth is exported from replicated Ursula state.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -23,10 +25,10 @@ use serde::Serialize;
 
 /// Highest number of pending batches kept while a sink is unavailable.
 /// Beyond this the two oldest batches merge, so memory stays bounded while
-/// counts are still never dropped.
+/// counters remain intact inside this process.
 const MAX_PENDING_BATCHES: usize = 64;
 
-/// Coarse action classes for billing; finer distinctions stay in traces.
+/// Coarse action classes for usage telemetry; finer distinctions stay in traces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageClass {
@@ -59,9 +61,9 @@ pub struct UsageCounters {
     pub requests: u64,
     pub request_bytes: u64,
     pub response_bytes: u64,
-    /// Append bytes counted in fixed-size units, `ceil(bytes / unit)` with a
-    /// minimum of one, summed per request. Zero unless the gateway was given a
-    /// unit size.
+    /// Append request bytes counted in fixed-size units, `ceil(bytes / unit)`
+    /// with a minimum of one, summed per request. Zero unless the gateway was
+    /// given a unit size. This is edge telemetry, not committed-write truth.
     ///
     /// Recorded per request rather than derived later because it cannot be
     /// derived later: two appends of 5 KiB and 25 KiB and two of 10 KiB and
@@ -214,7 +216,7 @@ impl UsageCollector {
                 records,
             });
             while state.pending.len() > MAX_PENDING_BATCHES {
-                merge_oldest(&mut state.pending);
+                merge_oldest_unsent(&mut state.pending);
             }
         }
         !state.pending.is_empty()
@@ -234,6 +236,31 @@ impl UsageCollector {
             state.pending.pop_front();
         }
     }
+
+    fn pending_status(&self) -> (usize, u64) {
+        let state = self.lock();
+        let age_ms = state
+            .pending
+            .front()
+            .map(|batch| unix_time_ms().saturating_sub(batch.window_end_unix_ms))
+            .unwrap_or(0);
+        (state.pending.len(), age_ms)
+    }
+}
+
+/// Merges the oldest two batches that have never been handed to the sink.
+///
+/// The front batch is immutable once it may have been sent. A successful sink
+/// write can lose its acknowledgement, leaving that batch at the head even
+/// though the consumer has already bound its `(producer, sequence)` identity
+/// to the original payload. Growing that payload under the same sequence would
+/// make the consumer deduplicate away the newly merged counts on retry.
+fn merge_oldest_unsent(pending: &mut VecDeque<UsageBatch>) {
+    let Some(possibly_sent) = pending.pop_front() else {
+        return;
+    };
+    merge_oldest(pending);
+    pending.push_front(possibly_sent);
 }
 
 fn merge_oldest(pending: &mut VecDeque<UsageBatch>) {
@@ -295,8 +322,11 @@ pub(crate) async fn flush(collector: &UsageCollector, sink: &dyn UsageSink) {
         match sink.export(&batch).await {
             Ok(()) => collector.acknowledge(batch.sequence),
             Err(error) => {
+                let (pending_batches, oldest_batch_age_ms) = collector.pending_status();
                 tracing::warn!(
                     sequence = batch.sequence,
+                    pending_batches,
+                    oldest_batch_age_ms,
                     error = %error,
                     "usage export failed; batch retained for retry"
                 );
@@ -481,6 +511,36 @@ mod tests {
         flush(&collector, &sink).await;
         let exported = sink.exported.lock().expect("lock");
         let total: u64 = exported
+            .iter()
+            .flat_map(|batch| &batch.records)
+            .map(|record| record.counters.requests)
+            .sum();
+        assert_eq!(total, (MAX_PENDING_BATCHES + 8) as u64);
+    }
+
+    #[test]
+    fn overflow_never_mutates_the_batch_that_may_have_lost_its_ack() {
+        let collector = UsageCollector::new();
+        for sequence in 0..(MAX_PENDING_BATCHES + 8) {
+            collector.record(
+                key("tenant-a", UsageClass::Append),
+                1,
+                sequence as u64 + 1,
+                0,
+                0,
+            );
+            collector.rotate();
+        }
+
+        let state = collector.lock();
+        let front = state.pending.front().expect("possibly-sent head");
+        assert_eq!(front.sequence, 0);
+        assert_eq!(front.records.len(), 1);
+        assert_eq!(front.records[0].counters.requests, 1);
+        assert_eq!(front.records[0].counters.request_bytes, 1);
+
+        let total: u64 = state
+            .pending
             .iter()
             .flat_map(|batch| &batch.records)
             .map(|record| record.counters.requests)

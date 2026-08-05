@@ -32,6 +32,7 @@ fn usage_tracks_appends_retention_and_stream_lifecycle() {
     let usage = bucket_usage(&machine, "benchcmp");
     assert_eq!(usage.stream_count, 1);
     assert_eq!(usage.committed_append_bytes, 0);
+    assert_eq!(usage.committed_write_units_10kib, 1);
 
     assert!(matches!(
         machine.apply(append_cmd(stream("usage"), b"abc", Append::default())),
@@ -44,6 +45,7 @@ fn usage_tracks_appends_retention_and_stream_lifecycle() {
     let usage = bucket_usage(&machine, "benchcmp");
     assert_eq!(usage.committed_append_bytes, 5);
     assert_eq!(usage.committed_records, 2);
+    assert_eq!(usage.committed_write_units_10kib, 3);
     assert_eq!(usage.retained_bytes, 5);
 
     assert!(matches!(
@@ -102,6 +104,32 @@ fn usage_does_not_count_deduplicated_appends() {
         "retried append counts once"
     );
     assert_eq!(usage.committed_records, 1);
+    assert_eq!(usage.committed_write_units_10kib, 2);
+}
+
+#[test]
+fn committed_write_units_round_each_committed_operation() {
+    let mut machine = machine();
+    create_stream(&mut machine, "write-units");
+    assert!(matches!(
+        machine.apply(append_cmd(
+            stream("write-units"),
+            &vec![b'x'; 10 * 1024 + 1],
+            Append::default()
+        )),
+        StreamResponse::Appended { .. }
+    ));
+    let payloads = [vec![b'a'; 5 * 1024], vec![b'b'; 5 * 1024]];
+    let borrowed = payloads.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    machine
+        .append_batch_borrowed(stream("write-units"), Some(OCTET), &borrowed, None, 0)
+        .expect("batch commits");
+
+    assert_eq!(
+        bucket_usage(&machine, "benchcmp").committed_write_units_10kib,
+        4,
+        "create is one unit, the oversized append is two, and the batch is one"
+    );
 }
 
 #[test]
@@ -2616,6 +2644,7 @@ fn bucket_delete_requires_empty_bucket() {
         machine.apply(delete_cmd(stream("s-1"))),
         StreamResponse::Deleted
     );
+    let usage_before_delete = bucket_usage(&machine, "benchcmp");
     assert_eq!(
         machine.apply(StreamCommand::DeleteBucket {
             bucket_id: "benchcmp".to_owned(),
@@ -2624,6 +2653,10 @@ fn bucket_delete_requires_empty_bucket() {
             bucket_id: "benchcmp".to_owned(),
         }
     );
+    assert_eq!(bucket_usage(&machine, "benchcmp"), usage_before_delete);
+    assert_eq!(usage_before_delete.stream_count, 0);
+    assert_eq!(usage_before_delete.retained_bytes, 0);
+    assert!(usage_before_delete.committed_write_units_10kib > 0);
 }
 
 #[test]
@@ -3566,7 +3599,7 @@ proptest! {
 }
 
 #[test]
-fn purge_bucket_removes_streams_usage_and_bucket_idempotently() {
+fn purge_bucket_removes_streams_but_preserves_accounting_idempotently() {
     let mut machine = machine();
     create_stream(&mut machine, "orders");
     create_stream(&mut machine, "journal");
@@ -3586,6 +3619,10 @@ fn purge_bucket_removes_streams_usage_and_bucket_idempotently() {
         machine.apply(create_cmd(other.clone(), Create::default())),
         StreamResponse::Created { .. }
     ));
+    assert!(matches!(
+        machine.apply(set_quota_cmd(Some(10), Some(1024))),
+        StreamResponse::BucketQuotaSet { .. }
+    ));
 
     let response = machine.apply(StreamCommand::PurgeBucket {
         bucket_id: "benchcmp".to_owned(),
@@ -3600,13 +3637,20 @@ fn purge_bucket_removes_streams_usage_and_bucket_idempotently() {
     assert_eq!(bucket_id, "benchcmp");
     assert_eq!(removed_streams, 2);
 
-    // Streams, usage ledger, and the bucket itself are gone.
+    // Content and the bucket are gone. The aggregate ledger remains with zero
+    // gauges so an asynchronous meter cannot miss the committed writes.
+    let purged_usage = bucket_usage(&machine, "benchcmp");
+    assert_eq!(purged_usage.stream_count, 0);
+    assert_eq!(purged_usage.retained_bytes, 0);
+    assert!(purged_usage.committed_write_units_10kib > 0);
     assert!(
         machine
-            .bucket_usage_report()
+            .bucket_quota_report()
             .into_iter()
             .all(|entry| entry.bucket_id != "benchcmp")
     );
+    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
+    assert_eq!(bucket_usage(&restored, "benchcmp"), purged_usage);
     assert!(matches!(
         machine.apply(append_cmd(stream("orders"), b"x", Append::default())),
         StreamResponse::Error { .. }

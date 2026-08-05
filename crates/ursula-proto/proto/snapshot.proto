@@ -32,6 +32,9 @@ message BucketUsageV1 {
   uint64 committed_records = 3;
   uint64 retained_bytes = 4;
   uint64 stream_count = 5;
+  // Committed writes in 10 KiB units, rounded up per operation.
+  // Absent in snapshots written before data-plane billing counters.
+  uint64 committed_write_units_10kib = 6;
 }
 
 message BucketQuotaV1 {
