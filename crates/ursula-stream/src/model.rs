@@ -286,8 +286,11 @@ pub struct StreamBootstrapPlan {
 /// committed (non-deduplicated) appends and survive restarts through the
 /// snapshot. `retained_bytes` and `stream_count` are gauges derived from live
 /// stream state and are recomputed from the restored slots, so drift cannot
-/// accumulate across snapshot cycles. A bucket-wide total is the sum of this
-/// value across every Raft group.
+/// accumulate across snapshot cycles. Deleting or purging a bucket zeros the
+/// gauges but retains the monotonic counters: otherwise committed writes can
+/// disappear before an asynchronous accounting reader observes them. A bucket
+/// recreated under the same ID continues the counters. A bucket-wide total is
+/// the sum of this value across every Raft group.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketUsage {
     pub committed_append_bytes: u64,

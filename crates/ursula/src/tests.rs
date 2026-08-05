@@ -6610,9 +6610,9 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
 }
 
 // #150: administrator-triggered tenant purge. Purging tenant A must remove
-// its streams, bucket, and usage ledger entry while tenant B's identically
-// named stream, record coordinates, and snapshot survive untouched; a re-run
-// converges idempotently on the same report shape with zero counts.
+// its streams and bucket while retaining its aggregate accounting counters;
+// tenant B's identically named stream, record coordinates, and snapshot stay
+// untouched. A re-run converges on the same report shape with zero counts.
 #[tokio::test]
 async fn purge_endpoint_erases_one_tenant_and_leaves_the_other_intact() {
     let app = test_router();
@@ -6672,12 +6672,19 @@ async fn purge_endpoint_erases_one_tenant_and_leaves_the_other_intact() {
     let body = std::str::from_utf8(&body).expect("utf8 body");
     assert!(body.contains(r#""who":"b""#));
 
-    // The usage ledger no longer reports the purged tenant.
+    // Content gauges reach zero, but monotonic write counters remain visible
+    // until the asynchronous biller has observed them.
     let response = http_get(&app, "/__ursula/usage").await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_bytes(response).await;
     let usage: serde_json::Value = serde_json::from_slice(&body).expect("usage JSON");
-    assert!(usage["buckets"].get("tenant-a").is_none());
+    assert_eq!(usage["buckets"]["tenant-a"]["stream_count"], 0);
+    assert_eq!(usage["buckets"]["tenant-a"]["retained_bytes"], 0);
+    assert!(
+        usage["buckets"]["tenant-a"]["committed_write_units_10kib"]
+            .as_u64()
+            .is_some_and(|units| units > 0)
+    );
     assert!(usage["buckets"].get("tenant-b").is_some());
 
     // Idempotent re-run: same report shape, zero removals.

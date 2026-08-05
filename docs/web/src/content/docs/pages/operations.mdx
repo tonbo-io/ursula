@@ -80,7 +80,7 @@ A node that lost its Raft log (disk replaced, data dir wiped) rejoins with a sho
 
 ## Tenant offboarding (bucket purge)
 
-`DELETE /__ursula/purge/{bucket}` (admin plane) erases one tenant bucket completely: every stream in every Raft group, the bucket itself, and its usage-ledger entry, followed by one immediate cold-GC pass that reclaims the streams' cold-object prefixes. The response is a completion report an operator can attest to:
+`DELETE /__ursula/purge/{bucket}` (admin plane) erases one tenant's stream content: every stream in every Raft group, the bucket itself, and its quota, followed by one immediate cold-GC pass that reclaims the streams' cold-object prefixes. It retains only the bucket's aggregate usage counters, because deleting a counter before an asynchronous meter observes it would erase committed billable work. The response is a completion report an operator can attest to:
 
 ```bash
 curl -X DELETE http://127.0.0.1:4438/__ursula/purge/tenant-a
@@ -90,7 +90,8 @@ curl -X DELETE http://127.0.0.1:4438/__ursula/purge/tenant-a
 Semantics:
 
 - **Idempotent and resumable.** Purging an absent bucket returns the same report shape with zero counts. A purge interrupted mid-way converges on re-run: stream removal is a replicated command per group, and cold reclamation is a list-then-delete over object prefixes, so nothing depends on in-memory progress.
-- **Isolated.** Other buckets' streams, offsets, checksums, and snapshots are untouched; the purged bucket name conceals as not-found afterwards and may be recreated cleanly.
+- **Isolated.** Other buckets' streams, offsets, checksums, and snapshots are untouched; the purged bucket name conceals as not-found afterwards and may be recreated. A recreated bucket continues the same monotonic usage counters.
+- **Accounting residue.** The retained entry contains only aggregate counters and zero-valued content gauges, not stream data. Ursula does not currently provide an acknowledgement protocol for erasing it after an external meter persists the final delta. Use opaque bucket IDs if retaining the identifier itself would violate an erasure requirement.
 - **Cold-GC interaction.** If the immediate GC pass fails (for example S3 is briefly unavailable), the entries stay queued and the background GC worker finishes reclamation; the purge itself is already durable at that point.
 - **Backups.** A purged tenant may persist inside backups taken before the purge until those backups age out; restore replays whatever the manifest contains. Deleting old backup sets is part of completing an offboarding with erasure obligations.
 

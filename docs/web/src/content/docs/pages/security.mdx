@@ -29,7 +29,7 @@ Handle the following outside Ursula:
 
 CORS is permissive (`Access-Control-Allow-Origin: *`). Restrict at the proxy for browser traffic.
 
-Tenant offboarding has a first-class erasure path: the admin-plane [bucket purge endpoint](/docs/operations#tenant-offboarding-bucket-purge) removes a tenant's streams, bucket, usage entry, and cold objects idempotently, leaving other tenants untouched.
+Tenant offboarding has a first-class erasure path: the admin-plane [bucket purge endpoint](/docs/operations#tenant-offboarding-bucket-purge) removes a tenant's streams, bucket, quota, and cold objects idempotently, leaving other tenants untouched. It deliberately retains aggregate monotonic usage counters so asynchronous accounting cannot miss committed work; see the operations note for the remaining identifier-erasure limitation.
 
 ## Gateway access control (opt-in)
 
