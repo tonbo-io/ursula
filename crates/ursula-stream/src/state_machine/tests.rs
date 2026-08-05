@@ -32,7 +32,7 @@ fn usage_tracks_appends_retention_and_stream_lifecycle() {
     let usage = bucket_usage(&machine, "benchcmp");
     assert_eq!(usage.stream_count, 1);
     assert_eq!(usage.committed_append_bytes, 0);
-    assert_eq!(usage.committed_write_units_10kib, 1);
+    assert_eq!(usage.committed_write_units, 1);
 
     assert!(matches!(
         machine.apply(append_cmd(stream("usage"), b"abc", Append::default())),
@@ -45,7 +45,7 @@ fn usage_tracks_appends_retention_and_stream_lifecycle() {
     let usage = bucket_usage(&machine, "benchcmp");
     assert_eq!(usage.committed_append_bytes, 5);
     assert_eq!(usage.committed_records, 2);
-    assert_eq!(usage.committed_write_units_10kib, 3);
+    assert_eq!(usage.committed_write_units, 3);
     assert_eq!(usage.retained_bytes, 5);
 
     assert!(matches!(
@@ -80,6 +80,20 @@ fn usage_tracks_appends_retention_and_stream_lifecycle() {
 }
 
 #[test]
+fn usage_decodes_the_pre_contract_counter_name() {
+    let usage: crate::model::BucketUsage = serde_json::from_value(serde_json::json!({
+        "committed_append_bytes": 100,
+        "committed_records": 7,
+        "committed_write_units_10kib": 3,
+        "retained_bytes": 60,
+        "stream_count": 2
+    }))
+    .expect("legacy usage snapshot");
+
+    assert_eq!(usage.committed_write_units, 3);
+}
+
+#[test]
 fn usage_does_not_count_deduplicated_appends() {
     let mut machine = machine();
     create_stream(&mut machine, "dedup");
@@ -104,7 +118,7 @@ fn usage_does_not_count_deduplicated_appends() {
         "retried append counts once"
     );
     assert_eq!(usage.committed_records, 1);
-    assert_eq!(usage.committed_write_units_10kib, 2);
+    assert_eq!(usage.committed_write_units, 2);
 }
 
 #[test]
@@ -126,7 +140,7 @@ fn committed_write_units_round_each_committed_operation() {
         .expect("batch commits");
 
     assert_eq!(
-        bucket_usage(&machine, "benchcmp").committed_write_units_10kib,
+        bucket_usage(&machine, "benchcmp").committed_write_units,
         4,
         "create is one unit, the oversized append is two, and the batch is one"
     );
@@ -2656,7 +2670,7 @@ fn bucket_delete_requires_empty_bucket() {
     assert_eq!(bucket_usage(&machine, "benchcmp"), usage_before_delete);
     assert_eq!(usage_before_delete.stream_count, 0);
     assert_eq!(usage_before_delete.retained_bytes, 0);
-    assert!(usage_before_delete.committed_write_units_10kib > 0);
+    assert!(usage_before_delete.committed_write_units > 0);
 }
 
 #[test]
@@ -3642,7 +3656,7 @@ fn purge_bucket_removes_streams_but_preserves_accounting_idempotently() {
     let purged_usage = bucket_usage(&machine, "benchcmp");
     assert_eq!(purged_usage.stream_count, 0);
     assert_eq!(purged_usage.retained_bytes, 0);
-    assert!(purged_usage.committed_write_units_10kib > 0);
+    assert!(purged_usage.committed_write_units > 0);
     assert!(
         machine
             .bucket_quota_report()
