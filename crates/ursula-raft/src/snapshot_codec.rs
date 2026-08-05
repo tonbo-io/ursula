@@ -131,6 +131,7 @@ fn bucket_usage_from_proto(value: proto::BucketUsageV1) -> ursula_stream::Bucket
         usage: ursula_stream::BucketUsage {
             committed_append_bytes: value.committed_append_bytes,
             committed_records: value.committed_records,
+            committed_write_units_10kib: value.committed_write_units_10kib,
             retained_bytes: value.retained_bytes,
             stream_count: value.stream_count,
         },
@@ -142,6 +143,7 @@ fn bucket_usage_to_proto(value: ursula_stream::BucketUsageSnapshot) -> proto::Bu
         bucket_id: value.bucket_id,
         committed_append_bytes: value.usage.committed_append_bytes,
         committed_records: value.usage.committed_records,
+        committed_write_units_10kib: value.usage.committed_write_units_10kib,
         retained_bytes: value.usage.retained_bytes,
         stream_count: value.usage.stream_count,
     }
@@ -676,6 +678,7 @@ mod tests {
                     usage: ursula_stream::BucketUsage {
                         committed_append_bytes: 100,
                         committed_records: 7,
+                        committed_write_units_10kib: 3,
                         retained_bytes: 60,
                         stream_count: 2,
                     },

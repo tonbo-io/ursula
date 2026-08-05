@@ -570,6 +570,9 @@ impl ShardRuntime {
                 usage.committed_records = usage
                     .committed_records
                     .saturating_add(entry.usage.committed_records);
+                usage.committed_write_units_10kib = usage
+                    .committed_write_units_10kib
+                    .saturating_add(entry.usage.committed_write_units_10kib);
                 usage.retained_bytes = usage
                     .retained_bytes
                     .saturating_add(entry.usage.retained_bytes);

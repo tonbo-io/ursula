@@ -281,8 +281,9 @@ pub struct StreamBootstrapPlan {
 
 /// Per-bucket committed usage inside one Raft group's replicated state.
 ///
-/// `committed_append_bytes` and `committed_records` are monotonic: they count
-/// accepted (non-deduplicated) appends and survive restarts through the
+/// `committed_append_bytes`, `committed_records`, and
+/// `committed_write_units_10kib` are monotonic: they count
+/// committed (non-deduplicated) appends and survive restarts through the
 /// snapshot. `retained_bytes` and `stream_count` are gauges derived from live
 /// stream state and are recomputed from the restored slots, so drift cannot
 /// accumulate across snapshot cycles. A bucket-wide total is the sum of this
@@ -291,6 +292,12 @@ pub struct StreamBootstrapPlan {
 pub struct BucketUsage {
     pub committed_append_bytes: u64,
     pub committed_records: u64,
+    /// Committed write operations measured in 10 KiB units, rounded up per
+    /// operation and never below one. Kept in replicated state because a
+    /// gateway cannot distinguish "commit succeeded, response was lost" from
+    /// "the write never committed".
+    #[serde(default)]
+    pub committed_write_units_10kib: u64,
     pub retained_bytes: u64,
     pub stream_count: u64,
 }

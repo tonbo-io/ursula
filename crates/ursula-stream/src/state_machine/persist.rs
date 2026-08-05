@@ -267,6 +267,7 @@ impl StreamStateMachine {
             let usage = recomputed.entry(persisted.bucket_id).or_default();
             usage.committed_append_bytes = persisted.usage.committed_append_bytes;
             usage.committed_records = persisted.usage.committed_records;
+            usage.committed_write_units_10kib = persisted.usage.committed_write_units_10kib;
         }
         for usage in recomputed.values_mut() {
             if usage.committed_append_bytes == 0 {

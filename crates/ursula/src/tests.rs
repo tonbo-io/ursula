@@ -6338,6 +6338,7 @@ async fn usage_endpoint_reports_per_bucket_committed_counters() {
     let created = fetch_usage().await;
     let tenant_a_created = usage_for(&created, "tenant-a");
     assert_eq!(tenant_a_created["stream_count"], 1);
+    assert_eq!(tenant_a_created["committed_write_units_10kib"], 1);
     assert!(
         tenant_a_created["committed_append_bytes"]
             .as_u64()
@@ -6384,6 +6385,14 @@ async fn usage_endpoint_reports_per_bucket_committed_counters() {
             .expect("records")
             + 1,
         "exactly one record committed despite the duplicate retry"
+    );
+    assert_eq!(
+        tenant_a["committed_write_units_10kib"].as_u64().expect("units"),
+        tenant_a_created["committed_write_units_10kib"]
+            .as_u64()
+            .expect("units")
+            + 1,
+        "the duplicate retry does not create another write unit"
     );
     assert_eq!(
         tenant_a["committed_append_bytes"], tenant_a["retained_bytes"],

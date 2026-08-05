@@ -32,6 +32,7 @@ fn usage_tracks_appends_retention_and_stream_lifecycle() {
     let usage = bucket_usage(&machine, "benchcmp");
     assert_eq!(usage.stream_count, 1);
     assert_eq!(usage.committed_append_bytes, 0);
+    assert_eq!(usage.committed_write_units_10kib, 1);
 
     assert!(matches!(
         machine.apply(append_cmd(stream("usage"), b"abc", Append::default())),
@@ -44,6 +45,7 @@ fn usage_tracks_appends_retention_and_stream_lifecycle() {
     let usage = bucket_usage(&machine, "benchcmp");
     assert_eq!(usage.committed_append_bytes, 5);
     assert_eq!(usage.committed_records, 2);
+    assert_eq!(usage.committed_write_units_10kib, 3);
     assert_eq!(usage.retained_bytes, 5);
 
     assert!(matches!(
@@ -102,6 +104,32 @@ fn usage_does_not_count_deduplicated_appends() {
         "retried append counts once"
     );
     assert_eq!(usage.committed_records, 1);
+    assert_eq!(usage.committed_write_units_10kib, 2);
+}
+
+#[test]
+fn committed_write_units_round_each_committed_operation() {
+    let mut machine = machine();
+    create_stream(&mut machine, "write-units");
+    assert!(matches!(
+        machine.apply(append_cmd(
+            stream("write-units"),
+            &vec![b'x'; 10 * 1024 + 1],
+            Append::default()
+        )),
+        StreamResponse::Appended { .. }
+    ));
+    let payloads = [vec![b'a'; 5 * 1024], vec![b'b'; 5 * 1024]];
+    let borrowed = payloads.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    machine
+        .append_batch_borrowed(stream("write-units"), Some(OCTET), &borrowed, None, 0)
+        .expect("batch commits");
+
+    assert_eq!(
+        bucket_usage(&machine, "benchcmp").committed_write_units_10kib,
+        4,
+        "create is one unit, the oversized append is two, and the batch is one"
+    );
 }
 
 #[test]
