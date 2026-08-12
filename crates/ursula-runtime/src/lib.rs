@@ -188,6 +188,7 @@ pub use snapshot_store::SnapshotStoreFuture;
 pub use snapshot_store::default_snapshot_store;
 pub use snapshot_store::snapshot_store_from_config;
 pub use ursula_config::config::ColdConfig;
+pub use ursula_stream::COMMITTED_WRITE_UNIT_BYTES;
 pub use ursula_stream::ColdChunkRef;
 pub use ursula_stream::ColdFlushCandidate;
 pub use ursula_stream::ColdGcEntry;

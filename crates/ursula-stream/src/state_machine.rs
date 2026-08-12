@@ -90,7 +90,12 @@ mod registry;
 mod ttl;
 
 const TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE: usize = 256;
-const WRITE_UNIT_BYTES_10_KIB: u64 = 10 * 1024;
+/// Size of the self-described derived write unit exported by Ursula.
+///
+/// Raw committed bytes and records remain available beside it. Keeping the
+/// unit in the usage contract, rather than its field name, lets consumers
+/// validate the interpretation before using the derived counter.
+pub const COMMITTED_WRITE_UNIT_BYTES: u64 = 10 * 1024;
 
 new_key_type! {
     struct StreamKey;
@@ -219,9 +224,9 @@ impl StreamStateMachine {
         let usage = self.usage_mut(bucket_id);
         usage.committed_append_bytes = usage.committed_append_bytes.saturating_add(payload_bytes);
         usage.committed_records = usage.committed_records.saturating_add(records);
-        usage.committed_write_units_10kib = usage
-            .committed_write_units_10kib
-            .saturating_add(payload_bytes.div_ceil(WRITE_UNIT_BYTES_10_KIB).max(1));
+        usage.committed_write_units = usage
+            .committed_write_units
+            .saturating_add(payload_bytes.div_ceil(COMMITTED_WRITE_UNIT_BYTES).max(1));
         usage.retained_bytes = usage.retained_bytes.saturating_add(payload_bytes);
     }
 
@@ -232,9 +237,9 @@ impl StreamStateMachine {
         usage.stream_count = usage.stream_count.saturating_add(1);
         usage.committed_append_bytes = usage.committed_append_bytes.saturating_add(initial_bytes);
         usage.committed_records = usage.committed_records.saturating_add(records);
-        usage.committed_write_units_10kib = usage
-            .committed_write_units_10kib
-            .saturating_add(initial_bytes.div_ceil(WRITE_UNIT_BYTES_10_KIB).max(1));
+        usage.committed_write_units = usage
+            .committed_write_units
+            .saturating_add(initial_bytes.div_ceil(COMMITTED_WRITE_UNIT_BYTES).max(1));
         usage.retained_bytes = usage.retained_bytes.saturating_add(initial_bytes);
     }
 

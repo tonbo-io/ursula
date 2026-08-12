@@ -24,6 +24,9 @@ message SnapshotHeaderV1 {
   repeated BucketUsageV1 bucket_usage = 5;
   // Per-bucket data-plane quota records. Absent in legacy snapshots.
   repeated BucketQuotaV1 bucket_quotas = 6;
+  // Unit used to derive every committed_write_units counter in this snapshot.
+  // Absent means the original 10 KiB contract for backward compatibility.
+  optional uint64 committed_write_unit_bytes = 7;
 }
 
 message BucketUsageV1 {
@@ -32,9 +35,10 @@ message BucketUsageV1 {
   uint64 committed_records = 3;
   uint64 retained_bytes = 4;
   uint64 stream_count = 5;
-  // Committed writes in 10 KiB units, rounded up per operation.
-  // Absent in snapshots written before data-plane billing counters.
-  uint64 committed_write_units_10kib = 6;
+  // Committed writes in the self-described usage unit, rounded up per
+  // operation. Field number 6 is unchanged from the original 10 KiB-specific
+  // name, so existing snapshots remain wire-compatible.
+  uint64 committed_write_units = 6;
 }
 
 message BucketQuotaV1 {

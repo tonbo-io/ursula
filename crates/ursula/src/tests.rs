@@ -6338,7 +6338,9 @@ async fn usage_endpoint_reports_per_bucket_committed_counters() {
     let created = fetch_usage().await;
     let tenant_a_created = usage_for(&created, "tenant-a");
     assert_eq!(tenant_a_created["stream_count"], 1);
-    assert_eq!(tenant_a_created["committed_write_units_10kib"], 1);
+    assert_eq!(created["version"], 1);
+    assert_eq!(created["write_unit_bytes"], 10 * 1024);
+    assert_eq!(tenant_a_created["committed_write_units"], 1);
     assert!(
         tenant_a_created["committed_append_bytes"]
             .as_u64()
@@ -6387,10 +6389,8 @@ async fn usage_endpoint_reports_per_bucket_committed_counters() {
         "exactly one record committed despite the duplicate retry"
     );
     assert_eq!(
-        tenant_a["committed_write_units_10kib"]
-            .as_u64()
-            .expect("units"),
-        tenant_a_created["committed_write_units_10kib"]
+        tenant_a["committed_write_units"].as_u64().expect("units"),
+        tenant_a_created["committed_write_units"]
             .as_u64()
             .expect("units")
             + 1,
@@ -6681,7 +6681,7 @@ async fn purge_endpoint_erases_one_tenant_and_leaves_the_other_intact() {
     assert_eq!(usage["buckets"]["tenant-a"]["stream_count"], 0);
     assert_eq!(usage["buckets"]["tenant-a"]["retained_bytes"], 0);
     assert!(
-        usage["buckets"]["tenant-a"]["committed_write_units_10kib"]
+        usage["buckets"]["tenant-a"]["committed_write_units"]
             .as_u64()
             .is_some_and(|units| units > 0)
     );

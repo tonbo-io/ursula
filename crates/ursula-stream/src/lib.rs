@@ -64,6 +64,7 @@ pub use response::StreamResponse;
 pub use snapshot::StreamSnapshot;
 pub use snapshot::StreamSnapshotEntry;
 pub use snapshot::StreamSnapshotError;
+pub use state_machine::COMMITTED_WRITE_UNIT_BYTES;
 pub use state_machine::StreamStateMachine;
 pub use validate::validate_bucket_id;
 pub use validate::validate_stream_id;

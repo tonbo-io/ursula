@@ -78,6 +78,30 @@ A node that lost its Raft log (disk replaced, data dir wiped) rejoins with a sho
 
 `POST /__ursula/cluster-probe` also exists on the client plane, but it is machinery rather than an operator surface: nodes send each other heartbeat-sized bodies through it to verify cluster-plane egress, and it bypasses ingress admission.
 
+## Usage export
+
+`GET /__ursula/usage` returns committed counters and current gauges from local replicated state, aggregated by bucket across this node's Raft groups:
+
+```json
+{
+  "version": 1,
+  "write_unit_bytes": 10240,
+  "buckets": {
+    "tenant-a": {
+      "committed_append_bytes": 24576,
+      "committed_records": 3,
+      "committed_write_units": 4,
+      "retained_bytes": 24576,
+      "stream_count": 1
+    }
+  }
+}
+```
+
+The raw byte and record counters are pricing-neutral facts. `committed_write_units` is a convenience derived meter: every committed, non-deduplicated create or append contributes at least one unit and rounds its canonical payload up independently by `write_unit_bytes`. Consumers must validate both `version` and `write_unit_bytes` before interpreting it; the unit is data in the contract, not encoded into the counter name. The same unit is persisted in Raft snapshots, and a build refuses to restore a snapshot carrying a different unit. Changing it therefore requires a new contract version and an explicit state migration, never a configuration edit. Ursula does not attach currency, a price, or an account owner.
+
+Counters are monotonic and survive snapshots, stream deletion, and bucket purge. `retained_bytes` and `stream_count` are current-state gauges and may decrease. A node serves local applied state, so replicated consumers should poll every voter and use their own completeness policy rather than treating one response as a cluster-wide linearizable read.
+
 ## Tenant offboarding (bucket purge)
 
 `DELETE /__ursula/purge/{bucket}` (admin plane) erases one tenant's stream content: every stream in every Raft group, the bucket itself, and its quota, followed by one immediate cold-GC pass that reclaims the streams' cold-object prefixes. It retains only the bucket's aggregate usage counters, because deleting a counter before an asynchronous meter observes it would erase committed billable work. The response is a completion report an operator can attest to:

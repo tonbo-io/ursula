@@ -83,6 +83,15 @@ pub(crate) fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, Snaps
             "snapshot missing footer frame".to_owned(),
         ));
     }
+    let snapshot_write_unit = header
+        .committed_write_unit_bytes
+        .unwrap_or(ursula_stream::COMMITTED_WRITE_UNIT_BYTES);
+    if snapshot_write_unit != ursula_stream::COMMITTED_WRITE_UNIT_BYTES {
+        return Err(SnapshotStoreError::Deserialize(format!(
+            "snapshot committed write unit is {snapshot_write_unit} bytes; this build uses {}",
+            ursula_stream::COMMITTED_WRITE_UNIT_BYTES
+        )));
+    }
 
     Ok(GroupSnapshot {
         placement: placement_from_proto(required(header.placement, "snapshot header placement")?),
@@ -131,7 +140,7 @@ fn bucket_usage_from_proto(value: proto::BucketUsageV1) -> ursula_stream::Bucket
         usage: ursula_stream::BucketUsage {
             committed_append_bytes: value.committed_append_bytes,
             committed_records: value.committed_records,
-            committed_write_units_10kib: value.committed_write_units_10kib,
+            committed_write_units: value.committed_write_units,
             retained_bytes: value.retained_bytes,
             stream_count: value.stream_count,
         },
@@ -143,7 +152,7 @@ fn bucket_usage_to_proto(value: ursula_stream::BucketUsageSnapshot) -> proto::Bu
         bucket_id: value.bucket_id,
         committed_append_bytes: value.usage.committed_append_bytes,
         committed_records: value.usage.committed_records,
-        committed_write_units_10kib: value.usage.committed_write_units_10kib,
+        committed_write_units: value.usage.committed_write_units,
         retained_bytes: value.usage.retained_bytes,
         stream_count: value.usage.stream_count,
     }
@@ -187,6 +196,7 @@ impl GroupSnapshotFrameIter {
                     .into_iter()
                     .map(bucket_quota_to_proto)
                     .collect(),
+                committed_write_unit_bytes: Some(ursula_stream::COMMITTED_WRITE_UNIT_BYTES),
             }),
             streams: streams.into_iter(),
             append_counts: stream_append_counts.into_iter(),
@@ -678,7 +688,7 @@ mod tests {
                     usage: ursula_stream::BucketUsage {
                         committed_append_bytes: 100,
                         committed_records: 7,
-                        committed_write_units_10kib: 3,
+                        committed_write_units: 3,
                         retained_bytes: 60,
                         stream_count: 2,
                     },
@@ -727,6 +737,7 @@ mod tests {
                     next_cold_gc_seq: 0,
                     bucket_usage: Vec::new(),
                     bucket_quotas: Vec::new(),
+                    committed_write_unit_bytes: None,
                 },
             )),
         })
@@ -736,5 +747,38 @@ mod tests {
             decode_group_snapshot(&header),
             Err(SnapshotStoreError::Deserialize(_))
         ));
+    }
+
+    #[test]
+    fn rejects_a_snapshot_with_a_different_write_unit() {
+        let header = proto::SnapshotHeaderV1 {
+            placement: Some(placement_to_proto(ShardPlacement {
+                core_id: CoreId(0),
+                shard_id: ShardId(0),
+                raft_group_id: RaftGroupId(0),
+            })),
+            group_commit_index: 0,
+            buckets: Vec::new(),
+            next_cold_gc_seq: 0,
+            bucket_usage: Vec::new(),
+            bucket_quotas: Vec::new(),
+            committed_write_unit_bytes: Some(4096),
+        };
+        let bytes = [
+            encode_frame(proto::SnapshotFrameV1 {
+                frame: Some(proto::snapshot_frame_v1::Frame::Header(header)),
+            })
+            .expect("encode header"),
+            encode_frame(proto::SnapshotFrameV1 {
+                frame: Some(proto::snapshot_frame_v1::Frame::Footer(
+                    proto::SnapshotFooterV1 {},
+                )),
+            })
+            .expect("encode footer"),
+        ]
+        .concat();
+
+        let error = decode_group_snapshot(&bytes).expect_err("unit mismatch must fail restore");
+        assert!(error.to_string().contains("4096"), "{error}");
     }
 }
