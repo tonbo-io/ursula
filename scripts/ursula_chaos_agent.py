@@ -280,6 +280,7 @@ WORKLOAD_CLEAN_ERROR_RATE = 0.05
 FAULT_READY_MIN_SUCCESS_RATE = 0.90
 PROBE_PASS_ERROR_RATE = 0.05
 APPEND_TRANSIENT_RETRY_SECS = 5.0
+WORKLOAD_ROLLOVER_UNKNOWN_GRACE_SECS = 60.0
 _PUBLISHED_INJECTIONS = 8  # page renders last 3, keep a small lookback
 _PUBLISHED_EVENTS = 16  # page renders last 10
 _PUBLISHED_INJECTION_TIMELINE = 8  # timeline shown only in expandable details
@@ -513,6 +514,8 @@ class ChaosAgent:
             else None
         )
         self.rollover_in_progress = False
+        self.rollover_forced_with_unknown_appends = False
+        self.active_append_count = 0
         self.run_id = self.workload_run_id(self.run_generation)
         self.streams = self.build_workload_streams(self.run_id)
         self.producer_probe_stream = WorkloadStream(f"{self.run_id}-producer-probe")
@@ -1069,15 +1072,35 @@ class ChaosAgent:
     def maybe_rollover_workload_streams(self) -> None:
         if self.next_workload_rollover_at is None:
             return
-        if time.monotonic() < self.next_workload_rollover_at:
+        now = time.monotonic()
+        if now < self.next_workload_rollover_at:
             return
         if self.workload_probes_paused():
             return
         with self.state_lock:
-            if self.rollover_in_progress or self.has_unknown_appends_locked():
+            if not self.rollover_in_progress:
+                has_unknown_appends = self.has_unknown_appends_locked()
+                if (
+                    has_unknown_appends
+                    and now - self.next_workload_rollover_at
+                    < WORKLOAD_ROLLOVER_UNKNOWN_GRACE_SECS
+                ):
+                    return
+                self.rollover_forced_with_unknown_appends = has_unknown_appends
+                self.rollover_in_progress = True
+            # Setting rollover_in_progress prevents a new append from starting.
+            # Let calls that crossed that boundary first finish before replacing
+            # the stream objects and per-lane accounting below.
+            if self.active_append_count > 0:
                 return
-            self.rollover_in_progress = True
             next_generation = self.run_generation + 1
+            forced_with_unknown_appends = self.rollover_forced_with_unknown_appends
+        if forced_with_unknown_appends:
+            self.event(
+                "warn",
+                "forcing workload rollover after unresolved appends exceeded "
+                f"the {WORKLOAD_ROLLOVER_UNKNOWN_GRACE_SECS:.0f}s grace period",
+            )
         next_run_id = self.workload_run_id(next_generation)
         next_streams = self.build_workload_streams(next_run_id)
         next_probe_stream = WorkloadStream(f"{next_run_id}-producer-probe")
@@ -1086,6 +1109,7 @@ class ChaosAgent:
         except Exception:
             with self.state_lock:
                 self.rollover_in_progress = False
+                self.rollover_forced_with_unknown_appends = False
                 self.next_workload_rollover_at = time.monotonic() + min(60, self.workload_run_secs)
             raise
         with self.state_lock:
@@ -1101,6 +1125,7 @@ class ChaosAgent:
             self.lane_unresolved_appends = [False for _ in range(self.append_workers)]
             self.global_unresolved_append = False
             self.rollover_in_progress = False
+            self.rollover_forced_with_unknown_appends = False
             self.next_workload_rollover_at = time.monotonic() + self.workload_run_secs
         self.event("info", f"rolled workload streams {previous_run_id} -> {next_run_id}")
         for stream in previous_streams:
@@ -1110,6 +1135,15 @@ class ChaosAgent:
         with self.state_lock:
             if self.rollover_in_progress:
                 return False
+            self.active_append_count += 1
+        try:
+            return self._append_once_active(lane_id)
+        finally:
+            with self.state_lock:
+                self.active_append_count = max(0, self.active_append_count - 1)
+
+    def _append_once_active(self, lane_id: int | None = None) -> bool:
+        with self.state_lock:
             attempt_id = self.append_attempts
             self.append_attempts += 1
             if lane_id is None:
@@ -3374,6 +3408,15 @@ class ChaosAgent:
             if self.next_workload_rollover_at is not None
             else None
         )
+        with self.state_lock:
+            rollover_in_progress = self.rollover_in_progress
+            rollover_blocked_by_unknown_appends = (
+                self.next_workload_rollover_at is not None
+                and time.monotonic() >= self.next_workload_rollover_at
+                and self.has_unknown_appends_locked()
+                and not rollover_in_progress
+            )
+            active_append_count = self.active_append_count
         if self.current_injection() is not None:
             published_next_fault_at = None
         status = {
@@ -3402,6 +3445,9 @@ class ChaosAgent:
                 "workload_stream_ttl_secs": self.workload_stream_ttl_secs,
                 "workload_run_secs": self.workload_run_secs,
                 "next_workload_rollover_after": iso(next_workload_rollover_after),
+                "rollover_in_progress": rollover_in_progress,
+                "rollover_blocked_by_unknown_appends": rollover_blocked_by_unknown_appends,
+                "active_append_count": active_append_count,
                 "stream_count": len(self.streams),
                 "record_stream_count": sum(
                     1 for stream in self.streams if stream.content_type == "application/json"

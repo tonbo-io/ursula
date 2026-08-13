@@ -13,6 +13,7 @@ from ursula_chaos_agent import (
     CATCH_UP_RECOVERY_SLO_SECS,
     IMPAIRMENT_SCENARIOS,
     NODE_SERVICE_UNIT,
+    WORKLOAD_ROLLOVER_UNKNOWN_GRACE_SECS,
     ChaosAgent,
     Node,
     ProducerState,
@@ -459,6 +460,93 @@ class ChaosAgentStateTest(unittest.TestCase):
         self.assertFalse(agent.has_unknown_appends_locked())
         self.assertEqual(stream.next_offset, 80)
         self.assertEqual(stream.expected_live_setsum.hexdigest(), server_setsum.hexdigest())
+
+    def test_workload_rollover_forces_progress_after_unknown_append_grace(self) -> None:
+        agent = object.__new__(ChaosAgent)
+        agent.state_lock = threading.Lock()
+        agent.next_workload_rollover_at = 100.0
+        agent.workload_run_secs = 3600
+        agent.rollover_in_progress = False
+        agent.rollover_forced_with_unknown_appends = False
+        agent.active_append_count = 1
+        agent.active_fault = None
+        agent.active_injection_id = None
+        agent.injections = deque()
+        agent.base_run_id = "run-test"
+        agent.run_generation = 4
+        agent.run_id = "run-test-r0004"
+        agent.current_run_started_at = datetime.now(timezone.utc)
+        agent.workload_stream_count = 2
+        agent.record_stream_count = 1
+        old_stream = WorkloadStream("run-test-r0004-record-0000")
+        old_stream.pending_producer_appends["producer\0epoch\0seq"] = b"unknown"
+        agent.streams = [old_stream]
+        agent.producer_probe_stream = WorkloadStream("run-test-r0004-producer-probe")
+        agent.producer_probe_epoch = 3
+        agent.append_workers = 2
+        agent.lane_attempts = [9, 10]
+        agent.lane_unresolved_appends = [True, False]
+        agent.global_unresolved_append = False
+        events: list[tuple[str, str]] = []
+        created: list[str] = []
+        unregistered: list[str] = []
+        agent.event = lambda level, message: events.append((level, message))
+        agent.create_workload_run_streams = (
+            lambda run_id, streams, probe: created.append(run_id)
+        )
+        agent.unregister_index_stream = lambda stream: unregistered.append(stream.name)
+
+        with patch(
+            "ursula_chaos_agent.time.monotonic",
+            return_value=100.0 + WORKLOAD_ROLLOVER_UNKNOWN_GRACE_SECS - 1,
+        ):
+            agent.maybe_rollover_workload_streams()
+
+        self.assertFalse(agent.rollover_in_progress)
+        self.assertEqual(agent.run_generation, 4)
+        self.assertEqual(created, [])
+
+        with patch(
+            "ursula_chaos_agent.time.monotonic",
+            return_value=100.0 + WORKLOAD_ROLLOVER_UNKNOWN_GRACE_SECS + 1,
+        ):
+            agent.maybe_rollover_workload_streams()
+
+        self.assertTrue(agent.rollover_in_progress)
+        self.assertEqual(agent.run_generation, 4)
+        self.assertEqual(created, [])
+
+        agent.active_append_count = 0
+        with patch(
+            "ursula_chaos_agent.time.monotonic",
+            return_value=100.0 + WORKLOAD_ROLLOVER_UNKNOWN_GRACE_SECS + 1,
+        ):
+            agent.maybe_rollover_workload_streams()
+
+        self.assertFalse(agent.rollover_in_progress)
+        self.assertEqual(agent.run_generation, 5)
+        self.assertEqual(agent.run_id, "run-test-r0005")
+        self.assertEqual(created, ["run-test-r0005"])
+        self.assertEqual(unregistered, ["run-test-r0004-record-0000"])
+        self.assertEqual(agent.lane_unresolved_appends, [False, False])
+        self.assertFalse(agent.global_unresolved_append)
+        self.assertTrue(any("forcing workload rollover" in message for _, message in events))
+
+    def test_append_count_is_released_when_an_append_raises(self) -> None:
+        agent = object.__new__(ChaosAgent)
+        agent.state_lock = threading.Lock()
+        agent.rollover_in_progress = False
+        agent.active_append_count = 0
+
+        def fail(_lane_id):
+            raise RuntimeError("append failed")
+
+        agent._append_once_active = fail
+
+        with self.assertRaisesRegex(RuntimeError, "append failed"):
+            agent.append_once(3)
+
+        self.assertEqual(agent.active_append_count, 0)
 
 
 if __name__ == "__main__":
