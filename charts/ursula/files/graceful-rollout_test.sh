@@ -8,17 +8,21 @@ STATEFULSET=ursula
 REPLICAS=3
 EXPECTED_GROUPS=256
 TARGET_IMAGE=ghcr.io/tonbo-io/ursula:0.3.12
-CTL=/bin/true
+CTL=true
 ROLLOUT_SOURCE_ONLY=1
 export NAMESPACE STATEFULSET REPLICAS EXPECTED_GROUPS TARGET_IMAGE CTL ROLLOUT_SOURCE_ONLY
 
 # shellcheck source=graceful-rollout.sh
 . "${test_dir}/graceful-rollout.sh"
 
+mocked_revision=ursula-stale
 kubectl() {
   case "$*" in
     *"get configmap ursula-rollout-state -o jsonpath={.data.target-image}"*)
       printf '%s' "${TARGET_IMAGE}"
+      ;;
+    *"get configmap ursula-rollout-state -o jsonpath={.data.target-revision}"*)
+      printf '%s' ursula-stale
       ;;
     *"get configmap ursula-rollout-state -o jsonpath={.data.phase}"*)
       printf '%s' restarting
@@ -30,7 +34,10 @@ kubectl() {
       return 0
       ;;
     *"get pod ursula-1 -o jsonpath={.spec.containers"*)
-      printf '%s' ghcr.io/tonbo-io/ursula:0.3.11
+      printf '%s' "${TARGET_IMAGE}"
+      ;;
+    *"get pod ursula-1 -o jsonpath={.metadata.labels.controller-revision-hash}"*)
+      printf '%s' "${mocked_revision}"
       ;;
     *)
       printf 'unexpected kubectl invocation: %s\n' "$*" >&2
@@ -41,22 +48,39 @@ kubectl() {
 
 wait_for_pod_ready() {
   [ "$1" = "1" ]
+  [ "${replaced_stale}" = "1" ]
 }
 
 start_forward() {
-  echo "old-image resume must not open a new admin tunnel" >&2
-  return 1
+  [ "$1" = "1" ]
+  resumed_forward=1
 }
+
+desired_revision() {
+  printf '%s' ursula-current
+}
+
+replace_pod() {
+  [ "$1" = "1" ]
+  replaced_stale=1
+  mocked_revision=ursula-current
+}
+
+strict_verify() { :; }
 
 record_state() {
-  [ "$1" = "pending" ]
+  [ "$1" = "complete" ]
   [ "$2" = "2" ]
-  resumed_pending=1
+  resumed_complete=1
 }
 
-resumed_pending=0
+replaced_stale=0
+resumed_forward=0
+resumed_complete=0
 resume_if_needed
-[ "${resumed_pending}" = "1" ]
+[ "${replaced_stale}" = "1" ]
+[ "${resumed_forward}" = "1" ]
+[ "${resumed_complete}" = "1" ]
 
 mocked_revision=ursula-current
 kubectl() {
@@ -80,6 +104,25 @@ if pod_matches_target 1 ursula-current; then
   echo "same image with a stale controller revision must be rolled" >&2
   exit 1
 fi
+
+# A recorded replacement must be resumed before the blanket Ready gate. The
+# stale replacement in the fixture cannot become Ready until resume replaces
+# it, so reversing these two calls recreates the production deadlock.
+call_order=
+write_manifest() { :; }
+wait_for_template() { :; }
+start_ready_forwards() { call_order="${call_order} ready"; }
+resume_if_needed() { call_order="${call_order} resume"; }
+wait_for_pod_ready() { call_order="${call_order} wait"; }
+start_forward() { :; }
+strict_verify() { :; }
+desired_revision() { printf '%s' ursula-current; }
+roll_node() { :; }
+all_pods_match_target() { return 0; }
+record_state() { :; }
+REPLICAS=1
+main
+[ "${call_order}" = " ready resume wait" ]
 
 # The cluster manifest used to list three nodes literally, so any other replica
 # count produced a view that disagreed with the StatefulSet it was rolling. The
