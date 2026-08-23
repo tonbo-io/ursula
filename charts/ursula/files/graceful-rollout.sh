@@ -161,6 +161,41 @@ wait_for_pod_ready() {
   kubectl -n "${NAMESPACE}" wait --for=condition=Ready "pod/${pod}" --timeout=15m
 }
 
+start_ready_forwards() {
+  ordinal=0
+  while [ "${ordinal}" -lt "${REPLICAS}" ]; do
+    pod="${STATEFULSET}-${ordinal}"
+    ready=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
+      -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+    if [ "${ready}" = "True" ]; then
+      start_forward "${ordinal}"
+    fi
+    ordinal=$((ordinal + 1))
+  done
+}
+
+replace_pod() {
+  ordinal=$1
+  pod="${STATEFULSET}-${ordinal}"
+  old_uid=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
+    -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+  stop_forward "${ordinal}"
+  if [ -n "${old_uid}" ]; then
+    kubectl -n "${NAMESPACE}" delete pod "${pod}" --wait=false
+  fi
+  attempts=0
+  while :; do
+    new_uid=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
+      -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+    if [ -n "${new_uid}" ] && [ "${new_uid}" != "${old_uid}" ]; then
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    [ "${attempts}" -lt 300 ]
+    sleep 1
+  done
+}
+
 strict_verify() {
   "${CTL}" wait-ready \
     --config "${MANIFEST}" \
@@ -193,22 +228,41 @@ resume_if_needed() {
   fi
   saved_image=$(kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
     -o jsonpath='{.data.target-image}')
+  saved_revision=$(kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
+    -o jsonpath='{.data.target-revision}')
   phase=$(kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
     -o jsonpath='{.data.phase}')
   node_id=$(kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
     -o jsonpath='{.data.node-id}')
-  if [ "${saved_image}" != "${TARGET_IMAGE}" ] || [ "${phase}" != "restarting" ]; then
+  if [ "${phase}" != "restarting" ]; then
     return 0
   fi
+  case "${node_id}" in
+    ''|*[!0-9]*)
+      log "invalid saved rollout node id: ${node_id}"
+      return 1
+      ;;
+  esac
+  if [ "${node_id}" -lt 1 ] || [ "${node_id}" -gt "${REPLICAS}" ]; then
+    log "saved rollout node id ${node_id} is outside 1..${REPLICAS}"
+    return 1
+  fi
   ordinal=$((node_id - 1))
-  log "resuming interrupted rollout at node ${node_id}"
+  TARGET_REVISION=$(desired_revision)
+  log "resuming interrupted rollout at node ${node_id}: saved=${saved_image}@${saved_revision} current=${TARGET_IMAGE}@${TARGET_REVISION}"
+  # `restarting` is written only after drain and prepare-restart succeed. If a
+  # later Helm attempt stages a different template while that replacement is
+  # unready, waiting first deadlocks: the stale pod cannot become Ready and the
+  # code that is authorized to replace it is never reached. Finish the already
+  # committed replacement against the current StatefulSet revision.
+  if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
+    log "node ${node_id} is not at the current target; recreating the already-drained voter"
+    replace_pod "${ordinal}"
+  fi
   wait_for_pod_ready "${ordinal}"
-  image=$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-${ordinal}" \
-    -o jsonpath='{.spec.containers[?(@.name=="ursula")].image}')
-  if [ "${image}" != "${TARGET_IMAGE}" ]; then
-    log "node ${node_id} was not replaced before interruption; safely restarting its rollout"
-    record_state pending "${node_id}"
-    return 0
+  if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
+    log "node ${node_id} became Ready at a revision other than ${TARGET_REVISION}"
+    return 1
   fi
   start_forward "${ordinal}"
   "${CTL}" wait \
@@ -252,20 +306,7 @@ roll_node() {
   "${CTL}" prepare-restart --config "${MANIFEST}" --node "${node_id}"
   record_state restarting "${node_id}"
 
-  old_uid=$(kubectl -n "${NAMESPACE}" get pod "${pod}" -o jsonpath='{.metadata.uid}')
-  stop_forward "${ordinal}"
-  kubectl -n "${NAMESPACE}" delete pod "${pod}" --wait=false
-  attempts=0
-  while :; do
-    new_uid=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
-      -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
-    if [ -n "${new_uid}" ] && [ "${new_uid}" != "${old_uid}" ]; then
-      break
-    fi
-    attempts=$((attempts + 1))
-    [ "${attempts}" -lt 300 ]
-    sleep 1
-  done
+  replace_pod "${ordinal}"
 
   wait_for_pod_ready "${ordinal}"
   start_forward "${ordinal}"
@@ -299,6 +340,13 @@ main() {
   write_manifest
   wait_for_template
 
+  # Open tunnels only for voters that are already serving, then recover a
+  # replacement recorded as in-flight before requiring every pod to be Ready.
+  # The opposite order makes a superseded, crash-looping replacement
+  # impossible for the rollout state machine itself to repair.
+  start_ready_forwards
+  resume_if_needed
+
   ordinal=0
   while [ "${ordinal}" -lt "${REPLICAS}" ]; do
     wait_for_pod_ready "${ordinal}"
@@ -306,7 +354,6 @@ main() {
     ordinal=$((ordinal + 1))
   done
 
-  resume_if_needed
   strict_verify
 
   pass=1
