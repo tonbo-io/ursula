@@ -773,6 +773,15 @@ impl GroupEngine for RaftGroupEngine {
     ) -> GroupReadStreamPartsFuture<'a> {
         Box::pin(async move {
             let original_request = request.clone();
+            if request.leader_only && !self.raft.is_leader() {
+                if let Some(leader_node) = self.current_leader_node().await {
+                    let response =
+                        forward_read_stream_to_leader(placement, &leader_node, request).await?;
+                    return Ok(GroupReadStreamParts::from_response(response));
+                }
+                self.require_local_leader_for_read("leader-only read_stream")
+                    .await?;
+            }
             if !self.raft.is_leader() {
                 match self
                     .access_requires_write(request.stream_id.clone(), request.now_ms, true)
