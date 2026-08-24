@@ -139,6 +139,7 @@ async fn wait_raft_state_machine_payload(
                                     now_ms: 0,
                                     record: None,
                                     max_records: None,
+                                    leader_only: false,
                                 },
                                 placement,
                             )
@@ -2959,6 +2960,30 @@ async fn static_grpc_follower_serves_replicated_catch_up_read_without_leader_pro
         "follower replicated stream before local read",
     )
     .await;
+
+    let leader_read = http_client
+        .get(format!(
+            "{follower_base}/benchcmp/run-42/follower-local-read?consistency=leader"
+        ))
+        .send()
+        .await
+        .expect("send leader-consistent read through follower");
+    assert_eq!(leader_read.status(), StatusCode::OK);
+    assert_eq!(
+        leader_read
+            .headers()
+            .get(HEADER_STREAM_UP_TO_DATE)
+            .and_then(|value| value.to_str().ok()),
+        Some("true"),
+        "leader consistency must not be served by follower-local applied state"
+    );
+    assert_eq!(
+        &leader_read
+            .bytes()
+            .await
+            .expect("leader-consistent read body")[..],
+        b"read-without-leader"
+    );
 
     let leader = nodes.remove(0);
     leader.shutdown().await;

@@ -491,6 +491,11 @@ Where `{stream-url}` is the URL of the stream. Returns bytes starting from the s
 
 - `offset` (optional)
  - Start offset token. If omitted, defaults to the stream start (offset -1).
+- `consistency` (optional)
+ - `local` (default) permits immutable catch-up bytes from a follower's applied
+   state. `leader` routes the read to the current Raft leader and is intended
+   for recovery that must observe an acknowledged write before proceeding.
+   `leader` cannot be combined with a live read mode.
 
 #### Response Codes
 

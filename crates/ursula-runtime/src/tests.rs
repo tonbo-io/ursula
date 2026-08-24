@@ -77,6 +77,7 @@ fn read_req(stream_id: BucketStreamId, offset: u64, max_len: usize) -> ReadStrea
         now_ms: 0,
         record: None,
         max_records: None,
+        leader_only: false,
     }
 }
 
@@ -975,6 +976,7 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
                 now_ms: 1_500,
                 record: None,
                 max_records: None,
+                leader_only: false,
             },
             placement,
         )
@@ -1018,6 +1020,7 @@ async fn ttl_read_access_is_committed_and_expiry_removes_stream() {
                 now_ms: 2_500,
                 record: None,
                 max_records: None,
+                leader_only: false,
             },
             placement,
         )

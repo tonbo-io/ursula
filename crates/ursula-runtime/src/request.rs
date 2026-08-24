@@ -164,6 +164,11 @@ pub struct ReadStreamRequest {
     pub now_ms: u64,
     pub record: Option<u64>,
     pub max_records: Option<u64>,
+    /// Require the owning Raft leader's applied state instead of permitting a
+    /// local follower read. Recovery paths use this after an acknowledged
+    /// write; ordinary catch-up consumers keep the cheaper follower-local
+    /// behavior.
+    pub leader_only: bool,
 }
 
 impl ReadStreamRequest {
@@ -173,6 +178,7 @@ impl ReadStreamRequest {
             && self.max_len == other.max_len
             && self.record == other.record
             && self.max_records == other.max_records
+            && self.leader_only == other.leader_only
     }
 }
 

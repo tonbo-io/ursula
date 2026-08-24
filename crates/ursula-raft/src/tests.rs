@@ -233,6 +233,7 @@ fn read_req(stream_id: ursula_shard::BucketStreamId, max_len: usize) -> ReadStre
         now_ms: 0,
         record: None,
         max_records: None,
+        leader_only: false,
     }
 }
 

@@ -641,6 +641,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                                 now_ms: request.now_ms,
                                 record: read.record,
                                 max_records: read.max_records,
+                                leader_only: false,
                             },
                             placement,
                         )
