@@ -2900,6 +2900,18 @@ pub(crate) async fn read_stream_by_id(
         Err(response) => return *response,
     };
     let live_mode = query.get("live").map(String::as_str);
+    let leader_only = match query.get("consistency").map(String::as_str) {
+        None | Some("local") => false,
+        Some("leader") => true,
+        Some(_) => return (StatusCode::BAD_REQUEST, "invalid consistency").into_response(),
+    };
+    if leader_only && live_mode.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "leader consistency is available only for catch-up reads",
+        )
+            .into_response();
+    }
     let offset_is_now = query.get("offset").is_some_and(|offset| offset == "now");
     let record_aware = query.contains_key("record") || query.contains_key("tail_records");
     let envelope_view = match query.get("record_view").map(String::as_str) {
@@ -3032,6 +3044,7 @@ pub(crate) async fn read_stream_by_id(
             now_ms: state.unix_time_ms(),
             record,
             max_records,
+            leader_only,
         })
         .await
     {
@@ -3230,6 +3243,7 @@ async fn resolve_record_offset(
             now_ms: state.unix_time_ms(),
             record: Some(record),
             max_records: Some(1),
+            leader_only: false,
         })
         .await
     {
@@ -3525,6 +3539,7 @@ pub(crate) async fn long_poll_stream(
         now_ms: state.unix_time_ms(),
         record,
         max_records,
+        leader_only: false,
     });
     match http_time::timeout(Duration::from_millis(timeout_ms), read).await {
         Ok(Ok(response)) if response.payload.is_empty() && response.up_to_date => {
@@ -3664,6 +3679,7 @@ pub(crate) async fn sse_stream(
             } else {
                 state.max_records
             },
+            leader_only: false,
         };
         let read = if state.initial_read {
             state.initial_read = false;
