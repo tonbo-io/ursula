@@ -73,6 +73,21 @@ Set `URSULA_WAL_BENCH_FULL=1` for the wider matrix. A performance-sensitive
 follow-up must publish at least three independent runs from the same host and
 filesystem and explain any throughput or latency regression over five percent.
 
+The fsync-policy profile uses:
+
+```bash
+URSULA_WAL_BENCH_RUNS=3 \
+  URSULA_WAL_BENCH_GROUP=disk_wal_append_and_commit \
+  URSULA_WAL_BENCH_FILTER='disk_wal_append_and_commit.*groups=16' \
+  scripts/bench_raft_wal.sh target/raft-wal-append-commit
+```
+
+Deferring the replay-hint fsync reduced the shared writer's three-run mean from
+35.240 ms (1.758-ms standard deviation) to 17.336 ms (0.477-ms standard
+deviation), a 50.8-percent improvement. The direct-per-group control improved
+from 83.453 ms to 57.054 ms. This is the measured benefit of removing the
+second fsync; it does not change the durable append acknowledgement.
+
 ## On-disk contract
 
 Each active core owns one `core-N/journal.bin`. The v1 format starts with a
@@ -129,19 +144,21 @@ OpenRaft purge record that establishes the safe logical boundary.
 ## Durability and application boundary
 
 Acknowledged application writes retain the existing quorum contract. Append
-completion is tied to the durable WAL flush callback. Vote, committed-marker,
-truncate, and purge records remain synchronously persisted.
+completion is tied to the durable WAL flush callback, and votes are persisted
+before election progress is acknowledged. Purge also remains synchronous
+because the online generation checkpoint may physically discard the entries it
+covers.
 
-The committed marker is intentionally not relaxed in this increment. A fresh
-state machine restores the latest persisted snapshot and re-applies only entries
-through that marker. A durable uncommitted suffix remains available for Raft
-replication or truncation but is never exposed as application state after
-restart. OpenRaft's log-store conformance suite and an explicit committed-tail
-restart test cover this boundary.
-
-The apparent extra committed-marker sync is partially amortized by the per-core
-writer. Changing it requires crash testing that proves no acknowledged-state or
-replay regression and benchmark evidence beyond normal variance.
+Committed and truncate markers are replay hints, matching OpenRaft's `log-wal`
+contract. They are written immediately but do not request their own fsync. The
+next append, vote, or purge flushes them with its durable batch. If a crash loses
+one first, the durable entries remain and OpenRaft re-establishes the committed
+or conflict-truncation boundary after restart. A fresh state machine never
+blindly applies the durable suffix: it restores the latest persisted snapshot,
+then OpenRaft applies entries as their committed boundary is known. The explicit
+committed-tail restart test proves an uncommitted suffix is not exposed as
+application state, and the complete OpenRaft log-store conformance suite covers
+the storage contract.
 
 ## Metrics and operational interpretation
 
