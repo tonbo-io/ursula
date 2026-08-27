@@ -13,6 +13,7 @@ description = "OpenRaft integration for Ursula's per-group multi-Raft replicatio
 bitflags = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
+fs4 = { workspace = true }
 openraft-rt = { workspace = true }
 openraft = { workspace = true }
 opentelemetry = { workspace = true }
@@ -44,7 +45,14 @@ rand = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
 sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+criterion = { workspace = true, features = ["async_tokio"] }
+raft-log = "0.4.5"
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+
+[[bench]]
+name = "disk_wal"
+harness = false
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }

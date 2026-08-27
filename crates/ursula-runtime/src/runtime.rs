@@ -930,8 +930,9 @@ impl ShardRuntime {
         .await
     }
 
-    #[cfg(madsim)]
-    pub async fn shutdown_group_engine_for_simulation(
+    /// Shut down and remove one hosted group engine, waiting for its durable
+    /// resources (including an exclusive WAL lock) to be released.
+    pub async fn shutdown_group_engine(
         &self,
         placement: ShardPlacement,
     ) -> Result<(), RuntimeError> {
@@ -953,6 +954,14 @@ impl ShardRuntime {
             response_rx,
         )
         .await
+    }
+
+    #[cfg(madsim)]
+    pub async fn shutdown_group_engine_for_simulation(
+        &self,
+        placement: ShardPlacement,
+    ) -> Result<(), RuntimeError> {
+        self.shutdown_group_engine(placement).await
     }
 
     #[cfg(madsim)]

@@ -11,6 +11,7 @@ use ursula_stream::StreamErrorContext;
 
 use crate::engine::GroupEngine;
 use crate::engine::GroupEngineError;
+use crate::engine::GroupEngineMetrics;
 use crate::error::RuntimeError;
 use crate::request::AppendBatchRequest;
 use crate::request::ColdWriteAdmission;
@@ -25,6 +26,20 @@ pub struct RuntimeMetrics {
 }
 
 impl RuntimeMetrics {
+    /// Create an empty metric set sized for a runtime topology.
+    pub fn new(core_count: usize, raft_group_count: usize) -> Self {
+        Self {
+            inner: Arc::new(RuntimeMetricsInner::new(core_count, raft_group_count)),
+        }
+    }
+
+    /// Return the metric handle passed to one group engine.
+    pub fn group_engine_metrics(&self) -> GroupEngineMetrics {
+        GroupEngineMetrics {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
     /// Records one aggregate Raft-log pressure snapshot pass.
     pub fn record_raft_snapshot_pressure(&self, groups: u64) {
         self.inner.record_raft_snapshot_pressure(groups);
@@ -374,6 +389,14 @@ runtime_metrics! {
     sum wal_records: core per_core_wal_records, group per_group_wal_records;
     sum wal_write_ns: core per_core_wal_write_ns, group per_group_wal_write_ns;
     sum wal_sync_ns: core per_core_wal_sync_ns, group per_group_wal_sync_ns;
+    sum wal_fsyncs: core per_core_wal_fsyncs, group per_group_wal_fsyncs;
+    sum wal_fsync_records:
+        core per_core_wal_fsync_records, group per_group_wal_fsync_records;
+    sum wal_reclaims: core per_core_wal_reclaims, group per_group_wal_reclaims;
+    sum wal_reclaimed_bytes:
+        core per_core_wal_reclaimed_bytes, group per_group_wal_reclaimed_bytes;
+    sum wal_reclaim_ns: core per_core_wal_reclaim_ns, group per_group_wal_reclaim_ns;
+    sum wal_physical_bytes: core per_core_wal_physical_bytes;
     counter cold_flush_uploads;
     counter cold_flush_upload_bytes;
     counter cold_flush_upload_ns;
@@ -630,6 +653,32 @@ impl RuntimeMetricsInner {
         self.per_group_wal_sync_ns[group_index].fetch_add_relaxed(sync_ns);
     }
 
+    pub(crate) fn record_wal_storage(
+        &self,
+        core_id: CoreId,
+        group_id: RaftGroupId,
+        fsyncs: u64,
+        fsync_records: u64,
+        reclaims: u64,
+        reclaimed_bytes: u64,
+        reclaim_ns: u64,
+        physical_bytes: u64,
+    ) {
+        let core_index = usize::from(core_id.0);
+        let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
+        self.per_core_wal_fsyncs[core_index].fetch_add_relaxed(fsyncs);
+        self.per_group_wal_fsyncs[group_index].fetch_add_relaxed(fsyncs);
+        self.per_core_wal_fsync_records[core_index].fetch_add_relaxed(fsync_records);
+        self.per_group_wal_fsync_records[group_index].fetch_add_relaxed(fsync_records);
+        self.per_core_wal_reclaims[core_index].fetch_add_relaxed(reclaims);
+        self.per_group_wal_reclaims[group_index].fetch_add_relaxed(reclaims);
+        self.per_core_wal_reclaimed_bytes[core_index].fetch_add_relaxed(reclaimed_bytes);
+        self.per_group_wal_reclaimed_bytes[group_index].fetch_add_relaxed(reclaimed_bytes);
+        self.per_core_wal_reclaim_ns[core_index].fetch_add_relaxed(reclaim_ns);
+        self.per_group_wal_reclaim_ns[group_index].fetch_add_relaxed(reclaim_ns);
+        self.per_core_wal_physical_bytes[core_index].store_relaxed(physical_bytes);
+    }
+
     pub(crate) fn record_cold_upload(&self, bytes: u64, upload_ns: u64) {
         self.cold_flush_uploads.fetch_add_relaxed(1);
         self.cold_flush_upload_bytes.fetch_add_relaxed(bytes);
@@ -829,7 +878,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 126] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 143] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -926,6 +975,23 @@ mod metric_manifest_tests {
         "wal_sync_ns",
         "per_core_wal_sync_ns",
         "per_group_wal_sync_ns",
+        "wal_fsyncs",
+        "per_core_wal_fsyncs",
+        "per_group_wal_fsyncs",
+        "wal_fsync_records",
+        "per_core_wal_fsync_records",
+        "per_group_wal_fsync_records",
+        "wal_reclaims",
+        "per_core_wal_reclaims",
+        "per_group_wal_reclaims",
+        "wal_reclaimed_bytes",
+        "per_core_wal_reclaimed_bytes",
+        "per_group_wal_reclaimed_bytes",
+        "wal_reclaim_ns",
+        "per_core_wal_reclaim_ns",
+        "per_group_wal_reclaim_ns",
+        "wal_physical_bytes",
+        "per_core_wal_physical_bytes",
         "cold_flush_uploads",
         "cold_flush_upload_bytes",
         "cold_flush_upload_ns",
