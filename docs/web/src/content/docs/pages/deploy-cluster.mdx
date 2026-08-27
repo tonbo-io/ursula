@@ -78,7 +78,11 @@ curl http://127.0.0.1:4437/__ursula/metrics
 - Shared S3 is required for any multi-node cluster: replicas must be able to read chunks flushed by any leader.
 - Put stateless gateway replicas behind authenticated TLS ingress and keep voter and peer Services private. Ursula itself has no TLS or auth (see [Security](/docs/security)).
 - Kubernetes rolling updates do not transfer Raft leaders on their own. For an operationally safe restart, wrap the platform's restart in [ursulactl's maintenance verbs](/docs/cli): `ursulactl drain` the node, let Kubernetes restart the pod, then `ursulactl wait --node N` and `undrain` before moving to the next one. See [Operations](/docs/operations) for day-2 work.
-- There are no dedicated health probes yet. Cluster readiness comes from `helm test` or `ursulactl wait-ready`. The mutating admin surface is bound to pod loopback (`127.0.0.1:4438`) and is reached with `kubectl port-forward`.
+- The StatefulSet readiness probe calls `GET /__ursula/ready` and removes a pod
+  from service during WAL disk pressure. Cluster-wide Raft readiness still
+  comes from `helm test` or `ursulactl wait-ready`. The mutating admin surface
+  is bound to pod loopback (`127.0.0.1:4438`) and is reached with
+  `kubectl port-forward`.
 
 ## Optional: event-time indexer
 

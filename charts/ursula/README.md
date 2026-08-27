@@ -349,7 +349,7 @@ operationally safe restarts on an initialized cluster.
 | `server.podSecurityContext` | `{fsGroup: 10001, fsGroupChangePolicy: OnRootMismatch}` | Pod-level securityContext for Ursula server pods. |
 | `server.securityContext` | `{runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}` | Container-level securityContext for the Ursula server container. |
 | `server.probes.startup` | `{enabled: true, failureThreshold: 180, periodSeconds: 5, timeoutSeconds: 2}` | TCP startup probe. The 15-minute budget allows S3 snapshot restore before Kubernetes enables liveness checks. |
-| `server.probes.readiness` | `{enabled: true, periodSeconds: 5, timeoutSeconds: 2}` | TCP readiness probe. Rolling updates wait until the Ursula client port is actually serving before replacing the next voter. |
+| `server.probes.readiness` | `{enabled: true, periodSeconds: 5, timeoutSeconds: 2}` | HTTP `GET /__ursula/ready` probe. It removes the pod from service while the disk-WAL free-space guard is active. |
 | `server.probes.liveness` | `{enabled: true, periodSeconds: 10, timeoutSeconds: 2}` | TCP liveness probe enabled after startup succeeds. |
 | `server.podDisruptionBudget.enabled` | `true` | Render a PDB for multi-node clusters. The chart omits the PDB when `server.replicaCount=1`. |
 | `server.podDisruptionBudget.maxUnavailable` | `1` | Maximum voluntary disruptions. The template fails if this value would allow loss of Raft quorum. |
@@ -372,6 +372,9 @@ container receives only chart-managed container settings plus explicit
 | `raft.initMembershipPerGroup` | `true` | Idempotent per-group membership bootstrap flag; persistent groups may keep it enabled across restarts. |
 | `raft.storageMode` | `logDir` | Raft storage mode: `logDir` for durable logs, `memory` for ephemeral testing. |
 | `raft.logDir` | `/var/lib/ursula/raft` | Raft log directory mounted to the `raft-data` volume. |
+| `raft.minAvailableBytes` | `536870912` | Reject writes and readiness below this many free bytes on the WAL filesystem. `0` disables the guard. |
+| `raft.resumeAvailableBytes` | `1073741824` | Free bytes required before WAL disk pressure clears; must exceed the minimum. |
+| `raft.allowVolatileMultiPeer` | `false` | Required explicit opt-in for multi-pod memory WAL; intended only for development, benchmarks, or chaos. |
 | `raft.maxUncommittedBytesPerGroup` | `null` | Optional per-group cap for raft-submitted but not-yet-applied payload bytes. Renders `raft.max_uncommitted_size_per_group` in the generated config when set; `0` disables the cap. |
 | `raft.snapshotLogsSinceLast` | `5000` | Committed log entries per group between automatic full-state snapshots. Higher values trade log memory for lower snapshot CPU and tail latency. |
 | `raft.snapshotPressureUnpurgedLogs` | `65536` | Aggregate unpurged Raft entries per node that trigger pressure snapshots, bounding memory-WAL growth when traffic is spread across many groups. |

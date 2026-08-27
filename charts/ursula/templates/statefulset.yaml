@@ -107,7 +107,8 @@ spec:
           {{- end }}
           {{- if .Values.server.probes.readiness.enabled }}
           readinessProbe:
-            tcpSocket:
+            httpGet:
+              path: /__ursula/ready
               port: client
             periodSeconds: {{ .Values.server.probes.readiness.periodSeconds }}
             timeoutSeconds: {{ .Values.server.probes.readiness.timeoutSeconds }}

@@ -185,6 +185,12 @@ raft:
   storageMode: logDir
   # Raft log directory used when storageMode=logDir.
   logDir: /var/lib/ursula/raft
+  # Reject writes and readiness below this many free bytes on the WAL filesystem.
+  minAvailableBytes: 536870912
+  # Resume only above this watermark to avoid readiness flapping.
+  resumeAvailableBytes: 1073741824
+  # Required opt-in for multi-pod memory WAL clusters. Never enable in production.
+  allowVolatileMultiPeer: false
   # Optional cap for uncommitted payload bytes per group.
   maxUncommittedBytesPerGroup: null
   # Committed log entries per group between automatic full-state snapshots.

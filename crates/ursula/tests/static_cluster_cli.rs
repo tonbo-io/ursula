@@ -239,6 +239,27 @@ async fn cli_static_grpc_raft_log_dir_recovers_with_bootstrap_enabled_after_rest
         )
         .await;
         assert_eq!(payload, b"cli-durable-payload");
+        let metrics: serde_json::Value = client
+            .get(format!("{base_url}/__ursula/metrics"))
+            .send()
+            .await
+            .expect("request recovery metrics")
+            .json()
+            .await
+            .expect("decode recovery metrics");
+        for field in [
+            "wal_recovery_records",
+            "wal_recovery_bytes",
+            "wal_recovery_live_entries",
+        ] {
+            assert!(
+                metrics
+                    .get(field)
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|value| value > 0),
+                "{field} should report durable restart work: {metrics}"
+            );
+        }
     }
 
     std::fs::remove_dir_all(&root).expect("remove temp root");
@@ -320,6 +341,31 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
     )
     .await;
     assert_eq!(payload, b"cli-durable-cluster-payload");
+
+    // Restart one follower, append while it is absent, then prove the same
+    // disk WAL can reopen and catch up without duplicate application.
+    drop(children.remove(1));
+    post_until_no_content(
+        &client,
+        &format!("{}/benchcmp/cli-durable-cluster", peers[0].1),
+        "-after-follower-restart",
+    )
+    .await;
+    children.push(spawn_node_with_cluster_config(binary, &configs[2]));
+    wait_until_ready(&client, &peers[2].1, &mut children).await;
+    let recovered_payload = read_until_matches(
+        &client,
+        &format!(
+            "{}/benchcmp/cli-durable-cluster?offset=0&max_bytes=128",
+            peers[2].1
+        ),
+        b"cli-durable-cluster-payload-after-follower-restart",
+    )
+    .await;
+    assert_eq!(
+        recovered_payload,
+        b"cli-durable-cluster-payload-after-follower-restart"
+    );
 
     // raft replication is acked once a quorum (leader + one follower) has the
     // entry. The remaining follower may still be flushing to its journal when
@@ -752,6 +798,9 @@ backend = "{wal_backend}""#
     if let Some(p) = wal_path {
         writeln!(config, r#"path = "{}""#, p.display()).unwrap();
     }
+    if wal_backend == "memory" && peers.len() > 1 {
+        writeln!(config, "allow_volatile_multi_peer = true").unwrap();
+    }
     config.push('\n');
 
     for (peer_id, peer_url) in peers {
@@ -1127,6 +1176,26 @@ async fn read_until_replicated(client: &reqwest::Client, url: &str) -> Vec<u8> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("replicated payload did not become readable at {url}");
+}
+
+async fn read_until_matches(client: &reqwest::Client, url: &str, expected: &[u8]) -> Vec<u8> {
+    let mut last = Vec::new();
+    for _ in 0..100 {
+        if let Ok(response) = client.get(url).send().await
+            && response.status().is_success()
+        {
+            last = response
+                .bytes()
+                .await
+                .expect("read replicated payload")
+                .to_vec();
+            if last == expected {
+                return last;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("replicated payload at {url} did not converge: {last:?}");
 }
 
 async fn wait_metrics_contains(client: &reqwest::Client, base_url: &str, needle: &str) -> String {

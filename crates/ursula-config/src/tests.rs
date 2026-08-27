@@ -380,6 +380,71 @@ backend = "disk"
     }
 
     #[test]
+    fn validation_rejects_volatile_multi_peer_without_opt_in() {
+        let tmp = temp_config(
+            ".toml",
+            r#"
+[raft.wal]
+backend = "memory"
+
+[[raft.peers]]
+node_id = 1
+url = "http://127.0.0.1:4437"
+
+[[raft.peers]]
+node_id = 2
+url = "http://127.0.0.1:4438"
+"#,
+        );
+        let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+        assert!(
+            err.to_string().contains("allow_volatile_multi_peer"),
+            "error should name the explicit opt-in: {err}"
+        );
+    }
+
+    #[test]
+    fn volatile_multi_peer_explicit_opt_in_is_accepted() {
+        let tmp = temp_config(
+            ".toml",
+            r#"
+[raft.wal]
+backend = "memory"
+allow_volatile_multi_peer = true
+
+[[raft.peers]]
+node_id = 1
+url = "http://127.0.0.1:4437"
+
+[[raft.peers]]
+node_id = 2
+url = "http://127.0.0.1:4438"
+"#,
+        );
+        let config = load_config(Some(tmp.path()), None, Some(1)).expect("explicit opt-in");
+        assert!(config.raft.wal.allow_volatile_multi_peer);
+    }
+
+    #[test]
+    fn validation_rejects_disk_pressure_resume_at_or_below_minimum() {
+        let tmp = temp_config(
+            ".toml",
+            r#"
+[raft.wal]
+backend = "disk"
+path = "/tmp/ursula-wal"
+min_available_size = "1GiB"
+resume_available_size = "512MiB"
+"#,
+        );
+        let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+        assert!(
+            err.to_string().contains("resume_available_size"),
+            "error should name the invalid watermark: {err}"
+        );
+    }
+
+    #[test]
     fn validation_rejects_s3_without_bucket() {
         let tmp = temp_config(
             ".toml",
@@ -424,6 +489,9 @@ max_size = "128MiB"
         let tmp = temp_config(
             ".toml",
             r#"
+[raft.wal]
+allow_volatile_multi_peer = true
+
 [[raft.peers]]
 node_id = 1
 url = "http://10.0.0.1:4437"

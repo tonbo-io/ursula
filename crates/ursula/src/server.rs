@@ -177,9 +177,23 @@ async fn init_state(
         ursula_config::WalBackend::Memory => "memory",
         ursula_config::WalBackend::Disk => "disk",
     };
-    let state = state
+    let mut state = state
         .with_runtime_config(&config.runtime)
         .with_wal_backend(wal_backend);
+    if let Some(wal_path) = config.raft.wal.resolved_path() {
+        let monitor = crate::bootstrap::initialize_wal_disk_monitor(
+            &wal_path,
+            config.raft.wal.min_available_size.as_bytes(),
+            config.raft.wal.resume_available_size.as_bytes(),
+        )?;
+        state = state.with_wal_disk_monitor(monitor.clone());
+        crate::bootstrap::spawn_wal_disk_gate(
+            wal_path,
+            monitor,
+            state.raft_registry().cloned(),
+            config.raft.node_id,
+        );
+    }
     Ok(state)
 }
 
@@ -224,7 +238,8 @@ async fn serve(
     if let Some(cluster_addr) = cluster_listen {
         let client_app = client_router_with_admission(
             state.clone(),
-            crate::IngressAdmission::new(&config.server),
+            crate::IngressAdmission::new(&config.server)
+                .with_wal_disk_monitor(state.wal_disk_monitor()),
         );
         let cluster_app = cluster_router_from_state(state);
         let client_listener = tokio::net::TcpListener::bind(listen).await?;
@@ -247,10 +262,10 @@ async fn serve(
         cluster_res?;
         admin_res?;
     } else {
-        let app = cluster_router_from_state(state.clone()).merge(client_router_with_admission(
-            state,
-            crate::IngressAdmission::new(&config.server),
-        ));
+        let admission = crate::IngressAdmission::new(&config.server)
+            .with_wal_disk_monitor(state.wal_disk_monitor());
+        let app = cluster_router_from_state(state.clone())
+            .merge(client_router_with_admission(state, admission));
         let listener = tokio::net::TcpListener::bind(listen).await?;
         let serve_task = tokio::spawn(serve_until_shutdown(
             listener,
