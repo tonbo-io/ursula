@@ -16,8 +16,6 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
-use std::time::Instant as StdInstant;
 
 use fs4::fs_std::FileExt;
 use openraft::OptionalSend;
@@ -123,22 +121,6 @@ impl JournalLock {
         write!(file, "pid={}", std::process::id())?;
         file.sync_data()?;
         Ok(Self { _file: file, path })
-    }
-
-    fn acquire_wait(journal_path: &Path, timeout: Duration) -> Result<Self, io::Error> {
-        let deadline = StdInstant::now() + timeout;
-        loop {
-            match Self::acquire(journal_path) {
-                Ok(lock) => return Ok(lock),
-                Err(err)
-                    if err.kind() == io::ErrorKind::AlreadyExists
-                        && StdInstant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(err) => return Err(err),
-            }
-        }
     }
 }
 
@@ -331,10 +313,7 @@ impl CoreFileLogWriter {
             fs::create_dir_all(parent)?;
         }
         let (tx, rx) = mpsc::channel();
-        // An in-process runtime restart drops its mailboxes synchronously but
-        // the core worker may need a short moment to drop the previous writer.
-        // Cross-process owners continue to fail after this bounded grace period.
-        let lock = JournalLock::acquire_wait(&journal_path, Duration::from_millis(500))?;
+        let lock = JournalLock::acquire(&journal_path)?;
         if journal::migrate_legacy::<WireCodec<CoreJournalRecord>>(&journal_path)? {
             tracing::warn!(
                 path = %journal_path.display(),
