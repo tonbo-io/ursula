@@ -890,6 +890,28 @@ impl GroupEngineMetrics {
         );
     }
 
+    pub fn record_wal_storage(
+        &self,
+        placement: ShardPlacement,
+        fsyncs: u64,
+        fsync_records: u64,
+        reclaims: u64,
+        reclaimed_bytes: u64,
+        reclaim_ns: u64,
+        physical_bytes: u64,
+    ) {
+        self.inner.record_wal_storage(
+            placement.core_id,
+            placement.raft_group_id,
+            fsyncs,
+            fsync_records,
+            reclaims,
+            reclaimed_bytes,
+            reclaim_ns,
+            physical_bytes,
+        );
+    }
+
     pub fn record_raft_write_many(
         &self,
         placement: ShardPlacement,

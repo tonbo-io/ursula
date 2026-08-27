@@ -383,7 +383,6 @@ macro_rules! runtime_operations {
                 handle { call install_group_snapshot(engine, metrics, snapshot) }
                 client { none }
             }
-            #[cfg(madsim)]
             op ShutdownEngine {
                 fields {}
                 reply { response_tx: () }

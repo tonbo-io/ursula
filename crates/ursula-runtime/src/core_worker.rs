@@ -122,7 +122,6 @@ pub(crate) enum CoreCommand {
         placements: Vec<ShardPlacement>,
         response_tx: oneshot::Sender<Result<(), RuntimeError>>,
     },
-    #[cfg(madsim)]
     ShutdownGroupEngine {
         placement: ShardPlacement,
         response_tx: oneshot::Sender<Result<(), RuntimeError>>,
@@ -268,7 +267,6 @@ impl CoreWorker {
                 let response = self.warm_groups(placements).await;
                 let _ = response_tx.send(response);
             }
-            #[cfg(madsim)]
             CoreCommand::ShutdownGroupEngine {
                 placement,
                 response_tx,
@@ -387,7 +385,6 @@ impl CoreWorker {
             .clone())
     }
 
-    #[cfg(madsim)]
     pub(crate) async fn shutdown_group_engine(
         &mut self,
         placement: ShardPlacement,

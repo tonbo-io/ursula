@@ -1,8 +1,9 @@
 //! Append-only framed journal.
 //!
 //! Persistence is kept orthogonal to serialization. The journal moves opaque
-//! `[u32-LE length][payload]` frames to and from a file and handles the durability
-//! concerns — append, `fsync`, and recovery of a torn trailing frame after a crash.
+//! versioned, checksummed frames to and from a file and handles the durability
+//! concerns — append, `fsync`, bounded recovery, and recovery of a torn trailing
+//! frame after a crash.
 //! How a record turns into a payload is entirely the [`FrameCodec`]'s business, so
 //! the Raft log store can frame protobuf while the WAL engine frames JSON over the
 //! exact same code.
@@ -12,9 +13,34 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Read;
+use std::io::Seek;
 use std::io::Write;
 use std::marker::PhantomData;
 use std::path::Path;
+use std::path::PathBuf;
+
+const JOURNAL_MAGIC: [u8; 8] = *b"URSJWAL\0";
+const JOURNAL_VERSION: u16 = 1;
+const JOURNAL_HEADER_LEN: usize = 16;
+const FRAME_HEADER_LEN: usize = 8;
+
+/// Maximum encoded payload accepted from disk or written as one journal frame.
+///
+/// This is intentionally above Ursula's 256 MiB Raft RPC limit while still
+/// preventing a corrupted length field from requesting an unbounded allocation.
+pub const MAX_FRAME_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
+
+fn journal_header() -> [u8; JOURNAL_HEADER_LEN] {
+    let mut header = [0_u8; JOURNAL_HEADER_LEN];
+    header[..JOURNAL_MAGIC.len()].copy_from_slice(&JOURNAL_MAGIC);
+    header[8..10].copy_from_slice(&JOURNAL_VERSION.to_le_bytes());
+    header[10..12].copy_from_slice(
+        &u16::try_from(JOURNAL_HEADER_LEN)
+            .expect("journal header length fits u16")
+            .to_le_bytes(),
+    );
+    header
+}
 
 /// Serialization seam: how one record becomes a frame payload and back.
 ///
@@ -71,14 +97,32 @@ impl JournalWriter {
         }
     }
 
+    /// Create and initialize the journal file even when there are no records.
+    pub fn ensure_created(&mut self, path: &Path) -> io::Result<()> {
+        let _ = self.file_mut(path)?;
+        Ok(())
+    }
+
     /// Append one record as a framed payload. Does not durably flush; pair with
     /// [`JournalWriter::sync`] once per batch.
     pub fn append<C: FrameCodec>(&mut self, path: &Path, record: &C::Record) -> io::Result<()> {
         let payload = C::encode(record);
+        if payload.len() > MAX_FRAME_PAYLOAD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "journal record is {} bytes, exceeding the {} byte limit",
+                    payload.len(),
+                    MAX_FRAME_PAYLOAD_BYTES
+                ),
+            ));
+        }
         let len = u32::try_from(payload.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "journal record too large"))?;
+        let checksum = crc32fast::hash(&payload);
         let file = self.file_mut(path)?;
         file.write_all(&len.to_le_bytes())?;
+        file.write_all(&checksum.to_le_bytes())?;
         file.write_all(&payload)
     }
 
@@ -101,7 +145,18 @@ impl JournalWriter {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            self.file = Some(OpenOptions::new().create(true).append(true).open(path)?);
+            let mut file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(path)?;
+            let file_len = file.metadata()?.len();
+            if file_len == 0 {
+                file.write_all(&journal_header())?;
+            } else {
+                validate_file_header(&mut file, path, file_len)?;
+            }
+            self.file = Some(file);
         }
         Ok(self.file.as_mut().expect("file opened above"))
     }
@@ -132,27 +187,85 @@ pub fn replay_each<C: FrameCodec>(
 
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
-    let mut valid_len = 0_u64;
+    if file_len == 0 {
+        return Ok(());
+    }
+    if file_len < u64::try_from(JOURNAL_HEADER_LEN).expect("header length fits u64") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "journal '{}' has no complete Ursula WAL header; legacy unversioned journals require an explicit reset or migration",
+                path.display()
+            ),
+        ));
+    }
+    validate_file_header(&mut file, path, file_len)?;
+    let mut valid_len = u64::try_from(JOURNAL_HEADER_LEN).expect("header length fits u64");
+    let mut frame_index = 0_u64;
     while valid_len < file_len {
         let remaining = file_len.saturating_sub(valid_len);
-        if remaining < 4 {
+        if remaining < u64::try_from(FRAME_HEADER_LEN).expect("frame header length fits u64") {
             break;
         }
 
         let mut len_bytes = [0_u8; 4];
         file.read_exact(&mut len_bytes)?;
         let payload_len = u64::from(u32::from_le_bytes(len_bytes));
-        if remaining.saturating_sub(4) < payload_len {
+        let mut checksum_bytes = [0_u8; 4];
+        file.read_exact(&mut checksum_bytes)?;
+        let expected_checksum = u32::from_le_bytes(checksum_bytes);
+        if payload_len > u64::try_from(MAX_FRAME_PAYLOAD_BYTES).expect("frame limit fits u64") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "journal '{}' frame {} declares {} bytes, exceeding the {} byte limit",
+                    path.display(),
+                    frame_index + 1,
+                    payload_len,
+                    MAX_FRAME_PAYLOAD_BYTES
+                ),
+            ));
+        }
+        if remaining
+            .saturating_sub(u64::try_from(FRAME_HEADER_LEN).expect("frame header length fits u64"))
+            < payload_len
+        {
             break;
         }
 
         let payload_len = usize::try_from(payload_len).expect("u32 fits usize");
         let mut payload = vec![0_u8; payload_len];
         file.read_exact(&mut payload)?;
-        visit(C::decode(&payload)?)?;
+        let actual_checksum = crc32fast::hash(&payload);
+        if actual_checksum != expected_checksum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "journal '{}' frame {} checksum mismatch: expected {expected_checksum:#010x}, got {actual_checksum:#010x}",
+                    path.display(),
+                    frame_index + 1
+                ),
+            ));
+        }
+        let record = C::decode(&payload).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "journal '{}' frame {} decode failed: {err}",
+                    path.display(),
+                    frame_index + 1
+                ),
+            )
+        })?;
+        visit(record)?;
         valid_len = valid_len
-            .checked_add(4_u64.saturating_add(u64::try_from(payload_len).expect("usize fits u64")))
+            .checked_add(
+                u64::try_from(FRAME_HEADER_LEN)
+                    .expect("frame header length fits u64")
+                    .saturating_add(u64::try_from(payload_len).expect("usize fits u64")),
+            )
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "journal offset overflow"))?;
+        frame_index = frame_index.saturating_add(1);
     }
 
     if valid_len < file_len {
@@ -166,30 +279,239 @@ pub fn replay_each<C: FrameCodec>(
     Ok(())
 }
 
+/// Migrate the legacy `[length][payload]` journal format to the current
+/// checksummed format, retaining a hard-linked `.v0.bak` rollback copy.
+///
+/// A current-format or empty journal is left untouched. Unsupported future
+/// versions are also left for [`replay`] to reject explicitly.
+pub fn migrate_legacy<C: FrameCodec>(path: &Path) -> io::Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut source = File::open(path)?;
+    let file_len = source.metadata()?.len();
+    if file_len == 0 {
+        return Ok(false);
+    }
+    let mut prefix = [0_u8; JOURNAL_MAGIC.len()];
+    let prefix_len = source.read(&mut prefix)?;
+    source.rewind()?;
+    if prefix_len == JOURNAL_MAGIC.len() && prefix == JOURNAL_MAGIC {
+        return Ok(false);
+    }
+
+    let migrate_path = suffixed_path(path, ".migrate-v1");
+    let backup_path = suffixed_path(path, ".v0.bak");
+    if migrate_path.exists() {
+        fs::remove_file(&migrate_path)?;
+    }
+    let mut writer = JournalWriter::new(true);
+    let mut valid_len = 0_u64;
+    let mut frame_index = 0_u64;
+    while valid_len < file_len {
+        let remaining = file_len.saturating_sub(valid_len);
+        if remaining < 4 {
+            break;
+        }
+        let mut len_bytes = [0_u8; 4];
+        source.read_exact(&mut len_bytes)?;
+        let payload_len = u64::from(u32::from_le_bytes(len_bytes));
+        if payload_len > u64::try_from(MAX_FRAME_PAYLOAD_BYTES).expect("frame limit fits u64") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "legacy journal '{}' frame {} declares {} bytes, exceeding the {} byte limit",
+                    path.display(),
+                    frame_index + 1,
+                    payload_len,
+                    MAX_FRAME_PAYLOAD_BYTES
+                ),
+            ));
+        }
+        if remaining.saturating_sub(4) < payload_len {
+            break;
+        }
+        let payload_len = usize::try_from(payload_len).expect("u32 fits usize");
+        let mut payload = vec![0_u8; payload_len];
+        source.read_exact(&mut payload)?;
+        let record = C::decode(&payload).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "legacy journal '{}' frame {} decode failed: {err}",
+                    path.display(),
+                    frame_index + 1
+                ),
+            )
+        })?;
+        writer.append::<C>(&migrate_path, &record)?;
+        valid_len = valid_len
+            .checked_add(4_u64.saturating_add(u64::try_from(payload_len).expect("usize fits u64")))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "journal offset overflow"))?;
+        frame_index = frame_index.saturating_add(1);
+    }
+    if frame_index == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "journal '{}' has neither the Ursula WAL header nor a complete legacy frame",
+                path.display()
+            ),
+        ));
+    }
+    if valid_len < file_len {
+        tracing::warn!(
+            path = %path.display(),
+            valid_bytes = valid_len,
+            discarded_torn_bytes = file_len.saturating_sub(valid_len),
+            "discarding a torn legacy WAL tail during format migration"
+        );
+    }
+    writer.sync(&migrate_path)?;
+    drop(writer);
+
+    if backup_path.exists() {
+        fs::remove_file(&backup_path)?;
+    }
+    fs::hard_link(path, &backup_path)?;
+    sync_parent(path)?;
+    fs::rename(&migrate_path, path)?;
+    sync_parent(path)?;
+    Ok(true)
+}
+
+fn suffixed_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 /// Decode framed records from an in-memory buffer, returning the records and the byte
 /// length of the valid (fully-written) prefix. A torn trailing frame ends the scan.
 pub fn decode_frames<C: FrameCodec>(bytes: &[u8]) -> io::Result<(Vec<C::Record>, usize)> {
     let mut records = Vec::new();
-    let mut offset = 0usize;
+    if bytes.is_empty() {
+        return Ok((records, 0));
+    }
+    if bytes.len() < JOURNAL_HEADER_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "in-memory journal has no complete Ursula WAL header",
+        ));
+    }
+    validate_header_bytes(&bytes[..JOURNAL_HEADER_LEN], "in-memory journal")?;
+    let mut offset = JOURNAL_HEADER_LEN;
+    let mut frame_index = 0_usize;
     while offset < bytes.len() {
-        let Some(len_bytes) = bytes.get(offset..offset.saturating_add(4)) else {
+        let Some(frame_header) = bytes.get(offset..offset.saturating_add(FRAME_HEADER_LEN)) else {
             return Ok((records, offset)); // torn length prefix
         };
         let len = usize::try_from(u32::from_le_bytes(
-            len_bytes.try_into().expect("slice is exactly four bytes"),
+            frame_header[..4]
+                .try_into()
+                .expect("slice is exactly four bytes"),
         ))
         .expect("u32 fits usize");
-        let start = offset.saturating_add(4);
+        if len > MAX_FRAME_PAYLOAD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "in-memory journal frame {} declares {len} bytes, exceeding the {MAX_FRAME_PAYLOAD_BYTES} byte limit",
+                    frame_index + 1
+                ),
+            ));
+        }
+        let expected_checksum = u32::from_le_bytes(
+            frame_header[4..8]
+                .try_into()
+                .expect("slice is exactly four bytes"),
+        );
+        let start = offset.saturating_add(FRAME_HEADER_LEN);
         let end = start.checked_add(len).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "journal frame length overflow")
         })?;
         let Some(payload) = bytes.get(start..end) else {
             return Ok((records, offset)); // torn payload
         };
+        let actual_checksum = crc32fast::hash(payload);
+        if actual_checksum != expected_checksum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "in-memory journal frame {} checksum mismatch: expected {expected_checksum:#010x}, got {actual_checksum:#010x}",
+                    frame_index + 1
+                ),
+            ));
+        }
         records.push(C::decode(payload)?);
         offset = end;
+        frame_index = frame_index.saturating_add(1);
     }
     Ok((records, bytes.len()))
+}
+
+fn validate_file_header(file: &mut File, path: &Path, file_len: u64) -> io::Result<()> {
+    if file_len < u64::try_from(JOURNAL_HEADER_LEN).expect("header length fits u64") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("journal '{}' has a torn file header", path.display()),
+        ));
+    }
+    file.rewind()?;
+    let mut header = [0_u8; JOURNAL_HEADER_LEN];
+    file.read_exact(&mut header)?;
+    validate_header_bytes(&header, &format!("journal '{}'", path.display()))
+}
+
+fn validate_header_bytes(header: &[u8], description: &str) -> io::Result<()> {
+    if header.get(..JOURNAL_MAGIC.len()) != Some(JOURNAL_MAGIC.as_slice()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{description} has no Ursula WAL magic; legacy unversioned journals require an explicit reset or migration"
+            ),
+        ));
+    }
+    let version = u16::from_le_bytes(
+        header[8..10]
+            .try_into()
+            .expect("validated journal header has version bytes"),
+    );
+    if version != JOURNAL_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{description} uses unsupported Ursula WAL version {version}; this binary supports version {JOURNAL_VERSION}"
+            ),
+        ));
+    }
+    let header_len = usize::from(u16::from_le_bytes(
+        header[10..12]
+            .try_into()
+            .expect("validated journal header has length bytes"),
+    ));
+    if header_len != JOURNAL_HEADER_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{description} declares unsupported header length {header_len}; expected {JOURNAL_HEADER_LEN}"
+            ),
+        ));
+    }
+    if header[12..].iter().any(|byte| *byte != 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{description} has non-zero reserved header bytes"),
+        ));
+    }
+    Ok(())
 }
 
 /// Truncate `path` to `valid_len` bytes, dropping a torn trailing frame, then `fsync`.
@@ -201,6 +523,8 @@ pub fn truncate_to(path: &Path, valid_len: usize) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::SeekFrom;
+
     use super::*;
 
     fn write_all(path: &Path, records: &[String]) {
@@ -284,5 +608,119 @@ mod tests {
         .expect("stream replay");
 
         assert_eq!(replayed, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn replay_rejects_checksum_corruption() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("journal");
+        write_all(&path, &["clean".to_owned()]);
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open journal");
+        file.seek(SeekFrom::End(-1))
+            .expect("seek final payload byte");
+        file.write_all(b"x").expect("corrupt payload");
+        file.sync_data().expect("sync corruption");
+
+        let err = replay::<JsonCodec<String>>(&path).expect_err("checksum must fail closed");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("frame 1 checksum mismatch"));
+    }
+
+    #[test]
+    fn replay_rejects_legacy_unversioned_journal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("journal");
+        let payload = serde_json::to_vec("legacy").expect("encode legacy payload");
+        let mut file = File::create(&path).expect("create legacy journal");
+        file.write_all(
+            &u32::try_from(payload.len())
+                .expect("payload length fits u32")
+                .to_le_bytes(),
+        )
+        .expect("write legacy length");
+        file.write_all(&payload).expect("write legacy payload");
+        file.sync_data().expect("sync legacy journal");
+
+        let err = replay::<JsonCodec<String>>(&path).expect_err("legacy format must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("explicit reset or migration"));
+    }
+
+    #[test]
+    fn legacy_migration_preserves_records_and_a_rollback_copy() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("journal");
+        let records = ["first".to_owned(), "second".to_owned()];
+        let mut legacy = File::create(&path).expect("create legacy journal");
+        for record in &records {
+            let payload = serde_json::to_vec(record).expect("encode legacy payload");
+            legacy
+                .write_all(
+                    &u32::try_from(payload.len())
+                        .expect("payload length fits u32")
+                        .to_le_bytes(),
+                )
+                .expect("write legacy length");
+            legacy.write_all(&payload).expect("write legacy payload");
+        }
+        legacy.sync_data().expect("sync legacy journal");
+        drop(legacy);
+
+        assert!(migrate_legacy::<JsonCodec<String>>(&path).expect("migrate legacy journal"));
+        assert_eq!(
+            replay::<JsonCodec<String>>(&path).expect("replay migrated journal"),
+            records
+        );
+        assert!(suffixed_path(&path, ".v0.bak").exists());
+        assert!(!migrate_legacy::<JsonCodec<String>>(&path).expect("migration is idempotent"));
+    }
+
+    #[test]
+    fn replay_rejects_unsupported_version() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("journal");
+        write_all(&path, &["clean".to_owned()]);
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open journal");
+        file.seek(SeekFrom::Start(8)).expect("seek version");
+        file.write_all(&2_u16.to_le_bytes())
+            .expect("write unsupported version");
+        file.sync_data().expect("sync unsupported version");
+
+        let err = replay::<JsonCodec<String>>(&path).expect_err("version must fail closed");
+        assert!(err.to_string().contains("unsupported Ursula WAL version 2"));
+    }
+
+    #[test]
+    fn replay_rejects_oversized_frame_before_allocating() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("journal");
+        write_all(&path, &["clean".to_owned()]);
+
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open journal");
+        let oversized =
+            u32::try_from(MAX_FRAME_PAYLOAD_BYTES + 1).expect("configured frame limit fits u32");
+        file.write_all(&oversized.to_le_bytes())
+            .expect("write oversized length");
+        file.write_all(&0_u32.to_le_bytes())
+            .expect("write placeholder checksum");
+        file.sync_data().expect("sync oversized frame");
+
+        let err = replay::<JsonCodec<String>>(&path).expect_err("oversized frame must fail closed");
+        assert!(
+            err.to_string()
+                .contains("exceeding the 536870912 byte limit")
+        );
     }
 }
