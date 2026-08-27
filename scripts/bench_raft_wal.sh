@@ -8,6 +8,7 @@ run_count="${URSULA_WAL_BENCH_RUNS:-3}"
 benchmark_filter="${URSULA_WAL_BENCH_FILTER:-groups=16/payload=256}"
 criterion_group="${URSULA_WAL_BENCH_GROUP:-disk_wal_append_durable}"
 artifact_root="${1:-target/raft-wal-bench}"
+criterion_root="${CARGO_TARGET_DIR:-target}/criterion"
 mkdir -p "$artifact_root"
 
 {
@@ -15,7 +16,7 @@ mkdir -p "$artifact_root"
   echo "rustc=$(rustc --version)"
   echo "cargo=$(cargo --version)"
   echo "kernel=$(uname -a)"
-  echo "filesystem=$( (df -T . 2>/dev/null || df .) | tail -n 1)"
+  echo "filesystem=$(df -k . | tail -n 1)"
   echo "benchmark_filter=$benchmark_filter"
   echo "criterion_group=$criterion_group"
   echo "run_count=$run_count"
@@ -30,7 +31,7 @@ for run in $(seq 1 "$run_count"); do
     --sample-size "${URSULA_WAL_BENCH_SAMPLE_SIZE:-20}" \
     2>&1 | tee "$run_dir/output.txt"
   rm -rf "$run_dir/criterion"
-  cp -R "target/criterion/$criterion_group" "$run_dir/criterion"
+  cp -R "$criterion_root/$criterion_group" "$run_dir/criterion"
 done
 
 python3 scripts/summarize_raft_wal.py "$artifact_root"

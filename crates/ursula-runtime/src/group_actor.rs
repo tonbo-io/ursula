@@ -562,6 +562,7 @@ pub(crate) struct GroupActor {
 impl GroupActor {
     pub(crate) async fn run(mut self) {
         let mut pending = VecDeque::new();
+        let mut explicitly_shutdown = false;
         loop {
             let Some(Traced {
                 value: command,
@@ -578,8 +579,17 @@ impl GroupActor {
                 .await
                 .is_break()
             {
+                explicitly_shutdown = true;
                 break;
             }
+        }
+        if !explicitly_shutdown && let Err(err) = self.engine.shutdown().await {
+            tracing::warn!(
+                core_id = self.placement.core_id.0,
+                raft_group_id = self.placement.raft_group_id.0,
+                %err,
+                "group engine shutdown failed after its actor mailbox closed"
+            );
         }
     }
 
@@ -741,7 +751,6 @@ impl GroupActor {
         ControlFlow::Continue(())
     }
 
-    #[cfg(madsim)]
     async fn handle_shutdown_engine(
         &mut self,
         response_tx: oneshot::Sender<Result<(), RuntimeError>>,

@@ -19,6 +19,7 @@ use openraft::EntryPayload;
 use openraft::LogId;
 use openraft::Raft;
 use openraft::SnapshotPolicy;
+use openraft::StorageError;
 use openraft::alias::VoteOf;
 use openraft::entry::RaftEntry;
 use openraft::rt::WatchReceiver;
@@ -27,6 +28,9 @@ use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
+use openraft::testing::log::StoreBuilder;
+use openraft::testing::log::Suite;
+use openraft::type_config::TypeConfigExt;
 use openraft::vote::RaftLeaderId;
 use serde_json::json;
 use ursula_control::ControlCommand;
@@ -69,6 +73,41 @@ use crate::types::*;
 
 type CommittedLeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
 type MetaLeaderId = <MetaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
+
+struct FileLogStoreBuilder;
+
+impl
+    StoreBuilder<
+        UrsulaRaftTypeConfig,
+        Arc<RaftGroupFileLogStore>,
+        RaftGroupStateMachine,
+        tempfile::TempDir,
+    > for FileLogStoreBuilder
+{
+    async fn build(
+        &self,
+    ) -> Result<
+        (
+            tempfile::TempDir,
+            Arc<RaftGroupFileLogStore>,
+            RaftGroupStateMachine,
+        ),
+        StorageError<UrsulaRaftTypeConfig>,
+    > {
+        let dir = tempfile::tempdir()
+            .map_err(|err| StorageError::write(UrsulaRaftTypeConfig::err_from_error(&err)))?;
+        let store = RaftGroupFileLogStore::shared(dir.path().join("group.wal"))
+            .map_err(|err| StorageError::write(UrsulaRaftTypeConfig::err_from_error(&err)))?;
+        Ok((dir, store, RaftGroupStateMachine::new(placement())))
+    }
+}
+
+#[tokio::test]
+async fn raft_file_log_store_passes_openraft_conformance_suite() {
+    Suite::test_all(FileLogStoreBuilder)
+        .await
+        .expect("OpenRaft file log conformance");
+}
 
 #[test]
 fn follower_forwards_stale_read_visibility_errors() {
@@ -841,6 +880,71 @@ async fn raft_file_log_store_recovers_truncate_and_purge() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].log_id, log_id(3));
 
+    let _ = fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn raft_file_log_restart_rebuilds_only_through_the_committed_marker() {
+    let path = temp_log_path("committed-boundary");
+    let stream_id = bsid("committed-boundary");
+
+    {
+        let mut store = RaftGroupFileLogStore::shared(&path).expect("open file log store");
+        store
+            .append(
+                [
+                    normal_entry(1, create_command(stream_id.clone())),
+                    normal_entry(2, append_command(stream_id.clone(), b"committed")),
+                    normal_entry(3, append_command(stream_id.clone(), b"-uncommitted")),
+                ],
+                IOFlushed::noop(),
+            )
+            .await
+            .expect("append committed and uncommitted tail");
+        store
+            .save_committed(Some(log_id(2)))
+            .await
+            .expect("persist committed marker");
+    }
+
+    let mut reopened = RaftGroupFileLogStore::shared(&path).expect("reopen file log store");
+    let committed = reopened
+        .read_committed()
+        .await
+        .expect("read committed marker")
+        .expect("committed marker exists");
+    assert_eq!(committed, log_id(2));
+    let mut reader = reopened.get_log_reader().await;
+    let durable_entries = reader
+        .try_get_log_entries(1..4)
+        .await
+        .expect("read durable entries");
+    assert_eq!(
+        durable_entries.len(),
+        3,
+        "uncommitted tail stays replicable"
+    );
+    let committed_entries = durable_entries
+        .into_iter()
+        .take_while(|entry| entry.log_id.index <= committed.index)
+        .collect::<Vec<_>>();
+
+    let mut rebuilt = RaftGroupStateMachine::new(placement());
+    rebuilt
+        .apply(stream::iter(
+            committed_entries.into_iter().map(|entry| Ok((entry, None))),
+        ))
+        .await
+        .expect("rebuild state machine through committed marker");
+    let read = rebuilt
+        .engine
+        .read_stream(read_req(stream_id, 64), placement())
+        .await
+        .expect("read rebuilt stream");
+    assert_eq!(read.payload, b"committed");
+
+    drop(reader);
+    drop(reopened);
     let _ = fs::remove_file(&path);
 }
 
@@ -2404,6 +2508,10 @@ async fn durable_raft_group_engine_records_file_log_metrics() {
     );
     assert!(metrics.wal_write_ns > 0);
     assert!(metrics.wal_sync_ns > 0);
+    assert!(metrics.wal_fsyncs > 0);
+    assert!(metrics.wal_fsyncs <= metrics.wal_batches);
+    assert!(metrics.wal_fsync_records >= metrics.wal_fsyncs);
+    assert!(metrics.wal_physical_bytes > 0);
 
     drop(runtime);
     let _ = fs::remove_dir_all(&root);
@@ -2433,6 +2541,10 @@ async fn durable_raft_group_engine_recovers_from_core_journal() {
             ))
             .await
             .expect("append stream");
+        runtime
+            .shutdown_group_engine(placement())
+            .await
+            .expect("shutdown durable group before in-process restart");
     }
 
     let journal_path = root.join("core-0").join("journal.bin");

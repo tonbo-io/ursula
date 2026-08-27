@@ -653,10 +653,6 @@ impl RuntimeMetricsInner {
         self.per_group_wal_sync_ns[group_index].fetch_add_relaxed(sync_ns);
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the arguments are one flat WAL storage sample, kept allocation-free on the write path"
-    )]
     pub(crate) fn record_wal_storage(
         &self,
         core_id: CoreId,
