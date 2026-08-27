@@ -13,6 +13,7 @@ description = "Per-core actor runtime for Ursula: hot ring, cold-tier flush, and
 blake3 = { workspace = true }
 bytes = { workspace = true, features = ["serde"] }
 crossbeam-utils = { workspace = true }
+crc32fast = { workspace = true }
 futures-util = { workspace = true }
 opendal = { workspace = true, features = ["services-memory", "services-s3"] }
 serde = { workspace = true }
