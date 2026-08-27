@@ -19,7 +19,13 @@ There is no Prometheus scrape and no general-purpose orchestrator yet.
 curl http://127.0.0.1:4437/__ursula/metrics | jq .
 ```
 
-The JSON snapshot covers per-core mailbox depth, append/read counters, latency histograms, per-group leader and `last_applied`, hot/cold bytes, cold-flush backlog, HTTP status counters, live-read watchers, and cold-write admission state. Start here when triaging slowness, lag, or `503`s. `ursulactl status` is a friendlier read of the leadership-related fields across the whole cluster.
+The JSON snapshot covers per-core mailbox depth, append/read counters, latency
+histograms, per-group leader and `last_applied`, hot/cold bytes, cold-flush
+backlog, WAL physical/reclaim/recovery work, WAL disk-pressure admission, HTTP
+status counters, live-read watchers, and cold-write admission state. Start here
+when triaging slowness, lag, or `503`s. `GET /__ursula/ready` provides the
+process-level readiness signal; `ursulactl status` is a friendlier read of the
+leadership-related fields across the whole cluster.
 
 ## Admin endpoints
 
@@ -160,7 +166,11 @@ What you can additionally rely on:
 
 - **Quorum durability.** Acknowledged writes survive as long as a majority of voters survives. Three voters across AZs tolerate any single-AZ outage.
 - **Cold-tier durability.** Once flushed to S3, a chunk inherits S3-grade durability. The unflushed window is bounded by the flush interval (seconds by default).
-- **No on-disk migration.** `v0.x` does not promise stable on-disk formats. The runtime won't refuse to start on stale data, but it won't migrate either. Cross-version upgrades currently mean rebuild + replay from external truth.
+- **Versioned Raft WAL migration.** The current WAL automatically migrates the
+  legacy unversioned journal to checksummed v1 under its exclusive lock and
+  retains `journal.bin.v0.bak` for rollback. Other `v0.x` state formats do not
+  carry a general compatibility promise; stage upgrades and verify backup
+  restore before removing the retained WAL backup.
 
 Node-level loss: replace the host with the same `node_id` and cluster config, and it rehydrates from peers. Use `ursulactl wait-ready` afterwards to confirm the replacement is voting and caught up before declaring the recovery done. Total-cluster loss: restore the latest verified backup into a fresh cluster as above.
 

@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use std::time::Duration;
 
 use openraft::BasicNode;
@@ -305,7 +306,7 @@ impl GroupEngineFactory for ColdRaftGroupEngineFactory {
 #[derive(Debug, Clone)]
 pub struct DurableRaftLogStoreFactory {
     root: PathBuf,
-    core_writers: Arc<Mutex<BTreeMap<u16, Arc<CoreFileLogWriter>>>>,
+    core_writers: Arc<Mutex<BTreeMap<u16, Weak<CoreFileLogWriter>>>>,
 }
 
 impl DurableRaftLogStoreFactory {
@@ -336,19 +337,24 @@ impl DurableRaftLogStoreFactory {
 
     pub(crate) fn core_writer(
         &self,
-        core_id: CoreId,
+        placement: ShardPlacement,
+        metrics: GroupEngineMetrics,
     ) -> Result<Arc<CoreFileLogWriter>, GroupEngineError> {
         let mut writers = self
             .core_writers
             .lock()
             .map_err(|_| GroupEngineError::new("core file log writer mutex poisoned"))?;
-        if let Some(writer) = writers.get(&core_id.0) {
-            return Ok(writer.clone());
+        if let Some(writer) = writers.get(&placement.core_id.0).and_then(Weak::upgrade) {
+            return Ok(writer);
         }
 
-        let writer = CoreFileLogWriter::shared(self.core_journal_path(core_id))
-            .map_err(|err| GroupEngineError::new(format!("open OpenRaft core journal: {err}")))?;
-        writers.insert(core_id.0, writer.clone());
+        let writer = CoreFileLogWriter::shared_with_metrics(
+            self.core_journal_path(placement.core_id),
+            placement,
+            metrics,
+        )
+        .map_err(|err| GroupEngineError::new(format!("open OpenRaft core journal: {err}")))?;
+        writers.insert(placement.core_id.0, Arc::downgrade(&writer));
         Ok(writer)
     }
 
@@ -357,11 +363,12 @@ impl DurableRaftLogStoreFactory {
         placement: ShardPlacement,
         metrics: GroupEngineMetrics,
     ) -> Result<Arc<RaftGroupFileLogStore>, GroupEngineError> {
+        let core_writer = self.core_writer(placement, metrics.clone())?;
         RaftGroupFileLogStore::shared_with_core_writer(
             self.log_path(placement),
             placement,
             metrics,
-            self.core_writer(placement.core_id)?,
+            core_writer,
         )
         .map_err(|err| GroupEngineError::new(format!("open OpenRaft file log: {err}")))
     }

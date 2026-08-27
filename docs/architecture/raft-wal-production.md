@@ -1,7 +1,7 @@
 # Production Raft WAL with an in-memory state machine
 
-Status: accepted for the first production-hardening increment. The operational
-rollout gate remains tracked by [#273](https://github.com/tonbo-io/ursula/issues/273).
+Status: accepted, including the operational rollout gate tracked by
+[#273](https://github.com/tonbo-io/ursula/issues/273).
 
 ## Decision
 
@@ -181,10 +181,28 @@ growing value together with zero `wal_reclaims` means the snapshot/purge driver
 or its safety prerequisite is stalled; it is not evidence that S3 compaction
 alone should delete the WAL.
 
-Disk-free-space admission, readiness reporting, restart scan metrics, and the
-multi-node rolling-restart soak are the final operational gate in #273. Helm's
-production-facing default remains `raft.storageMode=logDir` with a per-pod PVC;
-`memory` remains an explicit development, benchmark, and chaos mode.
+Restart observability adds per-core `wal_recovery_ns`,
+`wal_recovery_records`, `wal_recovery_bytes`, and
+`wal_recovery_live_entries`. The implementation has one active generation per
+core and no separate payload cache, so segment and cache metrics would describe
+objects that do not exist; retained entries are bounded by OpenRaft
+snapshot/purge policy instead.
+
+Disk WAL monitors available space every second. Below
+`raft.wal.min_available_size`, writes receive `503 WalDiskPressure`,
+`/__ursula/ready` returns `503`, elections are disabled, and leaders are
+offered to healthy voters. Admission clears only after
+`raft.wal.resume_available_size`, providing hysteresis; a stat failure fails
+closed. Helm defaults these watermarks to 512 MiB and 1 GiB and keeps
+`raft.storageMode=logDir` with a per-pod PVC. Multi-peer memory WAL now requires
+the explicit `allow_volatile_multi_peer` development/benchmark/chaos opt-in.
+
+`scripts/soak_raft_wal.sh` first writes past the real 64-MiB reclaim threshold
+and proves purge/checkpoint converges the physical file to the live generation.
+It then repeats the real-process disk-WAL coverage for a three-voter
+replication path, snapshot/purge plus late-learner installation, and durable
+restart. It records the exact revision, toolchain, kernel, filesystem,
+topology, commands, and per-cycle output under `target/raft-wal-soak`.
 
 ## Verification envelope
 

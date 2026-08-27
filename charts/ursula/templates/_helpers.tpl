@@ -302,6 +302,12 @@ accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 {{- if and ($storageMode | eq "logDir") ($logDir | eq "") -}}
 {{- fail "raft.logDir must be non-empty when raft.storageMode=logDir" -}}
 {{- end -}}
+{{- if and ($storageMode | eq "memory") (gt $replicaCount 1) (not .Values.raft.allowVolatileMultiPeer) -}}
+{{- fail "multi-pod raft.storageMode=memory is volatile; set raft.allowVolatileMultiPeer=true only for development, benchmark, or chaos use" -}}
+{{- end -}}
+{{- if and ($storageMode | eq "logDir") (gt (.Values.raft.minAvailableBytes | int64) 0) (le (.Values.raft.resumeAvailableBytes | int64) (.Values.raft.minAvailableBytes | int64)) -}}
+{{- fail "raft.resumeAvailableBytes must exceed raft.minAvailableBytes when disk-pressure admission is enabled" -}}
+{{- end -}}
 {{- $serverUsesS3 := or .Values.coldStorage.enabled (.Values.snapshotStore.backend | eq "s3") -}}
 {{- $usesS3 := or $serverUsesS3 .Values.indexer.enabled -}}
 {{- if $usesS3 -}}

@@ -114,6 +114,15 @@ layer is an *export-time bridge*: it reads a snapshot at the collection
 interval rather than calling the metrics SDK per record, so enabling export
 adds nothing to the append/read path.
 
+For disk-WAL operations, the JSON snapshot includes current
+`wal_physical_bytes`; online checkpoint counts, bytes, and time under
+`wal_reclaims`, `wal_reclaimed_bytes`, and `wal_reclaim_ns`; and startup scan
+work under `wal_recovery_ns`, `wal_recovery_records`, `wal_recovery_bytes`, and
+`wal_recovery_live_entries`. Free-space admission is reported separately as
+`wal_available_bytes`, its two watermarks, `wal_disk_pressure`, and
+`wal_disk_stat_errors`. These are bounded per-node/per-core series; Ursula's
+single active generation has no segment or cache cardinality to report.
+
 The OTLP collection interval defaults to 60s. For a quick check, shorten it so
 readings arrive without waiting (and without relying on the shutdown flush):
 

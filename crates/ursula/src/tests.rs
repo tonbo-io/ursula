@@ -2433,6 +2433,8 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         let runtime = spawned.runtime;
         let registry = spawned.raft_registry.expect("registry");
         runtime.warm_all_groups().await.expect("warm group");
+        let placement = runtime.locate(&BucketStreamId::new("benchcmp", "static-raft-log-restart"));
+        let shutdown_runtime = runtime.clone();
         let raft = registry
             .get(RaftGroupId(0))
             .expect("registered static raft group");
@@ -2459,6 +2461,11 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        drop(app);
+        shutdown_runtime
+            .shutdown_group_engine(placement)
+            .await
+            .expect("shut down durable group before restart");
     }
 
     let journal_path = raft_root.join("core-0").join("journal.bin");
@@ -2494,6 +2501,8 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .current_leader(1, "restarted durable gRPC Raft group should elect node 1")
             .await
             .expect("wait for restarted leader");
+        let placement = runtime.locate(&BucketStreamId::new("benchcmp", "static-raft-log-restart"));
+        let shutdown_runtime = runtime.clone();
         let app = router_with_static_raft_cluster(runtime, registry, peers);
 
         let response = http_get(
@@ -2504,6 +2513,11 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_bytes(response).await;
         assert_eq!(&body[..], b"restart-payload");
+        drop(app);
+        shutdown_runtime
+            .shutdown_group_engine(placement)
+            .await
+            .expect("shut down restarted durable group");
     }
 
     std::fs::remove_dir_all(&raft_root).expect("remove raft root");
@@ -5249,6 +5263,7 @@ async fn ingress_body_budget_rejects_write_when_budget_is_exhausted() {
         .layer(middleware::from_fn_with_state(
             IngressAdmission {
                 body_bytes: Arc::new(tokio::sync::Semaphore::new(4)),
+                wal_disk: WalDiskMonitor::default(),
             },
             ingress_admission_middleware,
         ));
@@ -5297,6 +5312,7 @@ async fn ingress_body_budget_holds_credit_until_response_finishes() {
         .layer(middleware::from_fn_with_state(
             IngressAdmission {
                 body_bytes: Arc::new(tokio::sync::Semaphore::new(4)),
+                wal_disk: WalDiskMonitor::default(),
             },
             ingress_admission_middleware,
         ));
@@ -5328,6 +5344,65 @@ async fn ingress_body_budget_holds_credit_until_response_finishes() {
     assert_eq!(
         first.await.expect("first join").status(),
         StatusCode::NO_CONTENT
+    );
+}
+
+#[tokio::test]
+async fn wal_disk_pressure_rejects_writes_and_marks_readiness_unavailable() {
+    let monitor = WalDiskMonitor::new(100, 200);
+    assert_eq!(
+        monitor.observe_available(99),
+        crate::wal_disk::WalDiskTransition::EnterPressure
+    );
+    let state = HttpState::new(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    )
+    .with_wal_disk_monitor(monitor.clone());
+    let app = client_router_with_admission(
+        state,
+        IngressAdmission::default().with_wal_disk_monitor(monitor.clone()),
+    );
+
+    let ready = http_get(&app, READINESS_PATH).await;
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let metrics = http_get(&app, "/__ursula/metrics").await;
+    assert_eq!(metrics.status(), StatusCode::OK);
+    let metrics = body_bytes(metrics).await;
+    let metrics: serde_json::Value =
+        serde_json::from_slice(&metrics).expect("decode pressure metrics");
+    assert_eq!(metrics.get("wal_disk_pressure"), Some(&json!(true)));
+    assert_eq!(metrics.get("wal_available_bytes"), Some(&json!(99)));
+
+    let write = http_put(
+        &app,
+        "/benchcmp/disk-pressure",
+        &[(CONTENT_LENGTH.as_str(), "1")],
+        Body::from("x"),
+    )
+    .await;
+    assert_eq!(write.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_bytes(write).await;
+    assert!(
+        std::str::from_utf8(&body)
+            .expect("utf8 response")
+            .contains("WalDiskPressure")
+    );
+
+    assert_eq!(
+        monitor.observe_available(200),
+        crate::wal_disk::WalDiskTransition::LeavePressure
+    );
+    assert_eq!(
+        http_get(&app, READINESS_PATH).await.status(),
+        StatusCode::OK
     );
 }
 

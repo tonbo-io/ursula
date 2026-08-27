@@ -305,6 +305,45 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
         self.assertEqual(parsed["raft"]["max_uncommitted_size_per_group"], "0")
 
+    def test_wal_disk_watermarks_and_http_readiness_are_rendered(self) -> None:
+        rendered = render_chart("--set", "s3.bucket=bkt")
+        config = render_config("--set", "s3.bucket=bkt")
+        wal = tomllib.loads(config)["raft"]["wal"]
+
+        self.assertEqual(wal["min_available_size"], "536870912")
+        self.assertEqual(wal["resume_available_size"], "1073741824")
+        self.assertFalse(wal["allow_volatile_multi_peer"])
+        self.assertIn(
+            "readinessProbe:\n            httpGet:\n              path: /__ursula/ready\n              port: client",
+            rendered,
+        )
+
+    def test_multi_peer_memory_wal_requires_explicit_opt_in(self) -> None:
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                "charts/ursula",
+                "--set",
+                "raft.storageMode=memory",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("raft.allowVolatileMultiPeer=true", result.stderr)
+
+        config = render_config(
+            "--set",
+            "raft.storageMode=memory",
+            "--set",
+            "raft.allowVolatileMultiPeer=true",
+        )
+        self.assertTrue(tomllib.loads(config)["raft"]["wal"]["allow_volatile_multi_peer"])
+
     def test_cold_max_hot_bytes_zero_is_rendered(self) -> None:
         config = render_config(
             "--set",

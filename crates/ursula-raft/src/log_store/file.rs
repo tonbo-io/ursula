@@ -306,9 +306,25 @@ impl RaftGroupFileLogStore {
 }
 
 impl CoreFileLogWriter {
-    #[cfg(not(madsim))]
+    #[cfg(all(not(madsim), test))]
     pub(crate) fn shared(journal_path: impl Into<PathBuf>) -> Result<Arc<Self>, io::Error> {
-        let journal_path = journal_path.into();
+        Self::shared_inner(journal_path.into(), None)
+    }
+
+    #[cfg(not(madsim))]
+    pub(crate) fn shared_with_metrics(
+        journal_path: impl Into<PathBuf>,
+        placement: ShardPlacement,
+        metrics: GroupEngineMetrics,
+    ) -> Result<Arc<Self>, io::Error> {
+        Self::shared_inner(journal_path.into(), Some((placement, metrics)))
+    }
+
+    #[cfg(not(madsim))]
+    fn shared_inner(
+        journal_path: PathBuf,
+        recovery_metrics: Option<(ShardPlacement, GroupEngineMetrics)>,
+    ) -> Result<Arc<Self>, io::Error> {
         if let Some(parent) = journal_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -321,7 +337,33 @@ impl CoreFileLogWriter {
                 "migrated legacy OpenRaft core WAL to checksummed format"
             );
         }
-        let recovered = load_log_store_inners_from_core_journal(&journal_path)?;
+        let recovery_started_at = Instant::now();
+        let recovery_bytes = fs::metadata(&journal_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let (recovered, recovery_records) =
+            load_log_store_inners_from_core_journal_with_stats(&journal_path)?;
+        let recovery_ns = elapsed_ns(recovery_started_at);
+        let recovery_live_entries = recovered.values().fold(0_u64, |total, inner| {
+            total.saturating_add(u64::try_from(inner.entries.len()).unwrap_or(u64::MAX))
+        });
+        if let Some((placement, metrics)) = &recovery_metrics {
+            metrics.record_wal_recovery(
+                *placement,
+                recovery_ns,
+                u64::try_from(recovery_records).unwrap_or(u64::MAX),
+                recovery_bytes,
+                recovery_live_entries,
+            );
+        }
+        tracing::info!(
+            path = %journal_path.display(),
+            recovery_ns,
+            recovery_records,
+            recovery_bytes,
+            recovery_live_entries,
+            "recovered OpenRaft core journal"
+        );
         if let Some((before, after)) = compact_core_journal(&journal_path, &recovered)? {
             tracing::info!(
                 path = %journal_path.display(),
@@ -349,11 +391,16 @@ impl CoreFileLogWriter {
     }
 
     #[cfg(madsim)]
-    pub(crate) fn shared(_journal_path: impl Into<PathBuf>) -> Result<Arc<Self>, io::Error> {
+    pub(crate) fn shared_with_metrics(
+        _journal_path: impl Into<PathBuf>,
+        _placement: ShardPlacement,
+        _metrics: GroupEngineMetrics,
+    ) -> Result<Arc<Self>, io::Error> {
         panic!(
-            "CoreFileLogWriter::shared spawns an OS thread and is unavailable under cfg(madsim); \
-             the simulator must use memory-backed log stores via RaftGroupEngineFactory / \
-             RegisteredRaftGroupEngineFactory / MadsimScopedRaftGroupEngineFactory"
+            "CoreFileLogWriter::shared_with_metrics spawns an OS thread and is unavailable under \
+             cfg(madsim); the simulator must use memory-backed log stores via \
+             RaftGroupEngineFactory / RegisteredRaftGroupEngineFactory / \
+             MadsimScopedRaftGroupEngineFactory"
         );
     }
 
@@ -768,6 +815,12 @@ pub(crate) fn load_log_store_inner_from_core_journal(
 fn load_log_store_inners_from_core_journal(
     journal_path: &Path,
 ) -> Result<BTreeMap<u32, RaftGroupLogStoreInner>, io::Error> {
+    load_log_store_inners_from_core_journal_with_stats(journal_path).map(|(inners, _)| inners)
+}
+
+fn load_log_store_inners_from_core_journal_with_stats(
+    journal_path: &Path,
+) -> Result<(BTreeMap<u32, RaftGroupLogStoreInner>, usize), io::Error> {
     let mut inners = BTreeMap::<u32, RaftGroupLogStoreInner>::new();
     let mut record_index = 0_usize;
     journal::replay_each::<WireCodec<CoreJournalRecord>>(journal_path, |record| {
@@ -784,7 +837,7 @@ fn load_log_store_inners_from_core_journal(
             },
         )
     })?;
-    Ok(inners)
+    Ok((inners, record_index))
 }
 
 #[cfg(not(madsim))]
@@ -1025,9 +1078,12 @@ mod tests {
     use openraft::entry::RaftEntry;
     use openraft::vote::RaftLeaderId;
     use openraft::vote::leader_id_adv::CommittedLeaderId;
+    use ursula_runtime::GroupWriteCommand;
+    use ursula_shard::BucketStreamId;
     use ursula_shard::CoreId;
     use ursula_shard::RaftGroupId;
     use ursula_shard::ShardId;
+    use ursula_stream::StreamCommand;
 
     use super::*;
 
@@ -1062,6 +1118,22 @@ mod tests {
 
     fn blank_entry(index: u64) -> EntryOf<UrsulaRaftTypeConfig> {
         EntryOf::<UrsulaRaftTypeConfig>::new(test_log_id(index), EntryPayload::Blank)
+    }
+
+    fn payload_entry(index: u64, payload_size: usize) -> EntryOf<UrsulaRaftTypeConfig> {
+        EntryOf::<UrsulaRaftTypeConfig>::new(
+            test_log_id(index),
+            EntryPayload::Normal(GroupWriteCommand::Stream(StreamCommand::Append {
+                stream_id: BucketStreamId::new("wal-soak", "production-threshold"),
+                content_type: Some("application/octet-stream".to_owned()),
+                payload: bytes::Bytes::from(vec![7_u8; payload_size]),
+                close_after: false,
+                stream_seq: None,
+                producer: None,
+                now_ms: 0,
+                record_match: None,
+            })),
+        )
     }
 
     fn committed_vote() -> VoteOf<UrsulaRaftTypeConfig> {
@@ -1277,6 +1349,50 @@ mod tests {
         assert_eq!(group.entries.keys().copied().collect::<Vec<_>>(), [
             256, 257
         ]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(not(madsim))]
+    #[test]
+    #[ignore = "writes a production-threshold WAL generation; run through scripts/soak_raft_wal.sh"]
+    fn online_reclaim_converges_at_production_threshold() {
+        let path = temp_journal_path("core-journal-production-reclaim");
+        let mut handle = RaftGroupFileLogHandle::new(true);
+        write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
+            group_id: 7,
+            record: RaftGroupLogRecord::Append(vec![payload_entry(
+                1,
+                usize::try_from(CORE_LOG_ONLINE_RECLAIM_MIN_BYTES)
+                    .expect("reclaim threshold fits usize")
+                    .saturating_add(1024),
+            )]),
+        })
+        .expect("write production-sized historical record");
+        write_wire_frame_to_file(&path, &mut handle, &CoreJournalRecord {
+            group_id: 7,
+            record: RaftGroupLogRecord::Purge(test_log_id(1)),
+        })
+        .expect("write production-sized purge frontier");
+        sync_file_handle(&path, &mut handle).expect("sync production-sized core journal");
+        let before = fs::metadata(&path).expect("journal metadata").len();
+        assert!(before >= CORE_LOG_ONLINE_RECLAIM_MIN_BYTES);
+
+        let (reclaim_before, reclaim_after) =
+            reclaim_core_journal_if_needed(&path, &mut handle, CORE_LOG_ONLINE_RECLAIM_MIN_BYTES)
+                .expect("production-threshold online reclaim")
+                .expect("production-sized historical journal should shrink");
+        assert_eq!(reclaim_before, before);
+        assert!(reclaim_after < 1024 * 1024);
+        println!(
+            "production-threshold reclaim: before_bytes={reclaim_before} after_bytes={reclaim_after}"
+        );
+
+        drop(handle);
+        let recovered =
+            load_log_store_inners_from_core_journal(&path).expect("replay reclaimed WAL");
+        let group = recovered.get(&7).expect("recovered group");
+        assert_eq!(group.last_purged_log_id, Some(test_log_id(1)));
+        assert!(group.entries.is_empty());
         let _ = fs::remove_file(&path);
     }
 

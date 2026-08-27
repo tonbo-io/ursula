@@ -20,8 +20,13 @@ Useful jq selectors:
 | Per-core mailbox depth | `.cores[] | {core_id, mailbox_pending}` |
 | Live-read watcher counts | `.cores[] | {core_id, live_read_watchers_active}` |
 | HTTP error counters | `.http.responses_by_status` |
+| WAL disk pressure | `{available: .wal_available_bytes, minimum: .wal_min_available_bytes, pressure: .wal_disk_pressure}` |
+| WAL reclaim/restart | `{physical: .wal_physical_bytes, reclaims: .wal_reclaims, recovered_bytes: .wal_recovery_bytes, recovery_ns: .wal_recovery_ns}` |
 
-Ursula does **not** expose `/healthz`, `/readyz`, Prometheus `/metrics`, or `/cluster/status`. The JSON snapshot is the source of truth.
+`GET /__ursula/ready` is the process readiness probe: it returns `503` while
+the disk-WAL guard is active. Ursula does **not** expose `/healthz`, `/readyz`,
+Prometheus `/metrics`, or `/cluster/status`; use the JSON snapshot for detailed
+diagnosis and `ursulactl wait-ready` for cluster-wide Raft readiness.
 
 ## Startup failures
 
@@ -37,6 +42,13 @@ Static Raft mode requires a unique `raft.node_id` in the config file or a `--nod
 
 The local `raft.node_id` must appear in `[[raft.peers]]`. The peer list always includes self.
 
+### Multi-peer Raft with a memory WAL is volatile
+
+Use `raft.wal.backend = "disk"` for a real cluster. Memory WAL remains available
+for development, benchmarks, and chaos tests, but more than one configured peer
+requires `raft.wal.allow_volatile_multi_peer = true` so the loss-on-restart
+contract is explicit.
+
 ### `storage.cold.s3.bucket is required when cold backend is 's3'`
 
 Set `storage.cold.s3.bucket`, or set `storage.cold.backend = "none"` if you don't want cold storage.
@@ -47,7 +59,11 @@ Set `storage.cold.s3.bucket`, or set `storage.cold.backend = "none"` if you don'
 
 ### I/O error on `raft.wal.path`
 
-The directory must be writable. No lock file to clear, Ursula trusts the directory.
+The directory must be writable and owned by exactly one Ursula process. Each
+core journal holds an advisory `journal.bin.lock` containing the owner PID. Do
+not remove it while that process is alive; stop the conflicting process or fix
+the volume mount. A stale lock file is harmless because ownership is enforced
+by the OS lock, not the file's existence.
 
 ## Bootstrap and cluster join
 
@@ -67,7 +83,15 @@ Restart with the **same** `raft.node_id` and peer list. A fresh `raft.wal.path` 
 
 ### `503` with `Retry-After` on append
 
-Cold-write backpressure for that group. Either the hot ring exceeds `storage.cold.max_hot_size_per_group` (cold flush isn't keeping up), or the cold backend is slow or erroring out.
+Inspect the JSON error. `WalDiskPressure` means the WAL filesystem is below
+`raft.wal.min_available_size` (or its free-space stat failed); the node also
+becomes unready and attempts to yield its leaders. Free space or expand the
+volume. Admission resumes only at `raft.wal.resume_available_size`, preventing
+probe flapping.
+
+Other errors indicate cold-write backpressure for that group. Either the hot
+ring exceeds `storage.cold.max_hot_size_per_group` (cold flush isn't keeping
+up), or the cold backend is slow or erroring out.
 
 Raise the per-group ceiling, lower `storage.cold.flush_interval`, raise `storage.cold.flush_max_concurrency`, or fix the cold backend.
 

@@ -17,11 +17,14 @@ mod runtime;
 mod snapshot;
 mod topology;
 mod util;
+mod wal_disk;
 
 pub use runtime::SpawnedRuntime;
 pub use runtime::spawn_runtime;
 pub use topology::Persistence;
 pub use topology::Topology;
+pub(crate) use wal_disk::initialize_wal_disk_monitor;
+pub(crate) use wal_disk::spawn_wal_disk_gate;
 
 // Re-export test-visible internals so existing tests don't break.
 #[allow(unused_imports)]

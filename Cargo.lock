@@ -4365,6 +4365,7 @@ dependencies = [
  "clap",
  "console-subscriber",
  "flate2",
+ "fs4",
  "futures-util",
  "madsim",
  "openraft",

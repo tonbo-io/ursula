@@ -58,10 +58,15 @@ Without `server.cluster_listen`, `server.listen` serves both client/API and Raft
 | `raft.group_count` | `core_count × 16` | Total Raft groups. Higher values improve stream-to-group hash spread |
 | `raft.wal.backend` | `memory` | `memory` (volatile, survives no restart) or `disk` (durable, required for clusters) |
 | `raft.wal.path` | none | Required for `backend = "disk"`. Raft logs live under `PATH/raft-log`, and removing the directory wipes state cleanly |
+| `raft.wal.min_available_size` | `512MiB` | Reject writes and mark `/__ursula/ready` unavailable below this much free WAL-filesystem space. `0` disables the guard |
+| `raft.wal.resume_available_size` | `1GiB` | Free space required before disk-pressure admission clears. Must exceed the minimum |
+| `raft.wal.allow_volatile_multi_peer` | `false` | Explicit development/benchmark/chaos opt-in required for more than one peer with a memory WAL |
 | `raft.peers` | empty | Static gRPC peer list, with one `[[raft.peers]]` entry per voter, including this node |
 | `raft.init_membership_per_group` | `false` | One-time per-group membership bootstrap. Set `true` on the very first start of a fresh cluster, then flip back to `false` |
 
-Pick one WAL backend per cluster and use it on every peer.
+Pick one WAL backend per cluster and use it on every peer. Production clusters
+should use `disk`; a multi-peer `memory` configuration fails validation unless
+the volatile-mode opt-in is set explicitly.
 
 ## Cold storage
 

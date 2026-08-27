@@ -1648,6 +1648,20 @@
           "minLength": 1,
           "description": "Raft log directory for logDir mode."
         },
+        "minAvailableBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Free WAL filesystem bytes below which writes and readiness are rejected; zero disables."
+        },
+        "resumeAvailableBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Free WAL filesystem bytes required before pressure clears."
+        },
+        "allowVolatileMultiPeer": {
+          "type": "boolean",
+          "description": "Explicit development-only opt-in for multi-pod memory WAL clusters."
+        },
         "maxUncommittedBytesPerGroup": {
           "type": [
             "integer",

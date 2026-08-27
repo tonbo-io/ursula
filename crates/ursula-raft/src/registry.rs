@@ -699,14 +699,16 @@ pub enum LeadershipShedReason {
     ClusterEgress = 0b010,
     ColdHealth = 0b100,
     MaintenanceDrain = 0b1000,
+    WalDiskPressure = 0b1_0000,
 }
 
 impl LeadershipShedReason {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::SnapshotDriverS3,
         Self::ClusterEgress,
         Self::ColdHealth,
         Self::MaintenanceDrain,
+        Self::WalDiskPressure,
     ];
 
     const fn bit(self) -> u8 {
@@ -719,6 +721,7 @@ impl LeadershipShedReason {
             Self::ClusterEgress => "cluster-egress",
             Self::ColdHealth => "cold-health",
             Self::MaintenanceDrain => "maintenance-drain",
+            Self::WalDiskPressure => "wal-disk-pressure",
         }
     }
 }
@@ -736,6 +739,7 @@ bitflags::bitflags! {
         const CLUSTER_EGRESS = LeadershipShedReason::ClusterEgress.bit();
         const COLD_HEALTH = LeadershipShedReason::ColdHealth.bit();
         const MAINTENANCE_DRAIN = LeadershipShedReason::MaintenanceDrain.bit();
+        const WAL_DISK_PRESSURE = LeadershipShedReason::WalDiskPressure.bit();
     }
 }
 
@@ -761,7 +765,7 @@ impl LeadershipShedState {
     /// for those states can deadlock the balancer when every peer has a
     /// transient cold-path bit set.
     pub fn should_accept_transfer(self) -> bool {
-        !self.intersects(Self::CLUSTER_EGRESS | Self::MAINTENANCE_DRAIN)
+        !self.intersects(Self::CLUSTER_EGRESS | Self::MAINTENANCE_DRAIN | Self::WAL_DISK_PRESSURE)
     }
 
     /// Whether local raft groups should be allowed to campaign.
@@ -771,7 +775,12 @@ impl LeadershipShedState {
     /// leadership, but it must remain electable so a cluster-wide hot backlog
     /// cannot exclude every node from leadership.
     pub fn should_campaign(self) -> bool {
-        !self.intersects(Self::CLUSTER_EGRESS | Self::SNAPSHOT_DRIVER_S3 | Self::MAINTENANCE_DRAIN)
+        !self.intersects(
+            Self::CLUSTER_EGRESS
+                | Self::SNAPSHOT_DRIVER_S3
+                | Self::MAINTENANCE_DRAIN
+                | Self::WAL_DISK_PRESSURE,
+        )
     }
 
     /// Whether local raft groups should actively move current leadership away.
@@ -784,6 +793,8 @@ impl LeadershipShedState {
             Some(LeadershipShedReason::ClusterEgress)
         } else if self.contains(Self::MAINTENANCE_DRAIN) {
             Some(LeadershipShedReason::MaintenanceDrain)
+        } else if self.contains(Self::WAL_DISK_PRESSURE) {
+            Some(LeadershipShedReason::WalDiskPressure)
         } else {
             None
         }
@@ -1418,6 +1429,15 @@ mod tests {
         assert_eq!(
             maintenance_shed.transfer_rejection_reason(),
             Some(LeadershipShedReason::MaintenanceDrain)
+        );
+
+        let wal_disk_shed = LeadershipShedState::from(LeadershipShedReason::WalDiskPressure);
+        assert!(!wal_disk_shed.should_accept_transfer());
+        assert!(!wal_disk_shed.should_campaign());
+        assert!(wal_disk_shed.should_shed_current_leaders());
+        assert_eq!(
+            wal_disk_shed.transfer_rejection_reason(),
+            Some(LeadershipShedReason::WalDiskPressure)
         );
     }
 

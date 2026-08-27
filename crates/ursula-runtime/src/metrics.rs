@@ -397,6 +397,10 @@ runtime_metrics! {
         core per_core_wal_reclaimed_bytes, group per_group_wal_reclaimed_bytes;
     sum wal_reclaim_ns: core per_core_wal_reclaim_ns, group per_group_wal_reclaim_ns;
     sum wal_physical_bytes: core per_core_wal_physical_bytes;
+    sum wal_recovery_ns: core per_core_wal_recovery_ns;
+    sum wal_recovery_records: core per_core_wal_recovery_records;
+    sum wal_recovery_bytes: core per_core_wal_recovery_bytes;
+    sum wal_recovery_live_entries: core per_core_wal_recovery_live_entries;
     counter cold_flush_uploads;
     counter cold_flush_upload_bytes;
     counter cold_flush_upload_ns;
@@ -679,6 +683,21 @@ impl RuntimeMetricsInner {
         self.per_core_wal_physical_bytes[core_index].store_relaxed(physical_bytes);
     }
 
+    pub(crate) fn record_wal_recovery(
+        &self,
+        core_id: CoreId,
+        recovery_ns: u64,
+        records: u64,
+        bytes: u64,
+        live_entries: u64,
+    ) {
+        let core_index = usize::from(core_id.0);
+        self.per_core_wal_recovery_ns[core_index].fetch_add_relaxed(recovery_ns);
+        self.per_core_wal_recovery_records[core_index].fetch_add_relaxed(records);
+        self.per_core_wal_recovery_bytes[core_index].fetch_add_relaxed(bytes);
+        self.per_core_wal_recovery_live_entries[core_index].fetch_add_relaxed(live_entries);
+    }
+
     pub(crate) fn record_cold_upload(&self, bytes: u64, upload_ns: u64) {
         self.cold_flush_uploads.fetch_add_relaxed(1);
         self.cold_flush_upload_bytes.fetch_add_relaxed(bytes);
@@ -878,7 +897,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 143] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 151] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -992,6 +1011,14 @@ mod metric_manifest_tests {
         "per_group_wal_reclaim_ns",
         "wal_physical_bytes",
         "per_core_wal_physical_bytes",
+        "wal_recovery_ns",
+        "per_core_wal_recovery_ns",
+        "wal_recovery_records",
+        "per_core_wal_recovery_records",
+        "wal_recovery_bytes",
+        "per_core_wal_recovery_bytes",
+        "wal_recovery_live_entries",
+        "per_core_wal_recovery_live_entries",
         "cold_flush_uploads",
         "cold_flush_upload_bytes",
         "cold_flush_upload_ns",
