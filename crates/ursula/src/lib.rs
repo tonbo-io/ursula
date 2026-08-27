@@ -17,6 +17,7 @@ mod http_time {
     pub use tokio::time::timeout;
 }
 mod render;
+mod wal_disk;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -118,6 +119,7 @@ use ursula_runtime::new_external_payload_path;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::is_reserved_affinity_stream_id;
+use wal_disk::WalDiskMonitor;
 
 use crate::bootstrap::reenable_elections_if_campaign_allowed;
 use crate::render::apply_record_envelope;
@@ -343,6 +345,7 @@ pub struct HttpState {
     /// JSON so operator tooling can tell a volatile node from a durable one
     /// (e.g. ursulactl auto-enabling empty-log rejoin only for `memory`).
     wal_backend: &'static str,
+    wal_disk: WalDiskMonitor,
 }
 
 impl HttpState {
@@ -364,6 +367,7 @@ impl HttpState {
             leadership_shed: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
+            wal_disk: WalDiskMonitor::default(),
         }
     }
 
@@ -382,6 +386,7 @@ impl HttpState {
             leadership_shed,
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
+            wal_disk: WalDiskMonitor::default(),
         }
     }
 
@@ -421,6 +426,7 @@ impl HttpState {
             leadership_shed,
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
+            wal_disk: WalDiskMonitor::default(),
         }
     }
 
@@ -456,6 +462,15 @@ impl HttpState {
     pub fn with_wal_backend(mut self, backend: &'static str) -> Self {
         self.wal_backend = backend;
         self
+    }
+
+    pub(crate) fn with_wal_disk_monitor(mut self, monitor: WalDiskMonitor) -> Self {
+        self.wal_disk = monitor;
+        self
+    }
+
+    pub(crate) fn wal_disk_monitor(&self) -> WalDiskMonitor {
+        self.wal_disk.clone()
     }
 
     /// Apply runtime-level config (memory monitor, payload threshold) derived
@@ -989,6 +1004,7 @@ pub fn cluster_router_from_state(state: HttpState) -> Router {
 #[derive(Clone)]
 pub struct IngressAdmission {
     body_bytes: Arc<tokio::sync::Semaphore>,
+    wal_disk: WalDiskMonitor,
 }
 
 impl Default for IngressAdmission {
@@ -997,6 +1013,7 @@ impl Default for IngressAdmission {
             body_bytes: Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_HTTP_INFLIGHT_BODY_BYTES,
             )),
+            wal_disk: WalDiskMonitor::default(),
         }
     }
 }
@@ -1006,13 +1023,20 @@ impl IngressAdmission {
         let body_budget = cfg.http_inflight_body_size.as_bytes() as usize;
         Self {
             body_bytes: Arc::new(tokio::sync::Semaphore::new(body_budget)),
+            wal_disk: WalDiskMonitor::default(),
         }
     }
 
     pub fn disabled() -> Self {
         Self {
             body_bytes: Arc::new(tokio::sync::Semaphore::new(usize::MAX)),
+            wal_disk: WalDiskMonitor::default(),
         }
+    }
+
+    pub(crate) fn with_wal_disk_monitor(mut self, monitor: WalDiskMonitor) -> Self {
+        self.wal_disk = monitor;
+        self
     }
 }
 
@@ -1029,6 +1053,9 @@ async fn ingress_admission_middleware(
     };
     if body_bytes > u64::try_from(MAX_HTTP_BODY_BYTES).expect("max body bytes fits u64") {
         return (StatusCode::PAYLOAD_TOO_LARGE, "request body is too large").into_response();
+    }
+    if admission.wal_disk.is_pressured() {
+        return retry_after_json("WalDiskPressure");
     }
 
     let _body_permits = if body_bytes > 0 {
@@ -1133,11 +1160,33 @@ fn json_response(status: StatusCode, body: String) -> Response {
 /// egress, which a small heartbeat-sized request would mask.
 pub(crate) const CLUSTER_PROBE_PATH: &str = "/__ursula/cluster-probe";
 pub(crate) const LEADERSHIP_SHED_PATH: &str = "/__ursula/leadership-shed";
+pub(crate) const READINESS_PATH: &str = "/__ursula/ready";
 
 /// Probe target: drain the body (so the sender's full egress traverses the
 /// cluster plane) and answer 200. Bypasses ingress admission.
 async fn cluster_probe(_body: Bytes) -> StatusCode {
     StatusCode::OK
+}
+
+async fn readiness(State(state): State<HttpState>) -> Response {
+    let disk = state.wal_disk.snapshot();
+    let status = if disk.pressure {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    json_response(
+        status,
+        serde_json::json!({
+            "ready": !disk.pressure,
+            "wal_disk_pressure": disk.pressure,
+            "wal_available_bytes": disk.available_bytes,
+            "wal_min_available_bytes": disk.min_available_bytes,
+            "wal_resume_available_bytes": disk.resume_available_bytes,
+            "wal_disk_stat_errors": disk.stat_errors,
+        })
+        .to_string(),
+    )
 }
 
 async fn leadership_shed_status(State(state): State<HttpState>) -> Response {
@@ -1208,6 +1257,7 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
 
     Router::new()
         .route("/__ursula/metrics", get(metrics))
+        .route(READINESS_PATH, get(readiness))
         .route("/__ursula/usage", get(bucket_usage))
         .route(
             "/__ursula/purge/{bucket}",
@@ -1541,6 +1591,27 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         object.insert(
             "wal_backend".to_owned(),
             serde_json::json!(state.wal_backend),
+        );
+        let wal_disk = state.wal_disk.snapshot();
+        object.insert(
+            "wal_available_bytes".to_owned(),
+            serde_json::json!(wal_disk.available_bytes),
+        );
+        object.insert(
+            "wal_min_available_bytes".to_owned(),
+            serde_json::json!(wal_disk.min_available_bytes),
+        );
+        object.insert(
+            "wal_resume_available_bytes".to_owned(),
+            serde_json::json!(wal_disk.resume_available_bytes),
+        );
+        object.insert(
+            "wal_disk_pressure".to_owned(),
+            serde_json::json!(wal_disk.pressure),
+        );
+        object.insert(
+            "wal_disk_stat_errors".to_owned(),
+            serde_json::json!(wal_disk.stat_errors),
         );
     }
     json_response(StatusCode::OK, body.to_string())

@@ -912,6 +912,23 @@ impl GroupEngineMetrics {
         );
     }
 
+    pub fn record_wal_recovery(
+        &self,
+        placement: ShardPlacement,
+        recovery_ns: u64,
+        records: u64,
+        bytes: u64,
+        live_entries: u64,
+    ) {
+        self.inner.record_wal_recovery(
+            placement.core_id,
+            recovery_ns,
+            records,
+            bytes,
+            live_entries,
+        );
+    }
+
     pub fn record_raft_write_many(
         &self,
         placement: ShardPlacement,

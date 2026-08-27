@@ -218,6 +218,14 @@ pub struct WalConfig {
     pub backend: WalBackend,
     /// Directory for on-disk WAL files. Required when `backend` is `Disk`.
     pub path: Option<PathBuf>,
+    /// Reject writes and mark the node unready below this many available bytes.
+    /// Zero disables disk-pressure admission.
+    pub min_available_size: HumanSize,
+    /// Clear disk-pressure admission only after free space reaches this value.
+    /// Must exceed `min_available_size` when the guard is enabled.
+    pub resume_available_size: HumanSize,
+    /// Explicit opt-in for a multi-peer cluster whose Raft log is volatile.
+    pub allow_volatile_multi_peer: bool,
 }
 
 impl WalConfig {
@@ -239,6 +247,9 @@ impl Default for WalConfig {
         Self {
             backend: WalBackend::Memory,
             path: None,
+            min_available_size: HumanSize::mib(512),
+            resume_available_size: HumanSize::gib(1),
+            allow_volatile_multi_peer: false,
         }
     }
 }

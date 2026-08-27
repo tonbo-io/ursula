@@ -105,6 +105,9 @@ data:
 {{- end }}
 
     [raft.wal]
+    min_available_size = {{ .Values.raft.minAvailableBytes | int64 | quote }}
+    resume_available_size = {{ .Values.raft.resumeAvailableBytes | int64 | quote }}
+    allow_volatile_multi_peer = {{ .Values.raft.allowVolatileMultiPeer }}
 {{- if .Values.raft.storageMode | eq "memory" }}
     backend = "memory"
 {{- else }}
