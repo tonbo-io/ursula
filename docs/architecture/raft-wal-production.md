@@ -54,14 +54,18 @@ filesystem and toolchain for all backends, produced:
 
 | Backend | Three-run mean for 16 durable appends | Stddev | CV |
 |---|---:|---:|---:|
-| Ursula direct file per group | 53.531 ms | 1.565 ms | 2.92% |
-| Ursula shared file per core | 18.952 ms | 3.883 ms | 20.49% |
-| Upstream `raft-log` per group | 88.058 ms | 3.466 ms | 3.94% |
+| Ursula direct file per group | 55.702 ms | 3.079 ms | 5.53% |
+| Ursula shared file per core | 19.475 ms | 1.050 ms | 5.39% |
+| Upstream `raft-log` per group | 91.762 ms | 3.931 ms | 4.28% |
 
-The shared result has visible host noise, but its slowest individual run still
-beats the alternatives by more than the five-percent decision threshold. The
-result supports retaining cross-group fsync batching; it is not a general claim
-that the current file format is faster than every segmented WAL workload.
+The shared writer is about 2.9 times faster than the direct-per-group writer and
+4.7 times faster than the upstream per-group adapter in this profile. A main
+worktree carrying only the same benchmark harness measured the old shared WAL
+at 20.345 ms with a 1.532-ms standard deviation. The new checksummed path's
+4.3-percent lower mean is inside the observed variance, so the defensible
+before/after conclusion is no measurable regression, not a claimed speedup.
+The result supports retaining cross-group fsync batching; it is not a general
+claim that the current file format is faster than every segmented WAL workload.
 
 `disk_wal` also covers one and many groups, 256-byte through 64-KiB payloads,
 append plus committed-marker persistence, recent reads, and restart replay.
