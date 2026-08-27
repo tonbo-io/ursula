@@ -286,12 +286,16 @@ impl RaftGroupFileLogStore {
         } else {
             let mut file = self.lock_file()?;
             let (write_ns, sync_ns) = append_log_store_record(&self.path, &mut file, record)?;
+            let fsyncs = u64::from(raft_group_log_record_requires_sync(record));
             CoreFileLogWriteTiming {
                 write_ns,
                 sync_ns,
-                fsyncs: 1,
-                fsync_records: u64::try_from(raft_group_log_record_count(record))
-                    .unwrap_or(u64::MAX),
+                fsyncs,
+                fsync_records: if fsyncs == 0 {
+                    0
+                } else {
+                    u64::try_from(raft_group_log_record_count(record)).unwrap_or(u64::MAX)
+                },
                 reclaims: 0,
                 reclaimed_bytes: 0,
                 reclaim_ns: 0,
@@ -503,9 +507,16 @@ pub(crate) fn write_core_log_batch(
     }
     let write_ns = elapsed_ns(write_started_at);
 
-    let sync_started_at = Instant::now();
-    sync_file_handle(journal_path, journal_handle)?;
-    let sync_ns = elapsed_ns(sync_started_at);
+    let requires_sync = batch
+        .iter()
+        .any(|request| raft_group_log_record_requires_sync(&request.record));
+    let sync_ns = if requires_sync {
+        let sync_started_at = Instant::now();
+        sync_file_handle(journal_path, journal_handle)?;
+        elapsed_ns(sync_started_at)
+    } else {
+        0
+    };
     let reclaim_started_at = Instant::now();
     let mut reclaims = 0;
     let mut reclaimed_bytes = 0;
@@ -537,8 +548,12 @@ pub(crate) fn write_core_log_batch(
     Ok(CoreFileLogWriteTiming {
         write_ns,
         sync_ns,
-        fsyncs: 1,
-        fsync_records: u64::try_from(batch.len()).unwrap_or(u64::MAX),
+        fsyncs: u64::from(requires_sync).saturating_add(reclaims),
+        fsync_records: if requires_sync || reclaims != 0 {
+            u64::try_from(batch.len()).unwrap_or(u64::MAX)
+        } else {
+            0
+        },
         reclaims,
         reclaimed_bytes,
         reclaim_ns,
@@ -918,9 +933,13 @@ pub(crate) fn append_log_store_record(
     write_wire_frame_to_file(path, handle, record)?;
     let write_ns = elapsed_ns(write_started_at);
 
-    let sync_started_at = Instant::now();
-    sync_file_handle(path, handle)?;
-    Ok((write_ns, elapsed_ns(sync_started_at)))
+    if raft_group_log_record_requires_sync(record) {
+        let sync_started_at = Instant::now();
+        sync_file_handle(path, handle)?;
+        Ok((write_ns, elapsed_ns(sync_started_at)))
+    } else {
+        Ok((write_ns, 0))
+    }
 }
 
 pub(crate) fn write_wire_frame_to_file<T: Serialize + DeserializeOwned>(
@@ -950,6 +969,23 @@ pub(crate) fn raft_group_log_record_count(record: &RaftGroupLogRecord) -> usize 
         RaftGroupLogRecord::Append(entries) => entries.len(),
         _ => 1,
     }
+}
+
+/// Whether OpenRaft requires this record to reach stable storage before the
+/// storage method returns.
+///
+/// Committed and truncate markers are replay optimizations. Losing either in a
+/// crash leaves the durable entries intact and OpenRaft re-establishes the
+/// marker after restart. Append and vote durability are consensus safety
+/// requirements. Purge remains durable because online reclaim may physically
+/// discard the entries it covers.
+fn raft_group_log_record_requires_sync(record: &RaftGroupLogRecord) -> bool {
+    matches!(
+        record,
+        RaftGroupLogRecord::SaveVote(_)
+            | RaftGroupLogRecord::Append(_)
+            | RaftGroupLogRecord::Purge(_)
+    )
 }
 
 pub(crate) fn elapsed_ns(started_at: Instant) -> u64 {
@@ -1051,6 +1087,25 @@ mod tests {
 
     fn committed_vote() -> VoteOf<UrsulaRaftTypeConfig> {
         openraft::Vote::new_committed(7, 1)
+    }
+
+    #[test]
+    fn fsync_policy_keeps_only_replay_hints_best_effort() {
+        assert!(raft_group_log_record_requires_sync(
+            &RaftGroupLogRecord::SaveVote(committed_vote())
+        ));
+        assert!(raft_group_log_record_requires_sync(
+            &RaftGroupLogRecord::Append(vec![blank_entry(1)])
+        ));
+        assert!(raft_group_log_record_requires_sync(
+            &RaftGroupLogRecord::Purge(test_log_id(1))
+        ));
+        assert!(!raft_group_log_record_requires_sync(
+            &RaftGroupLogRecord::SaveCommitted(Some(test_log_id(1)))
+        ));
+        assert!(!raft_group_log_record_requires_sync(
+            &RaftGroupLogRecord::TruncateAfter(Some(test_log_id(1)))
+        ));
     }
 
     #[test]
