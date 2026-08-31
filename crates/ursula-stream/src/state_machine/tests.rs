@@ -2072,6 +2072,7 @@ fn snapshot_restore_rejects_invalid_entries() {
             next_cold_gc_seq: 0,
             shared_cold_object_owners: Vec::new(),
             buckets: vec!["benchcmp".to_owned(), "benchcmp".to_owned()],
+            erased_buckets: Vec::new(),
             streams: Vec::new(),
             bucket_usage: Vec::new(),
             bucket_quotas: Vec::new(),
@@ -2086,6 +2087,7 @@ fn snapshot_restore_rejects_invalid_entries() {
             next_cold_gc_seq: 0,
             shared_cold_object_owners: Vec::new(),
             buckets: vec!["benchcmp".to_owned()],
+            erased_buckets: Vec::new(),
             streams: vec![entry],
             bucket_usage: Vec::new(),
             bucket_quotas: Vec::new(),
@@ -3667,11 +3669,39 @@ fn purge_bucket_removes_streams_but_preserves_accounting_idempotently() {
             .into_iter()
             .all(|entry| entry.bucket_id != "benchcmp")
     );
-    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
+    let snapshot = machine.snapshot();
+    assert_eq!(snapshot.erased_buckets, vec!["benchcmp".to_owned()]);
+    let mut restored = StreamStateMachine::restore(snapshot).expect("restore snapshot");
     assert_eq!(bucket_usage(&restored, "benchcmp"), purged_usage);
     assert!(matches!(
         machine.apply(append_cmd(stream("orders"), b"x", Append::default())),
         StreamResponse::Error { .. }
+    ));
+    // Commands linearized after the purge can never recreate the namespace.
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateBucket {
+            bucket_id: "benchcmp".to_owned(),
+        }),
+        StreamResponse::Error {
+            code: StreamErrorCode::BucketErased,
+            ..
+        }
+    ));
+    assert!(matches!(
+        restored.apply(StreamCommand::CreateBucket {
+            bucket_id: "benchcmp".to_owned(),
+        }),
+        StreamResponse::Error {
+            code: StreamErrorCode::BucketErased,
+            ..
+        }
+    ));
+    assert!(matches!(
+        restored.apply(create_cmd(stream("after-restore"), Create::default())),
+        StreamResponse::Error {
+            code: StreamErrorCode::BucketErased,
+            ..
+        }
     ));
     // The other tenant is untouched.
     assert_eq!(bucket_usage(&machine, "other-tenant").stream_count, 1);

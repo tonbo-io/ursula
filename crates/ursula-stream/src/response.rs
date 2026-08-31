@@ -98,6 +98,8 @@ pub enum StreamErrorCode {
     InvalidBucketId,
     InvalidStreamId,
     BucketNotFound,
+    /// The bucket was permanently purged and its name is fenced from reuse.
+    BucketErased,
     BucketNotEmpty,
     StreamNotFound,
     StreamGone,

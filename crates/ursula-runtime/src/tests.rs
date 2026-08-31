@@ -1592,6 +1592,7 @@ async fn install_group_snapshot_rejects_mismatched_placement_before_routing() {
         group_commit_index: 0,
         stream_snapshot: StreamSnapshot {
             buckets: Vec::new(),
+            erased_buckets: Vec::new(),
             streams: Vec::new(),
             pending_cold_gc: Vec::new(),
             next_cold_gc_seq: 0,
@@ -4139,6 +4140,7 @@ impl GroupEngine for BlockingReadEngine {
                 group_commit_index: 0,
                 stream_snapshot: StreamSnapshot {
                     buckets: Vec::new(),
+                    erased_buckets: Vec::new(),
                     streams: Vec::new(),
                     pending_cold_gc: Vec::new(),
                     next_cold_gc_seq: 0,
@@ -4374,6 +4376,7 @@ impl GroupEngine for RecordingEngine {
                 group_commit_index: self.commit_index,
                 stream_snapshot: StreamSnapshot {
                     buckets: Vec::new(),
+                    erased_buckets: Vec::new(),
                     streams: Vec::new(),
                     pending_cold_gc: Vec::new(),
                     next_cold_gc_seq: 0,
