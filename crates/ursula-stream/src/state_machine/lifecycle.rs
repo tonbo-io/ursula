@@ -103,6 +103,8 @@ impl StreamStateMachine {
         StreamResponse::BucketPurged {
             bucket_id: bucket_id.to_owned(),
             removed_streams,
+            pending_cold_gc_entries: u64::try_from(self.pending_cold_gc_len_for_bucket(bucket_id))
+                .unwrap_or(u64::MAX),
         }
     }
 
@@ -587,10 +589,12 @@ impl StreamStateMachine {
         // Enqueue the whole prefix for the background GC worker to reclaim;
         // A prefix sweep is safe and keeps the queue O(streams), not O(chunks).
         if slot.cold.has_cold_objects() {
-            self.cold_gc
-                .enqueue(ColdGcTarget::Stream(stream_id.clone()));
+            self.cold_gc.enqueue(
+                stream_id.bucket_id.clone(),
+                ColdGcTarget::Stream(stream_id.clone()),
+            );
         }
-        self.release_shared_cold_objects(shared_paths, 0);
+        self.release_shared_cold_objects(&stream_id.bucket_id, shared_paths, 0);
         true
     }
 

@@ -2070,6 +2070,7 @@ fn snapshot_restore_rejects_invalid_entries() {
         StreamStateMachine::restore(StreamSnapshot {
             pending_cold_gc: Vec::new(),
             next_cold_gc_seq: 0,
+            shared_cold_object_owners: Vec::new(),
             buckets: vec!["benchcmp".to_owned(), "benchcmp".to_owned()],
             streams: Vec::new(),
             bucket_usage: Vec::new(),
@@ -2083,6 +2084,7 @@ fn snapshot_restore_rejects_invalid_entries() {
         StreamStateMachine::restore(StreamSnapshot {
             pending_cold_gc: Vec::new(),
             next_cold_gc_seq: 0,
+            shared_cold_object_owners: Vec::new(),
             buckets: vec!["benchcmp".to_owned()],
             streams: vec![entry],
             bucket_usage: Vec::new(),
@@ -3644,12 +3646,14 @@ fn purge_bucket_removes_streams_but_preserves_accounting_idempotently() {
     let StreamResponse::BucketPurged {
         bucket_id,
         removed_streams,
+        pending_cold_gc_entries,
     } = response
     else {
         panic!("expected BucketPurged, got {response:?}");
     };
     assert_eq!(bucket_id, "benchcmp");
     assert_eq!(removed_streams, 2);
+    assert_eq!(pending_cold_gc_entries, 0);
 
     // Content and the bucket are gone. The aggregate ledger remains with zero
     // gauges so an asynchronous meter cannot miss the committed writes.

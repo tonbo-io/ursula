@@ -478,6 +478,7 @@ pub struct AckColdGcResponse {
 pub struct PurgeBucketResponse {
     pub placement: ShardPlacement,
     pub removed_streams: u64,
+    pub pending_cold_gc_entries: u64,
     pub group_commit_index: u64,
 }
 

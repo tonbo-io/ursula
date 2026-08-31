@@ -97,6 +97,13 @@ use crate::rt::sync::oneshot;
 use crate::rt::time::Instant;
 use crate::trace::Traced;
 
+fn is_legacy_cross_bucket_pack(stream_id: &BucketStreamId, chunk: &ColdChunkRef) -> bool {
+    chunk.shared_object
+        && !chunk
+            .s3_path
+            .starts_with(&format!("{}/_packs/", stream_id.bucket_id))
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub core_count: usize,
@@ -174,6 +181,14 @@ pub struct ShardRuntime {
 pub struct PurgeBucketReport {
     pub removed_streams: u64,
     pub groups_with_streams: Vec<usize>,
+    pub pending_cold_gc_entries: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LegacySharedMigrationReport {
+    pub observed_chunks: usize,
+    pub migrated_chunks: usize,
+    pub pending_chunks: usize,
 }
 
 impl ShardRuntime {
@@ -403,11 +418,29 @@ impl ShardRuntime {
         &self,
         candidates: Vec<ColdFlushCandidate>,
     ) -> Result<Vec<FlushColdResponse>, RuntimeError> {
-        if candidates.len() > 1 {
-            return self.flush_cold_candidates_pack(candidates).await;
-        }
-        let mut responses = Vec::with_capacity(candidates.len());
+        // A bucket is the physical erasure domain. Keep encounter order while
+        // partitioning one Raft group's flush plan so no pack can retain bytes
+        // for a deleted bucket merely because another bucket is still live.
+        let mut bucket_batches: Vec<Vec<ColdFlushCandidate>> = Vec::new();
         for candidate in candidates {
+            if let Some(batch) = bucket_batches.iter_mut().find(|batch| {
+                batch
+                    .first()
+                    .is_some_and(|first| first.stream_id.bucket_id == candidate.stream_id.bucket_id)
+            }) {
+                batch.push(candidate);
+            } else {
+                bucket_batches.push(vec![candidate]);
+            }
+        }
+
+        let mut responses = Vec::new();
+        for mut batch in bucket_batches {
+            if batch.len() > 1 {
+                responses.extend(self.flush_cold_candidates_pack(batch).await?);
+                continue;
+            }
+            let candidate = batch.pop().expect("single-candidate batch");
             match self.flush_cold_candidate(candidate).await {
                 Ok(response) => responses.push(response),
                 Err(err) if is_stale_cold_flush_candidate_error(&err) => {}
@@ -438,6 +471,15 @@ impl ShardRuntime {
                 message: "packed cold flush candidates must belong to one Raft group".to_owned(),
             });
         }
+        if candidates
+            .iter()
+            .any(|candidate| candidate.stream_id.bucket_id != first.stream_id.bucket_id)
+        {
+            return Err(RuntimeError::ColdStoreConfig {
+                message: "packed cold flush candidates must belong to one bucket erasure domain"
+                    .to_owned(),
+            });
+        }
         let payload_len = candidates.iter().try_fold(0usize, |total, candidate| {
             total.checked_add(candidate.payload.len())
         });
@@ -452,7 +494,7 @@ impl ShardRuntime {
             object_offsets.push(u64::try_from(payload.len()).expect("pack offset fits u64"));
             payload.extend_from_slice(&candidate.payload);
         }
-        let path = new_cold_pack_path(placement.raft_group_id.0);
+        let path = new_cold_pack_path(&first.stream_id.bucket_id, placement.raft_group_id.0);
         let upload_started_at = Instant::now();
         let object_size = match cold_store.write_chunk(&path, &payload).await {
             Ok(object_size) => object_size,
@@ -550,6 +592,9 @@ impl ShardRuntime {
             report.removed_streams = report
                 .removed_streams
                 .saturating_add(response.removed_streams);
+            report.pending_cold_gc_entries = report
+                .pending_cold_gc_entries
+                .saturating_add(response.pending_cold_gc_entries);
         }
         Ok(report)
     }
@@ -739,7 +784,9 @@ impl ShardRuntime {
             };
             let total_bytes = old_chunks
                 .iter()
-                .try_fold(0_u64, |total, chunk| total.checked_add(chunk.object_size))
+                .try_fold(0_u64, |total, chunk| {
+                    total.checked_add(chunk.end_offset.saturating_sub(chunk.start_offset))
+                })
                 .ok_or_else(|| RuntimeError::ColdStoreIo {
                     message: "cold compaction byte count overflow".to_owned(),
                 })?;
@@ -748,8 +795,8 @@ impl ShardRuntime {
             })?;
             let mut payload = Vec::with_capacity(capacity);
             for chunk in &old_chunks {
-                let len =
-                    usize::try_from(chunk.object_size).map_err(|_| RuntimeError::ColdStoreIo {
+                let len = usize::try_from(chunk.end_offset.saturating_sub(chunk.start_offset))
+                    .map_err(|_| RuntimeError::ColdStoreIo {
                         message: "cold chunk exceeds addressable memory".to_owned(),
                     })?;
                 let bytes = cold_store
@@ -816,6 +863,95 @@ impl ShardRuntime {
             compacted += 1;
         }
         Ok(compacted)
+    }
+
+    /// Rewrites a bounded number of pre-erasure-domain shared pack slices as
+    /// stream-exclusive objects. Each replacement is published through the
+    /// same group mutation and cold-index rollback contract as compaction.
+    pub async fn migrate_legacy_shared_cold_once(
+        &self,
+        max_chunks: usize,
+        gc_grace_ms: u64,
+    ) -> Result<LegacySharedMigrationReport, RuntimeError> {
+        let Some(cold_store) = self.cold_store.as_ref() else {
+            return Ok(LegacySharedMigrationReport::default());
+        };
+        let mut candidates = Vec::new();
+        for group_id in 0..self.shard_map.raft_group_count() {
+            let snapshot = self.snapshot_group(RaftGroupId(group_id)).await?;
+            for stream in snapshot.stream_snapshot.streams {
+                let stream_id = stream.metadata.stream_id;
+                for chunk in stream.cold_chunks {
+                    if is_legacy_cross_bucket_pack(&stream_id, &chunk) {
+                        candidates.push((stream_id.clone(), chunk));
+                    }
+                }
+            }
+        }
+        candidates.sort_by(|left, right| {
+            left.0
+                .bucket_id
+                .cmp(&right.0.bucket_id)
+                .then_with(|| left.0.affinity_key.cmp(&right.0.affinity_key))
+                .then_with(|| left.0.stream_id.cmp(&right.0.stream_id))
+                .then_with(|| left.1.start_offset.cmp(&right.1.start_offset))
+        });
+
+        let observed_chunks = candidates.len();
+        let mut migrated_chunks = 0usize;
+        for (stream_id, chunk) in candidates.into_iter().take(max_chunks) {
+            let logical_bytes = chunk.end_offset.saturating_sub(chunk.start_offset);
+            let len = usize::try_from(logical_bytes).map_err(|_| RuntimeError::ColdStoreIo {
+                message: "legacy shared chunk exceeds addressable memory".to_owned(),
+            })?;
+            let payload = cold_store
+                .read_chunk_range(&chunk, chunk.start_offset, len)
+                .await
+                .map_err(|err| RuntimeError::ColdStoreIo {
+                    message: err.to_string(),
+                })?;
+            let path = new_cold_chunk_path(&stream_id, chunk.start_offset, chunk.end_offset);
+            let object_size = cold_store
+                .write_chunk(&path, &payload)
+                .await
+                .map_err(|err| RuntimeError::ColdStoreIo {
+                    message: err.to_string(),
+                })?;
+            let replacement = ColdChunkRef {
+                start_offset: chunk.start_offset,
+                end_offset: chunk.end_offset,
+                object_size,
+                s3_path: path.clone(),
+                object_offset: 0,
+                shared_object: false,
+                payload_digest: blake3::hash(&payload).to_hex().to_string(),
+            };
+            if let Err(err) = self
+                .compact_cold(CompactColdRequest {
+                    stream_id: stream_id.clone(),
+                    old_chunks: vec![chunk],
+                    replacement,
+                    gc_not_before_ms: unix_time_ms().saturating_add(gc_grace_ms),
+                })
+                .await
+            {
+                if let Err(cleanup_err) = cold_store.delete_chunk(&path).await {
+                    tracing::warn!(
+                        stream = %stream_id,
+                        path,
+                        error = %cleanup_err,
+                        "failed to remove unpublished legacy pack replacement"
+                    );
+                }
+                return Err(err);
+            }
+            migrated_chunks = migrated_chunks.saturating_add(1);
+        }
+        Ok(LegacySharedMigrationReport {
+            observed_chunks,
+            migrated_chunks,
+            pending_chunks: observed_chunks.saturating_sub(migrated_chunks),
+        })
     }
 
     /// Drains the leader-side cold-GC queue for one group: physically reclaims

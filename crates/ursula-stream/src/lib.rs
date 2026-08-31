@@ -61,6 +61,7 @@ pub use record_index::is_json_record_content_type;
 pub use response::StreamErrorCode;
 pub use response::StreamErrorContext;
 pub use response::StreamResponse;
+pub use snapshot::SharedColdObjectOwnersSnapshot;
 pub use snapshot::StreamSnapshot;
 pub use snapshot::StreamSnapshotEntry;
 pub use snapshot::StreamSnapshotError;

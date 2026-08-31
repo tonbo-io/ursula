@@ -505,7 +505,7 @@ impl StreamStateMachine {
         slot.cold.push_cold_chunk(chunk.clone());
         self.remove_hot_payload_bytes(hot_bytes_before.saturating_sub(hot_bytes_after));
         if let Some(path) = shared_path {
-            self.retain_shared_cold_object(&path);
+            self.retain_shared_cold_object(&path, &stream_id.bucket_id);
         }
         self.compact_message_records_before(
             &stream_id,
@@ -533,10 +533,12 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             );
         }
-        if old_chunks.len() < 2 {
+        if old_chunks.is_empty()
+            || (old_chunks.len() < 2 && old_chunks.iter().all(|chunk| !chunk.shared_object))
+        {
             return StreamResponse::error(
                 StreamErrorCode::InvalidColdFlush,
-                "cold compaction requires at least two input chunks",
+                "cold compaction requires two raw chunks or one legacy shared chunk",
             );
         }
         if replacement.s3_path.trim().is_empty() || replacement.object_size == 0 {
@@ -545,14 +547,25 @@ impl StreamStateMachine {
                 "cold compaction replacement must name a non-empty object",
             );
         }
+        let rewriting_shared = old_chunks.iter().all(|chunk| chunk.shared_object);
+        if old_chunks.iter().any(|chunk| chunk.shared_object) != rewriting_shared
+            || replacement.shared_object
+            || replacement.object_offset != 0
+        {
+            return StreamResponse::error(
+                StreamErrorCode::InvalidColdFlush,
+                "cold compaction cannot mix shared and raw inputs or publish a shared replacement",
+            );
+        }
         let mut expected_start = old_chunks
             .first()
             .map_or(replacement.start_offset, |chunk| chunk.start_offset);
         let mut compacted_bytes = 0_u64;
         for chunk in &old_chunks {
+            let logical_bytes = chunk.end_offset.saturating_sub(chunk.start_offset);
             if chunk.start_offset != expected_start
                 || chunk.end_offset <= chunk.start_offset
-                || chunk.object_size != chunk.end_offset.saturating_sub(chunk.start_offset)
+                || (!chunk.shared_object && chunk.object_size != logical_bytes)
             {
                 return StreamResponse::error(
                     StreamErrorCode::InvalidColdFlush,
@@ -560,7 +573,7 @@ impl StreamStateMachine {
                 );
             }
             expected_start = chunk.end_offset;
-            compacted_bytes = compacted_bytes.saturating_add(chunk.object_size);
+            compacted_bytes = compacted_bytes.saturating_add(logical_bytes);
         }
         let first = old_chunks
             .first()
@@ -574,13 +587,35 @@ impl StreamStateMachine {
                 "cold compaction replacement must cover the exact input range",
             );
         }
-        let old_paths = old_chunks
-            .into_iter()
-            .map(|chunk| chunk.s3_path)
-            .collect::<Vec<_>>();
-        let compacted_chunks = u64::try_from(old_paths.len()).expect("chunk count fits u64");
-        self.cold_gc
-            .enqueue_after(ColdGcTarget::Paths(old_paths), gc_not_before_ms);
+        if rewriting_shared {
+            let slot = self
+                .stream_slot_mut(&stream_id)
+                .expect("stream existence checked before cold compaction");
+            if !slot.cold.remove_shared_chunks(&old_chunks) {
+                return StreamResponse::error(
+                    StreamErrorCode::InvalidColdFlush,
+                    "legacy shared compaction input no longer matches the stream state",
+                );
+            }
+        }
+        let compacted_chunks = u64::try_from(old_chunks.len()).expect("chunk count fits u64");
+        let mut exclusive_paths = Vec::new();
+        let mut shared_paths = Vec::new();
+        for chunk in old_chunks {
+            if chunk.shared_object {
+                shared_paths.push(chunk.s3_path);
+            } else {
+                exclusive_paths.push(chunk.s3_path);
+            }
+        }
+        if !exclusive_paths.is_empty() {
+            self.cold_gc.enqueue_after(
+                stream_id.bucket_id.clone(),
+                ColdGcTarget::Paths(exclusive_paths),
+                gc_not_before_ms,
+            );
+        }
+        self.release_shared_cold_objects(&stream_id.bucket_id, shared_paths, gc_not_before_ms);
         StreamResponse::ColdCompacted {
             compacted_chunks,
             compacted_bytes,
@@ -620,6 +655,10 @@ impl StreamStateMachine {
 
     pub fn pending_cold_gc_len(&self) -> usize {
         self.cold_gc.len()
+    }
+
+    pub fn pending_cold_gc_len_for_bucket(&self, bucket_id: &str) -> usize {
+        self.cold_gc.len_for_bucket(bucket_id)
     }
 
     pub(super) fn earliest_retained_offset(&self, stream_id: &BucketStreamId) -> u64 {
@@ -664,7 +703,7 @@ impl StreamStateMachine {
         slot.record_index = retained_record_index;
         slot.integrity.evict_before(retained_offset);
         let dropped_cold_paths = slot.cold.compact_before(retained_offset);
-        self.release_shared_cold_objects(dropped_cold_paths, 0);
+        self.release_shared_cold_objects(&stream_id.bucket_id, dropped_cold_paths, 0);
 
         let slot = self
             .stream_slot_mut(stream_id)

@@ -177,6 +177,9 @@ pub type ExternalPayloadRef = ExternalPayloadRefV1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColdGcEntry {
     pub seq: u64,
+    /// Bucket-scoped erasure domain owning every byte referenced by `target`.
+    /// Physical packs never cross this boundary.
+    pub bucket_id: String,
     /// Earliest wall-clock timestamp at which the physical object may be
     /// reclaimed. Zero preserves the immediate behavior of legacy entries.
     #[serde(default)]

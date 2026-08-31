@@ -26,19 +26,25 @@ impl ColdGcQueue {
     }
 
     /// Append a reclamation target, stamping it with the next sequence number.
-    pub(super) fn enqueue(&mut self, target: ColdGcTarget) {
-        self.enqueue_after(target, 0);
+    pub(super) fn enqueue(&mut self, bucket_id: String, target: ColdGcTarget) {
+        self.enqueue_after(bucket_id, target, 0);
     }
 
     /// Append a reclamation target that must remain readable until the given
     /// wall-clock timestamp. Cold-object compaction uses this grace period so
     /// a lagging replica can apply the replacement and invalidate its cached
     /// cold-index page before the old objects disappear.
-    pub(super) fn enqueue_after(&mut self, target: ColdGcTarget, not_before_ms: u64) {
+    pub(super) fn enqueue_after(
+        &mut self,
+        bucket_id: String,
+        target: ColdGcTarget,
+        not_before_ms: u64,
+    ) {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         self.pending.push_back(ColdGcEntry {
             seq,
+            bucket_id,
             not_before_ms,
             target,
         });
@@ -66,6 +72,16 @@ impl ColdGcQueue {
         self.pending.len()
     }
 
+    pub(super) fn len_for_bucket(&self, bucket_id: &str) -> usize {
+        self.pending
+            .iter()
+            // Snapshots written before bucket-scoped proof have no owner.
+            // Treat that unknown debt as relevant to every bucket until GC
+            // drains it; guessing an owner could produce a false absence proof.
+            .filter(|entry| entry.bucket_id.is_empty() || entry.bucket_id == bucket_id)
+            .count()
+    }
+
     /// Persist-side view of every pending entry, in queue order.
     pub(super) fn entries(&self) -> impl Iterator<Item = &ColdGcEntry> {
         self.pending.iter()
@@ -73,5 +89,25 @@ impl ColdGcQueue {
 
     pub(super) fn next_seq(&self) -> u64 {
         self.next_seq
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_unattributed_gc_debt_blocks_every_bucket_proof() {
+        let queue = ColdGcQueue::from_parts(
+            vec![ColdGcEntry {
+                seq: 7,
+                bucket_id: String::new(),
+                not_before_ms: 0,
+                target: ColdGcTarget::Paths(vec!["_packs/legacy.bin".to_owned()]),
+            }],
+            8,
+        );
+        assert_eq!(queue.len_for_bucket("bucket-a"), 1);
+        assert_eq!(queue.len_for_bucket("bucket-b"), 1);
     }
 }

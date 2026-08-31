@@ -73,6 +73,13 @@ impl StreamColdState {
             .map(|chunk| chunk.s3_path.as_str())
     }
 
+    pub(super) fn remove_shared_chunks(&mut self, old_chunks: &[ColdChunkRef]) -> bool {
+        let before = self.cold_chunks.len();
+        self.cold_chunks
+            .retain(|chunk| !old_chunks.iter().any(|old| old == chunk));
+        before.saturating_sub(self.cold_chunks.len()) == old_chunks.len()
+    }
+
     pub(super) fn cold_frontier_offset(&self, retained_offset: u64) -> u64 {
         let external_segments = self.external_segments();
         let cold_frontier = self.cold_frontier.max(retained_offset);

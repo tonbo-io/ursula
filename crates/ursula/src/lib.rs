@@ -1457,6 +1457,38 @@ pub(crate) async fn purge_bucket(
     State(state): State<HttpState>,
     Path(bucket): Path<String>,
 ) -> Response {
+    // Packs written before bucket erasure domains may contain several
+    // tenants. Rewrite a bounded number of their live slices on every retry
+    // and do not remove the target bucket until the global legacy debt reaches
+    // zero. Control retries this idempotent request, so large migrations
+    // converge without exceeding its claim lease. This compatibility pass may
+    // be removed only after every supported snapshot has zero shared chunks
+    // outside `{bucket}/_packs/` and the oldest deployable writer uses the
+    // bucket-scoped pack path.
+    let legacy = match state
+        .runtime
+        .migrate_legacy_shared_cold_once(LEGACY_SHARED_MIGRATION_MAX_CHUNKS, 0)
+        .await
+    {
+        Ok(report) => report,
+        Err(err) => {
+            let target = format!("/__ursula/purge/{bucket}");
+            return runtime_error_or_leader_redirect_async(&state, err, &target).await;
+        }
+    };
+    if legacy.pending_chunks > 0 {
+        return axum::Json(serde_json::json!({
+            "bucket": bucket,
+            "removed_streams": 0,
+            "groups_with_streams": [],
+            "cold_gc_entries_reclaimed": 0,
+            "cold_gc_pending_entries": legacy.pending_chunks,
+            "cold_gc_complete": false,
+            "cold_gc_error": null,
+            "legacy_shared_chunks_pending": legacy.pending_chunks,
+        }))
+        .into_response();
+    }
     let report = match state.runtime.purge_bucket_all_groups(&bucket).await {
         Ok(report) => report,
         Err(err) => {
@@ -1467,31 +1499,47 @@ pub(crate) async fn purge_bucket(
     // Reclaim the just-enqueued cold prefixes now instead of waiting for the
     // background worker's next pass. Failures leave entries queued for the
     // worker; the purge itself is already durable.
-    let cold_gc_reclaimed = match state
+    let (cold_gc_reclaimed, cold_gc_error) = match state
         .runtime
         .run_cold_gc_all_groups_once(COLD_GC_PURGE_BATCH_MAX_ENTRIES)
         .await
     {
-        Ok(reclaimed) => reclaimed,
+        Ok(reclaimed) => (reclaimed, None),
         Err(err) => {
             tracing::warn!(
                 bucket = %bucket,
                 error = %err,
                 "cold GC pass after purge failed; background worker will finish reclamation"
             );
-            0
+            (0, Some(err.to_string()))
         }
     };
+    // A second idempotent purge is a linearized read of every group's durable
+    // queue after reclamation. The number reclaimed by one pass is only
+    // diagnostic: delayed entries, a partial failure, or another leader's
+    // background worker can all make it zero without proving cold absence.
+    let proof = match state.runtime.purge_bucket_all_groups(&bucket).await {
+        Ok(report) => report,
+        Err(err) => {
+            let target = format!("/__ursula/purge/{bucket}");
+            return runtime_error_or_leader_redirect_async(&state, err, &target).await;
+        }
+    };
+    let cold_gc_complete = proof.pending_cold_gc_entries == 0 && cold_gc_error.is_none();
     axum::Json(serde_json::json!({
         "bucket": bucket,
         "removed_streams": report.removed_streams,
         "groups_with_streams": report.groups_with_streams,
         "cold_gc_entries_reclaimed": cold_gc_reclaimed,
+        "cold_gc_pending_entries": proof.pending_cold_gc_entries,
+        "cold_gc_complete": cold_gc_complete,
+        "cold_gc_error": cold_gc_error,
     }))
     .into_response()
 }
 
 const COLD_GC_PURGE_BATCH_MAX_ENTRIES: usize = 4096;
+const LEGACY_SHARED_MIGRATION_MAX_CHUNKS: usize = 32;
 
 pub(crate) async fn create_bucket(Path(_bucket): Path<String>) -> Response {
     StatusCode::CREATED.into_response()

@@ -24,6 +24,10 @@ pub struct StreamSnapshot {
     pub pending_cold_gc: Vec<ColdGcEntry>,
     #[serde(default)]
     pub next_cold_gc_seq: u64,
+    /// Bucket erasure owners retained until a shared physical object is
+    /// deleted. Absent in snapshots written before bucket-scoped proof.
+    #[serde(default)]
+    pub shared_cold_object_owners: Vec<SharedColdObjectOwnersSnapshot>,
     /// Monotonic per-bucket usage counters. Absent in legacy snapshots, in
     /// which case the monotonic counters restart from the restored gauges.
     #[serde(default)]
@@ -31,6 +35,12 @@ pub struct StreamSnapshot {
     /// Per-bucket data-plane quota records. Absent in legacy snapshots.
     #[serde(default)]
     pub bucket_quotas: Vec<BucketQuotaSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedColdObjectOwnersSnapshot {
+    pub s3_path: String,
+    pub bucket_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

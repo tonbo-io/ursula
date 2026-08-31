@@ -19,6 +19,7 @@ use ursula_stream::ObjectPayloadRef;
 use ursula_stream::ProducerAppendRecord;
 use ursula_stream::ProducerReceipt;
 use ursula_stream::ProducerSnapshot;
+use ursula_stream::SharedColdObjectOwnersSnapshot;
 use ursula_stream::StreamAttrs;
 use ursula_stream::StreamIntegritySnapshot;
 use ursula_stream::StreamMessageRecord;
@@ -101,6 +102,14 @@ pub(crate) fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, Snaps
             streams,
             pending_cold_gc,
             next_cold_gc_seq: header.next_cold_gc_seq,
+            shared_cold_object_owners: header
+                .shared_cold_object_owners
+                .into_iter()
+                .map(|record| SharedColdObjectOwnersSnapshot {
+                    s3_path: record.s3_path,
+                    bucket_ids: record.bucket_ids,
+                })
+                .collect(),
             bucket_usage: header
                 .bucket_usage
                 .into_iter()
@@ -179,6 +188,7 @@ impl GroupSnapshotFrameIter {
             streams,
             pending_cold_gc,
             next_cold_gc_seq,
+            shared_cold_object_owners,
             bucket_usage,
             bucket_quotas,
         } = stream_snapshot;
@@ -188,6 +198,13 @@ impl GroupSnapshotFrameIter {
                 group_commit_index,
                 buckets,
                 next_cold_gc_seq,
+                shared_cold_object_owners: shared_cold_object_owners
+                    .into_iter()
+                    .map(|record| proto::SharedColdObjectOwnersV1 {
+                        s3_path: record.s3_path,
+                        bucket_ids: record.bucket_ids,
+                    })
+                    .collect(),
                 bucket_usage: bucket_usage
                     .into_iter()
                     .map(bucket_usage_to_proto)
@@ -624,6 +641,7 @@ fn append_count_from_proto(
 fn cold_gc_to_proto(entry: ColdGcEntry) -> proto::ColdGcEntryV1 {
     proto::ColdGcEntryV1 {
         seq: entry.seq,
+        bucket_id: entry.bucket_id,
         not_before_ms: entry.not_before_ms,
         target: Some(match entry.target {
             ColdGcTarget::Stream(stream_id) => {
@@ -639,6 +657,7 @@ fn cold_gc_to_proto(entry: ColdGcEntry) -> proto::ColdGcEntryV1 {
 fn cold_gc_from_proto(entry: proto::ColdGcEntryV1) -> Result<ColdGcEntry, SnapshotStoreError> {
     Ok(ColdGcEntry {
         seq: entry.seq,
+        bucket_id: entry.bucket_id,
         not_before_ms: entry.not_before_ms,
         target: match required(entry.target, "snapshot cold gc target")? {
             proto::cold_gc_entry_v1::Target::Stream(stream_id) => {
@@ -683,6 +702,10 @@ mod tests {
                 streams: Vec::new(),
                 pending_cold_gc: Vec::new(),
                 next_cold_gc_seq: 9,
+                shared_cold_object_owners: vec![SharedColdObjectOwnersSnapshot {
+                    s3_path: "_packs/legacy.bin".to_owned(),
+                    bucket_ids: vec!["bucket".to_owned(), "other-bucket".to_owned()],
+                }],
                 bucket_usage: vec![ursula_stream::BucketUsageSnapshot {
                     bucket_id: "bucket".to_owned(),
                     usage: ursula_stream::BucketUsage {
@@ -735,6 +758,7 @@ mod tests {
                     group_commit_index: 0,
                     buckets: Vec::new(),
                     next_cold_gc_seq: 0,
+                    shared_cold_object_owners: Vec::new(),
                     bucket_usage: Vec::new(),
                     bucket_quotas: Vec::new(),
                     committed_write_unit_bytes: None,
@@ -760,6 +784,7 @@ mod tests {
             group_commit_index: 0,
             buckets: Vec::new(),
             next_cold_gc_seq: 0,
+            shared_cold_object_owners: Vec::new(),
             bucket_usage: Vec::new(),
             bucket_quotas: Vec::new(),
             committed_write_unit_bytes: Some(4096),
