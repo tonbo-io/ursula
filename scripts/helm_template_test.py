@@ -477,7 +477,10 @@ class HelmTemplateConfigTest(unittest.TestCase):
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("/indexer/workers/leaseMs", result.stderr)
+        self.assertRegex(
+            result.stderr,
+            r"(?:/indexer/workers/leaseMs|indexer\.workers\.leaseMs)",
+        )
 
 
 if __name__ == "__main__":
