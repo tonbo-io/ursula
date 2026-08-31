@@ -6806,7 +6806,7 @@ async fn purge_endpoint_erases_one_tenant_and_leaves_the_other_intact() {
     assert_eq!(rerun["cold_gc_pending_entries"], 0);
     assert_eq!(rerun["cold_gc_complete"], true);
 
-    // The tenant can be recreated cleanly after a purge.
+    // The durable erasure fence permanently rejects namespace reuse.
     let response = http_put(
         &app,
         "/tenant-a/orders",
@@ -6814,7 +6814,80 @@ async fn purge_endpoint_erases_one_tenant_and_leaves_the_other_intact() {
         Body::from(r#"{"who":"a2"}"#),
     )
     .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn purge_erases_external_payloads_and_uncommitted_stage_orphans() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        RuntimeConfig::new(1, 1),
+        InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
+        Some(cold_store.clone()),
+    )
+    .expect("runtime");
+    let app = router(runtime);
+    let payload = vec![b'x'; 1024 * 1024 + 1];
+    let response = http_put(
+        &app,
+        "/external-tenant/large",
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::from(payload.clone()),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::CREATED);
+    let response = http_get(&app, "/external-tenant/large?offset=0&max_bytes=1048577").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await.len(), payload.len());
+
+    // Simulates a process crash after S3 staging and before the Raft command:
+    // no stream state references this object, so only bucket-domain erasure
+    // can discover and remove it.
+    cold_store
+        .write_chunk(
+            "external-tenant/orphan/external/staged-before-commit.bin",
+            b"orphan",
+        )
+        .await
+        .expect("stage orphan");
+    cold_store
+        .write_chunk("surviving-tenant/keep/external/object.bin", b"keep")
+        .await
+        .expect("write other tenant object");
+    assert!(
+        !cold_store
+            .prefix_is_empty("external-tenant/")
+            .await
+            .expect("list tenant prefix")
+    );
+
+    let response = http_delete(&app, "/__ursula/purge/external-tenant").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let report: serde_json::Value =
+        serde_json::from_slice(&body_bytes(response).await).expect("purge report");
+    assert_eq!(report["cold_gc_complete"], true);
+    assert_eq!(report["bucket_prefix_absent"], true);
+    assert!(
+        cold_store
+            .prefix_is_empty("external-tenant/")
+            .await
+            .expect("prove tenant prefix absent")
+    );
+    assert!(
+        !cold_store
+            .prefix_is_empty("surviving-tenant/")
+            .await
+            .expect("list surviving tenant")
+    );
+
+    let response = http_put(
+        &app,
+        "/external-tenant/recreated",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("blocked"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 // #134 data-plane half: per-bucket quota backstops enforced over HTTP.

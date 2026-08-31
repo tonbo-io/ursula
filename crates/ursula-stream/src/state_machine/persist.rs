@@ -43,6 +43,8 @@ impl StreamStateMachine {
     pub fn snapshot(&self) -> StreamSnapshot {
         let mut buckets = self.buckets.iter().cloned().collect::<Vec<_>>();
         buckets.sort();
+        let mut erased_buckets = self.erased_buckets.iter().cloned().collect::<Vec<_>>();
+        erased_buckets.sort();
 
         let mut streams = self
             .registry
@@ -98,6 +100,7 @@ impl StreamStateMachine {
 
         StreamSnapshot {
             buckets,
+            erased_buckets,
             streams,
             pending_cold_gc: self.cold_gc.entries().cloned().collect(),
             next_cold_gc_seq: self.cold_gc.next_seq(),
@@ -114,7 +117,8 @@ impl StreamStateMachine {
     /// [`StreamErrorCode::ImportConflict`] and an invalid payload with
     /// [`StreamErrorCode::ImportInvalid`].
     pub(crate) fn import_snapshot(&mut self, snapshot: StreamSnapshot) -> StreamResponse {
-        if !self.buckets.is_empty() || !self.registry.is_empty() {
+        if !self.buckets.is_empty() || !self.erased_buckets.is_empty() || !self.registry.is_empty()
+        {
             return StreamResponse::error(
                 StreamErrorCode::ImportConflict,
                 format!(
@@ -139,9 +143,19 @@ impl StreamStateMachine {
 
     pub fn restore(snapshot: StreamSnapshot) -> Result<Self, StreamSnapshotError> {
         let mut machine = Self::default();
-        for bucket_id in snapshot.buckets {
+        for bucket_id in &snapshot.buckets {
             if !machine.buckets.insert(bucket_id.clone()) {
-                return Err(StreamSnapshotError::DuplicateBucket(bucket_id));
+                return Err(StreamSnapshotError::DuplicateBucket(bucket_id.clone()));
+            }
+        }
+        for bucket_id in &snapshot.erased_buckets {
+            if machine.buckets.contains(bucket_id) {
+                return Err(StreamSnapshotError::ActiveBucketErased(bucket_id.clone()));
+            }
+            if !machine.erased_buckets.insert(bucket_id.clone()) {
+                return Err(StreamSnapshotError::DuplicateErasedBucket(
+                    bucket_id.clone(),
+                ));
             }
         }
 

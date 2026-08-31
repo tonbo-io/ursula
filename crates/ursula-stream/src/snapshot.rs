@@ -19,6 +19,9 @@ use crate::record_index::StreamRecordIndex;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamSnapshot {
     pub buckets: Vec<String>,
+    /// Permanent bucket-erasure fences. Absent in legacy snapshots.
+    #[serde(default)]
+    pub erased_buckets: Vec<String>,
     pub streams: Vec<StreamSnapshotEntry>,
     #[serde(default)]
     pub pending_cold_gc: Vec<ColdGcEntry>,
@@ -73,6 +76,10 @@ pub struct StreamSnapshotEntry {
 pub enum StreamSnapshotError {
     #[error("snapshot contains duplicate bucket '{0}'")]
     DuplicateBucket(String),
+    #[error("snapshot contains duplicate erased bucket '{0}'")]
+    DuplicateErasedBucket(String),
+    #[error("snapshot bucket '{0}' is both active and erased")]
+    ActiveBucketErased(String),
     #[error("snapshot contains duplicate stream '{0}'")]
     DuplicateStream(BucketStreamId),
     #[error("snapshot stream '{stream_id}' contains duplicate producer '{producer_id}'")]

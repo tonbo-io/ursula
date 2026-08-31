@@ -640,6 +640,28 @@ impl ColdStore {
         Ok(())
     }
 
+    /// Proves that the object store has no file below `path`. Tenant purge
+    /// uses this after recursive deletion; a successful delete request alone
+    /// is not physical-absence evidence.
+    pub async fn prefix_is_empty(&self, path: &str) -> io::Result<bool> {
+        let mut lister = self
+            .operator
+            .lister_with(path)
+            .recursive(true)
+            .await
+            .map_err(|err| cold_store_io_error(path, err))?;
+        while let Some(entry) = lister
+            .try_next()
+            .await
+            .map_err(|err| cold_store_io_error(path, err))?
+        {
+            if entry.metadata().mode() == EntryMode::FILE {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub async fn read_chunk_range(
         &self,
         chunk: &ColdChunkRef,
@@ -1307,6 +1329,12 @@ pub fn new_cold_pack_path(bucket_id: &str, raft_group_id: u32) -> String {
     let unix_nanos = cold_object_unix_nanos();
     let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("{bucket_id}/_packs/{raft_group_id:08x}/{unix_nanos:032x}-{sequence:016x}.bin")
+}
+
+/// The physical erasure domain for one tenant bucket. Every current chunk,
+/// index, pack, and external payload path is nested below this prefix.
+pub fn cold_bucket_prefix(bucket_id: &str) -> String {
+    format!("{bucket_id}/")
 }
 
 /// The prefix under which all of a stream's cold chunks live. Cold objects are

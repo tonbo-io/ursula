@@ -99,6 +99,7 @@ pub(crate) fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, Snaps
         group_commit_index: header.group_commit_index,
         stream_snapshot: StreamSnapshot {
             buckets: header.buckets,
+            erased_buckets: header.erased_buckets,
             streams,
             pending_cold_gc,
             next_cold_gc_seq: header.next_cold_gc_seq,
@@ -185,6 +186,7 @@ impl GroupSnapshotFrameIter {
         } = snapshot;
         let StreamSnapshot {
             buckets,
+            erased_buckets,
             streams,
             pending_cold_gc,
             next_cold_gc_seq,
@@ -197,6 +199,7 @@ impl GroupSnapshotFrameIter {
                 placement: Some(placement_to_proto(placement)),
                 group_commit_index,
                 buckets,
+                erased_buckets,
                 next_cold_gc_seq,
                 shared_cold_object_owners: shared_cold_object_owners
                     .into_iter()
@@ -699,6 +702,7 @@ mod tests {
             group_commit_index: 42,
             stream_snapshot: StreamSnapshot {
                 buckets: vec!["bucket".to_owned()],
+                erased_buckets: vec!["erased-bucket".to_owned()],
                 streams: Vec::new(),
                 pending_cold_gc: Vec::new(),
                 next_cold_gc_seq: 9,
@@ -757,6 +761,7 @@ mod tests {
                     })),
                     group_commit_index: 0,
                     buckets: Vec::new(),
+                    erased_buckets: Vec::new(),
                     next_cold_gc_seq: 0,
                     shared_cold_object_owners: Vec::new(),
                     bucket_usage: Vec::new(),
@@ -783,6 +788,7 @@ mod tests {
             })),
             group_commit_index: 0,
             buckets: Vec::new(),
+            erased_buckets: Vec::new(),
             next_cold_gc_seq: 0,
             shared_cold_object_owners: Vec::new(),
             bucket_usage: Vec::new(),

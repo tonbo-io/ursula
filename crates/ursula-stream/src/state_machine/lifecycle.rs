@@ -37,6 +37,12 @@ impl StreamStateMachine {
         if let Err(message) = validate_bucket_id(&bucket_id) {
             return StreamResponse::error(StreamErrorCode::InvalidBucketId, message);
         }
+        if self.erased_buckets.contains(&bucket_id) {
+            return StreamResponse::error(
+                StreamErrorCode::BucketErased,
+                format!("bucket '{bucket_id}' was permanently erased"),
+            );
+        }
         if !self.buckets.insert(bucket_id.clone()) {
             return StreamResponse::BucketAlreadyExists { bucket_id };
         }
@@ -76,7 +82,8 @@ impl StreamStateMachine {
 
     /// Tenant offboarding: removes every stream the bucket owns in this
     /// group (each removal enqueues its cold-object prefixes for the GC
-    /// worker), then the bucket and its quota. The aggregate usage ledger is
+    /// worker), then the bucket and its quota, and installs a permanent
+    /// erasure fence. The aggregate usage ledger is
     /// retained with zero gauges until an external accounting system has had
     /// a chance to observe its monotonic counters. Unlike
     /// [`Self::delete_bucket`] this does not require the bucket to be empty,
@@ -100,6 +107,7 @@ impl StreamStateMachine {
         }
         self.buckets.remove(bucket_id);
         self.bucket_quotas.remove(bucket_id);
+        self.erased_buckets.insert(bucket_id.to_owned());
         StreamResponse::BucketPurged {
             bucket_id: bucket_id.to_owned(),
             removed_streams,
@@ -615,6 +623,12 @@ impl StreamStateMachine {
             ));
         }
         if !self.buckets.contains(&stream_id.bucket_id) {
+            if self.erased_buckets.contains(&stream_id.bucket_id) {
+                return Err(StreamResponse::error(
+                    StreamErrorCode::BucketErased,
+                    format!("bucket '{}' was permanently erased", stream_id.bucket_id),
+                ));
+            }
             return Err(StreamResponse::error(
                 StreamErrorCode::BucketNotFound,
                 format!("bucket '{}' does not exist", stream_id.bucket_id),

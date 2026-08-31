@@ -1485,6 +1485,7 @@ pub(crate) async fn purge_bucket(
             "cold_gc_pending_entries": legacy.pending_chunks,
             "cold_gc_complete": false,
             "cold_gc_error": null,
+            "bucket_prefix_absent": false,
             "legacy_shared_chunks_pending": legacy.pending_chunks,
         }))
         .into_response();
@@ -1499,7 +1500,7 @@ pub(crate) async fn purge_bucket(
     // Reclaim the just-enqueued cold prefixes now instead of waiting for the
     // background worker's next pass. Failures leave entries queued for the
     // worker; the purge itself is already durable.
-    let (cold_gc_reclaimed, cold_gc_error) = match state
+    let (cold_gc_reclaimed, mut cold_gc_error) = match state
         .runtime
         .run_cold_gc_all_groups_once(COLD_GC_PURGE_BATCH_MAX_ENTRIES)
         .await
@@ -1525,7 +1526,23 @@ pub(crate) async fn purge_bucket(
             return runtime_error_or_leader_redirect_async(&state, err, &target).await;
         }
     };
-    let cold_gc_complete = proof.pending_cold_gc_entries == 0 && cold_gc_error.is_none();
+    let bucket_prefix_absent = if proof.pending_cold_gc_entries == 0 && cold_gc_error.is_none() {
+        match state
+            .runtime
+            .erase_bucket_cold_prefix_and_prove(&bucket)
+            .await
+        {
+            Ok(()) => true,
+            Err(err) => {
+                cold_gc_error = Some(err.to_string());
+                false
+            }
+        }
+    } else {
+        false
+    };
+    let cold_gc_complete =
+        proof.pending_cold_gc_entries == 0 && cold_gc_error.is_none() && bucket_prefix_absent;
     axum::Json(serde_json::json!({
         "bucket": bucket,
         "removed_streams": report.removed_streams,
@@ -1534,6 +1551,7 @@ pub(crate) async fn purge_bucket(
         "cold_gc_pending_entries": proof.pending_cold_gc_entries,
         "cold_gc_complete": cold_gc_complete,
         "cold_gc_error": cold_gc_error,
+        "bucket_prefix_absent": bucket_prefix_absent,
     }))
     .into_response()
 }

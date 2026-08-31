@@ -61,6 +61,7 @@ pub use cold_store::ColdStoreFaultEffect;
 pub use cold_store::ColdStoreHandle;
 pub use cold_store::ColdStoreInfo;
 pub use cold_store::ColdStoreOperation;
+pub use cold_store::cold_bucket_prefix;
 pub use cold_store::new_cold_chunk_path;
 pub use cold_store::new_external_payload_path;
 pub use cold_worker::spawn_cold_compaction_worker_if_configured;

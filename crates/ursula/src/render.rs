@@ -87,6 +87,7 @@ pub(crate) fn runtime_error_status(err: &RuntimeError) -> StatusCode {
 pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
     match code {
         StreamErrorCode::StreamGone => StatusCode::GONE,
+        StreamErrorCode::BucketErased => StatusCode::NOT_FOUND,
         StreamErrorCode::BucketNotFound
         | StreamErrorCode::StreamNotFound
         | StreamErrorCode::SnapshotNotFound => StatusCode::NOT_FOUND,
