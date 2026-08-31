@@ -27,6 +27,15 @@ message SnapshotHeaderV1 {
   // Unit used to derive every committed_write_units counter in this snapshot.
   // Absent means the original 10 KiB contract for backward compatibility.
   optional uint64 committed_write_unit_bytes = 7;
+  // Bucket owners whose bytes have occupied a still-live shared object.
+  // Retained until physical deletion so per-bucket erasure proof survives
+  // snapshots taken during legacy pack migration.
+  repeated SharedColdObjectOwnersV1 shared_cold_object_owners = 8;
+}
+
+message SharedColdObjectOwnersV1 {
+  string s3_path = 1;
+  repeated string bucket_ids = 2;
 }
 
 message BucketUsageV1 {
@@ -165,6 +174,7 @@ message ColdGcEntryV1 {
     ColdGcPathsV1 paths = 3;
   }
   uint64 not_before_ms = 4;
+  string bucket_id = 5;
 }
 
 message ColdGcPathsV1 {

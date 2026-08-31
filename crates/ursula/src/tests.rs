@@ -6752,6 +6752,9 @@ async fn purge_endpoint_erases_one_tenant_and_leaves_the_other_intact() {
     let report: serde_json::Value = serde_json::from_slice(&body).expect("purge report JSON");
     assert_eq!(report["bucket"], "tenant-a");
     assert_eq!(report["removed_streams"], 1);
+    assert_eq!(report["cold_gc_pending_entries"], 0);
+    assert_eq!(report["cold_gc_complete"], true);
+    assert!(report["cold_gc_error"].is_null());
     assert!(
         report["groups_with_streams"]
             .as_array()
@@ -6800,6 +6803,8 @@ async fn purge_endpoint_erases_one_tenant_and_leaves_the_other_intact() {
     let body = body_bytes(response).await;
     let rerun: serde_json::Value = serde_json::from_slice(&body).expect("rerun report JSON");
     assert_eq!(rerun["removed_streams"], 0);
+    assert_eq!(rerun["cold_gc_pending_entries"], 0);
+    assert_eq!(rerun["cold_gc_complete"], true);
 
     // The tenant can be recreated cleanly after a purge.
     let response = http_put(

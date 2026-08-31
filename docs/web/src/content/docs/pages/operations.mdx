@@ -114,7 +114,7 @@ Counters are monotonic and survive snapshots, stream deletion, and bucket purge.
 
 ```bash
 curl -X DELETE http://127.0.0.1:4438/__ursula/purge/tenant-a
-# {"bucket":"tenant-a","removed_streams":12,"groups_with_streams":[0,3,5],"cold_gc_entries_reclaimed":12}
+# {"bucket":"tenant-a","removed_streams":12,"groups_with_streams":[0,3,5],"cold_gc_entries_reclaimed":12,"cold_gc_pending_entries":0,"cold_gc_complete":true,"cold_gc_error":null}
 ```
 
 Semantics:
@@ -122,7 +122,7 @@ Semantics:
 - **Idempotent and resumable.** Purging an absent bucket returns the same report shape with zero counts. A purge interrupted mid-way converges on re-run: stream removal is a replicated command per group, and cold reclamation is a list-then-delete over object prefixes, so nothing depends on in-memory progress.
 - **Isolated.** Other buckets' streams, offsets, checksums, and snapshots are untouched; the purged bucket name conceals as not-found afterwards and may be recreated. A recreated bucket continues the same monotonic usage counters.
 - **Accounting residue.** The retained entry contains only aggregate counters and zero-valued content gauges, not stream data. Ursula does not currently provide an acknowledgement protocol for erasing it after an external meter persists the final delta. Use opaque bucket IDs if retaining the identifier itself would violate an erasure requirement.
-- **Cold-GC interaction.** If the immediate GC pass fails (for example S3 is briefly unavailable), the entries stay queued and the background GC worker finishes reclamation; the purge itself is already durable at that point.
+- **Cold-GC interaction.** `cold_gc_entries_reclaimed` is diagnostic only. Ursula issues a second idempotent replicated purge to read every group's durable queue after the immediate pass; only `cold_gc_complete=true` with `cold_gc_pending_entries=0` proves cold reclamation. If S3 is unavailable, the response remains incomplete and the queued entries survive for the background worker and a later proof request.
 - **Backups.** A purged tenant may persist inside backups taken before the purge until those backups age out; restore replays whatever the manifest contains. Deleting old backup sets is part of completing an offboarding with erasure obligations.
 
 ## Cleaning S3

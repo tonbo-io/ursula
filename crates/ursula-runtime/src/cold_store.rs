@@ -1303,10 +1303,10 @@ pub fn new_cold_chunk_path(
     )
 }
 
-pub fn new_cold_pack_path(raft_group_id: u32) -> String {
+pub fn new_cold_pack_path(bucket_id: &str, raft_group_id: u32) -> String {
     let unix_nanos = cold_object_unix_nanos();
     let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("_packs/{raft_group_id:08x}/{unix_nanos:032x}-{sequence:016x}.bin")
+    format!("{bucket_id}/_packs/{raft_group_id:08x}/{unix_nanos:032x}-{sequence:016x}.bin")
 }
 
 /// The prefix under which all of a stream's cold chunks live. Cold objects are
