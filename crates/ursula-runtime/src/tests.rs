@@ -2301,13 +2301,13 @@ async fn legacy_cross_bucket_pack_is_rewritten_before_bucket_erasure_proof() {
         .snapshot_group(group_id)
         .await
         .expect("snapshot partial legacy migration");
-    assert_eq!(intermediate.stream_snapshot.shared_cold_object_owners.len(), 1);
+    assert_eq!(
+        intermediate.stream_snapshot.shared_cold_object_owners.len(),
+        1
+    );
     assert_eq!(
         intermediate.stream_snapshot.shared_cold_object_owners[0].bucket_ids,
-        vec![
-            "legacy-erasure-a".to_owned(),
-            "legacy-erasure-b".to_owned()
-        ]
+        vec!["legacy-erasure-a".to_owned(), "legacy-erasure-b".to_owned()]
     );
 
     let migration = runtime
