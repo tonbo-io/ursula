@@ -599,6 +599,40 @@ impl ShardRuntime {
         Ok(report)
     }
 
+    /// Removes the entire bucket erasure domain, including external payloads
+    /// and stage-before-commit orphans, then verifies the authoritative store
+    /// no longer lists an object below that prefix. Call only after every
+    /// group has durably installed the bucket tombstone and legacy shared-pack
+    /// debt has converged to zero.
+    pub async fn erase_bucket_cold_prefix_and_prove(
+        &self,
+        bucket_id: &str,
+    ) -> Result<(), RuntimeError> {
+        let Some(cold_store) = self.cold_store.as_ref() else {
+            return Ok(());
+        };
+        let prefix = crate::cold_bucket_prefix(bucket_id);
+        cold_store
+            .remove_all(&prefix)
+            .await
+            .map_err(|err| RuntimeError::ColdStoreIo {
+                message: err.to_string(),
+            })?;
+        let absent =
+            cold_store
+                .prefix_is_empty(&prefix)
+                .await
+                .map_err(|err| RuntimeError::ColdStoreIo {
+                    message: err.to_string(),
+                })?;
+        if !absent {
+            return Err(RuntimeError::ColdStoreIo {
+                message: format!("bucket prefix '{prefix}' still contains objects after erasure"),
+            });
+        }
+        Ok(())
+    }
+
     pub async fn bucket_usage_all_groups(
         &self,
     ) -> Result<Vec<ursula_stream::BucketUsageSnapshot>, RuntimeError> {

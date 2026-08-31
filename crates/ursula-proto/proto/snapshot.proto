@@ -31,6 +31,9 @@ message SnapshotHeaderV1 {
   // Retained until physical deletion so per-bucket erasure proof survives
   // snapshots taken during legacy pack migration.
   repeated SharedColdObjectOwnersV1 shared_cold_object_owners = 8;
+  // Permanent bucket-erasure fences. Absent in snapshots written before
+  // tenant physical-erasure proof became part of the contract.
+  repeated string erased_buckets = 9;
 }
 
 message SharedColdObjectOwnersV1 {

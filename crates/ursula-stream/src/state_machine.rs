@@ -104,6 +104,10 @@ new_key_type! {
 #[derive(Debug, Clone, Default)]
 pub struct StreamStateMachine {
     buckets: HashSet<String>,
+    /// Permanent tenant-erasure fences. A purged bucket name can never be
+    /// reused, including after snapshot restore, so bytes cannot reappear
+    /// behind an already-issued physical absence proof.
+    erased_buckets: HashSet<String>,
     registry: StreamRegistry,
     /// Group-wide hot payload gauge. Kept incrementally so append admission
     /// and responses do not scan every stream in the group.
@@ -291,6 +295,12 @@ impl StreamStateMachine {
     ) -> StreamResponse {
         if let Err(message) = validate_bucket_id(&bucket_id) {
             return StreamResponse::error(StreamErrorCode::InvalidBucketId, message);
+        }
+        if self.erased_buckets.contains(&bucket_id) {
+            return StreamResponse::error(
+                StreamErrorCode::BucketErased,
+                format!("bucket '{bucket_id}' was permanently erased"),
+            );
         }
         let quota = BucketQuota {
             max_streams,
