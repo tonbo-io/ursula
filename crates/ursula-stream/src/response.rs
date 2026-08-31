@@ -76,6 +76,7 @@ pub enum StreamResponse {
     BucketPurged {
         bucket_id: String,
         removed_streams: u64,
+        pending_cold_gc_entries: u64,
     },
     /// A whole-group state import accepted by [`StreamCommand::ImportSnapshot`].
     ///

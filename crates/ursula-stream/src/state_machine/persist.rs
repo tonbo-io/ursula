@@ -81,11 +81,27 @@ impl StreamStateMachine {
             compare_stream_ids(&left.metadata.stream_id, &right.metadata.stream_id)
         });
 
+        let mut shared_cold_object_owners = self
+            .shared_cold_object_owners
+            .iter()
+            .filter(|(path, _)| self.shared_cold_object_refs.contains_key(*path))
+            .map(|(path, owners)| {
+                let mut bucket_ids = owners.iter().cloned().collect::<Vec<_>>();
+                bucket_ids.sort();
+                crate::SharedColdObjectOwnersSnapshot {
+                    s3_path: path.clone(),
+                    bucket_ids,
+                }
+            })
+            .collect::<Vec<_>>();
+        shared_cold_object_owners.sort_by(|left, right| left.s3_path.cmp(&right.s3_path));
+
         StreamSnapshot {
             buckets,
             streams,
             pending_cold_gc: self.cold_gc.entries().cloned().collect(),
             next_cold_gc_seq: self.cold_gc.next_seq(),
+            shared_cold_object_owners,
             bucket_usage: self.bucket_usage_report(),
             bucket_quotas: self.bucket_quota_report(),
         }
@@ -240,7 +256,20 @@ impl StreamStateMachine {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
             }
             for path in shared_cold_paths {
-                machine.retain_shared_cold_object(&path);
+                machine.retain_shared_cold_object(&path, &stream_id.bucket_id);
+            }
+        }
+
+        for record in snapshot.shared_cold_object_owners {
+            if machine
+                .shared_cold_object_refs
+                .contains_key(&record.s3_path)
+            {
+                machine
+                    .shared_cold_object_owners
+                    .entry(record.s3_path)
+                    .or_default()
+                    .extend(record.bucket_ids);
             }
         }
 
