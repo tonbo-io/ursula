@@ -592,10 +592,20 @@ pub async fn repair_restarted_voter(
         .filter(|node_id| *node_id != target.id)
         .collect::<BTreeSet<_>>();
 
-    client
-        .set_maintenance_drain(target, true)
-        .await
-        .with_context(|| format!("mark restarted node {} maintenance-drained", target.id))?;
+    // A partial replacement may have caught up far enough to receive a
+    // leadership just before recovery starts. Maintenance drain prevents new
+    // campaigns and inbound transfers, but does not itself move a current
+    // leader. Explicitly drain the target before fencing the other survivor,
+    // otherwise the anchor can never become the sole leader authority.
+    drain_recovery_target(
+        nodes,
+        target,
+        client,
+        drain_options,
+        &configured_node_ids,
+    )
+    .await
+    .context("drain current leaders from restarted voter before membership repair")?;
     let fence =
         pin_restart_leaders(nodes, target, client, drain_options, &configured_node_ids).await?;
     let leader = nodes
@@ -1613,6 +1623,7 @@ mod tests {
     #[tokio::test]
     async fn restarted_voter_is_rebuilt_through_durable_membership() {
         let (nodes, cluster) = mock_cluster(LeaderScenario::RepairableTarget).await;
+        cluster.pinned_leader.store(3, Ordering::SeqCst);
         let preparation = repair_restarted_voter(
             &nodes,
             &nodes[2],
@@ -1639,6 +1650,7 @@ mod tests {
         assert_eq!(cluster.membership_phase.load(Ordering::SeqCst), 3);
         assert_eq!(*cluster.operations.lock().unwrap(), vec![
             "drain:3",
+            "transfer:3->1",
             "drain:2",
             "membership:1:1,2",
             "learner:1:3",
