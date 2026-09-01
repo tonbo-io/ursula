@@ -15,8 +15,7 @@ export NAMESPACE STATEFULSET REPLICAS EXPECTED_GROUPS TARGET_IMAGE CTL ROLLOUT_S
 # shellcheck source=graceful-rollout.sh
 . "${test_dir}/graceful-rollout.sh"
 original_write_manifest=$(declare -f write_manifest)
-original_reassert_restart_fence=$(declare -f reassert_restart_fence)
-original_finish_rearmed_catchup=$(declare -f finish_rearmed_catchup)
+original_prepare_recovery_restart=$(declare -f prepare_recovery_restart)
 
 mocked_revision=ursula-stale
 kubectl() {
@@ -71,17 +70,9 @@ replace_pod() {
 
 strict_verify() { :; }
 
-reassert_restart_fence() {
+prepare_recovery_restart() {
   [ "$1" = "2" ]
-  resumed_reassert=1
-  REASSERT_RESULT=catchup-required
-}
-
-finish_rearmed_catchup() {
-  [ "$1" = "2" ]
-  [ "${REASSERT_RESULT}" = "catchup-required" ]
-  resumed_finish=1
-  REASSERT_RESULT=ready
+  resumed_prepare_recovery=1
 }
 
 record_state() {
@@ -93,17 +84,14 @@ record_state() {
 replaced_stale=0
 resumed_forward=0
 resumed_complete=0
-resumed_reassert=0
-resumed_finish=0
+resumed_prepare_recovery=0
 CTL=true
 resume_if_needed
 [ "${replaced_stale}" = "1" ]
 [ "${resumed_forward}" = "1" ]
-[ "${resumed_reassert}" = "1" ]
-[ "${resumed_finish}" = "1" ]
+[ "${resumed_prepare_recovery}" = "1" ]
 [ "${resumed_complete}" = "1" ]
-eval "${original_reassert_restart_fence}"
-eval "${original_finish_rearmed_catchup}"
+eval "${original_prepare_recovery_restart}"
 CTL=true
 
 mocked_revision=ursula-current
@@ -141,16 +129,6 @@ case "$1" in
   classify-amnesiac)
     printf '%s\n' 3
     ;;
-  reassert-restart-fence)
-    printf '%s\n' "$1" >>"${mock_ctl_calls}"
-    while [ "$#" -gt 0 ]; do
-      if [ "$1" = "--result-file" ]; then
-        printf '%s\n' ready >"$2"
-        break
-      fi
-      shift
-    done
-    ;;
   prepare-amnesiac-restart|wait|undrain)
     printf '%s\n' "$1" >>"${mock_ctl_calls}"
     ;;
@@ -180,41 +158,13 @@ recover_amnesiac_if_needed
 [ "${recovered_forward}" = "1" ]
 [ "${recovered_verified}" = "1" ]
 grep -q '^prepare-amnesiac-restart$' "${mock_ctl_calls}"
-grep -q '^reassert-restart-fence$' "${mock_ctl_calls}"
 grep -q '^restarting 3$' "${mock_ctl_calls}"
 grep -q '^wait$' "${mock_ctl_calls}"
 grep -q '^undrain$' "${mock_ctl_calls}"
 grep -q '^complete 3$' "${mock_ctl_calls}"
 rm -f "${mock_ctl}" "${mock_ctl_calls}"
 
-# A rearmed live replacement catches up in place. It must not be replaced
-# again because that clears groups which already recovered and lets the old
-# process consume the newly armed permissions.
-rearmed_calls=$(mktemp)
-rearmed_ctl=$(mktemp)
-export rearmed_calls
-cat >"${rearmed_ctl}" <<'CTL'
-#!/bin/sh
-[ "$1" = "wait" ] || exit 1
-printf '%s\n' wait >>"${rearmed_calls}"
-CTL
-chmod +x "${rearmed_ctl}"
-CTL=${rearmed_ctl}
-REASSERT_RESULT=catchup-required
-reassert_restart_fence() {
-  [ "$1" = "3" ]
-  printf '%s\n' reassert >>"${rearmed_calls}"
-  REASSERT_RESULT=ready
-}
-finish_rearmed_catchup 3
-cat >"${rearmed_calls}.expected" <<'CALLS'
-wait
-reassert
-CALLS
-cmp "${rearmed_calls}.expected" "${rearmed_calls}"
-rm -f "${rearmed_ctl}" "${rearmed_calls}" "${rearmed_calls}.expected"
-eval "${original_reassert_restart_fence}"
-eval "${original_finish_rearmed_catchup}"
+eval "${original_prepare_recovery_restart}"
 
 # A recorded replacement must be resumed before the blanket Ready gate. The
 # stale replacement in the fixture cannot become Ready until resume replaces

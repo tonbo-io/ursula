@@ -45,16 +45,16 @@ enum Command {
     /// Arm one empty-log rejoin per group for a raft-memory node that lost its
     /// volatile log. Refused on disk-backed clusters.
     AllowRejoin(NodeArgs),
-    /// Prepare one node for an immediate platform restart. Memory-WAL clusters
-    /// arm stable-leader rejoin permissions; disk-WAL clusters need no action.
+    /// Quiesce one drained node for an immediate platform restart. Memory-WAL
+    /// clusters then arm stable-leader rejoin permissions.
     PrepareRestart(NodeArgs),
     /// Recover the uniquely identifiable voter that is missing whole Raft
-    /// groups. Drains its remaining leaderships and arms one memory-WAL rejoin
-    /// before the platform immediately restarts it.
+    /// groups. Drains and quiesces it, then arms one memory-WAL rejoin before
+    /// the platform immediately restarts it.
     PrepareAmnesiacRestart(RestartTargetArgs),
-    /// Re-establish a replacement voter's process-local drain fence, transfer
-    /// startup leaderships away, and re-arm any still-missing memory-WAL groups.
-    ReassertRestartFence(ReassertRestartArgs),
+    /// Fence and quiesce a partial replacement, then arm every memory-WAL
+    /// group for the next process. Used to resume an interrupted rollout.
+    PrepareRecoveryRestart(RestartTargetArgs),
     /// Print the unique safely recoverable amnesiac voter id, or `none` when
     /// every voter is ready. Refuses every other unready cluster shape.
     ClassifyAmnesiac(AmnesiacClassifyArgs),
@@ -182,16 +182,6 @@ struct RestartTargetArgs {
 }
 
 #[derive(Args, Debug)]
-struct ReassertRestartArgs {
-    #[command(flatten)]
-    restart: RestartTargetArgs,
-    /// Write `ready` when no group was re-armed, or `catchup-required` when the
-    /// caller must keep the live memory-WAL voter fenced while it catches up.
-    #[arg(long, value_name = "PATH")]
-    result_file: Option<PathBuf>,
-}
-
-#[derive(Args, Debug)]
 struct AmnesiacClassifyArgs {
     /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
     #[arg(long, value_name = "PATH")]
@@ -260,7 +250,9 @@ async fn main() -> Result<()> {
         Command::PrepareAmnesiacRestart(args) => {
             run_prepare_amnesiac_restart_subcommand(args).await
         }
-        Command::ReassertRestartFence(args) => run_reassert_restart_fence_subcommand(args).await,
+        Command::PrepareRecoveryRestart(args) => {
+            run_prepare_recovery_restart_subcommand(args).await
+        }
         Command::ClassifyAmnesiac(args) => run_classify_amnesiac_subcommand(args).await,
         Command::VerifyCluster(args) => run_verify_cluster_subcommand(args).await,
         Command::BackupCreate(args) => run_backup_create_subcommand(args).await,
@@ -480,7 +472,9 @@ async fn run_prepare_restart_subcommand(args: NodeArgs) -> Result<()> {
     let nodes = load_nodes(&args.config).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
     let target = find_node(&nodes, args.node)?;
-    if ursula_ctl::resolve_restart_rejoin_policy(&client, &nodes).await? {
+    let memory_rejoin = ursula_ctl::resolve_restart_rejoin_policy(&client, &nodes).await?;
+    client.quiesce_for_restart(target).await?;
+    if memory_rejoin {
         ursula_ctl::arm_empty_rejoin(
             &nodes,
             target,
@@ -489,12 +483,12 @@ async fn run_prepare_restart_subcommand(args: NodeArgs) -> Result<()> {
         )
         .await?;
         println!(
-            "node {}: memory-WAL restart prepared on stable group leaders",
+            "node {}: quiesced and memory-WAL restart prepared on stable group leaders",
             target.id
         );
     } else {
         println!(
-            "node {}: disk-WAL restart needs no empty-log rejoin permission",
+            "node {}: quiesced for disk-WAL restart; no empty-log rejoin permission needed",
             target.id
         );
     }
@@ -526,15 +520,11 @@ async fn run_prepare_amnesiac_restart_subcommand(args: RestartTargetArgs) -> Res
     Ok(())
 }
 
-async fn run_reassert_restart_fence_subcommand(args: ReassertRestartArgs) -> Result<()> {
-    let ReassertRestartArgs {
-        restart: args,
-        result_file,
-    } = args;
+async fn run_prepare_recovery_restart_subcommand(args: RestartTargetArgs) -> Result<()> {
     let nodes = load_nodes(&args.config).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
     let target = find_node(&nodes, args.node)?;
-    let rearmed_groups = ursula_ctl::reassert_restart_fence(
+    let missing_groups = ursula_ctl::prepare_recovery_restart(
         &nodes,
         target,
         &client,
@@ -548,24 +538,11 @@ async fn run_reassert_restart_fence_subcommand(args: ReassertRestartArgs) -> Res
         &ursula_ctl::RejoinOptions::default(),
     )
     .await?;
-    if let Some(path) = result_file {
-        let result = restart_fence_result(rearmed_groups);
-        std::fs::write(&path, result)
-            .with_context(|| format!("write restart-fence result to {}", path.display()))?;
-    }
     println!(
-        "node {}: restart fence reasserted; rearmed {} wholly missing group(s)",
-        target.id, rearmed_groups
+        "node {}: recovery restart quiesced; {} group(s) were wholly missing before the full restart inventory was armed",
+        target.id, missing_groups
     );
     Ok(())
-}
-
-fn restart_fence_result(rearmed_groups: usize) -> &'static str {
-    if rearmed_groups == 0 {
-        "ready\n"
-    } else {
-        "catchup-required\n"
-    }
 }
 
 async fn run_classify_amnesiac_subcommand(args: AmnesiacClassifyArgs) -> Result<()> {
@@ -600,38 +577,26 @@ async fn run_verify_cluster_subcommand(args: VerifyClusterArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use clap::Parser;
 
     use super::Cli;
     use super::Command;
-    use super::restart_fence_result;
 
     #[test]
-    fn restart_fence_result_is_a_stable_machine_contract() {
-        assert_eq!(restart_fence_result(0), "ready\n");
-        assert_eq!(restart_fence_result(1), "catchup-required\n");
-        assert_eq!(restart_fence_result(256), "catchup-required\n");
-    }
-
-    #[test]
-    fn reassert_restart_fence_accepts_a_result_file() {
+    fn prepare_recovery_restart_accepts_the_recovery_contract() {
         let cli = Cli::try_parse_from([
             "ursulactl",
-            "reassert-restart-fence",
+            "prepare-recovery-restart",
             "--config",
             "cluster.json",
             "--node",
             "3",
-            "--result-file",
-            "/tmp/result",
         ])
         .unwrap();
 
-        let Command::ReassertRestartFence(args) = cli.command else {
-            panic!("expected reassert-restart-fence command");
+        let Command::PrepareRecoveryRestart(args) = cli.command else {
+            panic!("expected prepare-recovery-restart command");
         };
-        assert_eq!(args.result_file.as_deref(), Some(Path::new("/tmp/result")));
+        assert_eq!(args.node, 3);
     }
 }

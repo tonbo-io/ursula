@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use futures_util::future::join_all;
 use openraft::BasicNode;
 use openraft::OptionalSend;
 use openraft::Raft;
@@ -877,6 +878,40 @@ impl RaftGroupHandleRegistry {
     /// by a node instance that is already shutting down.
     pub fn shutdown_transport(&self) {
         self.transport_shutdown.send_replace(true);
+    }
+
+    /// Stop every local Raft core before an intentional memory-WAL restart.
+    ///
+    /// OpenRaft's one-shot log-reversion permission must be installed on each
+    /// leader only after the old follower can no longer answer replication
+    /// requests. Otherwise the old process may consume that permission before
+    /// the replacement loses its volatile log. The admin server stays alive so
+    /// the rollout controller can prove the node is quiesced and arm the peers.
+    pub async fn quiesce_for_restart(&self) -> Result<usize, String> {
+        self.shutdown_transport();
+        let groups = self
+            .groups
+            .lock()
+            .expect("raft group handle registry mutex")
+            .iter()
+            .map(|(raft_group_id, raft)| (*raft_group_id, raft.clone()))
+            .collect::<Vec<_>>();
+        let group_count = groups.len();
+        let results = join_all(groups.into_iter().map(|(raft_group_id, raft)| async move {
+            raft.shutdown()
+                .await
+                .map_err(|err| format!("group {raft_group_id}: {err}"))
+        }))
+        .await;
+        let failures = results
+            .into_iter()
+            .filter_map(Result::err)
+            .collect::<Vec<_>>();
+        if failures.is_empty() {
+            Ok(group_count)
+        } else {
+            Err(failures.join("; "))
+        }
     }
 
     pub(crate) fn subscribe_transport_shutdown(&self) -> watch::Receiver<bool> {
