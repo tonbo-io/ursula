@@ -684,24 +684,28 @@ pub async fn repair_restarted_voter(
         }
     }
     let survivor_voters = &survivor_node_ids;
-    run_group_phase(detach_groups, repair_options.max_concurrency, move |group_id| {
-        reconcile_group_operation(
-            leader,
-            client,
-            group_id,
-            repair_options,
-            "detach restarted voter",
-            move |group| {
-                group
-                    .voter_ids
-                    .iter()
-                    .copied()
-                    .collect::<BTreeSet<_>>()
-                    .eq(survivor_voters)
-            },
-            move || client.change_membership(leader, group_id, survivor_voters),
-        )
-    })
+    run_group_phase(
+        detach_groups,
+        repair_options.max_concurrency,
+        move |group_id| {
+            reconcile_group_operation(
+                leader,
+                client,
+                group_id,
+                repair_options,
+                "detach restarted voter",
+                move |group| {
+                    group
+                        .voter_ids
+                        .iter()
+                        .copied()
+                        .collect::<BTreeSet<_>>()
+                        .eq(survivor_voters)
+                },
+                move || client.change_membership(leader, group_id, survivor_voters),
+            )
+        },
+    )
     .await
     .context("detach restarted voter from unready groups")?;
 
@@ -740,17 +744,21 @@ pub async fn repair_restarted_voter(
             attach_groups.push(*group_id);
         }
     }
-    run_group_phase(attach_groups, repair_options.max_concurrency, move |group_id| {
-        reconcile_group_operation(
-            leader,
-            client,
-            group_id,
-            repair_options,
-            "attach restarted voter as a learner",
-            |group| group.learner_ids.contains(&target.id),
-            move || client.add_learner(leader, group_id, target),
-        )
-    })
+    run_group_phase(
+        attach_groups,
+        repair_options.max_concurrency,
+        move |group_id| {
+            reconcile_group_operation(
+                leader,
+                client,
+                group_id,
+                repair_options,
+                "attach restarted voter as a learner",
+                |group| group.learner_ids.contains(&target.id),
+                move || client.add_learner(leader, group_id, target),
+            )
+        },
+    )
     .await
     .context("attach restarted voter as a learner")?;
 
