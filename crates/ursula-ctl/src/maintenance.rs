@@ -690,9 +690,7 @@ pub async fn repair_restarted_voter(
             group_id,
             repair_options,
             "detach restarted voter",
-            |group| {
-                group.voter_ids.iter().copied().collect::<BTreeSet<_>>() == survivor_node_ids
-            },
+            |group| group.voter_ids.iter().copied().collect::<BTreeSet<_>>() == survivor_node_ids,
             || client.change_membership(leader, group_id, &survivor_node_ids),
         )
     })
@@ -770,8 +768,7 @@ pub async fn repair_restarted_voter(
                 repair_options,
                 "promote caught-up learner back to voter",
                 |group| {
-                    group.voter_ids.iter().copied().collect::<BTreeSet<_>>()
-                        == configured_node_ids
+                    group.voter_ids.iter().copied().collect::<BTreeSet<_>>() == configured_node_ids
                 },
                 || client.change_membership(leader, group_id, &configured_node_ids),
             )
@@ -812,10 +809,7 @@ where
         match client.fetch_node(leader).await {
             Ok(view) => {
                 let group = view.group(group_id).ok_or_else(|| {
-                    anyhow!(
-                        "leader node {} does not report group {group_id}",
-                        leader.id
-                    )
+                    anyhow!("leader node {} does not report group {group_id}", leader.id)
                 })?;
                 if postcondition(group) {
                     if saw_ambiguous_result {
@@ -1665,10 +1659,7 @@ mod tests {
             _ => return StatusCode::BAD_REQUEST,
         };
         let stall_mode = if voters == "1,2" {
-            state
-                .cluster
-                .stalled_detach_mode
-                .swap(0, Ordering::SeqCst)
+            state.cluster.stalled_detach_mode.swap(0, Ordering::SeqCst)
         } else {
             0
         };
