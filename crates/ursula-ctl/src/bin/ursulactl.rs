@@ -185,8 +185,8 @@ struct RestartTargetArgs {
 struct ReassertRestartArgs {
     #[command(flatten)]
     restart: RestartTargetArgs,
-    /// Write `ready` when no group was re-armed, or `restart-required` when the
-    /// caller must prepare and replace the memory-WAL voter once more.
+    /// Write `ready` when no group was re-armed, or `catchup-required` when the
+    /// caller must keep the live memory-WAL voter fenced while it catches up.
     #[arg(long, value_name = "PATH")]
     result_file: Option<PathBuf>,
 }
@@ -564,7 +564,7 @@ fn restart_fence_result(rearmed_groups: usize) -> &'static str {
     if rearmed_groups == 0 {
         "ready\n"
     } else {
-        "restart-required\n"
+        "catchup-required\n"
     }
 }
 
@@ -611,8 +611,8 @@ mod tests {
     #[test]
     fn restart_fence_result_is_a_stable_machine_contract() {
         assert_eq!(restart_fence_result(0), "ready\n");
-        assert_eq!(restart_fence_result(1), "restart-required\n");
-        assert_eq!(restart_fence_result(256), "restart-required\n");
+        assert_eq!(restart_fence_result(1), "catchup-required\n");
+        assert_eq!(restart_fence_result(256), "catchup-required\n");
     }
 
     #[test]

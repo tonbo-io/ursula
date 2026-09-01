@@ -225,7 +225,7 @@ reassert_restart_fence() {
   fi
   IFS= read -r REASSERT_RESULT <"${result_file}"
   case "${REASSERT_RESULT}" in
-    ready|restart-required) ;;
+    ready|catchup-required) ;;
     *)
       log "invalid restart-fence result for node ${node_id}: ${REASSERT_RESULT}"
       return 1
@@ -233,29 +233,17 @@ reassert_restart_fence() {
   esac
 }
 
-finish_rearmed_restart() {
+finish_rearmed_catchup() {
   node_id=$1
-  ordinal=$2
-  if [ "${REASSERT_RESULT}" != "restart-required" ]; then
+  if [ "${REASSERT_RESULT}" != "catchup-required" ]; then
     return 0
   fi
-  # reassert-restart-fence only re-arms groups that are wholly missing from
-  # the live replacement. The next memory-WAL restart clears every group, so
-  # prepare-restart must arm all group leaders before that replacement.
-  log "node ${node_id} requires a prepared restart after fence reassertion"
-  "${CTL}" prepare-restart --config "${MANIFEST}" --node "${node_id}"
-  record_state restarting "${node_id}"
-  replace_pod "${ordinal}"
-  wait_for_pod_ready "${ordinal}"
-  if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
-    log "node ${node_id} became Ready at a revision other than ${TARGET_REVISION}"
-    return 1
-  fi
-  start_forward "${ordinal}"
-  # Kubernetes Ready only proves that the HTTP process is accepting traffic.
-  # A memory-WAL voter still needs time to recreate and catch up every Raft
-  # group. Reasserting before that point misclassifies in-flight groups as
-  # wholly missing and causes an unnecessary restart loop.
+  # The live replacement has already reported the groups that are wholly
+  # missing, and reassert-restart-fence armed exactly those group leaders.
+  # Deleting it here clears the groups that already caught up and lets the old
+  # process consume the new permissions before replacement. Keep this process
+  # fenced and wait for it to consume the permissions and install snapshots.
+  log "node ${node_id} is rearmed; waiting for the live voter to catch up"
   "${CTL}" wait \
     --config "${MANIFEST}" \
     --node "${node_id}" \
@@ -264,7 +252,7 @@ finish_rearmed_restart() {
     --lag-tolerance 16
   reassert_restart_fence "${node_id}"
   if [ "${REASSERT_RESULT}" != "ready" ]; then
-    log "node ${node_id} required another restart after full Raft catch-up"
+    log "node ${node_id} still has wholly missing groups after rearmed catch-up"
     return 1
   fi
 }
@@ -326,7 +314,7 @@ resume_if_needed() {
   fi
   start_forward "${ordinal}"
   reassert_restart_fence "${node_id}"
-  finish_rearmed_restart "${node_id}" "${ordinal}"
+  finish_rearmed_catchup "${node_id}"
   "${CTL}" wait \
     --config "${MANIFEST}" \
     --node "${node_id}" \
@@ -372,7 +360,7 @@ recover_amnesiac_if_needed() {
   fi
   start_forward "${ordinal}"
   reassert_restart_fence "${node_id}"
-  finish_rearmed_restart "${node_id}" "${ordinal}"
+  finish_rearmed_catchup "${node_id}"
   "${CTL}" wait \
     --config "${MANIFEST}" \
     --node "${node_id}" \
@@ -420,7 +408,7 @@ roll_node() {
   wait_for_pod_ready "${ordinal}"
   start_forward "${ordinal}"
   reassert_restart_fence "${node_id}"
-  finish_rearmed_restart "${node_id}" "${ordinal}"
+  finish_rearmed_catchup "${node_id}"
   image=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
     -o jsonpath='{.spec.containers[?(@.name=="ursula")].image}')
   if [ "${image}" != "${TARGET_IMAGE}" ]; then
