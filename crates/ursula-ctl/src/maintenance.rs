@@ -2609,8 +2609,7 @@ mod tests {
 
         let mut higher_term_reports_a_leader = stale_term.clone();
         higher_term_reports_a_leader.per_node[1].groups[0].current_leader = Some(2);
-        let error = stale_survivor_term_handoff(&higher_term_reports_a_leader, 7, 1)
-            .unwrap_err();
+        let error = stale_survivor_term_handoff(&higher_term_reports_a_leader, 7, 1).unwrap_err();
         assert!(
             error.to_string().contains("still reports leader"),
             "{error:#}"
@@ -2619,7 +2618,10 @@ mod tests {
         let mut higher_term_is_behind = stale_term;
         higher_term_is_behind.per_node[1].groups[0].committed_index = Some(99);
         let error = stale_survivor_term_handoff(&higher_term_is_behind, 7, 1).unwrap_err();
-        assert!(error.to_string().contains("is behind stale leader"), "{error:#}");
+        assert!(
+            error.to_string().contains("is behind stale leader"),
+            "{error:#}"
+        );
     }
 
     #[test]
