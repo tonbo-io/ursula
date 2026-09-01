@@ -52,6 +52,9 @@ enum Command {
     /// groups. Drains its remaining leaderships and arms one memory-WAL rejoin
     /// before the platform immediately restarts it.
     PrepareAmnesiacRestart(AmnesiacRestartArgs),
+    /// Re-establish a replacement voter's process-local drain fence, transfer
+    /// startup leaderships away, and re-arm any still-missing memory-WAL groups.
+    ReassertRestartFence(AmnesiacRestartArgs),
     /// Print the unique safely recoverable amnesiac voter id, or `none` when
     /// every voter is ready. Refuses every other unready cluster shape.
     ClassifyAmnesiac(AmnesiacClassifyArgs),
@@ -247,6 +250,7 @@ async fn main() -> Result<()> {
         Command::PrepareAmnesiacRestart(args) => {
             run_prepare_amnesiac_restart_subcommand(args).await
         }
+        Command::ReassertRestartFence(args) => run_reassert_restart_fence_subcommand(args).await,
         Command::ClassifyAmnesiac(args) => run_classify_amnesiac_subcommand(args).await,
         Command::VerifyCluster(args) => run_verify_cluster_subcommand(args).await,
         Command::BackupCreate(args) => run_backup_create_subcommand(args).await,
@@ -508,6 +512,31 @@ async fn run_prepare_amnesiac_restart_subcommand(args: AmnesiacRestartArgs) -> R
     println!(
         "node {}: prepared amnesiac restart for {} missing group(s); restart immediately",
         target.id, missing_groups
+    );
+    Ok(())
+}
+
+async fn run_reassert_restart_fence_subcommand(args: AmnesiacRestartArgs) -> Result<()> {
+    let nodes = load_nodes(&args.config).await?;
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let target = find_node(&nodes, args.node)?;
+    let rearmed_groups = ursula_ctl::reassert_restart_fence(
+        &nodes,
+        target,
+        &client,
+        &ursula_ctl::DrainOptions {
+            drain_timeout: Duration::from_secs(args.drain_timeout_secs),
+            ready_timeout: Duration::ZERO,
+            poll_interval: Duration::from_secs(args.poll_interval_secs),
+            lag_tolerance: args.lag_tolerance,
+            dry_run: false,
+        },
+        &ursula_ctl::RejoinOptions::default(),
+    )
+    .await?;
+    println!(
+        "node {}: restart fence reasserted; rearmed {} wholly missing group(s)",
+        target.id, rearmed_groups
     );
     Ok(())
 }

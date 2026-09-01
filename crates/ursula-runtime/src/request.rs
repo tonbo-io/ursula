@@ -478,8 +478,17 @@ pub struct AckColdGcResponse {
 pub struct PurgeBucketResponse {
     pub placement: ShardPlacement,
     pub removed_streams: u64,
+    /// Rolling-upgrade compatibility for <=0.4.5 voters, which did not return
+    /// a bucket-specific cold-GC count. Missing is mapped to maximally pending,
+    /// never to zero, so a mixed-version cluster cannot forge absence proof.
+    /// Remove after the minimum supported rolling source is >=0.4.6.
+    #[serde(default = "unknown_pending_cold_gc_entries")]
     pub pending_cold_gc_entries: u64,
     pub group_commit_index: u64,
+}
+
+const fn unknown_pending_cold_gc_entries() -> u64 {
+    u64::MAX
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -707,4 +716,21 @@ pub struct AppendTransactionResponse {
 pub struct StreamAppendCount {
     pub stream_id: BucketStreamId,
     pub append_count: u64,
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::PurgeBucketResponse;
+
+    #[test]
+    fn legacy_purge_response_is_never_interpreted_as_absence_proof() {
+        let response: PurgeBucketResponse = serde_json::from_value(serde_json::json!({
+            "placement": {"core_id": 0, "shard_id": 0, "raft_group_id": 7},
+            "removed_streams": 0,
+            "group_commit_index": 8
+        }))
+        .expect("decode <=0.4.5 purge response");
+
+        assert_eq!(response.pending_cold_gc_entries, u64::MAX);
+    }
 }

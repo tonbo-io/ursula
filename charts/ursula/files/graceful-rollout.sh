@@ -209,6 +209,15 @@ strict_verify() {
     --lag-tolerance 16
 }
 
+reassert_restart_fence() {
+  node_id=$1
+  "${CTL}" reassert-restart-fence \
+    --config "${MANIFEST}" \
+    --node "${node_id}" \
+    --drain-timeout-secs 300 \
+    --lag-tolerance 16
+}
+
 record_state() {
   phase=$1
   node_id=$2
@@ -265,6 +274,7 @@ resume_if_needed() {
     return 1
   fi
   start_forward "${ordinal}"
+  reassert_restart_fence "${node_id}"
   "${CTL}" wait \
     --config "${MANIFEST}" \
     --node "${node_id}" \
@@ -309,6 +319,7 @@ recover_amnesiac_if_needed() {
     return 1
   fi
   start_forward "${ordinal}"
+  reassert_restart_fence "${node_id}"
   "${CTL}" wait \
     --config "${MANIFEST}" \
     --node "${node_id}" \
@@ -355,6 +366,7 @@ roll_node() {
 
   wait_for_pod_ready "${ordinal}"
   start_forward "${ordinal}"
+  reassert_restart_fence "${node_id}"
   image=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
     -o jsonpath='{.spec.containers[?(@.name=="ursula")].image}')
   if [ "${image}" != "${TARGET_IMAGE}" ]; then
