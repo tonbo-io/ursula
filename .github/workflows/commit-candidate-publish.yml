@@ -1,0 +1,172 @@
+name: Commit Candidate Publish
+
+# A commit candidate is a canary deployment artifact, not a Ursula release.
+# It never creates a Git tag, GitHub Release, stable image alias, or source
+# version bump. Stable releases are published only after the candidate has
+# passed the reviewed EKS rollout and recovery checks.
+on:
+  pull_request:
+    paths:
+      - .dockerignore
+      - .github/workflows/commit-candidate-publish.yml
+      - Dockerfile
+      - charts/ursula/**
+      - scripts/helm_template_test.py
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Exact current main commit to build
+        required: true
+        type: string
+      confirm:
+        description: Type publish-main-commit-candidate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+
+concurrency:
+  group: commit-candidate-${{ github.event_name == 'workflow_dispatch' && inputs.commit || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CHART_DIR: charts/ursula
+  CHART_REGISTRY: oci://ghcr.io/${{ github.repository_owner }}/charts
+  IMAGE: ghcr.io/${{ github.repository }}
+  DOCKER_PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  candidate:
+    name: Build commit candidate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.commit || github.sha }}
+
+      - name: Resolve and authorize candidate
+        id: candidate
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_COMMIT: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+
+          commit="$(git rev-parse HEAD)"
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            [[ "$REQUESTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+            [ "$CONFIRM" = publish-main-commit-candidate ]
+            [ "$commit" = "$REQUESTED_COMMIT" ]
+            git fetch origin main --no-tags
+            [ "$(git rev-parse origin/main)" = "$commit" ]
+          fi
+
+          short_commit="${commit:0:12}"
+          candidate_version="0.0.0-main.${short_commit}"
+          echo "commit=$commit" >>"$GITHUB_OUTPUT"
+          echo "version=$candidate_version" >>"$GITHUB_OUTPUT"
+
+      - name: Verify source release metadata is unchanged
+        run: ./scripts/check-release-versions.sh
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Validate candidate chart
+        run: |
+          set -euo pipefail
+          helm lint "$CHART_DIR" --strict
+          helm template ursula "$CHART_DIR" >/tmp/ursula-chart-rendered.yaml
+          python3 scripts/helm_template_test.py
+          helm template ursula "$CHART_DIR" \
+            --namespace ursula \
+            -f "$CHART_DIR/examples/production-eks.yaml" \
+            >/tmp/ursula-production-eks.yaml
+
+      - name: Set up Depot
+        uses: depot/setup-action@v1
+
+      - name: Log in to GHCR
+        if: github.event_name == 'workflow_dispatch'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build candidate image
+        id: image
+        uses: depot/build-push-action@v1
+        with:
+          project: ls2d88cjpz
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ env.DOCKER_PLATFORMS }}
+          push: ${{ github.event_name == 'workflow_dispatch' }}
+          tags: ${{ env.IMAGE }}:${{ steps.candidate.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.candidate.outputs.commit }}
+            org.opencontainers.image.version=${{ steps.candidate.outputs.version }}
+          provenance: true
+          sbom: true
+
+      - name: Package candidate chart
+        id: chart
+        env:
+          CANDIDATE_VERSION: ${{ steps.candidate.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/charts
+          helm package "$CHART_DIR" \
+            --destination dist/charts \
+            --version "$CANDIDATE_VERSION" \
+            --app-version "$CANDIDATE_VERSION"
+          package="dist/charts/ursula-${CANDIDATE_VERSION}.tgz"
+          test -f "$package"
+          echo "package=$package" >>"$GITHUB_OUTPUT"
+
+      - name: Push candidate chart
+        if: github.event_name == 'workflow_dispatch'
+        id: chart_push
+        env:
+          PACKAGE: ${{ steps.chart.outputs.package }}
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            helm registry login ghcr.io \
+              --username "${{ github.actor }}" \
+              --password-stdin
+          result="$(helm push "$PACKAGE" "$CHART_REGISTRY")"
+          printf '%s\n' "$result"
+          digest="$(sed -n 's/^Digest: //p' <<<"$result" | tail -n 1)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >>"$GITHUB_OUTPUT"
+
+      - name: Record candidate evidence
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          CANDIDATE_VERSION: ${{ steps.candidate.outputs.version }}
+          CHART_DIGEST: ${{ steps.chart_push.outputs.digest }}
+          COMMIT: ${{ steps.candidate.outputs.commit }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          {
+            echo "## Commit candidate"
+            echo
+            echo "- Commit: \`$COMMIT\`"
+            echo "- Candidate: \`$CANDIDATE_VERSION\`"
+            echo "- Image digest: \`$IMAGE_DIGEST\`"
+            echo "- Chart digest: \`$CHART_DIGEST\`"
+            echo
+            echo "This is not a stable release and created no Git tag or GitHub Release."
+          } >>"$GITHUB_STEP_SUMMARY"
