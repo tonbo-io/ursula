@@ -357,14 +357,12 @@ pub async fn prepare_recovery_restart(
         )?;
         let missing_groups =
             wholly_missing_groups(&snapshot, target.id, drain_options.lag_tolerance);
-        if !missing_groups.is_empty() {
-            if !memory_rejoin {
-                bail!(
-                    "disk-WAL node {} is missing {} whole group(s); refusing empty-log recovery",
-                    target.id,
-                    missing_groups.len()
-                );
-            }
+        if !missing_groups.is_empty() && !memory_rejoin {
+            bail!(
+                "disk-WAL node {} is missing {} whole group(s); refusing empty-log recovery",
+                target.id,
+                missing_groups.len()
+            );
         }
         client.quiesce_for_restart(target).await.with_context(|| {
             format!("quiesce restarted node {} before rearming peers", target.id)

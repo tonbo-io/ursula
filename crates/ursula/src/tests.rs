@@ -3459,12 +3459,12 @@ async fn static_grpc_memory_node_rejoins_all_groups_after_allowed_log_revert() {
             .expect("wait for leader purge");
     }
 
-    let restarted_listener = tokio::net::TcpListener::bind(addrs[2])
+    let stale_listener = tokio::net::TcpListener::bind(addrs[2])
         .await
         .expect("rebind node 3 listener");
-    let restarted = spawn_static_grpc_test_node(
+    let stale_replacement = spawn_static_grpc_test_node(
         3,
-        restarted_listener,
+        stale_listener,
         peers.clone(),
         peers.clone(),
         true,
