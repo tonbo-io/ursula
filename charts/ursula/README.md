@@ -37,7 +37,7 @@ kind load docker-image ursula:dev
 From the published OCI chart:
 
 ```bash
-helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.4.9
+helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.4.10
 ```
 
 For a local image loaded into the cluster:
