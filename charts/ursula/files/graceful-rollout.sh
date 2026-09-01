@@ -236,28 +236,37 @@ reassert_restart_fence() {
 finish_rearmed_restart() {
   node_id=$1
   ordinal=$2
-  attempt=0
-  while [ "${REASSERT_RESULT}" = "restart-required" ]; do
-    attempt=$((attempt + 1))
-    if [ "${attempt}" -gt 3 ]; then
-      log "node ${node_id} still requires a prepared restart after 3 attempts"
-      return 1
-    fi
-    # reassert-restart-fence only re-arms groups that are wholly missing from
-    # the live replacement. The next memory-WAL restart clears every group, so
-    # prepare-restart must arm all group leaders before that replacement.
-    log "node ${node_id} requires prepared restart ${attempt}/3 after fence reassertion"
-    "${CTL}" prepare-restart --config "${MANIFEST}" --node "${node_id}"
-    record_state restarting "${node_id}"
-    replace_pod "${ordinal}"
-    wait_for_pod_ready "${ordinal}"
-    if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
-      log "node ${node_id} became Ready at a revision other than ${TARGET_REVISION}"
-      return 1
-    fi
-    start_forward "${ordinal}"
-    reassert_restart_fence "${node_id}"
-  done
+  if [ "${REASSERT_RESULT}" != "restart-required" ]; then
+    return 0
+  fi
+  # reassert-restart-fence only re-arms groups that are wholly missing from
+  # the live replacement. The next memory-WAL restart clears every group, so
+  # prepare-restart must arm all group leaders before that replacement.
+  log "node ${node_id} requires a prepared restart after fence reassertion"
+  "${CTL}" prepare-restart --config "${MANIFEST}" --node "${node_id}"
+  record_state restarting "${node_id}"
+  replace_pod "${ordinal}"
+  wait_for_pod_ready "${ordinal}"
+  if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
+    log "node ${node_id} became Ready at a revision other than ${TARGET_REVISION}"
+    return 1
+  fi
+  start_forward "${ordinal}"
+  # Kubernetes Ready only proves that the HTTP process is accepting traffic.
+  # A memory-WAL voter still needs time to recreate and catch up every Raft
+  # group. Reasserting before that point misclassifies in-flight groups as
+  # wholly missing and causes an unnecessary restart loop.
+  "${CTL}" wait \
+    --config "${MANIFEST}" \
+    --node "${node_id}" \
+    --stall-timeout-secs 300 \
+    --ready-timeout-secs 1800 \
+    --lag-tolerance 16
+  reassert_restart_fence "${node_id}"
+  if [ "${REASSERT_RESULT}" != "ready" ]; then
+    log "node ${node_id} required another restart after full Raft catch-up"
+    return 1
+  fi
 }
 
 record_state() {
