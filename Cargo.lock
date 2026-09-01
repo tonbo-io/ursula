@@ -288,7 +288,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
 dependencies = [
  "async-trait",
- "axum-core 0.4.5",
+ "axum-core 0.4.6",
  "bytes",
  "futures-util",
  "http",
@@ -343,7 +343,7 @@ dependencies = [
 
 [[package]]
 name = "axum-core"
-version = "0.4.5"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09f2bd6146b97ae3359fa0cc6d6b376d9539582c7b4220f041a33ec24c226199"
 dependencies = [
@@ -3060,7 +3060,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "raft-log"
-version = "0.4.5"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8999e6471b3bea3511286ba232930652756bd1ecc08e25a274836365655b4b70"
 dependencies = [
@@ -4356,7 +4356,7 @@ dependencies = [
 
 [[package]]
 name = "ursula"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "axum 0.8.9",
  "base64 0.22.1",
@@ -4394,7 +4394,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-bench"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4413,7 +4413,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-config"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "dirs",
  "serde",
@@ -4424,7 +4424,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-control"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "serde",
  "ursula-shard",
@@ -4432,7 +4432,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-ctl"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -4457,7 +4457,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-gateway"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "axum 0.8.9",
  "bytes",
@@ -4482,7 +4482,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-index"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -4510,7 +4510,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-observability"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "axum 0.8.9",
  "criterion",
@@ -4525,7 +4525,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-proto"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "prost 0.13.5",
  "prost-build",
@@ -4535,7 +4535,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-raft"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "bitflags",
  "bytes",
@@ -4573,7 +4573,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-runtime"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "blake3",
  "bytes",
@@ -4598,7 +4598,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-shard"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -4607,7 +4607,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-sim"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "axum 0.8.9",
  "madsim",
@@ -4626,7 +4626,7 @@ dependencies = [
 
 [[package]]
 name = "ursula-stream"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "blake3",
  "bytes",
