@@ -15,16 +15,17 @@ on:
   workflow_dispatch:
     inputs:
       commit:
-        description: Exact current main commit to build
+        description: Exact current main commit or same-repository open PR head to build
         required: true
         type: string
       confirm:
-        description: Type publish-main-commit-candidate
+        description: Type publish-main-commit-candidate or publish-open-pr-commit-candidate
         required: true
         type: string
 
 permissions:
   contents: read
+  pull-requests: read
   packages: write
   attestations: write
   id-token: write
@@ -55,21 +56,41 @@ jobs:
         env:
           CONFIRM: ${{ inputs.confirm }}
           EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
           REQUESTED_COMMIT: ${{ inputs.commit }}
         run: |
           set -euo pipefail
 
           commit="$(git rev-parse HEAD)"
+          channel="pr"
           if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
             [[ "$REQUESTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-            [ "$CONFIRM" = publish-main-commit-candidate ]
             [ "$commit" = "$REQUESTED_COMMIT" ]
             git fetch origin main --no-tags
-            [ "$(git rev-parse origin/main)" = "$commit" ]
+            if [[ "$CONFIRM" == publish-main-commit-candidate ]]; then
+              [ "$(git rev-parse origin/main)" = "$commit" ]
+              channel="main"
+            elif [[ "$CONFIRM" == publish-open-pr-commit-candidate ]]; then
+              matching_prs="$(
+                gh api \
+                  -H 'Accept: application/vnd.github+json' \
+                  "/repos/$REPOSITORY/commits/$commit/pulls" |
+                jq -r --arg repository "$REPOSITORY" --arg commit "$commit" \
+                  '[.[] | select(.state == "open" and .base.ref == "main" and .head.sha == $commit and .head.repo.full_name == $repository)] | length'
+              )"
+              [ "$matching_prs" = 1 ] || {
+                echo "$commit must be the unique head of an open same-repository PR targeting main" >&2
+                exit 1
+              }
+            else
+              echo "invalid candidate confirmation" >&2
+              exit 1
+            fi
           fi
 
           short_commit="${commit:0:12}"
-          candidate_version="0.0.0-main.${short_commit}"
+          candidate_version="0.0.0-${channel}.${short_commit}"
           echo "commit=$commit" >>"$GITHUB_OUTPUT"
           echo "version=$candidate_version" >>"$GITHUB_OUTPUT"
 

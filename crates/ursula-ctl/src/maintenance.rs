@@ -189,9 +189,10 @@ pub async fn drain_node(
 /// the target may be missing whole groups, but every other configured voter
 /// must be complete, mutually consistent, and caught up for every group.
 ///
-/// On success the maintenance-drain mark remains set and every stable group
-/// leader has accepted one empty-log rejoin for `target`. The caller must
-/// immediately restart that node, wait for catch-up, and then undrain it.
+/// On success the maintenance-drain mark remains set, the target's Raft cores
+/// are stopped, and every stable group leader has accepted one empty-log
+/// rejoin for `target`. The caller must immediately restart that node, wait for
+/// catch-up, and then undrain it.
 pub async fn prepare_amnesiac_restart(
     nodes: &[NodeInfo],
     target: &NodeInfo,
@@ -267,6 +268,10 @@ pub async fn prepare_amnesiac_restart(
             }
             tokio::time::sleep(drain_options.poll_interval).await;
         }
+        client
+            .quiesce_for_restart(target)
+            .await
+            .with_context(|| format!("quiesce amnesiac node {} before arming peers", target.id))?;
         arm_empty_rejoin(nodes, target, client, rejoin_options).await?;
         Ok::<_, anyhow::Error>(candidate.missing_group_ids.len())
     }
@@ -280,15 +285,15 @@ pub async fn prepare_amnesiac_restart(
     }
 }
 
-/// Re-establish the maintenance fence after the platform has restarted a
-/// voter. The server-side drain flag is process-local, so the replacement
-/// must be fenced again before catch-up is allowed to continue.
+/// Prepare a partial replacement for one more platform restart after an
+/// interrupted rollout.
 ///
 /// This operation is deliberately valid only while every non-target voter is
-/// complete and caught up. It transfers any leadership the replacement
-/// acquired during startup, then re-arms only groups that are still wholly
-/// absent on a memory-WAL target. Partially caught-up groups need no revert.
-pub async fn reassert_restart_fence(
+/// complete and caught up. It fences and quiesces the target before arming the
+/// full memory-WAL inventory for the next process. Arming only currently
+/// missing groups is unsafe because the restart discards partially recovered
+/// volatile groups too.
+pub async fn prepare_recovery_restart(
     nodes: &[NodeInfo],
     target: &NodeInfo,
     client: &MetricsClient,
@@ -296,18 +301,18 @@ pub async fn reassert_restart_fence(
     rejoin_options: &RejoinOptions,
 ) -> Result<usize> {
     if drain_options.dry_run {
-        bail!("restart fence reassertion does not support dry-run DrainOptions");
+        bail!("recovery restart preparation does not support dry-run DrainOptions");
     }
     let configured_node_ids = nodes.iter().map(|node| node.id).collect::<BTreeSet<_>>();
     if configured_node_ids.len() != nodes.len() || !configured_node_ids.contains(&target.id) {
-        bail!("restart fence requires an exact, unique configured voter inventory");
+        bail!("recovery restart requires an exact, unique configured voter inventory");
     }
     let memory_rejoin = resolve_restart_rejoin_policy(client, nodes).await?;
 
     client
         .set_maintenance_drain(target, true)
         .await
-        .with_context(|| format!("reassert maintenance-drain on restarted node {}", target.id))?;
+        .with_context(|| format!("mark maintenance-drain on recovery node {}", target.id))?;
     let prepared = async {
         let deadline = Instant::now() + drain_options.drain_timeout;
         loop {
@@ -334,7 +339,7 @@ pub async fn reassert_restart_fence(
             transfer_drain_plan(target, client, &plan).await?;
             if Instant::now() >= deadline {
                 bail!(
-                    "restart fence timeout: node {} still leads {} group(s) after {:?}",
+                    "recovery restart timeout: node {} still leads {} group(s) after {:?}",
                     target.id,
                     still_leads.len(),
                     drain_options.drain_timeout
@@ -352,16 +357,22 @@ pub async fn reassert_restart_fence(
         )?;
         let missing_groups =
             wholly_missing_groups(&snapshot, target.id, drain_options.lag_tolerance);
-        if !missing_groups.is_empty() {
-            if !memory_rejoin {
-                bail!(
-                    "disk-WAL node {} is missing {} whole group(s); refusing empty-log recovery",
-                    target.id,
-                    missing_groups.len()
-                );
-            }
-            arm_empty_rejoin_groups(nodes, target, client, rejoin_options, Some(&missing_groups))
-                .await?;
+        if !missing_groups.is_empty() && !memory_rejoin {
+            bail!(
+                "disk-WAL node {} is missing {} whole group(s); refusing empty-log recovery",
+                target.id,
+                missing_groups.len()
+            );
+        }
+        client.quiesce_for_restart(target).await.with_context(|| {
+            format!("quiesce restarted node {} before rearming peers", target.id)
+        })?;
+        if memory_rejoin {
+            // The next process loses every memory-WAL group, including groups
+            // that this partial replacement already recovered. Arm the full
+            // peer-reported inventory only after the old Raft cores have
+            // stopped, so they cannot consume the replacement's permissions.
+            arm_empty_rejoin(nodes, target, client, rejoin_options).await?;
         }
         Ok::<_, anyhow::Error>(missing_groups.len())
     }
@@ -388,7 +399,7 @@ fn validate_surviving_voters(
         .collect::<BTreeSet<_>>();
     if &reported != configured_node_ids {
         bail!(
-            "restart fence voter inventory differs: configured={configured_node_ids:?} reported={reported:?}"
+            "recovery restart voter inventory differs: configured={configured_node_ids:?} reported={reported:?}"
         );
     }
     for node_id in configured_node_ids {
@@ -949,25 +960,31 @@ fn stable_non_target_leader(
     target_node_id: u64,
 ) -> Result<u64> {
     let mut leader = None;
-    for view in &snap.per_node {
+    for view in snap
+        .per_node
+        .iter()
+        .filter(|view| view.node.id != target_node_id)
+    {
         let Some(group) = view.group(raft_group_id) else {
             continue;
         };
         let Some(candidate) = group.current_leader else {
             continue;
         };
-        if candidate == target_node_id {
-            bail!(
-                "target node {} is still reported as leader for group {} by node {}",
-                target_node_id,
-                raft_group_id,
-                view.node.id
-            );
+        // A follower's current_leader observation may remain stale across an
+        // otherwise completed transfer. The target is quiesced before this
+        // plan is built, so its frozen view is especially unsuitable as an
+        // authority. A leader's own view is the narrow authoritative signal:
+        // the allow-next-revert endpoint independently enforces the same
+        // self-leader condition, and the caller samples this map again after
+        // every group is armed.
+        if candidate != view.node.id {
+            continue;
         }
         if let Some(existing) = leader {
             if existing != candidate {
                 bail!(
-                    "conflicting leaders for group {} while allowing node {} rejoin: {} vs {}",
+                    "multiple peers self-report leadership for group {} while allowing node {} rejoin: {} vs {}",
                     raft_group_id,
                     target_node_id,
                     existing,
@@ -1037,6 +1054,8 @@ mod tests {
         metrics_fetches: AtomicUsize,
         armed_on_nodes: Mutex<Vec<u64>>,
         drained_nodes: Mutex<Vec<u64>>,
+        quiesced_nodes: Mutex<Vec<u64>>,
+        operations: Mutex<Vec<String>>,
     }
 
     #[derive(Clone)]
@@ -1090,6 +1109,12 @@ mod tests {
             .lock()
             .unwrap()
             .push(state.node_id);
+        state
+            .cluster
+            .operations
+            .lock()
+            .unwrap()
+            .push(format!("arm:{}", state.node_id));
         StatusCode::OK
     }
 
@@ -1100,6 +1125,28 @@ mod tests {
             .lock()
             .unwrap()
             .push(state.node_id);
+        state
+            .cluster
+            .operations
+            .lock()
+            .unwrap()
+            .push(format!("drain:{}", state.node_id));
+        StatusCode::OK
+    }
+
+    async fn mock_quiesce(State(state): State<MockNode>) -> StatusCode {
+        state
+            .cluster
+            .quiesced_nodes
+            .lock()
+            .unwrap()
+            .push(state.node_id);
+        state
+            .cluster
+            .operations
+            .lock()
+            .unwrap()
+            .push(format!("quiesce:{}", state.node_id));
         StatusCode::OK
     }
 
@@ -1109,6 +1156,8 @@ mod tests {
             metrics_fetches: AtomicUsize::new(0),
             armed_on_nodes: Mutex::new(Vec::new()),
             drained_nodes: Mutex::new(Vec::new()),
+            quiesced_nodes: Mutex::new(Vec::new()),
+            operations: Mutex::new(Vec::new()),
         });
         let mut nodes = Vec::new();
         for node_id in 1..=3 {
@@ -1125,6 +1174,7 @@ mod tests {
                     post(mock_arm),
                 )
                 .route("/__ursula/leadership-shed/maintenance", post(mock_drain))
+                .route("/__ursula/raft/quiesce-for-restart", post(mock_quiesce))
                 .with_state(state);
             tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
@@ -1170,9 +1220,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restarted_amnesiac_is_refenced_and_rearmed_on_current_leader() {
+    async fn partial_replacement_is_quiesced_before_full_inventory_is_rearmed() {
         let (nodes, cluster) = mock_cluster(LeaderScenario::TargetMissing).await;
-        let rearmed = reassert_restart_fence(
+        let missing = prepare_recovery_restart(
             &nodes,
             &nodes[2],
             &MetricsClient::new(Duration::from_secs(1)).unwrap(),
@@ -1192,9 +1242,15 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(rearmed, 1);
+        assert_eq!(missing, 1);
         assert_eq!(*cluster.drained_nodes.lock().unwrap(), vec![3]);
+        assert_eq!(*cluster.quiesced_nodes.lock().unwrap(), vec![3]);
         assert_eq!(*cluster.armed_on_nodes.lock().unwrap(), vec![2]);
+        assert_eq!(*cluster.operations.lock().unwrap(), vec![
+            "drain:3",
+            "quiesce:3",
+            "arm:2"
+        ]);
     }
 
     #[tokio::test]
@@ -1478,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_reported_target_leader_keeps_drain_active() {
+    fn drain_uses_all_reports_but_rejoin_uses_a_peer_self_leader() {
         let snapshot = ClusterSnapshot {
             per_node: vec![
                 NodeMetricsView {
@@ -1505,11 +1561,32 @@ mod tests {
         assert_eq!(still_led.len(), 1);
         assert_eq!(still_led[0].raft_group_id, 7);
 
-        let err = stable_non_target_leader(&snapshot, 7, 1).unwrap_err();
-        assert!(
-            err.to_string().contains("still reported as leader"),
-            "{err:#}"
-        );
+        assert_eq!(stable_non_target_leader(&snapshot, 7, 1).unwrap(), 2);
+    }
+
+    #[test]
+    fn rejoin_ignores_the_quiesced_targets_frozen_leader_view() {
+        let snapshot = ClusterSnapshot {
+            per_node: vec![
+                NodeMetricsView {
+                    node: n(1, "10.0.0.1"),
+                    groups: vec![group(159, 1, Some(1), 100, 100)],
+                    wal_backend: Some("memory".into()),
+                },
+                NodeMetricsView {
+                    node: n(2, "10.0.0.2"),
+                    groups: vec![group(159, 2, Some(3), 100, 100)],
+                    wal_backend: Some("memory".into()),
+                },
+                NodeMetricsView {
+                    node: n(3, "10.0.0.3"),
+                    groups: vec![group(159, 3, Some(1), 100, 100)],
+                    wal_backend: Some("memory".into()),
+                },
+            ],
+        };
+
+        assert_eq!(stable_non_target_leader(&snapshot, 159, 2).unwrap(), 1);
     }
 
     #[test]

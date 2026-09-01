@@ -167,6 +167,31 @@ impl MetricsClient {
             ))
         }
     }
+
+    pub async fn quiesce_for_restart(&self, node: &NodeInfo) -> Result<()> {
+        let url = node
+            .admin_url
+            .join("/__ursula/raft/quiesce-for-restart")
+            .with_context(|| format!("compose restart-quiesce url for node {}", node.id))?;
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "restart quiesce at node {} returned {}: {}",
+                node.id,
+                status,
+                body
+            ))
+        }
+    }
 }
 
 fn metrics_base_url(node: &NodeInfo) -> &url::Url {
