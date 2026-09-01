@@ -303,58 +303,13 @@ pub async fn prepare_recovery_restart(
     if drain_options.dry_run {
         bail!("recovery restart preparation does not support dry-run DrainOptions");
     }
-    let configured_node_ids = nodes.iter().map(|node| node.id).collect::<BTreeSet<_>>();
-    if configured_node_ids.len() != nodes.len() || !configured_node_ids.contains(&target.id) {
-        bail!("recovery restart requires an exact, unique configured voter inventory");
-    }
+    let configured_node_ids = recovery_inventory(nodes, target)?;
     let memory_rejoin = resolve_restart_rejoin_policy(client, nodes).await?;
 
-    client
-        .set_maintenance_drain(target, true)
-        .await
-        .with_context(|| format!("mark maintenance-drain on recovery node {}", target.id))?;
     let prepared = async {
-        let deadline = Instant::now() + drain_options.drain_timeout;
-        loop {
-            let snapshot = client.fetch_cluster(nodes).await?;
-            validate_surviving_voters(
-                &snapshot,
-                &configured_node_ids,
-                target.id,
-                drain_options.lag_tolerance,
-            )?;
-            let still_leads = snapshot.groups_reported_led_by(target.id);
-            if still_leads.is_empty() {
-                break;
-            }
-            let plan = plan_drain(&snapshot, target.id);
-            if plan.transfers.len() != still_leads.len() {
-                bail!(
-                    "restarted node {} still leads {} group(s), but only {} safe transfer(s) exist",
-                    target.id,
-                    still_leads.len(),
-                    plan.transfers.len()
-                );
-            }
-            transfer_drain_plan(target, client, &plan).await?;
-            if Instant::now() >= deadline {
-                bail!(
-                    "recovery restart timeout: node {} still leads {} group(s) after {:?}",
-                    target.id,
-                    still_leads.len(),
-                    drain_options.drain_timeout
-                );
-            }
-            tokio::time::sleep(drain_options.poll_interval).await;
-        }
-
-        let snapshot = client.fetch_cluster(nodes).await?;
-        validate_surviving_voters(
-            &snapshot,
-            &configured_node_ids,
-            target.id,
-            drain_options.lag_tolerance,
-        )?;
+        let snapshot =
+            drain_recovery_target(nodes, target, client, drain_options, &configured_node_ids)
+                .await?;
         let missing_groups =
             wholly_missing_groups(&snapshot, target.id, drain_options.lag_tolerance);
         if !missing_groups.is_empty() && !memory_rejoin {
@@ -383,6 +338,135 @@ pub async fn prepare_recovery_restart(
             clear_maintenance_drain(client, target).await;
             Err(error)
         }
+    }
+}
+
+/// Drain a partial memory-WAL replacement without calling restart quiescence.
+///
+/// This is the narrow upgrade bridge for a replacement process that predates
+/// `/__ursula/raft/quiesce-for-restart`. Every surviving voter is validated
+/// before the target loses leadership. On success its process-local drain
+/// fence intentionally remains set; the platform must immediately replace it
+/// with a binary that supports [`prepare_recovery_restart`]. No rejoin token is
+/// armed here, so the old process cannot consume a permission after handoff.
+pub async fn prepare_recovery_handoff(
+    nodes: &[NodeInfo],
+    target: &NodeInfo,
+    client: &MetricsClient,
+    drain_options: &DrainOptions,
+) -> Result<usize> {
+    if drain_options.dry_run {
+        bail!("recovery handoff does not support dry-run DrainOptions");
+    }
+    let configured_node_ids = recovery_inventory(nodes, target)?;
+    if !resolve_restart_rejoin_policy(client, nodes).await? {
+        bail!("recovery handoff is only applicable to a memory-WAL cluster");
+    }
+    let prepared =
+        drain_recovery_target(nodes, target, client, drain_options, &configured_node_ids).await;
+    match prepared {
+        Ok(snapshot) => {
+            Ok(wholly_missing_groups(&snapshot, target.id, drain_options.lag_tolerance).len())
+        }
+        Err(error) => {
+            clear_maintenance_drain(client, target).await;
+            Err(error)
+        }
+    }
+}
+
+/// Re-establish the recovery fence on a newly started memory-WAL process and
+/// arm only the groups that are still empty in that process.
+///
+/// Maintenance drain is intentionally process-local, so a Kubernetes Pod
+/// replacement loses the fence installed before restart. The final process
+/// must be drained again before catch-up; otherwise peer leadership balancers
+/// can immediately transfer leaders back to the recovering node. Unlike
+/// [`prepare_recovery_restart`], this operation does not quiesce or restart the
+/// target. It installs one-shot permissions only for groups whose target view
+/// has no applied entry, so partially recovered groups retain their log. Once
+/// the drain is installed, every error deliberately leaves it set: a failed
+/// recovery must not make the incomplete process leadership-eligible.
+pub async fn repair_recovery_rejoin(
+    nodes: &[NodeInfo],
+    target: &NodeInfo,
+    client: &MetricsClient,
+    drain_options: &DrainOptions,
+    rejoin_options: &RejoinOptions,
+) -> Result<usize> {
+    if drain_options.dry_run {
+        bail!("recovery rejoin repair does not support dry-run DrainOptions");
+    }
+    let configured_node_ids = recovery_inventory(nodes, target)?;
+    if !resolve_restart_rejoin_policy(client, nodes).await? {
+        bail!("recovery rejoin repair is only applicable to a memory-WAL cluster");
+    }
+
+    async {
+        let snapshot =
+            drain_recovery_target(nodes, target, client, drain_options, &configured_node_ids)
+                .await?;
+        let empty_groups = empty_target_groups(&snapshot, target.id, drain_options.lag_tolerance);
+        if !empty_groups.is_empty() {
+            arm_empty_rejoin_groups(nodes, target, client, rejoin_options, Some(&empty_groups))
+                .await?;
+        }
+        Ok::<_, anyhow::Error>(empty_groups.len())
+    }
+    .await
+}
+
+fn recovery_inventory(nodes: &[NodeInfo], target: &NodeInfo) -> Result<BTreeSet<u64>> {
+    let configured_node_ids = nodes.iter().map(|node| node.id).collect::<BTreeSet<_>>();
+    if configured_node_ids.len() != nodes.len() || !configured_node_ids.contains(&target.id) {
+        bail!("recovery restart requires an exact, unique configured voter inventory");
+    }
+    Ok(configured_node_ids)
+}
+
+async fn drain_recovery_target(
+    nodes: &[NodeInfo],
+    target: &NodeInfo,
+    client: &MetricsClient,
+    drain_options: &DrainOptions,
+    configured_node_ids: &BTreeSet<u64>,
+) -> Result<ClusterSnapshot> {
+    client
+        .set_maintenance_drain(target, true)
+        .await
+        .with_context(|| format!("mark maintenance-drain on recovery node {}", target.id))?;
+    let deadline = Instant::now() + drain_options.drain_timeout;
+    loop {
+        let snapshot = client.fetch_cluster(nodes).await?;
+        validate_surviving_voters(
+            &snapshot,
+            configured_node_ids,
+            target.id,
+            drain_options.lag_tolerance,
+        )?;
+        let still_leads = snapshot.groups_reported_led_by(target.id);
+        if still_leads.is_empty() {
+            return Ok(snapshot);
+        }
+        let plan = plan_drain(&snapshot, target.id);
+        if plan.transfers.len() != still_leads.len() {
+            bail!(
+                "restarted node {} still leads {} group(s), but only {} safe transfer(s) exist",
+                target.id,
+                still_leads.len(),
+                plan.transfers.len()
+            );
+        }
+        transfer_drain_plan(target, client, &plan).await?;
+        if Instant::now() >= deadline {
+            bail!(
+                "recovery restart timeout: node {} still leads {} group(s) after {:?}",
+                target.id,
+                still_leads.len(),
+                drain_options.drain_timeout
+            );
+        }
+        tokio::time::sleep(drain_options.poll_interval).await;
     }
 }
 
@@ -421,6 +505,19 @@ fn wholly_missing_groups(
         .per_group
         .into_values()
         .filter(|group| !group.ready && !group.voter_member && group.target_applied_index.is_none())
+        .map(|group| group.raft_group_id)
+        .collect()
+}
+
+fn empty_target_groups(
+    snapshot: &ClusterSnapshot,
+    target_node_id: u64,
+    lag_tolerance: u64,
+) -> BTreeSet<u64> {
+    check_readiness(snapshot, target_node_id, lag_tolerance)
+        .per_group
+        .into_values()
+        .filter(|group| !group.ready && group.target_applied_index.is_none())
         .map(|group| group.raft_group_id)
         .collect()
 }
@@ -1250,6 +1347,63 @@ mod tests {
             "drain:3",
             "quiesce:3",
             "arm:2"
+        ]);
+    }
+
+    #[tokio::test]
+    async fn legacy_partial_replacement_handoff_drains_without_arming() {
+        let (nodes, cluster) = mock_cluster(LeaderScenario::TargetMissing).await;
+        let missing = prepare_recovery_handoff(
+            &nodes,
+            &nodes[2],
+            &MetricsClient::new(Duration::from_secs(1)).unwrap(),
+            &DrainOptions {
+                drain_timeout: Duration::from_secs(1),
+                ready_timeout: Duration::ZERO,
+                poll_interval: Duration::from_millis(1),
+                lag_tolerance: 16,
+                dry_run: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(missing, 1);
+        assert_eq!(*cluster.drained_nodes.lock().unwrap(), vec![3]);
+        assert!(cluster.quiesced_nodes.lock().unwrap().is_empty());
+        assert!(cluster.armed_on_nodes.lock().unwrap().is_empty());
+        assert_eq!(*cluster.operations.lock().unwrap(), vec!["drain:3"]);
+    }
+
+    #[tokio::test]
+    async fn final_recovery_process_is_redrained_and_only_empty_groups_are_rearmed() {
+        let (nodes, cluster) = mock_cluster(LeaderScenario::TargetMissing).await;
+        let empty = repair_recovery_rejoin(
+            &nodes,
+            &nodes[2],
+            &MetricsClient::new(Duration::from_secs(1)).unwrap(),
+            &DrainOptions {
+                drain_timeout: Duration::from_secs(1),
+                ready_timeout: Duration::ZERO,
+                poll_interval: Duration::from_millis(1),
+                lag_tolerance: 16,
+                dry_run: false,
+            },
+            &RejoinOptions {
+                timeout: Duration::from_secs(1),
+                max_concurrency: 2,
+                retry_interval: Duration::from_millis(1),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(empty, 1);
+        assert_eq!(*cluster.drained_nodes.lock().unwrap(), vec![3]);
+        assert!(cluster.quiesced_nodes.lock().unwrap().is_empty());
+        assert_eq!(*cluster.armed_on_nodes.lock().unwrap(), vec![2]);
+        assert_eq!(*cluster.operations.lock().unwrap(), vec![
+            "drain:3", "arm:2"
         ]);
     }
 

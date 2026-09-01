@@ -219,6 +219,26 @@ prepare_recovery_restart() {
     --lag-tolerance 16
 }
 
+prepare_recovery_handoff() {
+  node_id=$1
+  "${CTL}" prepare-recovery-handoff \
+    --config "${MANIFEST}" \
+    --node "${node_id}" \
+    --drain-timeout-secs 300 \
+    --http-timeout-secs 60 \
+    --lag-tolerance 16
+}
+
+repair_recovery_rejoin() {
+  node_id=$1
+  "${CTL}" repair-recovery-rejoin \
+    --config "${MANIFEST}" \
+    --node "${node_id}" \
+    --drain-timeout-secs 300 \
+    --http-timeout-secs 60 \
+    --lag-tolerance 16
+}
+
 record_state() {
   phase=$1
   node_id=$2
@@ -276,6 +296,53 @@ replacement_attempt_was_superseded() {
   [ "${current_sequence}" -gt "${saved_sequence}" ]
 }
 
+finish_recovery_restart() {
+  ordinal=$1
+  node_id=$2
+  wait_for_pod_ready "${ordinal}"
+  if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
+    log "recovered node ${node_id} did not start at ${TARGET_IMAGE}@${TARGET_REVISION}"
+    return 1
+  fi
+  start_forward "${ordinal}"
+  repair_recovery_rejoin "${node_id}"
+  "${CTL}" wait \
+    --config "${MANIFEST}" \
+    --node "${node_id}" \
+    --stall-timeout-secs 300 \
+    --ready-timeout-secs 1800 \
+    --lag-tolerance 16
+  "${CTL}" undrain --config "${MANIFEST}" --node "${node_id}"
+  strict_verify
+  record_state complete "${node_id}"
+}
+
+resume_quiesce_upgrade() {
+  ordinal=$1
+  node_id=$2
+  source_pod_uid=$3
+  pod="${STATEFULSET}-${ordinal}"
+  current_pod_uid=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
+    -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+  if [ -n "${current_pod_uid}" ] && [ "${current_pod_uid}" = "${source_pod_uid}" ]; then
+    log "replacing drained legacy node ${node_id} with a restart-quiesce-capable binary"
+    replace_pod "${ordinal}"
+  fi
+  wait_for_pod_ready "${ordinal}"
+  if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
+    log "legacy recovery handoff at node ${node_id} produced a non-target Pod"
+    return 1
+  fi
+  start_forward "${ordinal}"
+  prepare_recovery_restart "${node_id}"
+  quiesced_pod_uid=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
+    -o jsonpath='{.metadata.uid}')
+  record_state restarting "${node_id}" "${quiesced_pod_uid}"
+  log "node ${node_id} now supports restart quiescence and is rearmed; recreating it once"
+  replace_pod "${ordinal}"
+  finish_recovery_restart "${ordinal}" "${node_id}"
+}
+
 resume_if_needed() {
   if ! kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" >/dev/null 2>&1; then
     return 0
@@ -292,11 +359,23 @@ resume_if_needed() {
     -o jsonpath='{.data.phase}')
   node_id=$(kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
     -o jsonpath='{.data.node-id}')
-  if [ "${phase}" != "restarting" ]; then
-    return 0
-  fi
+  case "${phase}" in
+    complete)
+      return 0
+      ;;
+    restarting|upgrading-restart-quiesce)
+      ;;
+    *)
+      log "unsupported rollout state phase: ${phase}"
+      return 1
+      ;;
+  esac
   case "${state_schema:-1}" in
     1)
+      if [ "${phase}" != "restarting" ]; then
+        log "rollout state schema 1 cannot represent phase ${phase}"
+        return 1
+      fi
       ;;
     2)
       if [ -z "${source_pod_uid}" ]; then
@@ -322,6 +401,10 @@ resume_if_needed() {
   ordinal=$((node_id - 1))
   TARGET_REVISION=$(desired_revision)
   log "resuming interrupted rollout at node ${node_id}: schema=${state_schema:-1} saved=${saved_image}@${saved_revision} current=${TARGET_IMAGE}@${TARGET_REVISION}"
+  if [ "${phase}" = "upgrading-restart-quiesce" ]; then
+    resume_quiesce_upgrade "${ordinal}" "${node_id}" "${source_pod_uid}"
+    return
+  fi
   if replacement_attempt_was_superseded "${ordinal}" "${saved_revision}" "${source_pod_uid}"; then
     log "saved replacement at node ${node_id} was superseded by a newer Ready Pod; verifying before closing the old state"
     start_forward "${ordinal}"
@@ -339,6 +422,22 @@ resume_if_needed() {
     fi
     log "superseding Pod at node ${node_id} is not yet a complete voter; continuing fail-closed recovery"
   fi
+  if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
+    # The concrete compatibility consumer is an interrupted rollout whose
+    # partial replacement predates restart quiescence. Rearming while that
+    # process is alive is unsafe: it could consume one-shot revert permission.
+    # Drain it without arming anything, persist the handoff, replace it with
+    # the target binary, then use the normal quiesce-and-rearm operation.
+    # Remove this phase after every retained rollout state and running voter
+    # is known to include the restart-quiesce endpoint.
+    start_forward "${ordinal}"
+    prepare_recovery_handoff "${node_id}"
+    legacy_pod_uid=$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-${ordinal}" \
+      -o jsonpath='{.metadata.uid}')
+    record_state upgrading-restart-quiesce "${node_id}" "${legacy_pod_uid}"
+    resume_quiesce_upgrade "${ordinal}" "${node_id}" "${legacy_pod_uid}"
+    return
+  fi
   # `restarting` is written after drain and before the irreversible quiesce.
   # If a later Helm attempt finds it, waiting first deadlocks: the quiesced or
   # stale pod cannot become Ready and only this state machine may replace it.
@@ -349,23 +448,12 @@ resume_if_needed() {
   # consume those one-shot permissions.
   start_forward "${ordinal}"
   prepare_recovery_restart "${node_id}"
+  quiesced_pod_uid=$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-${ordinal}" \
+    -o jsonpath='{.metadata.uid}')
+  record_state restarting "${node_id}" "${quiesced_pod_uid}"
   log "node ${node_id} is quiesced and rearmed; recreating the voter"
   replace_pod "${ordinal}"
-  wait_for_pod_ready "${ordinal}"
-  if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
-    log "node ${node_id} became Ready at a revision other than ${TARGET_REVISION}"
-    return 1
-  fi
-  start_forward "${ordinal}"
-  "${CTL}" wait \
-    --config "${MANIFEST}" \
-    --node "${node_id}" \
-    --stall-timeout-secs 300 \
-    --ready-timeout-secs 1800 \
-    --lag-tolerance 16
-  "${CTL}" undrain --config "${MANIFEST}" --node "${node_id}"
-  strict_verify
-  record_state complete "${node_id}"
+  finish_recovery_restart "${ordinal}" "${node_id}"
 }
 
 recover_amnesiac_if_needed() {

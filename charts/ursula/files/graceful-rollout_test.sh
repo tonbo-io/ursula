@@ -19,6 +19,7 @@ original_prepare_recovery_restart=$(declare -f prepare_recovery_restart)
 original_record_state=$(declare -f record_state)
 
 mocked_revision=ursula-stale
+mocked_uid=legacy-partial-uid
 kubectl() {
   case "$*" in
     *"get configmap ursula-rollout-state -o jsonpath={.data.target-image}"*)
@@ -48,6 +49,9 @@ kubectl() {
     *"get pod ursula-1 -o jsonpath={.status.conditions"*)
       printf '%s' False
       ;;
+    *"get pod ursula-1 -o jsonpath={.metadata.uid}"*)
+      printf '%s' "${mocked_uid}"
+      ;;
     *)
       printf 'unexpected kubectl invocation: %s\n' "$*" >&2
       return 1
@@ -57,7 +61,7 @@ kubectl() {
 
 wait_for_pod_ready() {
   [ "$1" = "1" ]
-  [ "${replaced_stale}" = "1" ]
+  [ "${replacement_count}" -ge 1 ]
 }
 
 start_forward() {
@@ -71,7 +75,8 @@ desired_revision() {
 
 replace_pod() {
   [ "$1" = "1" ]
-  replaced_stale=1
+  replacement_count=$((replacement_count + 1))
+  mocked_uid="replacement-${replacement_count}"
   mocked_revision=ursula-current
 }
 
@@ -82,21 +87,46 @@ prepare_recovery_restart() {
   resumed_prepare_recovery=1
 }
 
-record_state() {
-  [ "$1" = "complete" ]
-  [ "$2" = "2" ]
-  resumed_complete=1
+prepare_recovery_handoff() {
+  [ "$1" = "2" ]
+  resumed_prepare_handoff=1
 }
 
-replaced_stale=0
+record_state() {
+  [ "$2" = "2" ]
+  case "$1" in
+    upgrading-restart-quiesce)
+      [ "$3" = legacy-partial-uid ]
+      resumed_upgrade_state=1
+      ;;
+    restarting)
+      [ "$3" = replacement-1 ]
+      resumed_restarting_state=1
+      ;;
+    complete)
+      resumed_complete=1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+replacement_count=0
 resumed_forward=0
 resumed_complete=0
 resumed_prepare_recovery=0
+resumed_prepare_handoff=0
+resumed_upgrade_state=0
+resumed_restarting_state=0
 CTL=true
 resume_if_needed
-[ "${replaced_stale}" = "1" ]
+[ "${replacement_count}" = "2" ]
 [ "${resumed_forward}" = "1" ]
+[ "${resumed_prepare_handoff}" = "1" ]
 [ "${resumed_prepare_recovery}" = "1" ]
+[ "${resumed_upgrade_state}" = "1" ]
+[ "${resumed_restarting_state}" = "1" ]
 [ "${resumed_complete}" = "1" ]
 
 # A schema-v1 state can outlive more than one failed Helm attempt. If the
