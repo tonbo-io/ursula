@@ -16,12 +16,14 @@ use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::HeadStreamResponse;
+use ursula_runtime::PurgeBucketResponse;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::ReadStreamResponse;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 
 use crate::codec::decode_wire;
+use crate::codec::encode_wire;
 use crate::grpc::GRPC_LEADER_CHANNELS;
 use crate::grpc::RAFT_GRPC_MAX_MESSAGE_BYTES;
 use crate::grpc::RaftClient;
@@ -161,6 +163,58 @@ pub(crate) async fn forward_group_read_to_leader(
         .await
         .map(|response| response.into_inner())
         .map_err(|err| GroupEngineError::new(format!("forward group read to leader: {err}")))
+}
+
+/// Forward the cluster-wide administrative bucket purge to the known
+/// Raft-group leader. Ordinary client writes intentionally do not use this
+/// path: their admission checks must run on the serving leader before
+/// replication. PurgeBucket has no per-stream admission step, and constraining
+/// this helper to that exact command keeps the exception narrow.
+pub(crate) async fn forward_purge_bucket_to_leader(
+    placement: ShardPlacement,
+    leader_node: &BasicNode,
+    bucket_id: String,
+) -> Result<PurgeBucketResponse, GroupEngineError> {
+    let channel = grpc_leader_channel(&leader_node.addr).await?;
+    let mut client = RaftClient::new(channel)
+        .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES);
+    let mut grpc_request = tonic::Request::new(raft_internal_proto::GroupWriteRequestV1 {
+        raft_group_id: placement.raft_group_id.0,
+        core_id: u32::from(placement.core_id.0),
+        shard_id: placement.shard_id.0,
+        command_payloads: vec![encode_wire(&GroupWriteCommand::Stream(
+            ursula_stream::StreamCommand::PurgeBucket { bucket_id },
+        ))],
+    });
+    crate::telemetry::inject_current_context(grpc_request.metadata_mut());
+    let response = client
+        .group_write(grpc_request)
+        .await
+        .map_err(|err| GroupEngineError::new(format!("forward group write to leader: {err}")))?
+        .into_inner();
+    let mut results = response.results.into_iter();
+    let result = results
+        .next()
+        .ok_or_else(|| GroupEngineError::new("forward group write returned no result"))?;
+    if results.next().is_some() {
+        return Err(GroupEngineError::new(
+            "forward group write returned more than one result",
+        ));
+    }
+    if result.ok {
+        match decode_wire(&result.payload, "bucket purge response")? {
+            GroupWriteResponse::PurgeBucket(response) => Ok(response),
+            other => Err(GroupEngineError::new(format!(
+                "unexpected forwarded bucket purge response: {other:?}"
+            ))),
+        }
+    } else {
+        Err(decode_wire::<GroupEngineError>(
+            &result.payload,
+            "bucket purge error",
+        )?)
+    }
 }
 
 pub(crate) async fn grpc_leader_channel(addr: &str) -> Result<Channel, GroupEngineError> {

@@ -98,6 +98,7 @@ use ursula_stream::StreamCommand;
 
 use crate::forward::forward_get_stream_attrs_to_leader;
 use crate::forward::forward_head_stream_to_leader;
+use crate::forward::forward_purge_bucket_to_leader;
 use crate::forward::forward_read_stream_to_leader;
 use crate::forward::group_engine_client_write_error;
 use crate::forward::group_engine_forward_to_leader_error;
@@ -1157,6 +1158,21 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupPurgeBucketFuture<'a> {
         Box::pin(async move {
+            if !self.raft.is_leader() {
+                let leader_id = self.raft.current_leader().await;
+                let leader_node = self.current_leader_node().await;
+                let self_id = self.raft.metrics().borrow_watched().id;
+                let Some(leader_node) = leader_node else {
+                    return Err(group_engine_forward_to_leader_error(
+                        "OpenRaft bucket purge has no known group leader",
+                        leader_id,
+                        None,
+                        self_id,
+                    ));
+                };
+                return forward_purge_bucket_to_leader(self.placement, &leader_node, bucket_id)
+                    .await;
+            }
             match self
                 .write(GroupWriteCommand::Stream(StreamCommand::PurgeBucket {
                     bucket_id,
