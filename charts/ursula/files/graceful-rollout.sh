@@ -19,6 +19,7 @@ CTL=${CTL:-/tools/ursulactl}
 STATE_CONFIGMAP="${STATEFULSET}-rollout-state"
 MANIFEST=/tmp/cluster.json
 TARGET_REVISION=
+PREPARED_RESTART_NODE=
 
 log() {
   printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
@@ -93,7 +94,33 @@ stop_forwards() {
     ordinal=$((ordinal + 1))
   done
 }
-trap stop_forwards EXIT INT TERM
+
+abort_incomplete_prepared_restart() {
+  if [ -z "${PREPARED_RESTART_NODE}" ] || [ ! -f "${MANIFEST}" ]; then
+    return 0
+  fi
+  log "releasing survivor fences for failed prepared restart at node ${PREPARED_RESTART_NODE}"
+  "${CTL}" abort-prepared-restart \
+    --config "${MANIFEST}" \
+    --node "${PREPARED_RESTART_NODE}" \
+    --http-timeout-secs 60 || true
+  PREPARED_RESTART_NODE=
+}
+
+cleanup() {
+  abort_incomplete_prepared_restart
+  stop_forwards
+}
+trap cleanup EXIT INT TERM
+
+finish_prepared_restart() {
+  node_id=$1
+  "${CTL}" finish-prepared-restart \
+    --config "${MANIFEST}" \
+    --node "${node_id}" \
+    --http-timeout-secs 60
+  PREPARED_RESTART_NODE=
+}
 
 wait_for_template() {
   attempts=0
@@ -211,6 +238,7 @@ strict_verify() {
 
 prepare_recovery_restart() {
   node_id=$1
+  PREPARED_RESTART_NODE=${node_id}
   "${CTL}" prepare-recovery-restart \
     --config "${MANIFEST}" \
     --node "${node_id}" \
@@ -301,7 +329,7 @@ finish_recovery_restart() {
     --stall-timeout-secs 300 \
     --ready-timeout-secs 1800 \
     --lag-tolerance 16
-  "${CTL}" undrain --config "${MANIFEST}" --node "${node_id}"
+  finish_prepared_restart "${node_id}"
   strict_verify
   record_state complete "${node_id}"
 }
@@ -468,6 +496,7 @@ recover_amnesiac_if_needed() {
   source_pod_uid=$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-${ordinal}" \
     -o jsonpath='{.metadata.uid}')
   record_state restarting "${node_id}" "${source_pod_uid}"
+  PREPARED_RESTART_NODE=${node_id}
   "${CTL}" prepare-amnesiac-restart \
     --config "${MANIFEST}" \
     --node "${node_id}" \
@@ -487,7 +516,7 @@ recover_amnesiac_if_needed() {
     --stall-timeout-secs 300 \
     --ready-timeout-secs 1800 \
     --lag-tolerance 16
-  "${CTL}" undrain --config "${MANIFEST}" --node "${node_id}"
+  finish_prepared_restart "${node_id}"
   strict_verify
   record_state complete "${node_id}"
   log "amnesiac voter ${node_id} recovered and verified"
@@ -523,6 +552,7 @@ roll_node() {
   source_pod_uid=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
     -o jsonpath='{.metadata.uid}')
   record_state restarting "${node_id}" "${source_pod_uid}"
+  PREPARED_RESTART_NODE=${node_id}
   "${CTL}" prepare-restart \
     --config "${MANIFEST}" \
     --node "${node_id}" \
@@ -551,7 +581,7 @@ roll_node() {
     --stall-timeout-secs 300 \
     --ready-timeout-secs 1800 \
     --lag-tolerance 16
-  "${CTL}" undrain --config "${MANIFEST}" --node "${node_id}"
+  finish_prepared_restart "${node_id}"
   strict_verify
   TARGET_REVISION=${current_revision}
   record_state complete "${node_id}"

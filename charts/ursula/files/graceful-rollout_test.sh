@@ -301,7 +301,7 @@ case "$1" in
   classify-amnesiac)
     printf '%s\n' 3
     ;;
-  prepare-amnesiac-restart|wait|undrain)
+  prepare-amnesiac-restart|wait|finish-prepared-restart|abort-prepared-restart)
     printf '%s\n' "$1" >>"${mock_ctl_calls}"
     ;;
   *)
@@ -332,9 +332,14 @@ recover_amnesiac_if_needed
 grep -q '^prepare-amnesiac-restart$' "${mock_ctl_calls}"
 grep -q '^restarting 3$' "${mock_ctl_calls}"
 grep -q '^wait$' "${mock_ctl_calls}"
-grep -q '^undrain$' "${mock_ctl_calls}"
+grep -q '^finish-prepared-restart$' "${mock_ctl_calls}"
 grep -q '^complete 3$' "${mock_ctl_calls}"
-rm -f "${mock_ctl}" "${mock_ctl_calls}"
+printf '{}\n' >"${MANIFEST}"
+PREPARED_RESTART_NODE=2
+abort_incomplete_prepared_restart
+grep -q '^abort-prepared-restart$' "${mock_ctl_calls}"
+[ -z "${PREPARED_RESTART_NODE}" ]
+rm -f "${mock_ctl}" "${mock_ctl_calls}" "${MANIFEST}"
 
 eval "${original_prepare_recovery_restart}"
 

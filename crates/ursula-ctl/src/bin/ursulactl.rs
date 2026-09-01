@@ -46,8 +46,15 @@ enum Command {
     /// volatile log. Refused on disk-backed clusters.
     AllowRejoin(NodeArgs),
     /// Quiesce one drained node for an immediate platform restart. Memory-WAL
-    /// clusters then arm stable-leader rejoin permissions.
+    /// clusters then arm rejoin permissions while survivor leadership is
+    /// pinned to one anchor.
     PrepareRestart(NodeArgs),
+    /// Release the target and survivor maintenance fences after the prepared
+    /// replacement has caught up.
+    FinishPreparedRestart(NodeArgs),
+    /// Release only survivor fences after a prepared replacement failed. The
+    /// uncertain target remains maintenance-drained.
+    AbortPreparedRestart(NodeArgs),
     /// Recover the uniquely identifiable voter that is missing whole Raft
     /// groups. Drains and quiesces it, then arms one memory-WAL rejoin before
     /// the platform immediately restarts it.
@@ -250,6 +257,8 @@ async fn main() -> Result<()> {
         Command::Wait(args) => run_wait_subcommand(args).await,
         Command::AllowRejoin(args) => run_allow_rejoin_subcommand(args).await,
         Command::PrepareRestart(args) => run_prepare_restart_subcommand(args).await,
+        Command::FinishPreparedRestart(args) => run_finish_prepared_restart_subcommand(args).await,
+        Command::AbortPreparedRestart(args) => run_abort_prepared_restart_subcommand(args).await,
         Command::PrepareAmnesiacRestart(args) => {
             run_prepare_amnesiac_restart_subcommand(args).await
         }
@@ -478,26 +487,43 @@ async fn run_prepare_restart_subcommand(args: NodeArgs) -> Result<()> {
     let nodes = load_nodes(&args.config).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
     let target = find_node(&nodes, args.node)?;
-    let memory_rejoin = ursula_ctl::resolve_restart_rejoin_policy(&client, &nodes).await?;
-    client.quiesce_for_restart(target).await?;
-    if memory_rejoin {
-        ursula_ctl::arm_empty_rejoin(
-            &nodes,
-            target,
-            &client,
-            &ursula_ctl::RejoinOptions::default(),
-        )
-        .await?;
-        println!(
-            "node {}: quiesced and memory-WAL restart prepared on stable group leaders",
-            target.id
-        );
-    } else {
-        println!(
-            "node {}: quiesced for disk-WAL restart; no empty-log rejoin permission needed",
-            target.id
-        );
-    }
+    let preparation = ursula_ctl::prepare_restart(
+        &nodes,
+        target,
+        &client,
+        &ursula_ctl::DrainOptions {
+            ready_timeout: Duration::ZERO,
+            dry_run: false,
+            ..ursula_ctl::DrainOptions::default()
+        },
+        &ursula_ctl::RejoinOptions::default(),
+    )
+    .await?;
+    println!(
+        "node {}: quiesced with restart leaders pinned to node {}; fenced survivors={:?}",
+        target.id, preparation.leader_anchor, preparation.fenced_node_ids
+    );
+    Ok(())
+}
+
+async fn run_finish_prepared_restart_subcommand(args: NodeArgs) -> Result<()> {
+    let nodes = load_nodes(&args.config).await?;
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let target = find_node(&nodes, args.node)?;
+    ursula_ctl::finish_prepared_restart(&nodes, target, &client).await?;
+    println!("node {}: prepared restart fences cleared", target.id);
+    Ok(())
+}
+
+async fn run_abort_prepared_restart_subcommand(args: NodeArgs) -> Result<()> {
+    let nodes = load_nodes(&args.config).await?;
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let target = find_node(&nodes, args.node)?;
+    ursula_ctl::abort_prepared_restart(&nodes, target, &client).await?;
+    println!(
+        "node {}: survivor restart fences cleared; target remains drained",
+        target.id
+    );
     Ok(())
 }
 
@@ -505,7 +531,7 @@ async fn run_prepare_amnesiac_restart_subcommand(args: RestartTargetArgs) -> Res
     let nodes = load_nodes(&args.config).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
     let target = find_node(&nodes, args.node)?;
-    let missing_groups = ursula_ctl::prepare_amnesiac_restart(
+    let preparation = ursula_ctl::prepare_amnesiac_restart(
         &nodes,
         target,
         &client,
@@ -520,8 +546,11 @@ async fn run_prepare_amnesiac_restart_subcommand(args: RestartTargetArgs) -> Res
     )
     .await?;
     println!(
-        "node {}: prepared amnesiac restart for {} missing group(s); restart immediately",
-        target.id, missing_groups
+        "node {}: prepared amnesiac restart for {} missing group(s); leaders pinned to node {}; fenced survivors={:?}; restart immediately",
+        target.id,
+        preparation.missing_group_count,
+        preparation.leader_anchor,
+        preparation.fenced_node_ids
     );
     Ok(())
 }
@@ -530,7 +559,7 @@ async fn run_prepare_recovery_restart_subcommand(args: RestartTargetArgs) -> Res
     let nodes = load_nodes(&args.config).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
     let target = find_node(&nodes, args.node)?;
-    let missing_groups = ursula_ctl::prepare_recovery_restart(
+    let preparation = ursula_ctl::prepare_recovery_restart(
         &nodes,
         target,
         &client,
@@ -545,8 +574,11 @@ async fn run_prepare_recovery_restart_subcommand(args: RestartTargetArgs) -> Res
     )
     .await?;
     println!(
-        "node {}: recovery restart quiesced; {} group(s) were wholly missing before the full restart inventory was armed",
-        target.id, missing_groups
+        "node {}: recovery restart quiesced; {} group(s) were wholly missing; leaders pinned to node {}; fenced survivors={:?}; the full restart inventory is armed",
+        target.id,
+        preparation.missing_group_count,
+        preparation.leader_anchor,
+        preparation.fenced_node_ids
     );
     Ok(())
 }

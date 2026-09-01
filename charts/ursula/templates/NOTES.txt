@@ -57,8 +57,10 @@ Static membership warning:
 OnDelete rollout warning:
   Helm has staged the new StatefulSet pod template, but Kubernetes will not
   replace any Ursula voter automatically. Your external rollout controller must
-  drain, prepare-restart, delete, wait, verify-cluster, and undrain one voter at
-  a time. Until that sequence finishes, helm status can be deployed while pods
+  drain, prepare-restart, delete, wait, finish-prepared-restart, and verify one
+  voter at a time. `prepare-restart` pins survivor leadership to one anchor;
+  failures must call abort-prepared-restart so only the uncertain target remains
+  drained. Until that sequence finishes, helm status can be deployed while pods
   still run the previous image.
 
   Inspect staged and running images:

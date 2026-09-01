@@ -76,6 +76,19 @@ pub struct RejoinOptions {
     pub retry_interval: Duration,
 }
 
+/// Durable-for-the-maintenance-window description of a prepared restart.
+///
+/// `leader_anchor` is the one surviving voter that keeps every leadership
+/// while the target process is replaced. Every other surviving voter is
+/// maintenance-drained until [`finish_prepared_restart`] or
+/// [`abort_prepared_restart`] releases the fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestartPreparation {
+    pub missing_group_count: usize,
+    pub leader_anchor: u64,
+    pub fenced_node_ids: Vec<u64>,
+}
+
 impl Default for RejoinOptions {
     fn default() -> Self {
         Self {
@@ -184,6 +197,256 @@ pub async fn drain_node(
     }
 }
 
+/// Quiesce an already-drained voter and pin every group leadership to one
+/// surviving anchor until the platform has replaced and verified the voter.
+///
+/// Empty-log rejoin permission is process-local on the current OpenRaft
+/// leader. Without the survivor fence, an ordinary leadership rebalance in
+/// the few seconds between arming and process startup silently strands that
+/// permission on the previous leader. The fence is therefore part of every
+/// prepared restart, including disk-WAL restarts, so the platform has one
+/// uniform completion and abort contract.
+pub async fn prepare_restart(
+    nodes: &[NodeInfo],
+    target: &NodeInfo,
+    client: &MetricsClient,
+    drain_options: &DrainOptions,
+    rejoin_options: &RejoinOptions,
+) -> Result<RestartPreparation> {
+    if drain_options.dry_run {
+        bail!("restart preparation does not support dry-run DrainOptions");
+    }
+    let configured_node_ids = recovery_inventory(nodes, target)?;
+    let memory_rejoin = resolve_restart_rejoin_policy(client, nodes).await?;
+    client
+        .quiesce_for_restart(target)
+        .await
+        .with_context(|| format!("quiesce node {} before restart", target.id))?;
+
+    let prepared = async {
+        let fence =
+            pin_restart_leaders(nodes, target, client, drain_options, &configured_node_ids).await?;
+        if memory_rejoin {
+            arm_empty_rejoin(nodes, target, client, rejoin_options).await?;
+        }
+        Ok::<_, anyhow::Error>(fence)
+    }
+    .await;
+    match prepared {
+        Ok(preparation) => Ok(preparation),
+        Err(error) => {
+            best_effort_abort_prepared_restart(nodes, target, client).await;
+            Err(error)
+        }
+    }
+}
+
+fn restart_fence_layout(nodes: &[NodeInfo], target: &NodeInfo) -> Result<(u64, Vec<u64>)> {
+    let mut survivor_ids = nodes
+        .iter()
+        .map(|node| node.id)
+        .filter(|node_id| *node_id != target.id)
+        .collect::<Vec<_>>();
+    survivor_ids.sort_unstable();
+    survivor_ids.dedup();
+    if survivor_ids.len() + 1 != nodes.len() {
+        bail!("restart fence requires an exact, unique configured voter inventory");
+    }
+    let leader_anchor = survivor_ids
+        .first()
+        .copied()
+        .ok_or_else(|| anyhow!("restart fence requires at least one surviving voter"))?;
+    let fenced_node_ids = survivor_ids.into_iter().skip(1).collect();
+    Ok((leader_anchor, fenced_node_ids))
+}
+
+async fn pin_restart_leaders(
+    nodes: &[NodeInfo],
+    target: &NodeInfo,
+    client: &MetricsClient,
+    drain_options: &DrainOptions,
+    configured_node_ids: &BTreeSet<u64>,
+) -> Result<RestartPreparation> {
+    let (leader_anchor, fenced_node_ids) = restart_fence_layout(nodes, target)?;
+    let mut marked = Vec::new();
+    for node_id in &fenced_node_ids {
+        let node = nodes
+            .iter()
+            .find(|node| node.id == *node_id)
+            .ok_or_else(|| anyhow!("restart fence node {node_id} is not configured"))?;
+        if let Err(error) = client.set_maintenance_drain(node, true).await {
+            for marked_id in &marked {
+                if let Some(marked_node) = nodes.iter().find(|node| node.id == *marked_id) {
+                    clear_maintenance_drain(client, marked_node).await;
+                }
+            }
+            return Err(error)
+                .with_context(|| format!("mark restart-fence node {node_id} drained"));
+        }
+        marked.push(*node_id);
+    }
+
+    let deadline = Instant::now() + drain_options.drain_timeout;
+    let last_error = loop {
+        let outcome = converge_restart_leader_fence_once(
+            nodes,
+            target,
+            client,
+            configured_node_ids,
+            drain_options.lag_tolerance,
+            leader_anchor,
+            &fenced_node_ids,
+        )
+        .await;
+        let error = match outcome {
+            Ok(true) => {
+                tracing::info!(
+                    target_node_id = target.id,
+                    leader_anchor,
+                    fenced_nodes = ?fenced_node_ids,
+                    "restart leaders pinned"
+                );
+                return Ok(RestartPreparation {
+                    missing_group_count: 0,
+                    leader_anchor,
+                    fenced_node_ids,
+                });
+            }
+            Ok(false) => anyhow!("restart-fence leadership transfers are still converging"),
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            break error;
+        }
+        tokio::time::sleep(drain_options.poll_interval).await;
+    };
+
+    for node_id in &marked {
+        if let Some(node) = nodes.iter().find(|node| node.id == *node_id) {
+            clear_maintenance_drain(client, node).await;
+        }
+    }
+    Err(last_error).context(format!(
+        "restart leader fence did not converge on node {leader_anchor} before {:?}",
+        drain_options.drain_timeout
+    ))
+}
+
+async fn converge_restart_leader_fence_once(
+    nodes: &[NodeInfo],
+    target: &NodeInfo,
+    client: &MetricsClient,
+    configured_node_ids: &BTreeSet<u64>,
+    lag_tolerance: u64,
+    leader_anchor: u64,
+    fenced_node_ids: &[u64],
+) -> Result<bool> {
+    let snapshot = client
+        .fetch_cluster(nodes)
+        .await
+        .context("fetch cluster while pinning restart leaders")?;
+    validate_surviving_voters(&snapshot, configured_node_ids, target.id, lag_tolerance)?;
+    let group_ids = peer_reported_rejoin_groups(&snapshot, target.id);
+    if group_ids.is_empty() {
+        bail!(
+            "no initialized group inventory remains while pinning restart leaders for node {}",
+            target.id
+        );
+    }
+
+    let mut transfers = Vec::new();
+    for group_id in group_ids {
+        match stable_non_target_leader(&snapshot, group_id, target.id)? {
+            current_leader if current_leader == leader_anchor => {}
+            current_leader if fenced_node_ids.contains(&current_leader) => {
+                transfers.push((group_id, current_leader));
+            }
+            current_leader => bail!(
+                "group {group_id} is led by unexpected node {current_leader} while pinning restart anchor {leader_anchor}"
+            ),
+        }
+    }
+    if transfers.is_empty() {
+        return Ok(true);
+    }
+    for (group_id, current_leader) in transfers {
+        let leader = nodes
+            .iter()
+            .find(|node| node.id == current_leader)
+            .expect("leader plan only contains configured nodes");
+        let response = client
+            .transfer_leader(leader, group_id, leader_anchor)
+            .await?;
+        if !response.transferred {
+            bail!(
+                "restart-fence transfer for group {group_id} from {current_leader} to {leader_anchor} was rejected: {}",
+                response.reason.unwrap_or_else(|| "unknown".to_owned())
+            );
+        }
+    }
+    Ok(false)
+}
+
+async fn release_prepared_restart(
+    nodes: &[NodeInfo],
+    target: &NodeInfo,
+    client: &MetricsClient,
+    include_target: bool,
+) -> Result<()> {
+    let (_, fenced_node_ids) = restart_fence_layout(nodes, target)?;
+    let mut release_ids = fenced_node_ids;
+    if include_target {
+        release_ids.insert(0, target.id);
+    }
+    let mut errors = Vec::new();
+    for node_id in release_ids {
+        let node = nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .expect("restart fence contains configured nodes");
+        if let Err(error) = client.set_maintenance_drain(node, false).await {
+            errors.push(format!("node {node_id}: {error}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "release prepared restart fence failed: {}",
+            errors.join("; ")
+        )
+    }
+}
+
+/// Clear the target drain and every survivor fence after catch-up succeeded.
+pub async fn finish_prepared_restart(
+    nodes: &[NodeInfo],
+    target: &NodeInfo,
+    client: &MetricsClient,
+) -> Result<()> {
+    release_prepared_restart(nodes, target, client, true).await
+}
+
+/// Release survivor fences after a failed replacement while leaving the
+/// uncertain target drained and unable to acquire leadership.
+pub async fn abort_prepared_restart(
+    nodes: &[NodeInfo],
+    target: &NodeInfo,
+    client: &MetricsClient,
+) -> Result<()> {
+    release_prepared_restart(nodes, target, client, false).await
+}
+
+async fn best_effort_abort_prepared_restart(
+    nodes: &[NodeInfo],
+    target: &NodeInfo,
+    client: &MetricsClient,
+) {
+    if let Err(error) = abort_prepared_restart(nodes, target, client).await {
+        tracing::warn!(target_node_id = target.id, %error, "failed to release restart survivor fence");
+    }
+}
+
 /// Prepare exactly one partially amnesiac memory-WAL voter for a platform
 /// restart. This recovery path is deliberately narrower than ordinary drain:
 /// the target may be missing whole groups, but every other configured voter
@@ -192,18 +455,19 @@ pub async fn drain_node(
 /// On success the maintenance-drain mark remains set, the target's Raft cores
 /// are stopped, and every stable group leader has accepted one empty-log
 /// rejoin for `target`. The caller must immediately restart that node, wait for
-/// catch-up, and then undrain it.
+/// catch-up, and then call [`finish_prepared_restart`].
 pub async fn prepare_amnesiac_restart(
     nodes: &[NodeInfo],
     target: &NodeInfo,
     client: &MetricsClient,
     drain_options: &DrainOptions,
     rejoin_options: &RejoinOptions,
-) -> Result<usize> {
+) -> Result<RestartPreparation> {
     if drain_options.dry_run {
         bail!("amnesiac restart preparation does not support dry-run DrainOptions");
     }
     let configured_node_ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
+    let configured_node_id_set = configured_node_ids.iter().copied().collect::<BTreeSet<_>>();
     let initial = client.fetch_cluster(nodes).await?;
     let candidate =
         classify_amnesiac_voter(&initial, &configured_node_ids, drain_options.lag_tolerance)
@@ -272,13 +536,26 @@ pub async fn prepare_amnesiac_restart(
             .quiesce_for_restart(target)
             .await
             .with_context(|| format!("quiesce amnesiac node {} before arming peers", target.id))?;
+        let fence = pin_restart_leaders(
+            nodes,
+            target,
+            client,
+            drain_options,
+            &configured_node_id_set,
+        )
+        .await?;
         arm_empty_rejoin(nodes, target, client, rejoin_options).await?;
-        Ok::<_, anyhow::Error>(candidate.missing_group_ids.len())
+        Ok::<_, anyhow::Error>(RestartPreparation {
+            missing_group_count: candidate.missing_group_ids.len(),
+            leader_anchor: fence.leader_anchor,
+            fenced_node_ids: fence.fenced_node_ids,
+        })
     }
     .await;
     match prepared {
-        Ok(missing_groups) => Ok(missing_groups),
+        Ok(preparation) => Ok(preparation),
         Err(error) => {
+            best_effort_abort_prepared_restart(nodes, target, client).await;
             clear_maintenance_drain(client, target).await;
             Err(error)
         }
@@ -299,7 +576,7 @@ pub async fn prepare_recovery_restart(
     client: &MetricsClient,
     drain_options: &DrainOptions,
     rejoin_options: &RejoinOptions,
-) -> Result<usize> {
+) -> Result<RestartPreparation> {
     if drain_options.dry_run {
         bail!("recovery restart preparation does not support dry-run DrainOptions");
     }
@@ -322,6 +599,8 @@ pub async fn prepare_recovery_restart(
         client.quiesce_for_restart(target).await.with_context(|| {
             format!("quiesce restarted node {} before rearming peers", target.id)
         })?;
+        let fence =
+            pin_restart_leaders(nodes, target, client, drain_options, &configured_node_ids).await?;
         if memory_rejoin {
             // The next process loses every memory-WAL group, including groups
             // that this partial replacement already recovered. Arm the full
@@ -329,12 +608,17 @@ pub async fn prepare_recovery_restart(
             // stopped, so they cannot consume the replacement's permissions.
             arm_empty_rejoin(nodes, target, client, rejoin_options).await?;
         }
-        Ok::<_, anyhow::Error>(missing_groups.len())
+        Ok::<_, anyhow::Error>(RestartPreparation {
+            missing_group_count: missing_groups.len(),
+            leader_anchor: fence.leader_anchor,
+            fenced_node_ids: fence.fenced_node_ids,
+        })
     }
     .await;
     match prepared {
-        Ok(missing_groups) => Ok(missing_groups),
+        Ok(preparation) => Ok(preparation),
         Err(error) => {
+            best_effort_abort_prepared_restart(nodes, target, client).await;
             clear_maintenance_drain(client, target).await;
             Err(error)
         }
@@ -1073,6 +1357,7 @@ mod tests {
 
     use axum::Json;
     use axum::Router;
+    use axum::extract::Path;
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::routing::get;
@@ -1095,8 +1380,10 @@ mod tests {
     struct MockCluster {
         scenario: LeaderScenario,
         metrics_fetches: AtomicUsize,
+        pinned_leader: AtomicUsize,
         armed_on_nodes: Mutex<Vec<u64>>,
         drained_nodes: Mutex<Vec<u64>>,
+        undrained_nodes: Mutex<Vec<u64>>,
         quiesced_nodes: Mutex<Vec<u64>>,
         operations: Mutex<Vec<String>>,
     }
@@ -1110,12 +1397,16 @@ mod tests {
     async fn mock_metrics(State(state): State<MockNode>) -> Json<serde_json::Value> {
         let fetch = state.cluster.metrics_fetches.fetch_add(1, Ordering::SeqCst);
         let sample = fetch / 3;
-        let leader = match state.cluster.scenario {
-            LeaderScenario::DriftOnce if sample == 0 => 2,
-            LeaderScenario::DriftOnce => 3,
-            LeaderScenario::AlwaysDrift if sample.is_multiple_of(2) => 2,
-            LeaderScenario::AlwaysDrift => 3,
-            LeaderScenario::Stable | LeaderScenario::TargetMissing => 2,
+        let pinned_leader = state.cluster.pinned_leader.load(Ordering::SeqCst);
+        let leader = match pinned_leader {
+            0 => match state.cluster.scenario {
+                LeaderScenario::DriftOnce if sample == 0 => 2,
+                LeaderScenario::DriftOnce => 3,
+                LeaderScenario::AlwaysDrift if sample.is_multiple_of(2) => 2,
+                LeaderScenario::AlwaysDrift => 3,
+                LeaderScenario::Stable | LeaderScenario::TargetMissing => 2,
+            },
+            pinned => u64::try_from(pinned).unwrap(),
         };
         if matches!(state.cluster.scenario, LeaderScenario::TargetMissing) && state.node_id == 3 {
             return Json(json!({
@@ -1177,6 +1468,45 @@ mod tests {
         StatusCode::OK
     }
 
+    async fn mock_undrain(State(state): State<MockNode>) -> StatusCode {
+        state
+            .cluster
+            .undrained_nodes
+            .lock()
+            .unwrap()
+            .push(state.node_id);
+        state
+            .cluster
+            .operations
+            .lock()
+            .unwrap()
+            .push(format!("undrain:{}", state.node_id));
+        StatusCode::OK
+    }
+
+    async fn mock_transfer(
+        State(state): State<MockNode>,
+        Path((_group_id, to)): Path<(u64, u64)>,
+    ) -> Json<serde_json::Value> {
+        state
+            .cluster
+            .pinned_leader
+            .store(usize::try_from(to).unwrap(), Ordering::SeqCst);
+        state
+            .cluster
+            .operations
+            .lock()
+            .unwrap()
+            .push(format!("transfer:{}->{to}", state.node_id));
+        Json(json!({
+            "raft_group_id": 7,
+            "from": state.node_id,
+            "to": to,
+            "current_leader": to,
+            "transferred": true
+        }))
+    }
+
     async fn mock_quiesce(State(state): State<MockNode>) -> StatusCode {
         state
             .cluster
@@ -1197,8 +1527,10 @@ mod tests {
         let cluster = Arc::new(MockCluster {
             scenario,
             metrics_fetches: AtomicUsize::new(0),
+            pinned_leader: AtomicUsize::new(0),
             armed_on_nodes: Mutex::new(Vec::new()),
             drained_nodes: Mutex::new(Vec::new()),
+            undrained_nodes: Mutex::new(Vec::new()),
             quiesced_nodes: Mutex::new(Vec::new()),
             operations: Mutex::new(Vec::new()),
         });
@@ -1216,7 +1548,14 @@ mod tests {
                     "/__ursula/raft/{group_id}/nodes/{node_id}/allow-next-revert",
                     post(mock_arm),
                 )
-                .route("/__ursula/leadership-shed/maintenance", post(mock_drain))
+                .route(
+                    "/__ursula/leadership-shed/maintenance",
+                    post(mock_drain).delete(mock_undrain),
+                )
+                .route(
+                    "/__ursula/raft/{group_id}/leader/transfer/{to}",
+                    post(mock_transfer),
+                )
                 .route("/__ursula/raft/quiesce-for-restart", post(mock_quiesce))
                 .with_state(state);
             tokio::spawn(async move {
@@ -1265,7 +1604,7 @@ mod tests {
     #[tokio::test]
     async fn partial_replacement_is_quiesced_before_full_inventory_is_rearmed() {
         let (nodes, cluster) = mock_cluster(LeaderScenario::TargetMissing).await;
-        let missing = prepare_recovery_restart(
+        let preparation = prepare_recovery_restart(
             &nodes,
             &nodes[2],
             &MetricsClient::new(Duration::from_secs(1)).unwrap(),
@@ -1285,15 +1624,28 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(missing, 1);
-        assert_eq!(*cluster.drained_nodes.lock().unwrap(), vec![3]);
+        assert_eq!(preparation.missing_group_count, 1);
+        assert_eq!(preparation.leader_anchor, 1);
+        assert_eq!(preparation.fenced_node_ids, vec![2]);
+        assert_eq!(*cluster.drained_nodes.lock().unwrap(), vec![3, 2]);
         assert_eq!(*cluster.quiesced_nodes.lock().unwrap(), vec![3]);
-        assert_eq!(*cluster.armed_on_nodes.lock().unwrap(), vec![2]);
+        assert_eq!(*cluster.armed_on_nodes.lock().unwrap(), vec![1]);
         assert_eq!(*cluster.operations.lock().unwrap(), vec![
             "drain:3",
             "quiesce:3",
-            "arm:2"
+            "drain:2",
+            "transfer:2->1",
+            "arm:1"
         ]);
+
+        finish_prepared_restart(
+            &nodes,
+            &nodes[2],
+            &MetricsClient::new(Duration::from_secs(1)).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*cluster.undrained_nodes.lock().unwrap(), vec![3, 2]);
     }
 
     #[tokio::test]
