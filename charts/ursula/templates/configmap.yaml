@@ -71,6 +71,20 @@ data:
     config_path="${config_dir}/ursula.toml"
     mkdir -p "${config_dir}"
 
+    start_maintenance_drained=false
+    rollout_state_dir="/var/run/ursula-rollout-state"
+    if [ -r "${rollout_state_dir}/phase" ] && [ -r "${rollout_state_dir}/node-id" ]; then
+      rollout_phase=$(cat "${rollout_state_dir}/phase")
+      rollout_node_id=$(cat "${rollout_state_dir}/node-id")
+      case "${rollout_phase}" in
+        restarting|upgrading-restart-quiesce)
+          if [ "${rollout_node_id}" = "${node_id}" ]; then
+            start_maintenance_drained=true
+          fi
+          ;;
+      esac
+    fi
+
     # Restrict generated config permissions: it may contain S3 credentials.
     old_umask=$(umask)
     umask 077
@@ -182,6 +196,7 @@ data:
     chmod 600 "${config_path}"
     umask "${old_umask}"
 
+    export URSULA_START_MAINTENANCE_DRAINED="${start_maintenance_drained}"
     exec /usr/local/bin/ursula server --config "${config_path}" --node-id "${node_id}" "$@"
   cluster-manifest.json: |
 {{ dict "nodes" $nodes | toPrettyJson | indent 4 }}

@@ -4383,6 +4383,7 @@ dependencies = [
  "tower 0.5.3",
  "tower-http",
  "tracing",
+ "url",
  "ursula-config",
  "ursula-gateway",
  "ursula-index",

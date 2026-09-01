@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,9 +18,9 @@ use ursula_shard::RaftGroupId;
 use crate::HttpState;
 use crate::Persistence;
 use crate::Topology;
+use crate::bootstrap::spawn_runtime_with_maintenance_drain;
 use crate::client_router_with_admission;
 use crate::cluster_router_from_state;
-use crate::spawn_runtime;
 
 #[derive(Args, Debug, Default)]
 pub struct ServerArgs {
@@ -75,7 +76,10 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         preset.unwrap_or(Preset::Default)
     );
 
-    let state = init_state(&config, preset).await?;
+    let start_maintenance_drained = parse_start_maintenance_drained(
+        std::env::var_os("URSULA_START_MAINTENANCE_DRAINED").as_deref(),
+    )?;
+    let state = init_state(&config, preset, start_maintenance_drained).await?;
     state.register_otel_metrics();
     serve(state, &config).await
 }
@@ -91,6 +95,7 @@ fn init_telemetry(
 async fn init_state(
     config: &ursula_config::UrsulaConfig,
     preset: Option<Preset>,
+    start_maintenance_drained: bool,
 ) -> Result<HttpState, Box<dyn std::error::Error>> {
     let raft_peers: Vec<(u64, String)> = config
         .raft
@@ -98,6 +103,13 @@ async fn init_state(
         .iter()
         .map(|p| (p.node_id, p.url.clone()))
         .collect();
+    if start_maintenance_drained && raft_peers.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "URSULA_START_MAINTENANCE_DRAINED requires a static Raft cluster",
+        )
+        .into());
+    }
 
     let persistence = if preset == Some(Preset::Default) && raft_peers.is_empty() {
         // Default single-node dev mode: use the simple InMemory engine (no
@@ -138,7 +150,12 @@ async fn init_state(
         )?
     };
 
-    let spawned = spawn_runtime(config, persistence, topology)?;
+    let spawned = spawn_runtime_with_maintenance_drain(
+        config,
+        persistence,
+        topology,
+        start_maintenance_drained,
+    )?;
     let runtime = spawned.runtime;
 
     if !raft_peers.is_empty() {
@@ -195,6 +212,18 @@ async fn init_state(
         );
     }
     Ok(state)
+}
+
+fn parse_start_maintenance_drained(value: Option<&OsStr>) -> Result<bool, std::io::Error> {
+    match value.and_then(OsStr::to_str) {
+        None if value.is_none() => Ok(false),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "URSULA_START_MAINTENANCE_DRAINED must be exactly true or false",
+        )),
+    }
 }
 
 fn static_grpc_node_hosts_group(
@@ -323,7 +352,18 @@ fn spawn_shutdown_signal_task(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::io::Write;
+
+    use super::parse_start_maintenance_drained;
+
+    #[test]
+    fn startup_maintenance_drain_is_strict_and_opt_in() {
+        assert!(!parse_start_maintenance_drained(None).unwrap());
+        assert!(parse_start_maintenance_drained(Some(OsStr::new("true"))).unwrap());
+        assert!(!parse_start_maintenance_drained(Some(OsStr::new("false"))).unwrap());
+        assert!(parse_start_maintenance_drained(Some(OsStr::new("1"))).is_err());
+    }
 
     #[test]
     fn loads_minimal_toml_config() {

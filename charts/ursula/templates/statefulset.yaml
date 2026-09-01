@@ -126,6 +126,9 @@ spec:
               readOnly: true
             - name: generated-config
               mountPath: /etc/ursula/generated
+            - name: rollout-state
+              mountPath: /var/run/ursula-rollout-state
+              readOnly: true
             - name: tmp
               mountPath: /tmp
             - name: raft-data
@@ -137,6 +140,10 @@ spec:
             defaultMode: 0555
         - name: generated-config
           emptyDir: {}
+        - name: rollout-state
+          configMap:
+            name: {{ printf "%s-rollout-state" (include "ursula.fullname" .) }}
+            optional: true
         - name: tmp
           emptyDir: {}
         {{- if not .Values.persistence.enabled }}

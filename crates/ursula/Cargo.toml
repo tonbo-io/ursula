@@ -50,6 +50,7 @@ tonic = { workspace = true, features = ["transport"] }
 tower = { workspace = true, features = ["util", "limit", "load-shed"] }
 tower-http = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 ursula-config = { workspace = true }
 ursula-gateway = { workspace = true }
 ursula-index = { workspace = true }
