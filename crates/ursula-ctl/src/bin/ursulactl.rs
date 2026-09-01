@@ -257,9 +257,7 @@ async fn main() -> Result<()> {
         Command::PrepareAmnesiacRestart(args) => {
             run_prepare_amnesiac_restart_subcommand(args).await
         }
-        Command::RepairRestartedVoter(args) => {
-            run_repair_restarted_voter_subcommand(args).await
-        }
+        Command::RepairRestartedVoter(args) => run_repair_restarted_voter_subcommand(args).await,
         Command::PrepareRecoveryHandoff(args) => {
             run_prepare_recovery_handoff_subcommand(args).await
         }
@@ -459,17 +457,13 @@ async fn run_prepare_restart_subcommand(args: NodeArgs) -> Result<()> {
     let nodes = load_nodes(&args.config).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
     let target = find_node(&nodes, args.node)?;
-    let preparation = ursula_ctl::prepare_restart(
-        &nodes,
-        target,
-        &client,
-        &ursula_ctl::DrainOptions {
+    let preparation =
+        ursula_ctl::prepare_restart(&nodes, target, &client, &ursula_ctl::DrainOptions {
             ready_timeout: Duration::ZERO,
             dry_run: false,
             ..ursula_ctl::DrainOptions::default()
-        },
-    )
-    .await?;
+        })
+        .await?;
     println!(
         "node {}: quiesced with restart leaders pinned to node {}; fenced survivors={:?}",
         target.id, preparation.leader_anchor, preparation.fenced_node_ids
@@ -502,19 +496,15 @@ async fn run_prepare_amnesiac_restart_subcommand(args: RestartTargetArgs) -> Res
     let nodes = load_nodes(&args.config).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
     let target = find_node(&nodes, args.node)?;
-    let preparation = ursula_ctl::prepare_amnesiac_restart(
-        &nodes,
-        target,
-        &client,
-        &ursula_ctl::DrainOptions {
+    let preparation =
+        ursula_ctl::prepare_amnesiac_restart(&nodes, target, &client, &ursula_ctl::DrainOptions {
             drain_timeout: Duration::from_secs(args.drain_timeout_secs),
             ready_timeout: Duration::ZERO,
             poll_interval: Duration::from_secs(args.poll_interval_secs),
             lag_tolerance: args.lag_tolerance,
             dry_run: false,
-        },
-    )
-    .await?;
+        })
+        .await?;
     println!(
         "node {}: prepared amnesiac restart for {} missing group(s); leaders pinned to node {}; fenced survivors={:?}; restart immediately",
         target.id,

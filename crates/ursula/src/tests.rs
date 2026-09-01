@@ -3357,10 +3357,7 @@ async fn static_grpc_memory_node_rejoins_all_groups_through_membership_replaceme
             .post(format!(
                 "{leader_base}/__ursula/raft/{raw_group_id}/learners/3"
             ))
-            .query(&[
-                ("addr", peers[2].1.as_str()),
-                ("blocking", "false"),
-            ])
+            .query(&[("addr", peers[2].1.as_str()), ("blocking", "false")])
             .send()
             .await
             .expect("attach restarted node 3 as non-blocking learner");
@@ -3373,7 +3370,11 @@ async fn static_grpc_memory_node_rejoins_all_groups_through_membership_replaceme
             .registry
             .get(raft_group_id)
             .expect("observer group");
-        let required_applied = observer_raft.metrics().borrow_watched().last_applied;
+        let required_applied = observer_raft
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .map(|log_id| log_id.index);
         restarted
             .registry
             .get(raft_group_id)

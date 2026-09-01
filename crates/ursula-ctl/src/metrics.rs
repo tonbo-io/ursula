@@ -187,10 +187,7 @@ impl MetricsClient {
                 target.id
             )
         })?;
-        let path = format!(
-            "/__ursula/raft/{raft_group_id}/learners/{}",
-            target.id
-        );
+        let path = format!("/__ursula/raft/{raft_group_id}/learners/{}", target.id);
         let mut url = leader.admin_url.join(&path).with_context(|| {
             format!(
                 "compose add-learner url at leader node {} for group {}",

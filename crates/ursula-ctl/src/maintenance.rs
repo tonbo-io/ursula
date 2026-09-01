@@ -596,14 +596,8 @@ pub async fn repair_restarted_voter(
         .set_maintenance_drain(target, true)
         .await
         .with_context(|| format!("mark restarted node {} maintenance-drained", target.id))?;
-    let fence = pin_restart_leaders(
-        nodes,
-        target,
-        client,
-        drain_options,
-        &configured_node_ids,
-    )
-    .await?;
+    let fence =
+        pin_restart_leaders(nodes, target, client, drain_options, &configured_node_ids).await?;
     let leader = nodes
         .iter()
         .find(|node| node.id == fence.leader_anchor)
@@ -763,13 +757,18 @@ async fn wait_repair_learners_caught_up(
             anyhow!("restart anchor {leader_anchor} disappeared during learner catch-up")
         })?;
         let target_view = snapshot.node(target.id).ok_or_else(|| {
-            anyhow!("restarted node {} disappeared during learner catch-up", target.id)
+            anyhow!(
+                "restarted node {} disappeared during learner catch-up",
+                target.id
+            )
         })?;
         let mut progress = LearnerRepairProgress::default();
         let mut pending = Vec::new();
         for group_id in group_ids {
             let anchor_group = anchor.group(*group_id).ok_or_else(|| {
-                anyhow!("restart anchor {leader_anchor} lost group {group_id} during learner catch-up")
+                anyhow!(
+                    "restart anchor {leader_anchor} lost group {group_id} during learner catch-up"
+                )
             })?;
             if !anchor_group.learner_ids.contains(&target.id) {
                 bail!(
@@ -789,11 +788,12 @@ async fn wait_repair_learners_caught_up(
                 .values()
                 .filter_map(|group| group.committed_index)
                 .max();
-            let caught_up = peer_committed
-                .zip(target_applied)
-                .is_some_and(|(committed, applied)| {
-                    committed.saturating_sub(applied) <= lag_tolerance
-                });
+            let caught_up =
+                peer_committed
+                    .zip(target_applied)
+                    .is_some_and(|(committed, applied)| {
+                        committed.saturating_sub(applied) <= lag_tolerance
+                    });
             if caught_up {
                 progress.caught_up_groups += 1;
             } else {
@@ -1029,7 +1029,6 @@ pub enum CatchUpOutcome {
 /// Wait until `target` is back as a voter in every group and its applied index
 /// is within `lag_tolerance` of peers' committed index. Progress-gated, not a
 /// fixed timeout: any forward motion resets the stall clock.
-///
 pub async fn wait_node_ready(
     nodes: &[NodeInfo],
     target: &NodeInfo,
@@ -1229,9 +1228,7 @@ impl TargetProgress {
 /// A target that reports no applied entries in any group after the readiness
 /// window either never attached as a learner or never came back up; plain gap
 /// numbers do not tell an operator that.
-fn missing_target_timeout_hint(
-    report: &crate::plan::ReadinessReport,
-) -> Option<&'static str> {
+fn missing_target_timeout_hint(report: &crate::plan::ReadinessReport) -> Option<&'static str> {
     let all_unapplied = !report.per_group.is_empty()
         && report
             .per_group
@@ -1525,7 +1522,10 @@ mod tests {
             "1,2,3" => 3,
             _ => return StatusCode::BAD_REQUEST,
         };
-        state.cluster.membership_phase.store(phase, Ordering::SeqCst);
+        state
+            .cluster
+            .membership_phase
+            .store(phase, Ordering::SeqCst);
         state
             .cluster
             .operations
@@ -2013,7 +2013,10 @@ mod tests {
             ],
         };
 
-        assert_eq!(survivor_group_inventory(&snapshot, 1), [7].into_iter().collect());
+        assert_eq!(
+            survivor_group_inventory(&snapshot, 1),
+            [7].into_iter().collect()
+        );
         assert_eq!(stable_non_target_leader(&snapshot, 7, 1).unwrap(), 2);
     }
 }
