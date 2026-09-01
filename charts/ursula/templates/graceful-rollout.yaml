@@ -77,6 +77,13 @@ rules:
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
     verbs: ["get", "list", "watch"]
+  # Schema-v1 rollout state has no source Pod UID. Reading the controller-owned
+  # revision sequence is the one-time compatibility proof that a Ready voter
+  # superseded that saved replacement. Remove this permission with the schema-v1
+  # recovery branch once pre-v2 rollout state is no longer a supported source.
+  - apiGroups: ["apps"]
+    resources: ["controllerrevisions"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
