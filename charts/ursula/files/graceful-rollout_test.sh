@@ -195,8 +195,14 @@ rearmed_ctl=$(mktemp)
 export rearmed_calls
 cat >"${rearmed_ctl}" <<'CTL'
 #!/bin/sh
-[ "$1" = "prepare-restart" ] || exit 1
-printf '%s\n' prepare-restart >>"${rearmed_calls}"
+case "$1" in
+  prepare-restart|wait)
+    printf '%s\n' "$1" >>"${rearmed_calls}"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
 CTL
 chmod +x "${rearmed_ctl}"
 CTL=${rearmed_ctl}
@@ -219,6 +225,7 @@ restarting 3
 replace
 ready
 forward
+wait
 reassert
 CALLS
 cmp "${rearmed_calls}.expected" "${rearmed_calls}"
