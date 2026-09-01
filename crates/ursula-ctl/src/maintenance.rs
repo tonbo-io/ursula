@@ -683,15 +683,23 @@ pub async fn repair_restarted_voter(
             );
         }
     }
-    run_group_phase(detach_groups, repair_options.max_concurrency, |group_id| {
+    let survivor_voters = &survivor_node_ids;
+    run_group_phase(detach_groups, repair_options.max_concurrency, move |group_id| {
         reconcile_group_operation(
             leader,
             client,
             group_id,
             repair_options,
             "detach restarted voter",
-            |group| group.voter_ids.iter().copied().collect::<BTreeSet<_>>() == survivor_node_ids,
-            || client.change_membership(leader, group_id, &survivor_node_ids),
+            move |group| {
+                group
+                    .voter_ids
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    .eq(survivor_voters)
+            },
+            move || client.change_membership(leader, group_id, survivor_voters),
         )
     })
     .await
@@ -732,7 +740,7 @@ pub async fn repair_restarted_voter(
             attach_groups.push(*group_id);
         }
     }
-    run_group_phase(attach_groups, repair_options.max_concurrency, |group_id| {
+    run_group_phase(attach_groups, repair_options.max_concurrency, move |group_id| {
         reconcile_group_operation(
             leader,
             client,
@@ -740,7 +748,7 @@ pub async fn repair_restarted_voter(
             repair_options,
             "attach restarted voter as a learner",
             |group| group.learner_ids.contains(&target.id),
-            || client.add_learner(leader, group_id, target),
+            move || client.add_learner(leader, group_id, target),
         )
     })
     .await
@@ -757,20 +765,26 @@ pub async fn repair_restarted_voter(
     )
     .await?;
 
+    let configured_voters = &configured_node_ids;
     run_group_phase(
         work_groups.iter().copied().collect(),
         repair_options.max_concurrency,
-        |group_id| {
+        move |group_id| {
             reconcile_group_operation(
                 leader,
                 client,
                 group_id,
                 repair_options,
                 "promote caught-up learner back to voter",
-                |group| {
-                    group.voter_ids.iter().copied().collect::<BTreeSet<_>>() == configured_node_ids
+                move |group| {
+                    group
+                        .voter_ids
+                        .iter()
+                        .copied()
+                        .collect::<BTreeSet<_>>()
+                        .eq(configured_voters)
                 },
-                || client.change_membership(leader, group_id, &configured_node_ids),
+                move || client.change_membership(leader, group_id, configured_voters),
             )
         },
     )
