@@ -15,8 +15,8 @@ export NAMESPACE STATEFULSET REPLICAS EXPECTED_GROUPS TARGET_IMAGE CTL ROLLOUT_S
 # shellcheck source=graceful-rollout.sh
 . "${test_dir}/graceful-rollout.sh"
 original_write_manifest=$(declare -f write_manifest)
-original_recover_amnesiac_if_needed=$(declare -f recover_amnesiac_if_needed)
 original_reassert_restart_fence=$(declare -f reassert_restart_fence)
+original_finish_rearmed_restart=$(declare -f finish_rearmed_restart)
 
 mocked_revision=ursula-stale
 kubectl() {
@@ -74,13 +74,15 @@ strict_verify() { :; }
 reassert_restart_fence() {
   [ "$1" = "2" ]
   resumed_reassert=1
+  REASSERT_RESULT=restart-required
 }
 
-recover_amnesiac_if_needed() {
+finish_rearmed_restart() {
   [ "$1" = "2" ]
-  resumed_amnesiac=1
-  resumed_complete=1
-  RECOVERED_AMNESIAC_NODE=2
+  [ "$2" = "1" ]
+  [ "${REASSERT_RESULT}" = "restart-required" ]
+  resumed_finish=1
+  REASSERT_RESULT=ready
 }
 
 record_state() {
@@ -92,17 +94,17 @@ record_state() {
 replaced_stale=0
 resumed_forward=0
 resumed_complete=0
-resumed_amnesiac=0
 resumed_reassert=0
-CTL=/bin/false
+resumed_finish=0
+CTL=true
 resume_if_needed
 [ "${replaced_stale}" = "1" ]
 [ "${resumed_forward}" = "1" ]
 [ "${resumed_reassert}" = "1" ]
-[ "${resumed_amnesiac}" = "1" ]
+[ "${resumed_finish}" = "1" ]
 [ "${resumed_complete}" = "1" ]
-eval "${original_recover_amnesiac_if_needed}"
 eval "${original_reassert_restart_fence}"
+eval "${original_finish_rearmed_restart}"
 CTL=true
 
 mocked_revision=ursula-current
@@ -140,7 +142,17 @@ case "$1" in
   classify-amnesiac)
     printf '%s\n' 3
     ;;
-  prepare-amnesiac-restart|reassert-restart-fence|wait|undrain)
+  reassert-restart-fence)
+    printf '%s\n' "$1" >>"${mock_ctl_calls}"
+    while [ "$#" -gt 0 ]; do
+      if [ "$1" = "--result-file" ]; then
+        printf '%s\n' ready >"$2"
+        break
+      fi
+      shift
+    done
+    ;;
+  prepare-amnesiac-restart|wait|undrain)
     printf '%s\n' "$1" >>"${mock_ctl_calls}"
     ;;
   *)
@@ -164,7 +176,7 @@ record_state() {
 recovered_replaced=0
 recovered_forward=0
 recovered_verified=0
-recover_amnesiac_if_needed 3
+recover_amnesiac_if_needed
 [ "${recovered_replaced}" = "1" ]
 [ "${recovered_forward}" = "1" ]
 [ "${recovered_verified}" = "1" ]
@@ -174,16 +186,45 @@ grep -q '^restarting 3$' "${mock_ctl_calls}"
 grep -q '^wait$' "${mock_ctl_calls}"
 grep -q '^undrain$' "${mock_ctl_calls}"
 grep -q '^complete 3$' "${mock_ctl_calls}"
-
-# A saved in-flight voter may only trigger recovery of that same voter. If the
-# cluster classifies a different node, stop before replacing either one.
-recovered_replaced=0
-if recover_amnesiac_if_needed 2; then
-  echo "mismatched saved and amnesiac voters must fail closed" >&2
-  exit 1
-fi
-[ "${recovered_replaced}" = "0" ]
 rm -f "${mock_ctl}" "${mock_ctl_calls}"
+
+# Re-arming a live replacement is not enough: prepare every group before the
+# next memory-WAL restart, then reassert the new process-local fence.
+rearmed_calls=$(mktemp)
+rearmed_ctl=$(mktemp)
+export rearmed_calls
+cat >"${rearmed_ctl}" <<'CTL'
+#!/bin/sh
+[ "$1" = "prepare-restart" ] || exit 1
+printf '%s\n' prepare-restart >>"${rearmed_calls}"
+CTL
+chmod +x "${rearmed_ctl}"
+CTL=${rearmed_ctl}
+TARGET_REVISION=ursula-recovered
+REASSERT_RESULT=restart-required
+record_state() { printf '%s %s\n' "$1" "$2" >>"${rearmed_calls}"; }
+replace_pod() { [ "$1" = "2" ]; printf '%s\n' replace >>"${rearmed_calls}"; }
+wait_for_pod_ready() { [ "$1" = "2" ]; printf '%s\n' ready >>"${rearmed_calls}"; }
+pod_matches_target() { [ "$1" = "2" ] && [ "$2" = "ursula-recovered" ]; }
+start_forward() { [ "$1" = "2" ]; printf '%s\n' forward >>"${rearmed_calls}"; }
+reassert_restart_fence() {
+  [ "$1" = "3" ]
+  printf '%s\n' reassert >>"${rearmed_calls}"
+  REASSERT_RESULT=ready
+}
+finish_rearmed_restart 3 2
+cat >"${rearmed_calls}.expected" <<'CALLS'
+prepare-restart
+restarting 3
+replace
+ready
+forward
+reassert
+CALLS
+cmp "${rearmed_calls}.expected" "${rearmed_calls}"
+rm -f "${rearmed_ctl}" "${rearmed_calls}" "${rearmed_calls}.expected"
+eval "${original_reassert_restart_fence}"
+eval "${original_finish_rearmed_restart}"
 
 # A recorded replacement must be resumed before the blanket Ready gate. The
 # stale replacement in the fixture cannot become Ready until resume replaces

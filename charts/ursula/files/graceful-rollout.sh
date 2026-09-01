@@ -211,11 +211,53 @@ strict_verify() {
 
 reassert_restart_fence() {
   node_id=$1
+  result_file=/tmp/reassert-restart-fence.result
+  rm -f "${result_file}"
   "${CTL}" reassert-restart-fence \
     --config "${MANIFEST}" \
     --node "${node_id}" \
     --drain-timeout-secs 300 \
-    --lag-tolerance 16
+    --lag-tolerance 16 \
+    --result-file "${result_file}"
+  if [ ! -r "${result_file}" ]; then
+    log "restart-fence result was not written for node ${node_id}"
+    return 1
+  fi
+  IFS= read -r REASSERT_RESULT <"${result_file}"
+  case "${REASSERT_RESULT}" in
+    ready|restart-required) ;;
+    *)
+      log "invalid restart-fence result for node ${node_id}: ${REASSERT_RESULT}"
+      return 1
+      ;;
+  esac
+}
+
+finish_rearmed_restart() {
+  node_id=$1
+  ordinal=$2
+  attempt=0
+  while [ "${REASSERT_RESULT}" = "restart-required" ]; do
+    attempt=$((attempt + 1))
+    if [ "${attempt}" -gt 3 ]; then
+      log "node ${node_id} still requires a prepared restart after 3 attempts"
+      return 1
+    fi
+    # reassert-restart-fence only re-arms groups that are wholly missing from
+    # the live replacement. The next memory-WAL restart clears every group, so
+    # prepare-restart must arm all group leaders before that replacement.
+    log "node ${node_id} requires prepared restart ${attempt}/3 after fence reassertion"
+    "${CTL}" prepare-restart --config "${MANIFEST}" --node "${node_id}"
+    record_state restarting "${node_id}"
+    replace_pod "${ordinal}"
+    wait_for_pod_ready "${ordinal}"
+    if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
+      log "node ${node_id} became Ready at a revision other than ${TARGET_REVISION}"
+      return 1
+    fi
+    start_forward "${ordinal}"
+    reassert_restart_fence "${node_id}"
+  done
 }
 
 record_state() {
@@ -275,16 +317,7 @@ resume_if_needed() {
   fi
   start_forward "${ordinal}"
   reassert_restart_fence "${node_id}"
-  # A replacement that started before the restart fence was reasserted has
-  # already made (and lost) its one empty-log rejoin attempt. Re-arming the
-  # leaders is not enough to make that live process try again. Route the
-  # uniquely amnesiac saved voter through the ordinary recovery path, which
-  # arms the permission before replacing it once more. A partially caught-up
-  # voter is not classified as amnesiac and continues into the normal wait.
-  recover_amnesiac_if_needed "${node_id}"
-  if [ "${RECOVERED_AMNESIAC_NODE}" = "${node_id}" ]; then
-    return 0
-  fi
+  finish_rearmed_restart "${node_id}" "${ordinal}"
   "${CTL}" wait \
     --config "${MANIFEST}" \
     --node "${node_id}" \
@@ -297,8 +330,6 @@ resume_if_needed() {
 }
 
 recover_amnesiac_if_needed() {
-  RECOVERED_AMNESIAC_NODE=
-  expected_node_id=${1:-}
   node_id=$("${CTL}" classify-amnesiac \
     --config "${MANIFEST}" \
     --lag-tolerance 16)
@@ -313,10 +344,6 @@ recover_amnesiac_if_needed() {
   esac
   if [ "${node_id}" -lt 1 ] || [ "${node_id}" -gt "${REPLICAS}" ]; then
     log "amnesiac recovery node id ${node_id} is outside 1..${REPLICAS}"
-    return 1
-  fi
-  if [ -n "${expected_node_id}" ] && [ "${node_id}" != "${expected_node_id}" ]; then
-    log "saved rollout node ${expected_node_id} differs from uniquely amnesiac voter ${node_id}"
     return 1
   fi
   ordinal=$((node_id - 1))
@@ -336,6 +363,7 @@ recover_amnesiac_if_needed() {
   fi
   start_forward "${ordinal}"
   reassert_restart_fence "${node_id}"
+  finish_rearmed_restart "${node_id}" "${ordinal}"
   "${CTL}" wait \
     --config "${MANIFEST}" \
     --node "${node_id}" \
@@ -345,7 +373,6 @@ recover_amnesiac_if_needed() {
   "${CTL}" undrain --config "${MANIFEST}" --node "${node_id}"
   strict_verify
   record_state complete "${node_id}"
-  RECOVERED_AMNESIAC_NODE=${node_id}
   log "amnesiac voter ${node_id} recovered and verified"
 }
 
@@ -384,6 +411,7 @@ roll_node() {
   wait_for_pod_ready "${ordinal}"
   start_forward "${ordinal}"
   reassert_restart_fence "${node_id}"
+  finish_rearmed_restart "${node_id}" "${ordinal}"
   image=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
     -o jsonpath='{.spec.containers[?(@.name=="ursula")].image}')
   if [ "${image}" != "${TARGET_IMAGE}" ]; then
