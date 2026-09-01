@@ -453,14 +453,14 @@ resume_if_needed() {
   ordinal=$((node_id - 1))
   TARGET_REVISION=$(desired_revision)
   log "resuming interrupted rollout at node ${node_id}: schema=${state_schema:-1} saved=${saved_image}@${saved_revision} current=${TARGET_IMAGE}@${TARGET_REVISION}"
-  if [ "${phase}" = "upgrading-restart-quiesce" ]; then
-    resume_quiesce_upgrade "${ordinal}" "${node_id}" "${source_pod_uid}"
-    return
-  fi
   if replacement_attempt_was_superseded "${ordinal}" "${saved_revision}" "${source_pod_uid}"; then
     log "saved replacement at node ${node_id} was superseded by a newer Ready Pod; reconciling its durable membership"
     finish_superseded_replacement "${ordinal}" "${node_id}"
     return 0
+  fi
+  if [ "${phase}" = "upgrading-restart-quiesce" ]; then
+    resume_quiesce_upgrade "${ordinal}" "${node_id}" "${source_pod_uid}"
+    return
   fi
   if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
     # The concrete compatibility consumer is an interrupted rollout whose
