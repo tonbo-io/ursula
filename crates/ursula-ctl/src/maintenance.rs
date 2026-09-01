@@ -810,12 +810,7 @@ enum GroupOperation<'a> {
 }
 
 impl GroupOperation<'_> {
-    async fn execute(
-        self,
-        client: &MetricsClient,
-        leader: &NodeInfo,
-        group_id: u64,
-    ) -> Result<()> {
+    async fn execute(self, client: &MetricsClient, leader: &NodeInfo, group_id: u64) -> Result<()> {
         match self {
             Self::ChangeMembership(voters) => {
                 client.change_membership(leader, group_id, voters).await
@@ -1732,10 +1727,7 @@ mod tests {
                 .promotion_leader_handoff
                 .swap(0, Ordering::SeqCst);
             if handoff != 0 {
-                state
-                    .cluster
-                    .pinned_leader
-                    .store(handoff, Ordering::SeqCst);
+                state.cluster.pinned_leader.store(handoff, Ordering::SeqCst);
             }
         }
         if state.node_id != mock_current_leader(&state.cluster) {
@@ -1973,9 +1965,7 @@ mod tests {
     async fn membership_repair_rediscovers_leader_after_promotion_handoff() {
         let (nodes, cluster) = mock_cluster(LeaderScenario::RepairableTarget).await;
         cluster.pinned_leader.store(3, Ordering::SeqCst);
-        cluster
-            .promotion_leader_handoff
-            .store(2, Ordering::SeqCst);
+        cluster.promotion_leader_handoff.store(2, Ordering::SeqCst);
 
         let preparation = repair_restarted_voter(
             &nodes,
