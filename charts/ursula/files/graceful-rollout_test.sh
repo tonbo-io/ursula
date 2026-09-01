@@ -247,9 +247,9 @@ fi
 [ "${controller_revision_read}" = "0" ]
 
 # A restart-quiesce handoff may have already replaced its source Pod before a
-# later target supersedes the failed Helm attempt. Reconcile that Ready
-# replacement's durable membership before ordinary convergence rolls it to the
-# new target; it is not required to already match the new target revision.
+# later target supersedes the failed Helm attempt. Replace that Ready non-target
+# Pod with the current target before membership repair: only the current binary
+# is guaranteed to honor the persisted election fence while survivors converge.
 (
   NAMESPACE=ursula
   STATEFULSET=ursula
@@ -263,12 +263,14 @@ fi
 
   superseded_ctl=$(mktemp)
   superseded_ctl_calls=$(mktemp)
-  export superseded_ctl_calls
+  superseded_order=$(mktemp)
+  export superseded_ctl_calls superseded_order
   cat >"${superseded_ctl}" <<'CTL'
 #!/bin/sh
 case "$1" in
   repair-restarted-voter|wait|finish-prepared-restart)
     printf '%s\n' "$1" >>"${superseded_ctl_calls}"
+    printf '%s\n' "$1" >>"${superseded_order}"
     ;;
   *)
     printf 'unexpected superseded ursulactl invocation: %s\n' "$*" >&2
@@ -305,12 +307,11 @@ CTL
         printf '%s' True
         ;;
       *"get pod ursula-2 -o jsonpath={.metadata.uid}"*)
-        printf '%s' prior-target-replacement-uid
+        printf '%s' "${superseded_uid}"
         ;;
       *"get pod ursula-2 -o jsonpath={.spec.containers"*|\
       *"get pod ursula-2 -o jsonpath={.metadata.labels.controller-revision-hash}"*)
-        echo "superseded recovery must not require the Ready replacement to match the new target" >&2
-        return 1
+        printf '%s' "${superseded_revision}"
         ;;
       *)
         printf 'unexpected superseded kubectl invocation: %s\n' "$*" >&2
@@ -322,7 +323,16 @@ CTL
   wait_for_pod_ready() { [ "$1" = 2 ]; }
   start_forward() { [ "$1" = 2 ]; superseded_forward=1; }
   strict_verify() { superseded_verified=1; }
-  replace_pod() { superseded_destructive_call=1; return 1; }
+  pod_matches_target() {
+    [ "$1" = 2 ] && [ "$2" = ursula-new-target ] && [ "${superseded_revision}" = ursula-new-target ]
+  }
+  replace_pod() {
+    [ "$1" = 2 ]
+    printf '%s\n' replace-pod >>"${superseded_order}"
+    superseded_uid=current-target-uid
+    superseded_revision=ursula-new-target
+    superseded_replacement_count=$((superseded_replacement_count + 1))
+  }
   record_state() {
     [ "$1" = complete ]
     [ "$2" = 3 ]
@@ -331,15 +341,18 @@ CTL
 
   superseded_forward=0
   superseded_verified=0
-  superseded_destructive_call=0
+  superseded_uid=prior-target-replacement-uid
+  superseded_revision=ursula-old-target
+  superseded_replacement_count=0
   superseded_complete=0
   resume_if_needed
   [ "${superseded_forward}" = 1 ]
   [ "${superseded_verified}" = 1 ]
-  [ "${superseded_destructive_call}" = 0 ]
+  [ "${superseded_replacement_count}" = 1 ]
   [ "${superseded_complete}" = 1 ]
   [ "$(tr '\n' ' ' <"${superseded_ctl_calls}")" = "repair-restarted-voter wait finish-prepared-restart " ]
-  rm -f "${superseded_ctl}" "${superseded_ctl_calls}"
+  [ "$(tr '\n' ' ' <"${superseded_order}")" = "replace-pod repair-restarted-voter wait finish-prepared-restart " ]
+  rm -f "${superseded_ctl}" "${superseded_ctl_calls}" "${superseded_order}"
 )
 
 CTL=true
