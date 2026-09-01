@@ -276,6 +276,51 @@ resume_if_needed() {
   record_state complete "${node_id}"
 }
 
+recover_amnesiac_if_needed() {
+  node_id=$("${CTL}" classify-amnesiac \
+    --config "${MANIFEST}" \
+    --lag-tolerance 16)
+  if [ "${node_id}" = "none" ]; then
+    return 0
+  fi
+  case "${node_id}" in
+    ''|*[!0-9]*)
+      log "invalid amnesiac recovery node id: ${node_id}"
+      return 1
+      ;;
+  esac
+  if [ "${node_id}" -lt 1 ] || [ "${node_id}" -gt "${REPLICAS}" ]; then
+    log "amnesiac recovery node id ${node_id} is outside 1..${REPLICAS}"
+    return 1
+  fi
+  ordinal=$((node_id - 1))
+  TARGET_REVISION=$(desired_revision)
+  log "preparing uniquely classified amnesiac voter ${node_id} for revision ${TARGET_REVISION}"
+  "${CTL}" prepare-amnesiac-restart \
+    --config "${MANIFEST}" \
+    --node "${node_id}" \
+    --drain-timeout-secs 300 \
+    --lag-tolerance 16
+  record_state restarting "${node_id}"
+  replace_pod "${ordinal}"
+  wait_for_pod_ready "${ordinal}"
+  if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
+    log "recovered node ${node_id} did not start at ${TARGET_IMAGE}@${TARGET_REVISION}"
+    return 1
+  fi
+  start_forward "${ordinal}"
+  "${CTL}" wait \
+    --config "${MANIFEST}" \
+    --node "${node_id}" \
+    --stall-timeout-secs 300 \
+    --ready-timeout-secs 1800 \
+    --lag-tolerance 16
+  "${CTL}" undrain --config "${MANIFEST}" --node "${node_id}"
+  strict_verify
+  record_state complete "${node_id}"
+  log "amnesiac voter ${node_id} recovered and verified"
+}
+
 roll_node() {
   ordinal=$1
   node_id=$((ordinal + 1))
@@ -354,6 +399,7 @@ main() {
     ordinal=$((ordinal + 1))
   done
 
+  recover_amnesiac_if_needed
   strict_verify
 
   pass=1

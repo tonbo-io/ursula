@@ -105,6 +105,53 @@ if pod_matches_target 1 ursula-current; then
   exit 1
 fi
 
+# A uniquely classified amnesiac voter is fenced, prepared through the
+# authoritative ursulactl recovery command, replaced, caught up, undrained and
+# strictly verified before the ordinary rollout starts.
+mock_ctl=$(mktemp)
+mock_ctl_calls=$(mktemp)
+export mock_ctl_calls
+cat >"${mock_ctl}" <<'CTL'
+#!/bin/sh
+case "$1" in
+  classify-amnesiac)
+    printf '%s\n' 3
+    ;;
+  prepare-amnesiac-restart|wait|undrain)
+    printf '%s\n' "$1" >>"${mock_ctl_calls}"
+    ;;
+  *)
+    printf 'unexpected ursulactl invocation: %s\n' "$*" >&2
+    exit 1
+    ;;
+esac
+CTL
+chmod +x "${mock_ctl}"
+CTL=${mock_ctl}
+REPLICAS=3
+desired_revision() { printf '%s' ursula-recovered; }
+replace_pod() { [ "$1" = "2" ]; recovered_replaced=1; }
+wait_for_pod_ready() { [ "$1" = "2" ]; }
+pod_matches_target() { [ "$1" = "2" ] && [ "$2" = "ursula-recovered" ]; }
+start_forward() { [ "$1" = "2" ]; recovered_forward=1; }
+strict_verify() { recovered_verified=1; }
+record_state() {
+  printf '%s %s\n' "$1" "$2" >>"${mock_ctl_calls}"
+}
+recovered_replaced=0
+recovered_forward=0
+recovered_verified=0
+recover_amnesiac_if_needed
+[ "${recovered_replaced}" = "1" ]
+[ "${recovered_forward}" = "1" ]
+[ "${recovered_verified}" = "1" ]
+grep -q '^prepare-amnesiac-restart$' "${mock_ctl_calls}"
+grep -q '^restarting 3$' "${mock_ctl_calls}"
+grep -q '^wait$' "${mock_ctl_calls}"
+grep -q '^undrain$' "${mock_ctl_calls}"
+grep -q '^complete 3$' "${mock_ctl_calls}"
+rm -f "${mock_ctl}" "${mock_ctl_calls}"
+
 # A recorded replacement must be resumed before the blanket Ready gate. The
 # stale replacement in the fixture cannot become Ready until resume replaces
 # it, so reversing these two calls recreates the production deadlock.
@@ -120,9 +167,17 @@ desired_revision() { printf '%s' ursula-current; }
 roll_node() { :; }
 all_pods_match_target() { return 0; }
 record_state() { :; }
+healthy_ctl=$(mktemp)
+cat >"${healthy_ctl}" <<'CTL'
+#!/bin/sh
+[ "$1" = "classify-amnesiac" ] && printf '%s\n' none
+CTL
+chmod +x "${healthy_ctl}"
+CTL=${healthy_ctl}
 REPLICAS=1
 main
 [ "${call_order}" = " ready resume wait" ]
+rm -f "${healthy_ctl}"
 
 # The cluster manifest used to list three nodes literally, so any other replica
 # count produced a view that disagreed with the StatefulSet it was rolling. The
