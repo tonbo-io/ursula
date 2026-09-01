@@ -3457,20 +3457,6 @@ async fn static_grpc_memory_node_rejoins_all_groups_after_allowed_log_revert() {
             )
             .await
             .expect("wait for leader purge");
-
-        let leader_base = peers
-            .iter()
-            .find(|(node_id, _)| *node_id == leader_id)
-            .map(|(_, base_url)| base_url.as_str())
-            .expect("leader peer base url");
-        let allow_revert = client
-            .post(format!(
-                "{leader_base}/__ursula/raft/{raw_group_id}/nodes/3/allow-next-revert"
-            ))
-            .send()
-            .await
-            .expect("allow node 3 log reversion through admin endpoint");
-        assert_eq!(allow_revert.status(), StatusCode::OK);
     }
 
     let restarted_listener = tokio::net::TcpListener::bind(addrs[2])
@@ -3494,6 +3480,36 @@ async fn static_grpc_memory_node_rejoins_all_groups_after_allowed_log_revert() {
         .warm_all_groups()
         .await
         .expect("warm restarted empty node 3 groups");
+
+    // Exercise the interrupted-rollout recovery shape: the replacement is
+    // already running and wholly missing these groups when the operator arms
+    // its next log reversion. The same process must catch up; restarting it
+    // again would clear any groups which had already recovered.
+    for raw_group_id in 0u32..6 {
+        let raft_group_id = RaftGroupId(raw_group_id);
+        let observer_raft = nodes[0]
+            .registry
+            .get(raft_group_id)
+            .expect("observer group");
+        let leader_id = observer_raft
+            .metrics()
+            .borrow_watched()
+            .current_leader
+            .expect("surviving leader remains elected");
+        let leader_base = peers
+            .iter()
+            .find(|(node_id, _)| *node_id == leader_id)
+            .map(|(_, base_url)| base_url.as_str())
+            .expect("leader peer base url");
+        let allow_revert = client
+            .post(format!(
+                "{leader_base}/__ursula/raft/{raw_group_id}/nodes/3/allow-next-revert"
+            ))
+            .send()
+            .await
+            .expect("allow running node 3 log reversion through admin endpoint");
+        assert_eq!(allow_revert.status(), StatusCode::OK);
+    }
 
     for (group_index, stream_id) in streams_by_group.iter().enumerate() {
         let raft_group_id = RaftGroupId(group_index as u32);
