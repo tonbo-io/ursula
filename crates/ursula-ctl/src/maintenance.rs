@@ -960,25 +960,31 @@ fn stable_non_target_leader(
     target_node_id: u64,
 ) -> Result<u64> {
     let mut leader = None;
-    for view in &snap.per_node {
+    for view in snap
+        .per_node
+        .iter()
+        .filter(|view| view.node.id != target_node_id)
+    {
         let Some(group) = view.group(raft_group_id) else {
             continue;
         };
         let Some(candidate) = group.current_leader else {
             continue;
         };
-        if candidate == target_node_id {
-            bail!(
-                "target node {} is still reported as leader for group {} by node {}",
-                target_node_id,
-                raft_group_id,
-                view.node.id
-            );
+        // A follower's current_leader observation may remain stale across an
+        // otherwise completed transfer. The target is quiesced before this
+        // plan is built, so its frozen view is especially unsuitable as an
+        // authority. A leader's own view is the narrow authoritative signal:
+        // the allow-next-revert endpoint independently enforces the same
+        // self-leader condition, and the caller samples this map again after
+        // every group is armed.
+        if candidate != view.node.id {
+            continue;
         }
         if let Some(existing) = leader {
             if existing != candidate {
                 bail!(
-                    "conflicting leaders for group {} while allowing node {} rejoin: {} vs {}",
+                    "multiple peers self-report leadership for group {} while allowing node {} rejoin: {} vs {}",
                     raft_group_id,
                     target_node_id,
                     existing,
@@ -1528,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn peer_reported_target_leader_keeps_drain_active() {
+    fn drain_uses_all_reports_but_rejoin_uses_a_peer_self_leader() {
         let snapshot = ClusterSnapshot {
             per_node: vec![
                 NodeMetricsView {
@@ -1555,11 +1561,32 @@ mod tests {
         assert_eq!(still_led.len(), 1);
         assert_eq!(still_led[0].raft_group_id, 7);
 
-        let err = stable_non_target_leader(&snapshot, 7, 1).unwrap_err();
-        assert!(
-            err.to_string().contains("still reported as leader"),
-            "{err:#}"
-        );
+        assert_eq!(stable_non_target_leader(&snapshot, 7, 1).unwrap(), 2);
+    }
+
+    #[test]
+    fn rejoin_ignores_the_quiesced_targets_frozen_leader_view() {
+        let snapshot = ClusterSnapshot {
+            per_node: vec![
+                NodeMetricsView {
+                    node: n(1, "10.0.0.1"),
+                    groups: vec![group(159, 1, Some(1), 100, 100)],
+                    wal_backend: Some("memory".into()),
+                },
+                NodeMetricsView {
+                    node: n(2, "10.0.0.2"),
+                    groups: vec![group(159, 2, Some(3), 100, 100)],
+                    wal_backend: Some("memory".into()),
+                },
+                NodeMetricsView {
+                    node: n(3, "10.0.0.3"),
+                    groups: vec![group(159, 3, Some(1), 100, 100)],
+                    wal_backend: Some("memory".into()),
+                },
+            ],
+        };
+
+        assert_eq!(stable_non_target_leader(&snapshot, 159, 2).unwrap(), 1);
     }
 
     #[test]
