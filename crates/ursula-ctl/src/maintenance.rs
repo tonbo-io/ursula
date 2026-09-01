@@ -597,15 +597,9 @@ pub async fn repair_restarted_voter(
     // campaigns and inbound transfers, but does not itself move a current
     // leader. Explicitly drain the target before fencing the other survivor,
     // otherwise the anchor can never become the sole leader authority.
-    drain_recovery_target(
-        nodes,
-        target,
-        client,
-        drain_options,
-        &configured_node_ids,
-    )
-    .await
-    .context("drain current leaders from restarted voter before membership repair")?;
+    drain_recovery_target(nodes, target, client, drain_options, &configured_node_ids)
+        .await
+        .context("drain current leaders from restarted voter before membership repair")?;
     let fence =
         pin_restart_leaders(nodes, target, client, drain_options, &configured_node_ids).await?;
     let leader = nodes
