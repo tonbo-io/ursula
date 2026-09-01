@@ -382,9 +382,19 @@ resume_quiesce_upgrade() {
   pod="${STATEFULSET}-${ordinal}"
   current_pod_uid=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
     -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
-  if [ -n "${current_pod_uid}" ] && [ "${current_pod_uid}" = "${source_pod_uid}" ]; then
-    log "replacing drained legacy node ${node_id} with a restart-quiesce-capable binary"
-    replace_pod "${ordinal}"
+  if [ -n "${current_pod_uid}" ]; then
+    if [ "${current_pod_uid}" = "${source_pod_uid}" ]; then
+      log "replacing drained legacy node ${node_id} with a restart-quiesce-capable binary"
+      replace_pod "${ordinal}"
+    elif ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
+      # The durable handoff owns every replacement after source_pod_uid. A
+      # failed Helm attempt may have created a Ready non-target replacement
+      # whose old binary cannot honor the persisted election fence. Replace it
+      # with the current target before membership repair so it cannot keep
+      # advancing terms while the surviving voters converge.
+      log "replacing superseded non-target node ${node_id} before durable membership repair"
+      replace_pod "${ordinal}"
+    fi
   fi
   wait_for_pod_ready "${ordinal}"
   if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
@@ -453,14 +463,14 @@ resume_if_needed() {
   ordinal=$((node_id - 1))
   TARGET_REVISION=$(desired_revision)
   log "resuming interrupted rollout at node ${node_id}: schema=${state_schema:-1} saved=${saved_image}@${saved_revision} current=${TARGET_IMAGE}@${TARGET_REVISION}"
+  if [ "${phase}" = "upgrading-restart-quiesce" ]; then
+    resume_quiesce_upgrade "${ordinal}" "${node_id}" "${source_pod_uid}"
+    return
+  fi
   if replacement_attempt_was_superseded "${ordinal}" "${saved_revision}" "${source_pod_uid}"; then
     log "saved replacement at node ${node_id} was superseded by a newer Ready Pod; reconciling its durable membership"
     finish_superseded_replacement "${ordinal}" "${node_id}"
     return 0
-  fi
-  if [ "${phase}" = "upgrading-restart-quiesce" ]; then
-    resume_quiesce_upgrade "${ordinal}" "${node_id}" "${source_pod_uid}"
-    return
   fi
   if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
     # The concrete compatibility consumer is an interrupted rollout whose
