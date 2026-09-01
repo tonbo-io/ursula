@@ -199,6 +199,7 @@ mod tests {
         RaftGroupView {
             raft_group_id,
             node_id: 0,
+            current_term: Some(1),
             current_leader: leader,
             committed_index: Some(1),
             last_applied_index: Some(1),
@@ -211,6 +212,7 @@ mod tests {
         RaftGroupView {
             raft_group_id,
             node_id: 0,
+            current_term: Some(0),
             current_leader: None,
             committed_index: None,
             last_applied_index: None,
