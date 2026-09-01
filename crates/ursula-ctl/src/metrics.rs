@@ -509,10 +509,9 @@ mod tests {
     #[tokio::test]
     async fn restart_quiesce_probe_distinguishes_legacy_route_absence() -> anyhow::Result<()> {
         let client = MetricsClient::new(Duration::from_secs(1))?;
-        let supported = capability_node(Router::new().route(
-            "/__ursula/raft/quiesce-for-restart",
-            post(quiesce_route),
-        ))
+        let supported = capability_node(
+            Router::new().route("/__ursula/raft/quiesce-for-restart", post(quiesce_route)),
+        )
         .await?;
         let legacy = capability_node(Router::new()).await?;
 
