@@ -308,6 +308,21 @@ fn parses_membership_voter_ids() {
 }
 
 #[test]
+fn query_parser_decodes_membership_and_learner_values() {
+    let query = parse_query(Some(
+        "voters=1%2C2%2C3&addr=http%3A%2F%2Fnode-3%3A4437&blocking=false",
+    ))
+    .expect("parse encoded admin query");
+
+    assert_eq!(query.get("voters").map(String::as_str), Some("1,2,3"));
+    assert_eq!(
+        query.get("addr").map(String::as_str),
+        Some("http://node-3:4437")
+    );
+    assert_eq!(query.get("blocking").map(String::as_str), Some("false"));
+}
+
+#[test]
 fn static_grpc_membership_config_rejects_partial_group_voters() {
     let result = crate::bootstrap::Topology::static_cluster(
         1,

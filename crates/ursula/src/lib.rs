@@ -3934,17 +3934,13 @@ pub(crate) fn parse_query(raw: Option<&str>) -> Result<HashMap<String, String>, 
     let Some(raw) = raw else {
         return Ok(query);
     };
-    for pair in raw.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+    for (key, value) in url::form_urlencoded::parse(raw.as_bytes()) {
         if key == "offset" && query.contains_key("offset") {
             return Err(Box::new(
                 (StatusCode::BAD_REQUEST, "multiple offset parameters").into_response(),
             ));
         }
-        query.insert(key.to_owned(), value.to_owned());
+        query.insert(key.into_owned(), value.into_owned());
     }
     Ok(query)
 }
