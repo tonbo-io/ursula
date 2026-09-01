@@ -31,6 +31,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", 
 tracing = { workspace = true }
 url = { workspace = true, features = ["serde"] }
 ursula-observability = { workspace = true }
+ursula-raft = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

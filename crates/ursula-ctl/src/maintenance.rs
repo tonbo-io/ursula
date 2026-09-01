@@ -1523,30 +1523,27 @@ async fn stabilize_survivor_leadership(
         }
 
         for handoff in handoffs {
-            let leader = nodes
+            let higher_term_voter = nodes
                 .iter()
-                .find(|node| node.id == handoff.stale_leader)
-                .expect("term handoff leader is a configured node");
+                .find(|node| node.id == handoff.higher_term_voter)
+                .expect("term handoff voter is a configured node");
             tracing::warn!(
                 raft_group_id = handoff.raft_group_id,
                 stale_leader = handoff.stale_leader,
                 stale_term = handoff.stale_term,
                 higher_term_voter = handoff.higher_term_voter,
                 higher_term = handoff.higher_term,
-                "nudging a stale self-reported leader through a Raft-native term handoff"
+                "asking the caught-up higher-term voter to start a Raft-native election"
             );
             match client
-                .transfer_leader(leader, handoff.raft_group_id, handoff.higher_term_voter)
+                .request_self_election(
+                    higher_term_voter,
+                    handoff.raft_group_id,
+                    handoff.higher_term,
+                )
                 .await
             {
-                Ok(response) if response.transferred => {}
-                Ok(response) => {
-                    last_error = anyhow!(
-                        "survivor term handoff for group {} was rejected: {}",
-                        handoff.raft_group_id,
-                        response.reason.unwrap_or_else(|| "unknown".to_owned())
-                    );
-                }
+                Ok(()) => {}
                 Err(error) => {
                     last_error = error.context(format!(
                         "trigger survivor term handoff for group {}",
@@ -1590,9 +1587,9 @@ fn stale_survivor_term_handoff(
             )
         })?;
         if group.voter_ids.contains(&view.node.id)
-            && max_term_voter.is_none_or(|(_, term)| current_term > term)
+            && max_term_voter.is_none_or(|(_, term, _)| current_term > term)
         {
-            max_term_voter = Some((view.node.id, current_term));
+            max_term_voter = Some((view.node.id, current_term, group));
         }
         if group.current_leader == Some(view.node.id) {
             if let Some((existing, _, _)) = &self_leader {
@@ -1604,14 +1601,14 @@ fn stale_survivor_term_handoff(
                     view.node.id
                 );
             }
-            self_leader = Some((view.node.id, current_term, group.voter_ids.clone()));
+            self_leader = Some((view.node.id, current_term, group));
         }
     }
-    let (stale_leader, stale_term, stale_leader_voters) = match self_leader {
+    let (stale_leader, stale_term, stale_group) = match self_leader {
         Some(leader) => leader,
         None => return Ok(None),
     };
-    let (higher_term_voter, higher_term) = max_term_voter.ok_or_else(|| {
+    let (higher_term_voter, higher_term, higher_group) = max_term_voter.ok_or_else(|| {
         anyhow!(
             "group {} has no surviving voter term while repairing node {}",
             raft_group_id,
@@ -1621,12 +1618,70 @@ fn stale_survivor_term_handoff(
     if stale_term >= higher_term {
         return Ok(None);
     }
-    if !stale_leader_voters.contains(&higher_term_voter) {
+    if !stale_group.voter_ids.contains(&higher_term_voter) {
         bail!(
             "group {} stale leader {} does not list higher-term node {} as a voter",
             raft_group_id,
             stale_leader,
             higher_term_voter
+        );
+    }
+    if higher_group.current_leader.is_some() {
+        bail!(
+            "group {} higher-term voter {} still reports leader {:?}; refusing an inferred self-election",
+            raft_group_id,
+            higher_term_voter,
+            higher_group.current_leader
+        );
+    }
+    if higher_group.voter_ids != stale_group.voter_ids {
+        bail!(
+            "group {} survivor voter sets differ during term handoff: stale leader {} has {:?}, higher-term voter {} has {:?}",
+            raft_group_id,
+            stale_leader,
+            stale_group.voter_ids,
+            higher_term_voter,
+            higher_group.voter_ids
+        );
+    }
+    let stale_committed = stale_group.committed_index.ok_or_else(|| {
+        anyhow!(
+            "group {} stale leader {} does not report committed_index",
+            raft_group_id,
+            stale_leader
+        )
+    })?;
+    let higher_committed = higher_group.committed_index.ok_or_else(|| {
+        anyhow!(
+            "group {} higher-term voter {} does not report committed_index",
+            raft_group_id,
+            higher_term_voter
+        )
+    })?;
+    let stale_applied = stale_group.last_applied_index.ok_or_else(|| {
+        anyhow!(
+            "group {} stale leader {} does not report last_applied_index",
+            raft_group_id,
+            stale_leader
+        )
+    })?;
+    let higher_applied = higher_group.last_applied_index.ok_or_else(|| {
+        anyhow!(
+            "group {} higher-term voter {} does not report last_applied_index",
+            raft_group_id,
+            higher_term_voter
+        )
+    })?;
+    if higher_committed < stale_committed || higher_applied < stale_applied {
+        bail!(
+            "group {} higher-term voter {} is behind stale leader {} (committed {} < {} or applied {} < {}); refusing election handoff",
+            raft_group_id,
+            higher_term_voter,
+            stale_leader,
+            higher_committed,
+            stale_committed,
+            higher_applied,
+            stale_applied
         );
     }
     Ok(Some(SurvivorTermHandoff {
@@ -2551,6 +2606,20 @@ mod tests {
                 higher_term: 100,
             })
         );
+
+        let mut higher_term_reports_a_leader = stale_term.clone();
+        higher_term_reports_a_leader.per_node[1].groups[0].current_leader = Some(2);
+        let error = stale_survivor_term_handoff(&higher_term_reports_a_leader, 7, 1)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("still reports leader"),
+            "{error:#}"
+        );
+
+        let mut higher_term_is_behind = stale_term;
+        higher_term_is_behind.per_node[1].groups[0].committed_index = Some(99);
+        let error = stale_survivor_term_handoff(&higher_term_is_behind, 7, 1).unwrap_err();
+        assert!(error.to_string().contains("is behind stale leader"), "{error:#}");
     }
 
     #[test]
