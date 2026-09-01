@@ -1,7 +1,7 @@
 //! Operational library behind the `ursulactl` CLI.
 //!
 //! ursulactl manages logical cluster state over Ursula's admin and metrics
-//! HTTP APIs: leadership placement, readiness, and rejoin permission. It
+//! HTTP APIs: leadership placement, readiness, and membership repair. It
 //! executes nothing on hosts. Physical lifecycle (deploying, restarting, and
 //! scaling processes) belongs to the platform, such as Helm and OpenTofu on
 //! Kubernetes or systemd on hosts, and the operator brings their own tunnel
@@ -14,8 +14,7 @@
 //! - [`observe`]: read-only status and cluster-wide readiness reporting.
 //! - [`plan`]: pure drain planning and per-node readiness checks.
 //! - [`backup`]: verifiable cluster backup, verification, and restore.
-//! - [`maintenance`]: node-maintenance verbs (drain, undrain, catch-up wait,
-//!   rejoin arming).
+//! - [`maintenance`]: node-maintenance verbs (drain, restart repair, catch-up).
 //! - [`provider`]: cluster manifest loading and node addressing.
 
 pub mod backup;
@@ -29,18 +28,15 @@ pub use maintenance::CatchUpOptions;
 pub use maintenance::CatchUpOutcome;
 pub use maintenance::DrainOptions;
 pub use maintenance::DrainOutcome;
-pub use maintenance::RejoinOptions;
+pub use maintenance::MembershipRepairOptions;
 pub use maintenance::RestartPreparation;
 pub use maintenance::abort_prepared_restart;
-pub use maintenance::arm_empty_rejoin;
 pub use maintenance::drain_node;
 pub use maintenance::finish_prepared_restart;
 pub use maintenance::prepare_amnesiac_restart;
 pub use maintenance::prepare_recovery_handoff;
-pub use maintenance::prepare_recovery_restart;
 pub use maintenance::prepare_restart;
-pub use maintenance::resolve_empty_rejoin_policy;
-pub use maintenance::resolve_restart_rejoin_policy;
+pub use maintenance::repair_restarted_voter;
 pub use maintenance::undrain_node;
 pub use maintenance::wait_cluster_ready;
 pub use maintenance::wait_node_ready;

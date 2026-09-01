@@ -122,6 +122,21 @@ finish_prepared_restart() {
   PREPARED_RESTART_NODE=
 }
 
+repair_restarted_voter() {
+  node_id=$1
+  PREPARED_RESTART_NODE=${node_id}
+  # The first replacement can be repaired through 0.4.8 survivors, whose
+  # learner endpoint ignores blocking=false and waits for catch-up. Keep the
+  # HTTP budget until every supported upgrade source includes non-blocking
+  # learner attachment.
+  "${CTL}" repair-restarted-voter \
+    --config "${MANIFEST}" \
+    --node "${node_id}" \
+    --drain-timeout-secs 300 \
+    --http-timeout-secs 600 \
+    --lag-tolerance 16
+}
+
 wait_for_template() {
   attempts=0
   while :; do
@@ -236,17 +251,6 @@ strict_verify() {
     --lag-tolerance 16
 }
 
-prepare_recovery_restart() {
-  node_id=$1
-  PREPARED_RESTART_NODE=${node_id}
-  "${CTL}" prepare-recovery-restart \
-    --config "${MANIFEST}" \
-    --node "${node_id}" \
-    --drain-timeout-secs 300 \
-    --http-timeout-secs 60 \
-    --lag-tolerance 16
-}
-
 prepare_recovery_handoff() {
   node_id=$1
   "${CTL}" prepare-recovery-handoff \
@@ -323,6 +327,24 @@ finish_recovery_restart() {
     return 1
   fi
   start_forward "${ordinal}"
+  repair_restarted_voter "${node_id}"
+  "${CTL}" wait \
+    --config "${MANIFEST}" \
+    --node "${node_id}" \
+    --stall-timeout-secs 300 \
+    --ready-timeout-secs 1800 \
+    --lag-tolerance 16
+  finish_prepared_restart "${node_id}"
+  strict_verify
+  record_state complete "${node_id}"
+}
+
+finish_superseded_replacement() {
+  ordinal=$1
+  node_id=$2
+  wait_for_pod_ready "${ordinal}"
+  start_forward "${ordinal}"
+  repair_restarted_voter "${node_id}"
   "${CTL}" wait \
     --config "${MANIFEST}" \
     --node "${node_id}" \
@@ -350,13 +372,7 @@ resume_quiesce_upgrade() {
     log "legacy recovery handoff at node ${node_id} produced a non-target Pod"
     return 1
   fi
-  start_forward "${ordinal}"
-  prepare_recovery_restart "${node_id}"
-  quiesced_pod_uid=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
-    -o jsonpath='{.metadata.uid}')
-  record_state restarting "${node_id}" "${quiesced_pod_uid}"
-  log "node ${node_id} now supports restart quiescence and is rearmed; recreating it once"
-  replace_pod "${ordinal}"
+  log "node ${node_id} now supports durable learner repair; rebuilding its incomplete groups"
   finish_recovery_restart "${ordinal}" "${node_id}"
 }
 
@@ -423,28 +439,15 @@ resume_if_needed() {
     return
   fi
   if replacement_attempt_was_superseded "${ordinal}" "${saved_revision}" "${source_pod_uid}"; then
-    log "saved replacement at node ${node_id} was superseded by a newer Ready Pod; verifying before closing the old state"
-    start_forward "${ordinal}"
-    if "${CTL}" wait \
-      --config "${MANIFEST}" \
-      --node "${node_id}" \
-      --stall-timeout-secs 300 \
-      --ready-timeout-secs 1800 \
-      --lag-tolerance 16 && strict_verify; then
-      "${CTL}" undrain --config "${MANIFEST}" --node "${node_id}"
-      strict_verify
-      record_state complete "${node_id}"
-      log "superseded replacement at node ${node_id} is healthy; old rollout state closed"
-      return 0
-    fi
-    log "superseding Pod at node ${node_id} is not yet a complete voter; continuing fail-closed recovery"
+    log "saved replacement at node ${node_id} was superseded by a newer Ready Pod; reconciling its durable membership"
+    finish_superseded_replacement "${ordinal}" "${node_id}"
+    return 0
   fi
   if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
     # The concrete compatibility consumer is an interrupted rollout whose
-    # partial replacement predates restart quiescence. Rearming while that
-    # process is alive is unsafe: it could consume one-shot revert permission.
-    # Drain it without arming anything, persist the handoff, replace it with
-    # the target binary, then use the normal quiesce-and-rearm operation.
+    # partial replacement predates restart quiescence. Drain it without
+    # invoking an endpoint it does not have, persist the handoff, replace it
+    # with the target binary, then rebuild it through durable membership.
     # Remove this phase after every retained rollout state and running voter
     # is known to include the restart-quiesce endpoint.
     start_forward "${ordinal}"
@@ -455,21 +458,17 @@ resume_if_needed() {
     resume_quiesce_upgrade "${ordinal}" "${node_id}" "${legacy_pod_uid}"
     return
   fi
-  # `restarting` is written after drain and before the irreversible quiesce.
-  # If a later Helm attempt finds it, waiting first deadlocks: the quiesced or
-  # stale pod cannot become Ready and only this state machine may replace it.
-  # Finish the committed replacement against the current StatefulSet revision.
-  # A replacement that came up before its leaders were armed may already have
-  # triggered OpenRaft's reversion guard. Quiesce its Raft cores first, rearm
-  # the full memory-WAL inventory, and only then create the process that will
-  # consume those one-shot permissions.
-  start_forward "${ordinal}"
-  prepare_recovery_restart "${node_id}"
-  quiesced_pod_uid=$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-${ordinal}" \
-    -o jsonpath='{.metadata.uid}')
-  record_state restarting "${node_id}" "${quiesced_pod_uid}"
-  log "node ${node_id} is quiesced and rearmed; recreating the voter"
-  replace_pod "${ordinal}"
+  # A recorded restart owns this drained node even if the previous Job died
+  # before or after quiescence. Recreate the source process at most once, then
+  # normalize every unready group through detach -> learner -> voter. The
+  # membership repair is durable and idempotent, so no process-local token is
+  # required to infer how far the previous attempt got.
+  current_pod_uid=$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-${ordinal}" \
+    -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+  if [ -n "${current_pod_uid}" ] && [ "${current_pod_uid}" = "${source_pod_uid}" ]; then
+    log "recreating recorded restart source at node ${node_id}"
+    replace_pod "${ordinal}"
+  fi
   finish_recovery_restart "${ordinal}" "${node_id}"
 }
 
@@ -510,6 +509,7 @@ recover_amnesiac_if_needed() {
     return 1
   fi
   start_forward "${ordinal}"
+  repair_restarted_voter "${node_id}"
   "${CTL}" wait \
     --config "${MANIFEST}" \
     --node "${node_id}" \
@@ -575,6 +575,7 @@ roll_node() {
     log "node ${node_id} recreated at revision ${revision} while target moved to ${current_revision}; finishing recovery before another pass"
   fi
 
+  repair_restarted_voter "${node_id}"
   "${CTL}" wait \
     --config "${MANIFEST}" \
     --node "${node_id}" \

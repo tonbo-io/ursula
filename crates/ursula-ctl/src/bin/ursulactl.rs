@@ -42,12 +42,8 @@ enum Command {
     /// Block until one node is back as a voter in every group and caught up.
     /// Progress-gated: a node that keeps advancing is never timed out.
     Wait(WaitArgs),
-    /// Arm one empty-log rejoin per group for a raft-memory node that lost its
-    /// volatile log. Refused on disk-backed clusters.
-    AllowRejoin(NodeArgs),
-    /// Quiesce one drained node for an immediate platform restart. Memory-WAL
-    /// clusters then arm rejoin permissions while survivor leadership is
-    /// pinned to one anchor.
+    /// Quiesce one drained node for an immediate platform restart and pin
+    /// survivor leadership to one anchor for durable membership repair.
     PrepareRestart(NodeArgs),
     /// Release the target and survivor maintenance fences after the prepared
     /// replacement has caught up.
@@ -55,15 +51,15 @@ enum Command {
     /// Release only survivor fences after a prepared replacement failed. The
     /// uncertain target remains maintenance-drained.
     AbortPreparedRestart(NodeArgs),
-    /// Recover the uniquely identifiable voter that is missing whole Raft
-    /// groups. Drains and quiesces it, then arms one memory-WAL rejoin before
-    /// the platform immediately restarts it.
+    /// Recover the uniquely identifiable memory-WAL voter that is missing
+    /// whole Raft groups. Drains and quiesces it for platform replacement.
     PrepareAmnesiacRestart(RestartTargetArgs),
-    /// Fence and quiesce a partial replacement, then arm every memory-WAL
-    /// group for the next process. Used to resume an interrupted rollout.
-    PrepareRecoveryRestart(RestartTargetArgs),
+    /// Rebuild an unready replacement by detaching it from each affected Raft
+    /// group, attaching it as a blocking learner, and promoting it after
+    /// catch-up. Safe to resume after a partially completed repair.
+    RepairRestartedVoter(RestartTargetArgs),
     /// Drain a partial replacement that predates restart quiescence so the
-    /// platform can replace it with a binary that supports safe rearming.
+    /// platform can replace it with a binary that supports membership repair.
     PrepareRecoveryHandoff(RestartTargetArgs),
     /// Print the unique safely recoverable amnesiac voter id, or `none` when
     /// every voter is ready. Refuses every other unready cluster shape.
@@ -255,15 +251,14 @@ async fn main() -> Result<()> {
         Command::Drain(args) => run_drain_subcommand(args).await,
         Command::Undrain(args) => run_undrain_subcommand(args).await,
         Command::Wait(args) => run_wait_subcommand(args).await,
-        Command::AllowRejoin(args) => run_allow_rejoin_subcommand(args).await,
         Command::PrepareRestart(args) => run_prepare_restart_subcommand(args).await,
         Command::FinishPreparedRestart(args) => run_finish_prepared_restart_subcommand(args).await,
         Command::AbortPreparedRestart(args) => run_abort_prepared_restart_subcommand(args).await,
         Command::PrepareAmnesiacRestart(args) => {
             run_prepare_amnesiac_restart_subcommand(args).await
         }
-        Command::PrepareRecoveryRestart(args) => {
-            run_prepare_recovery_restart_subcommand(args).await
+        Command::RepairRestartedVoter(args) => {
+            run_repair_restarted_voter_subcommand(args).await
         }
         Command::PrepareRecoveryHandoff(args) => {
             run_prepare_recovery_handoff_subcommand(args).await
@@ -448,7 +443,7 @@ async fn run_wait_subcommand(args: WaitArgs) -> Result<()> {
         poll_interval: Duration::from_secs(args.poll_interval_secs),
         lag_tolerance: args.lag_tolerance,
     };
-    match ursula_ctl::wait_node_ready(&nodes, target, &client, &options, false).await? {
+    match ursula_ctl::wait_node_ready(&nodes, target, &client, &options).await? {
         ursula_ctl::CatchUpOutcome::Ready => {
             println!("node {}: caught up", target.id);
             Ok(())
@@ -458,29 +453,6 @@ async fn run_wait_subcommand(args: WaitArgs) -> Result<()> {
             std::process::exit(2);
         }
     }
-}
-
-async fn run_allow_rejoin_subcommand(args: NodeArgs) -> Result<()> {
-    let nodes = load_nodes(&args.config).await?;
-    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
-    let target = find_node(&nodes, args.node)?;
-    // Refuses on all-disk clusters: an empty rejoin there means a wiped node.
-    let allowed = ursula_ctl::resolve_empty_rejoin_policy(&client, &nodes, true).await?;
-    if !allowed {
-        bail!("empty-log rejoin is not applicable to this cluster");
-    }
-    ursula_ctl::arm_empty_rejoin(
-        &nodes,
-        target,
-        &client,
-        &ursula_ctl::RejoinOptions::default(),
-    )
-    .await?;
-    println!(
-        "node {}: empty-log rejoin armed on every group leader",
-        target.id
-    );
-    Ok(())
 }
 
 async fn run_prepare_restart_subcommand(args: NodeArgs) -> Result<()> {
@@ -496,7 +468,6 @@ async fn run_prepare_restart_subcommand(args: NodeArgs) -> Result<()> {
             dry_run: false,
             ..ursula_ctl::DrainOptions::default()
         },
-        &ursula_ctl::RejoinOptions::default(),
     )
     .await?;
     println!(
@@ -542,7 +513,6 @@ async fn run_prepare_amnesiac_restart_subcommand(args: RestartTargetArgs) -> Res
             lag_tolerance: args.lag_tolerance,
             dry_run: false,
         },
-        &ursula_ctl::RejoinOptions::default(),
     )
     .await?;
     println!(
@@ -555,11 +525,11 @@ async fn run_prepare_amnesiac_restart_subcommand(args: RestartTargetArgs) -> Res
     Ok(())
 }
 
-async fn run_prepare_recovery_restart_subcommand(args: RestartTargetArgs) -> Result<()> {
+async fn run_repair_restarted_voter_subcommand(args: RestartTargetArgs) -> Result<()> {
     let nodes = load_nodes(&args.config).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
     let target = find_node(&nodes, args.node)?;
-    let preparation = ursula_ctl::prepare_recovery_restart(
+    let preparation = ursula_ctl::repair_restarted_voter(
         &nodes,
         target,
         &client,
@@ -570,11 +540,11 @@ async fn run_prepare_recovery_restart_subcommand(args: RestartTargetArgs) -> Res
             lag_tolerance: args.lag_tolerance,
             dry_run: false,
         },
-        &ursula_ctl::RejoinOptions::default(),
+        &ursula_ctl::MembershipRepairOptions::default(),
     )
     .await?;
     println!(
-        "node {}: recovery restart quiesced; {} group(s) were wholly missing; leaders pinned to node {}; fenced survivors={:?}; the full restart inventory is armed",
+        "node {}: repaired {} unready group(s) through learner catch-up; leaders pinned to node {}; fenced survivors={:?}",
         target.id,
         preparation.missing_group_count,
         preparation.leader_anchor,
@@ -631,30 +601,4 @@ async fn run_verify_cluster_subcommand(args: VerifyClusterArgs) -> Result<()> {
     .await?;
     println!("cluster verified: {} node(s) fully ready", nodes.len());
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use clap::Parser;
-
-    use super::Cli;
-    use super::Command;
-
-    #[test]
-    fn prepare_recovery_restart_accepts_the_recovery_contract() {
-        let cli = Cli::try_parse_from([
-            "ursulactl",
-            "prepare-recovery-restart",
-            "--config",
-            "cluster.json",
-            "--node",
-            "3",
-        ])
-        .unwrap();
-
-        let Command::PrepareRecoveryRestart(args) = cli.command else {
-            panic!("expected prepare-recovery-restart command");
-        };
-        assert_eq!(args.node, 3);
-    }
 }

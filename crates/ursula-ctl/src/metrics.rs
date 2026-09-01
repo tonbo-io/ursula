@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -133,19 +134,25 @@ impl MetricsClient {
         }
     }
 
-    pub async fn allow_next_revert(
+    pub async fn change_membership(
         &self,
         leader: &NodeInfo,
         raft_group_id: u64,
-        node_id: u64,
+        voters: &BTreeSet<u64>,
     ) -> Result<()> {
-        let path = format!("/__ursula/raft/{raft_group_id}/nodes/{node_id}/allow-next-revert");
-        let url = leader.admin_url.join(&path).with_context(|| {
+        let path = format!("/__ursula/raft/{raft_group_id}/membership");
+        let mut url = leader.admin_url.join(&path).with_context(|| {
             format!(
-                "compose allow-next-revert url at leader node {} for node {}",
-                leader.id, node_id
+                "compose membership url at leader node {} for group {}",
+                leader.id, raft_group_id
             )
         })?;
+        let voter_list = voters
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        url.query_pairs_mut().append_pair("voters", &voter_list);
         let resp = self
             .client
             .post(url.clone())
@@ -158,10 +165,56 @@ impl MetricsClient {
             Ok(())
         } else {
             Err(anyhow!(
-                "allow-next-revert at leader node {} (group {} node {}) returned {}: {}",
+                "change membership at leader node {} (group {} voters={:?}) returned {}: {}",
                 leader.id,
                 raft_group_id,
-                node_id,
+                voters,
+                status,
+                body
+            ))
+        }
+    }
+
+    pub async fn add_learner(
+        &self,
+        leader: &NodeInfo,
+        raft_group_id: u64,
+        target: &NodeInfo,
+    ) -> Result<()> {
+        let address = target.http_url.as_ref().ok_or_else(|| {
+            anyhow!(
+                "node {} has no public Raft/client address for learner attachment",
+                target.id
+            )
+        })?;
+        let path = format!(
+            "/__ursula/raft/{raft_group_id}/learners/{}",
+            target.id
+        );
+        let mut url = leader.admin_url.join(&path).with_context(|| {
+            format!(
+                "compose add-learner url at leader node {} for group {}",
+                leader.id, raft_group_id
+            )
+        })?;
+        url.query_pairs_mut().append_pair("addr", address.as_str());
+        url.query_pairs_mut().append_pair("blocking", "false");
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "add learner at leader node {} (group {} node {}) returned {}: {}",
+                leader.id,
+                raft_group_id,
+                target.id,
                 status,
                 body
             ))

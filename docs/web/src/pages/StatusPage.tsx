@@ -73,7 +73,6 @@ type ChaosInjection = {
   id: number;
   scenario?: string;
   expected_result?: string;
-  allow_next_revert?: boolean;
   fault_apply_ok?: boolean | null;
   node_id?: string | number | null;
   node_name?: string | null;

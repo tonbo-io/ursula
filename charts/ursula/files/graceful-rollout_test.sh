@@ -15,7 +15,6 @@ export NAMESPACE STATEFULSET REPLICAS EXPECTED_GROUPS TARGET_IMAGE CTL ROLLOUT_S
 # shellcheck source=graceful-rollout.sh
 . "${test_dir}/graceful-rollout.sh"
 original_write_manifest=$(declare -f write_manifest)
-original_prepare_recovery_restart=$(declare -f prepare_recovery_restart)
 original_record_state=$(declare -f record_state)
 
 mocked_revision=ursula-stale
@@ -82,11 +81,6 @@ replace_pod() {
 
 strict_verify() { :; }
 
-prepare_recovery_restart() {
-  [ "$1" = "2" ]
-  resumed_prepare_recovery=1
-}
-
 prepare_recovery_handoff() {
   [ "$1" = "2" ]
   resumed_prepare_handoff=1
@@ -98,10 +92,6 @@ record_state() {
     upgrading-restart-quiesce)
       [ "$3" = legacy-partial-uid ]
       resumed_upgrade_state=1
-      ;;
-    restarting)
-      [ "$3" = replacement-1 ]
-      resumed_restarting_state=1
       ;;
     complete)
       resumed_complete=1
@@ -115,31 +105,27 @@ record_state() {
 replacement_count=0
 resumed_forward=0
 resumed_complete=0
-resumed_prepare_recovery=0
 resumed_prepare_handoff=0
 resumed_upgrade_state=0
-resumed_restarting_state=0
 CTL=true
 resume_if_needed
-[ "${replacement_count}" = "2" ]
+[ "${replacement_count}" = "1" ]
 [ "${resumed_forward}" = "1" ]
 [ "${resumed_prepare_handoff}" = "1" ]
-[ "${resumed_prepare_recovery}" = "1" ]
 [ "${resumed_upgrade_state}" = "1" ]
-[ "${resumed_restarting_state}" = "1" ]
 [ "${resumed_complete}" = "1" ]
 
 # A schema-v1 state can outlive more than one failed Helm attempt. If the
 # current Ready Pod has a strictly newer controller-owned sequence than the
-# saved target, verify it as a complete voter and close the stale record. Do
-# not call the restart-quiesce endpoint: the concrete legacy Pod may predate it.
+# saved target, reconcile it through durable membership and close the stale
+# record. Do not call restart-quiesce: the concrete Pod may predate it.
 legacy_ctl=$(mktemp)
 legacy_ctl_calls=$(mktemp)
 export legacy_ctl_calls
 cat >"${legacy_ctl}" <<'CTL'
 #!/bin/sh
 case "$1" in
-  wait|undrain)
+  repair-restarted-voter|wait|finish-prepared-restart)
     printf '%s\n' "$1" >>"${legacy_ctl_calls}"
     ;;
   *)
@@ -195,9 +181,9 @@ kubectl() {
   esac
 }
 desired_revision() { printf '%s' ursula-revision-15; }
+wait_for_pod_ready() { [ "$1" = "2" ]; }
 start_forward() { [ "$1" = "2" ]; legacy_forward=1; }
 strict_verify() { legacy_verifies=$((legacy_verifies + 1)); }
-prepare_recovery_restart() { legacy_destructive_call=1; return 1; }
 replace_pod() { legacy_destructive_call=1; return 1; }
 record_state() {
   [ "$1" = complete ]
@@ -213,10 +199,10 @@ legacy_state_schema=
 legacy_source_pod_uid=
 resume_if_needed
 [ "${legacy_forward}" = "1" ]
-[ "${legacy_verifies}" = "2" ]
+[ "${legacy_verifies}" = "1" ]
 [ "${legacy_destructive_call}" = "0" ]
 [ "${legacy_complete}" = "1" ]
-[ "$(tr '\n' ' ' <"${legacy_ctl_calls}")" = "wait undrain " ]
+[ "$(tr '\n' ' ' <"${legacy_ctl_calls}")" = "repair-restarted-voter wait finish-prepared-restart " ]
 legacy_current_sequence=12
 if replacement_attempt_was_superseded 2 ursula-revision-13 ''; then
   echo "an older ControllerRevision must not supersede saved rollout state" >&2
@@ -260,7 +246,6 @@ if replacement_attempt_was_superseded 0 ignored old-uid; then
 fi
 [ "${controller_revision_read}" = "0" ]
 
-eval "${original_prepare_recovery_restart}"
 CTL=true
 
 mocked_revision=ursula-current
@@ -301,7 +286,7 @@ case "$1" in
   classify-amnesiac)
     printf '%s\n' 3
     ;;
-  prepare-amnesiac-restart|wait|finish-prepared-restart|abort-prepared-restart)
+  prepare-amnesiac-restart|repair-restarted-voter|wait|finish-prepared-restart|abort-prepared-restart)
     printf '%s\n' "$1" >>"${mock_ctl_calls}"
     ;;
   *)
@@ -331,6 +316,7 @@ recover_amnesiac_if_needed
 [ "${recovered_verified}" = "1" ]
 grep -q '^prepare-amnesiac-restart$' "${mock_ctl_calls}"
 grep -q '^restarting 3$' "${mock_ctl_calls}"
+grep -q '^repair-restarted-voter$' "${mock_ctl_calls}"
 grep -q '^wait$' "${mock_ctl_calls}"
 grep -q '^finish-prepared-restart$' "${mock_ctl_calls}"
 grep -q '^complete 3$' "${mock_ctl_calls}"
@@ -340,8 +326,6 @@ abort_incomplete_prepared_restart
 grep -q '^abort-prepared-restart$' "${mock_ctl_calls}"
 [ -z "${PREPARED_RESTART_NODE}" ]
 rm -f "${mock_ctl}" "${mock_ctl_calls}" "${MANIFEST}"
-
-eval "${original_prepare_recovery_restart}"
 
 # A recorded replacement must be resumed before the blanket Ready gate. The
 # stale replacement in the fixture cannot become Ready until resume replaces

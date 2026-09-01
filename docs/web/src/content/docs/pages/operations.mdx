@@ -41,8 +41,8 @@ curl -X POST http://127.0.0.1:4438/__ursula/raft/42/snapshot
 # Purge log entries below the last snapshot index for one group
 curl -X POST http://127.0.0.1:4438/__ursula/raft/42/purge
 
-# Add a learner (non-voting replica) to one group
-curl -X POST http://127.0.0.1:4438/__ursula/raft/42/learners/4
+# Add a learner (non-voting replica) to one group without blocking on catch-up
+curl -X POST "http://127.0.0.1:4438/__ursula/raft/42/learners/4?addr=http://node-4:4437&blocking=false"
 
 # Hand leadership of one group to another voter (used by `ursulactl drain`)
 curl -X POST http://127.0.0.1:4438/__ursula/raft/42/leader/transfer/2
@@ -54,8 +54,6 @@ curl -X POST "http://127.0.0.1:4438/__ursula/raft/42/membership?voters=1,2,3"
 curl -X POST   http://127.0.0.1:4438/__ursula/leadership-shed/maintenance
 curl -X DELETE http://127.0.0.1:4438/__ursula/leadership-shed/maintenance
 
-# Permit the leader to accept one log revert from a wiped, rejoining node
-curl -X POST http://127.0.0.1:4438/__ursula/raft/42/nodes/4/allow-next-revert
 ```
 
 The leader-transfer endpoint refuses with `409 Conflict` if the receiving node isn't the current leader and `400 Bad Request` if the target isn't a voter. This is why `ursulactl` is the safer way to chain these calls: it consults metrics first.
@@ -80,7 +78,7 @@ The membership endpoint has the same leader-only contract: it answers `409 Confl
 
 ### Rejoining a wiped node
 
-A node that lost its Raft log (disk replaced, data dir wiped) rejoins with a shorter log than the leader has recorded for it, which Raft treats as a fault. `POST /__ursula/raft/{group}/nodes/{node}/allow-next-revert` tells the group's leader to accept exactly one such log revert from that node and re-replicate from scratch. It is a per-group, one-shot permission: loop over all group IDs when re-admitting a fully wiped node, and expect the leader to answer `500` if the underlying Raft rejects the request.
+Rebuild a wiped voter through committed membership: remove it from each affected voter set, attach it as a blocking learner with its current address, and promote it only after snapshot and log catch-up. Use `ursulactl repair-restarted-voter` for the cluster-wide, resumable sequence. A process-local log-reversion trigger is not a durable recovery contract and is not exposed by Ursula's admin API.
 
 `POST /__ursula/cluster-probe` also exists on the client plane, but it is machinery rather than an operator surface: nodes send each other heartbeat-sized bodies through it to verify cluster-plane egress, and it bypasses ingress admission.
 

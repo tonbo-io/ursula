@@ -2,7 +2,7 @@
 title: ursulactl
 ---
 
-`ursulactl` manages the **logical** state of a running cluster over Ursula's admin and metrics HTTP APIs: which node leads which Raft groups, whether a node is caught up, and whether a leader will accept an amnesiac node back. It executes nothing on hosts. Physical lifecycle belongs to whatever owns the process: Helm and the StatefulSet controller on Kubernetes, systemd on hosts, OpenTofu for the infrastructure underneath. The verbs encode the safety properties an operator otherwise has to remember manually:
+`ursulactl` manages the **logical** state of a running cluster over Ursula's admin and metrics HTTP APIs: which node leads which Raft groups, whether a node is caught up, and how a restarted voter is rebuilt through committed membership. It executes nothing on hosts. Physical lifecycle belongs to whatever owns the process: Helm and the StatefulSet controller on Kubernetes, systemd on hosts, OpenTofu for the infrastructure underneath. The verbs encode the safety properties an operator otherwise has to remember manually:
 
 - before a node goes down, transfer every Raft group it leads to a healthy successor (`drain`)
 - after it comes back, refuse to move on until `last_applied_index` has caught up to peers' `committed_index` (`wait`)
@@ -14,15 +14,16 @@ A safe rolling restart wraps the platform's restart in these verbs, one node at 
 ursulactl drain --config manifest.json --node 3
 ursulactl prepare-restart --config manifest.json --node 3
 kubectl delete pod ursula-2        # the platform restarts the pod
+ursulactl repair-restarted-voter --config manifest.json --node 3
 ursulactl wait --config manifest.json --node 3
+ursulactl finish-prepared-restart --config manifest.json --node 3
 ursulactl verify-cluster --config manifest.json
-ursulactl undrain --config manifest.json --node 3
 ```
 
 On bare metal the restart in the middle is `systemctl restart ursula` on the host. The drain planning and readiness logic is exercised under [deterministic simulation](/docs/architecture/overview).
 
 <Warning>
-The naive procedure of "restart followers, then leader" does **not** wait for `applied_index` to catch up between steps. Under `raft.wal.backend = "memory"` a target can come back as a voter while still missing committed entries, and a second restart pointed at a different node can corner the group with no live leader. Always `drain` before and `wait` after each node's restart.
+The naive procedure of "restart followers, then leader" does **not** wait for `applied_index` to catch up between steps. Under `raft.wal.backend = "memory"` a target comes back without its previous log. Always drain and prepare before restart, rebuild the replacement through committed membership, and wait for catch-up before moving to the next voter.
 </Warning>
 
 ## Verbs
@@ -30,10 +31,11 @@ The naive procedure of "restart followers, then leader" does **not** wait for `a
 | Verb | Effect |
 |------|--------|
 | `drain --node N` | Mark the node draining and transfer away every leadership it holds. The mark persists (the node attracts no leaderships) until `undrain`. `--dry-run` prints the transfer plan |
-| `prepare-restart --node N` | After `drain`, detect the cluster WAL backend and arm stable non-target leaders for one empty-log rejoin when memory WAL requires it. Disk-WAL clusters need no rejoin permission |
+| `prepare-restart --node N` | After `drain`, quiesce the target and pin every group leader to one survivor while the platform replaces it |
+| `repair-restarted-voter --node N` | For each unready group, durably detach the replacement, attach it as a blocking learner, then promote it after catch-up. Safe to resume after interruption |
+| `finish-prepared-restart --node N` | Release the target and survivor maintenance fences after repair and readiness checks |
 | `undrain --node N` | Clear the drain mark so the node may hold leaderships again |
 | `wait --node N` | Block until the node is a voter in every group and within `--lag-tolerance` of peers. Progress-gated: a node that keeps advancing is never timed out |
-| `allow-rejoin --node N` | Arm one empty-log rejoin per group for a raft-memory node that lost its volatile log. Refused on disk-backed clusters |
 | `status` | Per-node group counts and leadership distribution |
 | `wait-ready` | Block until every node reports the expected group count and every group has a leader |
 | `verify-cluster` | Require every configured voter to be present and caught up in two consecutive samples before the next rollout step |
@@ -42,7 +44,7 @@ Mutating verbs exit `0` on success and `2` on an abort (drain timeout, no safe t
 
 ## The admin plane
 
-Nodes carry **no cluster-mutation surface on the network**. The mutating operator endpoints (raft snapshot/purge/membership/learners/leader-transfer/allow-next-revert, maintenance drain, cold-flush trigger) plus metrics are served on a separate **admin plane** bound to `server.admin_listen`, which defaults to loopback (`127.0.0.1:4438`). The public client plane (`:4437`) serves only stream traffic and read-only metrics.
+Nodes carry **no cluster-mutation surface on the network**. The mutating operator endpoints (raft snapshot/purge/membership/learners/leader-transfer, maintenance drain, cold-flush trigger) plus metrics are served on a separate **admin plane** bound to `server.admin_listen`, which defaults to loopback (`127.0.0.1:4438`). The public client plane (`:4437`) serves only stream traffic and read-only metrics.
 
 `status` and `wait-ready` prefer each node's `http_url` because read-only metrics are available on the client plane, and fall back to `admin_url`. Mutating verbs always use `admin_url`.
 
@@ -109,9 +111,9 @@ Per-node fields, all optional except `id`:
 
 ## Restarting raft-memory nodes
 
-On clusters running the volatile `raft.wal.backend = "memory"`, a restarted node rejoins with an **empty** log, and group leaders refuse that log reversion unless it was explicitly permitted. Run `prepare-restart --node N` after the drain and before the restart: it detects the reported WAL backend and asks every group's stable leader to accept one empty-log rejoin from the target when memory WAL requires it. It fails closed when nodes omit or disagree on their backend. Disk-WAL clusters report that no permission is needed. `allow-rejoin` remains the explicit recovery verb, not the normal rolling-restart step.
+On clusters running the volatile `raft.wal.backend = "memory"`, a restarted node has no prior Raft log. `prepare-restart` quiesces the target and pins every group leader to one surviving voter. After the platform replacement starts, `repair-restarted-voter` commits a survivor-only voter set for each unready group, adds the target as a blocking learner, and promotes it only after catch-up. Those membership transitions survive leader changes, process restarts, and a partially completed multi-group repair.
 
-The permission must land on the node that is leader at that moment, since the endpoint answers `409 Conflict` from any other node (ursulactl resolves leadership per group and handles this). A node that is the membership initializer for some groups additionally refuses to start at all after losing its volatile log (the bootstrap-marker guard). That recovery is an explicit operator reset on the host, outside ursulactl's reach.
+Do not bypass the detach, learner, and promotion sequence with OpenRaft's process-local log-reversion trigger. It cannot provide durable progress across hundreds of independent groups. The rollout controller leaves the target drained and releases survivor fences on failure, so a later attempt can safely resume the committed membership state.
 
 The rebuild after an amnesiac restart installs snapshots for every group and can take 10+ minutes. `wait` is progress-gated, so no timeout tuning is needed: a rebuild that keeps advancing is never timed out, and `--stall-timeout-secs` (default 90) only aborts a node that stops making progress.
 
@@ -152,6 +154,6 @@ For custom tooling, every verb maps onto a small set of HTTP endpoints on each n
 | `status`, `wait-ready`, `wait` | `GET /__ursula/metrics` |
 | `drain` / `undrain` (maintenance guard) | `POST /__ursula/leadership-shed/maintenance`, `DELETE` to clear |
 | `drain` (transfer step) | `POST /__ursula/raft/{raft_group_id}/leader/transfer/{node_id}` |
-| `allow-rejoin` | `POST /__ursula/raft/{raft_group_id}/nodes/{node_id}/allow-next-revert` per group, on the group's leader |
+| `repair-restarted-voter` | `POST /__ursula/raft/{raft_group_id}/membership`, then `POST /__ursula/raft/{raft_group_id}/learners/{node_id}`, then membership promotion |
 
 The transfer endpoint refuses with `409 Conflict` if the receiving node isn't the current leader of the group, and `400` if the target node isn't a voter. ursulactl uses this to refuse to attempt a transfer it cannot reason about.

@@ -1,5 +1,4 @@
-//! Node maintenance verbs: drain, undrain, catch-up wait, and empty-log
-//! rejoin arming.
+//! Node maintenance verbs: drain, undrain, restart repair, and catch-up wait.
 //!
 //! These operate purely on Ursula's admin/metrics HTTP surface and never
 //! execute anything on a host. Physical lifecycle (stopping and starting the
@@ -7,7 +6,6 @@
 //! clusters, systemd for bare-metal hosts. A safe rolling restart runs these
 //! verbs around the platform's own restart, one node at a time.
 
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::time::Duration;
 use std::time::Instant;
@@ -64,16 +62,18 @@ pub enum DrainOutcome {
     },
 }
 
-/// Bounds for arming an empty-log rejoin immediately before a memory-WAL
-/// process restart.
+/// Bounds for rebuilding one restarted voter through committed Raft
+/// membership transitions.
 #[derive(Debug, Clone)]
-pub struct RejoinOptions {
-    /// Total budget for retrying transient leader changes.
-    pub timeout: Duration,
-    /// Maximum number of leader admin requests in flight.
+pub struct MembershipRepairOptions {
+    /// Maximum number of independent Raft groups repaired concurrently.
     pub max_concurrency: usize,
-    /// Delay before retrying a snapshot that observed leader movement.
-    pub retry_interval: Duration,
+    /// Abort when learner catch-up makes no progress for this long.
+    pub stall_timeout: Duration,
+    /// Absolute backstop for learner catch-up.
+    pub ready_timeout: Duration,
+    /// Delay between learner progress samples.
+    pub poll_interval: Duration,
 }
 
 /// Durable-for-the-maintenance-window description of a prepared restart.
@@ -89,12 +89,13 @@ pub struct RestartPreparation {
     pub fenced_node_ids: Vec<u64>,
 }
 
-impl Default for RejoinOptions {
+impl Default for MembershipRepairOptions {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(30),
-            max_concurrency: 32,
-            retry_interval: Duration::from_millis(100),
+            max_concurrency: 16,
+            stall_timeout: Duration::from_secs(300),
+            ready_timeout: Duration::from_secs(1800),
+            poll_interval: Duration::from_secs(2),
         }
     }
 }
@@ -200,24 +201,19 @@ pub async fn drain_node(
 /// Quiesce an already-drained voter and pin every group leadership to one
 /// surviving anchor until the platform has replaced and verified the voter.
 ///
-/// Empty-log rejoin permission is process-local on the current OpenRaft
-/// leader. Without the survivor fence, an ordinary leadership rebalance in
-/// the few seconds between arming and process startup silently strands that
-/// permission on the previous leader. The fence is therefore part of every
-/// prepared restart, including disk-WAL restarts, so the platform has one
-/// uniform completion and abort contract.
+/// The survivor fence keeps membership repair on a stable leader after the
+/// replacement starts. It is part of every prepared restart, including
+/// disk-WAL restarts, so the platform has one completion and abort contract.
 pub async fn prepare_restart(
     nodes: &[NodeInfo],
     target: &NodeInfo,
     client: &MetricsClient,
     drain_options: &DrainOptions,
-    rejoin_options: &RejoinOptions,
 ) -> Result<RestartPreparation> {
     if drain_options.dry_run {
         bail!("restart preparation does not support dry-run DrainOptions");
     }
     let configured_node_ids = recovery_inventory(nodes, target)?;
-    let memory_rejoin = resolve_restart_rejoin_policy(client, nodes).await?;
     client
         .quiesce_for_restart(target)
         .await
@@ -226,9 +222,6 @@ pub async fn prepare_restart(
     let prepared = async {
         let fence =
             pin_restart_leaders(nodes, target, client, drain_options, &configured_node_ids).await?;
-        if memory_rejoin {
-            arm_empty_rejoin(nodes, target, client, rejoin_options).await?;
-        }
         Ok::<_, anyhow::Error>(fence)
     }
     .await;
@@ -346,7 +339,7 @@ async fn converge_restart_leader_fence_once(
         .await
         .context("fetch cluster while pinning restart leaders")?;
     validate_surviving_voters(&snapshot, configured_node_ids, target.id, lag_tolerance)?;
-    let group_ids = peer_reported_rejoin_groups(&snapshot, target.id);
+    let group_ids = survivor_group_inventory(&snapshot, target.id);
     if group_ids.is_empty() {
         bail!(
             "no initialized group inventory remains while pinning restart leaders for node {}",
@@ -385,6 +378,16 @@ async fn converge_restart_leader_fence_once(
         }
     }
     Ok(false)
+}
+
+fn survivor_group_inventory(snap: &ClusterSnapshot, target_node_id: u64) -> BTreeSet<u64> {
+    snap.per_node
+        .iter()
+        .filter(|view| view.node.id != target_node_id)
+        .flat_map(|view| &view.groups)
+        .filter(|group| !group.voter_ids.is_empty())
+        .map(|group| group.raft_group_id)
+        .collect()
 }
 
 async fn release_prepared_restart(
@@ -452,16 +455,15 @@ async fn best_effort_abort_prepared_restart(
 /// the target may be missing whole groups, but every other configured voter
 /// must be complete, mutually consistent, and caught up for every group.
 ///
-/// On success the maintenance-drain mark remains set, the target's Raft cores
-/// are stopped, and every stable group leader has accepted one empty-log
-/// rejoin for `target`. The caller must immediately restart that node, wait for
-/// catch-up, and then call [`finish_prepared_restart`].
+/// On success the maintenance-drain mark remains set and the target's Raft
+/// cores are stopped. The caller must restart that node, rebuild missing groups
+/// with [`repair_restarted_voter`], wait for catch-up, and then call
+/// [`finish_prepared_restart`].
 pub async fn prepare_amnesiac_restart(
     nodes: &[NodeInfo],
     target: &NodeInfo,
     client: &MetricsClient,
     drain_options: &DrainOptions,
-    rejoin_options: &RejoinOptions,
 ) -> Result<RestartPreparation> {
     if drain_options.dry_run {
         bail!("amnesiac restart preparation does not support dry-run DrainOptions");
@@ -482,7 +484,7 @@ pub async fn prepare_amnesiac_restart(
             candidate.node_id
         );
     }
-    if !resolve_empty_rejoin_policy(client, nodes, true).await? {
+    if resolve_restart_wal_backend(client, nodes).await? != RestartWalBackend::Memory {
         bail!("amnesiac restart preparation requires a memory-WAL cluster");
     }
 
@@ -535,7 +537,7 @@ pub async fn prepare_amnesiac_restart(
         client
             .quiesce_for_restart(target)
             .await
-            .with_context(|| format!("quiesce amnesiac node {} before arming peers", target.id))?;
+            .with_context(|| format!("quiesce amnesiac node {} before replacement", target.id))?;
         let fence = pin_restart_leaders(
             nodes,
             target,
@@ -544,7 +546,6 @@ pub async fn prepare_amnesiac_restart(
             &configured_node_id_set,
         )
         .await?;
-        arm_empty_rejoin(nodes, target, client, rejoin_options).await?;
         Ok::<_, anyhow::Error>(RestartPreparation {
             missing_group_count: candidate.missing_group_ids.len(),
             leader_anchor: fence.leader_anchor,
@@ -562,67 +563,292 @@ pub async fn prepare_amnesiac_restart(
     }
 }
 
-/// Prepare a partial replacement for one more platform restart after an
-/// interrupted rollout.
+/// Rebuild a restarted or partially recovered voter through committed Raft
+/// membership transitions.
 ///
-/// This operation is deliberately valid only while every non-target voter is
-/// complete and caught up. It fences and quiesces the target before arming the
-/// full memory-WAL inventory for the next process. Arming only currently
-/// missing groups is unsafe because the restart discards partially recovered
-/// volatile groups too.
-pub async fn prepare_recovery_restart(
+/// The target remains maintenance-drained throughout. Every unready group is
+/// first reduced to the complete surviving voter set, which discards any
+/// stale replication progress for the target. The target is then attached as
+/// a blocking learner and promoted only after it has caught up. The operation
+/// is idempotent across a mixture of full-voter, detached, and learner states,
+/// so a later rollout Job can resume a partially completed 256-group repair.
+pub async fn repair_restarted_voter(
     nodes: &[NodeInfo],
     target: &NodeInfo,
     client: &MetricsClient,
     drain_options: &DrainOptions,
-    rejoin_options: &RejoinOptions,
+    repair_options: &MembershipRepairOptions,
 ) -> Result<RestartPreparation> {
     if drain_options.dry_run {
-        bail!("recovery restart preparation does not support dry-run DrainOptions");
+        bail!("restarted voter repair does not support dry-run DrainOptions");
+    }
+    if repair_options.max_concurrency == 0 {
+        bail!("membership repair max_concurrency must be positive");
     }
     let configured_node_ids = recovery_inventory(nodes, target)?;
-    let memory_rejoin = resolve_restart_rejoin_policy(client, nodes).await?;
+    let survivor_node_ids = configured_node_ids
+        .iter()
+        .copied()
+        .filter(|node_id| *node_id != target.id)
+        .collect::<BTreeSet<_>>();
 
-    let prepared = async {
-        let snapshot =
-            drain_recovery_target(nodes, target, client, drain_options, &configured_node_ids)
-                .await?;
-        let missing_groups =
-            wholly_missing_groups(&snapshot, target.id, drain_options.lag_tolerance);
-        if !missing_groups.is_empty() && !memory_rejoin {
+    client
+        .set_maintenance_drain(target, true)
+        .await
+        .with_context(|| format!("mark restarted node {} maintenance-drained", target.id))?;
+    let fence = pin_restart_leaders(
+        nodes,
+        target,
+        client,
+        drain_options,
+        &configured_node_ids,
+    )
+    .await?;
+    let leader = nodes
+        .iter()
+        .find(|node| node.id == fence.leader_anchor)
+        .expect("restart fence anchor is configured");
+
+    let initial = client.fetch_cluster(nodes).await?;
+    validate_surviving_voters(
+        &initial,
+        &configured_node_ids,
+        target.id,
+        drain_options.lag_tolerance,
+    )?;
+    let anchor_view = initial.node(fence.leader_anchor).ok_or_else(|| {
+        anyhow!(
+            "restart anchor {} did not report metrics",
+            fence.leader_anchor
+        )
+    })?;
+    let readiness = check_readiness(&initial, target.id, drain_options.lag_tolerance);
+    let mut work_groups = BTreeSet::new();
+    for group_id in survivor_group_inventory(&initial, target.id) {
+        let anchor_group = anchor_view.group(group_id).ok_or_else(|| {
+            anyhow!(
+                "restart anchor {} does not host group {}",
+                fence.leader_anchor,
+                group_id
+            )
+        })?;
+        let anchor_voters = anchor_group
+            .voter_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let target_ready = readiness
+            .per_group
+            .get(&group_id)
+            .is_some_and(|group| group.ready);
+        if !target_ready
+            || anchor_voters != configured_node_ids
+            || anchor_group.learner_ids.contains(&target.id)
+        {
+            work_groups.insert(group_id);
+        }
+    }
+    if work_groups.is_empty() {
+        return Ok(fence);
+    }
+
+    let mut detach_groups = Vec::new();
+    for group_id in &work_groups {
+        let group = anchor_view.group(*group_id).ok_or_else(|| {
+            anyhow!(
+                "restart anchor {} does not host group {}",
+                fence.leader_anchor,
+                group_id
+            )
+        })?;
+        let voters = group.voter_ids.iter().copied().collect::<BTreeSet<_>>();
+        if voters == configured_node_ids {
+            detach_groups.push(*group_id);
+        } else if voters != survivor_node_ids {
             bail!(
-                "disk-WAL node {} is missing {} whole group(s); refusing empty-log recovery",
-                target.id,
-                missing_groups.len()
+                "group {} has unexpected voter set {:?} during node {} repair",
+                group_id,
+                voters,
+                target.id
             );
         }
-        client.quiesce_for_restart(target).await.with_context(|| {
-            format!("quiesce restarted node {} before rearming peers", target.id)
+    }
+    run_group_phase(detach_groups, repair_options.max_concurrency, |group_id| {
+        client.change_membership(leader, group_id, &survivor_node_ids)
+    })
+    .await
+    .context("detach restarted voter from unready groups")?;
+
+    let detached = client.fetch_cluster(nodes).await?;
+    validate_surviving_voters(
+        &detached,
+        &configured_node_ids,
+        target.id,
+        drain_options.lag_tolerance,
+    )?;
+    let anchor_view = detached.node(fence.leader_anchor).ok_or_else(|| {
+        anyhow!(
+            "restart anchor {} disappeared after voter detach",
+            fence.leader_anchor
+        )
+    })?;
+    let mut attach_groups = Vec::new();
+    for group_id in &work_groups {
+        let group = anchor_view.group(*group_id).ok_or_else(|| {
+            anyhow!(
+                "restart anchor {} lost group {} after voter detach",
+                fence.leader_anchor,
+                group_id
+            )
         })?;
-        let fence =
-            pin_restart_leaders(nodes, target, client, drain_options, &configured_node_ids).await?;
-        if memory_rejoin {
-            // The next process loses every memory-WAL group, including groups
-            // that this partial replacement already recovered. Arm the full
-            // peer-reported inventory only after the old Raft cores have
-            // stopped, so they cannot consume the replacement's permissions.
-            arm_empty_rejoin(nodes, target, client, rejoin_options).await?;
+        let voters = group.voter_ids.iter().copied().collect::<BTreeSet<_>>();
+        if voters != survivor_node_ids {
+            bail!(
+                "group {} did not converge to survivor voter set {:?}: {:?}",
+                group_id,
+                survivor_node_ids,
+                voters
+            );
         }
-        Ok::<_, anyhow::Error>(RestartPreparation {
-            missing_group_count: missing_groups.len(),
-            leader_anchor: fence.leader_anchor,
-            fenced_node_ids: fence.fenced_node_ids,
-        })
-    }
-    .await;
-    match prepared {
-        Ok(preparation) => Ok(preparation),
-        Err(error) => {
-            best_effort_abort_prepared_restart(nodes, target, client).await;
-            clear_maintenance_drain(client, target).await;
-            Err(error)
+        if !group.learner_ids.contains(&target.id) {
+            attach_groups.push(*group_id);
         }
     }
+    run_group_phase(attach_groups, repair_options.max_concurrency, |group_id| {
+        client.add_learner(leader, group_id, target)
+    })
+    .await
+    .context("attach restarted voter as a learner")?;
+
+    wait_repair_learners_caught_up(
+        nodes,
+        target,
+        client,
+        fence.leader_anchor,
+        &work_groups,
+        drain_options.lag_tolerance,
+        repair_options,
+    )
+    .await?;
+
+    run_group_phase(
+        work_groups.iter().copied().collect(),
+        repair_options.max_concurrency,
+        |group_id| client.change_membership(leader, group_id, &configured_node_ids),
+    )
+    .await
+    .context("promote caught-up learner back to voter")?;
+
+    Ok(RestartPreparation {
+        missing_group_count: work_groups.len(),
+        ..fence
+    })
+}
+
+async fn wait_repair_learners_caught_up(
+    nodes: &[NodeInfo],
+    target: &NodeInfo,
+    client: &MetricsClient,
+    leader_anchor: u64,
+    group_ids: &BTreeSet<u64>,
+    lag_tolerance: u64,
+    options: &MembershipRepairOptions,
+) -> Result<()> {
+    let ceiling = Instant::now() + options.ready_timeout;
+    let mut last_advance = Instant::now();
+    let mut best = LearnerRepairProgress::default();
+    loop {
+        let snapshot = client.fetch_cluster(nodes).await?;
+        let anchor = snapshot.node(leader_anchor).ok_or_else(|| {
+            anyhow!("restart anchor {leader_anchor} disappeared during learner catch-up")
+        })?;
+        let target_view = snapshot.node(target.id).ok_or_else(|| {
+            anyhow!("restarted node {} disappeared during learner catch-up", target.id)
+        })?;
+        let mut progress = LearnerRepairProgress::default();
+        let mut pending = Vec::new();
+        for group_id in group_ids {
+            let anchor_group = anchor.group(*group_id).ok_or_else(|| {
+                anyhow!("restart anchor {leader_anchor} lost group {group_id} during learner catch-up")
+            })?;
+            if !anchor_group.learner_ids.contains(&target.id) {
+                bail!(
+                    "group {group_id} does not contain restarted node {} as a learner",
+                    target.id
+                );
+            }
+            progress.attached_groups += 1;
+            let target_applied = target_view
+                .group(*group_id)
+                .and_then(|group| group.last_applied_index);
+            if let Some(applied) = target_applied {
+                progress.applied_sum += u128::from(applied);
+            }
+            let peer_committed = snapshot
+                .peer_views(*group_id, target.id)
+                .values()
+                .filter_map(|group| group.committed_index)
+                .max();
+            let caught_up = peer_committed
+                .zip(target_applied)
+                .is_some_and(|(committed, applied)| {
+                    committed.saturating_sub(applied) <= lag_tolerance
+                });
+            if caught_up {
+                progress.caught_up_groups += 1;
+            } else {
+                pending.push(format!(
+                    "group {group_id}: applied={target_applied:?} peer_committed={peer_committed:?}"
+                ));
+            }
+        }
+        if progress.caught_up_groups == group_ids.len() {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if progress > best {
+            best = progress;
+            last_advance = now;
+        }
+        if now.duration_since(last_advance) >= options.stall_timeout {
+            bail!(
+                "learner catch-up made no progress for {:?}: {}",
+                options.stall_timeout,
+                pending.join("; ")
+            );
+        }
+        if now >= ceiling {
+            bail!(
+                "learner catch-up exceeded {:?}: {}",
+                options.ready_timeout,
+                pending.join("; ")
+            );
+        }
+        tokio::time::sleep(options.poll_interval).await;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct LearnerRepairProgress {
+    caught_up_groups: usize,
+    attached_groups: usize,
+    applied_sum: u128,
+}
+
+async fn run_group_phase<F, Fut>(
+    group_ids: Vec<u64>,
+    max_concurrency: usize,
+    operation: F,
+) -> Result<()>
+where
+    F: Fn(u64) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    futures_util::stream::iter(group_ids.into_iter().map(operation))
+        .buffer_unordered(max_concurrency)
+        .try_collect::<Vec<()>>()
+        .await?;
+    Ok(())
 }
 
 /// Drain a partial memory-WAL replacement without calling restart quiescence.
@@ -631,8 +857,7 @@ pub async fn prepare_recovery_restart(
 /// `/__ursula/raft/quiesce-for-restart`. Every surviving voter is validated
 /// before the target loses leadership. On success its process-local drain
 /// fence intentionally remains set; the platform must immediately replace it
-/// with a binary that supports [`prepare_recovery_restart`]. No rejoin token is
-/// armed here, so the old process cannot consume a permission after handoff.
+/// with a binary that supports [`repair_restarted_voter`].
 pub async fn prepare_recovery_handoff(
     nodes: &[NodeInfo],
     target: &NodeInfo,
@@ -643,7 +868,7 @@ pub async fn prepare_recovery_handoff(
         bail!("recovery handoff does not support dry-run DrainOptions");
     }
     let configured_node_ids = recovery_inventory(nodes, target)?;
-    if !resolve_restart_rejoin_policy(client, nodes).await? {
+    if resolve_restart_wal_backend(client, nodes).await? != RestartWalBackend::Memory {
         bail!("recovery handoff is only applicable to a memory-WAL cluster");
     }
     let prepared =
@@ -805,14 +1030,11 @@ pub enum CatchUpOutcome {
 /// is within `lag_tolerance` of peers' committed index. Progress-gated, not a
 /// fixed timeout: any forward motion resets the stall clock.
 ///
-/// `empty_rejoin_armed` only affects the diagnostic hint attached to a stall
-/// on a node that never reports an applied entry.
 pub async fn wait_node_ready(
     nodes: &[NodeInfo],
     target: &NodeInfo,
     client: &MetricsClient,
     options: &CatchUpOptions,
-    empty_rejoin_armed: bool,
 ) -> Result<CatchUpOutcome> {
     let ceiling = Instant::now() + options.ready_timeout;
     let mut best = TargetProgress::default();
@@ -843,7 +1065,7 @@ pub async fn wait_node_ready(
                 format!("no catch-up progress for {:?}", options.stall_timeout)
             };
             let mut reason = format!("{cause}: {}", format_unready(&report));
-            if let Some(hint) = amnesiac_timeout_hint(&report, empty_rejoin_armed) {
+            if let Some(hint) = missing_target_timeout_hint(&report) {
                 reason.push_str("; ");
                 reason.push_str(hint);
             }
@@ -897,195 +1119,13 @@ pub async fn wait_cluster_ready(
     }
 }
 
-/// Ask every group's stable leader to accept one empty-log rejoin from
-/// `target`, then prove that the same leaders still own those groups.
-///
-/// Permissions are leader-local OpenRaft state. A sequential 256-group loop
-/// takes long enough for the leadership balancer to move some groups after
-/// they were armed, silently invalidating the permission. Requests therefore
-/// run concurrently and the leader map is sampled again before success. Any
-/// movement retries the complete round so the platform can restart the target
-/// immediately after this function returns.
-pub async fn arm_empty_rejoin(
-    nodes: &[NodeInfo],
-    target: &NodeInfo,
-    client: &MetricsClient,
-    options: &RejoinOptions,
-) -> Result<()> {
-    arm_empty_rejoin_groups(nodes, target, client, options, None).await
-}
-
-async fn arm_empty_rejoin_groups(
-    nodes: &[NodeInfo],
-    target: &NodeInfo,
-    client: &MetricsClient,
-    options: &RejoinOptions,
-    scoped_group_ids: Option<&BTreeSet<u64>>,
-) -> Result<()> {
-    if options.max_concurrency == 0 {
-        bail!("rejoin max_concurrency must be positive");
-    }
-    if scoped_group_ids.is_some_and(BTreeSet::is_empty) {
-        bail!(
-            "no initialized raft group reported by a peer includes target node {}; cannot allow empty raft rejoin",
-            target.id
-        );
-    }
-    let deadline = Instant::now() + options.timeout;
-    let mut last_error: anyhow::Error;
-    loop {
-        let before = client.fetch_cluster(nodes).await?;
-        let group_ids = scoped_group_ids
-            .cloned()
-            .unwrap_or_else(|| peer_reported_rejoin_groups(&before, target.id));
-        if group_ids.is_empty() {
-            bail!(
-                "no initialized raft group reported by a peer includes target node {}; cannot allow empty raft rejoin",
-                target.id
-            );
-        }
-        let plan = match rejoin_leader_plan(nodes, target.id, &before, &group_ids) {
-            Ok(plan) => plan,
-            Err(err) => {
-                last_error = err;
-                if Instant::now() >= deadline {
-                    break;
-                }
-                tokio::time::sleep(options.retry_interval).await;
-                continue;
-            }
-        };
-
-        let result = futures_util::stream::iter(plan.iter().map(|(group_id, leader)| async move {
-            tracing::debug!(
-                "allowing empty raft rejoin: target_node_id={} raft_group_id={} leader_node_id={}",
-                target.id,
-                group_id,
-                leader.id
-            );
-            client
-                .allow_next_revert(leader, *group_id, target.id)
-                .await
-                .with_context(|| {
-                    format!(
-                        "allow target node {} to rejoin group {} through leader {}",
-                        target.id, group_id, leader.id
-                    )
-                })
-        }))
-        .buffer_unordered(options.max_concurrency)
-        .try_collect::<Vec<()>>()
-        .await;
-        if let Err(err) = result {
-            last_error = err;
-        } else {
-            let after = client.fetch_cluster(nodes).await?;
-            match rejoin_leader_plan(nodes, target.id, &after, &group_ids) {
-                Ok(after_plan)
-                    if plan.iter().all(|(group_id, leader)| {
-                        after_plan
-                            .get(group_id)
-                            .is_some_and(|after| after.id == leader.id)
-                    }) =>
-                {
-                    tracing::info!(
-                        "empty raft rejoin armed on stable leaders: target_node_id={} groups={}",
-                        target.id,
-                        plan.len()
-                    );
-                    return Ok(());
-                }
-                Ok(_) => {
-                    last_error = anyhow!(
-                        "one or more raft leaders changed while arming node {}",
-                        target.id
-                    );
-                }
-                Err(err) => last_error = err,
-            }
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(options.retry_interval).await;
-    }
-    Err(last_error).context("empty-log rejoin did not reach a stable leader map")
-}
-
-fn rejoin_leader_plan<'a>(
-    nodes: &'a [NodeInfo],
-    target_node_id: u64,
-    snap: &ClusterSnapshot,
-    group_ids: &BTreeSet<u64>,
-) -> Result<BTreeMap<u64, &'a NodeInfo>> {
-    let mut plan = BTreeMap::new();
-    for group_id in group_ids {
-        let leader_id = stable_non_target_leader(snap, *group_id, target_node_id)?;
-        let leader = nodes
-            .iter()
-            .find(|node| node.id == leader_id)
-            .ok_or_else(|| {
-                anyhow!(
-                    "leader node {} for group {} is not present in provider",
-                    leader_id,
-                    group_id
-                )
-            })?;
-        plan.insert(*group_id, leader);
-    }
-    Ok(plan)
-}
-
-fn peer_reported_rejoin_groups(snap: &ClusterSnapshot, target_node_id: u64) -> BTreeSet<u64> {
-    snap.per_node
-        .iter()
-        .filter(|view| view.node.id != target_node_id)
-        .flat_map(|view| &view.groups)
-        .filter(|group| group.voter_ids.contains(&target_node_id))
-        .map(|group| group.raft_group_id)
-        .collect()
-}
-
-/// Auto-derive the empty-log rejoin policy from the cluster's reported WAL
-/// backend. `memory` needs it (every restart is amnesiac) and `disk` refuses
-/// it (an empty rejoin there means a wiped node the leader should reject). An
-/// older server that omits the field honors the explicit `force` flag.
-pub async fn resolve_empty_rejoin_policy(
+/// Resolve the cluster WAL backend without guessing when a server is too old
+/// or unreachable to report it. Recovery decisions fail closed on incomplete,
+/// mixed, or unsupported reports.
+async fn resolve_restart_wal_backend(
     client: &MetricsClient,
     nodes: &[NodeInfo],
-    force: bool,
-) -> Result<bool> {
-    let snap = client.try_fetch_cluster(nodes).await;
-    let backends: Vec<Option<&str>> = snap
-        .per_node
-        .iter()
-        .map(|v| v.wal_backend.as_deref())
-        .collect();
-    let decision = decide_empty_rejoin(&backends, force)?;
-    match decision {
-        EmptyRejoinDecision::Memory => {
-            tracing::info!("empty-log rejoin: enabled (raft-memory backend detected)")
-        }
-        EmptyRejoinDecision::Disk => {
-            tracing::info!("empty-log rejoin: disabled (disk WAL backend detected)")
-        }
-        EmptyRejoinDecision::UnknownHonorFlag => tracing::info!(
-            "empty-log rejoin: cluster did not report wal_backend; honoring the explicit flag ({force})"
-        ),
-    }
-    Ok(decision.allow(force))
-}
-
-/// Resolve restart preparation without guessing when the server is too old or
-/// unreachable to report its WAL backend.
-///
-/// Automated rollouts must fail closed here: treating an unknown memory-WAL
-/// cluster as disk-backed would recreate an amnesiac voter without first
-/// granting the leader-local rejoin permission.
-pub async fn resolve_restart_rejoin_policy(
-    client: &MetricsClient,
-    nodes: &[NodeInfo],
-) -> Result<bool> {
+) -> Result<RestartWalBackend> {
     let snap = client.try_fetch_cluster(nodes).await;
     if snap.per_node.len() != nodes.len() {
         bail!(
@@ -1099,10 +1139,19 @@ pub async fn resolve_restart_rejoin_policy(
         .iter()
         .map(|v| v.wal_backend.as_deref())
         .collect();
-    decide_restart_rejoin(&backends, nodes.len())
+    decide_restart_wal_backend(&backends, nodes.len())
 }
 
-fn decide_restart_rejoin(backends: &[Option<&str>], expected_nodes: usize) -> Result<bool> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartWalBackend {
+    Memory,
+    Disk,
+}
+
+fn decide_restart_wal_backend(
+    backends: &[Option<&str>],
+    expected_nodes: usize,
+) -> Result<RestartWalBackend> {
     if backends.len() != expected_nodes {
         bail!(
             "cannot prepare an automated restart because only {}/{} nodes reported metrics",
@@ -1113,7 +1162,7 @@ fn decide_restart_rejoin(backends: &[Option<&str>], expected_nodes: usize) -> Re
     if backends.iter().any(Option::is_none) {
         bail!(
             "cannot prepare an automated restart because at least one node omitted wal_backend; \
-             refusing to guess whether empty-log rejoin is required"
+             refusing to guess the restart recovery contract"
         );
     }
     let memory_count = backends
@@ -1125,58 +1174,13 @@ fn decide_restart_rejoin(backends: &[Option<&str>], expected_nodes: usize) -> Re
         .filter(|backend| **backend == Some("disk"))
         .count();
     match (memory_count, disk_count) {
-        (memory, 0) if memory == expected_nodes => Ok(true),
-        (0, disk) if disk == expected_nodes => Ok(false),
+        (memory, 0) if memory == expected_nodes => Ok(RestartWalBackend::Memory),
+        (0, disk) if disk == expected_nodes => Ok(RestartWalBackend::Disk),
         _ => bail!(
             "cannot prepare an automated restart because nodes report inconsistent or unsupported \
              WAL backends: {backends:?}"
         ),
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EmptyRejoinDecision {
-    Memory,
-    Disk,
-    UnknownHonorFlag,
-}
-
-impl EmptyRejoinDecision {
-    pub(crate) fn allow(self, force: bool) -> bool {
-        match self {
-            EmptyRejoinDecision::Memory => true,
-            EmptyRejoinDecision::Disk => false,
-            EmptyRejoinDecision::UnknownHonorFlag => force,
-        }
-    }
-}
-
-/// Pure policy: `memory` anywhere enables empty rejoin. All-`disk` disables it
-/// and refuses an explicit `force`, because that would auto-accept a wiped
-/// node the leader must reject. An all-unknown cluster (older server) honors
-/// the flag.
-pub(crate) fn decide_empty_rejoin(
-    backends: &[Option<&str>],
-    force: bool,
-) -> Result<EmptyRejoinDecision> {
-    let any_memory = backends.contains(&Some("memory"));
-    let any_known = backends
-        .iter()
-        .any(|b| matches!(*b, Some("memory") | Some("disk")));
-    if any_memory {
-        return Ok(EmptyRejoinDecision::Memory);
-    }
-    if !any_known {
-        return Ok(EmptyRejoinDecision::UnknownHonorFlag);
-    }
-    if force {
-        bail!(
-            "empty-log rejoin was requested but every node reports a disk WAL backend; \
-             an empty rejoin on a durable cluster means a wiped node the leader must \
-             reject, so refusing rather than auto-accepting potential data loss"
-        );
-    }
-    Ok(EmptyRejoinDecision::Disk)
 }
 
 /// A monotonic snapshot of how far a restarting target has caught up. Applied
@@ -1223,11 +1227,10 @@ impl TargetProgress {
 }
 
 /// A target that reports no applied entries in any group after the readiness
-/// window either never got permission to rejoin with an empty log or never
-/// came back up at all; plain gap numbers do not tell an operator that.
-fn amnesiac_timeout_hint(
+/// window either never attached as a learner or never came back up; plain gap
+/// numbers do not tell an operator that.
+fn missing_target_timeout_hint(
     report: &crate::plan::ReadinessReport,
-    empty_rejoin_armed: bool,
 ) -> Option<&'static str> {
     let all_unapplied = !report.per_group.is_empty()
         && report
@@ -1237,22 +1240,11 @@ fn amnesiac_timeout_hint(
     if !all_unapplied {
         return None;
     }
-    if empty_rejoin_armed {
-        Some(
-            "target reports no applied entries in any group despite an armed \
-             empty-log rejoin; it may be failing to start (check its \
-             service logs, e.g. a raft-memory bootstrap marker refusing \
-             restart) or still installing snapshots, so consider a larger \
-             --ready-timeout-secs",
-        )
-    } else {
-        Some(
-            "target reports no applied entries in any group; if this cluster \
-             runs the volatile raft-memory backend, arm an empty-log rejoin \
-             (allow-rejoin, or restart with --allow-empty-raft-rejoin) and \
-             allow enough time for full snapshot rebuilds (often 10+ minutes)",
-        )
-    }
+    Some(
+        "target reports no applied entries in any group; check that the \
+         replacement process started and that durable membership repair \
+         attached it as a learner before promotion",
+    )
 }
 
 async fn transfer_drain_plan(
@@ -1299,19 +1291,17 @@ fn stable_non_target_leader(
             continue;
         };
         // A follower's current_leader observation may remain stale across an
-        // otherwise completed transfer. The target is quiesced before this
-        // plan is built, so its frozen view is especially unsuitable as an
-        // authority. A leader's own view is the narrow authoritative signal:
-        // the allow-next-revert endpoint independently enforces the same
-        // self-leader condition, and the caller samples this map again after
-        // every group is armed.
+        // otherwise completed transfer. The target is quiesced or drained, so
+        // its frozen view is especially unsuitable as an authority. A
+        // leader's own view is the narrow authoritative signal for the next
+        // membership mutation.
         if candidate != view.node.id {
             continue;
         }
         if let Some(existing) = leader {
             if existing != candidate {
                 bail!(
-                    "multiple peers self-report leadership for group {} while allowing node {} rejoin: {} vs {}",
+                    "multiple peers self-report leadership for group {} while repairing node {}: {} vs {}",
                     raft_group_id,
                     target_node_id,
                     existing,
@@ -1324,7 +1314,7 @@ fn stable_non_target_leader(
     }
     leader.ok_or_else(|| {
         anyhow!(
-            "group {} has no stable non-target leader; cannot allow empty raft rejoin for node {}",
+            "group {} has no stable non-target leader while repairing node {}",
             raft_group_id,
             target_node_id
         )
@@ -1350,6 +1340,7 @@ pub(crate) fn format_unready(report: &crate::plan::ReadinessReport) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
@@ -1358,6 +1349,7 @@ mod tests {
     use axum::Json;
     use axum::Router;
     use axum::extract::Path;
+    use axum::extract::Query;
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::routing::get;
@@ -1371,17 +1363,15 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum LeaderScenario {
-        DriftOnce,
-        AlwaysDrift,
         Stable,
         TargetMissing,
+        RepairableTarget,
     }
 
     struct MockCluster {
         scenario: LeaderScenario,
-        metrics_fetches: AtomicUsize,
         pinned_leader: AtomicUsize,
-        armed_on_nodes: Mutex<Vec<u64>>,
+        membership_phase: AtomicUsize,
         drained_nodes: Mutex<Vec<u64>>,
         undrained_nodes: Mutex<Vec<u64>>,
         quiesced_nodes: Mutex<Vec<u64>>,
@@ -1395,16 +1385,11 @@ mod tests {
     }
 
     async fn mock_metrics(State(state): State<MockNode>) -> Json<serde_json::Value> {
-        let fetch = state.cluster.metrics_fetches.fetch_add(1, Ordering::SeqCst);
-        let sample = fetch / 3;
         let pinned_leader = state.cluster.pinned_leader.load(Ordering::SeqCst);
         let leader = match pinned_leader {
             0 => match state.cluster.scenario {
-                LeaderScenario::DriftOnce if sample == 0 => 2,
-                LeaderScenario::DriftOnce => 3,
-                LeaderScenario::AlwaysDrift if sample.is_multiple_of(2) => 2,
-                LeaderScenario::AlwaysDrift => 3,
                 LeaderScenario::Stable | LeaderScenario::TargetMissing => 2,
+                LeaderScenario::RepairableTarget => 1,
             },
             pinned => u64::try_from(pinned).unwrap(),
         };
@@ -1422,6 +1407,28 @@ mod tests {
                 }]
             }));
         }
+        if matches!(state.cluster.scenario, LeaderScenario::RepairableTarget) {
+            let phase = state.cluster.membership_phase.load(Ordering::SeqCst);
+            let (voters, learners, applied) = match phase {
+                0 => (vec![1, 2, 3], vec![], (state.node_id != 3).then_some(100)),
+                1 if state.node_id == 3 => (vec![1, 2, 3], vec![], Some(100)),
+                1 => (vec![1, 2], vec![], Some(100)),
+                2 => (vec![1, 2], vec![3], Some(100)),
+                _ => (vec![1, 2, 3], vec![], Some(100)),
+            };
+            return Json(json!({
+                "wal_backend": "memory",
+                "raft_groups": [{
+                    "raft_group_id": 7,
+                    "node_id": state.node_id,
+                    "current_leader": leader,
+                    "committed_index": 100,
+                    "last_applied_index": applied,
+                    "voter_ids": voters,
+                    "learner_ids": learners
+                }]
+            }));
+        }
         Json(json!({
             "wal_backend": "memory",
             "raft_groups": [{
@@ -1434,22 +1441,6 @@ mod tests {
                 "learner_ids": []
             }]
         }))
-    }
-
-    async fn mock_arm(State(state): State<MockNode>) -> StatusCode {
-        state
-            .cluster
-            .armed_on_nodes
-            .lock()
-            .unwrap()
-            .push(state.node_id);
-        state
-            .cluster
-            .operations
-            .lock()
-            .unwrap()
-            .push(format!("arm:{}", state.node_id));
-        StatusCode::OK
     }
 
     async fn mock_drain(State(state): State<MockNode>) -> StatusCode {
@@ -1523,12 +1514,46 @@ mod tests {
         StatusCode::OK
     }
 
+    async fn mock_membership(
+        State(state): State<MockNode>,
+        Path(_group_id): Path<u64>,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> StatusCode {
+        let voters = query.get("voters").cloned().unwrap_or_default();
+        let phase = match voters.as_str() {
+            "1,2" => 1,
+            "1,2,3" => 3,
+            _ => return StatusCode::BAD_REQUEST,
+        };
+        state.cluster.membership_phase.store(phase, Ordering::SeqCst);
+        state
+            .cluster
+            .operations
+            .lock()
+            .unwrap()
+            .push(format!("membership:{}:{voters}", state.node_id));
+        StatusCode::OK
+    }
+
+    async fn mock_add_learner(
+        State(state): State<MockNode>,
+        Path((_group_id, target_node_id)): Path<(u64, u64)>,
+    ) -> StatusCode {
+        state.cluster.membership_phase.store(2, Ordering::SeqCst);
+        state
+            .cluster
+            .operations
+            .lock()
+            .unwrap()
+            .push(format!("learner:{}:{target_node_id}", state.node_id));
+        StatusCode::OK
+    }
+
     async fn mock_cluster(scenario: LeaderScenario) -> (Vec<NodeInfo>, Arc<MockCluster>) {
         let cluster = Arc::new(MockCluster {
             scenario,
-            metrics_fetches: AtomicUsize::new(0),
             pinned_leader: AtomicUsize::new(0),
-            armed_on_nodes: Mutex::new(Vec::new()),
+            membership_phase: AtomicUsize::new(0),
             drained_nodes: Mutex::new(Vec::new()),
             undrained_nodes: Mutex::new(Vec::new()),
             quiesced_nodes: Mutex::new(Vec::new()),
@@ -1545,16 +1570,20 @@ mod tests {
             let app = Router::new()
                 .route("/__ursula/metrics", get(mock_metrics))
                 .route(
-                    "/__ursula/raft/{group_id}/nodes/{node_id}/allow-next-revert",
-                    post(mock_arm),
-                )
-                .route(
                     "/__ursula/leadership-shed/maintenance",
                     post(mock_drain).delete(mock_undrain),
                 )
                 .route(
                     "/__ursula/raft/{group_id}/leader/transfer/{to}",
                     post(mock_transfer),
+                )
+                .route(
+                    "/__ursula/raft/{group_id}/membership",
+                    post(mock_membership),
+                )
+                .route(
+                    "/__ursula/raft/{group_id}/learners/{node_id}",
+                    post(mock_add_learner),
                 )
                 .route("/__ursula/raft/quiesce-for-restart", post(mock_quiesce))
                 .with_state(state);
@@ -1582,29 +1611,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejoin_retries_the_complete_round_after_leader_drift() {
-        let (nodes, cluster) = mock_cluster(LeaderScenario::DriftOnce).await;
-        arm_empty_rejoin(
-            &nodes,
-            &nodes[0],
-            &MetricsClient::new(Duration::from_secs(1)).unwrap(),
-            &RejoinOptions {
-                timeout: Duration::from_secs(1),
-                max_concurrency: 2,
-                retry_interval: Duration::from_millis(1),
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(*cluster.armed_on_nodes.lock().unwrap(), vec![2, 3]);
-        assert_eq!(cluster.metrics_fetches.load(Ordering::SeqCst), 12);
-    }
-
-    #[tokio::test]
-    async fn partial_replacement_is_quiesced_before_full_inventory_is_rearmed() {
-        let (nodes, cluster) = mock_cluster(LeaderScenario::TargetMissing).await;
-        let preparation = prepare_recovery_restart(
+    async fn restarted_voter_is_rebuilt_through_durable_membership() {
+        let (nodes, cluster) = mock_cluster(LeaderScenario::RepairableTarget).await;
+        let preparation = repair_restarted_voter(
             &nodes,
             &nodes[2],
             &MetricsClient::new(Duration::from_secs(1)).unwrap(),
@@ -1615,10 +1624,10 @@ mod tests {
                 lag_tolerance: 16,
                 dry_run: false,
             },
-            &RejoinOptions {
-                timeout: Duration::from_secs(1),
+            &MembershipRepairOptions {
                 max_concurrency: 2,
-                retry_interval: Duration::from_millis(1),
+                poll_interval: Duration::ZERO,
+                ..MembershipRepairOptions::default()
             },
         )
         .await
@@ -1627,29 +1636,52 @@ mod tests {
         assert_eq!(preparation.missing_group_count, 1);
         assert_eq!(preparation.leader_anchor, 1);
         assert_eq!(preparation.fenced_node_ids, vec![2]);
-        assert_eq!(*cluster.drained_nodes.lock().unwrap(), vec![3, 2]);
-        assert_eq!(*cluster.quiesced_nodes.lock().unwrap(), vec![3]);
-        assert_eq!(*cluster.armed_on_nodes.lock().unwrap(), vec![1]);
+        assert_eq!(cluster.membership_phase.load(Ordering::SeqCst), 3);
         assert_eq!(*cluster.operations.lock().unwrap(), vec![
             "drain:3",
-            "quiesce:3",
             "drain:2",
-            "transfer:2->1",
-            "arm:1"
+            "membership:1:1,2",
+            "learner:1:3",
+            "membership:1:1,2,3"
         ]);
-
-        finish_prepared_restart(
-            &nodes,
-            &nodes[2],
-            &MetricsClient::new(Duration::from_secs(1)).unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(*cluster.undrained_nodes.lock().unwrap(), vec![3, 2]);
     }
 
     #[tokio::test]
-    async fn legacy_partial_replacement_handoff_drains_without_arming() {
+    async fn durable_membership_repair_resumes_after_committed_detach() {
+        let (nodes, cluster) = mock_cluster(LeaderScenario::RepairableTarget).await;
+        cluster.membership_phase.store(1, Ordering::SeqCst);
+
+        repair_restarted_voter(
+            &nodes,
+            &nodes[2],
+            &MetricsClient::new(Duration::from_secs(1)).unwrap(),
+            &DrainOptions {
+                drain_timeout: Duration::from_secs(1),
+                ready_timeout: Duration::ZERO,
+                poll_interval: Duration::from_millis(1),
+                lag_tolerance: 16,
+                dry_run: false,
+            },
+            &MembershipRepairOptions {
+                max_concurrency: 2,
+                poll_interval: Duration::ZERO,
+                ..MembershipRepairOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(cluster.membership_phase.load(Ordering::SeqCst), 3);
+        assert_eq!(*cluster.operations.lock().unwrap(), vec![
+            "drain:3",
+            "drain:2",
+            "learner:1:3",
+            "membership:1:1,2,3"
+        ]);
+    }
+
+    #[tokio::test]
+    async fn legacy_partial_replacement_handoff_drains_without_quiescing() {
         let (nodes, cluster) = mock_cluster(LeaderScenario::TargetMissing).await;
         let missing = prepare_recovery_handoff(
             &nodes,
@@ -1669,33 +1701,7 @@ mod tests {
         assert_eq!(missing, 1);
         assert_eq!(*cluster.drained_nodes.lock().unwrap(), vec![3]);
         assert!(cluster.quiesced_nodes.lock().unwrap().is_empty());
-        assert!(cluster.armed_on_nodes.lock().unwrap().is_empty());
         assert_eq!(*cluster.operations.lock().unwrap(), vec!["drain:3"]);
-    }
-
-    #[tokio::test]
-    async fn rejoin_fails_when_the_leader_map_never_stabilizes() {
-        let (nodes, cluster) = mock_cluster(LeaderScenario::AlwaysDrift).await;
-        let error = arm_empty_rejoin(
-            &nodes,
-            &nodes[0],
-            &MetricsClient::new(Duration::from_secs(1)).unwrap(),
-            &RejoinOptions {
-                timeout: Duration::from_millis(40),
-                max_concurrency: 2,
-                retry_interval: Duration::from_millis(1),
-            },
-        )
-        .await
-        .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("empty-log rejoin did not reach a stable leader map"),
-            "{error:#}"
-        );
-        assert!(!cluster.armed_on_nodes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1768,7 +1774,7 @@ mod tests {
     }
 
     #[test]
-    fn amnesiac_timeout_hint_suggests_arming_only_when_unarmed() {
+    fn missing_target_timeout_hint_points_to_membership_repair() {
         let snapshot = ClusterSnapshot {
             per_node: vec![NodeMetricsView {
                 node: n(2, "10.0.0.2"),
@@ -1779,11 +1785,8 @@ mod tests {
         let report = check_readiness(&snapshot, 1, 5);
         assert!(!report.all_ready);
 
-        let hint = amnesiac_timeout_hint(&report, false).expect("hint when rejoin unarmed");
-        assert!(hint.contains("allow-rejoin"), "{hint}");
-
-        let hint = amnesiac_timeout_hint(&report, true).expect("hint when rejoin armed");
-        assert!(hint.contains("failing to start"), "{hint}");
+        let hint = missing_target_timeout_hint(&report).expect("missing target hint");
+        assert!(hint.contains("membership repair"), "{hint}");
     }
 
     #[test]
@@ -1858,82 +1861,57 @@ mod tests {
     }
 
     #[test]
-    fn empty_rejoin_policy_follows_reported_backend() {
-        // memory anywhere → on
+    fn restart_wal_backend_detection_fails_closed() {
         assert_eq!(
-            decide_empty_rejoin(&[Some("disk"), Some("memory")], false).unwrap(),
-            EmptyRejoinDecision::Memory
+            decide_restart_wal_backend(&[Some("memory"); 3], 3).unwrap(),
+            RestartWalBackend::Memory
         );
-        // all disk, not forced → off
         assert_eq!(
-            decide_empty_rejoin(&[Some("disk"), Some("disk")], false).unwrap(),
-            EmptyRejoinDecision::Disk
+            decide_restart_wal_backend(&[Some("disk"); 3], 3).unwrap(),
+            RestartWalBackend::Disk
         );
-        // all disk, forced → refused
-        assert!(decide_empty_rejoin(&[Some("disk")], true).is_err());
-        // unknown (older server) honors the flag
-        assert!(
-            decide_empty_rejoin(&[None, None], true)
-                .unwrap()
-                .allow(true)
-        );
-        assert!(!decide_empty_rejoin(&[None], false).unwrap().allow(false));
+        assert!(decide_restart_wal_backend(&[Some("memory"), Some("disk")], 2).is_err());
+        assert!(decide_restart_wal_backend(&[Some("memory"), None], 2).is_err());
+        assert!(decide_restart_wal_backend(&[Some("memory")], 2).is_err());
     }
 
     #[test]
-    fn automated_restart_policy_fails_closed() {
-        assert!(decide_restart_rejoin(&[Some("memory"); 3], 3).unwrap());
-        assert!(!decide_restart_rejoin(&[Some("disk"); 3], 3).unwrap());
-        assert!(decide_restart_rejoin(&[Some("memory"), Some("disk")], 2).is_err());
-        assert!(decide_restart_rejoin(&[Some("memory"), None], 2).is_err());
-        assert!(decide_restart_rejoin(&[Some("memory")], 2).is_err());
-    }
-
-    #[test]
-    fn rejoin_plan_requires_a_stable_non_target_leader() {
-        let nodes = vec![n(1, "10.0.0.1"), n(2, "10.0.0.2"), n(3, "10.0.0.3")];
-        let groups = BTreeSet::from([7]);
+    fn membership_repair_requires_a_stable_non_target_leader() {
         let stable = ClusterSnapshot {
             per_node: vec![
                 NodeMetricsView {
-                    node: nodes[1].clone(),
+                    node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(2), 100, 100)],
                     wal_backend: Some("memory".into()),
                 },
                 NodeMetricsView {
-                    node: nodes[2].clone(),
+                    node: n(3, "10.0.0.3"),
                     groups: vec![group(7, 3, Some(2), 100, 100)],
                     wal_backend: Some("memory".into()),
                 },
             ],
         };
-        assert_eq!(
-            rejoin_leader_plan(&nodes, 1, &stable, &groups)
-                .unwrap()
-                .get(&7)
-                .map(|node| node.id),
-            Some(2)
-        );
+        assert_eq!(stable_non_target_leader(&stable, 7, 1).unwrap(), 2);
 
         let conflicting = ClusterSnapshot {
             per_node: vec![
                 NodeMetricsView {
-                    node: nodes[1].clone(),
+                    node: n(2, "10.0.0.2"),
                     groups: vec![group(7, 2, Some(2), 100, 100)],
                     wal_backend: Some("memory".into()),
                 },
                 NodeMetricsView {
-                    node: nodes[2].clone(),
+                    node: n(3, "10.0.0.3"),
                     groups: vec![group(7, 3, Some(3), 100, 100)],
                     wal_backend: Some("memory".into()),
                 },
             ],
         };
-        assert!(rejoin_leader_plan(&nodes, 1, &conflicting, &groups).is_err());
+        assert!(stable_non_target_leader(&conflicting, 7, 1).is_err());
     }
 
     #[test]
-    fn amnesiac_timeout_hint_absent_when_target_has_applied_entries() {
+    fn missing_target_timeout_hint_absent_when_target_has_applied_entries() {
         let snapshot = ClusterSnapshot {
             per_node: vec![
                 NodeMetricsView {
@@ -1950,11 +1928,11 @@ mod tests {
         };
         let report = check_readiness(&snapshot, 1, 5);
         assert!(!report.all_ready);
-        assert!(amnesiac_timeout_hint(&report, false).is_none());
+        assert!(missing_target_timeout_hint(&report).is_none());
     }
 
     #[test]
-    fn drain_uses_all_reports_but_rejoin_uses_a_peer_self_leader() {
+    fn drain_uses_all_reports_but_repair_uses_a_peer_self_leader() {
         let snapshot = ClusterSnapshot {
             per_node: vec![
                 NodeMetricsView {
@@ -1985,7 +1963,7 @@ mod tests {
     }
 
     #[test]
-    fn rejoin_ignores_the_quiesced_targets_frozen_leader_view() {
+    fn repair_ignores_the_quiesced_targets_frozen_leader_view() {
         let snapshot = ClusterSnapshot {
             per_node: vec![
                 NodeMetricsView {
@@ -2010,7 +1988,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_target_group_uses_peer_membership_for_rejoin() {
+    fn empty_target_group_uses_survivor_inventory_for_repair() {
         let mut empty_target_group = group(7, 1, None, 0, 0);
         empty_target_group.voter_ids.clear();
         empty_target_group.committed_index = None;
@@ -2035,10 +2013,7 @@ mod tests {
             ],
         };
 
-        assert_eq!(
-            peer_reported_rejoin_groups(&snapshot, 1),
-            [7].into_iter().collect()
-        );
+        assert_eq!(survivor_group_inventory(&snapshot, 1), [7].into_iter().collect());
         assert_eq!(stable_non_target_leader(&snapshot, 7, 1).unwrap(), 2);
     }
 }
