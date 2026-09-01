@@ -335,6 +335,7 @@ mod tests {
         RaftGroupView {
             raft_group_id,
             node_id: reporting_node,
+            current_term: Some(1),
             current_leader: leader,
             committed_index: committed,
             last_applied_index: applied,
@@ -347,6 +348,7 @@ mod tests {
         RaftGroupView {
             raft_group_id,
             node_id: reporting_node,
+            current_term: Some(0),
             current_leader: None,
             committed_index: None,
             last_applied_index: None,

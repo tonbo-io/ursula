@@ -187,6 +187,7 @@ impl RollingRestartValidator {
                 groups: vec![RaftGroupView {
                     raft_group_id,
                     node_id,
+                    current_term: Some(metrics.current_term),
                     current_leader: metrics.current_leader,
                     committed_index: metrics.committed.map(|log_id| log_id.index),
                     last_applied_index: metrics.last_applied.map(|log_id| log_id.index),

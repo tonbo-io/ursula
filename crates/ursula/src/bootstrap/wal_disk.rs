@@ -12,7 +12,6 @@ use ursula_shard::RaftGroupId;
 
 use crate::bootstrap::util::leader_counts;
 use crate::bootstrap::util::prioritized_transfer_targets;
-use crate::bootstrap::util::reenable_elections_if_campaign_allowed;
 use crate::wal_disk::WalDiskMonitor;
 use crate::wal_disk::WalDiskTransition;
 
@@ -106,7 +105,6 @@ async fn enter_pressure(
         let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) else {
             continue;
         };
-        raft.runtime_config().elect(false);
         if snapshot.current_leader != Some(node_id) {
             continue;
         }
@@ -142,8 +140,4 @@ fn leave_pressure(registry: Option<&RaftGroupHandleRegistry>, node_id: u64, avai
         return;
     };
     registry.clear_leadership_shed(LeadershipShedReason::WalDiskPressure);
-    reenable_elections_if_campaign_allowed(
-        registry,
-        &format!("wal-disk: node {node_id} free space recovered"),
-    );
 }

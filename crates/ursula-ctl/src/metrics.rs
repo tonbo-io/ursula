@@ -334,6 +334,8 @@ struct RawRaftGroup {
     raft_group_id: u64,
     node_id: u64,
     #[serde(default)]
+    current_term: Option<u64>,
+    #[serde(default)]
     current_leader: Option<u64>,
     #[serde(default)]
     committed_index: Option<u64>,
@@ -362,6 +364,7 @@ impl NodeMetricsView {
             .map(|g| RaftGroupView {
                 raft_group_id: g.raft_group_id,
                 node_id: g.node_id,
+                current_term: g.current_term,
                 current_leader: g.current_leader,
                 committed_index: g.committed_index,
                 last_applied_index: g.last_applied_index,
@@ -394,6 +397,7 @@ impl NodeMetricsView {
 pub struct RaftGroupView {
     pub raft_group_id: u64,
     pub node_id: u64,
+    pub current_term: Option<u64>,
     pub current_leader: Option<u64>,
     pub committed_index: Option<u64>,
     pub last_applied_index: Option<u64>,

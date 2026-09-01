@@ -8,8 +8,6 @@ use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::default_snapshot_store;
 use ursula_shard::RaftGroupId;
 
-use crate::bootstrap::util::reenable_elections_if_campaign_allowed;
-
 pub(crate) fn resolve_snapshot_drive_interval_ms(
     configured: Option<usize>,
     snapshot_store_configured: bool,
@@ -153,7 +151,6 @@ pub fn spawn_snapshot_driver(
                     let Some(raft) = registry.get(RaftGroupId(snapshot.raft_group_id)) else {
                         continue;
                     };
-                    raft.runtime_config().elect(false);
                     if snapshot.current_leader == Some(snapshot.node_id)
                         && let Some(target) = snapshot
                             .voter_ids
@@ -179,7 +176,6 @@ pub fn spawn_snapshot_driver(
             } else if yielded && consecutive_good >= heal_ticks {
                 yielded = false;
                 registry.clear_leadership_shed(LeadershipShedReason::SnapshotDriverS3);
-                reenable_elections_if_campaign_allowed(&registry, "s3-healthy: node S3 recovered");
             }
 
             if !bad_tick {

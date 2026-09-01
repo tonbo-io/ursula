@@ -121,7 +121,6 @@ use ursula_shard::RaftGroupId;
 use ursula_shard::is_reserved_affinity_stream_id;
 use wal_disk::WalDiskMonitor;
 
-use crate::bootstrap::reenable_elections_if_campaign_allowed;
 use crate::render::apply_record_envelope;
 use crate::render::bootstrap_response;
 use crate::render::clamp_sse_text_read;
@@ -1226,7 +1225,6 @@ async fn clear_maintenance_drain(State(state): State<HttpState>) -> Response {
             .into_response();
     };
     registry.clear_leadership_shed(LeadershipShedReason::MaintenanceDrain);
-    reenable_elections_if_campaign_allowed(registry, "maintenance-drain cleared");
     leadership_shed_status(State(state)).await
 }
 

@@ -8,7 +8,6 @@ use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_shard::RaftGroupId;
 
 use crate::bootstrap::util::leader_counts;
-use crate::bootstrap::util::reenable_elections_if_campaign_allowed;
 
 const DEFAULT_CLUSTER_PROBE_INTERVAL_MS: usize = 500;
 const DEFAULT_CLUSTER_PROBE_TIMEOUT_MS: usize = 200;
@@ -226,12 +225,6 @@ pub fn spawn_egress_gate(
                 yielded = true;
                 registry.mark_leadership_shed(LeadershipShedReason::ClusterEgress);
                 let handoffs = plan_cluster_egress_shed(&snaps, node_id);
-                for snap in &snaps {
-                    let Some(raft) = registry.get(RaftGroupId(snap.raft_group_id)) else {
-                        continue;
-                    };
-                    raft.runtime_config().elect(false);
-                }
                 for handoff in handoffs {
                     let Some(raft) = registry.get(RaftGroupId(handoff.group_id)) else {
                         continue;
@@ -252,10 +245,6 @@ pub fn spawn_egress_gate(
             } else if yielded && consecutive_good >= heal_ticks {
                 yielded = false;
                 registry.clear_leadership_shed(LeadershipShedReason::ClusterEgress);
-                reenable_elections_if_campaign_allowed(
-                    &registry,
-                    &format!("cluster-egress: node {node_id} egress recovered"),
-                );
             }
         }
     });

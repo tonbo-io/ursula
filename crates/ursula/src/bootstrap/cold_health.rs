@@ -7,7 +7,6 @@ use ursula_shard::RaftGroupId;
 
 use crate::bootstrap::util::leader_counts;
 use crate::bootstrap::util::prioritized_transfer_targets;
-use crate::bootstrap::util::reenable_elections_if_campaign_allowed;
 
 /// M4 — cold-health leadership gate. Two signals declare this node
 /// "cold-impaired":
@@ -208,10 +207,6 @@ pub fn spawn_cold_health_gate(
                 }
                 ColdHealthDecision::Heal => {
                     registry.clear_leadership_shed(LeadershipShedReason::ColdHealth);
-                    reenable_elections_if_campaign_allowed(
-                        &registry,
-                        &format!("cold-health: node {node_id} cold recovered"),
-                    );
                 }
                 ColdHealthDecision::NoChange => {}
             }
