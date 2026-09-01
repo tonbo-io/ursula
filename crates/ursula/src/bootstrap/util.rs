@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use ursula_raft::RaftGroupHandleRegistry;
 pub(crate) fn leader_counts(
     snaps: &[ursula_raft::RaftGroupMetricsSnapshot],
 ) -> HashMap<u64, usize> {

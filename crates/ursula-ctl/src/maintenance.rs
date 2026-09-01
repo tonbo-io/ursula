@@ -612,15 +612,9 @@ pub async fn repair_restarted_voter(
     drain_recovery_target(nodes, target, client, drain_options, &configured_node_ids)
         .await
         .context("drain current leaders from restarted voter before membership repair")?;
-    stabilize_survivor_leadership(
-        nodes,
-        target,
-        client,
-        drain_options,
-        &configured_node_ids,
-    )
-    .await
-    .context("stabilize surviving voter terms before membership repair")?;
+    stabilize_survivor_leadership(nodes, target, client, drain_options, &configured_node_ids)
+        .await
+        .context("stabilize surviving voter terms before membership repair")?;
     let fence =
         pin_restart_leaders(nodes, target, client, drain_options, &configured_node_ids).await?;
     let initial = client.fetch_cluster(nodes).await?;
@@ -1667,9 +1661,8 @@ fn stable_non_target_leader(
                 view.node.id
             )
         })?;
-        max_survivor_term = Some(max_survivor_term.map_or(current_term, |term: u64| {
-            term.max(current_term)
-        }));
+        max_survivor_term =
+            Some(max_survivor_term.map_or(current_term, |term: u64| term.max(current_term)));
         let Some(candidate) = group.current_leader else {
             continue;
         };
@@ -1828,11 +1821,7 @@ mod tests {
                 2 => (vec![1, 2], vec![3], Some(100)),
                 _ => (vec![1, 2, 3], vec![], Some(100)),
             };
-            let terms_aligned = state
-                .cluster
-                .survivor_terms_aligned
-                .load(Ordering::SeqCst)
-                != 0;
+            let terms_aligned = state.cluster.survivor_terms_aligned.load(Ordering::SeqCst) != 0;
             let (current_term, current_leader) =
                 if matches!(state.cluster.scenario, LeaderScenario::DivergedSurvivorTerm)
                     && !terms_aligned

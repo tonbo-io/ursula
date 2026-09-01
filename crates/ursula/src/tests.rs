@@ -5142,6 +5142,8 @@ async fn startup_maintenance_drain_disables_groups_registered_after_the_fence() 
             .warm_all_groups()
             .await
             .expect("warm raft group");
+    }
+    for node in &nodes {
         node.registry
             .get(RaftGroupId(0))
             .expect("registered group")
