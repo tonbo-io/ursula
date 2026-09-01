@@ -85,6 +85,7 @@ jobs:
           helm lint "$CHART_DIR" --strict
           helm template ursula "$CHART_DIR" >/tmp/ursula-chart-rendered.yaml
           python3 scripts/helm_template_test.py
+          bash "$CHART_DIR/files/graceful-rollout_test.sh"
           helm template ursula "$CHART_DIR" \
             --namespace ursula \
             -f "$CHART_DIR/examples/production-eks.yaml" \

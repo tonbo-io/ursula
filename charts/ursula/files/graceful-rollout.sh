@@ -275,6 +275,16 @@ resume_if_needed() {
   fi
   start_forward "${ordinal}"
   reassert_restart_fence "${node_id}"
+  # A replacement that started before the restart fence was reasserted has
+  # already made (and lost) its one empty-log rejoin attempt. Re-arming the
+  # leaders is not enough to make that live process try again. Route the
+  # uniquely amnesiac saved voter through the ordinary recovery path, which
+  # arms the permission before replacing it once more. A partially caught-up
+  # voter is not classified as amnesiac and continues into the normal wait.
+  recover_amnesiac_if_needed "${node_id}"
+  if [ "${RECOVERED_AMNESIAC_NODE}" = "${node_id}" ]; then
+    return 0
+  fi
   "${CTL}" wait \
     --config "${MANIFEST}" \
     --node "${node_id}" \
@@ -287,6 +297,8 @@ resume_if_needed() {
 }
 
 recover_amnesiac_if_needed() {
+  RECOVERED_AMNESIAC_NODE=
+  expected_node_id=${1:-}
   node_id=$("${CTL}" classify-amnesiac \
     --config "${MANIFEST}" \
     --lag-tolerance 16)
@@ -301,6 +313,10 @@ recover_amnesiac_if_needed() {
   esac
   if [ "${node_id}" -lt 1 ] || [ "${node_id}" -gt "${REPLICAS}" ]; then
     log "amnesiac recovery node id ${node_id} is outside 1..${REPLICAS}"
+    return 1
+  fi
+  if [ -n "${expected_node_id}" ] && [ "${node_id}" != "${expected_node_id}" ]; then
+    log "saved rollout node ${expected_node_id} differs from uniquely amnesiac voter ${node_id}"
     return 1
   fi
   ordinal=$((node_id - 1))
@@ -329,6 +345,7 @@ recover_amnesiac_if_needed() {
   "${CTL}" undrain --config "${MANIFEST}" --node "${node_id}"
   strict_verify
   record_state complete "${node_id}"
+  RECOVERED_AMNESIAC_NODE=${node_id}
   log "amnesiac voter ${node_id} recovered and verified"
 }
 

@@ -54,6 +54,7 @@ jobs:
           helm lint charts/ursula
           helm template ursula charts/ursula --namespace ursula -f charts/ursula/examples/production-eks.yaml >/dev/null
           python3 scripts/helm_template_test.py
+          bash charts/ursula/files/graceful-rollout_test.sh
           sh scripts/helm_ondelete_upgrade_test.sh
           helm lint charts/ursula-chaos
           helm template ursula-chaos charts/ursula-chaos --namespace ursula >/dev/null
