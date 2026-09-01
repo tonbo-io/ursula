@@ -222,14 +222,58 @@ prepare_recovery_restart() {
 record_state() {
   phase=$1
   node_id=$2
+  source_pod_uid=${3:-}
   state_file=/tmp/rollout-state.yaml
   kubectl -n "${NAMESPACE}" create configmap "${STATE_CONFIGMAP}" \
+    --from-literal=state-schema-version="2" \
     --from-literal=target-image="${TARGET_IMAGE}" \
     --from-literal=target-revision="${TARGET_REVISION}" \
     --from-literal=phase="${phase}" \
     --from-literal=node-id="${node_id}" \
+    --from-literal=source-pod-uid="${source_pod_uid}" \
     --dry-run=client -o yaml >"${state_file}"
   kubectl -n "${NAMESPACE}" apply -f "${state_file}"
+}
+
+replacement_attempt_was_superseded() {
+  ordinal=$1
+  saved_revision=$2
+  source_pod_uid=$3
+  pod="${STATEFULSET}-${ordinal}"
+  ready=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+  [ "${ready}" = "True" ] || return 1
+
+  current_pod_uid=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
+    -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+  if [ -n "${source_pod_uid}" ]; then
+    [ -n "${current_pod_uid}" ] && [ "${current_pod_uid}" != "${source_pod_uid}" ]
+    return
+  fi
+
+  # State schema v1 did not record the source Pod UID. Its concrete consumer
+  # is an interrupted pre-0.4.7 rollout: a later hook replaced the voter but
+  # left the older `restarting` record behind. ControllerRevision.revision is
+  # the controller-owned monotonic order that proves the current Ready Pod is
+  # newer than that saved target. Remove this branch once releases predating
+  # state schema v2 are no longer supported upgrade sources.
+  current_revision=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
+    -o jsonpath='{.metadata.labels.controller-revision-hash}' 2>/dev/null || true)
+  saved_sequence=$(kubectl -n "${NAMESPACE}" get controllerrevision "${saved_revision}" \
+    -o jsonpath='{.revision}' 2>/dev/null || true)
+  current_sequence=$(kubectl -n "${NAMESPACE}" get controllerrevision "${current_revision}" \
+    -o jsonpath='{.revision}' 2>/dev/null || true)
+  case "${saved_sequence}" in
+    ''|*[!0-9]*)
+      return 1
+      ;;
+  esac
+  case "${current_sequence}" in
+    ''|*[!0-9]*)
+      return 1
+      ;;
+  esac
+  [ "${current_sequence}" -gt "${saved_sequence}" ]
 }
 
 resume_if_needed() {
@@ -240,6 +284,10 @@ resume_if_needed() {
     -o jsonpath='{.data.target-image}')
   saved_revision=$(kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
     -o jsonpath='{.data.target-revision}')
+  state_schema=$(kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
+    -o jsonpath='{.data.state-schema-version}' 2>/dev/null || true)
+  source_pod_uid=$(kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
+    -o jsonpath='{.data.source-pod-uid}' 2>/dev/null || true)
   phase=$(kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
     -o jsonpath='{.data.phase}')
   node_id=$(kubectl -n "${NAMESPACE}" get configmap "${STATE_CONFIGMAP}" \
@@ -247,6 +295,20 @@ resume_if_needed() {
   if [ "${phase}" != "restarting" ]; then
     return 0
   fi
+  case "${state_schema:-1}" in
+    1)
+      ;;
+    2)
+      if [ -z "${source_pod_uid}" ]; then
+        log "rollout state schema 2 is missing source-pod-uid"
+        return 1
+      fi
+      ;;
+    *)
+      log "unsupported rollout state schema: ${state_schema}"
+      return 1
+      ;;
+  esac
   case "${node_id}" in
     ''|*[!0-9]*)
       log "invalid saved rollout node id: ${node_id}"
@@ -259,7 +321,24 @@ resume_if_needed() {
   fi
   ordinal=$((node_id - 1))
   TARGET_REVISION=$(desired_revision)
-  log "resuming interrupted rollout at node ${node_id}: saved=${saved_image}@${saved_revision} current=${TARGET_IMAGE}@${TARGET_REVISION}"
+  log "resuming interrupted rollout at node ${node_id}: schema=${state_schema:-1} saved=${saved_image}@${saved_revision} current=${TARGET_IMAGE}@${TARGET_REVISION}"
+  if replacement_attempt_was_superseded "${ordinal}" "${saved_revision}" "${source_pod_uid}"; then
+    log "saved replacement at node ${node_id} was superseded by a newer Ready Pod; verifying before closing the old state"
+    start_forward "${ordinal}"
+    if "${CTL}" wait \
+      --config "${MANIFEST}" \
+      --node "${node_id}" \
+      --stall-timeout-secs 300 \
+      --ready-timeout-secs 1800 \
+      --lag-tolerance 16 && strict_verify; then
+      "${CTL}" undrain --config "${MANIFEST}" --node "${node_id}"
+      strict_verify
+      record_state complete "${node_id}"
+      log "superseded replacement at node ${node_id} is healthy; old rollout state closed"
+      return 0
+    fi
+    log "superseding Pod at node ${node_id} is not yet a complete voter; continuing fail-closed recovery"
+  fi
   # `restarting` is written after drain and before the irreversible quiesce.
   # If a later Helm attempt finds it, waiting first deadlocks: the quiesced or
   # stale pod cannot become Ready and only this state machine may replace it.
@@ -309,7 +388,9 @@ recover_amnesiac_if_needed() {
   ordinal=$((node_id - 1))
   TARGET_REVISION=$(desired_revision)
   log "preparing uniquely classified amnesiac voter ${node_id} for revision ${TARGET_REVISION}"
-  record_state restarting "${node_id}"
+  source_pod_uid=$(kubectl -n "${NAMESPACE}" get pod "${STATEFULSET}-${ordinal}" \
+    -o jsonpath='{.metadata.uid}')
+  record_state restarting "${node_id}" "${source_pod_uid}"
   "${CTL}" prepare-amnesiac-restart \
     --config "${MANIFEST}" \
     --node "${node_id}" \
@@ -362,7 +443,9 @@ roll_node() {
     --drain-timeout-secs 300 \
     --ready-timeout-secs 300 \
     --lag-tolerance 16
-  record_state restarting "${node_id}"
+  source_pod_uid=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
+    -o jsonpath='{.metadata.uid}')
+  record_state restarting "${node_id}" "${source_pod_uid}"
   "${CTL}" prepare-restart \
     --config "${MANIFEST}" \
     --node "${node_id}" \
