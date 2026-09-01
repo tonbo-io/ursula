@@ -23,6 +23,7 @@ use crate::metrics::ClusterSnapshot;
 use crate::metrics::MetricsClient;
 use crate::plan::DrainPlan;
 use crate::plan::check_readiness;
+use crate::plan::classify_amnesiac_voter;
 use crate::plan::plan_drain;
 use crate::provider::NodeInfo;
 
@@ -180,6 +181,102 @@ pub async fn drain_node(
             });
         }
         tokio::time::sleep(options.poll_interval).await;
+    }
+}
+
+/// Prepare exactly one partially amnesiac memory-WAL voter for a platform
+/// restart. This recovery path is deliberately narrower than ordinary drain:
+/// the target may be missing whole groups, but every other configured voter
+/// must be complete, mutually consistent, and caught up for every group.
+///
+/// On success the maintenance-drain mark remains set and every stable group
+/// leader has accepted one empty-log rejoin for `target`. The caller must
+/// immediately restart that node, wait for catch-up, and then undrain it.
+pub async fn prepare_amnesiac_restart(
+    nodes: &[NodeInfo],
+    target: &NodeInfo,
+    client: &MetricsClient,
+    drain_options: &DrainOptions,
+    rejoin_options: &RejoinOptions,
+) -> Result<usize> {
+    if drain_options.dry_run {
+        bail!("amnesiac restart preparation does not support dry-run DrainOptions");
+    }
+    let configured_node_ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
+    let initial = client.fetch_cluster(nodes).await?;
+    let candidate =
+        classify_amnesiac_voter(&initial, &configured_node_ids, drain_options.lag_tolerance)
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| {
+                anyhow!("cluster is fully ready; amnesiac recovery is not applicable")
+            })?;
+    if candidate.node_id != target.id {
+        bail!(
+            "node {} is not the uniquely recoverable amnesiac voter (node {} is)",
+            target.id,
+            candidate.node_id
+        );
+    }
+    if !resolve_empty_rejoin_policy(client, nodes, true).await? {
+        bail!("amnesiac restart preparation requires a memory-WAL cluster");
+    }
+
+    client
+        .set_maintenance_drain(target, true)
+        .await
+        .with_context(|| format!("mark maintenance-drain on amnesiac node {}", target.id))?;
+    let prepared = async {
+        let deadline = Instant::now() + drain_options.drain_timeout;
+        loop {
+            let snapshot = client.fetch_cluster(nodes).await?;
+            let current = classify_amnesiac_voter(
+                &snapshot,
+                &configured_node_ids,
+                drain_options.lag_tolerance,
+            )
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow!("cluster changed while preparing amnesiac recovery"))?;
+            if current.node_id != target.id {
+                bail!(
+                    "amnesiac recovery target changed from node {} to node {}",
+                    target.id,
+                    current.node_id
+                );
+            }
+            let still_leads = snapshot.groups_reported_led_by(target.id);
+            if still_leads.is_empty() {
+                break;
+            }
+            let plan = plan_drain(&snapshot, target.id);
+            if plan.transfers.len() != still_leads.len() {
+                bail!(
+                    "amnesiac node {} still leads {} group(s), but only {} safe transfer(s) exist",
+                    target.id,
+                    still_leads.len(),
+                    plan.transfers.len()
+                );
+            }
+            transfer_drain_plan(target, client, &plan).await?;
+            if Instant::now() >= deadline {
+                bail!(
+                    "amnesiac drain timeout: node {} still leads {} group(s) after {:?}",
+                    target.id,
+                    still_leads.len(),
+                    drain_options.drain_timeout
+                );
+            }
+            tokio::time::sleep(drain_options.poll_interval).await;
+        }
+        arm_empty_rejoin(nodes, target, client, rejoin_options).await?;
+        Ok::<_, anyhow::Error>(candidate.missing_group_ids.len())
+    }
+    .await;
+    match prepared {
+        Ok(missing_groups) => Ok(missing_groups),
+        Err(error) => {
+            clear_maintenance_drain(client, target).await;
+            Err(error)
+        }
     }
 }
 
