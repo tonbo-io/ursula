@@ -129,9 +129,12 @@ metadata:
   annotations:
     "helm.sh/hook": post-upgrade
     "helm.sh/hook-weight": "0"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
+    # Keep a failed Job and Pod until the next upgrade so the exact rollout
+    # error remains inspectable. The next attempt still removes it before
+    # creating a replacement, and successful hooks leave no residue.
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
     "argocd.argoproj.io/hook": Sync
-    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded,HookFailed
+    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded
 spec:
   backoffLimit: 0
   activeDeadlineSeconds: {{ .Values.server.gracefulRollout.activeDeadlineSeconds }}

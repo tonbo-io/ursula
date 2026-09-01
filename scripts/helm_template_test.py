@@ -217,9 +217,14 @@ class HelmTemplateConfigTest(unittest.TestCase):
         )
         for (kind, name), annotations in sorted(rollout.items()):
             with self.subTest(kind=kind, name=name):
+                expected_delete_policy = (
+                    "before-hook-creation,hook-succeeded"
+                    if kind == "Job"
+                    else "before-hook-creation,hook-succeeded,hook-failed"
+                )
                 self.assertEqual(
                     annotations["helm.sh/hook-delete-policy"],
-                    "before-hook-creation,hook-succeeded,hook-failed",
+                    expected_delete_policy,
                 )
 
         job = re.search(
@@ -230,6 +235,10 @@ class HelmTemplateConfigTest(unittest.TestCase):
             re.S,
         )
         self.assertIsNotNone(job)
+        self.assertIn(
+            '"argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded',
+            job.group(0),
+        )
         pod_labels = job.group("labels")
         self.assertIn("app.kubernetes.io/component: graceful-rollout", pod_labels)
         self.assertNotIn("app.kubernetes.io/name:", pod_labels)
