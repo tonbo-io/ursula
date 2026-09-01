@@ -379,6 +379,7 @@ struct StaticGrpcTestNodeStorage {
     engine_config: Option<ursula_raft::RaftEngineConfig>,
     per_group_initializers: bool,
     per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
+    start_maintenance_drained: bool,
 }
 
 async fn spawn_static_grpc_test_node(
@@ -391,6 +392,9 @@ async fn spawn_static_grpc_test_node(
     storage: StaticGrpcTestNodeStorage,
 ) -> StaticGrpcTestNode {
     let registry = RaftGroupHandleRegistry::default();
+    if storage.start_maintenance_drained {
+        registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
+    }
     let mut config = RuntimeConfig::new(1, raft_group_count);
     config.threading = ursula_runtime::RuntimeThreading::HostedTokio;
     let mut factory = StaticGrpcRaftGroupEngineFactory::new(
@@ -5097,6 +5101,85 @@ async fn maintenance_drain_endpoint_marks_and_clears_leadership_shed() {
     assert!(body.contains("\"state\":\"none\""), "{body}");
     assert!(body.contains("\"should_accept_transfer\":true"), "{body}");
     assert!(body.contains("\"should_campaign\":true"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn startup_maintenance_drain_disables_groups_registered_after_the_fence() {
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    for node_id in 1..=3u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        peers.push((
+            node_id,
+            format!("http://{}", listener.local_addr().expect("listener addr")),
+        ));
+        listeners.push(listener);
+    }
+
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        nodes.push(
+            spawn_static_grpc_test_node(
+                u64::try_from(index + 1).expect("node id fits u64"),
+                listener,
+                peers.clone(),
+                peers.clone(),
+                true,
+                1,
+                StaticGrpcTestNodeStorage {
+                    per_group_initializers: true,
+                    start_maintenance_drained: index == 2,
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    for node in &nodes {
+        node.runtime
+            .warm_all_groups()
+            .await
+            .expect("warm raft group");
+        node.registry
+            .get(RaftGroupId(0))
+            .expect("registered group")
+            .wait(Some(Duration::from_secs(5)))
+            .current_leader(1, "group 0 initializer elected node 1")
+            .await
+            .expect("wait for initial leader");
+    }
+
+    let follower = nodes[2]
+        .registry
+        .get(RaftGroupId(0))
+        .expect("drained follower group");
+    let term_before = follower.metrics().borrow_watched().current_term;
+    nodes[0]
+        .registry
+        .get(RaftGroupId(0))
+        .expect("leader group")
+        .runtime_config()
+        .heartbeat(false);
+    nodes[1]
+        .registry
+        .get(RaftGroupId(0))
+        .expect("other follower group")
+        .runtime_config()
+        .elect(false);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let metrics = follower.metrics().borrow_watched().clone();
+    assert_eq!(
+        metrics.current_term, term_before,
+        "maintenance-drained follower must not campaign after its leader lease expires"
+    );
+    assert_ne!(metrics.current_leader, Some(3));
+
+    for node in nodes {
+        node.shutdown().await;
+    }
 }
 
 #[tokio::test]

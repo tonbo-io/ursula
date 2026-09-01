@@ -50,7 +50,6 @@ mod test_reexports {
     pub(crate) use super::snapshot::unpurged_log_entries;
     pub(crate) use super::util::leader_counts;
     pub(crate) use super::util::prioritized_transfer_targets;
-    pub(crate) use super::util::reenable_elections_if_campaign_allowed;
 }
 #[allow(unused_imports)]
 pub(crate) use test_reexports::*;

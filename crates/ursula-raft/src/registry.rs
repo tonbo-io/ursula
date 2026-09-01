@@ -923,10 +923,17 @@ impl RaftGroupHandleRegistry {
         placement: ShardPlacement,
         raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
     ) {
-        self.groups
+        // The leadership-shed flag may be installed before groups are warmed
+        // (notably URSULA_START_MAINTENANCE_DRAINED during a replacement).
+        // Apply the same election policy while holding the registry lock so a
+        // concurrent shed transition cannot miss a newly registered group.
+        let mut groups = self
+            .groups
             .lock()
-            .expect("raft group handle registry mutex")
-            .insert(placement.raft_group_id.0, raft);
+            .expect("raft group handle registry mutex");
+        raft.runtime_config()
+            .elect(self.leadership_shed_state().should_campaign());
+        groups.insert(placement.raft_group_id.0, raft);
     }
 
     pub fn get(&self, raft_group_id: RaftGroupId) -> Option<RaftGroupHandle> {
@@ -1020,8 +1027,12 @@ impl RaftGroupHandleRegistry {
         let previous = self
             .leadership_shed
             .fetch_or(reason.bit(), Ordering::Release);
+        let previous_state = LeadershipShedState::from_bits_truncate(previous);
+        let current = LeadershipShedState::from_bits_truncate(previous | reason.bit());
+        if previous_state.should_campaign() != current.should_campaign() {
+            self.set_registered_group_elections(current.should_campaign());
+        }
         if previous & reason.bit() == 0 {
-            let current = LeadershipShedState::from_bits_truncate(previous | reason.bit());
             tracing::warn!("leadership-shed: mark {reason}; state={current}");
         }
     }
@@ -1030,9 +1041,23 @@ impl RaftGroupHandleRegistry {
         let previous = self
             .leadership_shed
             .fetch_and(!reason.bit(), Ordering::Release);
+        let previous_state = LeadershipShedState::from_bits_truncate(previous);
+        let current = LeadershipShedState::from_bits_truncate(previous & !reason.bit());
+        if previous_state.should_campaign() != current.should_campaign() {
+            self.set_registered_group_elections(current.should_campaign());
+        }
         if previous & reason.bit() != 0 {
-            let current = LeadershipShedState::from_bits_truncate(previous & !reason.bit());
             tracing::warn!("leadership-shed: clear {reason}; state={current}");
+        }
+    }
+
+    fn set_registered_group_elections(&self, enabled: bool) {
+        let groups = self
+            .groups
+            .lock()
+            .expect("raft group handle registry mutex");
+        for raft in groups.values() {
+            raft.runtime_config().elect(enabled);
         }
     }
 

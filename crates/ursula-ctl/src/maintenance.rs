@@ -612,6 +612,15 @@ pub async fn repair_restarted_voter(
     drain_recovery_target(nodes, target, client, drain_options, &configured_node_ids)
         .await
         .context("drain current leaders from restarted voter before membership repair")?;
+    stabilize_survivor_leadership(
+        nodes,
+        target,
+        client,
+        drain_options,
+        &configured_node_ids,
+    )
+    .await
+    .context("stabilize surviving voter terms before membership repair")?;
     let fence =
         pin_restart_leaders(nodes, target, client, drain_options, &configured_node_ids).await?;
     let initial = client.fetch_cluster(nodes).await?;
@@ -1462,12 +1471,115 @@ async fn transfer_drain_plan(
     Ok(())
 }
 
-fn stable_non_target_leader(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SurvivorTermHandoff {
+    raft_group_id: u64,
+    stale_leader: u64,
+    stale_term: u64,
+    higher_term_voter: u64,
+    higher_term: u64,
+}
+
+async fn stabilize_survivor_leadership(
+    nodes: &[NodeInfo],
+    target: &NodeInfo,
+    client: &MetricsClient,
+    drain_options: &DrainOptions,
+    configured_node_ids: &BTreeSet<u64>,
+) -> Result<()> {
+    let deadline = Instant::now() + drain_options.drain_timeout;
+    let mut last_error = anyhow!("surviving voter leadership has not converged");
+    loop {
+        let snapshot = client
+            .fetch_cluster(nodes)
+            .await
+            .context("fetch cluster while stabilizing surviving voter leadership")?;
+        validate_surviving_voters(
+            &snapshot,
+            configured_node_ids,
+            target.id,
+            drain_options.lag_tolerance,
+        )?;
+        let group_ids = survivor_group_inventory(&snapshot, target.id);
+        if group_ids.is_empty() {
+            bail!(
+                "no initialized group inventory remains while stabilizing survivors for node {}",
+                target.id
+            );
+        }
+
+        let mut all_stable = true;
+        let mut handoffs = Vec::new();
+        for group_id in group_ids {
+            match stable_non_target_leader(&snapshot, group_id, target.id) {
+                Ok(_) => {}
+                Err(error) => {
+                    all_stable = false;
+                    last_error = error;
+                    if let Some(handoff) =
+                        stale_survivor_term_handoff(&snapshot, group_id, target.id)?
+                    {
+                        handoffs.push(handoff);
+                    }
+                }
+            }
+        }
+        if all_stable {
+            return Ok(());
+        }
+
+        for handoff in handoffs {
+            let leader = nodes
+                .iter()
+                .find(|node| node.id == handoff.stale_leader)
+                .expect("term handoff leader is a configured node");
+            tracing::warn!(
+                raft_group_id = handoff.raft_group_id,
+                stale_leader = handoff.stale_leader,
+                stale_term = handoff.stale_term,
+                higher_term_voter = handoff.higher_term_voter,
+                higher_term = handoff.higher_term,
+                "nudging a stale self-reported leader through a Raft-native term handoff"
+            );
+            match client
+                .transfer_leader(leader, handoff.raft_group_id, handoff.higher_term_voter)
+                .await
+            {
+                Ok(response) if response.transferred => {}
+                Ok(response) => {
+                    last_error = anyhow!(
+                        "survivor term handoff for group {} was rejected: {}",
+                        handoff.raft_group_id,
+                        response.reason.unwrap_or_else(|| "unknown".to_owned())
+                    );
+                }
+                Err(error) => {
+                    last_error = error.context(format!(
+                        "trigger survivor term handoff for group {}",
+                        handoff.raft_group_id
+                    ));
+                }
+            }
+        }
+
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(drain_options.poll_interval).await;
+    }
+    Err(last_error).context(format!(
+        "surviving voter leadership did not stabilize before {:?}",
+        drain_options.drain_timeout
+    ))
+}
+
+fn stale_survivor_term_handoff(
     snap: &ClusterSnapshot,
     raft_group_id: u64,
     target_node_id: u64,
-) -> Result<u64> {
-    let mut leader = None;
+) -> Result<Option<SurvivorTermHandoff>> {
+    let mut self_leader = None;
+    let mut max_term_voter = None;
     for view in snap
         .per_node
         .iter()
@@ -1476,6 +1588,88 @@ fn stable_non_target_leader(
         let Some(group) = view.group(raft_group_id) else {
             continue;
         };
+        let current_term = group.current_term.ok_or_else(|| {
+            anyhow!(
+                "group {} on surviving node {} does not report current_term",
+                raft_group_id,
+                view.node.id
+            )
+        })?;
+        if group.voter_ids.contains(&view.node.id)
+            && max_term_voter.is_none_or(|(_, term)| current_term > term)
+        {
+            max_term_voter = Some((view.node.id, current_term));
+        }
+        if group.current_leader == Some(view.node.id) {
+            if let Some((existing, _, _)) = &self_leader {
+                bail!(
+                    "multiple peers self-report leadership for group {} while repairing node {}: {} vs {}",
+                    raft_group_id,
+                    target_node_id,
+                    existing,
+                    view.node.id
+                );
+            }
+            self_leader = Some((view.node.id, current_term, group.voter_ids.clone()));
+        }
+    }
+    let (stale_leader, stale_term, stale_leader_voters) = match self_leader {
+        Some(leader) => leader,
+        None => return Ok(None),
+    };
+    let (higher_term_voter, higher_term) = max_term_voter.ok_or_else(|| {
+        anyhow!(
+            "group {} has no surviving voter term while repairing node {}",
+            raft_group_id,
+            target_node_id
+        )
+    })?;
+    if stale_term >= higher_term {
+        return Ok(None);
+    }
+    if !stale_leader_voters.contains(&higher_term_voter) {
+        bail!(
+            "group {} stale leader {} does not list higher-term node {} as a voter",
+            raft_group_id,
+            stale_leader,
+            higher_term_voter
+        );
+    }
+    Ok(Some(SurvivorTermHandoff {
+        raft_group_id,
+        stale_leader,
+        stale_term,
+        higher_term_voter,
+        higher_term,
+    }))
+}
+
+fn stable_non_target_leader(
+    snap: &ClusterSnapshot,
+    raft_group_id: u64,
+    target_node_id: u64,
+) -> Result<u64> {
+    let mut leader = None;
+    let mut leader_term = None;
+    let mut max_survivor_term = None;
+    for view in snap
+        .per_node
+        .iter()
+        .filter(|view| view.node.id != target_node_id)
+    {
+        let Some(group) = view.group(raft_group_id) else {
+            continue;
+        };
+        let current_term = group.current_term.ok_or_else(|| {
+            anyhow!(
+                "group {} on surviving node {} does not report current_term",
+                raft_group_id,
+                view.node.id
+            )
+        })?;
+        max_survivor_term = Some(max_survivor_term.map_or(current_term, |term: u64| {
+            term.max(current_term)
+        }));
         let Some(candidate) = group.current_leader else {
             continue;
         };
@@ -1499,15 +1693,28 @@ fn stable_non_target_leader(
             }
         } else {
             leader = Some(candidate);
+            leader_term = Some(current_term);
         }
     }
-    leader.ok_or_else(|| {
+    let leader = leader.ok_or_else(|| {
         anyhow!(
             "group {} has no stable non-target leader while repairing node {}",
             raft_group_id,
             target_node_id
         )
-    })
+    })?;
+    let leader_term = leader_term.expect("a selected leader has a reported term");
+    let max_survivor_term = max_survivor_term.expect("a selected leader is a survivor");
+    if leader_term < max_survivor_term {
+        bail!(
+            "group {} self-reported leader {} is stale at term {} while a surviving voter reports term {}",
+            raft_group_id,
+            leader,
+            leader_term,
+            max_survivor_term
+        );
+    }
+    Ok(leader)
 }
 
 pub(crate) fn format_unready(report: &crate::plan::ReadinessReport) -> String {
@@ -1554,6 +1761,7 @@ mod tests {
         Stable,
         TargetMissing,
         RepairableTarget,
+        DivergedSurvivorTerm,
     }
 
     struct MockCluster {
@@ -1562,6 +1770,7 @@ mod tests {
         membership_phase: AtomicUsize,
         stalled_detach_mode: AtomicUsize,
         promotion_leader_handoff: AtomicUsize,
+        survivor_terms_aligned: AtomicUsize,
         drained_nodes: Mutex<Vec<u64>>,
         undrained_nodes: Mutex<Vec<u64>>,
         quiesced_nodes: Mutex<Vec<u64>>,
@@ -1579,6 +1788,7 @@ mod tests {
             0 => match cluster.scenario {
                 LeaderScenario::Stable | LeaderScenario::TargetMissing => 2,
                 LeaderScenario::RepairableTarget => 1,
+                LeaderScenario::DivergedSurvivorTerm => 2,
             },
             pinned => u64::try_from(pinned).unwrap(),
         }
@@ -1592,6 +1802,7 @@ mod tests {
                 "raft_groups": [{
                     "raft_group_id": 7,
                     "node_id": state.node_id,
+                    "current_term": 1,
                     "current_leader": null,
                     "committed_index": null,
                     "last_applied_index": null,
@@ -1600,21 +1811,47 @@ mod tests {
                 }]
             }));
         }
-        if matches!(state.cluster.scenario, LeaderScenario::RepairableTarget) {
+        if matches!(
+            state.cluster.scenario,
+            LeaderScenario::RepairableTarget | LeaderScenario::DivergedSurvivorTerm
+        ) {
             let phase = state.cluster.membership_phase.load(Ordering::SeqCst);
             let (voters, learners, applied) = match phase {
+                0 if matches!(state.cluster.scenario, LeaderScenario::DivergedSurvivorTerm)
+                    && state.node_id == 3 =>
+                {
+                    (vec![], vec![], None)
+                }
                 0 => (vec![1, 2, 3], vec![], (state.node_id != 3).then_some(100)),
                 1 if state.node_id == 3 => (vec![1, 2, 3], vec![], Some(100)),
                 1 => (vec![1, 2], vec![], Some(100)),
                 2 => (vec![1, 2], vec![3], Some(100)),
                 _ => (vec![1, 2, 3], vec![], Some(100)),
             };
+            let terms_aligned = state
+                .cluster
+                .survivor_terms_aligned
+                .load(Ordering::SeqCst)
+                != 0;
+            let (current_term, current_leader) =
+                if matches!(state.cluster.scenario, LeaderScenario::DivergedSurvivorTerm)
+                    && !terms_aligned
+                {
+                    match state.node_id {
+                        1 => (31, Some(1)),
+                        2 => (100, None),
+                        _ => (101, None),
+                    }
+                } else {
+                    (100, Some(leader))
+                };
             return Json(json!({
                 "wal_backend": "memory",
                 "raft_groups": [{
                     "raft_group_id": 7,
                     "node_id": state.node_id,
-                    "current_leader": leader,
+                    "current_term": current_term,
+                    "current_leader": current_leader,
                     "committed_index": 100,
                     "last_applied_index": applied,
                     "voter_ids": voters,
@@ -1627,6 +1864,7 @@ mod tests {
             "raft_groups": [{
                 "raft_group_id": 7,
                 "node_id": state.node_id,
+                "current_term": 1,
                 "current_leader": leader,
                 "committed_index": 100,
                 "last_applied_index": 100,
@@ -1672,6 +1910,12 @@ mod tests {
         State(state): State<MockNode>,
         Path((_group_id, to)): Path<(u64, u64)>,
     ) -> Json<serde_json::Value> {
+        if matches!(state.cluster.scenario, LeaderScenario::DivergedSurvivorTerm) {
+            state
+                .cluster
+                .survivor_terms_aligned
+                .store(1, Ordering::SeqCst);
+        }
         state
             .cluster
             .pinned_leader
@@ -1787,6 +2031,7 @@ mod tests {
             membership_phase: AtomicUsize::new(0),
             stalled_detach_mode: AtomicUsize::new(0),
             promotion_leader_handoff: AtomicUsize::new(0),
+            survivor_terms_aligned: AtomicUsize::new(0),
             drained_nodes: Mutex::new(Vec::new()),
             undrained_nodes: Mutex::new(Vec::new()),
             quiesced_nodes: Mutex::new(Vec::new()),
@@ -1875,6 +2120,42 @@ mod tests {
             "drain:3",
             "transfer:3->1",
             "drain:2",
+            "membership:1:1,2",
+            "learner:1:3",
+            "membership:1:1,2,3"
+        ]);
+    }
+
+    #[tokio::test]
+    async fn restarted_voter_reconciles_a_stale_self_reported_survivor_leader() {
+        let (nodes, cluster) = mock_cluster(LeaderScenario::DivergedSurvivorTerm).await;
+        let preparation = repair_restarted_voter(
+            &nodes,
+            &nodes[2],
+            &MetricsClient::new(Duration::from_secs(1)).unwrap(),
+            &DrainOptions {
+                drain_timeout: Duration::from_secs(1),
+                ready_timeout: Duration::ZERO,
+                poll_interval: Duration::from_millis(1),
+                lag_tolerance: 16,
+                dry_run: false,
+            },
+            &MembershipRepairOptions {
+                max_concurrency: 2,
+                poll_interval: Duration::ZERO,
+                ..MembershipRepairOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(preparation.missing_group_count, 1);
+        assert_eq!(preparation.leader_anchor, 1);
+        assert_eq!(*cluster.operations.lock().unwrap(), vec![
+            "drain:3",
+            "transfer:1->2",
+            "drain:2",
+            "transfer:2->1",
             "membership:1:1,2",
             "learner:1:3",
             "membership:1:1,2,3"
@@ -2091,6 +2372,7 @@ mod tests {
         RaftGroupView {
             raft_group_id,
             node_id,
+            current_term: Some(1),
             current_leader,
             committed_index: Some(committed),
             last_applied_index: Some(applied),
@@ -2263,6 +2545,23 @@ mod tests {
             ],
         };
         assert!(stable_non_target_leader(&conflicting, 7, 1).is_err());
+
+        let mut stale_term = stable;
+        stale_term.per_node[0].groups[0].current_term = Some(31);
+        stale_term.per_node[1].groups[0].current_term = Some(100);
+        stale_term.per_node[1].groups[0].current_leader = None;
+        let error = stable_non_target_leader(&stale_term, 7, 1).unwrap_err();
+        assert!(error.to_string().contains("stale at term 31"), "{error:#}");
+        assert_eq!(
+            stale_survivor_term_handoff(&stale_term, 7, 1).unwrap(),
+            Some(SurvivorTermHandoff {
+                raft_group_id: 7,
+                stale_leader: 2,
+                stale_term: 31,
+                higher_term_voter: 3,
+                higher_term: 100,
+            })
+        );
     }
 
     #[test]
