@@ -126,14 +126,14 @@ repair_restarted_voter() {
   node_id=$1
   PREPARED_RESTART_NODE=${node_id}
   # The first replacement can be repaired through 0.4.8 survivors, whose
-  # learner endpoint ignores blocking=false and waits for catch-up. Keep the
-  # HTTP budget until every supported upgrade source includes non-blocking
-  # learner attachment.
+  # learner endpoint ignores blocking=false and waits for catch-up. The CLI
+  # bounds each ambiguous attempt and verifies the Raft postcondition before
+  # retrying, so the request budget no longer becomes the rollout stall bound.
   "${CTL}" repair-restarted-voter \
     --config "${MANIFEST}" \
     --node "${node_id}" \
     --drain-timeout-secs 300 \
-    --http-timeout-secs 600 \
+    --http-timeout-secs 60 \
     --lag-tolerance 16
 }
 
