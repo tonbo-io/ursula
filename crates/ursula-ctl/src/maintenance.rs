@@ -68,6 +68,11 @@ pub enum DrainOutcome {
 pub struct MembershipRepairOptions {
     /// Maximum number of independent Raft groups repaired concurrently.
     pub max_concurrency: usize,
+    /// Maximum time spent waiting for one ambiguous HTTP operation attempt.
+    pub operation_timeout: Duration,
+    /// Maximum time spent reconciling one operation to its observed Raft
+    /// postcondition. Timed-out requests are never assumed to have failed.
+    pub operation_reconcile_timeout: Duration,
     /// Abort when learner catch-up makes no progress for this long.
     pub stall_timeout: Duration,
     /// Absolute backstop for learner catch-up.
@@ -93,6 +98,8 @@ impl Default for MembershipRepairOptions {
     fn default() -> Self {
         Self {
             max_concurrency: 16,
+            operation_timeout: Duration::from_secs(60),
+            operation_reconcile_timeout: Duration::from_secs(300),
             stall_timeout: Duration::from_secs(300),
             ready_timeout: Duration::from_secs(1800),
             poll_interval: Duration::from_secs(2),
@@ -585,6 +592,11 @@ pub async fn repair_restarted_voter(
     if repair_options.max_concurrency == 0 {
         bail!("membership repair max_concurrency must be positive");
     }
+    if repair_options.operation_timeout.is_zero()
+        || repair_options.operation_reconcile_timeout.is_zero()
+    {
+        bail!("membership repair operation timeouts must be positive");
+    }
     let configured_node_ids = recovery_inventory(nodes, target)?;
     let survivor_node_ids = configured_node_ids
         .iter()
@@ -672,7 +684,17 @@ pub async fn repair_restarted_voter(
         }
     }
     run_group_phase(detach_groups, repair_options.max_concurrency, |group_id| {
-        client.change_membership(leader, group_id, &survivor_node_ids)
+        reconcile_group_operation(
+            leader,
+            client,
+            group_id,
+            repair_options,
+            "detach restarted voter",
+            |group| {
+                group.voter_ids.iter().copied().collect::<BTreeSet<_>>() == survivor_node_ids
+            },
+            || client.change_membership(leader, group_id, &survivor_node_ids),
+        )
     })
     .await
     .context("detach restarted voter from unready groups")?;
@@ -713,7 +735,15 @@ pub async fn repair_restarted_voter(
         }
     }
     run_group_phase(attach_groups, repair_options.max_concurrency, |group_id| {
-        client.add_learner(leader, group_id, target)
+        reconcile_group_operation(
+            leader,
+            client,
+            group_id,
+            repair_options,
+            "attach restarted voter as a learner",
+            |group| group.learner_ids.contains(&target.id),
+            || client.add_learner(leader, group_id, target),
+        )
     })
     .await
     .context("attach restarted voter as a learner")?;
@@ -732,7 +762,20 @@ pub async fn repair_restarted_voter(
     run_group_phase(
         work_groups.iter().copied().collect(),
         repair_options.max_concurrency,
-        |group_id| client.change_membership(leader, group_id, &configured_node_ids),
+        |group_id| {
+            reconcile_group_operation(
+                leader,
+                client,
+                group_id,
+                repair_options,
+                "promote caught-up learner back to voter",
+                |group| {
+                    group.voter_ids.iter().copied().collect::<BTreeSet<_>>()
+                        == configured_node_ids
+                },
+                || client.change_membership(leader, group_id, &configured_node_ids),
+            )
+        },
     )
     .await
     .context("promote caught-up learner back to voter")?;
@@ -741,6 +784,98 @@ pub async fn repair_restarted_voter(
         missing_group_count: work_groups.len(),
         ..fence
     })
+}
+
+/// Reconcile an HTTP operation to a committed Raft postcondition.
+///
+/// Dropping an HTTP request at a timeout boundary does not establish whether
+/// OpenRaft committed the operation. Observe the leader's group state before
+/// every retry and only declare success from that durable postcondition.
+async fn reconcile_group_operation<F, Fut, P>(
+    leader: &NodeInfo,
+    client: &MetricsClient,
+    group_id: u64,
+    options: &MembershipRepairOptions,
+    operation_name: &str,
+    postcondition: P,
+    operation: F,
+) -> Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+    P: Fn(&crate::metrics::RaftGroupView) -> bool,
+{
+    let deadline = Instant::now() + options.operation_reconcile_timeout;
+    let mut last_error = anyhow!("postcondition has not been observed");
+    let mut saw_ambiguous_result = false;
+    loop {
+        match client.fetch_node(leader).await {
+            Ok(view) => {
+                let group = view.group(group_id).ok_or_else(|| {
+                    anyhow!(
+                        "leader node {} does not report group {group_id}",
+                        leader.id
+                    )
+                })?;
+                if postcondition(group) {
+                    if saw_ambiguous_result {
+                        tracing::info!(
+                            leader_node_id = leader.id,
+                            raft_group_id = group_id,
+                            operation = operation_name,
+                            "Raft postcondition resolved an ambiguous HTTP operation"
+                        );
+                    }
+                    return Ok(());
+                }
+            }
+            Err(error) => {
+                last_error = error.context(format!(
+                    "observe {operation_name} postcondition at leader node {} for group {group_id}",
+                    leader.id
+                ));
+                if Instant::now() >= deadline {
+                    break;
+                }
+                tokio::time::sleep(options.poll_interval).await;
+                continue;
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt_timeout = options.operation_timeout.min(remaining);
+        last_error = match tokio::time::timeout(attempt_timeout, operation()).await {
+            Ok(Ok(())) => anyhow!("HTTP operation returned success before its postcondition"),
+            Ok(Err(error)) => {
+                saw_ambiguous_result = true;
+                error
+            }
+            Err(_) => {
+                saw_ambiguous_result = true;
+                anyhow!("HTTP operation attempt exceeded {attempt_timeout:?}")
+            }
+        };
+        if saw_ambiguous_result {
+            tracing::warn!(
+                leader_node_id = leader.id,
+                raft_group_id = group_id,
+                operation = operation_name,
+                error = %last_error,
+                "Raft HTTP result is ambiguous; reconciling its postcondition before retry"
+            );
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(options.poll_interval).await;
+    }
+    Err(last_error).context(format!(
+        "{operation_name} did not converge for group {group_id} within {:?}",
+        options.operation_reconcile_timeout
+    ))
 }
 
 async fn wait_repair_learners_caught_up(
@@ -1372,6 +1507,7 @@ mod tests {
         scenario: LeaderScenario,
         pinned_leader: AtomicUsize,
         membership_phase: AtomicUsize,
+        stalled_detach_mode: AtomicUsize,
         drained_nodes: Mutex<Vec<u64>>,
         undrained_nodes: Mutex<Vec<u64>>,
         quiesced_nodes: Mutex<Vec<u64>>,
@@ -1528,6 +1664,17 @@ mod tests {
             "1,2,3" => 3,
             _ => return StatusCode::BAD_REQUEST,
         };
+        let stall_mode = if voters == "1,2" {
+            state
+                .cluster
+                .stalled_detach_mode
+                .swap(0, Ordering::SeqCst)
+        } else {
+            0
+        };
+        if stall_mode == 1 {
+            return std::future::pending::<StatusCode>().await;
+        }
         state
             .cluster
             .membership_phase
@@ -1538,6 +1685,9 @@ mod tests {
             .lock()
             .unwrap()
             .push(format!("membership:{}:{voters}", state.node_id));
+        if stall_mode == 2 {
+            return std::future::pending::<StatusCode>().await;
+        }
         StatusCode::OK
     }
 
@@ -1569,6 +1719,7 @@ mod tests {
             scenario,
             pinned_leader: AtomicUsize::new(0),
             membership_phase: AtomicUsize::new(0),
+            stalled_detach_mode: AtomicUsize::new(0),
             drained_nodes: Mutex::new(Vec::new()),
             undrained_nodes: Mutex::new(Vec::new()),
             quiesced_nodes: Mutex::new(Vec::new()),
@@ -1652,6 +1803,86 @@ mod tests {
         assert_eq!(preparation.missing_group_count, 1);
         assert_eq!(preparation.leader_anchor, 1);
         assert_eq!(preparation.fenced_node_ids, vec![2]);
+        assert_eq!(cluster.membership_phase.load(Ordering::SeqCst), 3);
+        assert_eq!(*cluster.operations.lock().unwrap(), vec![
+            "drain:3",
+            "transfer:3->1",
+            "drain:2",
+            "membership:1:1,2",
+            "learner:1:3",
+            "membership:1:1,2,3"
+        ]);
+    }
+
+    #[tokio::test]
+    async fn membership_repair_retries_a_timed_out_uncommitted_request() {
+        let (nodes, cluster) = mock_cluster(LeaderScenario::RepairableTarget).await;
+        cluster.pinned_leader.store(3, Ordering::SeqCst);
+        cluster.stalled_detach_mode.store(1, Ordering::SeqCst);
+
+        let preparation = repair_restarted_voter(
+            &nodes,
+            &nodes[2],
+            &MetricsClient::new(Duration::from_millis(20)).unwrap(),
+            &DrainOptions {
+                drain_timeout: Duration::from_secs(1),
+                ready_timeout: Duration::ZERO,
+                poll_interval: Duration::from_millis(1),
+                lag_tolerance: 16,
+                dry_run: false,
+            },
+            &MembershipRepairOptions {
+                max_concurrency: 1,
+                operation_timeout: Duration::from_millis(20),
+                operation_reconcile_timeout: Duration::from_secs(1),
+                poll_interval: Duration::from_millis(1),
+                ..MembershipRepairOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(preparation.missing_group_count, 1);
+        assert_eq!(cluster.membership_phase.load(Ordering::SeqCst), 3);
+        assert_eq!(*cluster.operations.lock().unwrap(), vec![
+            "drain:3",
+            "transfer:3->1",
+            "drain:2",
+            "membership:1:1,2",
+            "learner:1:3",
+            "membership:1:1,2,3"
+        ]);
+    }
+
+    #[tokio::test]
+    async fn membership_repair_accepts_a_committed_request_with_a_lost_response() {
+        let (nodes, cluster) = mock_cluster(LeaderScenario::RepairableTarget).await;
+        cluster.pinned_leader.store(3, Ordering::SeqCst);
+        cluster.stalled_detach_mode.store(2, Ordering::SeqCst);
+
+        let preparation = repair_restarted_voter(
+            &nodes,
+            &nodes[2],
+            &MetricsClient::new(Duration::from_millis(20)).unwrap(),
+            &DrainOptions {
+                drain_timeout: Duration::from_secs(1),
+                ready_timeout: Duration::ZERO,
+                poll_interval: Duration::from_millis(1),
+                lag_tolerance: 16,
+                dry_run: false,
+            },
+            &MembershipRepairOptions {
+                max_concurrency: 1,
+                operation_timeout: Duration::from_millis(20),
+                operation_reconcile_timeout: Duration::from_secs(1),
+                poll_interval: Duration::from_millis(1),
+                ..MembershipRepairOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(preparation.missing_group_count, 1);
         assert_eq!(cluster.membership_phase.load(Ordering::SeqCst), 3);
         assert_eq!(*cluster.operations.lock().unwrap(), vec![
             "drain:3",
