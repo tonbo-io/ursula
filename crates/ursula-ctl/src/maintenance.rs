@@ -280,6 +280,139 @@ pub async fn prepare_amnesiac_restart(
     }
 }
 
+/// Re-establish the maintenance fence after the platform has restarted a
+/// voter. The server-side drain flag is process-local, so the replacement
+/// must be fenced again before catch-up is allowed to continue.
+///
+/// This operation is deliberately valid only while every non-target voter is
+/// complete and caught up. It transfers any leadership the replacement
+/// acquired during startup, then re-arms only groups that are still wholly
+/// absent on a memory-WAL target. Partially caught-up groups need no revert.
+pub async fn reassert_restart_fence(
+    nodes: &[NodeInfo],
+    target: &NodeInfo,
+    client: &MetricsClient,
+    drain_options: &DrainOptions,
+    rejoin_options: &RejoinOptions,
+) -> Result<usize> {
+    if drain_options.dry_run {
+        bail!("restart fence reassertion does not support dry-run DrainOptions");
+    }
+    let configured_node_ids = nodes.iter().map(|node| node.id).collect::<BTreeSet<_>>();
+    if configured_node_ids.len() != nodes.len() || !configured_node_ids.contains(&target.id) {
+        bail!("restart fence requires an exact, unique configured voter inventory");
+    }
+    let memory_rejoin = resolve_restart_rejoin_policy(client, nodes).await?;
+
+    client
+        .set_maintenance_drain(target, true)
+        .await
+        .with_context(|| format!("reassert maintenance-drain on restarted node {}", target.id))?;
+    let prepared = async {
+        let deadline = Instant::now() + drain_options.drain_timeout;
+        loop {
+            let snapshot = client.fetch_cluster(nodes).await?;
+            validate_surviving_voters(
+                &snapshot,
+                &configured_node_ids,
+                target.id,
+                drain_options.lag_tolerance,
+            )?;
+            let still_leads = snapshot.groups_reported_led_by(target.id);
+            if still_leads.is_empty() {
+                break;
+            }
+            let plan = plan_drain(&snapshot, target.id);
+            if plan.transfers.len() != still_leads.len() {
+                bail!(
+                    "restarted node {} still leads {} group(s), but only {} safe transfer(s) exist",
+                    target.id,
+                    still_leads.len(),
+                    plan.transfers.len()
+                );
+            }
+            transfer_drain_plan(target, client, &plan).await?;
+            if Instant::now() >= deadline {
+                bail!(
+                    "restart fence timeout: node {} still leads {} group(s) after {:?}",
+                    target.id,
+                    still_leads.len(),
+                    drain_options.drain_timeout
+                );
+            }
+            tokio::time::sleep(drain_options.poll_interval).await;
+        }
+
+        let snapshot = client.fetch_cluster(nodes).await?;
+        validate_surviving_voters(
+            &snapshot,
+            &configured_node_ids,
+            target.id,
+            drain_options.lag_tolerance,
+        )?;
+        let missing_groups =
+            wholly_missing_groups(&snapshot, target.id, drain_options.lag_tolerance);
+        if !missing_groups.is_empty() {
+            if !memory_rejoin {
+                bail!(
+                    "disk-WAL node {} is missing {} whole group(s); refusing empty-log recovery",
+                    target.id,
+                    missing_groups.len()
+                );
+            }
+            arm_empty_rejoin_groups(nodes, target, client, rejoin_options, &missing_groups).await?;
+        }
+        Ok::<_, anyhow::Error>(missing_groups.len())
+    }
+    .await;
+    match prepared {
+        Ok(missing_groups) => Ok(missing_groups),
+        Err(error) => {
+            clear_maintenance_drain(client, target).await;
+            Err(error)
+        }
+    }
+}
+
+fn validate_surviving_voters(
+    snapshot: &ClusterSnapshot,
+    configured_node_ids: &BTreeSet<u64>,
+    target_node_id: u64,
+    lag_tolerance: u64,
+) -> Result<()> {
+    let reported = snapshot
+        .per_node
+        .iter()
+        .map(|view| view.node.id)
+        .collect::<BTreeSet<_>>();
+    if &reported != configured_node_ids {
+        bail!(
+            "restart fence voter inventory differs: configured={configured_node_ids:?} reported={reported:?}"
+        );
+    }
+    for node_id in configured_node_ids {
+        if *node_id != target_node_id
+            && !check_readiness(snapshot, *node_id, lag_tolerance).all_ready
+        {
+            bail!("surviving voter {node_id} is not complete and caught up");
+        }
+    }
+    Ok(())
+}
+
+fn wholly_missing_groups(
+    snapshot: &ClusterSnapshot,
+    target_node_id: u64,
+    lag_tolerance: u64,
+) -> BTreeSet<u64> {
+    check_readiness(snapshot, target_node_id, lag_tolerance)
+        .per_group
+        .into_values()
+        .filter(|group| !group.ready && !group.voter_member && group.target_applied_index.is_none())
+        .map(|group| group.raft_group_id)
+        .collect()
+}
+
 /// Clear the maintenance-drain mark on `target` so it may hold leaderships
 /// again.
 pub async fn undrain_node(client: &MetricsClient, target: &NodeInfo) -> Result<()> {
@@ -440,22 +573,32 @@ pub async fn arm_empty_rejoin(
     client: &MetricsClient,
     options: &RejoinOptions,
 ) -> Result<()> {
+    let snapshot = client.fetch_cluster(nodes).await?;
+    let group_ids = peer_reported_rejoin_groups(&snapshot, target.id);
+    arm_empty_rejoin_groups(nodes, target, client, options, &group_ids).await
+}
+
+async fn arm_empty_rejoin_groups(
+    nodes: &[NodeInfo],
+    target: &NodeInfo,
+    client: &MetricsClient,
+    options: &RejoinOptions,
+    group_ids: &BTreeSet<u64>,
+) -> Result<()> {
     if options.max_concurrency == 0 {
         bail!("rejoin max_concurrency must be positive");
+    }
+    if group_ids.is_empty() {
+        bail!(
+            "no initialized raft group reported by a peer includes target node {}; cannot allow empty raft rejoin",
+            target.id
+        );
     }
     let deadline = Instant::now() + options.timeout;
     let mut last_error: anyhow::Error;
     loop {
         let before = client.fetch_cluster(nodes).await?;
-        let group_ids = peer_reported_rejoin_groups(&before, target.id);
-        if group_ids.is_empty() {
-            bail!(
-                "no initialized raft group reported by a peer includes target node {}; \
-                 cannot allow empty raft rejoin",
-                target.id
-            );
-        }
-        let plan = match rejoin_leader_plan(nodes, target.id, &before, &group_ids) {
+        let plan = match rejoin_leader_plan(nodes, target.id, &before, group_ids) {
             Ok(plan) => plan,
             Err(err) => {
                 last_error = err;
@@ -491,7 +634,7 @@ pub async fn arm_empty_rejoin(
             last_error = err;
         } else {
             let after = client.fetch_cluster(nodes).await?;
-            match rejoin_leader_plan(nodes, target.id, &after, &group_ids) {
+            match rejoin_leader_plan(nodes, target.id, &after, group_ids) {
                 Ok(after_plan)
                     if plan.iter().all(|(group_id, leader)| {
                         after_plan
@@ -690,23 +833,27 @@ pub(crate) fn decide_empty_rejoin(
     Ok(EmptyRejoinDecision::Disk)
 }
 
-/// A monotonic snapshot of how far a restarting target has caught up. Both
-/// components only grow during a healthy rebuild: `applied_sum` climbs as
-/// entries (or a whole snapshot) are applied, and `voters_ready` climbs as the
-/// target rejoins each group's voter set.
+/// A monotonic snapshot of how far a restarting target has caught up. Applied
+/// indices from already-ready groups are deliberately excluded: unrelated
+/// writes there must not keep a wholly missing group alive forever.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct TargetProgress {
-    applied_sum: u128,
+    ready_groups: usize,
     voters_ready: usize,
+    unready_applied_sum: u128,
 }
 
 impl TargetProgress {
     fn of(report: &crate::plan::ReadinessReport) -> Self {
         let mut p = TargetProgress::default();
         for g in report.per_group.values() {
-            p.applied_sum = p
-                .applied_sum
-                .saturating_add(u128::from(g.target_applied_index.unwrap_or(0)));
+            if g.ready {
+                p.ready_groups = p.ready_groups.saturating_add(1);
+            } else {
+                p.unready_applied_sum = p
+                    .unready_applied_sum
+                    .saturating_add(u128::from(g.target_applied_index.unwrap_or(0)));
+            }
             if g.voter_member {
                 p.voters_ready = p.voters_ready.saturating_add(1);
             }
@@ -714,10 +861,18 @@ impl TargetProgress {
         p
     }
 
-    /// True if either dimension advanced past `prev`. Any forward motion
-    /// resets the stall clock.
+    /// Compare lexicographically so a readiness or membership regression can
+    /// never be disguised as progress by writes in some other group.
     fn advanced_past(&self, prev: &TargetProgress) -> bool {
-        self.applied_sum > prev.applied_sum || self.voters_ready > prev.voters_ready
+        (
+            self.ready_groups,
+            self.voters_ready,
+            self.unready_applied_sum,
+        ) > (
+            prev.ready_groups,
+            prev.voters_ready,
+            prev.unready_applied_sum,
+        )
     }
 }
 
@@ -866,12 +1021,14 @@ mod tests {
         DriftOnce,
         AlwaysDrift,
         Stable,
+        TargetMissing,
     }
 
     struct MockCluster {
         scenario: LeaderScenario,
         metrics_fetches: AtomicUsize,
         armed_on_nodes: Mutex<Vec<u64>>,
+        drained_nodes: Mutex<Vec<u64>>,
     }
 
     #[derive(Clone)]
@@ -888,8 +1045,22 @@ mod tests {
             LeaderScenario::DriftOnce => 3,
             LeaderScenario::AlwaysDrift if sample.is_multiple_of(2) => 2,
             LeaderScenario::AlwaysDrift => 3,
-            LeaderScenario::Stable => 2,
+            LeaderScenario::Stable | LeaderScenario::TargetMissing => 2,
         };
+        if matches!(state.cluster.scenario, LeaderScenario::TargetMissing) && state.node_id == 3 {
+            return Json(json!({
+                "wal_backend": "memory",
+                "raft_groups": [{
+                    "raft_group_id": 7,
+                    "node_id": state.node_id,
+                    "current_leader": null,
+                    "committed_index": null,
+                    "last_applied_index": null,
+                    "voter_ids": [],
+                    "learner_ids": []
+                }]
+            }));
+        }
         Json(json!({
             "wal_backend": "memory",
             "raft_groups": [{
@@ -914,11 +1085,22 @@ mod tests {
         StatusCode::OK
     }
 
+    async fn mock_drain(State(state): State<MockNode>) -> StatusCode {
+        state
+            .cluster
+            .drained_nodes
+            .lock()
+            .unwrap()
+            .push(state.node_id);
+        StatusCode::OK
+    }
+
     async fn mock_cluster(scenario: LeaderScenario) -> (Vec<NodeInfo>, Arc<MockCluster>) {
         let cluster = Arc::new(MockCluster {
             scenario,
             metrics_fetches: AtomicUsize::new(0),
             armed_on_nodes: Mutex::new(Vec::new()),
+            drained_nodes: Mutex::new(Vec::new()),
         });
         let mut nodes = Vec::new();
         for node_id in 1..=3 {
@@ -934,6 +1116,7 @@ mod tests {
                     "/__ursula/raft/{group_id}/nodes/{node_id}/allow-next-revert",
                     post(mock_arm),
                 )
+                .route("/__ursula/leadership-shed/maintenance", post(mock_drain))
                 .with_state(state);
             tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
@@ -976,6 +1159,34 @@ mod tests {
 
         assert_eq!(*cluster.armed_on_nodes.lock().unwrap(), vec![2, 3]);
         assert_eq!(cluster.metrics_fetches.load(Ordering::SeqCst), 12);
+    }
+
+    #[tokio::test]
+    async fn restarted_amnesiac_is_refenced_and_rearmed_on_current_leader() {
+        let (nodes, cluster) = mock_cluster(LeaderScenario::TargetMissing).await;
+        let rearmed = reassert_restart_fence(
+            &nodes,
+            &nodes[2],
+            &MetricsClient::new(Duration::from_secs(1)).unwrap(),
+            &DrainOptions {
+                drain_timeout: Duration::from_secs(1),
+                ready_timeout: Duration::ZERO,
+                poll_interval: Duration::from_millis(1),
+                lag_tolerance: 16,
+                dry_run: false,
+            },
+            &RejoinOptions {
+                timeout: Duration::from_secs(1),
+                max_concurrency: 2,
+                retry_interval: Duration::from_millis(1),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rearmed, 1);
+        assert_eq!(*cluster.drained_nodes.lock().unwrap(), vec![3]);
+        assert_eq!(*cluster.armed_on_nodes.lock().unwrap(), vec![2]);
     }
 
     #[tokio::test]
@@ -1124,6 +1335,42 @@ mod tests {
         assert!(more.advanced_past(&applying));
         assert!(!applying.advanced_past(&applying)); // no motion → stall clock keeps running
         assert!(!voter.advanced_past(&more)); // a regression is not progress
+    }
+
+    #[test]
+    fn target_progress_ignores_writes_in_already_ready_groups() {
+        use std::collections::BTreeMap;
+
+        use crate::plan::GroupReadiness;
+        use crate::plan::ReadinessReport;
+
+        let report = |ready_applied: u64| {
+            let mut per_group = BTreeMap::new();
+            per_group.insert(7, GroupReadiness {
+                raft_group_id: 7,
+                voter_member: true,
+                target_applied_index: Some(ready_applied),
+                peer_max_committed_index: Some(ready_applied),
+                catch_up_gap: Some(0),
+                ready: true,
+            });
+            per_group.insert(8, GroupReadiness {
+                raft_group_id: 8,
+                voter_member: false,
+                target_applied_index: None,
+                peer_max_committed_index: Some(8),
+                catch_up_gap: Some(8),
+                ready: false,
+            });
+            ReadinessReport {
+                all_ready: false,
+                per_group,
+            }
+        };
+
+        let before = TargetProgress::of(&report(10));
+        let unrelated_write = TargetProgress::of(&report(11));
+        assert!(!unrelated_write.advanced_past(&before));
     }
 
     #[test]

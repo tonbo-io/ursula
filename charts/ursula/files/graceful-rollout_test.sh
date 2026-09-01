@@ -14,6 +14,7 @@ export NAMESPACE STATEFULSET REPLICAS EXPECTED_GROUPS TARGET_IMAGE CTL ROLLOUT_S
 
 # shellcheck source=graceful-rollout.sh
 . "${test_dir}/graceful-rollout.sh"
+original_write_manifest=$(declare -f write_manifest)
 
 mocked_revision=ursula-stale
 kubectl() {
@@ -117,7 +118,7 @@ case "$1" in
   classify-amnesiac)
     printf '%s\n' 3
     ;;
-  prepare-amnesiac-restart|wait|undrain)
+  prepare-amnesiac-restart|reassert-restart-fence|wait|undrain)
     printf '%s\n' "$1" >>"${mock_ctl_calls}"
     ;;
   *)
@@ -146,6 +147,7 @@ recover_amnesiac_if_needed
 [ "${recovered_forward}" = "1" ]
 [ "${recovered_verified}" = "1" ]
 grep -q '^prepare-amnesiac-restart$' "${mock_ctl_calls}"
+grep -q '^reassert-restart-fence$' "${mock_ctl_calls}"
 grep -q '^restarting 3$' "${mock_ctl_calls}"
 grep -q '^wait$' "${mock_ctl_calls}"
 grep -q '^undrain$' "${mock_ctl_calls}"
@@ -178,6 +180,7 @@ REPLICAS=1
 main
 [ "${call_order}" = " ready resume wait" ]
 rm -f "${healthy_ctl}"
+eval "${original_write_manifest}"
 
 # The cluster manifest used to list three nodes literally, so any other replica
 # count produced a view that disagreed with the StatefulSet it was rolling. The
