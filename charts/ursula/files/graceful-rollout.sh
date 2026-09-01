@@ -259,32 +259,26 @@ resume_if_needed() {
   ordinal=$((node_id - 1))
   TARGET_REVISION=$(desired_revision)
   log "resuming interrupted rollout at node ${node_id}: saved=${saved_image}@${saved_revision} current=${TARGET_IMAGE}@${TARGET_REVISION}"
-  # `restarting` is written only after drain and prepare-restart succeed. If a
-  # later Helm attempt stages a different template while that replacement is
-  # unready, waiting first deadlocks: the stale pod cannot become Ready and the
-  # code that is authorized to replace it is never reached. Finish the already
-  # committed replacement against the current StatefulSet revision.
-  if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
-    log "node ${node_id} is not at the current target; recreating the already-drained voter"
-    replace_pod "${ordinal}"
-  fi
+  # `restarting` is written only after drain and prepare-restart succeed. The
+  # empty-log rejoin permission is leader-local, so it may have disappeared
+  # while this hook was interrupted. Re-arm it before starting a fresh process;
+  # doing this only after replacement is too late because Ursula makes its one
+  # empty-log rejoin attempt during startup. The voter is already drained and
+  # fenced, so replacing it again is the single safe way to make that attempt
+  # consume the restored permission.
+  reassert_restart_fence "${node_id}"
+  log "recreating already-drained node ${node_id} after restoring its restart fence"
+  replace_pod "${ordinal}"
   wait_for_pod_ready "${ordinal}"
   if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
     log "node ${node_id} became Ready at a revision other than ${TARGET_REVISION}"
     return 1
   fi
   start_forward "${ordinal}"
+  # Reassert once more after startup in case leadership moved while the voter
+  # was being recreated. The fresh process has already consumed the pre-start
+  # permission; this second pass maintains the fence while it catches up.
   reassert_restart_fence "${node_id}"
-  # A replacement that started before the restart fence was reasserted has
-  # already made (and lost) its one empty-log rejoin attempt. Re-arming the
-  # leaders is not enough to make that live process try again. Route the
-  # uniquely amnesiac saved voter through the ordinary recovery path, which
-  # arms the permission before replacing it once more. A partially caught-up
-  # voter is not classified as amnesiac and continues into the normal wait.
-  recover_amnesiac_if_needed "${node_id}"
-  if [ "${RECOVERED_AMNESIAC_NODE}" = "${node_id}" ]; then
-    return 0
-  fi
   "${CTL}" wait \
     --config "${MANIFEST}" \
     --node "${node_id}" \
@@ -297,8 +291,6 @@ resume_if_needed() {
 }
 
 recover_amnesiac_if_needed() {
-  RECOVERED_AMNESIAC_NODE=
-  expected_node_id=${1:-}
   node_id=$("${CTL}" classify-amnesiac \
     --config "${MANIFEST}" \
     --lag-tolerance 16)
@@ -313,10 +305,6 @@ recover_amnesiac_if_needed() {
   esac
   if [ "${node_id}" -lt 1 ] || [ "${node_id}" -gt "${REPLICAS}" ]; then
     log "amnesiac recovery node id ${node_id} is outside 1..${REPLICAS}"
-    return 1
-  fi
-  if [ -n "${expected_node_id}" ] && [ "${node_id}" != "${expected_node_id}" ]; then
-    log "saved rollout node ${expected_node_id} differs from uniquely amnesiac voter ${node_id}"
     return 1
   fi
   ordinal=$((node_id - 1))
@@ -345,7 +333,6 @@ recover_amnesiac_if_needed() {
   "${CTL}" undrain --config "${MANIFEST}" --node "${node_id}"
   strict_verify
   record_state complete "${node_id}"
-  RECOVERED_AMNESIAC_NODE=${node_id}
   log "amnesiac voter ${node_id} recovered and verified"
 }
 

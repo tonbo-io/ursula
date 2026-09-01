@@ -15,7 +15,6 @@ export NAMESPACE STATEFULSET REPLICAS EXPECTED_GROUPS TARGET_IMAGE CTL ROLLOUT_S
 # shellcheck source=graceful-rollout.sh
 . "${test_dir}/graceful-rollout.sh"
 original_write_manifest=$(declare -f write_manifest)
-original_recover_amnesiac_if_needed=$(declare -f recover_amnesiac_if_needed)
 original_reassert_restart_fence=$(declare -f reassert_restart_fence)
 
 mocked_revision=ursula-stale
@@ -65,6 +64,7 @@ desired_revision() {
 
 replace_pod() {
   [ "$1" = "1" ]
+  [ "${resume_reassertions}" = "1" ]
   replaced_stale=1
   mocked_revision=ursula-current
 }
@@ -73,14 +73,7 @@ strict_verify() { :; }
 
 reassert_restart_fence() {
   [ "$1" = "2" ]
-  resumed_reassert=1
-}
-
-recover_amnesiac_if_needed() {
-  [ "$1" = "2" ]
-  resumed_amnesiac=1
-  resumed_complete=1
-  RECOVERED_AMNESIAC_NODE=2
+  resume_reassertions=$((resume_reassertions + 1))
 }
 
 record_state() {
@@ -92,18 +85,14 @@ record_state() {
 replaced_stale=0
 resumed_forward=0
 resumed_complete=0
-resumed_amnesiac=0
-resumed_reassert=0
-CTL=/bin/false
+resume_reassertions=0
+CTL=true
 resume_if_needed
 [ "${replaced_stale}" = "1" ]
 [ "${resumed_forward}" = "1" ]
-[ "${resumed_reassert}" = "1" ]
-[ "${resumed_amnesiac}" = "1" ]
+[ "${resume_reassertions}" = "2" ]
 [ "${resumed_complete}" = "1" ]
-eval "${original_recover_amnesiac_if_needed}"
 eval "${original_reassert_restart_fence}"
-CTL=true
 
 mocked_revision=ursula-current
 kubectl() {
@@ -164,7 +153,7 @@ record_state() {
 recovered_replaced=0
 recovered_forward=0
 recovered_verified=0
-recover_amnesiac_if_needed 3
+recover_amnesiac_if_needed
 [ "${recovered_replaced}" = "1" ]
 [ "${recovered_forward}" = "1" ]
 [ "${recovered_verified}" = "1" ]
@@ -175,14 +164,6 @@ grep -q '^wait$' "${mock_ctl_calls}"
 grep -q '^undrain$' "${mock_ctl_calls}"
 grep -q '^complete 3$' "${mock_ctl_calls}"
 
-# A saved in-flight voter may only trigger recovery of that same voter. If the
-# cluster classifies a different node, stop before replacing either one.
-recovered_replaced=0
-if recover_amnesiac_if_needed 2; then
-  echo "mismatched saved and amnesiac voters must fail closed" >&2
-  exit 1
-fi
-[ "${recovered_replaced}" = "0" ]
 rm -f "${mock_ctl}" "${mock_ctl_calls}"
 
 # A recorded replacement must be resumed before the blanket Ready gate. The
