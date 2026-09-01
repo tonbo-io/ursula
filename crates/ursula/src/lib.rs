@@ -940,6 +940,10 @@ fn admin_ops_router(state: HttpState) -> Router {
             post(allow_raft_node_next_revert),
         )
         .route(
+            "/__ursula/raft/quiesce-for-restart",
+            post(quiesce_raft_for_restart),
+        )
+        .route(
             "/__ursula/raft/{raft_group_id}/leader/transfer/{node_id}",
             post(transfer_raft_leader),
         )
@@ -1228,6 +1232,63 @@ async fn clear_maintenance_drain(State(state): State<HttpState>) -> Response {
     registry.clear_leadership_shed(LeadershipShedReason::MaintenanceDrain);
     reenable_elections_if_campaign_allowed(registry, "maintenance-drain cleared");
     leadership_shed_status(State(state)).await
+}
+
+async fn quiesce_raft_for_restart(State(state): State<HttpState>) -> Response {
+    let Some(registry) = state.raft_registry() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "raft registry is not configured for this server",
+        )
+            .into_response();
+    };
+    if !registry
+        .leadership_shed_state()
+        .contains(ursula_raft::LeadershipShedState::MAINTENANCE_DRAIN)
+    {
+        return (
+            StatusCode::CONFLICT,
+            "maintenance drain must be active before Raft restart quiescence",
+        )
+            .into_response();
+    }
+    let groups = registry.metrics_snapshot();
+    let Some(node_id) = groups.first().map(|group| group.node_id) else {
+        return (StatusCode::CONFLICT, "no local Raft groups are registered").into_response();
+    };
+    let led_groups = groups
+        .into_iter()
+        .filter(|group| group.current_leader == Some(node_id))
+        .map(|group| group.raft_group_id)
+        .collect::<Vec<_>>();
+    if !led_groups.is_empty() {
+        return json_response(
+            StatusCode::CONFLICT,
+            serde_json::json!({
+                "quiesced": false,
+                "node_id": node_id,
+                "reason": "node still leads raft groups",
+                "raft_group_ids": led_groups,
+            })
+            .to_string(),
+        );
+    }
+    match registry.quiesce_for_restart().await {
+        Ok(group_count) => json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "quiesced": true,
+                "node_id": node_id,
+                "raft_group_count": group_count,
+            })
+            .to_string(),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("quiesce raft groups for restart: {err}"),
+        )
+            .into_response(),
+    }
 }
 
 pub fn client_router_with_admission(state: HttpState, admission: IngressAdmission) -> Router {

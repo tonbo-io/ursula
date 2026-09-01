@@ -209,52 +209,14 @@ strict_verify() {
     --lag-tolerance 16
 }
 
-reassert_restart_fence() {
+prepare_recovery_restart() {
   node_id=$1
-  result_file=/tmp/reassert-restart-fence.result
-  rm -f "${result_file}"
-  "${CTL}" reassert-restart-fence \
+  "${CTL}" prepare-recovery-restart \
     --config "${MANIFEST}" \
     --node "${node_id}" \
     --drain-timeout-secs 300 \
-    --lag-tolerance 16 \
-    --result-file "${result_file}"
-  if [ ! -r "${result_file}" ]; then
-    log "restart-fence result was not written for node ${node_id}"
-    return 1
-  fi
-  IFS= read -r REASSERT_RESULT <"${result_file}"
-  case "${REASSERT_RESULT}" in
-    ready|catchup-required) ;;
-    *)
-      log "invalid restart-fence result for node ${node_id}: ${REASSERT_RESULT}"
-      return 1
-      ;;
-  esac
-}
-
-finish_rearmed_catchup() {
-  node_id=$1
-  if [ "${REASSERT_RESULT}" != "catchup-required" ]; then
-    return 0
-  fi
-  # The live replacement has already reported the groups that are wholly
-  # missing, and reassert-restart-fence armed exactly those group leaders.
-  # Deleting it here clears the groups that already caught up and lets the old
-  # process consume the new permissions before replacement. Keep this process
-  # fenced and wait for it to consume the permissions and install snapshots.
-  log "node ${node_id} is rearmed; waiting for the live voter to catch up"
-  "${CTL}" wait \
-    --config "${MANIFEST}" \
-    --node "${node_id}" \
-    --stall-timeout-secs 300 \
-    --ready-timeout-secs 1800 \
+    --http-timeout-secs 60 \
     --lag-tolerance 16
-  reassert_restart_fence "${node_id}"
-  if [ "${REASSERT_RESULT}" != "ready" ]; then
-    log "node ${node_id} still has wholly missing groups after rearmed catch-up"
-    return 1
-  fi
 }
 
 record_state() {
@@ -298,23 +260,24 @@ resume_if_needed() {
   ordinal=$((node_id - 1))
   TARGET_REVISION=$(desired_revision)
   log "resuming interrupted rollout at node ${node_id}: saved=${saved_image}@${saved_revision} current=${TARGET_IMAGE}@${TARGET_REVISION}"
-  # `restarting` is written only after drain and prepare-restart succeed. If a
-  # later Helm attempt stages a different template while that replacement is
-  # unready, waiting first deadlocks: the stale pod cannot become Ready and the
-  # code that is authorized to replace it is never reached. Finish the already
-  # committed replacement against the current StatefulSet revision.
-  if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
-    log "node ${node_id} is not at the current target; recreating the already-drained voter"
-    replace_pod "${ordinal}"
-  fi
+  # `restarting` is written after drain and before the irreversible quiesce.
+  # If a later Helm attempt finds it, waiting first deadlocks: the quiesced or
+  # stale pod cannot become Ready and only this state machine may replace it.
+  # Finish the committed replacement against the current StatefulSet revision.
+  # A replacement that came up before its leaders were armed may already have
+  # triggered OpenRaft's reversion guard. Quiesce its Raft cores first, rearm
+  # the full memory-WAL inventory, and only then create the process that will
+  # consume those one-shot permissions.
+  start_forward "${ordinal}"
+  prepare_recovery_restart "${node_id}"
+  log "node ${node_id} is quiesced and rearmed; recreating the voter"
+  replace_pod "${ordinal}"
   wait_for_pod_ready "${ordinal}"
   if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
     log "node ${node_id} became Ready at a revision other than ${TARGET_REVISION}"
     return 1
   fi
   start_forward "${ordinal}"
-  reassert_restart_fence "${node_id}"
-  finish_rearmed_catchup "${node_id}"
   "${CTL}" wait \
     --config "${MANIFEST}" \
     --node "${node_id}" \
@@ -346,12 +309,13 @@ recover_amnesiac_if_needed() {
   ordinal=$((node_id - 1))
   TARGET_REVISION=$(desired_revision)
   log "preparing uniquely classified amnesiac voter ${node_id} for revision ${TARGET_REVISION}"
+  record_state restarting "${node_id}"
   "${CTL}" prepare-amnesiac-restart \
     --config "${MANIFEST}" \
     --node "${node_id}" \
     --drain-timeout-secs 300 \
+    --http-timeout-secs 60 \
     --lag-tolerance 16
-  record_state restarting "${node_id}"
   replace_pod "${ordinal}"
   wait_for_pod_ready "${ordinal}"
   if ! pod_matches_target "${ordinal}" "${TARGET_REVISION}"; then
@@ -359,8 +323,6 @@ recover_amnesiac_if_needed() {
     return 1
   fi
   start_forward "${ordinal}"
-  reassert_restart_fence "${node_id}"
-  finish_rearmed_catchup "${node_id}"
   "${CTL}" wait \
     --config "${MANIFEST}" \
     --node "${node_id}" \
@@ -400,15 +362,16 @@ roll_node() {
     --drain-timeout-secs 300 \
     --ready-timeout-secs 300 \
     --lag-tolerance 16
-  "${CTL}" prepare-restart --config "${MANIFEST}" --node "${node_id}"
   record_state restarting "${node_id}"
+  "${CTL}" prepare-restart \
+    --config "${MANIFEST}" \
+    --node "${node_id}" \
+    --http-timeout-secs 60
 
   replace_pod "${ordinal}"
 
   wait_for_pod_ready "${ordinal}"
   start_forward "${ordinal}"
-  reassert_restart_fence "${node_id}"
-  finish_rearmed_catchup "${node_id}"
   image=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
     -o jsonpath='{.spec.containers[?(@.name=="ursula")].image}')
   if [ "${image}" != "${TARGET_IMAGE}" ]; then

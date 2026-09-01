@@ -3459,12 +3459,12 @@ async fn static_grpc_memory_node_rejoins_all_groups_after_allowed_log_revert() {
             .expect("wait for leader purge");
     }
 
-    let restarted_listener = tokio::net::TcpListener::bind(addrs[2])
+    let stale_listener = tokio::net::TcpListener::bind(addrs[2])
         .await
         .expect("rebind node 3 listener");
-    let restarted = spawn_static_grpc_test_node(
+    let stale_replacement = spawn_static_grpc_test_node(
         3,
-        restarted_listener,
+        stale_listener,
         peers.clone(),
         peers.clone(),
         true,
@@ -3475,16 +3475,38 @@ async fn static_grpc_memory_node_rejoins_all_groups_after_allowed_log_revert() {
         },
     )
     .await;
-    restarted
+    stale_replacement
         .runtime
         .warm_all_groups()
         .await
-        .expect("warm restarted empty node 3 groups");
+        .expect("warm stale empty node 3 groups");
 
-    // Exercise the interrupted-rollout recovery shape: the replacement is
-    // already running and wholly missing these groups when the operator arms
-    // its next log reversion. The same process must catch up; restarting it
-    // again would clear any groups which had already recovered.
+    let rejected_quiesce = client
+        .post(format!("{}/__ursula/raft/quiesce-for-restart", peers[2].1))
+        .send()
+        .await
+        .expect("attempt quiesce without drain");
+    assert_eq!(rejected_quiesce.status(), StatusCode::CONFLICT);
+    let mark_drain = client
+        .post(format!(
+            "{}/__ursula/leadership-shed/maintenance",
+            peers[2].1
+        ))
+        .send()
+        .await
+        .expect("mark stale replacement drained");
+    assert_eq!(mark_drain.status(), StatusCode::OK);
+    let quiesce = client
+        .post(format!("{}/__ursula/raft/quiesce-for-restart", peers[2].1))
+        .send()
+        .await
+        .expect("quiesce stale replacement before rearming leaders");
+    assert_eq!(quiesce.status(), StatusCode::OK);
+
+    // Exercise the production ordering: stop the old Raft cores before
+    // installing one-shot permissions on the leaders. The quiesced process
+    // remains alive while all groups are armed, proving it cannot consume a
+    // permission intended for the next volatile-WAL process.
     for raw_group_id in 0u32..6 {
         let raft_group_id = RaftGroupId(raw_group_id);
         let observer_raft = nodes[0]
@@ -3507,9 +3529,33 @@ async fn static_grpc_memory_node_rejoins_all_groups_after_allowed_log_revert() {
             ))
             .send()
             .await
-            .expect("allow running node 3 log reversion through admin endpoint");
+            .expect("allow next node 3 log reversion through admin endpoint");
         assert_eq!(allow_revert.status(), StatusCode::OK);
     }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    stale_replacement.shutdown().await;
+
+    let restarted_listener = tokio::net::TcpListener::bind(addrs[2])
+        .await
+        .expect("rebind node 3 after quiescence");
+    let restarted = spawn_static_grpc_test_node(
+        3,
+        restarted_listener,
+        peers.clone(),
+        peers.clone(),
+        true,
+        6,
+        StaticGrpcTestNodeStorage {
+            per_group_initializers: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    restarted
+        .runtime
+        .warm_all_groups()
+        .await
+        .expect("warm final empty node 3 groups");
 
     for (group_index, stream_id) in streams_by_group.iter().enumerate() {
         let raft_group_id = RaftGroupId(group_index as u32);
