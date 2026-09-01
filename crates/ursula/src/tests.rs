@@ -6709,6 +6709,121 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
     assert!(conflicted, "expected at least one bucket-owning group");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cluster_wide_purge_reaches_every_distributed_group_leader() {
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    for node_id in 1..=3u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        peers.push((node_id, format!("http://{addr}")));
+        listeners.push(listener);
+    }
+
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        nodes.push(
+            spawn_static_grpc_test_node(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                true,
+                6,
+                StaticGrpcTestNodeStorage {
+                    per_group_initializers: true,
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    for node in &nodes {
+        tokio::time::timeout(Duration::from_secs(10), node.runtime.warm_all_groups())
+            .await
+            .expect("warm all groups timed out")
+            .expect("warm all groups");
+    }
+    for raw_group_id in 0u32..6 {
+        let expected_leader = u64::from(raw_group_id % 3) + 1;
+        for node in &nodes {
+            node.registry
+                .get(RaftGroupId(raw_group_id))
+                .expect("registered group")
+                .wait(Some(Duration::from_secs(5)))
+                .current_leader(expected_leader, "per-group leader elected")
+                .await
+                .expect("wait for distributed leader");
+        }
+    }
+
+    let mut streams_by_group: Vec<Option<BucketStreamId>> = vec![None; 6];
+    for candidate in 0..10_000 {
+        let stream_id =
+            BucketStreamId::new("multi-leader-purge", format!("group-stream-{candidate}"));
+        let group_index = usize::try_from(nodes[0].runtime.locate(&stream_id).raft_group_id.0)
+            .expect("raft group id fits usize");
+        if streams_by_group[group_index].is_none() {
+            streams_by_group[group_index] = Some(stream_id);
+        }
+        if streams_by_group.iter().all(Option::is_some) {
+            break;
+        }
+    }
+    let streams_by_group = streams_by_group
+        .into_iter()
+        .map(|stream| stream.expect("found stream for every group"))
+        .collect::<Vec<_>>();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("build HTTP client");
+    for stream_id in &streams_by_group {
+        let response = client
+            .put(format!("{}/{}", peers[0].1, stream_id))
+            .header(CONTENT_TYPE, "text/plain")
+            .body("before-purge")
+            .send()
+            .await
+            .expect("create through group leader redirect");
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let response = client
+        .delete(format!("{}/__ursula/purge/multi-leader-purge", peers[0].1))
+        .send()
+        .await
+        .expect("one cluster-wide purge request must not enter a redirect loop");
+    assert_eq!(response.status(), StatusCode::OK);
+    let report: serde_json::Value = response.json().await.expect("purge report JSON");
+    assert_eq!(report["removed_streams"], 6);
+    assert_eq!(
+        report["groups_with_streams"],
+        serde_json::json!([0, 1, 2, 3, 4, 5])
+    );
+    assert_eq!(report["cold_gc_pending_entries"], 0);
+    assert_eq!(report["cold_gc_complete"], true);
+    assert_eq!(report["bucket_prefix_absent"], true);
+
+    for stream_id in &streams_by_group {
+        let response = client
+            .put(format!("{}/{}", peers[0].1, stream_id))
+            .header(CONTENT_TYPE, "text/plain")
+            .body("must-stay-erased")
+            .send()
+            .await
+            .expect("recreate request reaches group leader");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    for node in nodes {
+        node.shutdown().await;
+    }
+}
+
 // #150: administrator-triggered tenant purge. Purging tenant A must remove
 // its streams and bucket while retaining its aggregate accounting counters;
 // tenant B's identically named stream, record coordinates, and snapshot stay
