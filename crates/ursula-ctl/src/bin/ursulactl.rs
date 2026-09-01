@@ -48,6 +48,13 @@ enum Command {
     /// Prepare one node for an immediate platform restart. Memory-WAL clusters
     /// arm stable-leader rejoin permissions; disk-WAL clusters need no action.
     PrepareRestart(NodeArgs),
+    /// Recover the uniquely identifiable voter that is missing whole Raft
+    /// groups. Drains its remaining leaderships and arms one memory-WAL rejoin
+    /// before the platform immediately restarts it.
+    PrepareAmnesiacRestart(AmnesiacRestartArgs),
+    /// Print the unique safely recoverable amnesiac voter id, or `none` when
+    /// every voter is ready. Refuses every other unready cluster shape.
+    ClassifyAmnesiac(AmnesiacClassifyArgs),
     /// Strictly verify that every configured node is a voter in every group,
     /// caught up, and observes a usable leader.
     VerifyCluster(VerifyClusterArgs),
@@ -152,6 +159,38 @@ struct DrainArgs {
 }
 
 #[derive(Args, Debug)]
+struct AmnesiacRestartArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// Target node id from the manifest. It must be the unique safe candidate.
+    #[arg(long)]
+    node: u64,
+    /// Seconds to transfer the target's remaining leaderships before aborting.
+    #[arg(long, default_value_t = 300)]
+    drain_timeout_secs: u64,
+    #[arg(long, default_value_t = 2)]
+    poll_interval_secs: u64,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+    /// Allowed replication gap on every surviving peer.
+    #[arg(long, default_value_t = 16)]
+    lag_tolerance: u64,
+}
+
+#[derive(Args, Debug)]
+struct AmnesiacClassifyArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+    /// Allowed replication gap on every surviving peer.
+    #[arg(long, default_value_t = 16)]
+    lag_tolerance: u64,
+}
+
+#[derive(Args, Debug)]
 struct WaitArgs {
     /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
     #[arg(long, value_name = "PATH")]
@@ -205,6 +244,10 @@ async fn main() -> Result<()> {
         Command::Wait(args) => run_wait_subcommand(args).await,
         Command::AllowRejoin(args) => run_allow_rejoin_subcommand(args).await,
         Command::PrepareRestart(args) => run_prepare_restart_subcommand(args).await,
+        Command::PrepareAmnesiacRestart(args) => {
+            run_prepare_amnesiac_restart_subcommand(args).await
+        }
+        Command::ClassifyAmnesiac(args) => run_classify_amnesiac_subcommand(args).await,
         Command::VerifyCluster(args) => run_verify_cluster_subcommand(args).await,
         Command::BackupCreate(args) => run_backup_create_subcommand(args).await,
         Command::BackupVerify(args) => run_backup_verify_subcommand(args).await,
@@ -440,6 +483,45 @@ async fn run_prepare_restart_subcommand(args: NodeArgs) -> Result<()> {
             "node {}: disk-WAL restart needs no empty-log rejoin permission",
             target.id
         );
+    }
+    Ok(())
+}
+
+async fn run_prepare_amnesiac_restart_subcommand(args: AmnesiacRestartArgs) -> Result<()> {
+    let nodes = load_nodes(&args.config).await?;
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let target = find_node(&nodes, args.node)?;
+    let missing_groups = ursula_ctl::prepare_amnesiac_restart(
+        &nodes,
+        target,
+        &client,
+        &ursula_ctl::DrainOptions {
+            drain_timeout: Duration::from_secs(args.drain_timeout_secs),
+            ready_timeout: Duration::ZERO,
+            poll_interval: Duration::from_secs(args.poll_interval_secs),
+            lag_tolerance: args.lag_tolerance,
+            dry_run: false,
+        },
+        &ursula_ctl::RejoinOptions::default(),
+    )
+    .await?;
+    println!(
+        "node {}: prepared amnesiac restart for {} missing group(s); restart immediately",
+        target.id, missing_groups
+    );
+    Ok(())
+}
+
+async fn run_classify_amnesiac_subcommand(args: AmnesiacClassifyArgs) -> Result<()> {
+    let nodes = load_nodes(&args.config).await?;
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let snapshot = client.fetch_cluster(&nodes).await?;
+    let configured_node_ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
+    match ursula_ctl::classify_amnesiac_voter(&snapshot, &configured_node_ids, args.lag_tolerance)
+        .map_err(anyhow::Error::msg)?
+    {
+        Some(candidate) => println!("{}", candidate.node_id),
+        None => println!("none"),
     }
     Ok(())
 }
