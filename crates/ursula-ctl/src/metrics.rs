@@ -152,7 +152,11 @@ impl MetricsClient {
             .map(u64::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        url.query_pairs_mut().append_pair("voters", &voter_list);
+        // Compatibility consumer: 0.4.8 servers split query strings without
+        // URL-decoding values. Keep the comma literal while 0.4.8 remains a
+        // supported rolling-upgrade source; ordinary query-pair encoding turns
+        // it into `%2C` and makes the old server reject every membership change.
+        url.set_query(Some(&format!("voters={voter_list}")));
         let resp = self
             .client
             .post(url.clone())
@@ -194,8 +198,16 @@ impl MetricsClient {
                 leader.id, raft_group_id
             )
         })?;
-        url.query_pairs_mut().append_pair("addr", address.as_str());
-        url.query_pairs_mut().append_pair("blocking", "false");
+        // The same 0.4.8 compatibility boundary applies to learner addresses:
+        // its parser expects a literal URL. Remove this raw query construction
+        // once 0.4.8 is no longer a supported rolling-upgrade source.
+        if address.query().is_some() || address.fragment().is_some() {
+            bail!(
+                "node {} learner address must not contain a query or fragment",
+                target.id
+            );
+        }
+        url.set_query(Some(&format!("addr={address}&blocking=false")));
         let resp = self
             .client
             .post(url.clone())

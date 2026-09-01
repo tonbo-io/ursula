@@ -1341,7 +1341,6 @@ pub(crate) fn format_unready(report: &crate::plan::ReadinessReport) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
@@ -1349,8 +1348,8 @@ mod tests {
 
     use axum::Json;
     use axum::Router;
+    use axum::extract::OriginalUri;
     use axum::extract::Path;
-    use axum::extract::Query;
     use axum::extract::State;
     use axum::http::StatusCode;
     use axum::routing::get;
@@ -1518,10 +1517,13 @@ mod tests {
     async fn mock_membership(
         State(state): State<MockNode>,
         Path(_group_id): Path<u64>,
-        Query(query): Query<HashMap<String, String>>,
+        OriginalUri(uri): OriginalUri,
     ) -> StatusCode {
-        let voters = query.get("voters").cloned().unwrap_or_default();
-        let phase = match voters.as_str() {
+        let voters = uri
+            .query()
+            .and_then(|query| query.strip_prefix("voters="))
+            .unwrap_or_default();
+        let phase = match voters {
             "1,2" => 1,
             "1,2,3" => 3,
             _ => return StatusCode::BAD_REQUEST,
@@ -1542,7 +1544,16 @@ mod tests {
     async fn mock_add_learner(
         State(state): State<MockNode>,
         Path((_group_id, target_node_id)): Path<(u64, u64)>,
+        OriginalUri(uri): OriginalUri,
     ) -> StatusCode {
+        let address = uri
+            .query()
+            .and_then(|query| query.strip_prefix("addr="))
+            .and_then(|query| query.strip_suffix("&blocking=false"))
+            .unwrap_or_default();
+        if !address.starts_with("http://") || address.contains('%') {
+            return StatusCode::BAD_REQUEST;
+        }
         state.cluster.membership_phase.store(2, Ordering::SeqCst);
         state
             .cluster
