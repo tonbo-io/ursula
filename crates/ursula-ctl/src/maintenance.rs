@@ -1483,6 +1483,7 @@ async fn stabilize_survivor_leadership(
 ) -> Result<()> {
     let deadline = Instant::now() + drain_options.drain_timeout;
     let mut last_error = anyhow!("surviving voter leadership has not converged");
+    let mut standard_handoff_attempted = BTreeSet::new();
     loop {
         let snapshot = client
             .fetch_cluster(nodes)
@@ -1523,6 +1524,44 @@ async fn stabilize_survivor_leadership(
         }
 
         for handoff in handoffs {
+            if standard_handoff_attempted.insert(handoff.raft_group_id) {
+                let stale_leader = nodes
+                    .iter()
+                    .find(|node| node.id == handoff.stale_leader)
+                    .expect("term handoff leader is a configured node");
+                tracing::warn!(
+                    raft_group_id = handoff.raft_group_id,
+                    stale_leader = handoff.stale_leader,
+                    stale_term = handoff.stale_term,
+                    higher_term_voter = handoff.higher_term_voter,
+                    higher_term = handoff.higher_term,
+                    "requesting the standard Raft leader transfer before using the term bridge"
+                );
+                match client
+                    .transfer_leader(
+                        stale_leader,
+                        handoff.raft_group_id,
+                        handoff.higher_term_voter,
+                    )
+                    .await
+                {
+                    Ok(response) if response.transferred => {}
+                    Ok(response) => {
+                        last_error = anyhow!(
+                            "standard survivor term handoff for group {} was rejected: {}",
+                            handoff.raft_group_id,
+                            response.reason.unwrap_or_else(|| "unknown".to_owned())
+                        );
+                    }
+                    Err(error) => {
+                        last_error = error.context(format!(
+                            "trigger standard survivor term handoff for group {}",
+                            handoff.raft_group_id
+                        ));
+                    }
+                }
+                continue;
+            }
             let higher_term_voter = nodes
                 .iter()
                 .find(|node| node.id == handoff.higher_term_voter)
