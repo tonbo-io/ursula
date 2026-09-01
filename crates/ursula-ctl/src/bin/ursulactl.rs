@@ -51,10 +51,10 @@ enum Command {
     /// Recover the uniquely identifiable voter that is missing whole Raft
     /// groups. Drains its remaining leaderships and arms one memory-WAL rejoin
     /// before the platform immediately restarts it.
-    PrepareAmnesiacRestart(AmnesiacRestartArgs),
+    PrepareAmnesiacRestart(RestartTargetArgs),
     /// Re-establish a replacement voter's process-local drain fence, transfer
     /// startup leaderships away, and re-arm any still-missing memory-WAL groups.
-    ReassertRestartFence(AmnesiacRestartArgs),
+    ReassertRestartFence(ReassertRestartArgs),
     /// Print the unique safely recoverable amnesiac voter id, or `none` when
     /// every voter is ready. Refuses every other unready cluster shape.
     ClassifyAmnesiac(AmnesiacClassifyArgs),
@@ -162,11 +162,11 @@ struct DrainArgs {
 }
 
 #[derive(Args, Debug)]
-struct AmnesiacRestartArgs {
+struct RestartTargetArgs {
     /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
-    /// Target node id from the manifest. It must be the unique safe candidate.
+    /// Target node id from the manifest.
     #[arg(long)]
     node: u64,
     /// Seconds to transfer the target's remaining leaderships before aborting.
@@ -179,6 +179,16 @@ struct AmnesiacRestartArgs {
     /// Allowed replication gap on every surviving peer.
     #[arg(long, default_value_t = 16)]
     lag_tolerance: u64,
+}
+
+#[derive(Args, Debug)]
+struct ReassertRestartArgs {
+    #[command(flatten)]
+    restart: RestartTargetArgs,
+    /// Write `ready` when no group was re-armed, or `restart-required` when the
+    /// caller must prepare and replace the memory-WAL voter once more.
+    #[arg(long, value_name = "PATH")]
+    result_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -491,7 +501,7 @@ async fn run_prepare_restart_subcommand(args: NodeArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_prepare_amnesiac_restart_subcommand(args: AmnesiacRestartArgs) -> Result<()> {
+async fn run_prepare_amnesiac_restart_subcommand(args: RestartTargetArgs) -> Result<()> {
     let nodes = load_nodes(&args.config).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
     let target = find_node(&nodes, args.node)?;
@@ -516,7 +526,11 @@ async fn run_prepare_amnesiac_restart_subcommand(args: AmnesiacRestartArgs) -> R
     Ok(())
 }
 
-async fn run_reassert_restart_fence_subcommand(args: AmnesiacRestartArgs) -> Result<()> {
+async fn run_reassert_restart_fence_subcommand(args: ReassertRestartArgs) -> Result<()> {
+    let ReassertRestartArgs {
+        restart: args,
+        result_file,
+    } = args;
     let nodes = load_nodes(&args.config).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
     let target = find_node(&nodes, args.node)?;
@@ -534,11 +548,24 @@ async fn run_reassert_restart_fence_subcommand(args: AmnesiacRestartArgs) -> Res
         &ursula_ctl::RejoinOptions::default(),
     )
     .await?;
+    if let Some(path) = result_file {
+        let result = restart_fence_result(rearmed_groups);
+        std::fs::write(&path, result)
+            .with_context(|| format!("write restart-fence result to {}", path.display()))?;
+    }
     println!(
         "node {}: restart fence reasserted; rearmed {} wholly missing group(s)",
         target.id, rearmed_groups
     );
     Ok(())
+}
+
+fn restart_fence_result(rearmed_groups: usize) -> &'static str {
+    if rearmed_groups == 0 {
+        "ready\n"
+    } else {
+        "restart-required\n"
+    }
 }
 
 async fn run_classify_amnesiac_subcommand(args: AmnesiacClassifyArgs) -> Result<()> {
@@ -569,4 +596,42 @@ async fn run_verify_cluster_subcommand(args: VerifyClusterArgs) -> Result<()> {
     .await?;
     println!("cluster verified: {} node(s) fully ready", nodes.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use clap::Parser;
+
+    use super::Cli;
+    use super::Command;
+    use super::restart_fence_result;
+
+    #[test]
+    fn restart_fence_result_is_a_stable_machine_contract() {
+        assert_eq!(restart_fence_result(0), "ready\n");
+        assert_eq!(restart_fence_result(1), "restart-required\n");
+        assert_eq!(restart_fence_result(256), "restart-required\n");
+    }
+
+    #[test]
+    fn reassert_restart_fence_accepts_a_result_file() {
+        let cli = Cli::try_parse_from([
+            "ursulactl",
+            "reassert-restart-fence",
+            "--config",
+            "cluster.json",
+            "--node",
+            "3",
+            "--result-file",
+            "/tmp/result",
+        ])
+        .unwrap();
+
+        let Command::ReassertRestartFence(args) = cli.command else {
+            panic!("expected reassert-restart-fence command");
+        };
+        assert_eq!(args.result_file.as_deref(), Some(Path::new("/tmp/result")));
+    }
 }
