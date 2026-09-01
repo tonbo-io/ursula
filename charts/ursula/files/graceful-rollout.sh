@@ -229,16 +229,6 @@ prepare_recovery_handoff() {
     --lag-tolerance 16
 }
 
-repair_recovery_rejoin() {
-  node_id=$1
-  "${CTL}" repair-recovery-rejoin \
-    --config "${MANIFEST}" \
-    --node "${node_id}" \
-    --drain-timeout-secs 300 \
-    --http-timeout-secs 60 \
-    --lag-tolerance 16
-}
-
 record_state() {
   phase=$1
   node_id=$2
@@ -305,7 +295,6 @@ finish_recovery_restart() {
     return 1
   fi
   start_forward "${ordinal}"
-  repair_recovery_rejoin "${node_id}"
   "${CTL}" wait \
     --config "${MANIFEST}" \
     --node "${node_id}" \

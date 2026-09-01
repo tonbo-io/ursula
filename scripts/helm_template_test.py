@@ -86,6 +86,29 @@ def hook_annotations(rendered: str) -> dict[tuple[str, str], dict[str, str]]:
 
 
 class HelmTemplateConfigTest(unittest.TestCase):
+    def test_rollout_target_starts_maintenance_drained(self) -> None:
+        rendered = render_chart("--set", "s3.bucket=bkt")
+
+        self.assertIn(
+            'if [ -r "${rollout_state_dir}/phase" ] && [ -r "${rollout_state_dir}/node-id" ]; then',
+            rendered,
+        )
+        self.assertIn("restarting|upgrading-restart-quiesce)", rendered)
+        self.assertIn('if [ "${rollout_node_id}" = "${node_id}" ]; then', rendered)
+        self.assertIn(
+            'export URSULA_START_MAINTENANCE_DRAINED="${start_maintenance_drained}"',
+            rendered,
+        )
+        self.assertNotIn("start_maintenance_drained =", render_config("--set", "s3.bucket=bkt"))
+        self.assertIn(
+            "- name: rollout-state\n              mountPath: /var/run/ursula-rollout-state\n              readOnly: true",
+            rendered,
+        )
+        self.assertIn(
+            "- name: rollout-state\n          configMap:\n            name: test-ursula-rollout-state\n            optional: true",
+            rendered,
+        )
+
     def test_matching_deployment_contract_renders(self) -> None:
         render_chart(*deployment_contract_values())
 

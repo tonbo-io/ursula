@@ -58,9 +58,6 @@ enum Command {
     /// Drain a partial replacement that predates restart quiescence so the
     /// platform can replace it with a binary that supports safe rearming.
     PrepareRecoveryHandoff(RestartTargetArgs),
-    /// Re-drain a newly started recovery process and arm only the Raft groups
-    /// that still have no applied entry on that process.
-    RepairRecoveryRejoin(RestartTargetArgs),
     /// Print the unique safely recoverable amnesiac voter id, or `none` when
     /// every voter is ready. Refuses every other unready cluster shape.
     ClassifyAmnesiac(AmnesiacClassifyArgs),
@@ -262,7 +259,6 @@ async fn main() -> Result<()> {
         Command::PrepareRecoveryHandoff(args) => {
             run_prepare_recovery_handoff_subcommand(args).await
         }
-        Command::RepairRecoveryRejoin(args) => run_repair_recovery_rejoin_subcommand(args).await,
         Command::ClassifyAmnesiac(args) => run_classify_amnesiac_subcommand(args).await,
         Command::VerifyCluster(args) => run_verify_cluster_subcommand(args).await,
         Command::BackupCreate(args) => run_backup_create_subcommand(args).await,
@@ -575,31 +571,6 @@ async fn run_prepare_recovery_handoff_subcommand(args: RestartTargetArgs) -> Res
     Ok(())
 }
 
-async fn run_repair_recovery_rejoin_subcommand(args: RestartTargetArgs) -> Result<()> {
-    let nodes = load_nodes(&args.config).await?;
-    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
-    let target = find_node(&nodes, args.node)?;
-    let empty_groups = ursula_ctl::repair_recovery_rejoin(
-        &nodes,
-        target,
-        &client,
-        &ursula_ctl::DrainOptions {
-            drain_timeout: Duration::from_secs(args.drain_timeout_secs),
-            ready_timeout: Duration::ZERO,
-            poll_interval: Duration::from_secs(args.poll_interval_secs),
-            lag_tolerance: args.lag_tolerance,
-            dry_run: false,
-        },
-        &ursula_ctl::RejoinOptions::default(),
-    )
-    .await?;
-    println!(
-        "node {}: recovery fence restored; {empty_groups} empty group(s) rearmed",
-        target.id
-    );
-    Ok(())
-}
-
 async fn run_classify_amnesiac_subcommand(args: AmnesiacClassifyArgs) -> Result<()> {
     let nodes = load_nodes(&args.config).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
@@ -651,24 +622,6 @@ mod tests {
 
         let Command::PrepareRecoveryRestart(args) = cli.command else {
             panic!("expected prepare-recovery-restart command");
-        };
-        assert_eq!(args.node, 3);
-    }
-
-    #[test]
-    fn repair_recovery_rejoin_accepts_the_recovery_contract() {
-        let cli = Cli::try_parse_from([
-            "ursulactl",
-            "repair-recovery-rejoin",
-            "--config",
-            "cluster.json",
-            "--node",
-            "3",
-        ])
-        .unwrap();
-
-        let Command::RepairRecoveryRejoin(args) = cli.command else {
-            panic!("expected repair-recovery-rejoin command");
         };
         assert_eq!(args.node, 3);
     }

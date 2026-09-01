@@ -21,6 +21,7 @@ mod wal_disk;
 
 pub use runtime::SpawnedRuntime;
 pub use runtime::spawn_runtime;
+pub(crate) use runtime::spawn_runtime_with_maintenance_drain;
 pub use topology::Persistence;
 pub use topology::Topology;
 pub(crate) use wal_disk::initialize_wal_disk_monitor;

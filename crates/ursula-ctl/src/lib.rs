@@ -35,7 +35,6 @@ pub use maintenance::drain_node;
 pub use maintenance::prepare_amnesiac_restart;
 pub use maintenance::prepare_recovery_handoff;
 pub use maintenance::prepare_recovery_restart;
-pub use maintenance::repair_recovery_rejoin;
 pub use maintenance::resolve_empty_rejoin_policy;
 pub use maintenance::resolve_restart_rejoin_policy;
 pub use maintenance::undrain_node;
