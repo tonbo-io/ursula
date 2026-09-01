@@ -43,6 +43,7 @@ pub use maintenance::wait_node_ready;
 pub use metrics::ClusterSnapshot;
 pub use metrics::MetricsClient;
 pub use metrics::RaftGroupView;
+pub use metrics::RestartQuiesceCapability;
 pub use observe::StatusReport;
 pub use observe::wait_ready;
 pub use observe::write_status;

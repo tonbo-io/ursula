@@ -372,6 +372,105 @@ grep -q -- '--from-literal=state-schema-version=2' "${record_state_args}"
 grep -q -- '--from-literal=source-pod-uid=source-uid-2' "${record_state_args}"
 rm -f "${record_state_args}" /tmp/rollout-state.yaml
 
+# A healthy 0.4.8 voter has no restart-quiesce route. The ordinary convergence
+# pass must explicitly classify that route absence, persist a durable recovery
+# handoff before replacement, and never reinterpret probe errors as legacy.
+(
+  NAMESPACE=ursula
+  STATEFULSET=ursula
+  REPLICAS=3
+  EXPECTED_GROUPS=256
+  TARGET_IMAGE=ghcr.io/tonbo-io/ursula:0.4.9
+  ROLLOUT_SOURCE_ONLY=1
+  export NAMESPACE STATEFULSET REPLICAS EXPECTED_GROUPS TARGET_IMAGE ROLLOUT_SOURCE_ONLY
+  # shellcheck source=graceful-rollout.sh
+  . "${test_dir}/graceful-rollout.sh"
+
+  legacy_roll_calls=$(mktemp)
+  legacy_probe_error=false
+  export legacy_roll_calls legacy_probe_error
+  legacy_roll_ctl=$(mktemp)
+  cat >"${legacy_roll_ctl}" <<'CTL'
+#!/bin/sh
+printf '%s\n' "$1" >>"${legacy_roll_calls}"
+case "$1" in
+  restart-quiesce-capability)
+    if [ "${legacy_probe_error}" = true ]; then
+      echo "capability request failed" >&2
+      exit 1
+    fi
+    printf '%s\n' legacy-unavailable
+    ;;
+  prepare-recovery-handoff)
+    ;;
+  *)
+    printf 'unexpected legacy convergence command: %s\n' "$*" >&2
+    exit 1
+    ;;
+esac
+CTL
+  chmod +x "${legacy_roll_ctl}"
+  CTL=${legacy_roll_ctl}
+  MANIFEST=$(mktemp)
+  printf '{}\n' >"${MANIFEST}"
+  kubectl() {
+    case "$*" in
+      *"get pod ursula-2 -o jsonpath={.spec.containers"*)
+        printf '%s' ghcr.io/tonbo-io/ursula:0.4.8
+        ;;
+      *"get pod ursula-2 -o jsonpath={.metadata.labels.controller-revision-hash}"*)
+        printf '%s' ursula-legacy
+        ;;
+      *"get pod ursula-2 -o jsonpath={.metadata.uid}"*)
+        printf '%s' legacy-source-uid
+        ;;
+      *)
+        printf 'unexpected legacy convergence kubectl invocation: %s\n' "$*" >&2
+        return 1
+        ;;
+    esac
+  }
+  desired_revision() { printf '%s' ursula-target; }
+  pod_matches_target() { return 1; }
+  strict_verify() { legacy_strict_verified=1; }
+  record_state() {
+    [ "$1" = upgrading-restart-quiesce ]
+    [ "$2" = 3 ]
+    [ "$3" = legacy-source-uid ]
+    legacy_state_recorded=1
+  }
+  resume_quiesce_upgrade() {
+    [ "$1" = 2 ]
+    [ "$2" = 3 ]
+    [ "$3" = legacy-source-uid ]
+    [ "${legacy_state_recorded}" = 1 ]
+    legacy_replacement_resumed=1
+  }
+
+  legacy_strict_verified=0
+  legacy_state_recorded=0
+  legacy_replacement_resumed=0
+  roll_node 2
+  [ "${legacy_strict_verified}" = 1 ]
+  [ "${legacy_state_recorded}" = 1 ]
+  [ "${legacy_replacement_resumed}" = 1 ]
+  [ "$(tr '\n' ' ' <"${legacy_roll_calls}")" = "restart-quiesce-capability prepare-recovery-handoff " ]
+
+  : >"${legacy_roll_calls}"
+  legacy_probe_error=true
+  export legacy_probe_error
+  legacy_state_recorded=0
+  legacy_replacement_resumed=0
+  if roll_node 2; then
+    echo "restart-quiesce probe errors must fail closed" >&2
+    exit 1
+  fi
+  [ "${legacy_state_recorded}" = 0 ]
+  [ "${legacy_replacement_resumed}" = 0 ]
+  [ "$(tr '\n' ' ' <"${legacy_roll_calls}")" = "restart-quiesce-capability " ]
+  rm -f "${legacy_roll_ctl}" "${legacy_roll_calls}" "${MANIFEST}"
+)
+
 # The cluster manifest used to list three nodes literally, so any other replica
 # count produced a view that disagreed with the StatefulSet it was rolling. The
 # chart offers 1, 3 and 5.

@@ -45,6 +45,9 @@ enum Command {
     /// Quiesce one drained node for an immediate platform restart and pin
     /// survivor leadership to one anchor for durable membership repair.
     PrepareRestart(NodeArgs),
+    /// Print whether the target exposes restart quiescence without mutating it.
+    /// The legacy-unavailable result exists only for the 0.4.8 upgrade bridge.
+    RestartQuiesceCapability(NodeArgs),
     /// Release the target and survivor maintenance fences after the prepared
     /// replacement has caught up.
     FinishPreparedRestart(NodeArgs),
@@ -252,6 +255,9 @@ async fn main() -> Result<()> {
         Command::Undrain(args) => run_undrain_subcommand(args).await,
         Command::Wait(args) => run_wait_subcommand(args).await,
         Command::PrepareRestart(args) => run_prepare_restart_subcommand(args).await,
+        Command::RestartQuiesceCapability(args) => {
+            run_restart_quiesce_capability_subcommand(args).await
+        }
         Command::FinishPreparedRestart(args) => run_finish_prepared_restart_subcommand(args).await,
         Command::AbortPreparedRestart(args) => run_abort_prepared_restart_subcommand(args).await,
         Command::PrepareAmnesiacRestart(args) => {
@@ -468,6 +474,19 @@ async fn run_prepare_restart_subcommand(args: NodeArgs) -> Result<()> {
         "node {}: quiesced with restart leaders pinned to node {}; fenced survivors={:?}",
         target.id, preparation.leader_anchor, preparation.fenced_node_ids
     );
+    Ok(())
+}
+
+async fn run_restart_quiesce_capability_subcommand(args: NodeArgs) -> Result<()> {
+    let nodes = load_nodes(&args.config).await?;
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let target = find_node(&nodes, args.node)?;
+    match client.restart_quiesce_capability(target).await? {
+        ursula_ctl::RestartQuiesceCapability::Supported => println!("supported"),
+        ursula_ctl::RestartQuiesceCapability::LegacyUnavailable => {
+            println!("legacy-unavailable")
+        }
+    }
     Ok(())
 }
 

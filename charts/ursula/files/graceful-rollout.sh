@@ -261,6 +261,25 @@ prepare_recovery_handoff() {
     --lag-tolerance 16
 }
 
+restart_quiesce_capability() {
+  node_id=$1
+  if ! capability=$("${CTL}" restart-quiesce-capability \
+      --config "${MANIFEST}" \
+      --node "${node_id}" \
+      --http-timeout-secs 60); then
+    return 1
+  fi
+  case "${capability}" in
+    supported|legacy-unavailable)
+      printf '%s' "${capability}"
+      ;;
+    *)
+      log "invalid restart-quiesce capability for node ${node_id}: ${capability}" >&2
+      return 1
+      ;;
+  esac
+}
+
 record_state() {
   phase=$1
   node_id=$2
@@ -543,6 +562,23 @@ roll_node() {
 
   log "draining node ${node_id} before ${image}@${revision} -> ${TARGET_IMAGE}@${TARGET_REVISION}"
   strict_verify
+  if ! capability=$(restart_quiesce_capability "${node_id}"); then
+    return 1
+  fi
+  if [ "${capability}" = "legacy-unavailable" ]; then
+    # Ursula 0.4.8 is the concrete compatibility consumer. Its admin plane
+    # has no restart-quiesce route, so make a fail-closed memory-WAL handoff,
+    # persist the source UID, replace it once, and rebuild durable membership.
+    # Remove this branch after no running voter or retained rollout state can
+    # reference 0.4.8.
+    log "node ${node_id} predates restart quiescence; preparing durable recovery handoff"
+    prepare_recovery_handoff "${node_id}"
+    source_pod_uid=$(kubectl -n "${NAMESPACE}" get pod "${pod}" \
+      -o jsonpath='{.metadata.uid}')
+    record_state upgrading-restart-quiesce "${node_id}" "${source_pod_uid}"
+    resume_quiesce_upgrade "${ordinal}" "${node_id}" "${source_pod_uid}"
+    return
+  fi
   "${CTL}" drain \
     --config "${MANIFEST}" \
     --node "${node_id}" \
