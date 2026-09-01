@@ -360,7 +360,8 @@ pub async fn reassert_restart_fence(
                     missing_groups.len()
                 );
             }
-            arm_empty_rejoin_groups(nodes, target, client, rejoin_options, &missing_groups).await?;
+            arm_empty_rejoin_groups(nodes, target, client, rejoin_options, Some(&missing_groups))
+                .await?;
         }
         Ok::<_, anyhow::Error>(missing_groups.len())
     }
@@ -573,9 +574,7 @@ pub async fn arm_empty_rejoin(
     client: &MetricsClient,
     options: &RejoinOptions,
 ) -> Result<()> {
-    let snapshot = client.fetch_cluster(nodes).await?;
-    let group_ids = peer_reported_rejoin_groups(&snapshot, target.id);
-    arm_empty_rejoin_groups(nodes, target, client, options, &group_ids).await
+    arm_empty_rejoin_groups(nodes, target, client, options, None).await
 }
 
 async fn arm_empty_rejoin_groups(
@@ -583,12 +582,12 @@ async fn arm_empty_rejoin_groups(
     target: &NodeInfo,
     client: &MetricsClient,
     options: &RejoinOptions,
-    group_ids: &BTreeSet<u64>,
+    scoped_group_ids: Option<&BTreeSet<u64>>,
 ) -> Result<()> {
     if options.max_concurrency == 0 {
         bail!("rejoin max_concurrency must be positive");
     }
-    if group_ids.is_empty() {
+    if scoped_group_ids.is_some_and(BTreeSet::is_empty) {
         bail!(
             "no initialized raft group reported by a peer includes target node {}; cannot allow empty raft rejoin",
             target.id
@@ -598,7 +597,16 @@ async fn arm_empty_rejoin_groups(
     let mut last_error: anyhow::Error;
     loop {
         let before = client.fetch_cluster(nodes).await?;
-        let plan = match rejoin_leader_plan(nodes, target.id, &before, group_ids) {
+        let group_ids = scoped_group_ids
+            .cloned()
+            .unwrap_or_else(|| peer_reported_rejoin_groups(&before, target.id));
+        if group_ids.is_empty() {
+            bail!(
+                "no initialized raft group reported by a peer includes target node {}; cannot allow empty raft rejoin",
+                target.id
+            );
+        }
+        let plan = match rejoin_leader_plan(nodes, target.id, &before, &group_ids) {
             Ok(plan) => plan,
             Err(err) => {
                 last_error = err;
@@ -634,7 +642,7 @@ async fn arm_empty_rejoin_groups(
             last_error = err;
         } else {
             let after = client.fetch_cluster(nodes).await?;
-            match rejoin_leader_plan(nodes, target.id, &after, group_ids) {
+            match rejoin_leader_plan(nodes, target.id, &after, &group_ids) {
                 Ok(after_plan)
                     if plan.iter().all(|(group_id, leader)| {
                         after_plan
