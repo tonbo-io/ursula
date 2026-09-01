@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -6,6 +7,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 use reqwest::Client;
+use reqwest::StatusCode;
 use serde::Deserialize;
 
 use crate::provider::NodeInfo;
@@ -14,6 +16,12 @@ use crate::provider::NodeInfo;
 pub struct MetricsClient {
     client: Client,
     timeout: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartQuiesceCapability {
+    Supported,
+    LegacyUnavailable,
 }
 
 impl MetricsClient {
@@ -133,19 +141,29 @@ impl MetricsClient {
         }
     }
 
-    pub async fn allow_next_revert(
+    pub async fn change_membership(
         &self,
         leader: &NodeInfo,
         raft_group_id: u64,
-        node_id: u64,
+        voters: &BTreeSet<u64>,
     ) -> Result<()> {
-        let path = format!("/__ursula/raft/{raft_group_id}/nodes/{node_id}/allow-next-revert");
-        let url = leader.admin_url.join(&path).with_context(|| {
+        let path = format!("/__ursula/raft/{raft_group_id}/membership");
+        let mut url = leader.admin_url.join(&path).with_context(|| {
             format!(
-                "compose allow-next-revert url at leader node {} for node {}",
-                leader.id, node_id
+                "compose membership url at leader node {} for group {}",
+                leader.id, raft_group_id
             )
         })?;
+        let voter_list = voters
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        // Compatibility consumer: 0.4.8 servers split query strings without
+        // URL-decoding values. Keep the comma literal while 0.4.8 remains a
+        // supported rolling-upgrade source; ordinary query-pair encoding turns
+        // it into `%2C` and makes the old server reject every membership change.
+        url.set_query(Some(&format!("voters={voter_list}")));
         let resp = self
             .client
             .post(url.clone())
@@ -158,10 +176,61 @@ impl MetricsClient {
             Ok(())
         } else {
             Err(anyhow!(
-                "allow-next-revert at leader node {} (group {} node {}) returned {}: {}",
+                "change membership at leader node {} (group {} voters={:?}) returned {}: {}",
                 leader.id,
                 raft_group_id,
-                node_id,
+                voters,
+                status,
+                body
+            ))
+        }
+    }
+
+    pub async fn add_learner(
+        &self,
+        leader: &NodeInfo,
+        raft_group_id: u64,
+        target: &NodeInfo,
+    ) -> Result<()> {
+        let address = target.http_url.as_ref().ok_or_else(|| {
+            anyhow!(
+                "node {} has no public Raft/client address for learner attachment",
+                target.id
+            )
+        })?;
+        let path = format!("/__ursula/raft/{raft_group_id}/learners/{}", target.id);
+        let mut url = leader.admin_url.join(&path).with_context(|| {
+            format!(
+                "compose add-learner url at leader node {} for group {}",
+                leader.id, raft_group_id
+            )
+        })?;
+        // The same 0.4.8 compatibility boundary applies to learner addresses:
+        // its parser expects a literal URL. Remove this raw query construction
+        // once 0.4.8 is no longer a supported rolling-upgrade source.
+        if address.query().is_some() || address.fragment().is_some() {
+            bail!(
+                "node {} learner address must not contain a query or fragment",
+                target.id
+            );
+        }
+        url.set_query(Some(&format!("addr={address}&blocking=false")));
+        let resp = self
+            .client
+            .post(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "add learner at leader node {} (group {} node {}) returned {}: {}",
+                leader.id,
+                raft_group_id,
+                target.id,
                 status,
                 body
             ))
@@ -190,6 +259,45 @@ impl MetricsClient {
                 status,
                 body
             ))
+        }
+    }
+
+    /// Probe route presence without mutating restart state.
+    ///
+    /// Ursula 0.4.8 has no restart-quiesce route and returns 404. A current
+    /// POST-only Axum route returns 405 to GET. This is the narrow rolling
+    /// upgrade discriminator for that source release; every other HTTP or
+    /// transport result fails closed.
+    pub async fn restart_quiesce_capability(
+        &self,
+        node: &NodeInfo,
+    ) -> Result<RestartQuiesceCapability> {
+        let url = node
+            .admin_url
+            .join("/__ursula/raft/quiesce-for-restart")
+            .with_context(|| format!("compose restart-quiesce url for node {}", node.id))?;
+        let resp = self
+            .client
+            .get(url.clone())
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))?;
+        let status = resp.status();
+        match status {
+            StatusCode::NOT_FOUND => Ok(RestartQuiesceCapability::LegacyUnavailable),
+            StatusCode::METHOD_NOT_ALLOWED if resp.headers().contains_key("allow") => {
+                Ok(RestartQuiesceCapability::Supported)
+            }
+            status if status.is_success() => Ok(RestartQuiesceCapability::Supported),
+            _ => {
+                let body = resp.text().await.unwrap_or_default();
+                bail!(
+                    "restart-quiesce capability at node {} returned {}: {}",
+                    node.id,
+                    status,
+                    body
+                )
+            }
         }
     }
 }
@@ -347,6 +455,9 @@ impl ClusterSnapshot {
 
 #[cfg(test)]
 mod tests {
+    use axum::Router;
+    use axum::http::StatusCode;
+    use axum::routing::post;
     use url::Url;
 
     use super::*;
@@ -374,6 +485,44 @@ mod tests {
         };
 
         assert_eq!(metrics_base_url(&node).port(), Some(4438));
+        Ok(())
+    }
+
+    async fn quiesce_route() -> StatusCode {
+        StatusCode::OK
+    }
+
+    async fn capability_node(app: Router) -> anyhow::Result<NodeInfo> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Ok(NodeInfo {
+            id: 1,
+            admin_url: Url::parse(&format!("http://{address}"))?,
+            host: address.to_string(),
+            http_url: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn restart_quiesce_probe_distinguishes_legacy_route_absence() -> anyhow::Result<()> {
+        let client = MetricsClient::new(Duration::from_secs(1))?;
+        let supported = capability_node(
+            Router::new().route("/__ursula/raft/quiesce-for-restart", post(quiesce_route)),
+        )
+        .await?;
+        let legacy = capability_node(Router::new()).await?;
+
+        assert_eq!(
+            client.restart_quiesce_capability(&supported).await?,
+            RestartQuiesceCapability::Supported
+        );
+        assert_eq!(
+            client.restart_quiesce_capability(&legacy).await?,
+            RestartQuiesceCapability::LegacyUnavailable
+        );
         Ok(())
     }
 }

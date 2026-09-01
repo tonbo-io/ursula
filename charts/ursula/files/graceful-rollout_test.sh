@@ -15,10 +15,10 @@ export NAMESPACE STATEFULSET REPLICAS EXPECTED_GROUPS TARGET_IMAGE CTL ROLLOUT_S
 # shellcheck source=graceful-rollout.sh
 . "${test_dir}/graceful-rollout.sh"
 original_write_manifest=$(declare -f write_manifest)
-original_prepare_recovery_restart=$(declare -f prepare_recovery_restart)
 original_record_state=$(declare -f record_state)
 
 mocked_revision=ursula-stale
+mocked_uid=legacy-partial-uid
 kubectl() {
   case "$*" in
     *"get configmap ursula-rollout-state -o jsonpath={.data.target-image}"*)
@@ -48,6 +48,9 @@ kubectl() {
     *"get pod ursula-1 -o jsonpath={.status.conditions"*)
       printf '%s' False
       ;;
+    *"get pod ursula-1 -o jsonpath={.metadata.uid}"*)
+      printf '%s' "${mocked_uid}"
+      ;;
     *)
       printf 'unexpected kubectl invocation: %s\n' "$*" >&2
       return 1
@@ -57,7 +60,7 @@ kubectl() {
 
 wait_for_pod_ready() {
   [ "$1" = "1" ]
-  [ "${replaced_stale}" = "1" ]
+  [ "${replacement_count}" -ge 1 ]
 }
 
 start_forward() {
@@ -71,45 +74,58 @@ desired_revision() {
 
 replace_pod() {
   [ "$1" = "1" ]
-  replaced_stale=1
+  replacement_count=$((replacement_count + 1))
+  mocked_uid="replacement-${replacement_count}"
   mocked_revision=ursula-current
 }
 
 strict_verify() { :; }
 
-prepare_recovery_restart() {
+prepare_recovery_handoff() {
   [ "$1" = "2" ]
-  resumed_prepare_recovery=1
+  resumed_prepare_handoff=1
 }
 
 record_state() {
-  [ "$1" = "complete" ]
   [ "$2" = "2" ]
-  resumed_complete=1
+  case "$1" in
+    upgrading-restart-quiesce)
+      [ "$3" = legacy-partial-uid ]
+      resumed_upgrade_state=1
+      ;;
+    complete)
+      resumed_complete=1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
-replaced_stale=0
+replacement_count=0
 resumed_forward=0
 resumed_complete=0
-resumed_prepare_recovery=0
+resumed_prepare_handoff=0
+resumed_upgrade_state=0
 CTL=true
 resume_if_needed
-[ "${replaced_stale}" = "1" ]
+[ "${replacement_count}" = "1" ]
 [ "${resumed_forward}" = "1" ]
-[ "${resumed_prepare_recovery}" = "1" ]
+[ "${resumed_prepare_handoff}" = "1" ]
+[ "${resumed_upgrade_state}" = "1" ]
 [ "${resumed_complete}" = "1" ]
 
 # A schema-v1 state can outlive more than one failed Helm attempt. If the
 # current Ready Pod has a strictly newer controller-owned sequence than the
-# saved target, verify it as a complete voter and close the stale record. Do
-# not call the restart-quiesce endpoint: the concrete legacy Pod may predate it.
+# saved target, reconcile it through durable membership and close the stale
+# record. Do not call restart-quiesce: the concrete Pod may predate it.
 legacy_ctl=$(mktemp)
 legacy_ctl_calls=$(mktemp)
 export legacy_ctl_calls
 cat >"${legacy_ctl}" <<'CTL'
 #!/bin/sh
 case "$1" in
-  wait|undrain)
+  repair-restarted-voter|wait|finish-prepared-restart)
     printf '%s\n' "$1" >>"${legacy_ctl_calls}"
     ;;
   *)
@@ -165,9 +181,9 @@ kubectl() {
   esac
 }
 desired_revision() { printf '%s' ursula-revision-15; }
+wait_for_pod_ready() { [ "$1" = "2" ]; }
 start_forward() { [ "$1" = "2" ]; legacy_forward=1; }
 strict_verify() { legacy_verifies=$((legacy_verifies + 1)); }
-prepare_recovery_restart() { legacy_destructive_call=1; return 1; }
 replace_pod() { legacy_destructive_call=1; return 1; }
 record_state() {
   [ "$1" = complete ]
@@ -183,10 +199,10 @@ legacy_state_schema=
 legacy_source_pod_uid=
 resume_if_needed
 [ "${legacy_forward}" = "1" ]
-[ "${legacy_verifies}" = "2" ]
+[ "${legacy_verifies}" = "1" ]
 [ "${legacy_destructive_call}" = "0" ]
 [ "${legacy_complete}" = "1" ]
-[ "$(tr '\n' ' ' <"${legacy_ctl_calls}")" = "wait undrain " ]
+[ "$(tr '\n' ' ' <"${legacy_ctl_calls}")" = "repair-restarted-voter wait finish-prepared-restart " ]
 legacy_current_sequence=12
 if replacement_attempt_was_superseded 2 ursula-revision-13 ''; then
   echo "an older ControllerRevision must not supersede saved rollout state" >&2
@@ -230,7 +246,6 @@ if replacement_attempt_was_superseded 0 ignored old-uid; then
 fi
 [ "${controller_revision_read}" = "0" ]
 
-eval "${original_prepare_recovery_restart}"
 CTL=true
 
 mocked_revision=ursula-current
@@ -271,7 +286,7 @@ case "$1" in
   classify-amnesiac)
     printf '%s\n' 3
     ;;
-  prepare-amnesiac-restart|wait|undrain)
+  prepare-amnesiac-restart|repair-restarted-voter|wait|finish-prepared-restart|abort-prepared-restart)
     printf '%s\n' "$1" >>"${mock_ctl_calls}"
     ;;
   *)
@@ -301,12 +316,16 @@ recover_amnesiac_if_needed
 [ "${recovered_verified}" = "1" ]
 grep -q '^prepare-amnesiac-restart$' "${mock_ctl_calls}"
 grep -q '^restarting 3$' "${mock_ctl_calls}"
+grep -q '^repair-restarted-voter$' "${mock_ctl_calls}"
 grep -q '^wait$' "${mock_ctl_calls}"
-grep -q '^undrain$' "${mock_ctl_calls}"
+grep -q '^finish-prepared-restart$' "${mock_ctl_calls}"
 grep -q '^complete 3$' "${mock_ctl_calls}"
-rm -f "${mock_ctl}" "${mock_ctl_calls}"
-
-eval "${original_prepare_recovery_restart}"
+printf '{}\n' >"${MANIFEST}"
+PREPARED_RESTART_NODE=2
+abort_incomplete_prepared_restart
+grep -q '^abort-prepared-restart$' "${mock_ctl_calls}"
+[ -z "${PREPARED_RESTART_NODE}" ]
+rm -f "${mock_ctl}" "${mock_ctl_calls}" "${MANIFEST}"
 
 # A recorded replacement must be resumed before the blanket Ready gate. The
 # stale replacement in the fixture cannot become Ready until resume replaces
@@ -352,6 +371,105 @@ record_state restarting 2 source-uid-2
 grep -q -- '--from-literal=state-schema-version=2' "${record_state_args}"
 grep -q -- '--from-literal=source-pod-uid=source-uid-2' "${record_state_args}"
 rm -f "${record_state_args}" /tmp/rollout-state.yaml
+
+# A healthy 0.4.8 voter has no restart-quiesce route. The ordinary convergence
+# pass must explicitly classify that route absence, persist a durable recovery
+# handoff before replacement, and never reinterpret probe errors as legacy.
+(
+  NAMESPACE=ursula
+  STATEFULSET=ursula
+  REPLICAS=3
+  EXPECTED_GROUPS=256
+  TARGET_IMAGE=ghcr.io/tonbo-io/ursula:0.4.9
+  ROLLOUT_SOURCE_ONLY=1
+  export NAMESPACE STATEFULSET REPLICAS EXPECTED_GROUPS TARGET_IMAGE ROLLOUT_SOURCE_ONLY
+  # shellcheck source=graceful-rollout.sh
+  . "${test_dir}/graceful-rollout.sh"
+
+  legacy_roll_calls=$(mktemp)
+  legacy_probe_error=false
+  export legacy_roll_calls legacy_probe_error
+  legacy_roll_ctl=$(mktemp)
+  cat >"${legacy_roll_ctl}" <<'CTL'
+#!/bin/sh
+printf '%s\n' "$1" >>"${legacy_roll_calls}"
+case "$1" in
+  restart-quiesce-capability)
+    if [ "${legacy_probe_error}" = true ]; then
+      echo "capability request failed" >&2
+      exit 1
+    fi
+    printf '%s\n' legacy-unavailable
+    ;;
+  prepare-recovery-handoff)
+    ;;
+  *)
+    printf 'unexpected legacy convergence command: %s\n' "$*" >&2
+    exit 1
+    ;;
+esac
+CTL
+  chmod +x "${legacy_roll_ctl}"
+  CTL=${legacy_roll_ctl}
+  MANIFEST=$(mktemp)
+  printf '{}\n' >"${MANIFEST}"
+  kubectl() {
+    case "$*" in
+      *"get pod ursula-2 -o jsonpath={.spec.containers"*)
+        printf '%s' ghcr.io/tonbo-io/ursula:0.4.8
+        ;;
+      *"get pod ursula-2 -o jsonpath={.metadata.labels.controller-revision-hash}"*)
+        printf '%s' ursula-legacy
+        ;;
+      *"get pod ursula-2 -o jsonpath={.metadata.uid}"*)
+        printf '%s' legacy-source-uid
+        ;;
+      *)
+        printf 'unexpected legacy convergence kubectl invocation: %s\n' "$*" >&2
+        return 1
+        ;;
+    esac
+  }
+  desired_revision() { printf '%s' ursula-target; }
+  pod_matches_target() { return 1; }
+  strict_verify() { legacy_strict_verified=1; }
+  record_state() {
+    [ "$1" = upgrading-restart-quiesce ]
+    [ "$2" = 3 ]
+    [ "$3" = legacy-source-uid ]
+    legacy_state_recorded=1
+  }
+  resume_quiesce_upgrade() {
+    [ "$1" = 2 ]
+    [ "$2" = 3 ]
+    [ "$3" = legacy-source-uid ]
+    [ "${legacy_state_recorded}" = 1 ]
+    legacy_replacement_resumed=1
+  }
+
+  legacy_strict_verified=0
+  legacy_state_recorded=0
+  legacy_replacement_resumed=0
+  roll_node 2
+  [ "${legacy_strict_verified}" = 1 ]
+  [ "${legacy_state_recorded}" = 1 ]
+  [ "${legacy_replacement_resumed}" = 1 ]
+  [ "$(tr '\n' ' ' <"${legacy_roll_calls}")" = "restart-quiesce-capability prepare-recovery-handoff " ]
+
+  : >"${legacy_roll_calls}"
+  legacy_probe_error=true
+  export legacy_probe_error
+  legacy_state_recorded=0
+  legacy_replacement_resumed=0
+  if roll_node 2; then
+    echo "restart-quiesce probe errors must fail closed" >&2
+    exit 1
+  fi
+  [ "${legacy_state_recorded}" = 0 ]
+  [ "${legacy_replacement_resumed}" = 0 ]
+  [ "$(tr '\n' ' ' <"${legacy_roll_calls}")" = "restart-quiesce-capability " ]
+  rm -f "${legacy_roll_ctl}" "${legacy_roll_calls}" "${MANIFEST}"
+)
 
 # The cluster manifest used to list three nodes literally, so any other replica
 # count produced a view that disagreed with the StatefulSet it was rolling. The

@@ -936,10 +936,6 @@ fn admin_ops_router(state: HttpState) -> Router {
             post(add_raft_learner),
         )
         .route(
-            "/__ursula/raft/{raft_group_id}/nodes/{node_id}/allow-next-revert",
-            post(allow_raft_node_next_revert),
-        )
-        .route(
             "/__ursula/raft/quiesce-for-restart",
             post(quiesce_raft_for_restart),
         )
@@ -2186,12 +2182,25 @@ pub(crate) async fn add_raft_learner(
     let Some(address) = query.get("addr").filter(|value| !value.trim().is_empty()) else {
         return (StatusCode::BAD_REQUEST, "addr query parameter is required").into_response();
     };
+    let blocking = match query.get("blocking") {
+        Some(raw) => match raw.parse::<bool>() {
+            Ok(blocking) => blocking,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid blocking query parameter '{raw}': {error}"),
+                )
+                    .into_response();
+            }
+        },
+        None => true,
+    };
     let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
         Ok(resolved) => resolved,
         Err(response) => return *response,
     };
     match raft
-        .add_learner(node_id, BasicNode::new(address.clone()), true)
+        .add_learner(node_id, BasicNode::new(address.clone()), blocking)
         .await
     {
         Ok(response) => json_response(
@@ -2284,54 +2293,6 @@ pub(crate) fn parse_voter_ids(raw: &str) -> Result<BTreeSet<u64>, String> {
         return Err("voters must not be empty".to_owned());
     }
     Ok(voters)
-}
-
-pub(crate) async fn allow_raft_node_next_revert(
-    State(state): State<HttpState>,
-    Path((raft_group_id, node_id)): Path<(u64, u64)>,
-) -> Response {
-    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
-        Ok(resolved) => resolved,
-        Err(response) => return *response,
-    };
-    // The trigger is a fire-and-forget command that the raft core silently
-    // drops on non-leaders, so a 200 from a follower would report an arming
-    // that never happened. Refuse here like the transfer/membership handlers.
-    let metrics = raft.metrics().borrow_watched().clone();
-    if metrics.current_leader != Some(metrics.id) {
-        return json_response(
-            StatusCode::CONFLICT,
-            serde_json::json!({
-                "raft_group_id": raft_group_id.0,
-                "node_id": node_id,
-                "current_leader": metrics.current_leader,
-                "allow_next_revert": false,
-                "reason": "not leader",
-            })
-            .to_string(),
-        );
-    }
-    match raft.trigger().allow_next_revert(&node_id, true).await {
-        Ok(Ok(())) => json_response(
-            StatusCode::OK,
-            serde_json::json!({
-                "raft_group_id": raft_group_id.0,
-                "node_id": node_id,
-                "allow_next_revert": true,
-            })
-            .to_string(),
-        ),
-        Ok(Err(err)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("allow raft node next revert: {err}"),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("allow raft node next revert: {err}"),
-        )
-            .into_response(),
-    }
 }
 
 pub(crate) async fn transfer_raft_leader(
@@ -3973,17 +3934,13 @@ pub(crate) fn parse_query(raw: Option<&str>) -> Result<HashMap<String, String>, 
     let Some(raw) = raw else {
         return Ok(query);
     };
-    for pair in raw.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+    for (key, value) in url::form_urlencoded::parse(raw.as_bytes()) {
         if key == "offset" && query.contains_key("offset") {
             return Err(Box::new(
                 (StatusCode::BAD_REQUEST, "multiple offset parameters").into_response(),
             ));
         }
-        query.insert(key.to_owned(), value.to_owned());
+        query.insert(key.into_owned(), value.into_owned());
     }
     Ok(query)
 }
