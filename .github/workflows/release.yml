@@ -1,0 +1,231 @@
+name: Stable Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact semver without the v prefix
+        required: true
+        type: string
+      source_revision:
+        description: Exact 40-character current main commit
+        required: true
+        type: string
+      confirm:
+        description: Type publish-stable-release
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  attestations: write
+  contents: write
+  id-token: write
+  packages: write
+
+concurrency:
+  group: stable-release
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Authorize exact main release
+    runs-on: ubuntu-24.04
+    outputs:
+      source_revision: ${{ steps.release.outputs.source_revision }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source_revision }}
+
+      - name: Authorize immutable source and version
+        id: release
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRM" = publish-stable-release
+          [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
+
+          git fetch origin main --no-tags
+          test "$(git rev-parse origin/main)" = "$SOURCE_REVISION"
+          ./scripts/check-release-versions.sh
+          workspace_version="$(awk '
+            /^\[workspace\.package\]/ { in_section = 1; next }
+            /^\[/ { in_section = 0 }
+            in_section && $1 == "version" { gsub(/"/, "", $3); print $3; exit }
+          ' Cargo.toml)"
+          test "$workspace_version" = "$RELEASE_VERSION"
+
+          successful_ci="$(gh run list \
+            --repo "$REPOSITORY" \
+            --workflow CI \
+            --commit "$SOURCE_REVISION" \
+            --event push \
+            --limit 20 \
+            --json conclusion,headSha \
+            --jq '[.[] | select(.headSha == "'"$SOURCE_REVISION"'" and .conclusion == "success")] | length')"
+          test "$successful_ci" -ge 1
+
+          tag="v${RELEASE_VERSION}"
+          if tag_ref="$(gh api "repos/$REPOSITORY/git/ref/tags/$tag" 2>/dev/null)"; then
+            tag_sha="$(jq -r .object.sha <<<"$tag_ref")"
+            tag_type="$(jq -r .object.type <<<"$tag_ref")"
+            if test "$tag_type" = tag; then
+              tag_sha="$(gh api "repos/$REPOSITORY/git/tags/$tag_sha" --jq .object.sha)"
+            fi
+            test "$tag_sha" = "$SOURCE_REVISION"
+            if gh release view "$tag" --repo "$REPOSITORY" >/dev/null 2>&1; then
+              echo "$tag is already a completed GitHub Release" >&2
+              exit 1
+            fi
+          fi
+
+          echo "source_revision=$SOURCE_REVISION" >>"$GITHUB_OUTPUT"
+          echo "version=$RELEASE_VERSION" >>"$GITHUB_OUTPUT"
+
+  crates:
+    name: Publish crates.io
+    needs: validate
+    uses: ./.github/workflows/crates-publish.yml
+    with:
+      publish: true
+      source_revision: ${{ needs.validate.outputs.source_revision }}
+      version: ${{ needs.validate.outputs.version }}
+
+  docker:
+    name: Publish Docker
+    needs: [validate, crates]
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      publish: true
+      source_revision: ${{ needs.validate.outputs.source_revision }}
+      version: ${{ needs.validate.outputs.version }}
+
+  chaos_docker:
+    name: Publish chaos Docker
+    needs: [validate, crates]
+    uses: ./.github/workflows/chaos-docker-publish.yml
+    with:
+      publish: true
+      source_revision: ${{ needs.validate.outputs.source_revision }}
+      version: ${{ needs.validate.outputs.version }}
+
+  helm:
+    name: Publish Helm
+    needs: [validate, crates]
+    uses: ./.github/workflows/helm-publish.yml
+    with:
+      publish: true
+      source_revision: ${{ needs.validate.outputs.source_revision }}
+      version: ${{ needs.validate.outputs.version }}
+
+  chaos_helm:
+    name: Publish chaos Helm
+    needs: [validate, crates]
+    uses: ./.github/workflows/chaos-helm-publish.yml
+    with:
+      publish: true
+      source_revision: ${{ needs.validate.outputs.source_revision }}
+      version: ${{ needs.validate.outputs.version }}
+
+  finalize:
+    name: Verify artifacts and create GitHub Release
+    needs: [validate, crates, docker, chaos_docker, helm, chaos_helm]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.validate.outputs.source_revision }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Verify every published artifact
+        env:
+          CHAOS_CHART_DIGEST: ${{ needs.chaos_helm.outputs.digest }}
+          CHAOS_IMAGE_DIGEST: ${{ needs.chaos_docker.outputs.digest }}
+          CHART_DIGEST: ${{ needs.helm.outputs.digest }}
+          IMAGE_DIGEST: ${{ needs.docker.outputs.digest }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          SOURCE_REVISION: ${{ needs.validate.outputs.source_revision }}
+        run: |
+          set -euo pipefail
+          python3 scripts/crates_release.py verify --version "$RELEASE_VERSION"
+
+          for digest in "$IMAGE_DIGEST" "$CHAOS_IMAGE_DIGEST" "$CHART_DIGEST" "$CHAOS_CHART_DIGEST"; do
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          done
+
+          image="$(docker buildx imagetools inspect \
+            "ghcr.io/${{ github.repository }}@$IMAGE_DIGEST" \
+            --format '{{json .Image}}')"
+          jq -e --arg revision "$SOURCE_REVISION" --arg version "$RELEASE_VERSION" --argjson image "$image" '
+            ["linux/amd64", "linux/arm64"] as $platforms |
+            all($platforms[]; . as $platform |
+              $image[$platform].config.Labels["org.opencontainers.image.revision"] == $revision and
+              $image[$platform].config.Labels["org.opencontainers.image.version"] == $version
+            )
+          ' -n >/dev/null
+
+          chaos_image="$(docker buildx imagetools inspect \
+            "ghcr.io/${{ github.repository }}-chaos-agent@$CHAOS_IMAGE_DIGEST" \
+            --format '{{json .Image}}')"
+          jq -e --arg revision "$SOURCE_REVISION" --arg version "$RELEASE_VERSION" --argjson image "$chaos_image" '
+            ["linux/amd64", "linux/arm64"] as $platforms |
+            all($platforms[]; . as $platform |
+              $image[$platform].config.Labels["org.opencontainers.image.revision"] == $revision and
+              $image[$platform].config.Labels["org.opencontainers.image.version"] == $version
+            )
+          ' -n >/dev/null
+
+          chart="$(helm show chart "oci://ghcr.io/${{ github.repository_owner }}/charts/ursula@$CHART_DIGEST")"
+          test "$(yq -r .version <<<"$chart")" = "$RELEASE_VERSION"
+          test "$(yq -r .appVersion <<<"$chart")" = "$RELEASE_VERSION"
+          chaos_chart="$(helm show chart "oci://ghcr.io/${{ github.repository_owner }}/charts/ursula-chaos@$CHAOS_CHART_DIGEST")"
+          test "$(yq -r .version <<<"$chaos_chart")" = "$RELEASE_VERSION"
+          test "$(yq -r .appVersion <<<"$chaos_chart")" = "$RELEASE_VERSION"
+
+      - name: Create immutable Git tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_REVISION: ${{ needs.validate.outputs.source_revision }}
+        run: |
+          set -euo pipefail
+          tag="v${RELEASE_VERSION}"
+          if ! gh api "repos/$REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
+            tag_object="$(gh api "repos/$REPOSITORY/git/tags" \
+              -f tag="$tag" \
+              -f message="Ursula $RELEASE_VERSION" \
+              -f object="$SOURCE_REVISION" \
+              -f type=commit)"
+            gh api "repos/$REPOSITORY/git/refs" \
+              -f ref="refs/tags/$tag" \
+              -f sha="$(jq -r .sha <<<"$tag_object")" >/dev/null
+          fi
+
+          if ! gh release view "$tag" --repo "$REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" \
+              --repo "$REPOSITORY" \
+              --verify-tag \
+              --title "Ursula $RELEASE_VERSION" \
+              --generate-notes \
+              --notes-start-tag v0.4.4
+          fi
+
+          gh release view "$tag" --repo "$REPOSITORY" --json tagName,isDraft,isPrerelease \
+            --jq 'select(.tagName == "'"$tag"'" and .isDraft == false and .isPrerelease == false)' \
+            >/dev/null

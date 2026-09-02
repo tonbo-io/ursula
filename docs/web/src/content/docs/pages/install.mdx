@@ -19,7 +19,7 @@ Every release publishes a multi-arch image to GHCR:
 docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.3.6
 ```
 
-The image runs as a non-root user and contains both `ursula` (the server) and `ursulactl` (the operator CLI). Images are published only from release tags, so pin the version you want to run.
+The image runs as a non-root user and contains both `ursula` (the server) and `ursulactl` (the operator CLI). Images are published only by the reviewed stable-release workflow, so pin the version you want to run.
 
 ## Build from source
 

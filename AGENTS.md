@@ -289,7 +289,8 @@ The Helm chart in `charts/ursula/` supports Kubernetes deployment with configura
 
 ### GitHub Container Registry
 
-Images and Helm charts are published to GHCR on tag pushes:
+The reviewed Stable Release workflow publishes crates, images, and Helm charts,
+verifies them, and only then creates the Git tag and GitHub Release:
 
 - Docker image: `ghcr.io/tonbo-io/ursula`
 - Helm chart: `oci://ghcr.io/tonbo-io/charts/ursula`
