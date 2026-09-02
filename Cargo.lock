@@ -4452,6 +4452,7 @@ dependencies = [
  "tracing",
  "url",
  "ursula-observability",
+ "ursula-raft",
  "ursula-stream",
  "yaml_serde",
 ]

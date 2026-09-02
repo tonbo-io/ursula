@@ -59,6 +59,7 @@ pub use grpc::RaftGrpcMetricsSnapshot;
 pub use grpc::RaftGrpcService;
 pub use grpc::raft_grpc_metrics_snapshot;
 pub use grpc::raft_grpc_service;
+pub use grpc::request_self_election_via_transfer;
 pub use log_store::MemoryRaftLogStore;
 pub use log_store::MetaRaftLogStore;
 pub use log_store::RaftGroupFileLogStore;
