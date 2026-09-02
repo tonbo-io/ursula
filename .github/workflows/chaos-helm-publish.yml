@@ -6,17 +6,29 @@ on:
       - .github/workflows/chaos-helm-publish.yml
       - charts/ursula-chaos/**
       - scripts/chaos_helm_template_test.py
-  push:
-    tags:
-      - "v*.*.*"
+  workflow_call:
+    inputs:
+      publish:
+        required: true
+        type: boolean
+      version:
+        required: true
+        type: string
+      source_revision:
+        required: true
+        type: string
+    outputs:
+      digest:
+        description: Published chaos OCI chart digest
+        value: ${{ jobs.helm.outputs.digest }}
 
 permissions:
   contents: read
   packages: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: chaos-helm-${{ inputs.source_revision || github.sha }}
+  cancel-in-progress: false
 
 env:
   CHART_DIR: charts/ursula-chaos
@@ -27,9 +39,13 @@ jobs:
   helm:
     name: Chaos Helm chart
     runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_revision || github.sha }}
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -45,8 +61,8 @@ jobs:
         run: |
           mkdir -p "$CHART_PACKAGE_DIR"
           package_args=()
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            tag_version="${GITHUB_REF_NAME#v}"
+          if [[ "$PUBLISH" == "true" ]]; then
+            tag_version="$RELEASE_VERSION"
             chart_version="$(awk '$1 == "version:" {print $2; exit}' "$CHART_DIR/Chart.yaml")"
             app_version="$(awk '$1 == "appVersion:" {gsub(/"/, "", $2); print $2; exit}' "$CHART_DIR/Chart.yaml")"
             test "$chart_version" = "$tag_version"
@@ -57,9 +73,12 @@ jobs:
           package="$(find "$CHART_PACKAGE_DIR" -maxdepth 1 -type f -name 'ursula-chaos-*.tgz' | sort | tail -n 1)"
           test -n "$package"
           echo "package=$package" >>"$GITHUB_OUTPUT"
+        env:
+          PUBLISH: ${{ inputs.publish }}
+          RELEASE_VERSION: ${{ inputs.version }}
 
       - name: Log in to GHCR
-        if: github.ref_type == 'tag'
+        if: inputs.publish
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | \
             helm registry login ghcr.io \
@@ -67,5 +86,14 @@ jobs:
               --password-stdin
 
       - name: Push chart to GHCR
-        if: github.ref_type == 'tag'
-        run: helm push "${{ steps.package.outputs.package }}" "$CHART_REGISTRY"
+        if: inputs.publish
+        id: push
+        env:
+          PACKAGE: ${{ steps.package.outputs.package }}
+        run: |
+          set -euo pipefail
+          result="$(helm push "$PACKAGE" "$CHART_REGISTRY")"
+          printf '%s\n' "$result"
+          digest="$(sed -n 's/^Digest: //p' <<<"$result" | tail -n 1)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >>"$GITHUB_OUTPUT"
