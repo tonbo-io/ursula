@@ -112,6 +112,39 @@ impl MetricsClient {
         }
     }
 
+    /// Trigger an election on a higher-term voter through the Raft
+    /// `TransferLeader` RPC shared with rolling-upgrade source versions.
+    pub async fn request_self_election(
+        &self,
+        voter: &NodeInfo,
+        raft_group_id: u64,
+        current_term: u64,
+    ) -> Result<()> {
+        let endpoint = voter.http_url.as_ref().ok_or_else(|| {
+            anyhow!(
+                "node {} has no public Raft/client address for survivor term handoff",
+                voter.id
+            )
+        })?;
+        if endpoint.path() != "/" || endpoint.query().is_some() || endpoint.fragment().is_some() {
+            bail!(
+                "node {} Raft/client address must not contain a path, query, or fragment",
+                voter.id
+            );
+        }
+        let raft_group_id = u32::try_from(raft_group_id)
+            .with_context(|| format!("raft group id exceeds u32: {raft_group_id}"))?;
+        ursula_raft::request_self_election_via_transfer(
+            endpoint.as_str(),
+            raft_group_id,
+            voter.id,
+            current_term,
+            self.timeout,
+        )
+        .await
+        .map_err(anyhow::Error::msg)
+    }
+
     pub async fn set_maintenance_drain(&self, node: &NodeInfo, enabled: bool) -> Result<()> {
         let url = node
             .admin_url
