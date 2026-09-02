@@ -73,6 +73,16 @@ def topological_order(packages: dict[str, dict[str, Any]]) -> list[str]:
     return order
 
 
+def internal_dependencies(
+    package: dict[str, Any], packages: dict[str, dict[str, Any]]
+) -> set[str]:
+    return {
+        dependency["name"]
+        for dependency in package["dependencies"]
+        if dependency["name"] in packages and dependency.get("kind") != "dev"
+    }
+
+
 def crate_version_exists(name: str, version: str) -> bool:
     request = urllib.request.Request(
         f"{CRATES_IO}/{name}/{version}",
@@ -104,10 +114,13 @@ def run(command: Iterable[str], *, env: dict[str, str] | None = None) -> None:
     subprocess.run(list(command), check=True, env=env)
 
 
-def validate(order: list[str]) -> None:
+def validate(order: list[str], packages: dict[str, dict[str, Any]]) -> None:
     for name in order:
-        print(f"packaging {name}", flush=True)
-        run(["cargo", "publish", "--dry-run", "--no-verify", "--locked", "-p", name])
+        print(f"checking package contents for {name}", flush=True)
+        run(["cargo", "package", "--list", "--locked", "-p", name])
+        if not internal_dependencies(packages[name], packages):
+            print(f"checking publish archive for leaf crate {name}", flush=True)
+            run(["cargo", "publish", "--dry-run", "--no-verify", "--locked", "-p", name])
 
 
 def publish(order: list[str], version: str) -> None:
@@ -152,7 +165,7 @@ def main() -> int:
     print("publication order: " + ", ".join(order), flush=True)
 
     if args.mode == "check":
-        validate(order)
+        validate(order, packages)
     elif args.mode == "publish":
         publish(order, args.version)
     else:

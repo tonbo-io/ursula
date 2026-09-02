@@ -1,6 +1,7 @@
 import unittest
+from unittest.mock import call, patch
 
-from crates_release import topological_order
+from crates_release import topological_order, validate
 
 
 class TopologicalOrderTests(unittest.TestCase):
@@ -32,6 +33,34 @@ class TopologicalOrderTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "publication dependency cycle"):
             topological_order(packages)
+
+    @patch("crates_release.run")
+    def test_validation_only_publish_dry_runs_leaf_crates(self, run) -> None:
+        packages = {
+            "leaf": {"dependencies": []},
+            "consumer": {"dependencies": [{"name": "leaf", "kind": None}]},
+        }
+
+        validate(["leaf", "consumer"], packages)
+
+        self.assertEqual(
+            run.call_args_list,
+            [
+                call(["cargo", "package", "--list", "--locked", "-p", "leaf"]),
+                call(
+                    [
+                        "cargo",
+                        "publish",
+                        "--dry-run",
+                        "--no-verify",
+                        "--locked",
+                        "-p",
+                        "leaf",
+                    ]
+                ),
+                call(["cargo", "package", "--list", "--locked", "-p", "consumer"]),
+            ],
+        )
 
 
 if __name__ == "__main__":

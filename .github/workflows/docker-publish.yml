@@ -84,8 +84,8 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=pr
-            type=semver,pattern={{version}},value=${{ inputs.version }},enable=${{ inputs.publish }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }},enable=${{ inputs.publish }}
+            type=semver,pattern={{version}},value=${{ inputs.version }},enable=${{ inputs.publish == true }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }},enable=${{ inputs.publish == true }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ inputs.source_revision || github.sha }}
