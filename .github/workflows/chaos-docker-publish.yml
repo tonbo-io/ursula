@@ -4,9 +4,11 @@ on:
   pull_request:
     paths:
       - .github/workflows/chaos-docker-publish.yml
+      - Cargo.toml
       - Dockerfile.chaos-agent
       - Dockerfile.chaos-agent.dockerignore
       - scripts/ursula_chaos_agent.py
+      - scripts/validate-release-version.sh
   workflow_call:
     inputs:
       publish:
@@ -58,7 +60,7 @@ jobs:
           SOURCE_REVISION: ${{ inputs.source_revision }}
         run: |
           set -euo pipefail
-          [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          ./scripts/validate-release-version.sh "$RELEASE_VERSION" >/dev/null
           [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
 
@@ -80,8 +82,8 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=pr
-            type=semver,pattern={{version}},value=${{ inputs.version }},enable=${{ inputs.publish == true }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }},enable=${{ inputs.publish == true }}
+            type=raw,value=${{ inputs.version }},enable=${{ inputs.publish == true }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }},enable=${{ inputs.publish == true && !contains(inputs.version, '-') }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ inputs.source_revision || github.sha }}

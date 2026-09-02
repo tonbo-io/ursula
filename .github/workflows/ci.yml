@@ -28,7 +28,9 @@ jobs:
       # artifact at this version before creating the immutable tag, so this is
       # the last place a forgotten bump costs a commit instead of a release.
       - name: Release versions agree
-        run: ./scripts/check-release-versions.sh
+        run: |
+          ./scripts/test_validate_release_version.sh
+          ./scripts/check-release-versions.sh
 
       - name: Install OpenTofu
         uses: opentofu/setup-opentofu@v1

@@ -31,6 +31,8 @@ if [ -z "${workspace}" ]; then
   exit 1
 fi
 
+./scripts/validate-release-version.sh "${workspace}" >/dev/null
+
 status=0
 for chart in charts/ursula charts/ursula-chaos; do
   version=$(awk '$1 == "version:" { print $2; exit }' "${chart}/Chart.yaml")

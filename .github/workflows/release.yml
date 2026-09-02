@@ -52,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$CONFIRM" = publish-stable-release
-          [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          ./scripts/validate-release-version.sh "$RELEASE_VERSION" >/dev/null
           [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
 
@@ -241,8 +241,7 @@ jobs:
               --repo "$REPOSITORY" \
               --verify-tag \
               --title "Ursula $RELEASE_VERSION" \
-              --generate-notes \
-              --notes-start-tag v0.4.4
+              --generate-notes
           fi
 
           gh release view "$tag" --repo "$REPOSITORY" --json tagName,isDraft,isPrerelease \

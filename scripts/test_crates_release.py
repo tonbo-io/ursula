@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import call, patch
 
 from crates_release import topological_order, validate
+from crates_release import validate_internal_dependency_requirements
 
 
 class TopologicalOrderTests(unittest.TestCase):
@@ -33,6 +34,22 @@ class TopologicalOrderTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "publication dependency cycle"):
             topological_order(packages)
+
+    def test_requires_exact_internal_release_versions(self) -> None:
+        packages = {
+            "leaf": {"dependencies": []},
+            "consumer": {
+                "dependencies": [
+                    {"name": "leaf", "kind": None, "req": "=0.5.0-patch1"}
+                ],
+            },
+        }
+
+        validate_internal_dependency_requirements(packages, "0.5.0-patch1")
+
+        packages["consumer"]["dependencies"][0]["req"] = "^0.5.0-patch1"
+        with self.assertRaisesRegex(RuntimeError, "expected '=0.5.0-patch1'"):
+            validate_internal_dependency_requirements(packages, "0.5.0-patch1")
 
     @patch("crates_release.run")
     def test_validation_only_publish_dry_runs_leaf_crates(self, run) -> None:
