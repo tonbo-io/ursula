@@ -99,7 +99,7 @@ jobs:
           context: .
           file: ./Dockerfile
           platforms: ${{ env.DOCKER_PLATFORMS }}
-          push: ${{ inputs.publish }}
+          push: ${{ inputs.publish == true }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
