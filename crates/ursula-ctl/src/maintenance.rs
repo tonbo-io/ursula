@@ -1704,14 +1704,13 @@ fn stale_survivor_term_handoff(
             max_term_voter = Some((view.node.id, current_term, group));
         }
         if group.current_leader == Some(view.node.id) {
-            if let Some((existing, _, _)) = &self_leader {
-                bail!(
-                    "multiple peers self-report leadership for group {} while repairing node {}: {} vs {}",
-                    raft_group_id,
-                    target_node_id,
-                    existing,
-                    view.node.id
-                );
+            if self_leader.is_some() {
+                // A successful term handoff can be visible on the new leader
+                // before the old leader processes the higher-term append and
+                // steps down. This is not a safe handoff shape, but it is also
+                // not terminal: the stabilization loop must keep the target
+                // drained and wait for one authoritative survivor leader.
+                return Ok(None);
             }
             self_leader = Some((view.node.id, current_term, group));
         }
@@ -1931,6 +1930,7 @@ mod tests {
         stalled_detach_mode: AtomicUsize,
         promotion_leader_handoff: AtomicUsize,
         survivor_terms_aligned: AtomicUsize,
+        transient_dual_leader_reports: AtomicUsize,
         drained_nodes: Mutex<Vec<u64>>,
         undrained_nodes: Mutex<Vec<u64>>,
         quiesced_nodes: Mutex<Vec<u64>>,
@@ -1989,6 +1989,13 @@ mod tests {
                 _ => (vec![1, 2, 3], vec![], Some(100)),
             };
             let terms_aligned = state.cluster.survivor_terms_aligned.load(Ordering::SeqCst) != 0;
+            let transient_dual_leader = state
+                .cluster
+                .transient_dual_leader_reports
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
             let (current_term, current_leader) =
                 if matches!(state.cluster.scenario, LeaderScenario::DivergedSurvivorTerm)
                     && !terms_aligned
@@ -1997,6 +2004,12 @@ mod tests {
                         1 => (31, Some(1)),
                         2 => (100, None),
                         _ => (101, None),
+                    }
+                } else if transient_dual_leader {
+                    match state.node_id {
+                        1 => (100, Some(1)),
+                        2 => (100, Some(2)),
+                        _ => (100, None),
                     }
                 } else {
                     (100, Some(leader))
@@ -2067,10 +2080,19 @@ mod tests {
         Path((_group_id, to)): Path<(u64, u64)>,
     ) -> Json<serde_json::Value> {
         if matches!(state.cluster.scenario, LeaderScenario::DivergedSurvivorTerm) {
-            state
+            if state
                 .cluster
                 .survivor_terms_aligned
-                .store(1, Ordering::SeqCst);
+                .swap(1, Ordering::SeqCst)
+                == 0
+            {
+                // Model one metrics snapshot in which the new higher-term
+                // leader and the old leader both still self-report leadership.
+                state
+                    .cluster
+                    .transient_dual_leader_reports
+                    .store(3, Ordering::SeqCst);
+            }
         }
         state
             .cluster
@@ -2188,6 +2210,7 @@ mod tests {
             stalled_detach_mode: AtomicUsize::new(0),
             promotion_leader_handoff: AtomicUsize::new(0),
             survivor_terms_aligned: AtomicUsize::new(0),
+            transient_dual_leader_reports: AtomicUsize::new(0),
             drained_nodes: Mutex::new(Vec::new()),
             undrained_nodes: Mutex::new(Vec::new()),
             quiesced_nodes: Mutex::new(Vec::new()),
@@ -2701,6 +2724,10 @@ mod tests {
             ],
         };
         assert!(stable_non_target_leader(&conflicting, 7, 1).is_err());
+        assert_eq!(
+            stale_survivor_term_handoff(&conflicting, 7, 1).unwrap(),
+            None
+        );
 
         let mut stale_term = stable;
         stale_term.per_node[0].groups[0].current_term = Some(31);
