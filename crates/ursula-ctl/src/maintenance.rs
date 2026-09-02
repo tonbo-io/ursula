@@ -1489,6 +1489,7 @@ struct SurvivorTermHandoff {
 struct SurvivorTermProbe {
     candidate: u64,
     current_term: u64,
+    current_vote_committed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1508,6 +1509,7 @@ fn survivor_term_probe(handoff: SurvivorTermHandoff) -> SurvivorTermProbe {
     SurvivorTermProbe {
         candidate: handoff.stale_leader,
         current_term: handoff.stale_term,
+        current_vote_committed: true,
     }
 }
 
@@ -1645,7 +1647,12 @@ async fn stabilize_survivor_leadership(
                 "asking the longer-log former leader to probe the higher peer term"
             );
             match client
-                .request_self_election(stale_leader, handoff.raft_group_id, probe.current_term)
+                .request_self_election(
+                    stale_leader,
+                    handoff.raft_group_id,
+                    probe.current_term,
+                    probe.current_vote_committed,
+                )
                 .await
             {
                 Ok(()) => {}
@@ -1671,7 +1678,7 @@ async fn stabilize_survivor_leadership(
                 "asking the longer-log former leader to probe the higher peer term"
             );
             if let Err(error) = client
-                .request_self_election(candidate, group_id, current_term)
+                .request_self_election(candidate, group_id, current_term, false)
                 .await
             {
                 last_error = error.context(format!(
@@ -1693,7 +1700,7 @@ async fn stabilize_survivor_leadership(
                 "retrying the former leader election after it learned the peer term"
             );
             if let Err(error) = client
-                .request_self_election(candidate, group_id, current_term)
+                .request_self_election(candidate, group_id, current_term, false)
                 .await
             {
                 last_error = error.context(format!(
@@ -2867,6 +2874,7 @@ mod tests {
         assert_eq!(survivor_term_probe(expected_handoff), SurvivorTermProbe {
             candidate: expected_handoff.stale_leader,
             current_term: expected_handoff.stale_term,
+            current_vote_committed: true,
         });
         let bridge = SurvivorTermBridge {
             candidate: expected_handoff.stale_leader,

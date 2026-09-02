@@ -119,6 +119,7 @@ impl MetricsClient {
         voter: &NodeInfo,
         raft_group_id: u64,
         current_term: u64,
+        current_vote_committed: bool,
     ) -> Result<()> {
         let endpoint = voter.http_url.as_ref().ok_or_else(|| {
             anyhow!(
@@ -139,6 +140,7 @@ impl MetricsClient {
             raft_group_id,
             voter.id,
             current_term,
+            current_vote_committed,
             self.timeout,
         )
         .await

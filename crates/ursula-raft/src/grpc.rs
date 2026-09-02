@@ -101,16 +101,18 @@ pub(crate) type RaftClient = raft_internal_proto::raft_internal_client::RaftInte
 /// Ask an existing voter to start an election through the version-one
 /// `TransferLeader` RPC understood by older Ursula servers.
 ///
-/// The request carries the voter's observed, uncommitted vote and targets the
-/// same voter. OpenRaft only acts when that vote still exactly matches its
-/// local state, so a stale observation is a no-op. Callers must establish that
-/// the node is a configured, caught-up voter with no current leader before
-/// using this rolling-upgrade bridge.
+/// The request carries the voter's exact observed vote and targets the same
+/// voter. OpenRaft only acts when the term, node id, and committed bit still
+/// match its local state, so a stale observation is a no-op. Callers must
+/// establish that the node is a configured, caught-up voter and report whether
+/// it still considers itself the committed leader before using this
+/// rolling-upgrade bridge.
 pub async fn request_self_election_via_transfer(
     endpoint: &str,
     raft_group_id: u32,
     node_id: u64,
     current_term: u64,
+    current_vote_committed: bool,
     timeout: Duration,
 ) -> Result<(), String> {
     let channel = Endpoint::from_shared(endpoint.to_owned())
@@ -120,7 +122,7 @@ pub async fn request_self_election_via_transfer(
         .connect()
         .await
         .map_err(|err| format!("connect to Raft gRPC endpoint {endpoint}: {err}"))?;
-    let transfer = self_election_transfer_request(node_id, current_term);
+    let transfer = self_election_transfer_request(node_id, current_term, current_vote_committed);
     let envelope = raft_internal_proto::RaftTransferLeaderRequestV1 {
         raft_group_id,
         node_id,
@@ -143,8 +145,14 @@ pub async fn request_self_election_via_transfer(
 fn self_election_transfer_request(
     node_id: u64,
     current_term: u64,
+    current_vote_committed: bool,
 ) -> TransferLeaderRequest<UrsulaRaftTypeConfig> {
-    TransferLeaderRequest::new(UrsulaVote::new(current_term, node_id), node_id, None)
+    let current_vote = if current_vote_committed {
+        UrsulaVote::new_committed(current_term, node_id)
+    } else {
+        UrsulaVote::new(current_term, node_id)
+    };
+    TransferLeaderRequest::new(current_vote, node_id, None)
 }
 
 #[cfg(test)]
@@ -153,8 +161,16 @@ mod self_election_transfer_tests {
 
     #[test]
     fn bridge_uses_exact_uncommitted_self_vote() {
-        let request = self_election_transfer_request(2, 7_381);
+        let request = self_election_transfer_request(2, 7_381, false);
         assert_eq!(request.from_leader(), &UrsulaVote::new(7_381, 2));
+        assert_eq!(request.to_node_id(), &2);
+        assert_eq!(request.last_log_id(), None);
+    }
+
+    #[test]
+    fn bridge_uses_exact_committed_self_vote_for_a_stale_leader() {
+        let request = self_election_transfer_request(2, 7_381, true);
+        assert_eq!(request.from_leader(), &UrsulaVote::new_committed(7_381, 2));
         assert_eq!(request.to_node_id(), &2);
         assert_eq!(request.last_log_id(), None);
     }
