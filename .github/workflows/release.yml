@@ -93,14 +93,33 @@ jobs:
           echo "source_revision=$SOURCE_REVISION" >>"$GITHUB_OUTPUT"
           echo "version=$RELEASE_VERSION" >>"$GITHUB_OUTPUT"
 
-  crates:
-    name: Publish crates.io
+  crates_check:
+    name: Validate crates.io packages
     needs: validate
     uses: ./.github/workflows/crates-publish.yml
     with:
-      publish: true
       source_revision: ${{ needs.validate.outputs.source_revision }}
       version: ${{ needs.validate.outputs.version }}
+
+  crates:
+    name: Publish crates.io
+    needs: [validate, crates_check]
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.validate.outputs.source_revision }}
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: python3 scripts/crates_release.py publish --version "$RELEASE_VERSION"
 
   docker:
     name: Publish Docker
