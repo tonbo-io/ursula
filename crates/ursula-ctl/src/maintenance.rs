@@ -2079,20 +2079,19 @@ mod tests {
         State(state): State<MockNode>,
         Path((_group_id, to)): Path<(u64, u64)>,
     ) -> Json<serde_json::Value> {
-        if matches!(state.cluster.scenario, LeaderScenario::DivergedSurvivorTerm) {
-            if state
+        if matches!(state.cluster.scenario, LeaderScenario::DivergedSurvivorTerm)
+            && state
                 .cluster
                 .survivor_terms_aligned
                 .swap(1, Ordering::SeqCst)
                 == 0
-            {
-                // Model one metrics snapshot in which the new higher-term
-                // leader and the old leader both still self-report leadership.
-                state
-                    .cluster
-                    .transient_dual_leader_reports
-                    .store(3, Ordering::SeqCst);
-            }
+        {
+            // Model one metrics snapshot in which the new higher-term leader
+            // and the old leader both still self-report leadership.
+            state
+                .cluster
+                .transient_dual_leader_reports
+                .store(3, Ordering::SeqCst);
         }
         state
             .cluster
