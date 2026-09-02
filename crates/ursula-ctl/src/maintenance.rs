@@ -2731,7 +2731,7 @@ mod tests {
             }
         );
 
-        fresh_higher_view.groups[0].current_leader = Some(3);
+        fresh_higher_view.groups[0].current_leader = Some(2);
         let error =
             refreshed_survivor_term_handoff(&stale_term, &fresh_higher_view, expected_handoff, 1)
                 .unwrap_err();
