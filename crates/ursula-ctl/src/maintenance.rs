@@ -1566,6 +1566,31 @@ async fn stabilize_survivor_leadership(
                 .iter()
                 .find(|node| node.id == handoff.higher_term_voter)
                 .expect("term handoff voter is a configured node");
+            let fresh_higher_view = match client.fetch_node(higher_term_voter).await {
+                Ok(view) => view,
+                Err(error) => {
+                    last_error = error.context(format!(
+                        "refresh higher-term voter {} before survivor term handoff for group {}",
+                        handoff.higher_term_voter, handoff.raft_group_id
+                    ));
+                    continue;
+                }
+            };
+            let handoff = match refreshed_survivor_term_handoff(
+                &snapshot,
+                &fresh_higher_view,
+                handoff,
+                target.id,
+            ) {
+                Ok(handoff) => handoff,
+                Err(error) => {
+                    last_error = error.context(format!(
+                        "revalidate survivor term handoff for group {}",
+                        handoff.raft_group_id
+                    ));
+                    continue;
+                }
+            };
             tracing::warn!(
                 raft_group_id = handoff.raft_group_id,
                 stale_leader = handoff.stale_leader,
@@ -1601,6 +1626,56 @@ async fn stabilize_survivor_leadership(
         "surviving voter leadership did not stabilize before {:?}",
         drain_options.drain_timeout
     ))
+}
+
+fn refreshed_survivor_term_handoff(
+    snapshot: &ClusterSnapshot,
+    fresh_higher_view: &NodeMetricsView,
+    expected: SurvivorTermHandoff,
+    target_node_id: u64,
+) -> Result<SurvivorTermHandoff> {
+    if fresh_higher_view.node.id != expected.higher_term_voter {
+        bail!(
+            "refreshed survivor term handoff for group {} returned node {}, expected higher-term voter {}",
+            expected.raft_group_id,
+            fresh_higher_view.node.id,
+            expected.higher_term_voter
+        );
+    }
+    let stale_view = snapshot.node(expected.stale_leader).ok_or_else(|| {
+        anyhow!(
+            "stale leader {} disappeared while refreshing survivor term handoff for group {}",
+            expected.stale_leader,
+            expected.raft_group_id
+        )
+    })?;
+    let refreshed_snapshot = ClusterSnapshot {
+        per_node: vec![stale_view.clone(), fresh_higher_view.clone()],
+    };
+    let refreshed = stale_survivor_term_handoff(
+        &refreshed_snapshot,
+        expected.raft_group_id,
+        target_node_id,
+    )?
+    .ok_or_else(|| {
+        anyhow!(
+            "group {} no longer has the validated stale-leader/higher-term-voter shape",
+            expected.raft_group_id
+        )
+    })?;
+    if refreshed.stale_leader != expected.stale_leader
+        || refreshed.higher_term_voter != expected.higher_term_voter
+    {
+        bail!(
+            "group {} survivor term handoff identity changed from stale leader {}/higher voter {} to {}/{}",
+            expected.raft_group_id,
+            expected.stale_leader,
+            expected.higher_term_voter,
+            refreshed.stale_leader,
+            refreshed.higher_term_voter
+        );
+    }
+    Ok(refreshed)
 }
 
 fn stale_survivor_term_handoff(
@@ -2635,16 +2710,43 @@ mod tests {
         stale_term.per_node[1].groups[0].current_leader = None;
         let error = stable_non_target_leader(&stale_term, 7, 1).unwrap_err();
         assert!(error.to_string().contains("stale at term 31"), "{error:#}");
+        let expected_handoff = SurvivorTermHandoff {
+            raft_group_id: 7,
+            stale_leader: 2,
+            stale_term: 31,
+            higher_term_voter: 3,
+            higher_term: 100,
+        };
         assert_eq!(
             stale_survivor_term_handoff(&stale_term, 7, 1).unwrap(),
-            Some(SurvivorTermHandoff {
-                raft_group_id: 7,
-                stale_leader: 2,
-                stale_term: 31,
-                higher_term_voter: 3,
-                higher_term: 100,
-            })
+            Some(expected_handoff)
         );
+
+        let mut fresh_higher_view = stale_term.per_node[1].clone();
+        fresh_higher_view.groups[0].current_term = Some(101);
+        assert_eq!(
+            refreshed_survivor_term_handoff(
+                &stale_term,
+                &fresh_higher_view,
+                expected_handoff,
+                1,
+            )
+            .unwrap(),
+            SurvivorTermHandoff {
+                higher_term: 101,
+                ..expected_handoff
+            }
+        );
+
+        fresh_higher_view.groups[0].current_leader = Some(3);
+        let error = refreshed_survivor_term_handoff(
+            &stale_term,
+            &fresh_higher_view,
+            expected_handoff,
+            1,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("still reports leader"), "{error:#}");
 
         let mut higher_term_reports_a_leader = stale_term.clone();
         higher_term_reports_a_leader.per_node[1].groups[0].current_leader = Some(2);
