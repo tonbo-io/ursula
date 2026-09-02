@@ -8,6 +8,8 @@ on:
       - Cargo.toml
       - scripts/crates_release.py
       - scripts/test_crates_release.py
+      - scripts/validate-release-version.sh
+      - scripts/test_validate_release_version.sh
   workflow_call:
     inputs:
       version:
@@ -50,7 +52,8 @@ jobs:
               in_section && $1 == "version" { gsub(/"/, "", $3); print $3; exit }
             ' Cargo.toml)"
           fi
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          ./scripts/validate-release-version.sh "$version" >/dev/null
+          ./scripts/test_validate_release_version.sh
           ./scripts/check-release-versions.sh
           python3 scripts/test_crates_release.py
           python3 scripts/crates_release.py check --version "$version"

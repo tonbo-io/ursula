@@ -83,6 +83,21 @@ def internal_dependencies(
     }
 
 
+def validate_internal_dependency_requirements(
+    packages: dict[str, dict[str, Any]], version: str
+) -> None:
+    expected = f"={version}"
+    for package_name, package in packages.items():
+        for dependency in package["dependencies"]:
+            if dependency["name"] not in packages or dependency.get("kind") == "dev":
+                continue
+            if dependency.get("req") != expected:
+                raise RuntimeError(
+                    f"{package_name} depends on {dependency['name']} with "
+                    f"{dependency.get('req')!r}, expected {expected!r}"
+                )
+
+
 def crate_version_exists(name: str, version: str) -> bool:
     request = urllib.request.Request(
         f"{CRATES_IO}/{name}/{version}",
@@ -161,6 +176,7 @@ def main() -> int:
     args = parser.parse_args()
 
     packages = publishable_packages(cargo_metadata(), args.version)
+    validate_internal_dependency_requirements(packages, args.version)
     order = topological_order(packages)
     print("publication order: " + ", ".join(order), flush=True)
 
