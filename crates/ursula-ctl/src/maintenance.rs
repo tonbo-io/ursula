@@ -20,7 +20,6 @@ use futures_util::TryStreamExt;
 
 use crate::metrics::ClusterSnapshot;
 use crate::metrics::MetricsClient;
-use crate::metrics::NodeMetricsView;
 use crate::plan::DrainPlan;
 use crate::plan::check_readiness;
 use crate::plan::classify_amnesiac_voter;
