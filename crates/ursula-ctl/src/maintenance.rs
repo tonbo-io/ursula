@@ -1564,13 +1564,10 @@ async fn stabilize_survivor_leadership(
                     if let Some(handoff) =
                         stale_survivor_term_handoff(&snapshot, group_id, target.id)?
                     {
-                        term_bridges.insert(
-                            group_id,
-                            SurvivorTermBridge {
-                                candidate: handoff.stale_leader,
-                                peer_term: handoff.higher_term,
-                            },
-                        );
+                        term_bridges.insert(group_id, SurvivorTermBridge {
+                            candidate: handoff.stale_leader,
+                            peer_term: handoff.higher_term,
+                        });
                         handoffs.push(handoff);
                     } else if let Some(bridge) = term_bridges.get(&group_id).copied() {
                         match survivor_bridge_action(&snapshot, group_id, target.id, bridge) {
@@ -1648,11 +1645,7 @@ async fn stabilize_survivor_leadership(
                 "asking the longer-log former leader to probe the higher peer term"
             );
             match client
-                .request_self_election(
-                    stale_leader,
-                    handoff.raft_group_id,
-                    probe.current_term,
-                )
+                .request_self_election(stale_leader, handoff.raft_group_id, probe.current_term)
                 .await
             {
                 Ok(()) => {}
@@ -2871,13 +2864,10 @@ mod tests {
             stale_survivor_term_handoff(&stale_term, 7, 1).unwrap(),
             Some(expected_handoff)
         );
-        assert_eq!(
-            survivor_term_probe(expected_handoff),
-            SurvivorTermProbe {
-                candidate: expected_handoff.stale_leader,
-                current_term: expected_handoff.stale_term,
-            }
-        );
+        assert_eq!(survivor_term_probe(expected_handoff), SurvivorTermProbe {
+            candidate: expected_handoff.stale_leader,
+            current_term: expected_handoff.stale_term,
+        });
         let bridge = SurvivorTermBridge {
             candidate: expected_handoff.stale_leader,
             peer_term: expected_handoff.higher_term,
