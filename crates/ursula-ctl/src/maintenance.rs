@@ -1485,6 +1485,32 @@ struct SurvivorTermHandoff {
     higher_term: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SurvivorTermProbe {
+    candidate: u64,
+    current_term: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SurvivorTermBridge {
+    candidate: u64,
+    peer_term: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurvivorBridgeAction {
+    Probe { current_term: u64 },
+    Elect { current_term: u64 },
+    Wait,
+}
+
+fn survivor_term_probe(handoff: SurvivorTermHandoff) -> SurvivorTermProbe {
+    SurvivorTermProbe {
+        candidate: handoff.stale_leader,
+        current_term: handoff.stale_term,
+    }
+}
+
 async fn stabilize_survivor_leadership(
     nodes: &[NodeInfo],
     target: &NodeInfo,
@@ -1495,12 +1521,15 @@ async fn stabilize_survivor_leadership(
     let deadline = Instant::now() + drain_options.drain_timeout;
     let mut last_error = anyhow!("surviving voter leadership has not converged");
     let mut standard_handoff_attempted = BTreeSet::new();
-    // A higher-term voter's first self-election teaches the former leader the
-    // new term. The former leader can still reject that vote when it has a
-    // longer uncommitted log. Remember it across the resulting no-leader
-    // snapshot so the next election uses both the learned term and the newest
-    // log; Raft still makes the final log-safety decision.
-    let mut bridge_candidates = BTreeMap::new();
+    // A higher-term voter cannot teach its term by campaigning when the former
+    // leader has a longer uncommitted log: OpenRaft rejects the request on log
+    // freshness before updating the former leader's vote. Instead, ask the
+    // longer-log former leader to campaign. Its request reaches the higher-term
+    // peer, whose rejection teaches the former leader the peer term. Keep
+    // probing until metrics prove that term was learned, then use both the
+    // learned term and the newest log for the final election; Raft still makes
+    // the log-safety decision.
+    let mut term_bridges = BTreeMap::new();
     loop {
         let snapshot = client
             .fetch_cluster(nodes)
@@ -1522,11 +1551,12 @@ async fn stabilize_survivor_leadership(
 
         let mut all_stable = true;
         let mut handoffs = Vec::new();
+        let mut term_probe_requests = Vec::new();
         let mut bridge_requests = Vec::new();
         for group_id in group_ids {
             match stable_non_target_leader(&snapshot, group_id, target.id) {
                 Ok(_) => {
-                    bridge_candidates.remove(&group_id);
+                    term_bridges.remove(&group_id);
                 }
                 Err(error) => {
                     all_stable = false;
@@ -1534,14 +1564,23 @@ async fn stabilize_survivor_leadership(
                     if let Some(handoff) =
                         stale_survivor_term_handoff(&snapshot, group_id, target.id)?
                     {
-                        bridge_candidates.insert(group_id, handoff.stale_leader);
+                        term_bridges.insert(
+                            group_id,
+                            SurvivorTermBridge {
+                                candidate: handoff.stale_leader,
+                                peer_term: handoff.higher_term,
+                            },
+                        );
                         handoffs.push(handoff);
-                    } else if let Some(candidate) = bridge_candidates.get(&group_id).copied() {
-                        match survivor_bridge_request(&snapshot, group_id, target.id, candidate) {
-                            Ok(Some(current_term)) => {
-                                bridge_requests.push((group_id, candidate, current_term));
+                    } else if let Some(bridge) = term_bridges.get(&group_id).copied() {
+                        match survivor_bridge_action(&snapshot, group_id, target.id, bridge) {
+                            Ok(SurvivorBridgeAction::Probe { current_term }) => {
+                                term_probe_requests.push((group_id, bridge, current_term));
                             }
-                            Ok(None) => {}
+                            Ok(SurvivorBridgeAction::Elect { current_term }) => {
+                                bridge_requests.push((group_id, bridge.candidate, current_term));
+                            }
+                            Ok(SurvivorBridgeAction::Wait) => {}
                             Err(error) => {
                                 last_error = error.context(format!(
                                     "revalidate survivor term bridge candidate for group {group_id}"
@@ -1595,33 +1634,57 @@ async fn stabilize_survivor_leadership(
                 }
                 continue;
             }
-            let higher_term_voter = nodes
+            let probe = survivor_term_probe(handoff);
+            let stale_leader = nodes
                 .iter()
-                .find(|node| node.id == handoff.higher_term_voter)
-                .expect("term handoff voter is a configured node");
+                .find(|node| node.id == probe.candidate)
+                .expect("term handoff leader is a configured node");
             tracing::warn!(
                 raft_group_id = handoff.raft_group_id,
                 stale_leader = handoff.stale_leader,
                 stale_term = handoff.stale_term,
                 higher_term_voter = handoff.higher_term_voter,
                 higher_term = handoff.higher_term,
-                "asking the caught-up higher-term voter to start a Raft-native election"
+                "asking the longer-log former leader to probe the higher peer term"
             );
             match client
                 .request_self_election(
-                    higher_term_voter,
+                    stale_leader,
                     handoff.raft_group_id,
-                    handoff.higher_term,
+                    probe.current_term,
                 )
                 .await
             {
                 Ok(()) => {}
                 Err(error) => {
                     last_error = error.context(format!(
-                        "trigger survivor term handoff for group {}",
+                        "probe survivor peer term for group {}",
                         handoff.raft_group_id
                     ));
                 }
+            }
+        }
+
+        for (group_id, bridge, current_term) in term_probe_requests {
+            let candidate = nodes
+                .iter()
+                .find(|node| node.id == bridge.candidate)
+                .expect("remembered bridge candidate is a configured node");
+            tracing::warn!(
+                raft_group_id = group_id,
+                stale_leader = bridge.candidate,
+                stale_term = current_term,
+                higher_term = bridge.peer_term,
+                "asking the longer-log former leader to probe the higher peer term"
+            );
+            if let Err(error) = client
+                .request_self_election(candidate, group_id, current_term)
+                .await
+            {
+                last_error = error.context(format!(
+                    "probe survivor peer term on node {} for group {group_id}",
+                    bridge.candidate
+                ));
             }
         }
 
@@ -1657,12 +1720,13 @@ async fn stabilize_survivor_leadership(
     ))
 }
 
-fn survivor_bridge_request(
+fn survivor_bridge_action(
     snapshot: &ClusterSnapshot,
     raft_group_id: u64,
     target_node_id: u64,
-    candidate_id: u64,
-) -> Result<Option<u64>> {
+    bridge: SurvivorTermBridge,
+) -> Result<SurvivorBridgeAction> {
+    let candidate_id = bridge.candidate;
     if candidate_id == target_node_id {
         bail!("survivor term bridge candidate is the restarting target");
     }
@@ -1696,9 +1760,13 @@ fn survivor_bridge_request(
                     raft_group_id
                 )
             })?;
-            Ok(Some(current_term))
+            if current_term < bridge.peer_term {
+                Ok(SurvivorBridgeAction::Probe { current_term })
+            } else {
+                Ok(SurvivorBridgeAction::Elect { current_term })
+            }
         }
-        Some(leader) if leader == candidate_id => Ok(None),
+        Some(leader) if leader == candidate_id => Ok(SurvivorBridgeAction::Wait),
         Some(leader) => bail!(
             "survivor term bridge candidate {} reports leader {} for group {}; waiting for the cluster-wide leader view instead of forcing an election",
             candidate_id,
@@ -2803,24 +2871,42 @@ mod tests {
             stale_survivor_term_handoff(&stale_term, 7, 1).unwrap(),
             Some(expected_handoff)
         );
+        assert_eq!(
+            survivor_term_probe(expected_handoff),
+            SurvivorTermProbe {
+                candidate: expected_handoff.stale_leader,
+                current_term: expected_handoff.stale_term,
+            }
+        );
+        let bridge = SurvivorTermBridge {
+            candidate: expected_handoff.stale_leader,
+            peer_term: expected_handoff.higher_term,
+        };
+
+        let mut probing_term = stale_term.clone();
+        probing_term.per_node[0].groups[0].current_term = Some(32);
+        probing_term.per_node[0].groups[0].current_leader = None;
+        assert_eq!(
+            survivor_bridge_action(&probing_term, 7, 1, bridge).unwrap(),
+            SurvivorBridgeAction::Probe { current_term: 32 }
+        );
 
         let mut learned_term = stale_term.clone();
-        learned_term.per_node[0].groups[0].current_term = Some(101);
+        learned_term.per_node[0].groups[0].current_term = Some(100);
         learned_term.per_node[0].groups[0].current_leader = None;
         assert_eq!(
-            survivor_bridge_request(&learned_term, 7, 1, expected_handoff.stale_leader).unwrap(),
-            Some(101)
+            survivor_bridge_action(&learned_term, 7, 1, bridge).unwrap(),
+            SurvivorBridgeAction::Elect { current_term: 100 }
         );
 
         learned_term.per_node[0].groups[0].current_leader = Some(2);
         assert_eq!(
-            survivor_bridge_request(&learned_term, 7, 1, expected_handoff.stale_leader).unwrap(),
-            None
+            survivor_bridge_action(&learned_term, 7, 1, bridge).unwrap(),
+            SurvivorBridgeAction::Wait
         );
 
         learned_term.per_node[0].groups[0].current_leader = Some(3);
-        let error = survivor_bridge_request(&learned_term, 7, 1, expected_handoff.stale_leader)
-            .unwrap_err();
+        let error = survivor_bridge_action(&learned_term, 7, 1, bridge).unwrap_err();
         assert!(error.to_string().contains("reports leader 3"), "{error:#}");
 
         let mut higher_term_reports_a_leader = stale_term.clone();
