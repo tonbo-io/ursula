@@ -613,6 +613,16 @@ pub async fn repair_restarted_voter(
     drain_recovery_target(nodes, target, client, drain_options, &configured_node_ids)
         .await
         .context("drain current leaders from restarted voter before membership repair")?;
+    // `prepare_restart` leaves every non-anchor survivor maintenance-fenced
+    // across the platform replacement. Leadership stabilization must allow
+    // those survivors to campaign before it can repair a stale-leader / higher-
+    // term-voter split. Keeping the higher-term survivor fenced makes the
+    // self-election bridge advance its term forever without winning a quorum.
+    // The uncertain replacement remains drained throughout this release and is
+    // therefore still excluded from leadership until the final verification.
+    release_prepared_restart(nodes, target, client, false)
+        .await
+        .context("release survivor restart fences before leadership stabilization")?;
     stabilize_survivor_leadership(nodes, target, client, drain_options, &configured_node_ids)
         .await
         .context("stabilize surviving voter terms before membership repair")?;
@@ -1897,6 +1907,7 @@ pub(crate) fn format_unready(report: &crate::plan::ReadinessReport) -> String {
 mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
@@ -1931,6 +1942,7 @@ mod tests {
         promotion_leader_handoff: AtomicUsize,
         survivor_terms_aligned: AtomicUsize,
         transient_dual_leader_reports: AtomicUsize,
+        survivor_fenced: AtomicBool,
         drained_nodes: Mutex<Vec<u64>>,
         undrained_nodes: Mutex<Vec<u64>>,
         quiesced_nodes: Mutex<Vec<u64>>,
@@ -2044,6 +2056,9 @@ mod tests {
     }
 
     async fn mock_drain(State(state): State<MockNode>) -> StatusCode {
+        if state.node_id == 2 {
+            state.cluster.survivor_fenced.store(true, Ordering::SeqCst);
+        }
         state
             .cluster
             .drained_nodes
@@ -2060,6 +2075,9 @@ mod tests {
     }
 
     async fn mock_undrain(State(state): State<MockNode>) -> StatusCode {
+        if state.node_id == 2 {
+            state.cluster.survivor_fenced.store(false, Ordering::SeqCst);
+        }
         state
             .cluster
             .undrained_nodes
@@ -2079,6 +2097,16 @@ mod tests {
         State(state): State<MockNode>,
         Path((_group_id, to)): Path<(u64, u64)>,
     ) -> Json<serde_json::Value> {
+        if to == 2 && state.cluster.survivor_fenced.load(Ordering::SeqCst) {
+            return Json(json!({
+                "raft_group_id": 7,
+                "from": state.node_id,
+                "to": to,
+                "current_leader": state.node_id,
+                "transferred": false,
+                "reason": "survivor is maintenance-fenced"
+            }));
+        }
         if matches!(state.cluster.scenario, LeaderScenario::DivergedSurvivorTerm)
             && state
                 .cluster
@@ -2210,6 +2238,7 @@ mod tests {
             promotion_leader_handoff: AtomicUsize::new(0),
             survivor_terms_aligned: AtomicUsize::new(0),
             transient_dual_leader_reports: AtomicUsize::new(0),
+            survivor_fenced: AtomicBool::new(false),
             drained_nodes: Mutex::new(Vec::new()),
             undrained_nodes: Mutex::new(Vec::new()),
             quiesced_nodes: Mutex::new(Vec::new()),
@@ -2297,6 +2326,7 @@ mod tests {
         assert_eq!(*cluster.operations.lock().unwrap(), vec![
             "drain:3",
             "transfer:3->1",
+            "undrain:2",
             "drain:2",
             "membership:1:1,2",
             "learner:1:3",
@@ -2307,6 +2337,7 @@ mod tests {
     #[tokio::test]
     async fn restarted_voter_reconciles_a_stale_self_reported_survivor_leader() {
         let (nodes, cluster) = mock_cluster(LeaderScenario::DivergedSurvivorTerm).await;
+        cluster.survivor_fenced.store(true, Ordering::SeqCst);
         let preparation = repair_restarted_voter(
             &nodes,
             &nodes[2],
@@ -2331,6 +2362,7 @@ mod tests {
         assert_eq!(preparation.leader_anchor, 1);
         assert_eq!(*cluster.operations.lock().unwrap(), vec![
             "drain:3",
+            "undrain:2",
             "transfer:1->2",
             "drain:2",
             "transfer:2->1",
@@ -2373,6 +2405,7 @@ mod tests {
         assert_eq!(*cluster.operations.lock().unwrap(), vec![
             "drain:3",
             "transfer:3->1",
+            "undrain:2",
             "drain:2",
             "membership:1:1,2",
             "learner:1:3",
@@ -2413,6 +2446,7 @@ mod tests {
         assert_eq!(*cluster.operations.lock().unwrap(), vec![
             "drain:3",
             "transfer:3->1",
+            "undrain:2",
             "drain:2",
             "membership:1:1,2",
             "learner:1:3",
@@ -2453,6 +2487,7 @@ mod tests {
         assert_eq!(*cluster.operations.lock().unwrap(), vec![
             "drain:3",
             "transfer:3->1",
+            "undrain:2",
             "drain:2",
             "membership:1:1,2",
             "learner:1:3",
@@ -2488,6 +2523,7 @@ mod tests {
         assert_eq!(cluster.membership_phase.load(Ordering::SeqCst), 3);
         assert_eq!(*cluster.operations.lock().unwrap(), vec![
             "drain:3",
+            "undrain:2",
             "drain:2",
             "learner:1:3",
             "membership:1:1,2,3"
