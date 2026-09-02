@@ -2076,10 +2076,7 @@ mod tests {
 
     async fn mock_undrain(State(state): State<MockNode>) -> StatusCode {
         if state.node_id == 2 {
-            state
-                .cluster
-                .survivor_fenced
-                .store(false, Ordering::SeqCst);
+            state.cluster.survivor_fenced.store(false, Ordering::SeqCst);
         }
         state
             .cluster
