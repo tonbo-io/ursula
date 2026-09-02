@@ -19,6 +19,7 @@ use futures_util::TryStreamExt;
 
 use crate::metrics::ClusterSnapshot;
 use crate::metrics::MetricsClient;
+use crate::metrics::NodeMetricsView;
 use crate::plan::DrainPlan;
 use crate::plan::check_readiness;
 use crate::plan::classify_amnesiac_voter;
@@ -1652,17 +1653,14 @@ fn refreshed_survivor_term_handoff(
     let refreshed_snapshot = ClusterSnapshot {
         per_node: vec![stale_view.clone(), fresh_higher_view.clone()],
     };
-    let refreshed = stale_survivor_term_handoff(
-        &refreshed_snapshot,
-        expected.raft_group_id,
-        target_node_id,
-    )?
-    .ok_or_else(|| {
-        anyhow!(
-            "group {} no longer has the validated stale-leader/higher-term-voter shape",
-            expected.raft_group_id
-        )
-    })?;
+    let refreshed =
+        stale_survivor_term_handoff(&refreshed_snapshot, expected.raft_group_id, target_node_id)?
+            .ok_or_else(|| {
+            anyhow!(
+                "group {} no longer has the validated stale-leader/higher-term-voter shape",
+                expected.raft_group_id
+            )
+        })?;
     if refreshed.stale_leader != expected.stale_leader
         || refreshed.higher_term_voter != expected.higher_term_voter
     {
@@ -2725,13 +2723,8 @@ mod tests {
         let mut fresh_higher_view = stale_term.per_node[1].clone();
         fresh_higher_view.groups[0].current_term = Some(101);
         assert_eq!(
-            refreshed_survivor_term_handoff(
-                &stale_term,
-                &fresh_higher_view,
-                expected_handoff,
-                1,
-            )
-            .unwrap(),
+            refreshed_survivor_term_handoff(&stale_term, &fresh_higher_view, expected_handoff, 1,)
+                .unwrap(),
             SurvivorTermHandoff {
                 higher_term: 101,
                 ..expected_handoff
@@ -2739,14 +2732,13 @@ mod tests {
         );
 
         fresh_higher_view.groups[0].current_leader = Some(3);
-        let error = refreshed_survivor_term_handoff(
-            &stale_term,
-            &fresh_higher_view,
-            expected_handoff,
-            1,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("still reports leader"), "{error:#}");
+        let error =
+            refreshed_survivor_term_handoff(&stale_term, &fresh_higher_view, expected_handoff, 1)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("still reports leader"),
+            "{error:#}"
+        );
 
         let mut higher_term_reports_a_leader = stale_term.clone();
         higher_term_reports_a_leader.per_node[1].groups[0].current_leader = Some(2);
