@@ -1,7 +1,7 @@
 global:
   image:
     repository: ghcr.io/tonbo-io/ursula
-    tag: "0.4.13"
+    tag: "0.5.0"
     pullPolicy: IfNotPresent
 
 serviceAccount:

@@ -1,0 +1,84 @@
+name: Crates.io Publish
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/crates-publish.yml
+      - Cargo.lock
+      - Cargo.toml
+      - scripts/crates_release.py
+      - scripts/test_crates_release.py
+  workflow_call:
+    inputs:
+      publish:
+        required: true
+        type: boolean
+      version:
+        required: true
+        type: string
+      source_revision:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crates-io-${{ inputs.source_revision || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Crates.io package contract
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_revision || github.sha }}
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Validate release plan
+        id: plan
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$RELEASE_VERSION"
+          if test -z "$version"; then
+            version="$(awk '
+              /^\[workspace\.package\]/ { in_section = 1; next }
+              /^\[/ { in_section = 0 }
+              in_section && $1 == "version" { gsub(/"/, "", $3); print $3; exit }
+            ' Cargo.toml)"
+          fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          ./scripts/check-release-versions.sh
+          python3 scripts/test_crates_release.py
+          python3 scripts/crates_release.py check --version "$version"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+  publish:
+    if: inputs.publish
+    needs: check
+    name: Publish crates.io packages
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_revision }}
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          RELEASE_VERSION: ${{ needs.check.outputs.version }}
+        run: python3 scripts/crates_release.py publish --version "$RELEASE_VERSION"

@@ -2,12 +2,11 @@
 #
 # Asserts that everything carrying the release version agrees.
 #
-# Both Helm publish workflows refuse to package a chart whose `version` and
-# `appVersion` differ from the tag being pushed, which is the right check in
-# the wrong place: it runs after the tag exists, and a tag cannot be corrected,
-# only superseded. `charts/ursula-chaos` drifted to 0.4.0 that way and its
-# publish failed on two consecutive releases before anybody noticed, because
-# the release PR does not touch that chart and so never ran its workflow.
+# The stable release workflow publishes every crate, image, and chart before
+# creating the immutable Git tag and GitHub Release. A version mismatch must be
+# found before any registry accepts an artifact. `charts/ursula-chaos` once
+# drifted independently and failed on two consecutive releases, because a
+# release PR did not touch that chart and so never ran its workflow.
 #
 # This runs on every pull request instead, where a forgotten file is one more
 # commit rather than one more release.
@@ -50,9 +49,9 @@ done
 if [ "${status}" -ne 0 ]; then
   cat >&2 <<EOF
 
-A release tag publishes every chart at the tag's version, and each publish
-workflow refuses a chart that disagrees. Bring them together in this pull
-request; after the tag is pushed the only remedy is another release.
+The stable release workflow publishes every chart at the workspace version.
+Bring them together in this pull request; after a registry accepts an artifact
+the only remedy is another release.
 EOF
   exit 1
 fi

@@ -6,9 +6,21 @@ on:
       - .dockerignore
       - .github/workflows/docker-publish.yml
       - Dockerfile
-  push:
-    tags:
-      - "v*.*.*"
+  workflow_call:
+    inputs:
+      publish:
+        required: true
+        type: boolean
+      version:
+        required: true
+        type: string
+      source_revision:
+        required: true
+        type: string
+    outputs:
+      digest:
+        description: Published multi-platform image digest
+        value: ${{ jobs.docker.outputs.digest }}
 
 permissions:
   contents: read
@@ -17,8 +29,8 @@ permissions:
   id-token: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: docker-${{ inputs.source_revision || github.sha }}
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
@@ -30,15 +42,35 @@ jobs:
   docker:
     name: Docker image
     runs-on: ubuntu-24.04
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_revision || github.sha }}
+
+      - name: Validate release inputs
+        if: inputs.publish
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          SOURCE_REVISION: ${{ inputs.source_revision }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
+          test "$(awk '
+            /^\[workspace\.package\]/ { in_section = 1; next }
+            /^\[/ { in_section = 0 }
+            in_section && $1 == "version" { gsub(/"/, "", $3); print $3; exit }
+          ' Cargo.toml)" = "$RELEASE_VERSION"
 
       - name: Set up Depot
         uses: depot/setup-action@v1
 
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
+        if: inputs.publish
         uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
@@ -52,18 +84,22 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=pr
-            type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{version}},value=${{ inputs.version }},enable=${{ inputs.publish }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }},enable=${{ inputs.publish }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ inputs.source_revision || github.sha }}
+            org.opencontainers.image.version=${{ inputs.version || format('pr-{0}', github.event.number) }}
 
       - name: Build and publish Docker image
+        id: build
         uses: depot/build-push-action@v1
         with:
           project: ls2d88cjpz
           context: .
           file: ./Dockerfile
           platforms: ${{ env.DOCKER_PLATFORMS }}
-          push: ${{ github.ref_type == 'tag' }}
+          push: ${{ inputs.publish }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
