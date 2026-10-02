@@ -1,6 +1,7 @@
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::future::Future;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
@@ -13,6 +14,7 @@ use std::sync::atomic::AtomicU64;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::time::SystemTime;
 
 use futures_util::FutureExt;
@@ -40,16 +42,21 @@ pub(crate) struct ObjectInfo {
     pub modified: Option<SystemTime>,
 }
 
-/// One object-store operation, as seen by an [`ObjectFaults`] hook.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// One object-store operation, as seen by [`ObjectHooks::decide`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ObjectOp {
-    /// A whole-object read (an S3 HEAD plus a conditional GET).
+    /// A whole-object read with its entity tag (an S3 HEAD plus a
+    /// conditional GET).
     Get,
     /// A ranged read (one GET).
     GetRange,
-    /// An entity-tag lookup (one HEAD).
+    /// An entity-tag or metadata lookup (one HEAD).
     Head,
-    /// A put-if-absent or compare-and-swap write (one PUT).
+    /// A create-only write (one PUT).
+    PutIfAbsent,
+    /// A write conditional on the current entity tag (one PUT).
+    CompareAndSwap,
+    /// An unconditional write (one PUT).
     Put,
     /// A recursive listing (one LIST per page).
     List,
@@ -57,13 +64,99 @@ pub enum ObjectOp {
     Delete,
 }
 
-/// Fault injection for object-store operations (crash-injection tests):
-/// consulted before every operation of a store built with
-/// [`ObjectStore::with_faults`]; an error fails the operation without
-/// performing it.
-pub trait ObjectFaults: Send + Sync {
-    /// Called before `op` on `key` (the prefix for [`ObjectOp::List`]).
-    fn check(&self, op: ObjectOp, key: &str) -> Result<(), IndexError>;
+impl ObjectOp {
+    /// Whether the operation mutates the store.
+    pub fn is_mutation(self) -> bool {
+        matches!(
+            self,
+            Self::PutIfAbsent | Self::CompareAndSwap | Self::Put | Self::Delete
+        )
+    }
+
+    /// Whether the operation writes an object (any PUT).
+    pub fn is_write(self) -> bool {
+        matches!(self, Self::PutIfAbsent | Self::CompareAndSwap | Self::Put)
+    }
+}
+
+/// The fault injected into one operation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ObjectFault {
+    /// The operation runs normally.
+    #[default]
+    None,
+    /// The operation fails without effect.
+    Fail,
+    /// A conditional write reports a conflict without effect (a spurious
+    /// precondition failure); other operations run normally.
+    Conflict,
+    /// A mutation takes effect and then reports a failure (a lost response);
+    /// reads fail without effect.
+    Ambiguous,
+}
+
+/// Latency and fault of one operation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FaultDecision {
+    /// Delay before the operation runs (slept on the task seam, so it is
+    /// virtual time under `cfg(madsim)`).
+    pub delay: Duration,
+    /// The injected fault.
+    pub fault: ObjectFault,
+}
+
+impl FaultDecision {
+    /// The operation fails without effect.
+    pub fn fail() -> Self {
+        Self {
+            delay: Duration::ZERO,
+            fault: ObjectFault::Fail,
+        }
+    }
+}
+
+/// A mutation that took effect.
+#[derive(Clone, Copy, Debug)]
+pub enum AppliedChange<'a> {
+    /// `key` now holds `bytes`.
+    Put {
+        /// Object key.
+        key: &'a str,
+        /// The written bytes.
+        bytes: &'a [u8],
+    },
+    /// `key`, which existed, was deleted.
+    Delete {
+        /// Object key.
+        key: &'a str,
+    },
+}
+
+/// Fault injection and mutation observation for any object store (the one
+/// mechanism of crash-injection tests and the indexer simulation), installed
+/// with [`ObjectStore::with_hooks`].
+///
+/// Every operation first asks [`Self::decide`] for a latency and a fault.
+/// Mutations that took effect are reported to [`Self::applied`] as soon as
+/// the backend returns, before the caller resumes; over the in-memory store,
+/// whose operations never suspend, that is the exact order in which they
+/// took effect.
+pub trait ObjectHooks: Send + Sync {
+    /// The latency and fault of the next operation `op` on `key` (the
+    /// prefix for [`ObjectOp::List`]).
+    fn decide(&self, op: ObjectOp, key: &str) -> FaultDecision {
+        let _unused = (op, key);
+        FaultDecision::default()
+    }
+
+    /// Called right after a mutation took effect.
+    fn applied(&self, change: AppliedChange<'_>) {
+        let _unused = change;
+    }
+}
+
+fn injected(op: ObjectOp, key: &str) -> IndexError {
+    IndexError::ObjectStore(format!("injected {op:?} failure on `{key}`"))
 }
 
 /// Object-store requests by S3 request class, counted as the S3 backend
@@ -118,7 +211,7 @@ impl ObjectRequestCounters {
             }
             ObjectOp::GetRange => bump(&self.get),
             ObjectOp::Head => bump(&self.head),
-            ObjectOp::Put => bump(&self.put),
+            ObjectOp::PutIfAbsent | ObjectOp::CompareAndSwap | ObjectOp::Put => bump(&self.put),
             ObjectOp::List => bump(&self.list),
             ObjectOp::Delete => bump(&self.delete),
         }
@@ -136,22 +229,63 @@ impl ObjectRequestCounters {
     }
 }
 
-/// A store whose requests are counted and, optionally, fault-injected.
+/// A store whose requests are counted, or go through [`ObjectHooks`].
 pub struct ObservedStore {
     inner: ObjectStore,
     counters: Option<Arc<ObjectRequestCounters>>,
-    faults: Option<Arc<dyn ObjectFaults>>,
+    hooks: Option<Arc<dyn ObjectHooks>>,
 }
 
 impl ObservedStore {
-    fn before(&self, op: ObjectOp, key: &str) -> Result<(), IndexError> {
-        if let Some(faults) = &self.faults {
-            faults.check(op, key)?;
+    /// Applies the hooks' latency and fault, then counts the request.
+    /// Returns the fault the operation still has to act on (a conflict or
+    /// an ambiguous mutation).
+    async fn before(&self, op: ObjectOp, key: &str) -> Result<ObjectFault, IndexError> {
+        let fault = match &self.hooks {
+            Some(hooks) => {
+                let decision = hooks.decide(op, key);
+                if !decision.delay.is_zero() {
+                    crate::rt::time::sleep(decision.delay).await;
+                }
+                decision.fault
+            }
+            None => ObjectFault::None,
+        };
+        if fault == ObjectFault::Fail || (fault == ObjectFault::Ambiguous && !op.is_mutation()) {
+            return Err(injected(op, key));
         }
         if let Some(counters) = &self.counters {
             counters.record(op);
         }
-        Ok(())
+        Ok(fault)
+    }
+
+    fn applied(&self, change: AppliedChange<'_>) {
+        if let Some(hooks) = &self.hooks {
+            hooks.applied(change);
+        }
+    }
+
+    /// Runs a conditional write under the decided fault.
+    async fn write(
+        &self,
+        op: ObjectOp,
+        key: &str,
+        bytes: &[u8],
+        write: impl Future<Output = Result<ConditionalWrite, IndexError>>,
+    ) -> Result<ConditionalWrite, IndexError> {
+        let fault = self.before(op, key).await?;
+        if fault == ObjectFault::Conflict && op != ObjectOp::Put {
+            return Ok(ConditionalWrite::Conflict);
+        }
+        let outcome = write.await?;
+        if outcome == ConditionalWrite::Written {
+            self.applied(AppliedChange::Put { key, bytes });
+        }
+        if fault == ObjectFault::Ambiguous {
+            return Err(injected(op, key));
+        }
+        Ok(outcome)
     }
 }
 
@@ -163,9 +297,9 @@ impl ObservedStore {
 pub enum ObjectStore {
     Fs(FsObjectStore),
     S3(S3ObjectStore),
-    /// A counted and possibly fault-injected view of another store.
+    /// A counted or hooked view of another store.
     Observed(Arc<ObservedStore>),
-    /// In-memory, with deterministic fault hooks (simulation and tests).
+    /// In-memory (simulation and tests).
     Memory(crate::MemoryObjectStore),
 }
 
@@ -175,16 +309,18 @@ impl ObjectStore {
         Self::Observed(Arc::new(ObservedStore {
             inner: self,
             counters: Some(counters),
-            faults: None,
+            hooks: None,
         }))
     }
 
-    /// This store with every operation first checked by `faults`.
-    pub fn with_faults(self, faults: Arc<dyn ObjectFaults>) -> Self {
+    /// This store with every operation going through `hooks`: latency and
+    /// faults decided per operation, and every mutation that took effect
+    /// reported.
+    pub fn with_hooks(self, hooks: Arc<dyn ObjectHooks>) -> Self {
         Self::Observed(Arc::new(ObservedStore {
             inner: self,
             counters: None,
-            faults: Some(faults),
+            hooks: Some(hooks),
         }))
     }
 
@@ -196,9 +332,9 @@ impl ObjectStore {
             match self {
                 Self::Fs(store) => store.get(key),
                 Self::S3(store) => store.get(key).await,
-                Self::Memory(store) => store.get(key).await,
+                Self::Memory(store) => Ok(store.get(key)),
                 Self::Observed(store) => {
-                    store.before(ObjectOp::Get, key)?;
+                    store.before(ObjectOp::Get, key).await?;
                     store.inner.get(key).await
                 }
             }
@@ -215,9 +351,9 @@ impl ObjectStore {
             match self {
                 Self::Fs(store) => Ok(store.get(key)?.map(|object| object.etag)),
                 Self::S3(store) => store.head(key).await,
-                Self::Memory(store) => Ok(store.get(key).await?.map(|object| object.etag)),
+                Self::Memory(store) => Ok(store.get(key).map(|object| object.etag)),
                 Self::Observed(store) => {
-                    store.before(ObjectOp::Head, key)?;
+                    store.before(ObjectOp::Head, key).await?;
                     store.inner.head(key).await
                 }
             }
@@ -234,9 +370,9 @@ impl ObjectStore {
             match self {
                 Self::Fs(store) => store.get_range(key, range),
                 Self::S3(store) => store.get_range(key, range).await,
-                Self::Memory(store) => store.get_range(key, range).await,
+                Self::Memory(store) => store.get_range(key, range),
                 Self::Observed(store) => {
-                    store.before(ObjectOp::GetRange, key)?;
+                    store.before(ObjectOp::GetRange, key).await?;
                     store.inner.get_range(key, range).await
                 }
             }
@@ -253,10 +389,16 @@ impl ObjectStore {
             match self {
                 Self::Fs(store) => store.put_if_absent(key, bytes),
                 Self::S3(store) => store.put_if_absent(key, bytes).await,
-                Self::Memory(store) => store.put_if_absent(key, bytes).await,
+                Self::Memory(store) => Ok(store.put_if_absent(key, bytes)),
                 Self::Observed(store) => {
-                    store.before(ObjectOp::Put, key)?;
-                    store.inner.put_if_absent(key, bytes).await
+                    store
+                        .write(
+                            ObjectOp::PutIfAbsent,
+                            key,
+                            bytes,
+                            store.inner.put_if_absent(key, bytes),
+                        )
+                        .await
                 }
             }
         }
@@ -273,12 +415,15 @@ impl ObjectStore {
             match self {
                 Self::Fs(store) => store.compare_and_swap(key, expected_etag, bytes),
                 Self::S3(store) => store.compare_and_swap(key, expected_etag, bytes).await,
-                Self::Memory(store) => store.compare_and_swap(key, expected_etag, bytes).await,
+                Self::Memory(store) => Ok(store.compare_and_swap(key, expected_etag, bytes)),
                 Self::Observed(store) => {
-                    store.before(ObjectOp::Put, key)?;
                     store
-                        .inner
-                        .compare_and_swap(key, expected_etag, bytes)
+                        .write(
+                            ObjectOp::CompareAndSwap,
+                            key,
+                            bytes,
+                            store.inner.compare_and_swap(key, expected_etag, bytes),
+                        )
                         .await
                 }
             }
@@ -294,9 +439,9 @@ impl ObjectStore {
             match self {
                 Self::Fs(store) => store.list(prefix),
                 Self::S3(store) => store.list(prefix).await,
-                Self::Memory(store) => store.list(prefix).await,
+                Self::Memory(store) => Ok(store.list(prefix)),
                 Self::Observed(store) => {
-                    store.before(ObjectOp::List, prefix)?;
+                    store.before(ObjectOp::List, prefix).await?;
                     store.inner.list(prefix).await
                 }
             }
@@ -304,15 +449,75 @@ impl ObjectStore {
         .boxed()
     }
 
-    pub(crate) fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), IndexError>> {
+    pub(crate) async fn delete(&self, key: &str) -> Result<(), IndexError> {
+        self.delete_reporting(key).await.map(|_existed| ())
+    }
+
+    /// Deletes `key`; returns whether it may have existed (always `true`
+    /// for S3, which does not say).
+    fn delete_reporting<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<bool, IndexError>> {
         async move {
             match self {
                 Self::Fs(store) => store.delete(key),
-                Self::S3(store) => store.delete(key).await,
-                Self::Memory(store) => store.delete(key).await,
+                Self::S3(store) => store.delete(key).await.map(|()| true),
+                Self::Memory(store) => Ok(store.delete(key)),
                 Self::Observed(store) => {
-                    store.before(ObjectOp::Delete, key)?;
-                    store.inner.delete(key).await
+                    let fault = store.before(ObjectOp::Delete, key).await?;
+                    let existed = store.inner.delete_reporting(key).await?;
+                    if existed {
+                        store.applied(AppliedChange::Delete { key });
+                    }
+                    if fault == ObjectFault::Ambiguous {
+                        return Err(injected(ObjectOp::Delete, key));
+                    }
+                    Ok(existed)
+                }
+            }
+        }
+        .boxed()
+    }
+
+    /// Writes `bytes` to `key` unconditionally (a content-addressed object
+    /// rewritten with the same bytes, which restarts its age).
+    pub(crate) fn put<'a>(
+        &'a self,
+        key: &'a str,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<(), IndexError>> {
+        async move {
+            match self {
+                Self::Fs(store) => store.put(key, bytes),
+                Self::S3(store) => store.put(key, bytes).await,
+                Self::Memory(store) => {
+                    store.put(key, bytes);
+                    Ok(())
+                }
+                Self::Observed(store) => store
+                    .write(ObjectOp::Put, key, bytes, async {
+                        store.inner.put(key, bytes).await?;
+                        Ok::<_, IndexError>(ConditionalWrite::Written)
+                    })
+                    .await
+                    .map(|_written| ()),
+            }
+        }
+        .boxed()
+    }
+
+    /// Key and modification time of `key` (one HEAD), or `None` when it is
+    /// absent.
+    pub(crate) fn stat<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<ObjectInfo>, IndexError>> {
+        async move {
+            match self {
+                Self::Fs(store) => store.stat(key),
+                Self::S3(store) => store.stat(key).await,
+                Self::Memory(store) => Ok(store.stat(key)),
+                Self::Observed(store) => {
+                    store.before(ObjectOp::Head, key).await?;
+                    store.inner.stat(key).await
                 }
             }
         }
@@ -489,10 +694,26 @@ impl FsObjectStore {
         Ok(objects)
     }
 
-    fn delete(&self, key: &str) -> Result<(), IndexError> {
+    fn delete(&self, key: &str) -> Result<bool, IndexError> {
         match fs::remove_file(self.path(key)?) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), IndexError> {
+        self.write_locked(key, bytes, "create-lock", |_path| Ok(true))
+            .map(|_written| ())
+    }
+
+    fn stat(&self, key: &str) -> Result<Option<ObjectInfo>, IndexError> {
+        match fs::metadata(self.path(key)?) {
+            Ok(metadata) => Ok(Some(ObjectInfo {
+                key: key.to_owned(),
+                modified: metadata.modified().ok(),
+            })),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
@@ -657,6 +878,25 @@ impl S3ObjectStore {
 
     async fn delete(&self, key: &str) -> Result<(), IndexError> {
         self.operator.delete(key).await.map_err(object_error)
+    }
+
+    async fn put(&self, key: &str, bytes: &[u8]) -> Result<(), IndexError> {
+        self.operator
+            .write(key, bytes.to_vec())
+            .await
+            .map(|_metadata| ())
+            .map_err(object_error)
+    }
+
+    async fn stat(&self, key: &str) -> Result<Option<ObjectInfo>, IndexError> {
+        match self.operator.stat(key).await {
+            Ok(metadata) => Ok(Some(ObjectInfo {
+                key: key.to_owned(),
+                modified: metadata.last_modified().map(Into::into),
+            })),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(object_error(error)),
+        }
     }
 }
 

@@ -9,6 +9,13 @@
 //! - A continuity rebuild split by `max_ingest_bytes` must not publish a `D`
 //!   below the one it replaces while the source still holds that many
 //!   records (`D` is monotone per namespace).
+//! - Cross-pod reuse: pins only order one engine's own GC. Another pod's
+//!   GC (or a sweep run as a separate process) can delete an old orphan
+//!   that a writer reuses through the content-addressed put-if-absent
+//!   dedupe; the writer must not publish a manifest whose part is gone.
+//!   Deleters therefore act only on fresh observations: a sweep whose
+//!   LIST is older than the decision TTL observes an object again before
+//!   deleting it.
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -26,12 +33,18 @@ use std::time::Duration;
 
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
+use ursula_index::AppliedChange;
+use ursula_index::FaultDecision;
 use ursula_index::MemoryObjectStore;
+use ursula_index::ObjectFault;
+use ursula_index::ObjectHooks;
+use ursula_index::ObjectOp;
 use ursula_index::ObjectStore;
 use ursula_index::clock::Clock;
 use ursula_index::keyed::IncarnationState;
 use ursula_index::keyed::KeyedEngine;
 use ursula_index::keyed::KeyedEngineConfig;
+use ursula_index::keyed::KeyedEntry;
 use ursula_index::keyed::KeyedManifest;
 use ursula_index::keyed::KeyedNamespace;
 use ursula_index::keyed::KeyedReadOutcome;
@@ -39,17 +52,16 @@ use ursula_index::keyed::KeyedReadRequest;
 use ursula_index::keyed::KeyedSource;
 use ursula_index::keyed::KeyedState;
 use ursula_index::keyed::Lower;
+use ursula_index::keyed::PartOptions;
 use ursula_index::keyed::RangeQuery;
 use ursula_index::keyed::Selection;
 use ursula_index::keyed::SourceClient;
 use ursula_index::keyed::SourceError;
 use ursula_index::keyed::SourcePage;
 use ursula_index::keyed::encode_key;
-use ursula_index::memory_store::AppliedChange;
-use ursula_index::memory_store::FaultDecision;
-use ursula_index::memory_store::MemoryStoreHooks;
-use ursula_index::memory_store::ObjectFault;
-use ursula_index::memory_store::ObjectOp;
+use ursula_index::keyed::manifest::ObjectWrite;
+use ursula_index::keyed::manifest::delete_decision_ttl;
+use ursula_index::keyed::part::encode_part;
 
 const GRACE: Duration = Duration::from_secs(10);
 
@@ -117,7 +129,7 @@ struct Script {
     deleted: Mutex<Vec<String>>,
 }
 
-impl MemoryStoreHooks for Script {
+impl ObjectHooks for Script {
     fn decide(&self, op: ObjectOp, _key: &str) -> FaultDecision {
         match op {
             ObjectOp::CompareAndSwap if self.conflict_next_cas.swap(false, Ordering::SeqCst) => {
@@ -189,9 +201,9 @@ async fn queued_deletion_spares_a_part_republished_by_a_retry() {
     });
     let clock: Arc<dyn Clock> = Arc::new(TestClock(tokio::time::Instant::now()));
     let raw = MemoryObjectStore::new(Arc::clone(&clock));
-    let store = raw.with_hooks(script.clone());
+    let store = ObjectStore::from(raw.clone()).with_hooks(script.clone());
     let engine = KeyedEngine::with_clock(
-        ObjectStore::from(store.clone()),
+        store.clone(),
         Arc::clone(&log),
         None,
         KeyedEngineConfig {
@@ -240,7 +252,7 @@ async fn queued_deletion_spares_a_part_republished_by_a_retry() {
 
     // Every object the current manifest references still exists, and the
     // keyed state is readable and equals the fold.
-    let published = KeyedNamespace::new(ObjectStore::from(raw.without_hooks()), source())
+    let published = KeyedNamespace::new(ObjectStore::from(raw.clone()), source())
         .load()
         .await
         .unwrap()
@@ -333,4 +345,197 @@ async fn split_continuity_rebuild_never_publishes_a_lower_d() {
             pair[1]
         );
     }
+}
+
+/// Every object `CURRENT` references, and whether it exists.
+fn referenced_objects(raw: &MemoryObjectStore) -> Vec<(String, bool)> {
+    let existing: Vec<String> = raw.snapshot().into_iter().map(|(key, _)| key).collect();
+    let current = existing
+        .iter()
+        .find(|key| key.ends_with("/CURRENT"))
+        .expect("a published namespace")
+        .clone();
+    let prefix = current.trim_end_matches("CURRENT").to_owned();
+    let pointer: serde_json::Value =
+        serde_json::from_slice(&raw.object_bytes(&current).unwrap()).unwrap();
+    let manifest_key = pointer["manifest"].as_str().unwrap().to_owned();
+    let manifest: KeyedManifest = serde_json::from_slice(
+        &raw.object_bytes(&format!("{prefix}{manifest_key}"))
+            .unwrap(),
+    )
+    .unwrap();
+    std::iter::once(manifest_key)
+        .chain(manifest.part_keys().map(str::to_owned))
+        .map(|key| {
+            let object = format!("{prefix}{key}");
+            let exists = existing.contains(&object);
+            (key, exists)
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn another_pods_gc_cannot_delete_a_part_reused_by_dedupe() {
+    let log = Arc::new(FakeLog::default());
+    let clock: Arc<dyn Clock> = Arc::new(TestClock(tokio::time::Instant::now()));
+    let raw = MemoryObjectStore::new(Arc::clone(&clock));
+    let config = KeyedEngineConfig {
+        min_publish_interval: Duration::ZERO,
+        gc_grace: GRACE,
+        gc_tick: Duration::from_secs(3_600),
+        // Reads go to the store, so a deleted part is noticed.
+        write_cache_bytes: 0,
+        ..KeyedEngineConfig::default()
+    };
+    // Pod A serves; pod B loses a CAS and later collects its garbage, with
+    // its DELETEs in flight for a while.
+    let pod_a = KeyedEngine::with_clock(
+        ObjectStore::from(raw.clone()),
+        Arc::clone(&log),
+        None,
+        config.clone(),
+        Arc::clone(&clock),
+    );
+    let script = Arc::new(Script {
+        log: Arc::clone(&log),
+        conflict_next_cas: AtomicBool::new(false),
+        delete_delay: Mutex::new(Duration::ZERO),
+        deleted: Mutex::new(Vec::new()),
+    });
+    let pod_b = KeyedEngine::with_clock(
+        ObjectStore::from(raw.clone()).with_hooks(script.clone()),
+        Arc::clone(&log),
+        None,
+        config,
+        Arc::clone(&clock),
+    );
+
+    // Generation 1 covers records 0..2.
+    log.records.lock().unwrap().extend((0..2).map(record));
+    let KeyedReadOutcome::Rows { through: 2, .. } = read(&pod_a, 2, Duration::from_secs(5)).await
+    else {
+        panic!("first publication");
+    };
+
+    // Pod B folds records 2..4 and loses its CAS: its parts are orphans in
+    // its GC queue, due after the grace period.
+    log.records.lock().unwrap().extend((2..4).map(record));
+    script.conflict_next_cas.store(true, Ordering::SeqCst);
+    let outcome = read(&pod_b, 4, Duration::from_secs(1)).await;
+    assert!(
+        !matches!(outcome, KeyedReadOutcome::Rows { through: 4, .. }),
+        "{outcome:?}"
+    );
+    let orphans: Vec<String> = raw
+        .snapshot()
+        .into_iter()
+        .map(|(key, _)| key)
+        .filter(|key| key.contains("/parts/"))
+        .collect();
+
+    // Past the grace period, pod B's GC decides to delete them (they are
+    // old and unreferenced); its DELETEs take a second to land.
+    tokio::time::sleep(GRACE + Duration::from_secs(1)).await;
+    *script.delete_delay.lock().unwrap() = Duration::from_secs(1);
+    let gc = tokio::spawn({
+        let pod_b = pod_b.clone();
+        async move { pod_b.collect_garbage().await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // Meanwhile pod A folds the same records into byte-identical parts,
+    // finds them present and reuses them.
+    log.failing.store(false, Ordering::SeqCst);
+    let outcome = read(&pod_a, 4, Duration::from_secs(30)).await;
+    let deleted = gc.await.unwrap();
+    assert!(deleted > 0, "pod B's GC ran");
+    assert!(
+        script
+            .deleted
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|key| orphans.contains(key)),
+        "pod B deleted a part pod A was reusing"
+    );
+    let KeyedReadOutcome::Rows { through: 4, .. } = outcome else {
+        panic!("second publication: {outcome:?}");
+    };
+    let missing: Vec<String> = referenced_objects(&raw)
+        .into_iter()
+        .filter(|(_, exists)| !exists)
+        .map(|(key, _)| key)
+        .collect();
+    assert!(missing.is_empty(), "CURRENT references missing {missing:?}");
+    let KeyedReadOutcome::Rows { through: 4, page } = read(&pod_a, 4, Duration::from_secs(5)).await
+    else {
+        panic!("keyed state is unreadable");
+    };
+    let records = log.records.lock().unwrap().clone();
+    let state = KeyedState::fold(records.iter().map(String::as_str)).unwrap();
+    assert_eq!(page.body(), state.range(&all_rows()).body());
+    assert!(pod_a.metrics().reused_settled > 0);
+}
+
+/// Delays every DELETE.
+struct SlowDeletes(Duration);
+
+impl ObjectHooks for SlowDeletes {
+    fn decide(&self, op: ObjectOp, _key: &str) -> FaultDecision {
+        FaultDecision {
+            delay: if op == ObjectOp::Delete {
+                self.0
+            } else {
+                Duration::ZERO
+            },
+            fault: ObjectFault::None,
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn sweep_observes_again_before_acting_on_a_stale_listing() {
+    let clock: Arc<dyn Clock> = Arc::new(TestClock(tokio::time::Instant::now()));
+    let raw = MemoryObjectStore::new(Arc::clone(&clock));
+    let writer = KeyedNamespace::new(ObjectStore::from(raw.clone()), source());
+    let options = PartOptions::default();
+    let mut parts: Vec<_> = (0..2_u8)
+        .map(|index| {
+            let entry = KeyedEntry {
+                key: vec![index],
+                record: u64::from(index),
+                value: Some(index.to_string()),
+            };
+            encode_part(&[entry], &[], &options).unwrap()
+        })
+        .collect();
+    parts.sort_by(|a, b| a.meta.key.cmp(&b.meta.key));
+    for part in &parts {
+        assert_eq!(writer.put_part(part).await.unwrap(), ObjectWrite::Created);
+    }
+    tokio::time::sleep(GRACE + Duration::from_secs(1)).await;
+
+    // The sweep lists both orphans as old; its first DELETE takes longer
+    // than the decision TTL, and meanwhile a writer reuses the second one.
+    assert!(Duration::from_secs(3) > delete_decision_ttl(GRACE));
+    let sweeper = KeyedNamespace::new(
+        ObjectStore::from(raw.clone()).with_hooks(Arc::new(SlowDeletes(Duration::from_secs(3)))),
+        source(),
+    );
+    let sweep = tokio::spawn({
+        let clock = Arc::clone(&clock);
+        async move { sweeper.sweep(&*clock, GRACE, false).await }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        writer.put_part(&parts[1]).await.unwrap(),
+        ObjectWrite::Refreshed
+    );
+    let report = sweep.await.unwrap().unwrap();
+    assert_eq!(report.deleted, vec![parts[0].meta.key.clone()]);
+    let existing: Vec<String> = raw.snapshot().into_iter().map(|(key, _)| key).collect();
+    assert!(
+        existing.iter().any(|key| key.ends_with(&parts[1].meta.key)),
+        "the reused part survived the sweep"
+    );
 }

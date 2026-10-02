@@ -67,28 +67,28 @@ const storage = await UrsulaStorage.open({ log, keyedState, mode: "fail-if-activ
 
 ## M3 benchmark results
 
-`npm run bench:e2e` (`test/e2e/perf/open.perf.ts`) on 2026-10-02: Apple Silicon laptop, 10 cores, under a load
-average of about 15 from other builds; single-node memory-engine `ursula` plus the keyed indexer on the same
-machine, 30 interleaved samples per scenario after one warm-up open. Histories are written by a real Pi
-Harness (two text turns and one tool turn per three, a `pi.reset` every 30 turns) and bulk-loaded. Harness-level
-open is `UrsulaStorage.open` + `Harness.open` + root + `resume()` + first `taskGraph` + first `viewState`;
-first submit is submit → provider request.
+`npm run bench:e2e` (`test/e2e/perf/open.perf.ts`) on 2026-10-02, after the indexer read-path fix (decoded part
+footers, page indexes and verified tails cached per part and shared by the pod, write cache footers decoded once,
+memory-hit range blocks not re-hashed, single-block reads without copying): Apple Silicon laptop, 10 cores, under
+load from other builds; single-node memory-engine `ursula` plus the keyed indexer on the same machine, 30
+interleaved samples per scenario after one warm-up open. Histories are written by a real Pi Harness (two text
+turns and one tool turn per three, a `pi.reset` every 30 turns) and bulk-loaded. Harness-level open is
+`UrsulaStorage.open` + `Harness.open` + root + `resume()` + first `taskGraph` + first `viewState`; first submit
+is submit → provider request.
 
 | Scenario | Records | Open p50 / p99 (ms) | First submit p50 (ms) | Remote reads at open | keyed-state point read p50 (ms) |
 |---|---|---|---|---|---|
-| 1k records | 1,004 | 6.5 / 10.2 | 1.5 | 21 | 0.32 |
-| 100k records | 100,005 | 12.7 / 18.1 | 1.6 | 21 | 1.04 |
-| 10 conversations | 6,001 | 17.8 / 48.5 | 3.6 | 21 | 0.61 |
-| 1,000 conversations | 5,997 | 12.7 / 62.0 | 3.2 | 21 | 0.75 |
+| 1k records | 1,004 | 5.7 / 8.9 | 1.5 | 21 | 0.26 |
+| 100k records | 100,005 | 5.7 / 8.1 | 1.4 | 21 | 0.21 |
+| 10 conversations | 6,001 | 5.0 / 8.6 | 1.2 | 21 | 0.24 |
+| 1,000 conversations | 5,997 | 4.2 / 7.2 | 1.3 | 21 | 0.17 |
 
-Gates: open p50 ≤ 250 ms and p99 ≤ 1 s, and first submit p50 ≤ 300 ms, pass everywhere. 1,000 vs 10
-conversations: 0.71× (pass). 100k vs 1k records: 1.95× (fails the 1.2× gate). The owner side is flat: the same
-21 keyed-state reads at open in both cases, at most about four round trips deep, with `viewState` and the first
-turn fully local (0 remote reads). The growth is the keyed-state read latency itself: sequential warm point reads
-of `m/owner` through the node take 0.32 ms at 1k records and 1.04 ms at 100k, and the mean read during open
-goes from 0.9 to 2.2 ms. In absolute terms the difference is 6 ms, far inside the 250 ms budget, but the ratio
-gate needs keyed-state reads that are flat in namespace size (§9.3: 2–6 ms warm), which is the indexer's
-read path, not the owner's.
+Every gate passes: open p50 ≤ 250 ms and p99 ≤ 1 s, first submit p50 ≤ 300 ms, 1,000 vs 10 conversations 0.84×,
+100k vs 1k records 1.00× (gate 1.2×). The owner issues the same 21 keyed-state reads at open in both cases, at
+most about four round trips deep, with `viewState` and the first turn fully local (0 remote reads). Before the
+fix the ratio was 1.95×: keyed-state point reads took 0.32 ms at 1k records and 1.04 ms at 100k, because the
+indexer fetched, hashed and decoded each part's footer and page index on every read. The indexer-side
+microbenchmark is `cargo bench -p ursula-index --bench keyed_point_read`.
 
 Zero remote reads on the Session line for steady-state text and tool turns holds on the fake under every
 indexer mode (`test/bounded-harness.test.ts`) and on the real stack (`test/e2e/steady-state.e2e.ts`), checked

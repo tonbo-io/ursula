@@ -13,6 +13,10 @@ description = "Rebuildable client-event-time index for Ursula JSON record stream
 name = "event_time_query"
 harness = false
 
+[[bench]]
+name = "keyed_point_read"
+harness = false
+
 [dependencies]
 anyhow = { workspace = true }
 arrow-array = { workspace = true }

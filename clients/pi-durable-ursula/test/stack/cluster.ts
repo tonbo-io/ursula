@@ -7,9 +7,11 @@
 // The nodes reach the indexer, and every component reaches S3, through FaultProxy instances, so a
 // drill can take either one down, or cut keyed-state over to another indexer, without touching the
 // processes. Every process logs to a file under the stack directory.
+import { execFile } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { freePort, Proc, sleep, ursulaBinary, waitReady } from "./proc.ts";
 import { FaultProxy } from "./proxy.ts";
 import { S3Client, type S3Server, startS3 } from "./s3.ts";
@@ -65,6 +67,8 @@ export interface IndexerHandle {
 	readonly port: number;
 	readonly url: string;
 }
+
+const execFileAsync = promisify(execFile);
 
 const S3_ROOT = "ursula";
 const ACCESS_ENV = (s3: S3Server): NodeJS.ProcessEnv => ({
@@ -336,6 +340,27 @@ export class Stack {
 		await waitReady(`${url}/readyz`, proc);
 		this.extraProcs.push(proc);
 		return { proc, port: listen, url };
+	}
+
+	/**
+	 * Runs `ursula indexer keyed <verb>` (the U20 maintenance CLI) against the stack's keyed object
+	 * store (S3 through its proxy, or the filesystem) for one stream; returns its JSON report.
+	 */
+	async keyedTool(verb: "verify" | "rebuild" | "sweep" | "dump", bucket: string, stream: string, incarnation: bigint, extra: readonly string[] = []): Promise<unknown> {
+		const args = ["indexer", "keyed", verb, "--bucket", bucket, "--stream", stream, "--incarnation", String(incarnation)];
+		if (this.s3 !== undefined && this.s3Proxy !== undefined) {
+			args.push("--s3-bucket", this.s3Bucket, "--keyed-s3-root", S3_ROOT, "--s3-endpoint", this.s3Proxy.url, "--s3-region", this.s3.region);
+		} else {
+			args.push("--object-dir", join(this.dir, "objects"));
+		}
+		if (verb === "verify" || verb === "rebuild") args.push("--source-url", this.url);
+		args.push(...extra);
+		const { stdout } = await execFileAsync(ursulaBinary(), args, {
+			cwd: this.dir,
+			env: { ...process.env, ...(this.s3 === undefined ? {} : ACCESS_ENV(this.s3)) },
+			maxBuffer: 64 * 1024 * 1024,
+		});
+		return JSON.parse(stdout);
 	}
 
 	/** Stops the current indexer (SIGKILL with `kill`). The proxy keeps pointing at its port. */

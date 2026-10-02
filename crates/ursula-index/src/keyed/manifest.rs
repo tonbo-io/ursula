@@ -11,9 +11,30 @@
 //! from a write, so the writer reads `CURRENT` back with the conditional get
 //! and adopts the tag only when the bytes are its own; anything else is a
 //! conflict, after which the caller reloads.
+//!
+//! Deletion and reuse of content-addressed objects across processes. S3 has
+//! no conditional delete, so a deleter (a pod's GC, the orphan sweep) and a
+//! writer that finds an object already present (a dedupe hit: another pod's
+//! or an earlier attempt's identical part) coordinate through object age:
+//!
+//! - A deleter removes an object only on an observation, made at most
+//!   [`delete_decision_ttl`] before the DELETE is issued, that the object
+//!   is at least the GC grace old and that no manifest a reader may hold
+//!   references it. A staler observation is made again first.
+//! - A writer that hits an existing object rewrites it (its age restarts),
+//!   and, unless it created the object itself recently, waits
+//!   [`settle_delay`] — every decision made before the rewrite has acted
+//!   by then — and rewrites whatever is gone, before publishing a manifest
+//!   that references it ([`KeyedNamespace::settle`]). Like any write, it
+//!   must publish within the grace of that rewrite.
+//!
+//! A deleter that observed the object before the rewrite has therefore
+//! acted before the writer's check, and one that observes it after sees a
+//! young object, or, after the grace, a published `CURRENT` referencing it.
 
 use std::collections::HashSet;
 use std::time::Duration;
+use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use serde::Deserialize;
@@ -22,6 +43,7 @@ use serde::Serialize;
 use super::part::EncodedPart;
 use super::part::StorePartOpener;
 use crate::IndexError;
+use crate::clock::Clock;
 use crate::object_store::ConditionalWrite;
 use crate::object_store::ObjectInfo;
 use crate::object_store::ObjectStore;
@@ -33,6 +55,77 @@ pub const KEYED_MANIFEST_VERSION: u32 = 6;
 pub const KEYED_PROJECTION_FORMAT: u32 = 1;
 /// Name of the pointer object inside a namespace.
 pub const KEYED_CURRENT_KEY: &str = "CURRENT";
+/// Upper bound of [`delete_decision_ttl`].
+pub const MAX_DELETE_DECISION_TTL: Duration = Duration::from_secs(10);
+/// Lower bound of [`delete_decision_ttl`] (tests run with a zero grace).
+pub const MIN_DELETE_DECISION_TTL: Duration = Duration::from_millis(100);
+
+/// How long a deleter may act on one observation of an object's age and of
+/// the manifests referencing it: a quarter of the grace, within
+/// [`MIN_DELETE_DECISION_TTL`]..=[`MAX_DELETE_DECISION_TTL`].
+pub fn delete_decision_ttl(grace: Duration) -> Duration {
+    grace
+        .checked_div(4)
+        .unwrap_or_default()
+        .clamp(MIN_DELETE_DECISION_TTL, MAX_DELETE_DECISION_TTL)
+}
+
+/// How long a writer waits after rewriting an object it found already
+/// present before checking that it survived: twice the longest decision
+/// TTL a deleter may use, leaving the second half for DELETE requests in
+/// flight.
+pub fn settle_delay(grace: Duration) -> Duration {
+    delete_decision_ttl(grace).saturating_mul(2)
+}
+
+/// Outcome of storing a content-addressed object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectWrite {
+    /// The object did not exist and was written.
+    Created,
+    /// The object existed (same key, so same bytes) and was rewritten to
+    /// restart its age; see [`KeyedNamespace::settle`].
+    Refreshed,
+}
+
+/// Result of [`KeyedNamespace::sweep`].
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SweepReport {
+    /// Objects listed.
+    pub listed: usize,
+    /// Objects a manifest that readers may still hold references.
+    pub referenced: usize,
+    /// Unreferenced objects younger than the grace period (kept).
+    pub young: usize,
+    /// Objects deleted (or, in a dry run, that would be).
+    pub deleted: Vec<String>,
+}
+
+/// Generation of a manifest object key, `manifests/{generation:020}-{hash}.json`.
+pub(crate) fn manifest_generation(key: &str) -> Option<u64> {
+    key.strip_prefix("manifests/")?
+        .strip_suffix(".json")?
+        .split_once('-')?
+        .0
+        .parse()
+        .ok()
+}
+
+/// Whether the sweep may delete `key` (relative to the namespace): parts and
+/// manifests only, never `CURRENT`, locks or temporary files.
+pub(crate) fn sweepable(key: &str) -> bool {
+    (key.starts_with("parts/") && key.ends_with(".parquet")) || manifest_generation(key).is_some()
+}
+
+fn millis(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|age| u64::try_from(age.as_millis()).ok())
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// The source a namespace was built from.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -377,7 +470,12 @@ pub struct KeyedNamespace {
     source: KeyedSource,
     format: u32,
     prefix: String,
+    /// The GC grace its writers settle reused objects for.
+    grace: Duration,
 }
+
+/// Default GC grace of a namespace (the engine's default `gc_grace`).
+pub const DEFAULT_GC_GRACE: Duration = Duration::from_secs(600);
 
 impl KeyedNamespace {
     /// The namespace of `source` at the current projection format.
@@ -395,7 +493,21 @@ impl KeyedNamespace {
             source,
             format,
             prefix,
+            grace: DEFAULT_GC_GRACE,
         }
+    }
+
+    /// The GC grace this namespace's writers assume (it sets how long
+    /// [`Self::publish`] settles a manifest it found already present).
+    #[must_use]
+    pub fn with_grace(mut self, grace: Duration) -> Self {
+        self.grace = grace;
+        self
+    }
+
+    /// The GC grace this namespace's writers assume.
+    pub fn grace(&self) -> Duration {
+        self.grace
     }
 
     /// The projection format of this namespace.
@@ -422,14 +534,58 @@ impl KeyedNamespace {
         StorePartOpener::new(self.store.clone(), self.prefix.clone())
     }
 
-    /// Stores a part (put-if-absent; parts are content-addressed, so an
-    /// existing object already holds the same bytes).
-    pub async fn put_part(&self, part: &EncodedPart) -> Result<(), IndexError> {
-        let _written = self
-            .store
-            .put_if_absent(&self.object(&part.meta.key), &part.bytes)
-            .await?;
+    /// Stores a part. Parts are content-addressed, so an existing object
+    /// already holds the same bytes; it is rewritten so that its age
+    /// restarts ([`ObjectWrite::Refreshed`]), and the caller must
+    /// [`Self::settle`] it before publishing a manifest that references it
+    /// (unless it created the object itself within half the grace).
+    pub async fn put_part(&self, part: &EncodedPart) -> Result<ObjectWrite, IndexError> {
+        self.put_content(&part.meta.key, &part.bytes).await
+    }
+
+    async fn put_content(&self, key: &str, bytes: &[u8]) -> Result<ObjectWrite, IndexError> {
+        let object = self.object(key);
+        match self.store.put_if_absent(&object, bytes).await? {
+            ConditionalWrite::Written => Ok(ObjectWrite::Created),
+            ConditionalWrite::Conflict => {
+                self.store.put(&object, bytes).await?;
+                Ok(ObjectWrite::Refreshed)
+            }
+        }
+    }
+
+    /// Makes refreshed objects safe to reference (see the module docs):
+    /// waits [`settle_delay`] of `grace` after their rewrite, then rewrites
+    /// any that a deletion decided before the rewrite removed. `objects` are
+    /// namespace-relative keys with their bytes.
+    pub async fn settle(
+        &self,
+        objects: &[(String, bytes::Bytes)],
+        grace: Duration,
+    ) -> Result<(), IndexError> {
+        if objects.is_empty() {
+            return Ok(());
+        }
+        crate::rt::time::sleep(settle_delay(grace)).await;
+        for (key, bytes) in objects {
+            let object = self.object(key);
+            if self.store.stat(&object).await?.is_none() {
+                tracing::info!(key, "keyed object deleted while being reused; rewriting it");
+                self.store.put(&object, bytes).await?;
+            }
+        }
         Ok(())
+    }
+
+    /// The object's modification time, or `None` when it is absent or its
+    /// age is unknown (one HEAD).
+    pub(crate) async fn modified_ms(&self, key: &str) -> Result<Option<u64>, IndexError> {
+        Ok(self
+            .store
+            .stat(&self.object(key))
+            .await?
+            .and_then(|info| info.modified)
+            .and_then(millis))
     }
 
     /// Deletes an object of the namespace (GC, or a writer's own unpublished
@@ -481,43 +637,130 @@ impl KeyedNamespace {
         Ok(Some(manifest))
     }
 
-    /// The orphan sweep (U20 `sweep`): one LIST of the namespace, then
-    /// deletes every part and manifest that the published manifest does not
-    /// reference and that is older than `grace` at `now_ms`. Objects of
-    /// unknown age are kept. Returns the number of objects deleted.
-    pub async fn sweep(&self, now_ms: u64, grace: Duration) -> Result<usize, IndexError> {
-        let objects = self.store.list(&self.prefix).await?;
-        let published = self.load().await?;
-        let mut referenced: HashSet<&str> = HashSet::new();
-        if let Some(published) = &published {
-            referenced.insert(published.manifest_key.as_str());
-            referenced.extend(published.manifest.part_keys());
-        }
-        let grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
-        let mut deleted = 0_usize;
-        for object in objects {
-            let Some(name) = object.key.strip_prefix(&self.prefix) else {
-                continue;
-            };
-            let data = (name.starts_with("parts/") && name.ends_with(".parquet"))
-                || (name.starts_with("manifests/") && name.ends_with(".json"));
-            if !data || referenced.contains(name) {
-                continue;
-            }
-            let Some(modified_ms) = object
+    /// Every object a reader may still use, at `now_ms`, with the listed
+    /// objects' ages (one GET of `CURRENT` and one per protected manifest).
+    ///
+    /// A manifest is protected when a reader may still use it: the
+    /// published one; every manifest up to the published generation written
+    /// within the grace period; and the newest manifest written before it,
+    /// which may have been the published one when the period began.
+    /// Everything they reference is protected too.
+    async fn protected(
+        &self,
+        objects: &[ObjectInfo],
+        now_ms: u64,
+        grace: Duration,
+    ) -> Result<HashSet<String>, IndexError> {
+        let Some(published) = self.load().await? else {
+            return Ok(HashSet::new());
+        };
+        let young = |object: &ObjectInfo| {
+            object
                 .modified
-                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                .and_then(|age| u64::try_from(age.as_millis()).ok())
-            else {
-                continue;
-            };
-            if now_ms.saturating_sub(modified_ms) < grace_ms {
+                .and_then(millis)
+                .is_none_or(|modified| now_ms.saturating_sub(modified) < duration_ms(grace))
+        };
+        let current_generation = published.manifest.generation;
+        let manifests: Vec<(u64, &str, bool)> = objects
+            .iter()
+            .filter_map(|object| {
+                manifest_generation(&object.key)
+                    .filter(|generation| *generation <= current_generation)
+                    .map(|generation| (generation, object.key.as_str(), young(object)))
+            })
+            .collect();
+        let window_start = manifests
+            .iter()
+            .filter(|(_, _, young)| !young)
+            .map(|(generation, _, _)| *generation)
+            .max();
+        let mut protected: HashSet<String> = HashSet::new();
+        protected.insert(published.manifest_key.clone());
+        protected.extend(published.manifest.part_keys().map(str::to_owned));
+        for (generation, key, young) in &manifests {
+            let at_window_start =
+                Some(*generation) == window_start && *generation < current_generation;
+            if !(*young || at_window_start) || *key == published.manifest_key {
                 continue;
             }
-            self.store.delete(&object.key).await?;
-            deleted = deleted.saturating_add(1);
+            protected.insert((*key).to_owned());
+            if let Some(manifest) = self.manifest(key).await? {
+                protected.extend(manifest.part_keys().map(str::to_owned));
+            }
         }
-        Ok(deleted)
+        Ok(protected)
+    }
+
+    /// The orphan sweep (U20 `sweep`, also run by the engine): one LIST of
+    /// the namespace, then deletes every part and manifest that is older
+    /// than `grace` at `clock`'s time and that no manifest a reader may
+    /// still hold references (see `protected`). `CURRENT`, unknown objects
+    /// and objects of unknown age are never deleted.
+    ///
+    /// Each deletion acts on observations at most [`delete_decision_ttl`]
+    /// old: past that, the protected set is reloaded (it only grows) and the
+    /// object's age is observed again (one HEAD) before its DELETE.
+    pub async fn sweep(
+        &self,
+        clock: &dyn Clock,
+        grace: Duration,
+        dry_run: bool,
+    ) -> Result<SweepReport, IndexError> {
+        let ttl_ms = duration_ms(delete_decision_ttl(grace));
+        let grace_ms = duration_ms(grace);
+        let listed_at = clock.now_ms();
+        let objects = self.objects().await?;
+        let mut protected = self.protected(&objects, listed_at, grace).await?;
+        let mut protected_at = listed_at;
+        let mut report = SweepReport {
+            listed: objects.len(),
+            ..SweepReport::default()
+        };
+        for object in objects {
+            if object.key == KEYED_CURRENT_KEY || !sweepable(&object.key) {
+                continue;
+            }
+            if protected.contains(&object.key) {
+                report.referenced = report.referenced.saturating_add(1);
+                continue;
+            }
+            let mut observed_at = listed_at;
+            let mut modified = object.modified.and_then(millis);
+            let old = |modified: Option<u64>, at: u64| {
+                modified.is_some_and(|modified| at.saturating_sub(modified) >= grace_ms)
+            };
+            if !old(modified, observed_at) {
+                report.young = report.young.saturating_add(1);
+                continue;
+            }
+            if !dry_run && clock.now_ms().saturating_sub(observed_at) > ttl_ms {
+                // A stale observation: observe the age again, then, when
+                // stale too, the manifests that may reference the object.
+                observed_at = clock.now_ms();
+                modified = self.modified_ms(&object.key).await?;
+                if modified.is_none() {
+                    continue;
+                }
+                if !old(modified, observed_at) {
+                    report.young = report.young.saturating_add(1);
+                    continue;
+                }
+                if observed_at.saturating_sub(protected_at) > ttl_ms {
+                    let fresh = self.protected(&[], observed_at, grace).await?;
+                    protected.extend(fresh);
+                    protected_at = observed_at;
+                    if protected.contains(&object.key) {
+                        report.referenced = report.referenced.saturating_add(1);
+                        continue;
+                    }
+                }
+            }
+            if !dry_run {
+                self.delete(&object.key).await?;
+            }
+            report.deleted.push(object.key);
+        }
+        Ok(report)
     }
 
     /// Loads the published manifest; `None` is a missing namespace
@@ -583,7 +826,12 @@ impl KeyedNamespace {
         }
         manifest.validate()?;
         let (key, bytes, pointer) = manifest.encode()?;
-        let _manifest_write = self.store.put_if_absent(&self.object(&key), &bytes).await?;
+        if self.put_content(&key, &bytes).await? == ObjectWrite::Refreshed {
+            // An identical manifest existed (a retried attempt): it may be
+            // an orphan a deleter already decided to remove.
+            self.settle(&[(key.clone(), bytes::Bytes::from(bytes))], self.grace)
+                .await?;
+        }
         let current = self.object(KEYED_CURRENT_KEY);
         let written = match base {
             Some(base) => {
