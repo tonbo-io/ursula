@@ -177,10 +177,10 @@ async fn keyed_engine_folds_a_real_node_log() {
                 })
                 .body()
         );
-        // P1 text fidelity reaches the rows.
-        if round == 0 {
-            assert!(page.body().contains("1.50e3"), "{}", page.body());
-        }
+        // The fold input is the node's stored text (P1): literal number
+        // text and lone-surrogate escapes survive.
+        assert!(records.iter().any(|text| text.contains("1.50e3")));
+        assert!(records.iter().any(|text| text.contains("\\ud800")));
     }
     // The incarnation check found the stream: the namespace remains.
     assert!(
