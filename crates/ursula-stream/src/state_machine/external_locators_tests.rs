@@ -309,3 +309,30 @@ fn delete_queues_state_held_external_refs_for_gc() {
         "a staged ref that was never offloaded is reclaimed with its stream"
     );
 }
+
+/// Now that this binary supports level 3, a level-3 snapshot holding staged
+/// locators restores to the same state, and the restored machine still
+/// offloads them.
+#[test]
+fn level_three_snapshot_with_staged_locators_round_trips() {
+    let mut machine = machine_at(FEATURE_LEVEL_EXTERNAL_LOCATORS);
+    append_inline(&mut machine, b"abcd");
+    append_external(&mut machine, "s/external/a.bin", 10);
+    append_external(&mut machine, "s/external/b.bin", 6);
+    let snapshot = machine.snapshot();
+    let mut restored = StreamStateMachine::restore(snapshot.clone()).expect("restore level 3");
+    assert_eq!(restored.feature_level(), FEATURE_LEVEL_EXTERNAL_LOCATORS);
+    assert_eq!(restored.snapshot(), snapshot);
+    assert_eq!(restored.external_segments(&stream("s")), &[
+        object(4, 14, "s/external/a.bin"),
+        object(14, 20, "s/external/b.bin"),
+    ]);
+    let response = offload(&mut restored, vec![object(4, 14, "s/external/a.bin")]);
+    assert!(
+        matches!(response, StreamResponse::ColdRefsOffloaded {
+            removed: 1,
+            remaining: 1
+        }),
+        "{response:?}"
+    );
+}
