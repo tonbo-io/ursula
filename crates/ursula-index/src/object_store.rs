@@ -477,33 +477,6 @@ impl ObjectStore {
         .boxed()
     }
 
-    /// Writes `bytes` to `key` unconditionally (a content-addressed object
-    /// rewritten with the same bytes, which restarts its age).
-    pub(crate) fn put<'a>(
-        &'a self,
-        key: &'a str,
-        bytes: &'a [u8],
-    ) -> BoxFuture<'a, Result<(), IndexError>> {
-        async move {
-            match self {
-                Self::Fs(store) => store.put(key, bytes),
-                Self::S3(store) => store.put(key, bytes).await,
-                Self::Memory(store) => {
-                    store.put(key, bytes);
-                    Ok(())
-                }
-                Self::Observed(store) => store
-                    .write(ObjectOp::Put, key, bytes, async {
-                        store.inner.put(key, bytes).await?;
-                        Ok::<_, IndexError>(ConditionalWrite::Written)
-                    })
-                    .await
-                    .map(|_written| ()),
-            }
-        }
-        .boxed()
-    }
-
     /// Key and modification time of `key` (one HEAD), or `None` when it is
     /// absent.
     pub(crate) fn stat<'a>(
@@ -702,11 +675,6 @@ impl FsObjectStore {
         }
     }
 
-    fn put(&self, key: &str, bytes: &[u8]) -> Result<(), IndexError> {
-        self.write_locked(key, bytes, "create-lock", |_path| Ok(true))
-            .map(|_written| ())
-    }
-
     fn stat(&self, key: &str) -> Result<Option<ObjectInfo>, IndexError> {
         match fs::metadata(self.path(key)?) {
             Ok(metadata) => Ok(Some(ObjectInfo {
@@ -878,14 +846,6 @@ impl S3ObjectStore {
 
     async fn delete(&self, key: &str) -> Result<(), IndexError> {
         self.operator.delete(key).await.map_err(object_error)
-    }
-
-    async fn put(&self, key: &str, bytes: &[u8]) -> Result<(), IndexError> {
-        self.operator
-            .write(key, bytes.to_vec())
-            .await
-            .map(|_metadata| ())
-            .map_err(object_error)
     }
 
     async fn stat(&self, key: &str) -> Result<Option<ObjectInfo>, IndexError> {

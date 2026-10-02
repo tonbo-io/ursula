@@ -150,11 +150,6 @@ impl MemoryObjectStore {
         ConditionalWrite::Written
     }
 
-    pub(crate) fn put(&self, key: &str, bytes: &[u8]) {
-        let mut objects = lock(&self.objects);
-        self.install(&mut objects, key, bytes);
-    }
-
     pub(crate) fn list(&self, prefix: &str) -> Vec<ObjectInfo> {
         lock(&self.objects)
             .range(prefix.to_owned()..)
@@ -297,12 +292,6 @@ mod tests {
             listed[0].modified,
             SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(5_000))
         );
-        // An unconditional put restarts the object's age.
-        as_object.put("a/x", b"two").await.unwrap();
-        assert_eq!(
-            as_object.stat("a/x").await.unwrap().unwrap().modified,
-            SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(9_000))
-        );
         as_object.delete("a/y").await.unwrap();
         as_object.delete("a/y").await.unwrap();
         assert_eq!(*lock(&script.applied), [
@@ -310,7 +299,6 @@ mod tests {
             "put a/x",
             "put a/y",
             "put b/z",
-            "put a/x",
             "delete a/y"
         ]);
         assert_eq!(store.snapshot().len(), 2);

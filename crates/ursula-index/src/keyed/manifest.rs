@@ -67,19 +67,17 @@ pub fn delete_decision_ttl(grace: Duration) -> Duration {
 }
 
 /// A random 128-bit nonce (32 hex digits) that makes a stored object's key
-/// unique to one write (see the module docs). Falls back to the time and a
-/// process counter if the OS has no randomness to give.
+/// unique to one write (see the module docs). Should the OS have no
+/// randomness to give, it falls back to a hash of the process id and a
+/// process counter.
 pub fn unique_object_nonce() -> String {
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
     static FALLBACK: AtomicU64 = AtomicU64::new(0);
     let mut bytes = [0_u8; 16];
     if getrandom::fill(&mut bytes).is_err() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since| since.as_nanos());
         let counter = FALLBACK.fetch_add(1, Ordering::Relaxed);
-        let seed = format!("{nanos}-{counter}-{}", std::process::id());
+        let seed = format!("{}-{counter}", std::process::id());
         let hashed = blake3::hash(seed.as_bytes());
         bytes.copy_from_slice(hashed.as_bytes().get(..16).unwrap_or(&[0; 16]));
     }

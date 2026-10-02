@@ -428,11 +428,12 @@ async fn a_delete_landing_after_a_competing_publish_never_hits_current() {
         !matches!(outcome, KeyedReadOutcome::Rows { through: 4, .. }),
         "{outcome:?}"
     );
+    // Every part and manifest that exists before pod A's publication.
     let orphans: Vec<String> = raw
         .snapshot()
         .into_iter()
         .map(|(key, _)| key)
-        .filter(|key| key.contains("/parts/"))
+        .filter(|key| key.contains("/parts/") || key.contains("/manifests/"))
         .collect();
 
     // Past the grace period, pod B's GC decides to delete them (they are
@@ -748,21 +749,21 @@ async fn gc_of_a_lost_cas_never_touches_a_later_publication() {
     else {
         panic!("generation 1");
     };
-    let parts = || -> Vec<String> {
+    let objects = || -> Vec<String> {
         raw.snapshot()
             .into_iter()
             .map(|(key, _)| key)
-            .filter(|key| key.contains("/parts/"))
+            .filter(|key| key.contains("/parts/") || key.contains("/manifests/"))
             .collect()
     };
-    let before = parts();
-    // Pod B folds records 2..4 and loses its CAS: its parts are orphans in
-    // its GC queue.
+    let before = objects();
+    // Pod B folds records 2..4 and loses its CAS: its parts and manifest
+    // are orphans in its GC queue.
     log.records.lock().unwrap().extend((2..4).map(record));
     script.conflict_next_cas.store(true, Ordering::SeqCst);
     let _lost = read(&pod_b, 4, Duration::from_secs(1)).await;
     log.failing.store(false, Ordering::SeqCst);
-    let orphans: Vec<String> = parts()
+    let orphans: Vec<String> = objects()
         .into_iter()
         .filter(|key| !before.contains(key))
         .collect();
@@ -787,7 +788,9 @@ async fn gc_of_a_lost_cas_never_touches_a_later_publication() {
         .map(|(key, _)| key)
         .filter(|key| key.contains("/manifests/"))
         .collect();
-    for key in &manifest_keys {
+    // Pod B's own unpublished manifest references its orphans; no other
+    // manifest does.
+    for key in manifest_keys.iter().filter(|key| !orphans.contains(key)) {
         let manifest: KeyedManifest =
             serde_json::from_slice(&raw.object_bytes(key).unwrap()).unwrap();
         for part in manifest.part_keys() {
