@@ -8899,3 +8899,74 @@ async fn producer_id_and_stream_seq_length_caps_reject_with_400() {
     let journal = body_bytes(http_get(&app, "/benchcmp/run-caps/journal").await).await;
     assert!(journal.is_empty());
 }
+
+/// bounded-stream-state F3 at feature level 1: a duplicate whose receipt
+/// the stream's receipt window evicted answers `204` with `Producer-Seq` and
+/// without byte or record range headers, and never appends.
+#[tokio::test]
+async fn duplicate_beyond_receipt_window_answers_204_without_ranges() {
+    let app = test_router();
+    let response = http_post(
+        &app,
+        "/__ursula/feature-level",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"level":1}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = http_put(
+        &app,
+        "/benchcmp/receipt-window",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let post = |seq: u64| {
+        let app = app.clone();
+        async move {
+            let seq = seq.to_string();
+            http_post(
+                &app,
+                "/benchcmp/receipt-window",
+                &[
+                    (CONTENT_TYPE.as_str(), "application/json"),
+                    (HEADER_PRODUCER_ID, "writer"),
+                    (HEADER_PRODUCER_EPOCH, "0"),
+                    (HEADER_PRODUCER_SEQ, seq.as_str()),
+                ],
+                Body::from(r#"{"a":1}"#),
+            )
+            .await
+        }
+    };
+    for seq in 0..1_026 {
+        assert_eq!(post(seq).await.status(), StatusCode::OK);
+    }
+    let tail = http_head(&app, "/benchcmp/receipt-window").await;
+    let tail_offset = tail.headers().get(HEADER_STREAM_NEXT_OFFSET).cloned();
+
+    let evicted = post(0).await;
+    assert_eq!(evicted.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        evicted
+            .headers()
+            .get(HEADER_PRODUCER_SEQ)
+            .and_then(|value| value.to_str().ok()),
+        Some("0")
+    );
+    assert!(evicted.headers().get(HEADER_STREAM_NEXT_OFFSET).is_none());
+    assert!(evicted.headers().get("Stream-Record-Start").is_none());
+    assert!(evicted.headers().get("Stream-Record-Next").is_none());
+
+    let newest = post(1_025).await;
+    assert_eq!(newest.status(), StatusCode::NO_CONTENT);
+    assert!(newest.headers().get(HEADER_STREAM_NEXT_OFFSET).is_some());
+    assert!(newest.headers().get("Stream-Record-Start").is_some());
+
+    let after = http_head(&app, "/benchcmp/receipt-window").await;
+    assert_eq!(
+        after.headers().get(HEADER_STREAM_NEXT_OFFSET).cloned(),
+        tail_offset
+    );
+}

@@ -9,6 +9,8 @@
 //! - [`cold`]: cold-tier flush candidates, GC, retention compaction, snapshot publishing.
 //! - [`flush_planner`]: leader-side flush passes over a derived hot-stream index.
 //! - [`persist`]: snapshot / restore / integrity serialization.
+//! - [`producers`]: F3 receipt window, idle-producer expiry, F4a collapse and
+//!   `TidyStream` (feature level 1).
 //! - [`hot_buffer`], [`cold_state`], [`ttl`]: internal per-stream data structures.
 //!
 //! The root keeps the [`StreamStateMachine`] type, its core slot/TTL accessors,
@@ -97,6 +99,7 @@ pub use self::flush_planner::ColdFlushPlanStats;
 pub use self::flush_planner::ColdFlushPressure;
 mod lifecycle;
 mod persist;
+mod producers;
 mod query;
 mod registry;
 mod ttl;
@@ -166,6 +169,8 @@ struct StreamSlot {
     retained_offset: u64,
     visible_snapshot: Option<StreamVisibleSnapshot>,
     producers: HashMap<String, ProducerState>,
+    /// Derived F3 receipt window over `producers`; rebuilt on restore.
+    receipt_window: producers::ReceiptWindow,
     /// Runtime append count for this incarnation (F9). Kept by the group
     /// engine, not in [`StreamSnapshot`]; living in the slot makes it die with
     /// the stream on every removal path (delete, TTL expiry, bucket purge).
@@ -705,6 +710,7 @@ impl StreamStateMachine {
                 producer,
                 now_ms,
             } => {
+                let batch_stream_id = stream_id.clone();
                 let response = match self.append_batch_borrowed(
                     stream_id,
                     content_type.as_deref(),
@@ -712,6 +718,19 @@ impl StreamStateMachine {
                     producer,
                     now_ms,
                 ) {
+                    Ok(batch) if batch.receipt_evicted => {
+                        let tail = self
+                            .stream_metadata(&batch_stream_id)
+                            .map_or(0, |stream| stream.tail_offset);
+                        StreamResponse::Appended {
+                            offset: tail,
+                            next_offset: tail,
+                            closed: false,
+                            deduplicated: true,
+                            producer: None,
+                            receipt_evicted: true,
+                        }
+                    }
                     Ok(batch) => batch
                         .items
                         .last()
@@ -721,6 +740,7 @@ impl StreamStateMachine {
                             closed: item.closed,
                             deduplicated: item.deduplicated,
                             producer: None,
+                            receipt_evicted: false,
                         })
                         .unwrap_or_else(|| {
                             StreamResponse::error(
@@ -806,6 +826,7 @@ impl StreamStateMachine {
                 max_retained_bytes,
             } => self.set_bucket_quota(bucket_id, max_streams, max_retained_bytes),
             StreamCommand::SetFeatureLevel { level } => self.set_feature_level(level),
+            StreamCommand::TidyStream { stream_id, now_ms } => self.tidy_stream(&stream_id, now_ms),
         }
     }
 }
@@ -1013,5 +1034,7 @@ fn snapshot_digest(content_type: &str, payload: &[u8]) -> String {
 
 #[cfg(test)]
 mod hygiene_tests;
+#[cfg(test)]
+mod producer_window_tests;
 #[cfg(test)]
 mod tests;

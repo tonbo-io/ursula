@@ -37,6 +37,11 @@ pub enum StreamResponse {
         closed: bool,
         deduplicated: bool,
         producer: Option<ProducerRequest>,
+        /// A duplicate whose receipt the stream's receipt window evicted
+        /// (F3, feature level 1). It is answered as deduplicated without
+        /// byte or record ranges: `offset` and `next_offset` are the stream
+        /// tail and carry no information about the original append.
+        receipt_evicted: bool,
     },
     Closed {
         next_offset: u64,
@@ -92,6 +97,13 @@ pub enum StreamResponse {
     FeatureLevelSet {
         level: u32,
         previous_level: u32,
+    },
+    /// Result of [`StreamCommand::TidyStream`]: whether the stream still has
+    /// normalization debt after this bounded step.
+    ///
+    /// [`StreamCommand::TidyStream`]: crate::StreamCommand::TidyStream
+    StreamTidied {
+        debt_remaining: bool,
     },
     Error {
         code: StreamErrorCode,

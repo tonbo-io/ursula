@@ -338,6 +338,13 @@ macro_rules! runtime_operations {
                 handle { call set_feature_level(engine, metrics, request, placement) }
                 client { pub group fn set_feature_level }
             }
+            op TidyStreams {
+                fields { request: TidyStreamsRequest }
+                reply { response_tx: TidyStreamsResponse }
+                guard { none }
+                handle { call tidy_streams(engine, metrics, request, placement) }
+                client { pub group fn tidy_streams }
+            }
             op AckColdGc {
                 fields { up_to_seq: u64 }
                 reply { response_tx: AckColdGcResponse }

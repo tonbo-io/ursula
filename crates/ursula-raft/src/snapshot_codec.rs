@@ -594,6 +594,7 @@ fn producer_to_proto(producer: ProducerSnapshot) -> proto::ProducerSnapshotV1 {
             .into_iter()
             .map(producer_receipt_to_proto)
             .collect(),
+        last_seen_ms: producer.last_seen_ms,
     }
 }
 
@@ -615,6 +616,7 @@ fn producer_from_proto(producer: proto::ProducerSnapshotV1) -> ProducerSnapshot 
             .into_iter()
             .map(producer_receipt_from_proto)
             .collect(),
+        last_seen_ms: producer.last_seen_ms,
     }
 }
 
@@ -809,6 +811,87 @@ mod tests {
         let decoded = decode_group_snapshot(&bytes).expect("decode frames");
 
         assert_eq!(decoded, snapshot);
+    }
+
+    /// Bounded-state F3: the producer idle clock and the level-1 receipt
+    /// window survive the group snapshot codec, so an installed replica
+    /// holds exactly the live replica's producer state.
+    #[test]
+    fn producer_last_seen_and_receipt_window_round_trip() {
+        let mut machine = ursula_stream::StreamStateMachine::new();
+        machine.apply(ursula_stream::StreamCommand::SetFeatureLevel { level: 1 });
+        machine.apply(ursula_stream::StreamCommand::CreateBucket {
+            bucket_id: "bucket".to_owned(),
+        });
+        let stream_id = BucketStreamId::new("bucket", "producers");
+        machine.apply(ursula_stream::StreamCommand::CreateStream {
+            stream_id: stream_id.clone(),
+            content_type: "application/octet-stream".to_owned(),
+            initial_payload: bytes::Bytes::new(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            attrs: None,
+            now_ms: 1,
+        });
+        for seq in 0..1_100u64 {
+            for (producer_id, now_ms) in [("a", 10 + seq), ("b", 20 + seq)] {
+                if producer_id == "b" && seq > 3 {
+                    continue;
+                }
+                let response = machine.apply(ursula_stream::StreamCommand::Append {
+                    stream_id: stream_id.clone(),
+                    content_type: Some("application/octet-stream".to_owned()),
+                    payload: bytes::Bytes::from_static(b"xy"),
+                    close_after: false,
+                    stream_seq: None,
+                    producer: Some(ursula_stream::ProducerRequest {
+                        producer_id: producer_id.to_owned(),
+                        producer_epoch: 1,
+                        producer_seq: seq,
+                    }),
+                    now_ms,
+                    record_match: None,
+                });
+                assert!(
+                    matches!(response, ursula_stream::StreamResponse::Appended { .. }),
+                    "{response:?}"
+                );
+            }
+        }
+        let stream_snapshot = machine.snapshot();
+        let producers = &stream_snapshot.streams[0].producer_states;
+        assert_eq!(producers[0].last_seen_ms, Some(10 + 1_099));
+        assert_eq!(producers[1].last_seen_ms, Some(23));
+        assert!(
+            producers
+                .iter()
+                .all(|producer| producer.last_items.is_empty())
+        );
+        let snapshot = GroupSnapshot {
+            placement: ShardPlacement {
+                core_id: CoreId(0),
+                shard_id: ShardId(0),
+                raft_group_id: RaftGroupId(0),
+            },
+            group_commit_index: 7,
+            stream_snapshot,
+            stream_append_counts: Vec::new(),
+        };
+        let bytes = group_snapshot_frames(Arc::new(snapshot.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("encode frames")
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let decoded = decode_group_snapshot(&bytes).expect("decode frames");
+        assert_eq!(decoded, snapshot);
+        let restored = ursula_stream::StreamStateMachine::restore(decoded.stream_snapshot)
+            .expect("restore decoded snapshot");
+        assert_eq!(restored.snapshot(), machine.snapshot());
+        assert_eq!(restored.state_gauges(), machine.state_gauges());
     }
 
     #[test]

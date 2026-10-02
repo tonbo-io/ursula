@@ -110,6 +110,20 @@ pub type GroupSetBucketQuotaFuture<'a> =
     Pin<Box<dyn Future<Output = Result<SetBucketQuotaResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupSetFeatureLevelFuture<'a> =
     Pin<Box<dyn Future<Output = Result<SetFeatureLevelResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupTidyStreamFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<crate::request::TidyStreamResponse, GroupEngineError>>
+            + Send
+            + 'a,
+    >,
+>;
+pub type GroupTidyStreamsFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<crate::request::TidyStreamsResponse, GroupEngineError>>
+            + Send
+            + 'a,
+    >,
+>;
 pub type GroupListBucketStreamsFuture<'a> = Pin<
     Box<
         dyn Future<
@@ -206,6 +220,7 @@ pub enum GroupWriteResponse {
     // Appended last so serialized variant positions of older variants stay
     // stable across mixed-version clusters.
     SetFeatureLevel(SetFeatureLevelResponse),
+    TidyStream(crate::request::TidyStreamResponse),
 }
 
 pub trait GroupEngine: Send + 'static {
@@ -384,6 +399,33 @@ pub trait GroupEngine: Send + 'static {
                 placement.raft_group_id.0
             )))
         })
+    }
+
+    /// Replicated `TidyStream` write (bounded-state F0); see
+    /// `StreamCommand::TidyStream`. Default unsupported.
+    fn tidy_stream<'a>(
+        &'a mut self,
+        _stream_id: BucketStreamId,
+        _now_ms: u64,
+        placement: ShardPlacement,
+    ) -> GroupTidyStreamFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "stream tidy is not supported for group {}",
+                placement.raft_group_id.0
+            )))
+        })
+    }
+
+    /// One leader-side `TidyStream` pass (bounded-state F0): proposes
+    /// `TidyStream` for up to `request.max_streams` streams with debt. A
+    /// follower or an engine without support tidies nothing.
+    fn tidy_streams<'a>(
+        &'a mut self,
+        _request: crate::request::TidyStreamsRequest,
+        _placement: ShardPlacement,
+    ) -> GroupTidyStreamsFuture<'a> {
+        Box::pin(async move { Ok(crate::request::TidyStreamsResponse::default()) })
     }
 
     /// Replicated `SetFeatureLevel` write (C0); see
@@ -956,6 +998,10 @@ pub trait GroupEngine: Send + 'static {
                     .set_feature_level(SetFeatureLevelRequest { level }, placement)
                     .await
                     .map(GroupWriteResponse::SetFeatureLevel),
+                StreamCommand::TidyStream { stream_id, now_ms } => self
+                    .tidy_stream(stream_id, now_ms, placement)
+                    .await
+                    .map(GroupWriteResponse::TidyStream),
                 StreamCommand::CreateBucket { .. } | StreamCommand::DeleteBucket { .. } => Err(
                     GroupEngineError::new("bucket commands are not valid group writes"),
                 ),

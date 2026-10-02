@@ -261,6 +261,7 @@ mod tests {
             retained_offset: 0,
             visible_snapshot: None,
             producers: HashMap::new(),
+            receipt_window: Default::default(),
             append_count: 0,
         }
     }

@@ -130,7 +130,7 @@ impl StreamStateMachine {
             else {
                 unreachable!("transaction commands validated before mutation");
             };
-            let response = self.append_borrowed(AppendStreamInput {
+            let response = self.append_borrowed_unenforced(AppendStreamInput {
                 stream_id,
                 content_type: content_type.as_deref(),
                 payload: &payload,
@@ -145,6 +145,13 @@ impl StreamStateMachine {
                 return Err(response);
             }
             responses.push(response);
+        }
+        // F3: the window is enforced once, after the whole transaction
+        // applied, so a failed transaction evicts nothing.
+        for (stream_id, undo) in &stream_undo {
+            if !undo.producers.is_empty() {
+                self.enforce_producer_window(stream_id);
+            }
         }
         Ok(responses)
     }
@@ -179,6 +186,7 @@ impl StreamStateMachine {
                 index.rollback_appends(checkpoint);
             }
             slot.integrity = undo.integrity;
+            let producers_touched = !undo.producers.is_empty();
             for (producer_id, producer) in undo.producers {
                 match producer {
                     Some(producer) => {
@@ -189,11 +197,26 @@ impl StreamStateMachine {
                     }
                 }
             }
+            if producers_touched {
+                slot.receipt_window = super::producers::ReceiptWindow::rebuild(&slot.producers);
+            }
             self.sync_hot_index(&stream_id);
         }
     }
 
+    /// Applies one append, then enforces the F3 receipt window once.
     pub fn append_borrowed(&mut self, input: AppendStreamInput<'_>) -> StreamResponse {
+        let enforce_on = input.producer.as_ref().map(|_| input.stream_id.clone());
+        let response = self.append_borrowed_unenforced(input);
+        if let Some(stream_id) = enforce_on {
+            self.enforce_producer_window(&stream_id);
+        }
+        response
+    }
+
+    /// One append without the F3 enforcement point, which a transaction
+    /// runs once after all of its appends.
+    fn append_borrowed_unenforced(&mut self, input: AppendStreamInput<'_>) -> StreamResponse {
         let AppendStreamInput {
             stream_id,
             content_type,
@@ -223,10 +246,36 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             );
         }
-        let producer_decision = match self.evaluate_producer(&stream_id, producer.as_ref()) {
+        if let Some(producer) = producer.as_ref() {
+            self.expire_idle_producer(&stream_id, &producer.producer_id, now_ms);
+        }
+        let producer_decision = match self.evaluate_producer(&stream_id, producer.as_ref(), now_ms)
+        {
             Ok(decision) => decision,
             Err(response) => return response,
         };
+        if let ProducerDecision::DuplicateEvicted { producer } = producer_decision {
+            let (tail, closed) = self
+                .stream_metadata(&stream_id)
+                .map_or((0, false), |stream| {
+                    (stream.tail_offset, stream.status == StreamStatus::Closed)
+                });
+            if payload.is_empty() {
+                return StreamResponse::Closed {
+                    next_offset: tail,
+                    deduplicated: true,
+                    producer: Some(producer),
+                };
+            }
+            return StreamResponse::Appended {
+                offset: tail,
+                next_offset: tail,
+                closed,
+                deduplicated: true,
+                producer: Some(producer),
+                receipt_evicted: true,
+            };
+        }
         if let ProducerDecision::Duplicate {
             offset,
             next_offset,
@@ -248,6 +297,7 @@ impl StreamStateMachine {
                 closed,
                 deduplicated: true,
                 producer: Some(producer),
+                receipt_evicted: false,
             };
         }
 
@@ -360,6 +410,7 @@ impl StreamStateMachine {
             self.record_producer_success(
                 stream_id.clone(),
                 producer,
+                now_ms,
                 ProducerAppendRecord {
                     start_offset: offset,
                     next_offset,
@@ -414,11 +465,21 @@ impl StreamStateMachine {
                 closed: close_after,
                 deduplicated: false,
                 producer: producer_ack,
+                receipt_evicted: false,
             }
         }
     }
 
     pub(super) fn append_external(&mut self, input: AppendExternalInput<'_>) -> StreamResponse {
+        let enforce_on = input.producer.as_ref().map(|_| input.stream_id.clone());
+        let response = self.append_external_unenforced(input);
+        if let Some(stream_id) = enforce_on {
+            self.enforce_producer_window(&stream_id);
+        }
+        response
+    }
+
+    fn append_external_unenforced(&mut self, input: AppendExternalInput<'_>) -> StreamResponse {
         let AppendExternalInput {
             stream_id,
             content_type,
@@ -451,10 +512,29 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             );
         }
-        let producer_decision = match self.evaluate_producer(&stream_id, producer.as_ref()) {
+        if let Some(producer) = producer.as_ref() {
+            self.expire_idle_producer(&stream_id, &producer.producer_id, now_ms);
+        }
+        let producer_decision = match self.evaluate_producer(&stream_id, producer.as_ref(), now_ms)
+        {
             Ok(decision) => decision,
             Err(response) => return response,
         };
+        if let ProducerDecision::DuplicateEvicted { producer } = producer_decision {
+            let (tail, closed) = self
+                .stream_metadata(&stream_id)
+                .map_or((0, false), |stream| {
+                    (stream.tail_offset, stream.status == StreamStatus::Closed)
+                });
+            return StreamResponse::Appended {
+                offset: tail,
+                next_offset: tail,
+                closed,
+                deduplicated: true,
+                producer: Some(producer),
+                receipt_evicted: true,
+            };
+        }
         if let ProducerDecision::Duplicate {
             offset,
             next_offset,
@@ -469,6 +549,7 @@ impl StreamStateMachine {
                 closed,
                 deduplicated: true,
                 producer: Some(producer),
+                receipt_evicted: false,
             };
         }
 
@@ -550,6 +631,7 @@ impl StreamStateMachine {
             self.record_producer_success(
                 stream_id.clone(),
                 producer,
+                now_ms,
                 ProducerAppendRecord {
                     start_offset: offset,
                     next_offset,
@@ -594,6 +676,8 @@ impl StreamStateMachine {
                 next_offset,
                 &record_ends,
             ));
+        // F4a: an external append is a cold transition.
+        self.collapse_sealed_message_records(&stream_id);
         let appended_bytes = next_offset.saturating_sub(offset);
         self.usage_on_append(
             &stream_id.bucket_id,
@@ -606,10 +690,35 @@ impl StreamStateMachine {
             closed: close_after,
             deduplicated: false,
             producer: producer_ack,
+            receipt_evicted: false,
         }
     }
 
+    /// Applies one append batch, then enforces the F3 receipt window once.
     pub fn append_batch_borrowed(
+        &mut self,
+        stream_id: BucketStreamId,
+        content_type: Option<&str>,
+        payloads: &[&[u8]],
+        producer: Option<ProducerRequest>,
+        now_ms: u64,
+    ) -> Result<StreamBatchAppend, StreamResponse> {
+        let enforce = producer.is_some();
+        let enforce_on = stream_id.clone();
+        let response = self.append_batch_borrowed_unenforced(
+            stream_id,
+            content_type,
+            payloads,
+            producer,
+            now_ms,
+        );
+        if enforce {
+            self.enforce_producer_window(&enforce_on);
+        }
+        response
+    }
+
+    fn append_batch_borrowed_unenforced(
         &mut self,
         stream_id: BucketStreamId,
         content_type: Option<&str>,
@@ -631,7 +740,17 @@ impl StreamStateMachine {
                 format!("stream '{stream_id}' does not exist"),
             ));
         }
-        let producer_decision = self.evaluate_producer(&stream_id, producer.as_ref())?;
+        if let Some(producer) = producer.as_ref() {
+            self.expire_idle_producer(&stream_id, &producer.producer_id, now_ms);
+        }
+        let producer_decision = self.evaluate_producer(&stream_id, producer.as_ref(), now_ms)?;
+        if let ProducerDecision::DuplicateEvicted { .. } = producer_decision {
+            return Ok(StreamBatchAppend {
+                items: Vec::new(),
+                deduplicated: true,
+                receipt_evicted: true,
+            });
+        }
         if let ProducerDecision::Duplicate { items, .. } = producer_decision {
             return Ok(StreamBatchAppend {
                 items: items
@@ -644,6 +763,7 @@ impl StreamStateMachine {
                     })
                     .collect(),
                 deduplicated: true,
+                receipt_evicted: false,
             });
         }
 
@@ -789,7 +909,13 @@ impl StreamStateMachine {
         renew_stream_ttl(stream, now_ms);
         self.refresh_ttl_entry(&stream_id);
         if let Some(producer) = producer {
-            self.record_producer_success(stream_id.clone(), producer, last.clone(), items.clone());
+            self.record_producer_success(
+                stream_id.clone(),
+                producer,
+                now_ms,
+                last.clone(),
+                items.clone(),
+            );
         }
         let slot = self
             .stream_slot_mut(&stream_id)
@@ -836,6 +962,7 @@ impl StreamStateMachine {
                 })
                 .collect(),
             deduplicated: false,
+            receipt_evicted: false,
         })
     }
 
@@ -896,8 +1023,8 @@ impl StreamStateMachine {
             return false;
         }
         matches!(
-            self.evaluate_producer(stream_id, producer),
-            Ok(ProducerDecision::Duplicate { .. })
+            self.evaluate_producer(stream_id, producer, now_ms),
+            Ok(ProducerDecision::Duplicate { .. } | ProducerDecision::DuplicateEvicted { .. })
         )
     }
 
@@ -905,6 +1032,7 @@ impl StreamStateMachine {
         &self,
         stream_id: &BucketStreamId,
         producer: Option<&ProducerRequest>,
+        now_ms: u64,
     ) -> Result<ProducerDecision, StreamResponse> {
         let Some(producer) = producer else {
             return Ok(ProducerDecision::Accept);
@@ -912,7 +1040,12 @@ impl StreamStateMachine {
         let Some(states) = self.stream_slot(stream_id).map(|slot| &slot.producers) else {
             return Ok(ProducerDecision::Accept);
         };
-        let Some(state) = states.get(&producer.producer_id) else {
+        let bounded = self.producer_bounds_enabled();
+        // F3: an idle producer is treated as absent at its own next write.
+        let state = states
+            .get(&producer.producer_id)
+            .filter(|state| !(bounded && super::producers::producer_is_idle(state, now_ms)));
+        let Some(state) = state else {
             if producer.producer_seq == 0 {
                 return Ok(ProducerDecision::Accept);
             }
@@ -955,11 +1088,19 @@ impl StreamStateMachine {
         }
 
         if producer.producer_seq <= state.producer_seq {
-            let Some(receipt) = state
-                .receipts
-                .iter()
-                .find(|receipt| receipt.producer_seq == producer.producer_seq)
-            else {
+            let Some(receipt) = find_receipt(&state.receipts, producer.producer_seq) else {
+                if bounded {
+                    // F3: beyond the receipt window a duplicate is still a
+                    // duplicate (never accepted twice), answered without
+                    // ranges.
+                    return Ok(ProducerDecision::DuplicateEvicted {
+                        producer: ProducerRequest {
+                            producer_id: producer.producer_id.clone(),
+                            producer_epoch: state.producer_epoch,
+                            producer_seq: producer.producer_seq,
+                        },
+                    });
+                }
                 return Err(StreamResponse::error_with_context(
                     StreamErrorCode::ProducerSeqConflict,
                     format!(
@@ -1006,9 +1147,11 @@ impl StreamStateMachine {
         &mut self,
         stream_id: BucketStreamId,
         producer: ProducerRequest,
+        now_ms: u64,
         last: ProducerAppendRecord,
         last_items: Vec<ProducerAppendRecord>,
     ) {
+        let bounded = self.producer_bounds_enabled();
         let receipt = ProducerReceipt {
             producer_seq: producer.producer_seq,
             start_offset: last.start_offset,
@@ -1016,11 +1159,14 @@ impl StreamStateMachine {
             closed: last.closed,
             items: last_items.clone(),
         };
-        let producers = &mut self
-            .stream_slot_mut(&stream_id)
-            .expect("stream existence checked before producer mutation")
-            .producers;
-        if let Some(state) = producers.get_mut(&producer.producer_id)
+        // Level 1 answers from the newest receipt and keeps no copy (F3);
+        // level 0 keeps `last_items` exactly as earlier releases do.
+        let last_items = if bounded { Vec::new() } else { last_items };
+        let last_seen_ms = bounded.then_some(now_ms);
+        let Some(slot) = self.stream_slot_mut(&stream_id) else {
+            return;
+        };
+        if let Some(state) = slot.producers.get_mut(&producer.producer_id)
             && state.producer_epoch == producer.producer_epoch
         {
             state.producer_seq = producer.producer_seq;
@@ -1028,19 +1174,55 @@ impl StreamStateMachine {
             state.last_next_offset = last.next_offset;
             state.last_closed = last.closed;
             state.last_items = last_items;
-            state.receipts.push(receipt);
+            // O(1) window update: the front is unchanged by a push and
+            // becomes evictable once the producer holds two receipts.
+            slot.receipt_window
+                .push_receipt(&producer.producer_id, state, &receipt);
+            state.receipts.push_back(receipt);
+            if last_seen_ms.is_some() {
+                state.last_seen_ms = last_seen_ms;
+            }
             return;
         }
-        producers.insert(producer.producer_id, ProducerState {
+        // A new producer or a new epoch: the previous state (and its
+        // receipts) is replaced.
+        slot.remove_producer(&producer.producer_id);
+        let state = ProducerState {
             producer_epoch: producer.producer_epoch,
             producer_seq: producer.producer_seq,
             last_start_offset: last.start_offset,
             last_next_offset: last.next_offset,
             last_closed: last.closed,
             last_items,
-            receipts: vec![receipt],
-        });
+            receipts: std::collections::VecDeque::from([receipt]),
+            last_seen_ms,
+        };
+        slot.receipt_window
+            .add_producer(&producer.producer_id, &state);
+        slot.producers.insert(producer.producer_id, state);
     }
+}
+
+/// O(1) duplicate lookup (F3): receipts hold contiguous sequences, so the
+/// receipt of `seq` sits at `seq - front.seq`. Falls back to a binary search
+/// for receipt lists restored from older snapshots.
+pub(super) fn find_receipt(
+    receipts: &std::collections::VecDeque<ProducerReceipt>,
+    seq: u64,
+) -> Option<&ProducerReceipt> {
+    let front = receipts.front()?;
+    let direct = seq
+        .checked_sub(front.producer_seq)
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| receipts.get(index))
+        .filter(|receipt| receipt.producer_seq == seq);
+    if direct.is_some() {
+        return direct;
+    }
+    receipts
+        .binary_search_by_key(&seq, |receipt| receipt.producer_seq)
+        .ok()
+        .and_then(|index| receipts.get(index))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1052,6 +1234,10 @@ enum ProducerDecision {
         closed: bool,
         producer: ProducerRequest,
         items: Vec<ProducerAppendRecord>,
+    },
+    /// A duplicate whose receipt the window evicted (F3, level 1).
+    DuplicateEvicted {
+        producer: ProducerRequest,
     },
 }
 

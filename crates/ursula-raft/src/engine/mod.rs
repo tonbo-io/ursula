@@ -78,6 +78,8 @@ use ursula_runtime::GroupSetFeatureLevelFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupStateGaugesFuture;
+use ursula_runtime::GroupTidyStreamFuture;
+use ursula_runtime::GroupTidyStreamsFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
 use ursula_runtime::GroupUpdateStreamAttrsFuture;
 use ursula_runtime::GroupWriteBatchFuture;
@@ -96,6 +98,8 @@ use ursula_runtime::SetBucketQuotaRequest;
 use ursula_runtime::SetFeatureLevelRequest;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::StreamErrorCode;
+use ursula_runtime::TidyStreamsRequest;
+use ursula_runtime::TidyStreamsResponse;
 use ursula_runtime::TouchStreamAccessResponse;
 use ursula_runtime::UpdateStreamAttrsRequest;
 use ursula_runtime::clipped_entries;
@@ -456,6 +460,24 @@ impl RaftGroupEngine {
             .shutdown()
             .await
             .map_err(|err| GroupEngineError::new(format!("shutdown OpenRaft group: {err}")))
+    }
+
+    /// This replica's applied group state, leader or follower (simulation
+    /// introspection: replicas compare producer state, bounded-state
+    /// Invariant 12).
+    #[cfg(madsim)]
+    pub async fn sim_local_group_snapshot(
+        &self,
+    ) -> Result<ursula_runtime::GroupSnapshot, GroupEngineError> {
+        self.with_state_machine(move |state_machine| {
+            Box::pin(async move {
+                state_machine
+                    .group_snapshot()
+                    .await
+                    .map_err(|err| GroupEngineError::new(format!("group snapshot: {err}")))
+            })
+        })
+        .await?
     }
 
     #[cfg(madsim)]
@@ -1057,6 +1079,67 @@ impl GroupEngine for RaftGroupEngine {
                     "unexpected set bucket quota write response: {other:?}"
                 ))),
             }
+        })
+    }
+
+    fn tidy_stream<'a>(
+        &'a mut self,
+        stream_id: BucketStreamId,
+        now_ms: u64,
+        _placement: ShardPlacement,
+    ) -> GroupTidyStreamFuture<'a> {
+        Box::pin(async move {
+            let command = GroupWriteCommand::from(StreamCommand::TidyStream { stream_id, now_ms });
+            if let Some(response) = self
+                .forward_write_to_leader_if_follower(command.clone())
+                .await?
+            {
+                return match response {
+                    GroupWriteResponse::TidyStream(response) => Ok(response),
+                    other => Err(GroupEngineError::new(format!(
+                        "unexpected tidy stream write response: {other:?}"
+                    ))),
+                };
+            }
+            match self.write(command).await? {
+                GroupWriteResponse::TidyStream(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected tidy stream write response: {other:?}"
+                ))),
+            }
+        })
+    }
+
+    fn tidy_streams<'a>(
+        &'a mut self,
+        request: TidyStreamsRequest,
+        placement: ShardPlacement,
+    ) -> GroupTidyStreamsFuture<'a> {
+        Box::pin(async move {
+            // Leader-side driver: followers propose nothing.
+            if !self.raft.is_leader() {
+                return Ok(TidyStreamsResponse::default());
+            }
+            let candidates = self
+                .with_state_machine(move |state_machine| {
+                    Box::pin(async move {
+                        Ok(state_machine
+                            .engine
+                            .tidy_candidates(request.now_ms, request.max_streams))
+                    })
+                })
+                .await??;
+            let mut report = TidyStreamsResponse::default();
+            for stream_id in candidates {
+                let response = self
+                    .tidy_stream(stream_id, request.now_ms, placement)
+                    .await?;
+                report.tidied = report.tidied.saturating_add(1);
+                if response.debt_remaining {
+                    report.debt_remaining = report.debt_remaining.saturating_add(1);
+                }
+            }
+            Ok(report)
         })
     }
 

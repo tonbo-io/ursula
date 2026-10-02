@@ -227,6 +227,7 @@ impl StreamStateMachine {
         }
         let message_records = Self::message_records_for_append(0, initial_len, &input.record_ends);
         let mut producer_states = HashMap::new();
+        let bounded = self.producer_bounds_enabled();
         if let Some(producer) = input.producer {
             let last_item = ProducerAppendRecord {
                 start_offset: 0,
@@ -241,14 +242,19 @@ impl StreamStateMachine {
                 last_start_offset: last_item.start_offset,
                 last_next_offset: last_item.next_offset,
                 last_closed: last_item.closed,
-                last_items: vec![last_item.clone()],
-                receipts: vec![ProducerReceipt {
+                last_items: if bounded {
+                    Vec::new()
+                } else {
+                    vec![last_item.clone()]
+                },
+                receipts: std::collections::VecDeque::from([ProducerReceipt {
                     producer_seq: producer.producer_seq,
                     start_offset: last_item.start_offset,
                     next_offset: last_item.next_offset,
                     closed: last_item.closed,
                     items: vec![last_item],
-                }],
+                }]),
+                last_seen_ms: bounded.then_some(input.now_ms),
             });
         }
         let stream_id = input.stream_id.clone();
@@ -262,6 +268,7 @@ impl StreamStateMachine {
             integrity,
             retained_offset: 0,
             visible_snapshot: None,
+            receipt_window: super::producers::ReceiptWindow::rebuild(&producer_states),
             producers: producer_states,
             append_count: 0,
         };
@@ -411,6 +418,7 @@ impl StreamStateMachine {
         }
         let message_records = Self::message_records_for_append(0, initial_len, &input.record_ends);
         let mut producer_states = HashMap::new();
+        let bounded = self.producer_bounds_enabled();
         if let Some(producer) = input.producer {
             let last_item = ProducerAppendRecord {
                 start_offset: 0,
@@ -425,14 +433,19 @@ impl StreamStateMachine {
                 last_start_offset: last_item.start_offset,
                 last_next_offset: last_item.next_offset,
                 last_closed: last_item.closed,
-                last_items: vec![last_item.clone()],
-                receipts: vec![ProducerReceipt {
+                last_items: if bounded {
+                    Vec::new()
+                } else {
+                    vec![last_item.clone()]
+                },
+                receipts: std::collections::VecDeque::from([ProducerReceipt {
                     producer_seq: producer.producer_seq,
                     start_offset: last_item.start_offset,
                     next_offset: last_item.next_offset,
                     closed: last_item.closed,
                     items: vec![last_item],
-                }],
+                }]),
+                last_seen_ms: bounded.then_some(input.now_ms),
             });
         }
         let stream_id = input.stream_id.clone();
@@ -446,6 +459,7 @@ impl StreamStateMachine {
             integrity,
             retained_offset: 0,
             visible_snapshot: None,
+            receipt_window: super::producers::ReceiptWindow::rebuild(&producer_states),
             producers: producer_states,
             append_count: 0,
         };
@@ -459,6 +473,8 @@ impl StreamStateMachine {
             );
         }
         self.record_created_at_ms(created_at_ms);
+        // F4a: the external body is cold at once; collapse its records.
+        self.collapse_sealed_message_records(&stream_id);
         self.usage_on_stream_created(
             &stream_id.bucket_id,
             initial_len,

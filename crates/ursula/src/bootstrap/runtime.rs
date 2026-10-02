@@ -123,6 +123,7 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         Some(registry),
     )?;
 
+    ursula_runtime::tidy_worker::spawn_tidy_worker(&spawned.runtime);
     if spawned.runtime.has_cold_store() {
         spawn_cold_flush_worker_if_configured(&spawned.runtime, &config.storage.cold);
         spawn_cold_compaction_worker_if_configured(&spawned.runtime, &config.storage.cold);

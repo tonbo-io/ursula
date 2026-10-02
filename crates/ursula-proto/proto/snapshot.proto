@@ -153,8 +153,14 @@ message ProducerSnapshotV1 {
   uint64 last_start_offset = 4;
   uint64 last_next_offset = 5;
   bool last_closed = 6;
+  // Written only below feature level 1; level 1 answers from the newest
+  // receipt, which the receipt window never evicts (bounded-state F3).
   repeated ProducerAppendRecordV1 last_items = 7;
   repeated ProducerReceiptV1 receipts = 8;
+  // now_ms of the producer's newest accepted write, kept from feature level
+  // 1 on for idle expiry (bounded-state F3). Absent for producers last
+  // written below level 1 and in older snapshots.
+  optional uint64 last_seen_ms = 9;
 }
 
 message ProducerReceiptV1 {

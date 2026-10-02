@@ -329,6 +329,9 @@ impl StreamStateMachine {
             self.earliest_retained_offset(&stream_id),
             chunk.end_offset,
         );
+        // F4a (level 1): external appends above the flushed hot prefix are
+        // cold too; collapse everything below the seal point.
+        self.collapse_sealed_message_records(&stream_id);
         StreamResponse::ColdFlushed {
             hot_start_offset: self.hot_start_offset(&stream_id),
         }
@@ -623,6 +626,12 @@ impl StreamStateMachine {
     ) -> bool {
         snapshot_offset == retained_offset
             || snapshot_offset <= self.cold_frontier_offset(stream_id, retained_offset)
+            // F4a collapses records below the seal point, so at level 1
+            // every offset at or below it is accepted (F18).
+            || (self.producer_bounds_enabled()
+                && self
+                    .stream_slot(stream_id)
+                    .is_some_and(|slot| snapshot_offset <= slot.seal_point()))
             || self
                 .stream_slot(stream_id)
                 .is_some_and(|slot| snapshot_offset <= slot.hot_buffer.hot_start_offset())
@@ -727,10 +736,14 @@ impl StreamStateMachine {
             return 0;
         };
         let retained_offset = slot.retained_offset;
+        // Every retained byte below the seal point is cold (F18), and F4a
+        // collapses message records there, so boundaries are exact only
+        // from the seal point on.
         let frontier = slot
             .cold
             .cold_frontier_offset(retained_offset)
-            .max(slot.hot_buffer.hot_start_offset());
+            .max(slot.hot_buffer.hot_start_offset())
+            .max(slot.seal_point());
         if frontier <= retained_offset {
             return retained_offset;
         }

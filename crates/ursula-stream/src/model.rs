@@ -83,11 +83,19 @@ pub struct ProducerSnapshot {
     pub last_next_offset: u64,
     pub last_closed: bool,
     pub last_items: Vec<ProducerAppendRecord>,
-    /// Bounded exact response history for delayed retries. Missing in legacy
-    /// snapshots, which are restored with the last response as the sole
+    /// Exact response history for delayed retries, oldest first. At feature
+    /// level 1 it is bounded by the stream's receipt window (F3), and a
+    /// producer's newest receipt is never evicted. Missing in legacy
+    /// snapshots: a level-0 restore uses the last response as the sole
     /// receipt.
     #[serde(default)]
     pub receipts: Vec<ProducerReceipt>,
+    /// `now_ms` of the producer's newest accepted write (F3 idle expiry),
+    /// kept from feature level 1 on. `None` for producers last written
+    /// below level 1 and in legacy snapshots: their idle period starts at
+    /// the first `TidyStream` that stamps them.
+    #[serde(default)]
+    pub last_seen_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,14 +125,25 @@ pub(crate) struct ProducerState {
     pub(crate) last_start_offset: u64,
     pub(crate) last_next_offset: u64,
     pub(crate) last_closed: bool,
+    /// The newest receipt's items. Kept only below feature level 1, where
+    /// snapshots still carry it for older binaries; level 1 answers from the
+    /// newest receipt, which the window never evicts (F3).
     pub(crate) last_items: Vec<ProducerAppendRecord>,
-    pub(crate) receipts: Vec<ProducerReceipt>,
+    /// Receipts of the current epoch in sequence order, with contiguous
+    /// sequences, so a duplicate's receipt sits at `seq - front.seq`.
+    pub(crate) receipts: std::collections::VecDeque<ProducerReceipt>,
+    /// See [`ProducerSnapshot::last_seen_ms`].
+    pub(crate) last_seen_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamBatchAppend {
     pub items: Vec<StreamBatchAppendItem>,
     pub deduplicated: bool,
+    /// A duplicate whose receipt the stream's receipt window evicted (F3,
+    /// feature level 1): deduplicated without per-frame ranges, so `items`
+    /// is empty.
+    pub receipt_evicted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

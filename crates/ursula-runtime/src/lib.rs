@@ -20,6 +20,7 @@
 //! - [`ops`]: declarative manifest of the uniform runtime operations; expands
 //!   into the per-operation actor and client plumbing.
 //! - [`metrics`]: runtime metrics shared across cores; lock-free counters.
+//! - [`tidy_worker`]: leader-side `TidyStream` driver (bounded-state F0).
 
 mod admission;
 pub mod cold_index;
@@ -38,6 +39,7 @@ mod request;
 mod rt;
 mod runtime;
 mod snapshot_store;
+pub mod tidy_worker;
 mod trace;
 
 pub use admission::RaftUncommittedAdmission;
@@ -131,6 +133,8 @@ pub use engine::GroupSetFeatureLevelFuture;
 pub use engine::GroupShutdownFuture;
 pub use engine::GroupSnapshotFuture;
 pub use engine::GroupStateGaugesFuture;
+pub use engine::GroupTidyStreamFuture;
+pub use engine::GroupTidyStreamsFuture;
 pub use engine::GroupTouchStreamAccessFuture;
 pub use engine::GroupUpdateStreamAttrsFuture;
 pub use engine::GroupWriteBatchFuture;
@@ -195,6 +199,9 @@ pub use request::SetBucketQuotaResponse;
 pub use request::SetFeatureLevelRequest;
 pub use request::SetFeatureLevelResponse;
 pub use request::StreamAppendCount;
+pub use request::TidyStreamResponse;
+pub use request::TidyStreamsRequest;
+pub use request::TidyStreamsResponse;
 pub use request::TouchStreamAccessResponse;
 pub use request::UpdateStreamAttrsRequest;
 pub use request::UpdateStreamAttrsResponse;
@@ -242,6 +249,8 @@ pub use ursula_stream::validate_bucket_id;
 
 #[cfg(test)]
 mod incarnation_gc_tests;
+#[cfg(test)]
+mod producer_window_tests;
 #[cfg(test)]
 mod tests;
 

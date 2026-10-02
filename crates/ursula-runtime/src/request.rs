@@ -408,6 +408,31 @@ pub struct SetFeatureLevelRequest {
     pub level: u32,
 }
 
+/// One leader-side `TidyStream` pass over a group (bounded-state F0): the
+/// engine proposes `TidyStream` for at most `max_streams` streams with
+/// normalization debt at `now_ms`. Followers propose nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TidyStreamsRequest {
+    pub max_streams: usize,
+    pub now_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TidyStreamsResponse {
+    /// `TidyStream` commands committed by this pass.
+    pub tidied: u64,
+    /// Tidied streams that still report debt after their command.
+    pub debt_remaining: u64,
+}
+
+/// Result of one replicated `TidyStream` command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TidyStreamResponse {
+    pub placement: ShardPlacement,
+    pub debt_remaining: bool,
+    pub group_commit_index: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetFeatureLevelResponse {
     pub placement: ShardPlacement,
@@ -734,6 +759,11 @@ pub struct AppendResponse {
     pub stream_hot_bytes: u64,
     #[serde(default)]
     pub group_hot_bytes: u64,
+    /// A duplicate beyond the stream's receipt window (bounded-state F3):
+    /// deduplicated without byte or record ranges. `start_offset` and
+    /// `next_offset` then carry no information about the original append.
+    #[serde(default)]
+    pub receipt_evicted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
