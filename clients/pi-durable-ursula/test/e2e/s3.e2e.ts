@@ -33,8 +33,19 @@ async function writeAndPublish(stream: string, url = baseUrl()): Promise<number>
 	for (let i = 0; i < 4; i++) await s.commit(conv(10 + i), ctx);
 	const tail = s.tail;
 	await s.close(ctx);
-	const r = await fetch(`${url}/${stream}/keyed-state?key=${b64(K.m(META.owner))}&min_through_record=${tail}&timeout_ms=20000`);
-	expect(r.status).toBe(200);
+	// 503 is retryable (keyed-state API): other e2e files restart the shared indexer concurrently.
+	const r = await until(
+		`keyed state of ${stream} through ${tail}`,
+		async () => {
+			const response = await fetch(`${url}/${stream}/keyed-state?key=${b64(K.m(META.owner))}&min_through_record=${tail}&timeout_ms=20000`);
+			if (response.status !== 503) return response;
+			await response.text();
+			return undefined;
+		},
+		60_000,
+		250,
+	);
+	expect(r.status, r.status === 200 ? "" : await r.text()).toBe(200);
 	return tail;
 }
 

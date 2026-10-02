@@ -61,11 +61,12 @@ describe.runIf(info.nodes.length >= 3)("keyed stack on a 3-node cluster", () => 
 		const answers = await Promise.all(
 			info.nodes.map(async (node) => {
 				// A follower that has not applied the tail yet answers 400 with its record tail (the
-				// owner retries that); poll until it serves.
+				// owner retries that), and 503 is retryable (other e2e files restart the shared
+				// indexer concurrently); poll until it serves.
 				for (let i = 0; ; i++) {
 					const r = await fetch(`${node.url}/${stream}/${query}`, { redirect: "manual" });
 					const body = await r.text();
-					if (r.status !== 400 || i > 100) return { node, status: r.status, through: r.headers.get("stream-keyed-through"), body };
+					if ((r.status !== 400 && r.status !== 503) || i > 200) return { node, status: r.status, through: r.headers.get("stream-keyed-through"), body };
 					await new Promise((res) => setTimeout(res, 50));
 				}
 			}),
