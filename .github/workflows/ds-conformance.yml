@@ -24,7 +24,7 @@ env:
 jobs:
   conformance:
     name: DS conformance (single node, memory)
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6

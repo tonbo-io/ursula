@@ -22,7 +22,7 @@ env:
 jobs:
   lint:
     name: Rust lint
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -45,8 +45,8 @@ jobs:
       fail-fast: false
       matrix:
         runner:
-          - depot-ubuntu-24.04-16
-          - depot-ubuntu-24.04-arm-16
+          - ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+          - ${{ vars.KS_RUNNER_ARM || 'ubuntu-24.04-arm' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -64,7 +64,7 @@ jobs:
 
   integration:
     name: Rust integration tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -81,7 +81,7 @@ jobs:
 
   dst:
     name: Deterministic simulation smoke
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -99,7 +99,7 @@ jobs:
 
   typescript:
     name: TypeScript owner
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
