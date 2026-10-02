@@ -7637,3 +7637,514 @@ fn feature_not_enabled_maps_to_conflict() {
         StatusCode::CONFLICT
     );
 }
+
+// Keyed streams P2 (`keyed-batch-v1`) on the write paths: design §5.2, §6.1
+// U4 and U10; `extensions.md` §9.1.
+
+const KEYED_CT: &str = "application/json; profile=keyed-batch-v1";
+
+async fn keyed_router_at_level_1() -> Router {
+    let app = test_router();
+    raise_feature_level(&app, 1).await;
+    app
+}
+
+async fn raise_feature_level(app: &Router, level: u32) {
+    let response = http_post(
+        app,
+        "/__ursula/feature-level",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(format!(r#"{{"level":{level}}}"#)),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+async fn body_text(response: Response) -> String {
+    String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8 body")
+}
+
+fn extension_tokens(response: &Response) -> Vec<String> {
+    response
+        .headers()
+        .get(HEADER_STREAM_EXTENSIONS)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .map(|token| token.trim().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[track_caller]
+fn assert_keyed_advertised(response: &Response) {
+    let tokens = extension_tokens(response);
+    assert!(
+        tokens.iter().any(|token| token == KEYED_BATCH_EXTENSION),
+        "{tokens:?}"
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|token| token == JSON_RECORD_COORDINATES_EXTENSION),
+        "{tokens:?}"
+    );
+}
+
+#[track_caller]
+fn assert_keyed_not_advertised(response: &Response) {
+    let tokens = extension_tokens(response);
+    assert!(
+        !tokens.iter().any(|token| token == KEYED_BATCH_EXTENSION),
+        "{tokens:?}"
+    );
+}
+
+#[tokio::test]
+async fn keyed_create_is_refused_below_feature_level_1_and_allowed_after_raising_it() {
+    let app = test_router();
+    let response = http_put(
+        &app,
+        "/benchcmp/keyed-gated",
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = body_text(response).await;
+    assert!(body.contains("requires group feature level 1"), "{body}");
+    assert_eq!(
+        http_head(&app, "/benchcmp/keyed-gated").await.status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // A quoted profile is not keyed and is not gated.
+    let response = http_put(
+        &app,
+        "/benchcmp/keyed-quoted",
+        &[(
+            CONTENT_TYPE.as_str(),
+            "application/json; profile=\"keyed-batch-v1\"",
+        )],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_keyed_not_advertised(&response);
+
+    raise_feature_level(&app, 1).await;
+    let response = http_put(
+        &app,
+        "/benchcmp/keyed-gated",
+        &[(
+            CONTENT_TYPE.as_str(),
+            "Application/JSON;Profile=keyed-batch-v1",
+        )],
+        Body::from(r#"{"ops":[["p","AQ",1]]}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(header_str(&response, CONTENT_TYPE), KEYED_CT);
+    assert_keyed_advertised(&response);
+
+    // Idempotent re-create also advertises.
+    let response = http_put(
+        &app,
+        "/benchcmp/keyed-gated",
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_advertised(&response);
+}
+
+#[tokio::test]
+async fn keyed_create_body_is_validated_before_the_feature_gate() {
+    let app = test_router();
+    // 422 (HTTP layer) precedes the apply-time 409 of the level gate.
+    let response = http_put(
+        &app,
+        "/benchcmp/keyed-create-invalid",
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"[{"ops":[]},{"ops":[["p","AA=",1]]}]"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = body_text(response).await;
+    assert!(
+        body.starts_with("invalid keyed batch at message 1: "),
+        "{body}"
+    );
+
+    // JSON syntax stays 400.
+    let response = http_put(
+        &app,
+        "/benchcmp/keyed-create-invalid",
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"{"ops":["#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    raise_feature_level(&app, 1).await;
+    let response = http_put(
+        &app,
+        "/benchcmp/keyed-create-invalid",
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"{"ops":[["q","AQ"]]}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        http_head(&app, "/benchcmp/keyed-create-invalid")
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn keyed_append_validates_every_message_and_commits_nothing_on_failure() {
+    let app = keyed_router_at_level_1().await;
+    let uri = "/benchcmp/keyed-append";
+    let response = http_put(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_keyed_advertised(&response);
+
+    let response = http_post(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"{"o":17, "ops":[["p","AQ",{"b":2,"a":1}],["d","Ag"],["x","AA","AP8"]]}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_keyed_advertised(&response);
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
+
+    let response = http_post(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"[{"ops":[]},{"ops":[]},{"ops":[["x","AP8","AA"]]}]"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_keyed_not_advertised(&response);
+    let body = body_text(response).await;
+    assert!(
+        body.starts_with("invalid keyed batch at message 2: "),
+        "{body}"
+    );
+
+    let response = http_post(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"[{"ops":[]},{"ops":"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = http_get(&app, uri).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_advertised(&response);
+    assert_eq!(
+        &body_bytes(response).await[..],
+        b"{\"o\":17,\"ops\":[[\"p\",\"AQ\",{\"b\":2,\"a\":1}],[\"d\",\"Ag\"],[\"x\",\"AA\",\"AP8\"]]}\n"
+    );
+
+    let response = http_head(&app, uri).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_advertised(&response);
+
+    let response = http_get(&app, &format!("{uri}?record=0&record_view=envelope")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_advertised(&response);
+
+    let response = http_get(&app, &format!("{uri}?offset=now")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_advertised(&response);
+}
+
+#[tokio::test]
+async fn keyed_validation_runs_before_stream_lookup() {
+    let app = test_router();
+    // Absent stream: grammar failure is 422, a valid batch is the apply-time 404.
+    let response = http_post(
+        &app,
+        "/benchcmp/keyed-absent",
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"{"ops":[["p","AQ"]]}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let response = http_post(
+        &app,
+        "/benchcmp/keyed-absent",
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"{"ops":[["p","AQ",1]]}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_keyed_not_advertised(&response);
+
+    // Non-keyed stream: ungrammatical keyed write is 422, a valid one 409.
+    let uri = "/benchcmp/plain-json";
+    let response = http_put(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_keyed_not_advertised(&response);
+    let response = http_post(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"{"no_ops":1}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let response = http_post(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(r#"{"ops":[]}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_keyed_not_advertised(&response);
+
+    // Plain JSON streams accept any JSON and never advertise keyed-batch-v1.
+    let response = http_post(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"no_ops":1}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_keyed_not_advertised(&response);
+    let response = http_head(&app, uri).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_not_advertised(&response);
+    let response = http_get(&app, &format!("{uri}?record=0")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_not_advertised(&response);
+}
+
+#[tokio::test]
+async fn keyed_append_batch_fails_whole_request_with_frame_and_message_index() {
+    let app = keyed_router_at_level_1().await;
+    let uri = "/benchcmp/keyed-batch";
+    let response = http_put(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = http_post(
+        &app,
+        &format!("{uri}/append-batch"),
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(batch_body(&[
+            br#"{"ops":[["p","AQ",1]]}"#.as_slice(),
+            br#"[{"ops":[]},{"ops":[["d","AQ","AQ"]]}]"#.as_slice(),
+        ])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = body_text(response).await;
+    assert!(
+        body.starts_with("invalid keyed batch at frame 1 message 1: "),
+        "{body}"
+    );
+    let response = http_head(&app, uri).await;
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "0");
+
+    let response = http_post(
+        &app,
+        &format!("{uri}/append-batch"),
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::from(batch_body(&[
+            br#"{"ops":[["p","AQ",1]]}"#.as_slice(),
+            br#"[{"ops":[]},{"ops":[["d","AQ"]]}]"#.as_slice(),
+        ])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_advertised(&response);
+    let response = http_head(&app, uri).await;
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "3");
+}
+
+fn transaction_op(stream: &str, content_type: &str, payload: &str) -> serde_json::Value {
+    json!({
+        "stream": stream,
+        "content_type": content_type,
+        "payload_base64": BASE64_STANDARD.encode(payload),
+    })
+}
+
+async fn post_transaction(app: &Router, uri: &str, operations: Vec<serde_json::Value>) -> Response {
+    http_post(
+        app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(json!({ "operations": operations }).to_string()),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn keyed_transaction_ops_are_validated_and_advertised() {
+    let app = keyed_router_at_level_1().await;
+    for (stream, content_type) in [("keyed", KEYED_CT), ("plain", "application/json")] {
+        let response = http_put(
+            &app,
+            &format!("/benchcmp/txn-keyed/{stream}"),
+            &[(CONTENT_TYPE.as_str(), content_type)],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+    let txn = "/benchcmp/txn-keyed/$transaction";
+
+    let response = post_transaction(&app, txn, vec![
+        transaction_op("plain", "application/json", r#"{"a":1}"#),
+        transaction_op("keyed", KEYED_CT, r#"[{"ops":[]},{"ops":[["p","AQ"]]}]"#),
+    ])
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = body_text(response).await;
+    assert!(
+        body.starts_with("invalid keyed batch at message 1: "),
+        "{body}"
+    );
+    for stream in ["keyed", "plain"] {
+        let response = http_head(&app, &format!("/benchcmp/txn-keyed/{stream}")).await;
+        assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "0");
+    }
+
+    // Plain-only transactions do not advertise keyed-batch-v1.
+    let response = post_transaction(&app, txn, vec![transaction_op(
+        "plain",
+        "application/json",
+        r#"{"a":1}"#,
+    )])
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_not_advertised(&response);
+
+    // Op content types are normalized like the Content-Type header (U10).
+    let response = post_transaction(&app, txn, vec![
+        transaction_op("plain", "Application/JSON", r#"{"a":2}"#),
+        transaction_op(
+            "keyed",
+            "application/json ;Profile=Keyed-Batch-V1",
+            r#"{"ops":[["p","AQ",1]]}"#,
+        ),
+    ])
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        body_text(response).await
+    );
+}
+
+#[tokio::test]
+async fn transaction_op_content_types_are_normalized() {
+    // U10 regression: `$transaction` compared op content types verbatim, so
+    // a differently-cased type that the Content-Type header would accept was
+    // a 409.
+    let app = test_router();
+    let response = http_put(
+        &app,
+        "/benchcmp/txn-norm/journal",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = post_transaction(&app, "/benchcmp/txn-norm/$transaction", vec![
+        transaction_op("journal", " Application/JSON ", r#"{"a":1}"#),
+    ])
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_keyed_not_advertised(&response);
+    let body = body_bytes(http_get(&app, "/benchcmp/txn-norm/journal").await).await;
+    assert_eq!(&body[..], b"{\"a\":1}\n");
+}
+
+#[tokio::test]
+async fn keyed_batch_v1_message_vectors_through_http() {
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../ursula-index/tests/vectors/keyed_batch_v1.json"
+    ))
+    .expect("vectors");
+    let app = keyed_router_at_level_1().await;
+    let uri = "/benchcmp/keyed-vectors";
+    let response = http_put(
+        &app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let mut committed = 0u64;
+    for vector in vectors["messages"].as_array().expect("messages") {
+        let name = vector["name"].as_str().expect("name");
+        let message = vector["message"].as_str().expect("message");
+        // Wrap in an array so P1 flattening yields exactly this message.
+        let response = http_post(
+            &app,
+            uri,
+            &[(CONTENT_TYPE.as_str(), KEYED_CT)],
+            Body::from(format!("[{message}]")),
+        )
+        .await;
+        let status = response.status();
+        let text = body_text(response).await;
+        match (vector["valid"].as_bool(), vector["reason"].as_str()) {
+            (Some(true), _) => {
+                assert_eq!(status, StatusCode::NO_CONTENT, "{name}: {text}");
+                committed += 1;
+            }
+            (_, Some("invalid_json")) => {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {text}");
+            }
+            _ => {
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{name}: {text}");
+                assert!(
+                    text.starts_with("invalid keyed batch at message 0: "),
+                    "{name}: {text}"
+                );
+            }
+        }
+    }
+    let response = http_head(&app, uri).await;
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_RECORD_NEXT),
+        committed.to_string()
+    );
+}

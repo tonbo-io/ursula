@@ -191,6 +191,7 @@ const HEADER_STREAM_SEQ: &str = "stream-seq";
 const HEADER_STREAM_TTL: &str = "stream-ttl";
 const HEADER_STREAM_UP_TO_DATE: &str = "stream-up-to-date";
 const JSON_RECORD_COORDINATES_EXTENSION: &str = "json-record-coordinates-v1";
+const KEYED_BATCH_EXTENSION: &str = ursula_shard::KEYED_BATCH_PROFILE;
 const PATH_AFFINITY_EXTENSION: &str = "path-affinity-v1";
 const GROUP_APPEND_TRANSACTION_EXTENSION: &str = "group-append-transaction-v1";
 const HEADER_PRODUCER_ID: &str = "producer-id";
@@ -1479,6 +1480,7 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
     if let Some(record_range) = response.record_range {
         insert_record_operation_headers(&mut headers, record_range);
     }
+    insert_keyed_extension_for(&mut headers, content_type);
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
     }
@@ -2551,6 +2553,9 @@ pub(crate) async fn create_stream_by_id(
         Ok(payload) => payload,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
+    if let Err(response) = validate_keyed_write(&content_type, &request.initial_payload, None) {
+        return *response;
+    }
     request.close_after = stream_closed(&request_headers);
     request.stream_seq = stream_seq(&request_headers);
     request.stream_ttl_seconds = stream_ttl_seconds;
@@ -2681,6 +2686,10 @@ pub(crate) async fn append_stream_by_id(
         Ok(payload) => payload,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
+    if let Err(response) = validate_keyed_write(&content_type, &payload, None) {
+        return *response;
+    }
+    let keyed = ursula_shard::is_keyed_batch_content_type(&content_type);
     let mut request = AppendRequest::from_bytes(stream_id, payload);
     request.content_type = content_type;
     request.close_after = close_after;
@@ -2697,11 +2706,12 @@ pub(crate) async fn append_stream_by_id(
     };
 
     if should_externalize_payload(&state, request.payload.len(), true) {
-        return append_stream_external_by_id(state, request_target, request).await;
+        let response = append_stream_external_by_id(state, request_target, request).await;
+        return advertise_keyed_on_success(response, keyed);
     }
 
     match state.runtime.append(request).await {
-        Ok(response) => append_http_response(response),
+        Ok(response) => advertise_keyed_on_success(append_http_response(response), keyed),
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
@@ -2773,6 +2783,14 @@ pub(crate) async fn append_batch(
         Ok(payloads) => payloads,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
+    // Every frame is validated before any is committed: one bad frame fails
+    // the whole request (`extensions.md` §9.1.3).
+    for (frame, payload) in payloads.iter().enumerate() {
+        if let Err(response) = validate_keyed_write(&content_type, payload, Some(frame)) {
+            return *response;
+        }
+    }
+    let keyed = ursula_shard::is_keyed_batch_content_type(&content_type);
     let mut request = AppendBatchRequest::new(stream_id, payloads);
     request.content_type = content_type;
     request.producer = producer.clone();
@@ -2794,6 +2812,9 @@ pub(crate) async fn append_batch(
     });
     if has_record_ranges {
         insert_record_extension(&mut headers);
+    }
+    if keyed && response.items.iter().any(Result::is_ok) {
+        insert_keyed_extension_for(&mut headers, ursula_shard::KEYED_BATCH_CONTENT_TYPE);
     }
     if minimal_ack && response.items.iter().all(Result::is_ok) && !has_record_ranges {
         return (StatusCode::NO_CONTENT, headers).into_response();
@@ -2835,7 +2856,11 @@ pub(crate) async fn append_transaction(
     };
     let now_ms = state.unix_time_ms();
     let mut operations = Vec::with_capacity(transaction.operations.len());
+    let mut keyed = false;
     for operation in transaction.operations {
+        // U10: op content types are normalized like the Content-Type header,
+        // so apply compares them to the stream's stored (normalized) type.
+        let content_type = normalize_content_type(&operation.content_type);
         let payload = match BASE64_STANDARD.decode(operation.payload_base64) {
             Ok(payload) => Bytes::from(payload),
             Err(err) => {
@@ -2846,17 +2871,21 @@ pub(crate) async fn append_transaction(
                     .into_response();
             }
         };
-        let payload = match normalize_http_write_payload(&operation.content_type, payload, false) {
+        let payload = match normalize_http_write_payload(&content_type, payload, false) {
             Ok(payload) => payload,
             Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
         };
+        if let Err(response) = validate_keyed_write(&content_type, &payload, None) {
+            return *response;
+        }
+        keyed |= ursula_shard::is_keyed_batch_content_type(&content_type);
         operations.push(AppendRequest {
             stream_id: BucketStreamId::with_affinity(
                 path.bucket.clone(),
                 path.affinity.clone(),
                 operation.stream,
             ),
-            content_type: operation.content_type,
+            content_type,
             payload,
             close_after: operation.close_after,
             stream_seq: operation.stream_seq,
@@ -2889,6 +2918,12 @@ pub(crate) async fn append_transaction(
     let mut response_headers = HeaderMap::new();
     insert_default_response_headers(&mut response_headers);
     insert_content_type(&mut response_headers, "application/json");
+    if keyed {
+        insert_keyed_extension_for(
+            &mut response_headers,
+            ursula_shard::KEYED_BATCH_CONTENT_TYPE,
+        );
+    }
     (StatusCode::OK, response_headers, body).into_response()
 }
 
@@ -3042,6 +3077,7 @@ pub(crate) async fn head_stream_by_id(
             let mut headers = HeaderMap::new();
             insert_default_response_headers(&mut headers);
             insert_content_type(&mut headers, &response.content_type);
+            insert_keyed_extension_for(&mut headers, &response.content_type);
             insert_offset(&mut headers, response.tail_offset);
             insert_u64_header(
                 &mut headers,
@@ -3115,6 +3151,66 @@ pub(crate) async fn head_stream_by_id(
 
 fn insert_record_extension(headers: &mut HeaderMap) {
     insert_extension_token(headers, JSON_RECORD_COORDINATES_EXTENSION);
+}
+
+/// Advertises `keyed-batch-v1` together with `json-record-coordinates-v1`
+/// when `content_type` is the keyed activation type (`extensions.md`
+/// §9.1.5); responses for other streams never carry `keyed-batch-v1`.
+pub(crate) fn insert_keyed_extension_for(headers: &mut HeaderMap, content_type: &str) {
+    if ursula_shard::is_keyed_batch_content_type(content_type) {
+        insert_record_extension(headers);
+        insert_extension_token(headers, KEYED_BATCH_EXTENSION);
+    }
+}
+
+/// Adds the keyed advertisement to a successful write response whose request
+/// content type is keyed. Apply refuses a content type that differs from the
+/// stream's (409), so success proves the target stream is keyed.
+fn advertise_keyed_on_success(mut response: Response, keyed: bool) -> Response {
+    if keyed && response.status().is_success() {
+        insert_keyed_extension_for(
+            response.headers_mut(),
+            ursula_shard::KEYED_BATCH_CONTENT_TYPE,
+        );
+    }
+    response
+}
+
+/// Validates a P1-normalized JSON write body against `keyed-batch-v1`
+/// (`extensions.md` §9.1.3) when the request content type is the keyed
+/// activation type; other content types pass untouched. `frame` names the
+/// append-batch frame in the error text. Runs before the stream is looked
+/// up, so precedence is 400 (JSON), 422 (grammar), then apply statuses.
+fn validate_keyed_write(
+    content_type: &str,
+    normalized: &[u8],
+    frame: Option<usize>,
+) -> Result<(), Box<Response>> {
+    if !ursula_shard::is_keyed_batch_content_type(content_type) {
+        return Ok(());
+    }
+    // P1 stores one minified message per LF-terminated line; a minified
+    // message never contains a raw LF, and its text is valid UTF-8.
+    let messages = normalized
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| std::str::from_utf8(line).unwrap_or_default());
+    let Err(invalid) = ursula_index::keyed::validate_messages(messages) else {
+        return Ok(());
+    };
+    let status = if invalid.error.reason().is_json_syntax() {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::UNPROCESSABLE_ENTITY
+    };
+    let message = match frame {
+        Some(frame) => format!(
+            "invalid keyed batch at frame {frame} message {}: {}",
+            invalid.index, invalid.error
+        ),
+        None => invalid.to_string(),
+    };
+    Err(Box::new((status, message).into_response()))
 }
 
 fn insert_extension_token(headers: &mut HeaderMap, token: &'static str) {
@@ -3852,6 +3948,7 @@ pub(crate) async fn long_poll_stream(
             Ok(head) => {
                 let mut headers = HeaderMap::new();
                 insert_default_response_headers(&mut headers);
+                insert_keyed_extension_for(&mut headers, &head.content_type);
                 insert_offset(&mut headers, head.tail_offset);
                 insert_static(&mut headers, HEADER_STREAM_UP_TO_DATE, "true");
                 if let (Some(record), Some(record_range)) = (record, head.record_range) {
@@ -4025,6 +4122,7 @@ pub(crate) async fn sse_stream(
     if head.record_range.is_some() {
         insert_record_extension(&mut headers);
     }
+    insert_keyed_extension_for(&mut headers, &head.content_type);
     if encode_base64 {
         insert_static(&mut headers, HEADER_STREAM_SSE_DATA_ENCODING, "base64");
     }
@@ -4105,13 +4203,7 @@ pub(crate) fn has_content_type(headers: &HeaderMap) -> bool {
 }
 
 pub(crate) fn normalize_content_type(value: &str) -> String {
-    value
-        .split(';')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>()
-        .join("; ")
+    ursula_shard::normalize_content_type(value)
 }
 
 pub(crate) fn stream_lifetime(

@@ -4289,3 +4289,62 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn keyed_stream_create_is_gated_at_keyed_feature_level() {
+    const KEYED: &str = "application/json; profile=keyed-batch-v1";
+    let mut machine = machine();
+    let before = machine.snapshot();
+    assert_error_code(
+        machine.apply(create_cmd(stream("keyed"), Create {
+            content_type: KEYED,
+            ..Create::default()
+        })),
+        StreamErrorCode::FeatureNotEnabled,
+    );
+    assert_error_code(
+        machine.apply(StreamCommand::CreateExternal {
+            stream_id: stream("keyed-external"),
+            content_type: KEYED.to_owned(),
+            initial_payload: ExternalPayloadRef {
+                s3_path: "external/keyed.json".to_owned(),
+                payload_len: 11,
+                object_size: 11,
+            },
+            record_ends: vec![11],
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            attrs: None,
+            now_ms: 0,
+        }),
+        StreamErrorCode::FeatureNotEnabled,
+    );
+    assert_eq!(machine.snapshot(), before);
+
+    // Plain JSON and a quoted profile are not keyed and stay ungated.
+    for (name, content_type) in [
+        ("plain", "application/json"),
+        ("quoted", "application/json; profile=\"keyed-batch-v1\""),
+    ] {
+        assert!(matches!(
+            machine.apply(create_cmd(stream(name), Create {
+                content_type,
+                ..Create::default()
+            })),
+            StreamResponse::Created { .. }
+        ));
+    }
+
+    machine.apply(set_feature_level_cmd(crate::FEATURE_LEVEL_KEYED_STREAMS));
+    assert!(matches!(
+        machine.apply(create_cmd(stream("keyed"), Create {
+            content_type: KEYED,
+            payload: b"{\"ops\":[]}\n".to_vec(),
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+}

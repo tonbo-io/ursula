@@ -1,7 +1,24 @@
+//! Shard placement primitives and identifiers shared across Ursula crates.
+//!
+//! Module map:
+//!
+//! - [`content_type`]: content-type normalization and JSON profile detection
+//!   (`keyed-batch-v1` activation), shared by node, gateway and indexer.
+//! - crate root: shard and Raft group identifiers, [`BucketStreamId`],
+//!   reserved affinity stream IDs and the static shard map.
+
 use std::fmt;
 
 use serde::Deserialize;
 use serde::Serialize;
+
+pub mod content_type;
+
+pub use content_type::KEYED_BATCH_CONTENT_TYPE;
+pub use content_type::KEYED_BATCH_PROFILE;
+pub use content_type::is_keyed_batch_content_type;
+pub use content_type::normalize_content_type;
+pub use content_type::profile_of;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CoreId(pub u16);
