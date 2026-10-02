@@ -675,7 +675,7 @@ For an operation that creates no records, `Stream-Record-Start` and `Stream-Reco
 
 All messages from one JSON request body MUST commit atomically and receive one contiguous ordinal range, or the operation MUST fail without making any ordinal visible. Concurrent appenders MUST receive disjoint ranges in committed stream order.
 
-When an idempotent-producer retry is deduplicated, the server MUST return the original `Stream-Record-Start` and `Stream-Record-Next` values.
+When an idempotent-producer retry is deduplicated, the server MUST return the original `Stream-Record-Start` and `Stream-Record-Next` values for a sequence whose receipt it retains: every sequence in the stream's receipt window, and always each producer's newest sequence. A server MAY bound the receipt window; Ursula keeps 1,024 receipt items per stream beyond each producer's newest receipt. A duplicate whose receipt the window evicted MUST still be deduplicated, never appended again, and is answered `204 No Content` with `Producer-Seq` and without `Stream-Next-Offset`, `Stream-Record-Start` or `Stream-Record-Next`. A server MUST NOT return a recomputed range.
 
 For example, if the current record tail is `42`:
 
@@ -861,7 +861,7 @@ Implementations MUST preserve these invariants:
 1. Every successfully appended normalized JSON message receives exactly one ordinal.
 2. Ordinals are contiguous in committed stream order and are never reused.
 3. One atomic append receives one contiguous ordinal range or no range.
-4. A deduplicated append returns its original ordinal range.
+4. A deduplicated append returns its original ordinal range, or no range once its receipt left the receipt window.
 5. `O(r)` always identifies the first canonical byte of record `r`.
 6. Offset reads and record reads expose the same canonical JSON sequence.
 7. Record-aware reads never return partial records.
