@@ -678,13 +678,28 @@ impl Default for ColdHealthConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct KeyedStateConfig {
     /// Base URLs of every keyed-state indexer pod (for example
-    /// `http://indexer-0.indexer:4440`). Bucket purge sends
+    /// `http://indexer-0.indexer:4440`), in failover order: the node sends
+    /// every keyed-state read to the first healthy pod (the primary, then
+    /// the standbys). When non-empty this list takes precedence over
+    /// `server.keyed_state_upstream` for routing. Bucket purge sends
     /// `POST {url}/v1/keyed/drain` to each one and erases `.keyed/{bucket}/`
     /// only after all of them acknowledge (U23). Empty when no indexer runs.
     pub indexer_urls: Vec<String>,
     /// Per-indexer timeout of one drain request; a pod that does not
     /// acknowledge in time leaves the purge incomplete (retry it).
     pub drain_timeout: HumanDuration,
+    /// TCP connect timeout of a keyed-state request to one indexer pod.
+    pub upstream_connect_timeout: HumanDuration,
+    /// How long a keyed-state request waits for one pod's response headers,
+    /// beyond the read's own `timeout_ms`, before it fails over to the next
+    /// pod. The last pod tried gets the rest of the request's budget.
+    pub failover_header_timeout: HumanDuration,
+    /// How long a pod that failed (connection error, header timeout, 502,
+    /// 503, 504) stays out of the failover order before the node probes its
+    /// `/readyz` again; a successful probe makes it eligible again, so the
+    /// primary takes traffic back. At least one second, so a pod returning
+    /// to service has revalidated its view of `CURRENT` (P3.6).
+    pub unhealthy_backoff: HumanDuration,
 }
 
 impl Default for KeyedStateConfig {
@@ -692,6 +707,9 @@ impl Default for KeyedStateConfig {
         Self {
             indexer_urls: Vec::new(),
             drain_timeout: HumanDuration::sec(60),
+            upstream_connect_timeout: HumanDuration::sec(2),
+            failover_header_timeout: HumanDuration::sec(10),
+            unhealthy_backoff: HumanDuration::sec(2),
         }
     }
 }

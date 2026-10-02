@@ -44,6 +44,20 @@ impl UrsulaConfig {
                 )));
             }
         }
+        let keyed = &self.keyed_state;
+        if keyed.unhealthy_backoff.as_duration() < std::time::Duration::from_secs(1) {
+            return Err(ValidationError::Other(
+                "keyed_state.unhealthy_backoff must be at least 1s".into(),
+            ));
+        }
+        if keyed.upstream_connect_timeout.as_duration().is_zero()
+            || keyed.failover_header_timeout.as_duration().is_zero()
+        {
+            return Err(ValidationError::Other(
+                "keyed_state.upstream_connect_timeout and keyed_state.failover_header_timeout must be positive"
+                    .into(),
+            ));
+        }
         if self.raft.wal.backend == WalBackend::Disk && self.raft.wal.path.is_none() {
             return Err(ValidationError::RaftWalPathRequired);
         }

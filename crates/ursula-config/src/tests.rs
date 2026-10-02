@@ -856,4 +856,42 @@ drain_timeout = "5s"
         config.keyed_state.indexer_urls = vec!["indexer-0:4440".to_owned()];
         assert!(config.validate().is_err());
     }
+
+    #[test]
+    fn keyed_state_failover_settings_default_and_validate() {
+        let config = UrsulaConfig::default();
+        assert_eq!(
+            config.keyed_state.upstream_connect_timeout.as_duration(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            config.keyed_state.failover_header_timeout.as_duration(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            config.keyed_state.unhealthy_backoff.as_duration(),
+            Duration::from_secs(2)
+        );
+        let mut config: UrsulaConfig = toml::from_str(
+            r#"
+[keyed_state]
+indexer_urls = ["http://primary:4440", "http://standby:4440"]
+upstream_connect_timeout = "500ms"
+failover_header_timeout = "3s"
+unhealthy_backoff = "5s"
+"#,
+        )
+        .expect("valid config");
+        config.raft.node_id = 1;
+        config.validate().expect("valid failover config");
+        assert_eq!(
+            config.keyed_state.unhealthy_backoff.as_duration(),
+            Duration::from_secs(5)
+        );
+        config.keyed_state.unhealthy_backoff = Duration::from_millis(500).into();
+        assert!(config.validate().is_err());
+        config.keyed_state.unhealthy_backoff = Duration::from_secs(1).into();
+        config.keyed_state.failover_header_timeout = Duration::ZERO.into();
+        assert!(config.validate().is_err());
+    }
 }
