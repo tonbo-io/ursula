@@ -350,7 +350,10 @@ impl KeyedSourceClient {
 
     /// Whether incarnation `incarnation` of the stream still exists: a HEAD
     /// of the stream, then the bucket listing's `created_at_ms`. Absent or
-    /// lagging listing entries are inconclusive and count as present.
+    /// lagging listing entries are inconclusive and count as present: a
+    /// listing entry older than `incarnation` comes from a replica that has
+    /// not applied the recreate yet, and deleting the namespace on it would
+    /// drop the current incarnation's projection.
     pub async fn incarnation(
         &self,
         bucket: &str,
@@ -389,7 +392,11 @@ impl KeyedSourceClient {
                 .find(|entry| entry.stream_id == key)
                 .and_then(|entry| entry.created_at_ms)
             {
-                Some(created) if created != incarnation => IncarnationState::Gone,
+                // Incarnations are created with increasing `created_at_ms`.
+                // The listing reads a possibly lagging replica, so an OLDER
+                // incarnation there is inconclusive (a recreate it has not
+                // applied yet); only a NEWER one proves this one is gone.
+                Some(created) if created > incarnation => IncarnationState::Gone,
                 _ => IncarnationState::Present,
             },
         )
@@ -418,5 +425,65 @@ impl SourceClient for KeyedSourceClient {
         incarnation: u64,
     ) -> BoxFuture<'a, Result<IncarnationState, SourceError>> {
         KeyedSourceClient::incarnation(self, bucket, key, incarnation).boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A source whose HEAD always finds the stream and whose bucket listing
+    /// reports `created_at_ms` for it.
+    async fn source_listing(
+        created_at_ms: u64,
+    ) -> (KeyedSourceClient, tokio::task::JoinHandle<()>) {
+        use axum::routing::get;
+        let app = axum::Router::new()
+            .route("/b/k", get(|| async { "" }).head(|| async { "" }))
+            .route(
+                "/b/streams",
+                get(move || async move {
+                    axum::Json(serde_json::json!({
+                        "streams": [{"stream_id": "k", "created_at_ms": created_at_ms}],
+                    }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = KeyedSourceClient::new(Url::parse(&format!("http://{addr}/")).expect("url"))
+            .expect("client");
+        (client, server)
+    }
+
+    /// A lagging listing that still shows the previous incarnation (100)
+    /// after a recreate (200) is not proof that 200 is gone.
+    #[tokio::test]
+    async fn older_listed_incarnation_is_inconclusive() {
+        let (client, server) = source_listing(100).await;
+        assert_eq!(
+            client
+                .incarnation("b", "k", 200)
+                .await
+                .expect("incarnation"),
+            IncarnationState::Present
+        );
+        assert_eq!(
+            client
+                .incarnation("b", "k", 100)
+                .await
+                .expect("incarnation"),
+            IncarnationState::Present
+        );
+        // A newer incarnation proves the older one was deleted.
+        assert_eq!(
+            client.incarnation("b", "k", 50).await.expect("incarnation"),
+            IncarnationState::Gone
+        );
+        server.abort();
     }
 }
