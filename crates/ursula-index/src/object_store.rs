@@ -8,16 +8,15 @@ use std::io::Write;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(test)]
 use std::sync::Arc;
-#[cfg(test)]
 use std::sync::atomic::AtomicU64;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
-#[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
+use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
 use opendal::ErrorKind;
 use opendal::Operator;
 
@@ -41,6 +40,121 @@ pub(crate) struct ObjectInfo {
     pub modified: Option<SystemTime>,
 }
 
+/// One object-store operation, as seen by an [`ObjectFaults`] hook.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectOp {
+    /// A whole-object read (an S3 HEAD plus a conditional GET).
+    Get,
+    /// A ranged read (one GET).
+    GetRange,
+    /// An entity-tag lookup (one HEAD).
+    Head,
+    /// A put-if-absent or compare-and-swap write (one PUT).
+    Put,
+    /// A recursive listing (one LIST per page).
+    List,
+    /// A delete (one DELETE).
+    Delete,
+}
+
+/// Fault injection for object-store operations (crash-injection tests):
+/// consulted before every operation of a store built with
+/// [`ObjectStore::with_faults`]; an error fails the operation without
+/// performing it.
+pub trait ObjectFaults: Send + Sync {
+    /// Called before `op` on `key` (the prefix for [`ObjectOp::List`]).
+    fn check(&self, op: ObjectOp, key: &str) -> Result<(), IndexError>;
+}
+
+/// Object-store requests by S3 request class, counted as the S3 backend
+/// issues them: a whole-object read is a HEAD and a GET, a ranged read a
+/// GET, a conditional write a PUT, a listing a LIST (per call), a delete a
+/// DELETE.
+#[derive(Debug, Default)]
+pub struct ObjectRequestCounters {
+    get: AtomicU64,
+    head: AtomicU64,
+    put: AtomicU64,
+    list: AtomicU64,
+    delete: AtomicU64,
+}
+
+/// A snapshot of [`ObjectRequestCounters`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct ObjectRequestCounts {
+    /// GET requests.
+    pub get: u64,
+    /// HEAD requests.
+    pub head: u64,
+    /// PUT requests.
+    pub put: u64,
+    /// LIST requests.
+    pub list: u64,
+    /// DELETE requests.
+    pub delete: u64,
+}
+
+impl ObjectRequestCounts {
+    /// PUT-class requests (PUT, COPY, POST, LIST).
+    pub fn put_class(&self) -> u64 {
+        self.put.saturating_add(self.list)
+    }
+
+    /// GET-class requests (GET, HEAD and the rest).
+    pub fn get_class(&self) -> u64 {
+        self.get.saturating_add(self.head)
+    }
+}
+
+impl ObjectRequestCounters {
+    fn record(&self, op: ObjectOp) {
+        let bump = |counter: &AtomicU64| {
+            counter.fetch_add(1, Ordering::Relaxed);
+        };
+        match op {
+            ObjectOp::Get => {
+                bump(&self.head);
+                bump(&self.get);
+            }
+            ObjectOp::GetRange => bump(&self.get),
+            ObjectOp::Head => bump(&self.head),
+            ObjectOp::Put => bump(&self.put),
+            ObjectOp::List => bump(&self.list),
+            ObjectOp::Delete => bump(&self.delete),
+        }
+    }
+
+    /// The counts so far.
+    pub fn snapshot(&self) -> ObjectRequestCounts {
+        ObjectRequestCounts {
+            get: self.get.load(Ordering::Relaxed),
+            head: self.head.load(Ordering::Relaxed),
+            put: self.put.load(Ordering::Relaxed),
+            list: self.list.load(Ordering::Relaxed),
+            delete: self.delete.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A store whose requests are counted and, optionally, fault-injected.
+pub struct ObservedStore {
+    inner: ObjectStore,
+    counters: Option<Arc<ObjectRequestCounters>>,
+    faults: Option<Arc<dyn ObjectFaults>>,
+}
+
+impl ObservedStore {
+    fn before(&self, op: ObjectOp, key: &str) -> Result<(), IndexError> {
+        if let Some(faults) = &self.faults {
+            faults.check(op, key)?;
+        }
+        if let Some(counters) = &self.counters {
+            counters.record(op);
+        }
+        Ok(())
+    }
+}
+
 /// A conditional-write object backend. Opaque outside this crate: construct
 /// one via [`From`] on [`FsObjectStore`] or [`S3ObjectStore`] and hand it to
 /// [`crate::EventIndex::open`] or [`crate::IndexCatalog::new`].
@@ -48,62 +162,151 @@ pub(crate) struct ObjectInfo {
 pub enum ObjectStore {
     Fs(FsObjectStore),
     S3(S3ObjectStore),
+    /// A counted and possibly fault-injected view of another store.
+    Observed(Arc<ObservedStore>),
 }
 
 impl ObjectStore {
-    pub(crate) async fn get(&self, key: &str) -> Result<Option<StoredObject>, IndexError> {
-        match self {
-            Self::Fs(store) => store.get(key),
-            Self::S3(store) => store.get(key).await,
-        }
+    /// This store with its requests also counted in `counters`.
+    pub fn counted(self, counters: Arc<ObjectRequestCounters>) -> Self {
+        Self::Observed(Arc::new(ObservedStore {
+            inner: self,
+            counters: Some(counters),
+            faults: None,
+        }))
     }
 
-    pub(crate) async fn get_range(
-        &self,
-        key: &str,
+    /// This store with every operation first checked by `faults`.
+    pub fn with_faults(self, faults: Arc<dyn ObjectFaults>) -> Self {
+        Self::Observed(Arc::new(ObservedStore {
+            inner: self,
+            counters: None,
+            faults: Some(faults),
+        }))
+    }
+
+    pub(crate) fn get<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<StoredObject>, IndexError>> {
+        async move {
+            match self {
+                Self::Fs(store) => store.get(key),
+                Self::S3(store) => store.get(key).await,
+                Self::Observed(store) => {
+                    store.before(ObjectOp::Get, key)?;
+                    store.inner.get(key).await
+                }
+            }
+        }
+        .boxed()
+    }
+
+    /// The entity tag of `key`, or `None` when it is absent.
+    pub(crate) fn head<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<String>, IndexError>> {
+        async move {
+            match self {
+                Self::Fs(store) => Ok(store.get(key)?.map(|object| object.etag)),
+                Self::S3(store) => store.head(key).await,
+                Self::Observed(store) => {
+                    store.before(ObjectOp::Head, key)?;
+                    store.inner.head(key).await
+                }
+            }
+        }
+        .boxed()
+    }
+
+    pub(crate) fn get_range<'a>(
+        &'a self,
+        key: &'a str,
         range: Range<u64>,
-    ) -> Result<Option<Vec<u8>>, IndexError> {
-        match self {
-            Self::Fs(store) => store.get_range(key, range),
-            Self::S3(store) => store.get_range(key, range).await,
+    ) -> BoxFuture<'a, Result<Option<Vec<u8>>, IndexError>> {
+        async move {
+            match self {
+                Self::Fs(store) => store.get_range(key, range),
+                Self::S3(store) => store.get_range(key, range).await,
+                Self::Observed(store) => {
+                    store.before(ObjectOp::GetRange, key)?;
+                    store.inner.get_range(key, range).await
+                }
+            }
         }
+        .boxed()
     }
 
-    pub(crate) async fn put_if_absent(
-        &self,
-        key: &str,
-        bytes: &[u8],
-    ) -> Result<ConditionalWrite, IndexError> {
-        match self {
-            Self::Fs(store) => store.put_if_absent(key, bytes),
-            Self::S3(store) => store.put_if_absent(key, bytes).await,
+    pub(crate) fn put_if_absent<'a>(
+        &'a self,
+        key: &'a str,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<ConditionalWrite, IndexError>> {
+        async move {
+            match self {
+                Self::Fs(store) => store.put_if_absent(key, bytes),
+                Self::S3(store) => store.put_if_absent(key, bytes).await,
+                Self::Observed(store) => {
+                    store.before(ObjectOp::Put, key)?;
+                    store.inner.put_if_absent(key, bytes).await
+                }
+            }
         }
+        .boxed()
     }
 
-    pub(crate) async fn compare_and_swap(
-        &self,
-        key: &str,
-        expected_etag: &str,
-        bytes: &[u8],
-    ) -> Result<ConditionalWrite, IndexError> {
-        match self {
-            Self::Fs(store) => store.compare_and_swap(key, expected_etag, bytes),
-            Self::S3(store) => store.compare_and_swap(key, expected_etag, bytes).await,
+    pub(crate) fn compare_and_swap<'a>(
+        &'a self,
+        key: &'a str,
+        expected_etag: &'a str,
+        bytes: &'a [u8],
+    ) -> BoxFuture<'a, Result<ConditionalWrite, IndexError>> {
+        async move {
+            match self {
+                Self::Fs(store) => store.compare_and_swap(key, expected_etag, bytes),
+                Self::S3(store) => store.compare_and_swap(key, expected_etag, bytes).await,
+                Self::Observed(store) => {
+                    store.before(ObjectOp::Put, key)?;
+                    store
+                        .inner
+                        .compare_and_swap(key, expected_etag, bytes)
+                        .await
+                }
+            }
         }
+        .boxed()
     }
 
-    pub(crate) async fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>, IndexError> {
-        match self {
-            Self::Fs(store) => store.list(prefix),
-            Self::S3(store) => store.list(prefix).await,
+    pub(crate) fn list<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<ObjectInfo>, IndexError>> {
+        async move {
+            match self {
+                Self::Fs(store) => store.list(prefix),
+                Self::S3(store) => store.list(prefix).await,
+                Self::Observed(store) => {
+                    store.before(ObjectOp::List, prefix)?;
+                    store.inner.list(prefix).await
+                }
+            }
         }
+        .boxed()
     }
 
-    pub(crate) async fn delete(&self, key: &str) -> Result<(), IndexError> {
-        match self {
-            Self::Fs(store) => store.delete(key),
-            Self::S3(store) => store.delete(key).await,
+    pub(crate) fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), IndexError>> {
+        async move {
+            match self {
+                Self::Fs(store) => store.delete(key),
+                Self::S3(store) => store.delete(key).await,
+                Self::Observed(store) => {
+                    store.before(ObjectOp::Delete, key)?;
+                    store.inner.delete(key).await
+                }
+            }
         }
+        .boxed()
     }
 
     /// Delete every object in this store's configured namespace.
@@ -356,6 +559,17 @@ impl S3ObjectStore {
         Err(IndexError::ObjectStore(format!(
             "object `{key}` changed during three consecutive reads"
         )))
+    }
+
+    async fn head(&self, key: &str) -> Result<Option<String>, IndexError> {
+        match self.operator.stat(key).await {
+            Ok(metadata) => metadata
+                .etag()
+                .map(|etag| Some(etag.to_owned()))
+                .ok_or_else(|| IndexError::MissingEtag(key.to_owned())),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(object_error(error)),
+        }
     }
 
     async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Option<Vec<u8>>, IndexError> {
