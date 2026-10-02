@@ -449,6 +449,11 @@ pub(crate) fn render_raft_group_metrics_array(values: &[RaftGroupMetricsSnapshot
                     "purged_index": value.purged.map(|progress| progress.index),
                     "voter_ids": value.voter_ids,
                     "learner_ids": value.learner_ids,
+                    // F12e cadence inputs (bounded-state §7.5 soak gauges).
+                    "log_bytes_since_snapshot": value.log.log_bytes,
+                    "log_entries_since_snapshot": value.log.log_entries,
+                    "last_snapshot_bytes": value.log.last_snapshot_bytes,
+                    "has_snapshot": value.log.has_snapshot,
                 })
             })
             .collect(),

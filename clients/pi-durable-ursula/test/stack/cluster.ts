@@ -41,6 +41,12 @@ export interface StackOptions {
 	readonly featureLevel?: number;
 	/** Extra `[storage.cold]` lines (also written without S3, e.g. `max_hot_size_per_group`). */
 	readonly coldExtra?: readonly string[];
+	/**
+	 * Cold flush and GC cadence on S3: `fast` (default) flushes every 200 ms at 64 KiB for quick tests;
+	 * `default` keeps the server defaults (1 s / 8 MiB, 5 min max hot age), as the soak needs for
+	 * production-shaped S3 request counts.
+	 */
+	readonly coldCadence?: "fast" | "default";
 }
 
 export interface NodeHandle {
@@ -219,9 +225,7 @@ export class Stack {
 				"[storage.cold]",
 				'backend = "s3"',
 				`root = "${S3_ROOT}"`,
-				'flush_interval = "200ms"',
-				'flush_size = "64KiB"',
-				'gc_interval = "500ms"',
+				...(this.options.coldCadence === "default" ? [] : ['flush_interval = "200ms"', 'flush_size = "64KiB"', 'gc_interval = "500ms"']),
 				...(this.options.coldExtra ?? []),
 				"",
 				"[storage.cold.s3]",
