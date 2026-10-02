@@ -902,3 +902,86 @@ fn tidy_stream_command_round_trips_through_serde() {
     );
     assert_eq!(command.to_string(), "tidy_stream:window/serde");
 }
+
+#[test]
+fn producer_cap_evicts_hour_idle_producers_and_rejects_otherwise() {
+    use super::producers::MAX_PRODUCERS_PER_STREAM;
+    use super::producers::PRODUCER_CAP_EVICT_IDLE_MS;
+    let mut machine = machine_at(1);
+    let stream_id = create(&mut machine, "cap", OCTET);
+    // Producer `p0000` writes first, so it is the least recently seen.
+    for index in 0..MAX_PRODUCERS_PER_STREAM {
+        let now_ms = u64::try_from(index).unwrap();
+        appended(append(
+            &mut machine,
+            &stream_id,
+            &format!("p{index:04}"),
+            0,
+            now_ms,
+        ));
+    }
+    let count =
+        |machine: &StreamStateMachine| machine.stream_slot(&stream_id).unwrap().producers.len();
+    assert_eq!(count(&machine), MAX_PRODUCERS_PER_STREAM);
+
+    // Nobody has been idle for an hour: a new producer gets 429 producer_limit
+    // and nothing is written.
+    let tail_before = machine.stream_metadata(&stream_id).unwrap().tail_offset;
+    match append(&mut machine, &stream_id, "new-a", 0, 10_000) {
+        StreamResponse::Error { code, message, .. } => {
+            assert_eq!(code, StreamErrorCode::ProducerLimit);
+            assert!(message.starts_with("producer_limit"), "{message}");
+        }
+        other => panic!("expected ProducerLimit, got {other:?}"),
+    }
+    assert_eq!(
+        machine.stream_metadata(&stream_id).unwrap().tail_offset,
+        tail_before
+    );
+    assert_eq!(count(&machine), MAX_PRODUCERS_PER_STREAM);
+    // Existing producers keep writing at the cap.
+    appended(append(&mut machine, &stream_id, "p0001", 1, 10_000));
+
+    // An hour after `p0000` and `p0002` last wrote they are evictable; the
+    // least recently seen goes first and the cap holds.
+    let later = PRODUCER_CAP_EVICT_IDLE_MS + 2;
+    appended(append(&mut machine, &stream_id, "new-a", 0, later));
+    assert_eq!(count(&machine), MAX_PRODUCERS_PER_STREAM);
+    let slot = machine.stream_slot(&stream_id).unwrap();
+    assert!(!slot.producers.contains_key("p0000"));
+    assert!(
+        slot.producers.contains_key("p0001"),
+        "recently seen is kept"
+    );
+    assert!(slot.producers.contains_key("p0002"));
+    assert!(slot.producers.contains_key("new-a"));
+    appended(append(&mut machine, &stream_id, "new-b", 0, later));
+    let slot = machine.stream_slot(&stream_id).unwrap();
+    assert_eq!(slot.producers.len(), MAX_PRODUCERS_PER_STREAM);
+    assert!(!slot.producers.contains_key("p0002"));
+    window_items(&machine, &stream_id);
+
+    // A replica that restores the snapshot holds the same producers.
+    let restored = StreamStateMachine::restore(machine.snapshot()).unwrap();
+    assert_eq!(producer_snapshot(&restored), producer_snapshot(&machine));
+}
+
+#[test]
+fn producer_cap_does_not_apply_below_level_one() {
+    use super::producers::MAX_PRODUCERS_PER_STREAM;
+    let mut machine = machine_at(0);
+    let stream_id = create(&mut machine, "cap-l0", OCTET);
+    for index in 0..=MAX_PRODUCERS_PER_STREAM {
+        appended(append(
+            &mut machine,
+            &stream_id,
+            &format!("p{index:04}"),
+            0,
+            0,
+        ));
+    }
+    assert_eq!(
+        machine.stream_slot(&stream_id).unwrap().producers.len(),
+        MAX_PRODUCERS_PER_STREAM + 1
+    );
+}
