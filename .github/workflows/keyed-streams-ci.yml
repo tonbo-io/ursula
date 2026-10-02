@@ -1,0 +1,279 @@
+name: Keyed streams CI
+
+# Full verification for the keyed-streams work (docs/architecture/keyed-streams-pi-durable.md).
+# Runs on pushes to the integration branch and to its agent task branches only.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Rust lint
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  units:
+    name: Rust units (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+          - ${{ vars.KS_RUNNER_ARM || 'ubuntu-24.04-arm' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Test workspace units and binaries
+        run: cargo test --workspace --lib --bins
+
+      - name: Test workspace docs
+        run: cargo test --workspace --doc
+
+  integration:
+    name: Rust integration tests
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      # Every integration test target, including ursula-index's, which the main
+      # CI does not run. ursula-sim runs under madsim in the dst job.
+      - name: Test all integration targets
+        run: cargo test --workspace --tests --exclude ursula-sim
+
+  dst:
+    name: Deterministic simulation smoke
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Audit DST guards
+        run: python3 -m scripts.dst all
+
+      - name: Run madsim smoke corpus
+        run: RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim smoke_corpus_replays -- --nocapture
+
+      # Bounded-state DST PR subset (§7.4): sparse marks (F1), external
+      # locators at level 3 (F5: ambiguous appends and offloads, a learner
+      # installing a snapshot with staged refs, ambiguous CompactCold). A few
+      # seeds each, a few seconds of virtual-time runs; DST Nightly sweeps
+      # larger ranges through the *_SEEDS variables.
+      - name: Run bounded-state seed families (PR subset)
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
+            sparse_marks_survive external_locators_survive --nocapture
+
+      # Keyed indexer DST (keyed-streams U21): the PR seed family under S3
+      # faults, Raft leader changes, indexer crashes and restores.
+      - name: Run keyed indexer seed family
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib keyed_indexer_ -- --nocapture
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
+            --seed-family keyed-indexer \
+            --failure-dir target/ursula-sim-keyed-indexer-failures
+
+  typescript:
+    name: TypeScript owner
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Test clients/pi-durable-ursula
+        run: |
+          if [ ! -f clients/pi-durable-ursula/package.json ]; then
+            echo "clients/pi-durable-ursula does not exist yet"
+            exit 0
+          fi
+          cd clients/pi-durable-ursula
+          npm ci
+          npm run typecheck
+          npm test
+
+  typescript-e2e:
+    name: TypeScript owner e2e (single-node ursula + keyed indexer)
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Build ursula
+        run: cargo build --release -p ursula --bin ursula
+
+      # The global setup starts `ursula server` with `server.keyed_state_upstream` pointing at a
+      # keyed-mode `ursula indexer` (filesystem object store, source = the node), raises the
+      # feature level to 1, and the suite runs the bounded owner (LocalStore over keyed-state):
+      # Pi conformance 23 x {direct, reopen} x both open modes, open/claim/fencing, takeover and
+      # indexer-restart scenarios.
+      - name: Pi conformance, takeover and indexer restart against the real keyed stack
+        timeout-minutes: 10
+        run: |
+          cd clients/pi-durable-ursula
+          npm ci
+          URSULA_BIN="$GITHUB_WORKSPACE/target/release/ursula" E2E_STATE_STORE=bounded npm run test:e2e
+
+  typescript-e2e-s3:
+    name: TypeScript owner e2e on S3 (single node, then 3 nodes + gateway)
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 25
+    env:
+      URSULA_S3_ENDPOINT: http://127.0.0.1:9000
+      URSULA_S3_ACCESS_KEY: minioadmin
+      URSULA_S3_SECRET_KEY: minioadmin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # MinIO as the S3 service: the node cold store and the keyed indexer's object store (one
+      # S3 bucket per stack, the indexer under the node cold root's `.keyed/`).
+      - name: Start MinIO
+        run: scripts/ks_minio_ci.sh
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Build ursula
+        run: cargo build --release -p ursula --bin ursula
+
+      # The whole e2e suite plus the S3 lifecycle checks (stream-delete GC and bucket purge remove
+      # the indexer's namespaces) on one S3-backed node.
+      - name: e2e on S3, single node
+        timeout-minutes: 15
+        run: |
+          cd clients/pi-durable-ursula
+          npm ci
+          E2E_S3=1 URSULA_BIN="$GITHUB_WORKSPACE/target/release/ursula" npm run test:e2e
+
+      # The same suite through the gateway of a 3-node cluster, plus keyed-state on followers, an
+      # owner on a follower node (307 to the leader) and a takeover across nodes.
+      - name: e2e on S3, 3 nodes + gateway
+        timeout-minutes: 15
+        run: |
+          cd clients/pi-durable-ursula
+          E2E_NODES=3 E2E_S3=1 URSULA_BIN="$GITHUB_WORKSPACE/target/release/ursula" npm run test:e2e
+
+  fault-drills:
+    name: Keyed fault drills (short)
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    env:
+      URSULA_S3_ENDPOINT: http://127.0.0.1:9000
+      URSULA_S3_ACCESS_KEY: minioadmin
+      URSULA_S3_SECRET_KEY: minioadmin
+      DRILL_OUTAGE_S: "30"
+      DRILL_SETTLE_S: "5"
+      DRILL_OWNERS: "4"
+      DRILL_COMMIT_DEADLINE_MS: "10000"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Start MinIO
+        run: scripts/ks_minio_ci.sh
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Cache main's ursula binary (e6d8d70)
+        uses: actions/cache@v4
+        with:
+          path: target/ks-old/e6d8d70
+          key: ks-old-ursula-e6d8d70-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build main's ursula binary (rolling-upgrade source)
+        run: scripts/ks_build_old_ursula.sh
+
+      - name: Build ursula
+        run: cargo build --release -p ursula --bin ursula
+
+      - name: Drills
+        timeout-minutes: 45
+        run: |
+          cd clients/pi-durable-ursula
+          npm ci
+          URSULA_BIN="$GITHUB_WORKSPACE/target/release/ursula" \
+          URSULA_OLD_BIN="$GITHUB_WORKSPACE/target/ks-old/e6d8d70/ursula" \
+          DRILL_RESULTS_DIR="$RUNNER_TEMP/drill-results" \
+          npm run test:drills
+
+      - name: Upload drill results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: drill-results
+          path: ${{ runner.temp }}/drill-results
+          if-no-files-found: ignore

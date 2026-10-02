@@ -17,6 +17,20 @@ use crate::request::AppendBatchRequest;
 use crate::request::ColdWriteAdmission;
 use crate::rt::time::Instant;
 
+/// Record reads that found bytes disagreeing with the record index (F1
+/// anchor verification, RC-21). Process-wide: a scan runs outside any group
+/// actor, after the read plan left it.
+static RECORD_COORDINATE_CORRUPTIONS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_coordinate_corruption() {
+    RECORD_COORDINATE_CORRUPTIONS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record reads failed by F1 anchor verification since process start.
+pub fn record_coordinate_corruptions() -> u64 {
+    RECORD_COORDINATE_CORRUPTIONS.load(Ordering::Relaxed)
+}
+
 pub(crate) const GROUP_ACTOR_MAX_WRITE_BATCH: usize = 64;
 pub(crate) const COLD_FLUSH_GROUP_BATCH_MAX_CHUNKS: usize = 4096;
 
@@ -412,6 +426,7 @@ runtime_metrics! {
     counter cold_flush_publish_ns;
     counter cold_orphan_cleanup_attempts;
     counter cold_orphan_cleanup_errors;
+    counter cold_orphan_uncovered_chunks_kept;
     counter cold_orphan_bytes;
     counter cold_gc_reclaimed;
     counter cold_gc_errors;
@@ -725,6 +740,24 @@ impl RuntimeMetricsInner {
         self.cold_gc_reclaimed.fetch_add_relaxed(entries);
     }
 
+    /// One delete attempt of the cold orphan sweep (F14h): `bytes` reclaimed
+    /// on success, or an error.
+    pub(crate) fn record_cold_orphan_cleanup(&self, bytes: u64, error: bool) {
+        self.cold_orphan_cleanup_attempts.fetch_add_relaxed(1);
+        if error {
+            self.cold_orphan_cleanup_errors.fetch_add_relaxed(1);
+        } else {
+            self.cold_orphan_bytes.fetch_add_relaxed(bytes);
+        }
+    }
+
+    /// RT6 alert: the orphan sweep kept an unreferenced exclusive chunk
+    /// because no referenced object covers its retained range (a lost page
+    /// entry); an operator must repair the stream's cold index.
+    pub(crate) fn record_cold_orphan_uncovered_chunk_kept(&self) {
+        self.cold_orphan_uncovered_chunks_kept.fetch_add_relaxed(1);
+    }
+
     pub(crate) fn record_cold_flush_write_error(&self) {
         self.cold_flush_write_errors.fetch_add_relaxed(1);
     }
@@ -822,6 +855,25 @@ pub(crate) fn is_stale_cold_flush_candidate_error(err: &RuntimeError) -> bool {
     }
 }
 
+/// Records the hot backlog a write response carried (F6a), falling back to
+/// a state-machine query when the response came from an older leader.
+pub(crate) async fn record_write_hot_backlog(
+    group: &mut Box<dyn GroupEngine>,
+    metrics: &RuntimeMetricsInner,
+    backlog: Option<crate::request::WriteHotBacklog>,
+    stream_id: BucketStreamId,
+    placement: ShardPlacement,
+) {
+    match backlog {
+        Some(backlog) => metrics.record_cold_hot_backlog(
+            placement.raft_group_id,
+            backlog.stream_hot_bytes,
+            backlog.group_hot_bytes,
+        ),
+        None => record_cold_hot_backlog(group, metrics, stream_id, placement).await,
+    }
+}
+
 pub(crate) async fn record_cold_hot_backlog(
     group: &mut Box<dyn GroupEngine>,
     metrics: &RuntimeMetricsInner,
@@ -897,7 +949,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 151] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 152] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -1030,6 +1082,7 @@ mod metric_manifest_tests {
         "cold_flush_publish_ns",
         "cold_orphan_cleanup_attempts",
         "cold_orphan_cleanup_errors",
+        "cold_orphan_uncovered_chunks_kept",
         "cold_orphan_bytes",
         "cold_gc_reclaimed",
         "cold_gc_errors",

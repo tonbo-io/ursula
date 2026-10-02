@@ -6,8 +6,18 @@
 //! - [`query`]: read paths — heads, accessors, read plans, snapshots, bootstrap.
 //! - [`append`]: append paths and idempotent producer bookkeeping.
 //! - [`lifecycle`]: bucket/stream create, close, delete, attrs, and TTL expiry.
-//! - [`cold`]: cold-tier flush planning, GC, retention compaction, snapshot publishing.
+//! - [`cold`]: cold-tier flush candidates, GC, retention compaction, snapshot publishing.
+//! - [`flush_planner`]: leader-side flush passes over a derived hot-stream index.
 //! - [`persist`]: snapshot / restore / integrity serialization.
+//! - [`producers`]: F3 receipt window, idle-producer expiry, F4a collapse and
+//!   `TidyStream` (feature level 1).
+//! - [`marks`]: F1 sparse cold record marks — sealing at cold transitions and
+//!   record lookups (feature level 2).
+//! - [`boundaries`]: F4b message boundaries without message records — dense
+//!   record offsets or hot append starts, and the legacy conversion (feature
+//!   level 4).
+//! - [`external_locators`]: F5 state-held external payload locators and
+//!   `OffloadColdRefs` (feature level 3), plus the offload pass's query.
 //! - [`hot_buffer`], [`cold_state`], [`ttl`]: internal per-stream data structures.
 //!
 //! The root keeps the [`StreamStateMachine`] type, its core slot/TTL accessors,
@@ -27,7 +37,11 @@ use ursula_shard::BucketStreamId;
 
 use self::cold_gc::ColdGcQueue;
 use self::cold_state::StreamColdState;
+pub use self::gauges::GroupStateGauges;
 use self::hot_buffer::HotBuffer;
+pub use self::marks::RecordPlanError;
+pub use self::marks::RecordReadAnchor;
+pub use self::marks::RecordReadRequest;
 use self::registry::StreamRegistry;
 use self::ttl::TtlEntry;
 use self::ttl::TtlIndex;
@@ -35,14 +49,17 @@ use crate::command::StreamCommand;
 use crate::integrity::StreamIntegrity;
 use crate::model::AppendExternalInput;
 use crate::model::AppendStreamInput;
+use crate::model::BOOTSTRAP_MAX_UPDATE_BYTES;
 use crate::model::BucketQuota;
 use crate::model::BucketQuotaSnapshot;
+use crate::model::BucketStreamListing;
 use crate::model::BucketUsage;
 use crate::model::BucketUsageSnapshot;
 use crate::model::COLD_INDEX_PAGE_SPAN_BYTES;
 use crate::model::ColdChunkRef;
 use crate::model::ColdFlushCandidate;
 use crate::model::ColdGcEntry;
+use crate::model::ColdGcPlanEntry;
 use crate::model::ColdGcTarget;
 use crate::model::ExternalPayloadRef;
 use crate::model::HotPayloadSegment;
@@ -79,12 +96,35 @@ use crate::validate::validate_bucket_id;
 use crate::validate::validate_stream_id;
 
 mod append;
+mod boundaries;
 mod cold;
 mod cold_gc;
+mod cold_refs;
 mod cold_state;
+mod external_locators;
+mod flush_planner;
+mod gauges;
 mod hot_buffer;
+mod marks;
+
+pub use self::cold_refs::SHARED_REF_COMPACTION_THRESHOLD;
+pub use self::cold_refs::SHARED_REF_IDLE_MS;
+pub use self::cold_refs::SharedRefCandidate;
+pub use self::cold_refs::SharedRefCompactionRequest;
+pub use self::cold_refs::SharedRefIdleTracker;
+pub use self::cold_refs::is_legacy_cross_bucket_pack;
+pub use self::cold_refs::plan_shared_ref_run;
+pub use self::external_locators::MAX_STAGED_EXTERNAL_REFS;
+pub use self::external_locators::STAGED_EXTERNAL_REF_MAX_AGE_MS;
+pub use self::external_locators::StagedExternalRefCandidate;
+pub use self::flush_planner::ColdFlushHotAge;
+pub use self::flush_planner::ColdFlushPass;
+pub use self::flush_planner::ColdFlushPassRequest;
+pub use self::flush_planner::ColdFlushPlanStats;
+pub use self::flush_planner::ColdFlushPressure;
 mod lifecycle;
 mod persist;
+mod producers;
 mod query;
 mod registry;
 mod ttl;
@@ -96,6 +136,42 @@ const TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE: usize = 256;
 /// unit in the usage contract, rather than its field name, lets consumers
 /// validate the interpretation before using the derived counter.
 pub const COMMITTED_WRITE_UNIT_BYTES: u64 = 10 * 1024;
+
+/// Replicated bookkeeping per unflushed record beyond its payload, with hot
+/// blocks (F6b): a 16-byte message record plus an 8-byte dense record offset.
+/// Admission and flush thresholds count hot payload plus this much per hot
+/// record (F6c), so a window of tiny records is charged for its real memory.
+pub const HOT_RECORD_OVERHEAD_BYTES: u64 = 24;
+
+/// Per-record hot overhead from feature level 4 (F4b): message records are
+/// gone, and each hot message costs one 8-byte boundary (a dense record
+/// offset for JSON, an append start otherwise).
+pub const HOT_RECORD_OVERHEAD_BYTES_LB4: u64 = 8;
+
+/// Hot records of one stream (F6c): messages that start at or above its
+/// first hot byte. Records of external appends that sit above hot bytes
+/// count too; they occupy the same bookkeeping until the next flush.
+fn slot_hot_records(slot: &StreamSlot, derived: bool) -> u64 {
+    let Some(hot_start) = slot.hot_buffer.first_start_offset() else {
+        return 0;
+    };
+    if derived {
+        return slot.derived_hot_messages();
+    }
+    let below = slot
+        .message_records
+        .partition_point(|record| record.start_offset < hot_start);
+    u64::try_from(slot.message_records.len().saturating_sub(below)).unwrap_or(u64::MAX)
+}
+
+/// Payload plus per-record overhead (F6c), below feature level 4.
+pub fn hot_real_bytes(payload_bytes: u64, records: u64) -> u64 {
+    hot_real_bytes_with(payload_bytes, records, HOT_RECORD_OVERHEAD_BYTES)
+}
+
+fn hot_real_bytes_with(payload_bytes: u64, records: u64, per_record: u64) -> u64 {
+    payload_bytes.saturating_add(records.saturating_mul(per_record))
+}
 
 new_key_type! {
     struct StreamKey;
@@ -112,6 +188,10 @@ pub struct StreamStateMachine {
     /// Group-wide hot payload gauge. Kept incrementally so append admission
     /// and responses do not scan every stream in the group.
     hot_payload_bytes: u64,
+    /// Group-wide count of hot records (F6c): message records that start at
+    /// or above each stream's first hot byte. Derived, never replicated;
+    /// kept incrementally next to `hot_payload_bytes`.
+    hot_records: u64,
     cold_gc: ColdGcQueue,
     /// Live logical references to group-scoped shared cold objects. This is
     /// derived from per-stream cold refs when snapshots are restored.
@@ -127,6 +207,19 @@ pub struct StreamStateMachine {
     /// Per-bucket data-plane quota backstops enforced against this group's
     /// local counters; see [`BucketQuota`] for the enforcement semantics.
     bucket_quotas: HashMap<String, BucketQuota>,
+    /// Derived flush-planner state (bounded-stream-state F10): the streams
+    /// that hold hot bytes and the leader-local rotation cursor. Neither is
+    /// replicated nor part of snapshots; restore rebuilds the index.
+    flush_planner: flush_planner::FlushPlannerState,
+    /// Replicated group feature level (C0). Raised only by
+    /// [`StreamCommand::SetFeatureLevel`], never lowered; gated apply-time
+    /// behavior checks it through [`StreamStateMachine::require_feature_level`].
+    feature_level: u32,
+    /// Largest stream `created_at_ms` this group assigned (C7, F14a/F14g).
+    /// Maintained only at feature level 1 or later, where every create
+    /// assigns `max(now_ms, last_created_at_ms + 1)`, so stream incarnations
+    /// are unique per group even under a frozen or skewed clock.
+    last_created_at_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +234,12 @@ struct StreamSlot {
     retained_offset: u64,
     visible_snapshot: Option<StreamVisibleSnapshot>,
     producers: HashMap<String, ProducerState>,
+    /// Derived F3 receipt window over `producers`; rebuilt on restore.
+    receipt_window: producers::ReceiptWindow,
+    /// Runtime append count for this incarnation (F9). Kept by the group
+    /// engine, not in [`StreamSnapshot`]; living in the slot makes it die with
+    /// the stream on every removal path (delete, TTL expiry, bucket purge).
+    append_count: u64,
 }
 
 impl StreamStateMachine {
@@ -214,11 +313,42 @@ impl StreamStateMachine {
         self.registry.metadata_mut(stream_id)
     }
 
-    fn insert_stream_slot(&mut self, slot: StreamSlot) -> Option<StreamKey> {
+    fn insert_stream_slot(&mut self, mut slot: StreamSlot) -> Option<StreamKey> {
         let hot_payload_bytes = u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64");
+        let hot_records = slot_hot_records(&slot, self.derived_boundaries(&slot));
+        slot.hot_buffer.set_accounted_records(hot_records);
+        let stream_id = (!slot.hot_buffer.is_empty()).then(|| slot.metadata.stream_id.clone());
         let key = self.registry.insert(slot)?;
         self.hot_payload_bytes = self.hot_payload_bytes.saturating_add(hot_payload_bytes);
+        self.hot_records = self.hot_records.saturating_add(hot_records);
+        if let Some(stream_id) = stream_id {
+            self.flush_planner.mark_hot(&stream_id);
+        }
         Some(key)
+    }
+
+    /// Re-derives one stream's membership in the flush planner's hot index
+    /// and its share of the group's hot-record gauge (F6c) after its hot
+    /// buffer or message records changed.
+    fn sync_hot_index(&mut self, stream_id: &BucketStreamId) {
+        let mut hot = false;
+        let records_removed = self.message_records_removed();
+        if let Some(slot) = self.registry.slot_mut(stream_id) {
+            hot = !slot.hot_buffer.is_empty();
+            let previous = slot.hot_buffer.accounted_records();
+            let derived = records_removed && slot.message_records.is_empty();
+            let current = slot_hot_records(slot, derived);
+            slot.hot_buffer.set_accounted_records(current);
+            self.hot_records = self
+                .hot_records
+                .saturating_sub(previous)
+                .saturating_add(current);
+        }
+        if hot {
+            self.flush_planner.mark_hot(stream_id);
+        } else {
+            self.flush_planner.unmark_hot(stream_id);
+        }
     }
 
     fn add_hot_payload_bytes(&mut self, bytes: u64) {
@@ -385,6 +515,92 @@ impl StreamStateMachine {
             ));
         }
         Ok(())
+    }
+
+    /// This group's replicated feature level (C0).
+    pub fn feature_level(&self) -> u32 {
+        self.feature_level
+    }
+
+    /// Largest `created_at_ms` assigned by this group at feature level 1 or
+    /// later (C7).
+    pub fn last_created_at_ms(&self) -> u64 {
+        self.last_created_at_ms
+    }
+
+    fn max_live_created_at_ms(&self, floor: u64) -> u64 {
+        self.registry
+            .slots()
+            .map(|slot| slot.metadata.created_at_ms)
+            .fold(floor, u64::max)
+    }
+
+    /// The `created_at_ms` of a new stream incarnation (C7). At feature
+    /// level 1 or later it is `max(now_ms, last_created_at_ms + 1)`, unique
+    /// and strictly increasing per group; below it the command's `now_ms` is
+    /// used unchanged, as every earlier release does. The create records it
+    /// with [`Self::record_created_at_ms`] once the stream is inserted.
+    fn next_created_at_ms(&self, now_ms: u64) -> u64 {
+        if self.incarnation_scoped_cold_objects() {
+            now_ms.max(self.last_created_at_ms.saturating_add(1))
+        } else {
+            now_ms
+        }
+    }
+
+    fn record_created_at_ms(&mut self, created_at_ms: u64) {
+        if self.incarnation_scoped_cold_objects() {
+            self.last_created_at_ms = self.last_created_at_ms.max(created_at_ms);
+        }
+    }
+
+    /// Cold state for a new incarnation created at `created_at_ms`: scoped
+    /// to its incarnation at feature level 1 or later (F14g step 2),
+    /// generation 0 below it.
+    fn new_incarnation_cold_state(&self, created_at_ms: u64) -> StreamColdState {
+        if self.incarnation_scoped_cold_objects() {
+            StreamColdState::with_generation(created_at_ms)
+        } else {
+            StreamColdState::default()
+        }
+    }
+
+    /// Whether objects of new incarnations are scoped to their incarnation
+    /// (F14g step 2, feature level 1).
+    fn incarnation_scoped_cold_objects(&self) -> bool {
+        self.feature_level >= crate::feature::FEATURE_LEVEL_KEYED_STREAMS
+    }
+
+    /// Apply-time feature gate (C0). Gated commands call this before any
+    /// mutation; below `required` the command fails deterministically on
+    /// every replica with [`StreamErrorCode::FeatureNotEnabled`], whose
+    /// plain-text message names the required level.
+    pub fn require_feature_level(
+        &self,
+        required: u32,
+        operation: &str,
+    ) -> Result<(), StreamResponse> {
+        crate::feature::check_feature_level(self.feature_level, required, operation)
+            .map_err(|message| StreamResponse::error(StreamErrorCode::FeatureNotEnabled, message))
+    }
+
+    /// Applies [`StreamCommand::SetFeatureLevel`]: `max(current, level)`.
+    /// Lower or equal levels are accepted as no-ops so replays and repeated
+    /// operator runs are idempotent.
+    fn set_feature_level(&mut self, level: u32) -> StreamResponse {
+        let previous_level = self.feature_level;
+        self.feature_level = previous_level.max(level);
+        if previous_level < crate::feature::FEATURE_LEVEL_KEYED_STREAMS
+            && self.feature_level >= crate::feature::FEATURE_LEVEL_KEYED_STREAMS
+        {
+            // C7 starts at the raise from the live streams' creation times,
+            // so the first unique incarnation follows every existing one.
+            self.last_created_at_ms = self.max_live_created_at_ms(self.last_created_at_ms);
+        }
+        StreamResponse::FeatureLevelSet {
+            level: self.feature_level,
+            previous_level,
+        }
     }
 
     /// Current per-bucket quotas for this group, sorted for deterministic
@@ -572,6 +788,7 @@ impl StreamStateMachine {
                 producer,
                 now_ms,
             } => {
+                let batch_stream_id = stream_id.clone();
                 let response = match self.append_batch_borrowed(
                     stream_id,
                     content_type.as_deref(),
@@ -579,6 +796,20 @@ impl StreamStateMachine {
                     producer,
                     now_ms,
                 ) {
+                    Ok(batch) if batch.receipt_evicted => {
+                        let tail = self
+                            .stream_metadata(&batch_stream_id)
+                            .map_or(0, |stream| stream.tail_offset);
+                        StreamResponse::Appended {
+                            offset: tail,
+                            next_offset: tail,
+                            closed: false,
+                            deduplicated: true,
+                            producer: None,
+                            receipt_evicted: true,
+                            record_range: None,
+                        }
+                    }
                     Ok(batch) => batch
                         .items
                         .last()
@@ -588,6 +819,8 @@ impl StreamStateMachine {
                             closed: item.closed,
                             deduplicated: item.deduplicated,
                             producer: None,
+                            receipt_evicted: false,
+                            record_range: item.record_range,
                         })
                         .unwrap_or_else(|| {
                             StreamResponse::error(
@@ -646,7 +879,11 @@ impl StreamStateMachine {
                 self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
                 response
             }
-            StreamCommand::FlushCold { stream_id, chunk } => self.flush_cold(stream_id, chunk),
+            StreamCommand::FlushCold {
+                stream_id,
+                chunk,
+                cold_generation,
+            } => self.flush_cold(stream_id, chunk, cold_generation),
             StreamCommand::CompactCold {
                 stream_id,
                 old_chunks,
@@ -666,12 +903,20 @@ impl StreamStateMachine {
             StreamCommand::DeleteStream { stream_id } => self.delete_stream(&stream_id),
             StreamCommand::PurgeBucket { bucket_id } => self.purge_bucket(&bucket_id),
             StreamCommand::AckColdGc { up_to_seq } => self.ack_cold_gc(up_to_seq),
+            StreamCommand::DeferColdGc { seq, not_before_ms } => {
+                self.defer_cold_gc(seq, not_before_ms)
+            }
             StreamCommand::ImportSnapshot { snapshot } => self.import_snapshot(*snapshot),
             StreamCommand::SetBucketQuota {
                 bucket_id,
                 max_streams,
                 max_retained_bytes,
             } => self.set_bucket_quota(bucket_id, max_streams, max_retained_bytes),
+            StreamCommand::SetFeatureLevel { level } => self.set_feature_level(level),
+            StreamCommand::TidyStream { stream_id, now_ms } => self.tidy_stream(&stream_id, now_ms),
+            StreamCommand::OffloadColdRefs { stream_id, refs } => {
+                self.offload_cold_refs(&stream_id, &refs)
+            }
         }
     }
 }
@@ -877,5 +1122,15 @@ fn snapshot_digest(content_type: &str, payload: &[u8]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+#[cfg(test)]
+mod external_locators_tests;
+#[cfg(test)]
+mod hygiene_tests;
+#[cfg(test)]
+mod lb1_cold_tests;
+#[cfg(test)]
+mod lb4_boundaries_tests;
+#[cfg(test)]
+mod producer_window_tests;
 #[cfg(test)]
 mod tests;

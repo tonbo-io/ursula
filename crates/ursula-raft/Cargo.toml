@@ -20,6 +20,7 @@ opentelemetry = { workspace = true }
 prost = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true }
+serde_bytes = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
@@ -45,6 +46,7 @@ rand = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
 sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
+blake3 = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 raft-log = "0.4.5"
 tempfile = { workspace = true }

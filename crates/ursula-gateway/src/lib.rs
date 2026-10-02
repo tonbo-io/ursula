@@ -46,6 +46,7 @@ use tokio::time::Instant;
 use tracing::debug;
 use tracing::error;
 use ursula_shard::BucketStreamId;
+use ursula_shard::KEYED_STATE_RESOURCE;
 use ursula_shard::StaticShardMap;
 use ursula_shard::is_reserved_affinity_stream_id;
 
@@ -526,11 +527,18 @@ impl Gateway {
         let Ok(url) = reqwest::Url::parse(url) else {
             return self.response_header_timeout;
         };
+        // A keyed-state read with `min_through_record` waits up to
+        // `timeout_ms` under the same clamping as a long-poll (P3.2).
+        let is_keyed_state = url.path_segments().is_some_and(|segments| {
+            let segments = segments.collect::<Vec<_>>();
+            segments.len() >= 3 && segments.last() == Some(&KEYED_STATE_RESOURCE)
+        });
         let mut is_long_poll = false;
         let mut requested_timeout_ms = None;
         for (key, value) in url.query_pairs() {
             match key.as_ref() {
                 "live" if value == "long-poll" => is_long_poll = true,
+                "min_through_record" if is_keyed_state => is_long_poll = true,
                 "timeout_ms" => requested_timeout_ms = value.parse::<u64>().ok(),
                 _ => {}
             }
@@ -670,6 +678,10 @@ fn stream_affinity_key(uri: &Uri, shard_map: Option<&StaticShardMap>) -> Option<
     let third = segments
         .next()
         .and_then(|segment| percent_decode_str(segment).decode_utf8().ok());
+    if third.is_none() && second.as_ref() == "streams" {
+        // The bucket listing reads every group; it has no stream to pin to.
+        return None;
+    }
     let stream_id = match third {
         Some(stream) if stream.as_ref() == "$transaction" => {
             BucketStreamId::with_affinity(bucket.as_ref(), second.as_ref(), "$transaction")
@@ -858,6 +870,22 @@ fn classify_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<C
         });
     }
 
+    // `GET /{bucket}/streams` lists the bucket (extensions.md §1.4): a
+    // read-only, bucket-level resource. `streams` is a reserved stream ID, so
+    // no other method addresses it.
+    if segments.len() == 2 && segments.get(1).is_some_and(|segment| segment == "streams") {
+        if *method != Method::GET {
+            return None;
+        }
+        return Some(ClassifiedRequest {
+            resource: Resource {
+                bucket_id,
+                stream_id: None,
+            },
+            action: Action::Read,
+        });
+    }
+
     if segments.len() == 3
         && segments
             .get(2)
@@ -916,6 +944,16 @@ fn classify_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<C
         [suffix] if suffix == "attrs" && *method == Method::PUT => Action::Update,
         [suffix] if suffix == "attrs" && *method == Method::GET => Action::Head,
         [suffix] if suffix == "bootstrap" && *method == Method::GET => Action::Read,
+        // `keyed-state` (P3): a wait for `min_through_record` holds a waiter
+        // like a live read. Other methods classify as reads so an authorized
+        // caller sees the node's `405 Allow: GET`, not a gateway 404.
+        [suffix] if suffix == KEYED_STATE_RESOURCE => {
+            if *method == Method::GET && query_has_param(uri, "min_through_record") {
+                Action::Tail
+            } else {
+                Action::Read
+            }
+        }
         [suffix] if suffix == "append-batch" && *method == Method::POST => Action::Append,
         [suffix] if suffix == "snapshot" && *method == Method::GET => Action::ReadSnapshot,
         [suffix] if suffix == "snapshot" && *method == Method::PUT => Action::PublishSnapshot,
@@ -952,6 +990,15 @@ fn decode_path_segment(segment: &str) -> Option<String> {
         .decode_utf8()
         .ok()
         .map(|decoded| decoded.into_owned())
+}
+
+fn query_has_param(uri: &Uri, name: &str) -> bool {
+    uri.query().is_some_and(|query| {
+        query.split('&').any(|pair| {
+            let key = pair.split_once('=').map_or(pair, |(key, _value)| key);
+            decode_path_segment(key).as_deref() == Some(name)
+        })
+    })
 }
 
 fn query_has_live_mode(uri: &Uri) -> bool {

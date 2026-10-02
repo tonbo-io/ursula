@@ -8,11 +8,15 @@ use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::ColdFlushCandidate;
-use ursula_stream::ColdGcEntry;
+use ursula_stream::ColdGcPlanEntry;
 
 use crate::admission::RaftUncommittedAdmission;
 use crate::admission::SharedRaftUncommittedBytes;
 use crate::admission::UncommittedBytesGuard;
+use crate::cold_index::RepairColdIndexRequest;
+use crate::cold_index::RepairColdIndexResponse;
+use crate::cold_refs::ColdOrphanSweepPlan;
+use crate::cold_refs::ColdOrphanSweepRequest;
 use crate::command::GroupSnapshot;
 use crate::engine::GroupEngine;
 use crate::engine::GroupEngineError;
@@ -29,7 +33,7 @@ use crate::metrics::RuntimeMetricsInner;
 use crate::metrics::append_batch_payload_bytes;
 use crate::metrics::elapsed_ns;
 use crate::metrics::record_cold_backpressure_error;
-use crate::metrics::record_cold_hot_backlog;
+use crate::metrics::record_write_hot_backlog;
 use crate::request::AckColdGcResponse;
 use crate::request::AdvanceRetentionRequest;
 use crate::request::AdvanceRetentionResponse;
@@ -50,6 +54,7 @@ use crate::request::CompactColdResponse;
 use crate::request::CreateStreamExternalRequest;
 use crate::request::CreateStreamRequest;
 use crate::request::CreateStreamResponse;
+use crate::request::DeferColdGcResponse;
 use crate::request::DeleteSnapshotRequest;
 use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
@@ -62,6 +67,7 @@ use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
 use crate::request::ImportGroupStateRequest;
 use crate::request::ImportGroupStateResponse;
+use crate::request::ListBucketStreamsRequest;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -73,6 +79,10 @@ use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
 use crate::request::SetBucketQuotaRequest;
 use crate::request::SetBucketQuotaResponse;
+use crate::request::SetFeatureLevelRequest;
+use crate::request::SetFeatureLevelResponse;
+use crate::request::TidyStreamsRequest;
+use crate::request::TidyStreamsResponse;
 use crate::request::UpdateStreamAttrsRequest;
 use crate::request::UpdateStreamAttrsResponse;
 use crate::rt::sync::Semaphore;
@@ -578,7 +588,17 @@ impl CoreWorker {
                 placement.raft_group_id,
                 elapsed_ns(started_at),
             );
-            record_cold_hot_backlog(group, &metrics, stream_id.clone(), placement).await;
+            record_write_hot_backlog(
+                group,
+                &metrics,
+                response
+                    .as_ref()
+                    .ok()
+                    .and_then(|response| response.hot_backlog),
+                stream_id.clone(),
+                placement,
+            )
+            .await;
             Self::notify_read_watchers(
                 group,
                 metrics,
@@ -618,7 +638,17 @@ impl CoreWorker {
                 placement.raft_group_id,
                 elapsed_ns(started_at),
             );
-            record_cold_hot_backlog(group, &metrics, stream_id.clone(), placement).await;
+            record_write_hot_backlog(
+                group,
+                &metrics,
+                response
+                    .as_ref()
+                    .ok()
+                    .and_then(|response| response.hot_backlog),
+                stream_id.clone(),
+                placement,
+            )
+            .await;
             Self::notify_read_watchers(
                 group,
                 metrics,
@@ -874,7 +904,17 @@ impl CoreWorker {
                 placement.raft_group_id,
                 elapsed_ns(started_at),
             );
-            record_cold_hot_backlog(group, &metrics, stream_id.clone(), placement).await;
+            record_write_hot_backlog(
+                group,
+                &metrics,
+                response
+                    .as_ref()
+                    .ok()
+                    .and_then(|response| response.hot_backlog),
+                stream_id.clone(),
+                placement,
+            )
+            .await;
             Self::notify_read_watchers(
                 group,
                 metrics,
@@ -926,7 +966,17 @@ impl CoreWorker {
                 placement.raft_group_id,
                 elapsed_ns(started_at),
             );
-            record_cold_hot_backlog(group, &metrics, stream_id.clone(), placement).await;
+            record_write_hot_backlog(
+                group,
+                &metrics,
+                response
+                    .as_ref()
+                    .ok()
+                    .and_then(|response| response.hot_backlog),
+                stream_id.clone(),
+                placement,
+            )
+            .await;
             Self::notify_read_watchers(
                 group,
                 metrics,
@@ -994,7 +1044,7 @@ impl CoreWorker {
         group: &mut Box<dyn GroupEngine>,
         max: usize,
         placement: ShardPlacement,
-    ) -> Result<Vec<ColdGcEntry>, RuntimeError> {
+    ) -> Result<Vec<ColdGcPlanEntry>, RuntimeError> {
         // GC is leader-side side-effecting work: only the local leader reclaims
         // and acks, mirroring the cold-flush planner's leadership gate.
         if !group.accepts_local_writes() {
@@ -1006,6 +1056,54 @@ impl CoreWorker {
             .map_err(|err| RuntimeError::group_engine(placement, err))
     }
 
+    pub(crate) async fn repair_cold_index(
+        group: &mut Box<dyn GroupEngine>,
+        request: RepairColdIndexRequest,
+        placement: ShardPlacement,
+    ) -> Result<RepairColdIndexResponse, RuntimeError> {
+        // Page repair rewrites pages, so only the local leader runs it, in
+        // the group actor with every other page writer. A follower reports an
+        // empty, finished step.
+        if !group.accepts_local_writes() {
+            return Ok(RepairColdIndexResponse::default());
+        }
+        group
+            .repair_cold_index(request, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err))
+    }
+
+    pub(crate) async fn plan_shared_ref_compaction(
+        group: &mut Box<dyn GroupEngine>,
+        request: ursula_stream::SharedRefCompactionRequest,
+        placement: ShardPlacement,
+    ) -> Result<Vec<ursula_stream::SharedRefCandidate>, RuntimeError> {
+        // Compaction publishes replacements, so only the local leader plans.
+        if !group.accepts_local_writes() {
+            return Ok(Vec::new());
+        }
+        group
+            .plan_shared_ref_compaction(request, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err))
+    }
+
+    pub(crate) async fn plan_cold_orphan_sweep(
+        group: &mut Box<dyn GroupEngine>,
+        request: ColdOrphanSweepRequest,
+        placement: ShardPlacement,
+    ) -> Result<ColdOrphanSweepPlan, RuntimeError> {
+        // The sweep deletes objects, so only the local leader plans one; a
+        // follower answers with an empty, non-leader plan.
+        if !group.accepts_local_writes() {
+            return Ok(ColdOrphanSweepPlan::default());
+        }
+        group
+            .plan_cold_orphan_sweep(request, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err))
+    }
+
     pub(crate) async fn ack_cold_gc(
         group: &mut Box<dyn GroupEngine>,
         up_to_seq: u64,
@@ -1013,6 +1111,18 @@ impl CoreWorker {
     ) -> Result<AckColdGcResponse, RuntimeError> {
         group
             .ack_cold_gc(up_to_seq, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err))
+    }
+
+    pub(crate) async fn defer_cold_gc(
+        group: &mut Box<dyn GroupEngine>,
+        seq: u64,
+        not_before_ms: u64,
+        placement: ShardPlacement,
+    ) -> Result<DeferColdGcResponse, RuntimeError> {
+        group
+            .defer_cold_gc(seq, not_before_ms, placement)
             .await
             .map_err(|err| RuntimeError::group_engine(placement, err))
     }
@@ -1082,6 +1192,131 @@ impl CoreWorker {
         let exec_started_at = Instant::now();
         let response = group
             .bucket_usage(placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err));
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(exec_started_at),
+        );
+        response
+    }
+
+    pub(crate) async fn list_bucket_streams(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        request: ListBucketStreamsRequest,
+        placement: ShardPlacement,
+    ) -> Result<Option<Vec<ursula_stream::BucketStreamListing>>, RuntimeError> {
+        let exec_started_at = Instant::now();
+        let response = group
+            .list_bucket_streams(request, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err));
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(exec_started_at),
+        );
+        response
+    }
+
+    pub(crate) async fn feature_level(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        placement: ShardPlacement,
+    ) -> Result<u32, RuntimeError> {
+        let exec_started_at = Instant::now();
+        let response = group
+            .feature_level(placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err));
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(exec_started_at),
+        );
+        response
+    }
+
+    pub(crate) async fn state_gauges(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        placement: ShardPlacement,
+    ) -> Result<ursula_stream::GroupStateGauges, RuntimeError> {
+        let exec_started_at = Instant::now();
+        let response = group
+            .state_gauges(placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err));
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(exec_started_at),
+        );
+        response
+    }
+
+    pub(crate) async fn set_feature_level(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        request: SetFeatureLevelRequest,
+        placement: ShardPlacement,
+    ) -> Result<SetFeatureLevelResponse, RuntimeError> {
+        let exec_started_at = Instant::now();
+        let response = group
+            .set_feature_level(request, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err));
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(exec_started_at),
+        );
+        if response.is_ok() {
+            metrics.record_applied_mutation(
+                placement.core_id,
+                placement.raft_group_id,
+                elapsed_ns(exec_started_at),
+            );
+        }
+        response
+    }
+
+    /// One F5 external-locator offload pass (feature level 3). Offloading
+    /// writes cold-index pages and proposes, so only the local leader runs
+    /// it; a follower reports an empty pass.
+    pub(crate) async fn offload_cold_refs(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        request: crate::cold_refs::OffloadColdRefsRequest,
+        placement: ShardPlacement,
+    ) -> Result<crate::cold_refs::OffloadColdRefsResponse, RuntimeError> {
+        if !group.accepts_local_writes() {
+            return Ok(crate::cold_refs::OffloadColdRefsResponse::default());
+        }
+        let started_at = Instant::now();
+        let response = group
+            .offload_cold_refs(request, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err));
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(started_at),
+        );
+        response
+    }
+
+    pub(crate) async fn tidy_streams(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        request: TidyStreamsRequest,
+        placement: ShardPlacement,
+    ) -> Result<TidyStreamsResponse, RuntimeError> {
+        let exec_started_at = Instant::now();
+        let response = group
+            .tidy_streams(request, placement)
             .await
             .map_err(|err| RuntimeError::group_engine(placement, err));
         metrics.record_group_engine_exec(
@@ -1255,7 +1490,8 @@ impl CoreWorker {
                 placement.raft_group_id,
                 elapsed_ns(started_at),
             );
-            record_cold_hot_backlog(group, &metrics, stream_id, placement).await;
+            record_write_hot_backlog(group, &metrics, response.hot_backlog, stream_id, placement)
+                .await;
         }
         Ok(response)
     }
@@ -1284,7 +1520,8 @@ impl CoreWorker {
                 placement.raft_group_id,
                 elapsed_ns(started_at),
             );
-            record_cold_hot_backlog(group, &metrics, stream_id, placement).await;
+            record_write_hot_backlog(group, &metrics, response.hot_backlog, stream_id, placement)
+                .await;
         }
         Ok(response)
     }
@@ -1455,7 +1692,17 @@ impl CoreWorker {
                 placement.raft_group_id,
                 elapsed_ns(started_at),
             );
-            record_cold_hot_backlog(group, &metrics, stream_id.clone(), placement).await;
+            record_write_hot_backlog(
+                group,
+                &metrics,
+                Some(crate::request::WriteHotBacklog {
+                    stream_hot_bytes: response.stream_hot_bytes,
+                    group_hot_bytes: response.group_hot_bytes,
+                }),
+                stream_id.clone(),
+                placement,
+            )
+            .await;
             Self::notify_read_watchers(
                 group,
                 metrics,

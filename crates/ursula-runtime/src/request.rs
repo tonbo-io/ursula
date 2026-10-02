@@ -6,9 +6,11 @@ use serde::Serialize;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::ColdChunkRef;
+use ursula_stream::ColdFlushPressure;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::ProducerRequest;
 use ursula_stream::StreamAttrs;
+use ursula_stream::StreamErrorCode;
 use ursula_stream::StreamIntegritySnapshot;
 use ursula_stream::StreamReadPlan;
 use ursula_stream::StreamReadSegment;
@@ -98,6 +100,13 @@ impl CreateStreamRequest {
     }
 }
 
+/// A stream's and its group's hot payload bytes right after a write applied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteHotBacklog {
+    pub stream_hot_bytes: u64,
+    pub group_hot_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateStreamResponse {
     pub placement: ShardPlacement,
@@ -106,6 +115,11 @@ pub struct CreateStreamResponse {
     pub already_exists: bool,
     pub group_commit_index: u64,
     pub record_range: Option<StreamRecordRange>,
+    /// Hot backlog after the write applied (bounded-stream-state F6a), so
+    /// the runtime records its metric without a second state-machine round
+    /// trip. `None` from an older leader.
+    #[serde(default)]
+    pub hot_backlog: Option<WriteHotBacklog>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +142,12 @@ pub struct HeadStreamResponse {
     pub retained_offset: u64,
     pub integrity: StreamIntegritySnapshot,
     pub record_range: Option<StreamRecordRange>,
+    /// The stream incarnation's `created_at_ms`, unique per group from
+    /// feature level 1 (C7). Internal: the keyed-state proxy passes it to the
+    /// indexer as the incarnation; it has no public header. `default` keeps
+    /// HEAD responses forwarded by older followers decodable.
+    #[serde(default)]
+    pub created_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +189,20 @@ pub struct ReadStreamRequest {
     /// write; ordinary catch-up consumers keep the cheaper follower-local
     /// behavior.
     pub leader_only: bool,
+    /// Server-side continuation anchor (F1): the exact start of `record`
+    /// taken from this reader's own previous response. Used only when its
+    /// incarnation matches and it validates; otherwise the read resolves
+    /// from the record index. Never parsed from client input.
+    pub record_anchor: Option<RecordAnchor>,
+}
+
+/// Where record `record` of stream incarnation `incarnation` (its
+/// `created_at_ms`) starts, as a previous read returned it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordAnchor {
+    pub incarnation: u64,
+    pub record: u64,
+    pub offset: u64,
 }
 
 impl ReadStreamRequest {
@@ -179,6 +213,7 @@ impl ReadStreamRequest {
             && self.record == other.record
             && self.max_records == other.max_records
             && self.leader_only == other.leader_only
+            && self.record_anchor == other.record_anchor
     }
 }
 
@@ -265,7 +300,21 @@ impl GroupReadStreamParts {
         }
     }
 
-    pub async fn into_response(self) -> Result<ReadStreamResponse, GroupEngineError> {
+    /// Followers never let a trimmed record read claim `up_to_date`; they
+    /// forward or hold reads that reach the tail (F1, design §5.2).
+    pub fn forbid_trimmed_up_to_date(&mut self) {
+        if let GroupReadStreamBody::Planned { plan, .. } = &mut self.body
+            && let Some(trim) = plan.record_trim.as_mut()
+        {
+            trim.claim_up_to_date = false;
+        }
+    }
+
+    pub async fn into_response(mut self) -> Result<ReadStreamResponse, GroupEngineError> {
+        let record_trim = match &self.body {
+            GroupReadStreamBody::Planned { plan, .. } => plan.record_trim.as_deref().cloned(),
+            _ => None,
+        };
         let payload = match &self.body {
             GroupReadStreamBody::Materialized(payload) => payload.clone(),
             GroupReadStreamBody::Planned {
@@ -294,6 +343,30 @@ impl GroupReadStreamParts {
                 release.notified().await;
                 payload.clone()
             }
+        };
+        let payload = match record_trim {
+            Some(trim) => {
+                // F1: cut the bracketed window to the requested records.
+                let trimmed = ursula_stream::trim_record_window(&payload, self.offset, &trim)
+                    .map_err(|err| {
+                        tracing::error!(
+                            offset = self.offset,
+                            error = %err,
+                            "record read found bytes that disagree with the record index"
+                        );
+                        crate::metrics::record_coordinate_corruption();
+                        GroupEngineError::stream(StreamErrorCode::InvalidColdFlush, err.to_string())
+                    })?;
+                self.offset = trimmed.offset;
+                self.next_offset = trimmed.next_offset;
+                self.record_range = Some(trimmed.record_range);
+                self.up_to_date = trimmed.up_to_date;
+                let mut payload = payload;
+                payload.truncate(trimmed.end);
+                payload.drain(..trimmed.start);
+                payload
+            }
+            None => payload,
         };
         Ok(ReadStreamResponse {
             placement: self.placement,
@@ -341,6 +414,11 @@ pub struct PublishSnapshotResponse {
     pub snapshot_digest: String,
     pub group_commit_index: u64,
     pub record_range: Option<StreamRecordRange>,
+    /// Hot backlog after the write applied (bounded-stream-state F6a), so
+    /// the runtime records its metric without a second state-machine round
+    /// trip. `None` from an older leader.
+    #[serde(default)]
+    pub hot_backlog: Option<WriteHotBacklog>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,6 +434,11 @@ pub struct AdvanceRetentionResponse {
     pub retained_offset: u64,
     pub group_commit_index: u64,
     pub record_range: Option<StreamRecordRange>,
+    /// Hot backlog after the write applied (bounded-stream-state F6a), so
+    /// the runtime records its metric without a second state-machine round
+    /// trip. `None` from an older leader.
+    #[serde(default)]
+    pub hot_backlog: Option<WriteHotBacklog>,
 }
 
 /// Sets or clears one bucket's data-plane quota record on a group. The
@@ -370,6 +453,69 @@ pub struct SetBucketQuotaRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetBucketQuotaResponse {
     pub placement: ShardPlacement,
+    pub group_commit_index: u64,
+}
+
+/// One group's share of a bucket listing (`extensions.md` §1.4); see
+/// `StreamStateMachine::list_bucket_streams`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListBucketStreamsRequest {
+    pub bucket_id: String,
+    pub prefix: String,
+    pub after: Option<String>,
+    pub limit: usize,
+    pub now_ms: u64,
+}
+
+/// A bucket listing merged across every Raft group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListBucketStreamsResponse {
+    /// At most the requested limit, sorted by bucket-local stream path.
+    pub streams: Vec<ursula_stream::BucketStreamListing>,
+    /// More eligible streams sort after the last returned one.
+    pub has_more: bool,
+}
+
+/// Raises one group's replicated feature level (C0) to
+/// `max(current, level)`. The caller replicates the same request to every
+/// group, and must only send levels every replica supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetFeatureLevelRequest {
+    pub level: u32,
+}
+
+/// One leader-side `TidyStream` pass over a group (bounded-state F0): the
+/// engine proposes `TidyStream` for at most `max_streams` streams with
+/// normalization debt at `now_ms`. Followers propose nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TidyStreamsRequest {
+    pub max_streams: usize,
+    pub now_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TidyStreamsResponse {
+    /// `TidyStream` commands committed by this pass.
+    pub tidied: u64,
+    /// Tidied streams that still report debt after their command.
+    pub debt_remaining: u64,
+}
+
+/// Result of one replicated `TidyStream` command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TidyStreamResponse {
+    pub placement: ShardPlacement,
+    pub debt_remaining: bool,
+    pub group_commit_index: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetFeatureLevelResponse {
+    pub placement: ShardPlacement,
+    /// The group's level after apply.
+    pub level: u32,
+    /// The group's level before apply.
+    pub previous_level: u32,
     pub group_commit_index: u64,
 }
 
@@ -465,12 +611,27 @@ pub struct DeleteStreamRequest {
 pub struct DeleteStreamResponse {
     pub placement: ShardPlacement,
     pub group_commit_index: u64,
+    /// Hot backlog after the write applied (bounded-stream-state F6a), so
+    /// the runtime records its metric without a second state-machine round
+    /// trip. `None` from an older leader.
+    #[serde(default)]
+    pub hot_backlog: Option<WriteHotBacklog>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AckColdGcResponse {
     pub placement: ShardPlacement,
     pub removed: u64,
+    pub group_commit_index: u64,
+}
+
+/// Result of a replicated `DeferColdGc` (bounded-state F14b).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferColdGcResponse {
+    pub placement: ShardPlacement,
+    /// The entry's sequence number at the tail, or `None` when no pending
+    /// entry had the requested one.
+    pub new_seq: Option<u64>,
     pub group_commit_index: u64,
 }
 
@@ -495,6 +656,10 @@ const fn unknown_pending_cold_gc_entries() -> u64 {
 pub struct FlushColdRequest {
     pub stream_id: BucketStreamId,
     pub chunk: ColdChunkRef,
+    /// Cold generation the chunk was planned from
+    /// ([`ursula_stream::ColdFlushCandidate::cold_generation`]); see
+    /// `StreamCommand::FlushCold`. `None` skips the incarnation check.
+    pub cold_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -502,6 +667,11 @@ pub struct FlushColdResponse {
     pub placement: ShardPlacement,
     pub hot_start_offset: u64,
     pub group_commit_index: u64,
+    /// Hot backlog after the write applied (bounded-stream-state F6a), so
+    /// the runtime records its metric without a second state-machine round
+    /// trip. `None` from an older leader.
+    #[serde(default)]
+    pub hot_backlog: Option<WriteHotBacklog>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -541,6 +711,14 @@ pub struct PlanGroupColdFlushRequest {
     pub max_flush_bytes: usize,
     /// Maximum aggregate payload bytes returned by one group planning pass.
     pub max_batch_bytes: usize,
+    /// Node-level flush pressure: the group drains, largest streams first,
+    /// its proportional share of the node's excess hot bytes
+    /// (bounded-stream-state F10).
+    pub pressure: Option<ColdFlushPressure>,
+    /// Maximum hot age (`flush_max_hot_age`, bounded-stream-state F10): a
+    /// stream's hot tail older than this is flushed whole, even below the
+    /// group threshold. `None` disables it.
+    pub max_hot_age: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -685,6 +863,11 @@ pub struct AppendResponse {
     pub stream_hot_bytes: u64,
     #[serde(default)]
     pub group_hot_bytes: u64,
+    /// A duplicate beyond the stream's receipt window (bounded-state F3):
+    /// deduplicated without byte or record ranges. `start_offset` and
+    /// `next_offset` then carry no information about the original append.
+    #[serde(default)]
+    pub receipt_evicted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

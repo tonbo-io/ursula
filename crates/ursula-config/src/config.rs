@@ -31,10 +31,25 @@ pub enum WalBackend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RaftSnapshotBackend {
+    /// S3 whenever an S3 cold store is configured, inline otherwise
+    /// (bounded-stream-state F12b).
     #[default]
+    Auto,
     #[serde(alias = "default", alias = "")]
     Inline,
     S3,
+}
+
+impl RaftSnapshotBackend {
+    /// The concrete backend for a node whose cold store uses `cold_backend`:
+    /// [`Self::Auto`] picks S3 for an S3 cold store and inline otherwise.
+    pub fn resolve(self, cold_backend: ColdBackend) -> Self {
+        match self {
+            Self::Auto if cold_backend == ColdBackend::S3 => Self::S3,
+            Self::Auto => Self::Inline,
+            other => other,
+        }
+    }
 }
 
 /// Top-level Ursula server configuration.
@@ -49,6 +64,7 @@ pub struct UrsulaConfig {
     pub storage: StorageConfig,
     pub governance: GovernanceConfig,
     pub observability: ObservabilityConfig,
+    pub keyed_state: KeyedStateConfig,
 }
 
 /// HTTP server binding and admission settings.
@@ -67,6 +83,10 @@ pub struct ServerConfig {
     pub admin_listen: String,
     /// Process-wide cap on accepted write body bytes held by the HTTP layer.
     pub http_inflight_body_size: HumanSize,
+    /// Base URL of the keyed-state indexer (`ursula indexer` in keyed mode)
+    /// that serves `{stream_url}/keyed-state` (keyed-streams P3). When unset,
+    /// the resource answers 404 and nothing advertises `keyed-state-v1`.
+    pub keyed_state_upstream: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -76,6 +96,7 @@ impl Default for ServerConfig {
             cluster_listen: None,
             admin_listen: "127.0.0.1:4438".to_string(),
             http_inflight_body_size: HumanSize::mib(256),
+            keyed_state_upstream: None,
         }
     }
 }
@@ -164,17 +185,28 @@ pub struct RaftConfig {
     pub snapshot_build_max_concurrency: usize,
     /// Max concurrent snapshot installs across all groups on this node.
     pub snapshot_install_max_concurrency: usize,
-    /// Committed Raft log entries per group between automatic snapshots.
-    /// Larger values reduce full-state snapshot CPU and tail-latency spikes at
-    /// the cost of retaining more log entries for recovery.
+    /// Committed Raft log entries per group between automatic snapshots when
+    /// the manual snapshot driver is disabled (`storage.snapshot.drive_interval
+    /// = "0s"`) and OpenRaft's own policy runs. The driver snapshots by log
+    /// bytes instead (`snapshot_log_budget`).
     pub snapshot_logs_since_last: u64,
-    /// Aggregate unpurged Raft log entries on one node that trigger a
-    /// pressure snapshot pass. This bounds memory-WAL growth when traffic is
-    /// spread across many groups and no individual group reaches
-    /// `snapshot_logs_since_last`.
+    /// Retained for configuration compatibility. The snapshot driver's
+    /// pressure pass now follows `snapshot_log_budget` (bounded-stream-state
+    /// F12e).
     pub snapshot_pressure_unpurged_logs: u64,
-    /// Maximum groups snapshotted by one pressure pass.
+    /// Maximum groups snapshotted by one driver tick, including pressure
+    /// passes.
     pub snapshot_pressure_max_groups_per_tick: usize,
+    /// Node log-byte budget of the snapshot driver (bounded-stream-state
+    /// F12e). A group snapshots once the log it applied since its last
+    /// snapshot reaches `max(F, 2 × that snapshot's size)`, where the floor
+    /// `F` is this budget divided by twice the group count, at most 16 MiB;
+    /// once the node's groups hold three quarters of the budget, a pressure
+    /// pass snapshots the groups that free the most log per snapshot byte.
+    pub snapshot_log_budget: HumanSize,
+    /// Far backstop of the snapshot driver: applied entries since a group's
+    /// last snapshot after which it snapshots whatever its log bytes.
+    pub snapshot_backstop_logs: u64,
     /// Maximum number of payload-bearing Raft log entries retained per group
     /// after they are covered by a snapshot.
     pub max_in_snapshot_log_to_keep: u64,
@@ -205,6 +237,8 @@ impl Default for RaftConfig {
             snapshot_logs_since_last: 5_000,
             snapshot_pressure_unpurged_logs: 65_536,
             snapshot_pressure_max_groups_per_tick: 16,
+            snapshot_log_budget: HumanSize::gib(1),
+            snapshot_backstop_logs: 100_000,
             max_in_snapshot_log_to_keep: 64,
         }
     }
@@ -313,9 +347,19 @@ pub struct ColdConfig {
     /// Upper bound on bytes flushed per group per pass.
     /// Falls back to [`flush_size`](Self::flush_size) when unset.
     pub flush_max_size: Option<HumanSize>,
+    /// Maximum hot age: a stream's hot tail older than this is flushed even
+    /// when its group is below the flush threshold, which bounds how long a
+    /// quiet stream's records stay hot (bounded-stream-state F10). `0`
+    /// disables it.
+    pub flush_max_hot_age: HumanDuration,
     /// Max groups flushed concurrently.
     pub flush_max_concurrency: usize,
-    /// Enable background same-stream cold chunk compaction.
+    /// Enable background cold compaction (on by default, bounded-stream-state
+    /// F14d): the same-stream chunk compactor, which drains compaction debt
+    /// recorded by small flushes and the cold-index repair cursor and lists
+    /// no objects, and the shared pack-reference driver, which rewrites a
+    /// stream's packed slices into one exclusive chunk once it holds 64 of
+    /// them or its tail has been idle for an hour (F2).
     pub compaction_enabled: bool,
     /// Interval between cold chunk compaction discovery passes.
     pub compaction_interval: HumanDuration,
@@ -366,8 +410,9 @@ impl Default for ColdConfig {
             flush_min_hot_size: None,
             flush_pressure_hot_size: HumanSize::mib(128),
             flush_max_size: None,
+            flush_max_hot_age: HumanDuration::min(5),
             flush_max_concurrency: 4,
-            compaction_enabled: false,
+            compaction_enabled: true,
             compaction_interval: HumanDuration::sec(30),
             compaction_target_size: HumanSize::mib(8),
             compaction_max_size: HumanSize::mib(16),
@@ -484,11 +529,13 @@ pub struct RaftSnapshotConfig {
     /// S3 namespace for snapshot objects, relative to the cold-storage root.
     /// Used only when `backend` is `S3`.
     pub s3_prefix: Option<String>,
-    /// Interval for the manual snapshot driver.
+    /// Interval for the manual snapshot driver, which snapshots each group by
+    /// Raft log bytes (bounded-stream-state F12e).
     ///
-    /// When omitted, inline snapshot stores keep the manual driver disabled and
-    /// external snapshot stores use a 5s manual-driver default. Explicit `0s`
-    /// disables the manual driver and keeps openraft's default auto-policy.
+    /// When omitted, external snapshot stores use a 5s interval and inline
+    /// snapshot stores 1s; only external stores gate the driver on store
+    /// health. Explicit `0s` disables the manual driver and keeps openraft's
+    /// entry-count policy (`raft.snapshot_logs_since_last`).
     pub drive_interval: Option<HumanDuration>,
     /// Retained for configuration compatibility. Snapshot driving no longer
     /// forces cold flushes; the cold worker owns flush concurrency.
@@ -498,7 +545,7 @@ pub struct RaftSnapshotConfig {
 impl Default for RaftSnapshotConfig {
     fn default() -> Self {
         Self {
-            backend: RaftSnapshotBackend::Inline,
+            backend: RaftSnapshotBackend::Auto,
             s3_prefix: None,
             drive_interval: None,
             drive_flush_concurrency: 4,
@@ -622,6 +669,48 @@ impl Default for ColdHealthConfig {
             hot_size_high: HumanSize::mib(48),
             hot_size_low: HumanSize::mib(32),
             errors_per_tick_high: 1,
+        }
+    }
+}
+
+/// Keyed-state projection settings (keyed-streams §3.4, §3.8).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeyedStateConfig {
+    /// Base URLs of every keyed-state indexer pod (for example
+    /// `http://indexer-0.indexer:4440`), in failover order: the node sends
+    /// every keyed-state read to the first healthy pod (the primary, then
+    /// the standbys). When non-empty this list takes precedence over
+    /// `server.keyed_state_upstream` for routing. Bucket purge sends
+    /// `POST {url}/v1/keyed/drain` to each one and erases `.keyed/{bucket}/`
+    /// only after all of them acknowledge (U23). Empty when no indexer runs.
+    pub indexer_urls: Vec<String>,
+    /// Per-indexer timeout of one drain request; a pod that does not
+    /// acknowledge in time leaves the purge incomplete (retry it).
+    pub drain_timeout: HumanDuration,
+    /// TCP connect timeout of a keyed-state request to one indexer pod.
+    pub upstream_connect_timeout: HumanDuration,
+    /// How long a keyed-state request waits for one pod's response headers,
+    /// beyond the read's own `timeout_ms`, before it fails over to the next
+    /// pod. A pod that sent its headers then gets as long again for its
+    /// body. The last pod tried gets the rest of the request's budget.
+    pub failover_header_timeout: HumanDuration,
+    /// How long a pod that failed (connection error, header timeout, 502,
+    /// 503, 504) stays out of the failover order before the node probes its
+    /// `/readyz` again; a successful probe makes it eligible again, so the
+    /// primary takes traffic back. At least one second, so a pod returning
+    /// to service has revalidated its view of `CURRENT` (P3.6).
+    pub unhealthy_backoff: HumanDuration,
+}
+
+impl Default for KeyedStateConfig {
+    fn default() -> Self {
+        Self {
+            indexer_urls: Vec::new(),
+            drain_timeout: HumanDuration::sec(60),
+            upstream_connect_timeout: HumanDuration::sec(2),
+            failover_header_timeout: HumanDuration::sec(10),
+            unhealthy_backoff: HumanDuration::sec(2),
         }
     }
 }

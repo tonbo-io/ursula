@@ -114,6 +114,8 @@ pub struct ColdStore {
     observer: Arc<Mutex<Option<ColdStoreObserver>>>,
     fault_policy: Arc<Mutex<Option<ColdStoreFaultPolicy>>>,
     delay_fn: Arc<Mutex<ColdStoreDelayFn>>,
+    /// LIST requests issued (F14d: compaction discovery issues none).
+    list_requests: Arc<std::sync::atomic::AtomicU64>,
 }
 
 pub type ColdStoreHandle = Arc<ColdStore>;
@@ -284,6 +286,7 @@ impl ColdStore {
     /// page covers 64 MiB of one stream, so this is the bounded discovery
     /// surface used by the background chunk compactor.
     pub async fn list_cold_index_pages(&self) -> io::Result<Vec<ColdIndexPageKey>> {
+        self.count_list_request();
         let mut lister = self
             .operator
             .lister_with("")
@@ -450,7 +453,19 @@ impl ColdStore {
             observer: Arc::new(Mutex::new(None)),
             fault_policy: Arc::new(Mutex::new(None)),
             delay_fn: Arc::new(Mutex::new(default_cold_store_delay_fn())),
+            list_requests: Arc::default(),
         }
+    }
+
+    /// LIST requests this store has issued.
+    pub fn list_request_count(&self) -> u64 {
+        self.list_requests
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn count_list_request(&self) {
+        self.list_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn info(&self) -> &ColdStoreInfo {
@@ -640,10 +655,41 @@ impl ColdStore {
         Ok(())
     }
 
+    /// Lists the file names directly below the directory `dir` (which ends
+    /// in `/`), without recursing into subdirectories. Stream GC uses it so a
+    /// sweep never reaches another stream's namespace (F14g).
+    pub async fn list_file_names(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.count_list_request();
+        let mut lister = self
+            .operator
+            .lister_with(dir)
+            .await
+            .map_err(|err| cold_store_io_error(dir, err))?;
+        let mut names = Vec::new();
+        while let Some(entry) = lister
+            .try_next()
+            .await
+            .map_err(|err| cold_store_io_error(dir, err))?
+        {
+            if entry.metadata().mode() != EntryMode::FILE {
+                continue;
+            }
+            let Some(name) = entry.path().strip_prefix(dir) else {
+                continue;
+            };
+            if !name.is_empty() && !name.contains('/') {
+                names.push(name.to_owned());
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
     /// Proves that the object store has no file below `path`. Tenant purge
     /// uses this after recursive deletion; a successful delete request alone
     /// is not physical-absence evidence.
     pub async fn prefix_is_empty(&self, path: &str) -> io::Result<bool> {
+        self.count_list_request();
         let mut lister = self
             .operator
             .lister_with(path)
@@ -679,6 +725,29 @@ impl ColdStore {
             .await
     }
 
+    /// [`Self::read_chunk_range`] that bypasses the read cache: background
+    /// rewrites such as F2 compaction read each slice once, and must not
+    /// evict the blocks that serve client reads.
+    pub async fn read_chunk_range_uncached(
+        &self,
+        chunk: &ColdChunkRef,
+        read_start_offset: u64,
+        len: usize,
+    ) -> io::Result<Vec<u8>> {
+        let object = ObjectPayloadRef::from(chunk);
+        self.read_object_range_inner(None, &object, read_start_offset, len, false)
+            .await
+    }
+
+    /// Size of the object at `path`.
+    pub async fn object_size(&self, path: &str) -> io::Result<u64> {
+        self.operator
+            .stat(path)
+            .await
+            .map(|metadata| metadata.content_length())
+            .map_err(|err| cold_store_io_error(path, err))
+    }
+
     pub async fn read_object_range_for_stream(
         &self,
         stream_id: &BucketStreamId,
@@ -686,7 +755,7 @@ impl ColdStore {
         read_start_offset: u64,
         len: usize,
     ) -> io::Result<Vec<u8>> {
-        self.read_object_range_inner(Some(stream_id), object, read_start_offset, len)
+        self.read_object_range_inner(Some(stream_id), object, read_start_offset, len, true)
             .await
     }
 
@@ -696,7 +765,7 @@ impl ColdStore {
         read_start_offset: u64,
         len: usize,
     ) -> io::Result<Vec<u8>> {
-        self.read_object_range_inner(None, object, read_start_offset, len)
+        self.read_object_range_inner(None, object, read_start_offset, len, true)
             .await
     }
 
@@ -717,6 +786,7 @@ impl ColdStore {
         object: &ObjectPayloadRef,
         read_start_offset: u64,
         len: usize,
+        use_cache: bool,
     ) -> io::Result<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
@@ -754,7 +824,8 @@ impl ColdStore {
                 ),
             ));
         }
-        let cached = self.read_cache.is_some();
+        let read_cache = self.read_cache.as_ref().filter(|_| use_cache);
+        let cached = read_cache.is_some();
         self.notify(ColdStoreEvent::ReadObjectRangeBegin {
             stream_id: stream_id.cloned(),
             path: object.s3_path.clone(),
@@ -777,7 +848,7 @@ impl ColdStore {
                 cached: Some(cached),
             })
             .await?;
-        let mut bytes = if let Some(cache) = &self.read_cache {
+        let mut bytes = if let Some(cache) = read_cache {
             let bytes = self
                 .read_object_range_cached(cache, object, object_start, object_end, len)
                 .await?;
@@ -1130,7 +1201,13 @@ struct ColdCacheEntry {
 struct StreamReadState {
     next_offset: u64,
     sequential_score: usize,
+    /// Cache generation of the last read, for pruning idle readers (F13).
+    last_read: u64,
 }
+
+/// Minimum number of readahead reader entries kept before idle ones are
+/// pruned (F13).
+const MIN_TRACKED_READERS: usize = 4_096;
 
 impl ColdReadCache {
     fn new(config: ColdReadCacheParams) -> Self {
@@ -1186,7 +1263,12 @@ impl ColdReadCache {
         len: usize,
     ) -> usize {
         let mut inner = self.inner.lock().expect("cold cache mutex poisoned");
+        let generation = Self::next_generation(&mut inner);
+        if !inner.readers.contains_key(stream_id) {
+            self.prune_readers_if_needed(&mut inner);
+        }
         let state = inner.readers.entry(stream_id.clone()).or_default();
+        state.last_read = generation;
         if read_start_offset == state.next_offset {
             state.sequential_score = state
                 .sequential_score
@@ -1198,6 +1280,32 @@ impl ColdReadCache {
         state.next_offset =
             read_start_offset.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
         state.sequential_score.min(self.config.max_readahead_blocks)
+    }
+
+    /// Readahead state is kept per stream ever read; bound it at
+    /// max(4 x cache blocks, 4,096) entries by dropping the least recently
+    /// read half once the map is full. Amortized O(1) per new reader. A
+    /// pruned stream only loses its readahead score.
+    fn prune_readers_if_needed(&self, inner: &mut ColdReadCacheInner) {
+        let capacity_blocks = self.config.max_bytes / self.config.block_bytes.max(1);
+        let limit = capacity_blocks.saturating_mul(4).max(MIN_TRACKED_READERS);
+        if inner.readers.len() < limit {
+            return;
+        }
+        let keep = limit / 2;
+        let mut generations = inner
+            .readers
+            .values()
+            .map(|state| state.last_read)
+            .collect::<Vec<_>>();
+        let drop_count = generations.len().saturating_sub(keep);
+        if drop_count == 0 {
+            return;
+        }
+        let (_, threshold, _) = generations.select_nth_unstable(drop_count - 1);
+        let threshold = *threshold;
+        inner.readers.retain(|_, state| state.last_read > threshold);
+        inner.readers.shrink_to(limit);
     }
 
     fn invalidate_path(&self, path: &str) {
@@ -1217,6 +1325,12 @@ impl ColdReadCache {
 
     fn invalidate_prefix(&self, prefix: &str) {
         let mut inner = self.inner.lock().expect("cold cache mutex poisoned");
+        // Drop readahead state of every stream at or below the prefix: a
+        // stream prefix (`bucket/stream/...`) or a whole bucket (`bucket/`).
+        inner.readers.retain(|stream_id, _| {
+            let stream_prefix = format!("{stream_id}/");
+            !(prefix.starts_with(&stream_prefix) || stream_prefix.starts_with(prefix))
+        });
         let keys = inner
             .blocks
             .keys()
@@ -1297,7 +1411,14 @@ impl ColdReadCache {
 }
 
 fn cold_store_io_error(path: &str, err: opendal::Error) -> io::Error {
-    io::Error::other(format!("cold object '{path}': {err}"))
+    // Keep NotFound distinguishable: a read that names a compacted object
+    // refreshes its cold-index page and retries (RT2).
+    let kind = if err.kind() == opendal::ErrorKind::NotFound {
+        io::ErrorKind::NotFound
+    } else {
+        io::ErrorKind::Other
+    };
+    io::Error::new(kind, format!("cold object '{path}': {err}"))
 }
 
 #[cfg(not(madsim))]
@@ -1318,17 +1439,91 @@ pub fn new_cold_chunk_path(
     start_offset: u64,
     end_offset: u64,
 ) -> String {
+    new_cold_chunk_path_in_generation(stream_id, 0, start_offset, end_offset)
+}
+
+/// Names a new exclusive chunk of the stream incarnation whose cold
+/// generation is `generation` (F14g). Generation 0 keeps the legacy name
+/// directly under `{stream}/chunks/`; any other generation adds a
+/// `{generation:016x}/` component, so stream GC can delete one incarnation's
+/// chunks without touching another's.
+pub fn new_cold_chunk_path_in_generation(
+    stream_id: &BucketStreamId,
+    generation: u64,
+    start_offset: u64,
+    end_offset: u64,
+) -> String {
     let unix_nanos = cold_object_unix_nanos();
     let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!(
-        "{stream_id}/chunks/{start_offset:016x}-{end_offset:016x}-{unix_nanos:032x}-{sequence:016x}.bin"
+        "{}{start_offset:016x}-{end_offset:016x}-{unix_nanos:032x}-{sequence:016x}.bin",
+        cold_chunk_dir(stream_id, generation)
     )
+}
+
+/// The directory holding the exclusive chunks of one stream incarnation
+/// (F14g): `{stream}/chunks/` for generation 0, otherwise
+/// `{stream}/chunks/{generation:016x}/`.
+pub fn cold_chunk_dir(stream_id: &BucketStreamId, generation: u64) -> String {
+    if generation == 0 {
+        cold_chunk_prefix(stream_id)
+    } else {
+        format!("{stream_id}/chunks/{generation:016x}/")
+    }
+}
+
+/// The directory holding a stream's staged external payloads.
+pub fn cold_external_dir(stream_id: &BucketStreamId) -> String {
+    format!("{stream_id}/external/")
+}
+
+/// Whether `name` (a file name without directory) has the form Ursula uses
+/// for exclusive chunks, `{start:016x}-{end:016x}-{nanos:032x}-{seq:016x}.bin`.
+pub fn is_cold_chunk_file_name(name: &str) -> bool {
+    hex_fields_with_suffix(name, ".bin", &[16, 16, 32, 16])
+}
+
+/// The `[start, end)` byte range an exclusive chunk's file name encodes, or
+/// `None` for any other name.
+pub fn cold_chunk_file_range(name: &str) -> Option<(u64, u64)> {
+    if !is_cold_chunk_file_name(name) {
+        return None;
+    }
+    let mut fields = name.split('-');
+    let start = u64::from_str_radix(fields.next()?, 16).ok()?;
+    let end = u64::from_str_radix(fields.next()?, 16).ok()?;
+    Some((start, end))
+}
+
+/// Whether `name` has the form Ursula uses for staged external payloads,
+/// `{nanos:032x}-{seq:016x}.bin`.
+pub fn is_external_payload_file_name(name: &str) -> bool {
+    hex_fields_with_suffix(name, ".bin", &[32, 16])
+}
+
+fn hex_fields_with_suffix(name: &str, suffix: &str, widths: &[usize]) -> bool {
+    let Some(stem) = name.strip_suffix(suffix) else {
+        return false;
+    };
+    let fields = stem.split('-').collect::<Vec<_>>();
+    fields.len() == widths.len()
+        && fields.iter().zip(widths).all(|(field, width)| {
+            field.len() == *width && field.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 pub fn new_cold_pack_path(bucket_id: &str, raft_group_id: u32) -> String {
     let unix_nanos = cold_object_unix_nanos();
     let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("{bucket_id}/_packs/{raft_group_id:08x}/{unix_nanos:032x}-{sequence:016x}.bin")
+    format!(
+        "{}{unix_nanos:032x}-{sequence:016x}.bin",
+        cold_pack_dir(bucket_id, raft_group_id)
+    )
+}
+
+/// The directory holding one Raft group's packs for one bucket.
+pub fn cold_pack_dir(bucket_id: &str, raft_group_id: u32) -> String {
+    format!("{bucket_id}/_packs/{raft_group_id:08x}/")
 }
 
 /// The physical erasure domain for one tenant bucket. Every current chunk,
@@ -1337,9 +1532,10 @@ pub fn cold_bucket_prefix(bucket_id: &str) -> String {
     format!("{bucket_id}/")
 }
 
-/// The prefix under which all of a stream's cold chunks live. Cold objects are
-/// stream-exclusive, so removing this prefix reclaims every chunk for a fully
-/// deleted stream in one sweep. Mirrors the layout of [`new_cold_chunk_path`].
+/// The directory of a stream's legacy (generation-0) exclusive chunks.
+/// Mirrors the layout of [`new_cold_chunk_path`]. Never remove it
+/// recursively: an affinity stream named `chunks` under this stream's name
+/// lives below it (D4); stream GC lists it one level at a time instead.
 pub fn cold_chunk_prefix(stream_id: &BucketStreamId) -> String {
     format!("{stream_id}/chunks/")
 }
@@ -1530,6 +1726,42 @@ mod tests {
             inner.lru.len(),
             inner.blocks.len(),
         );
+    }
+
+    #[test]
+    fn readahead_readers_are_pruned_and_invalidated() {
+        // Measured before F13: one reader entry per stream ever read
+        // (149 B each), never evicted.
+        let cache = ColdReadCache::new(ColdReadCacheParams {
+            max_bytes: 4 * 1024,
+            block_bytes: 1024,
+            max_readahead_blocks: 2,
+        });
+        for index in 0..20_000 {
+            let stream_id = BucketStreamId::new("bucket", format!("s{index}"));
+            cache.record_stream_read(&stream_id, 0, 8);
+        }
+        let readers = cache.inner.lock().expect("cache mutex").readers.len();
+        assert!(readers <= 4_096, "{readers} reader entries retained");
+
+        // The most recent reader keeps its sequential state (a fresh entry
+        // reading at offset 8 would score 0).
+        let recent = BucketStreamId::new("bucket", "s19999");
+        assert_eq!(cache.record_stream_read(&recent, 8, 8), 2);
+
+        let doomed = BucketStreamId::new("other", "gone");
+        cache.record_stream_read(&doomed, 0, 8);
+        cache.invalidate_prefix(&super::cold_chunk_prefix(&doomed));
+        assert!(
+            !cache
+                .inner
+                .lock()
+                .expect("cache mutex")
+                .readers
+                .contains_key(&doomed)
+        );
+        cache.invalidate_prefix(&super::cold_bucket_prefix("bucket"));
+        assert!(cache.inner.lock().expect("cache mutex").readers.is_empty());
     }
 
     #[test]

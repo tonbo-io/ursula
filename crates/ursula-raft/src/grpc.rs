@@ -647,12 +647,20 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 placement,
                 metrics: None,
                 cold_store: self.cold_store.clone(),
-                cold_index_cache: self.cold_store.as_ref().map(|cold_store| {
-                    Arc::new(ColdIndexPageCache::new(
-                        Arc::new(ColdStoreColdIndexPageStore::new(cold_store.clone())),
-                        1024,
-                    ))
-                }),
+                // The group's shared page cache (bounded-state F13), which
+                // apply-time invalidation reaches; a request-scoped cache only
+                // when none was registered.
+                cold_index_cache: self
+                    .registry
+                    .cold_index_cache(placement.raft_group_id)
+                    .or_else(|| {
+                        self.cold_store.as_ref().map(|cold_store| {
+                            Arc::new(ColdIndexPageCache::new(
+                                Arc::new(ColdStoreColdIndexPageStore::new(cold_store.clone())),
+                                1024,
+                            ))
+                        })
+                    }),
             };
             let stream_id = match request.affinity_key {
                 Some(affinity_key) => BucketStreamId::with_affinity(
@@ -692,27 +700,14 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                         payload: encode_wire(&response),
                     }),
                 raft_internal_proto::group_read_request_v1::Read::ReadStream(read) => {
-                    let max_len = usize::try_from(read.max_len).map_err(|_| {
-                        tonic::Status::invalid_argument("group_read.read_stream.max_len too large")
-                    })?;
-                    engine
-                        .read_stream(
-                            ReadStreamRequest {
-                                stream_id,
-                                offset: read.offset,
-                                max_len,
-                                now_ms: request.now_ms,
-                                record: read.record,
-                                max_records: read.max_records,
-                                leader_only: false,
-                            },
-                            placement,
-                        )
-                        .await
-                        .map(|response| raft_internal_proto::GroupReadResponseV1 {
+                    let read = read_stream_request_from_v1(stream_id, request.now_ms, read)
+                        .map_err(tonic::Status::invalid_argument)?;
+                    engine.read_stream(read, placement).await.map(|response| {
+                        raft_internal_proto::GroupReadResponseV1 {
                             ok: true,
                             payload: encode_wire(&response),
-                        })
+                        }
+                    })
                 }
             };
             let response = match result {
@@ -731,6 +726,34 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
 
 /// Decode a MessagePack RPC payload carried inside a proto envelope, mapping
 /// failures to `InvalidArgument`.
+/// Server half of a forwarded read: the engine request, with the F1
+/// continuation anchor the follower sent (absent from older followers).
+/// `Err` names the invalid field.
+pub(crate) fn read_stream_request_from_v1(
+    stream_id: BucketStreamId,
+    now_ms: u64,
+    read: raft_internal_proto::ReadStreamReadV1,
+) -> Result<ReadStreamRequest, &'static str> {
+    let max_len =
+        usize::try_from(read.max_len).map_err(|_| "group_read.read_stream.max_len too large")?;
+    Ok(ReadStreamRequest {
+        stream_id,
+        offset: read.offset,
+        max_len,
+        now_ms,
+        record: read.record,
+        max_records: read.max_records,
+        leader_only: false,
+        record_anchor: read
+            .record_anchor
+            .map(|anchor| ursula_runtime::RecordAnchor {
+                incarnation: anchor.incarnation,
+                record: anchor.record,
+                offset: anchor.offset,
+            }),
+    })
+}
+
 fn decode_rpc_payload<T: DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T, GrpcRpcError> {
     decode_wire(bytes, what).map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))
 }

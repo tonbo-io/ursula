@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod hygiene_tests;
 pub mod in_memory;
 
 use std::borrow::Cow;
@@ -11,7 +13,7 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::BucketUsageSnapshot;
 use ursula_stream::ColdFlushCandidate;
-use ursula_stream::ColdGcEntry;
+use ursula_stream::ColdGcPlanEntry;
 use ursula_stream::StreamCommand;
 use ursula_stream::StreamErrorCode;
 use ursula_stream::StreamErrorContext;
@@ -41,6 +43,7 @@ use crate::request::CompactColdResponse;
 use crate::request::CreateStreamExternalRequest;
 use crate::request::CreateStreamRequest;
 use crate::request::CreateStreamResponse;
+use crate::request::DeferColdGcResponse;
 use crate::request::DeleteSnapshotRequest;
 use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
@@ -52,6 +55,7 @@ use crate::request::GroupReadStreamParts;
 use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
 use crate::request::ImportGroupStateRequest;
+use crate::request::ListBucketStreamsRequest;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -63,6 +67,8 @@ use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
 use crate::request::SetBucketQuotaRequest;
 use crate::request::SetBucketQuotaResponse;
+use crate::request::SetFeatureLevelRequest;
+use crate::request::SetFeatureLevelResponse;
 use crate::request::TouchStreamAccessResponse;
 use crate::request::UpdateStreamAttrsRequest;
 use crate::request::UpdateStreamAttrsResponse;
@@ -103,6 +109,42 @@ pub type GroupAdvanceRetentionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AdvanceRetentionResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupSetBucketQuotaFuture<'a> =
     Pin<Box<dyn Future<Output = Result<SetBucketQuotaResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupSetFeatureLevelFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<SetFeatureLevelResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupTidyStreamFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<crate::request::TidyStreamResponse, GroupEngineError>>
+            + Send
+            + 'a,
+    >,
+>;
+pub type GroupOffloadColdRefsFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<crate::cold_refs::OffloadColdRefsResponse, GroupEngineError>>
+            + Send
+            + 'a,
+    >,
+>;
+pub type GroupTidyStreamsFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<crate::request::TidyStreamsResponse, GroupEngineError>>
+            + Send
+            + 'a,
+    >,
+>;
+pub type GroupListBucketStreamsFuture<'a> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<Option<Vec<ursula_stream::BucketStreamListing>>, GroupEngineError>,
+            > + Send
+            + 'a,
+    >,
+>;
+pub type GroupFeatureLevelFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<u32, GroupEngineError>> + Send + 'a>>;
+pub type GroupStateGaugesFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<ursula_stream::GroupStateGauges, GroupEngineError>> + Send + 'a>,
+>;
 pub type GroupReadSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ReadSnapshotResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupDeleteSnapshotFuture<'a> =
@@ -119,10 +161,33 @@ pub type GroupDeleteStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<DeleteStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupAckColdGcFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AckColdGcResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupDeferColdGcFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<DeferColdGcResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupPurgeBucketFuture<'a> =
     Pin<Box<dyn Future<Output = Result<PurgeBucketResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupPlanColdGcFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Vec<ColdGcEntry>, GroupEngineError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<Vec<ColdGcPlanEntry>, GroupEngineError>> + Send + 'a>>;
+pub type GroupRepairColdIndexFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<crate::cold_index::RepairColdIndexResponse, GroupEngineError>>
+            + Send
+            + 'a,
+    >,
+>;
+pub type GroupPlanSharedRefCompactionFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Vec<ursula_stream::SharedRefCandidate>, GroupEngineError>>
+            + Send
+            + 'a,
+    >,
+>;
+pub type GroupPlanColdOrphanSweepFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<crate::cold_refs::ColdOrphanSweepPlan, GroupEngineError>>
+            + Send
+            + 'a,
+    >,
+>;
 pub type GroupImportGroupStateFuture<'a> = Pin<
     Box<
         dyn Future<Output = Result<crate::request::ImportGroupStateResponse, GroupEngineError>>
@@ -176,6 +241,12 @@ pub enum GroupWriteResponse {
     PurgeBucket(PurgeBucketResponse),
     ImportGroupState(crate::request::ImportGroupStateResponse),
     Batch(Vec<Result<GroupWriteResponse, GroupEngineError>>),
+    // Appended last so serialized variant positions of older variants stay
+    // stable across mixed-version clusters.
+    SetFeatureLevel(SetFeatureLevelResponse),
+    TidyStream(crate::request::TidyStreamResponse),
+    DeferColdGc(DeferColdGcResponse),
+    OffloadColdRefs(crate::cold_refs::OffloadStreamColdRefsResponse),
 }
 
 pub trait GroupEngine: Send + 'static {
@@ -309,6 +380,108 @@ pub trait GroupEngine: Send + 'static {
         })
     }
 
+    /// This group's share of a bucket listing (`extensions.md` §1.4), or
+    /// `None` when the group does not know the bucket. Like
+    /// [`GroupEngine::bucket_usage`] it is served from local replica state,
+    /// leader or follower: the listing is a catalog that tolerates
+    /// replication lag, and requiring leadership would fail it whenever any
+    /// group is led elsewhere. Default unsupported, so an engine that cannot
+    /// list never reports a bucket as empty.
+    fn list_bucket_streams<'a>(
+        &'a mut self,
+        request: ListBucketStreamsRequest,
+        placement: ShardPlacement,
+    ) -> GroupListBucketStreamsFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "bucket listing is not supported for bucket '{}' in group {}",
+                request.bucket_id, placement.raft_group_id.0
+            )))
+        })
+    }
+
+    /// Replicated group feature level (C0) held by this replica's applied
+    /// state. Like [`GroupEngine::bucket_usage`] it is served from local
+    /// state, leader or follower, so operators can verify every replica.
+    /// Default unsupported: an engine that cannot report its level must not
+    /// be counted as having reached one.
+    fn feature_level<'a>(&'a mut self, placement: ShardPlacement) -> GroupFeatureLevelFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "feature levels are not supported for group {}",
+                placement.raft_group_id.0
+            )))
+        })
+    }
+
+    /// Bounded-state gauges of this replica's applied state
+    /// (`docs/architecture/bounded-stream-state.md` §7.5). Served from local
+    /// state, leader or follower, like [`GroupEngine::feature_level`].
+    /// Default unsupported.
+    fn state_gauges<'a>(&'a mut self, placement: ShardPlacement) -> GroupStateGaugesFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "state gauges are not supported for group {}",
+                placement.raft_group_id.0
+            )))
+        })
+    }
+
+    /// Replicated `TidyStream` write (bounded-state F0); see
+    /// `StreamCommand::TidyStream`. Default unsupported.
+    fn tidy_stream<'a>(
+        &'a mut self,
+        _stream_id: BucketStreamId,
+        _now_ms: u64,
+        placement: ShardPlacement,
+    ) -> GroupTidyStreamFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "stream tidy is not supported for group {}",
+                placement.raft_group_id.0
+            )))
+        })
+    }
+
+    /// One leader-side `TidyStream` pass (bounded-state F0): proposes
+    /// `TidyStream` for up to `request.max_streams` streams with debt. A
+    /// follower or an engine without support tidies nothing.
+    fn tidy_streams<'a>(
+        &'a mut self,
+        _request: crate::request::TidyStreamsRequest,
+        _placement: ShardPlacement,
+    ) -> GroupTidyStreamsFuture<'a> {
+        Box::pin(async move { Ok(crate::request::TidyStreamsResponse::default()) })
+    }
+
+    /// One leader-side external-locator offload pass (bounded-state F5,
+    /// feature level 3): for each stream whose state-held external refs are
+    /// due, writes their cold-index page entries (clipping overlapping
+    /// entries) and then proposes `OffloadColdRefs`. A follower, a group below
+    /// level 3, or an engine without a cold store offloads nothing.
+    fn offload_cold_refs<'a>(
+        &'a mut self,
+        _request: crate::cold_refs::OffloadColdRefsRequest,
+        _placement: ShardPlacement,
+    ) -> GroupOffloadColdRefsFuture<'a> {
+        Box::pin(async move { Ok(crate::cold_refs::OffloadColdRefsResponse::default()) })
+    }
+
+    /// Replicated `SetFeatureLevel` write (C0); see
+    /// `StreamCommand::SetFeatureLevel`. Default unsupported.
+    fn set_feature_level<'a>(
+        &'a mut self,
+        _request: SetFeatureLevelRequest,
+        placement: ShardPlacement,
+    ) -> GroupSetFeatureLevelFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "feature levels are not supported for group {}",
+                placement.raft_group_id.0
+            )))
+        })
+    }
+
     fn read_snapshot<'a>(
         &'a mut self,
         request: ReadSnapshotRequest,
@@ -391,6 +564,18 @@ pub trait GroupEngine: Send + 'static {
         Box::pin(async { Err(GroupEngineError::new("cold GC ack is not supported")) })
     }
 
+    /// Replicated `DeferColdGc` (bounded-state F14b, feature level 1): moves
+    /// the failing cold-GC entry `seq` to the tail of the queue, due no
+    /// earlier than `not_before_ms`. Default unsupported.
+    fn defer_cold_gc<'a>(
+        &'a mut self,
+        _seq: u64,
+        _not_before_ms: u64,
+        _placement: ShardPlacement,
+    ) -> GroupDeferColdGcFuture<'a> {
+        Box::pin(async { Err(GroupEngineError::new("cold GC deferral is not supported")) })
+    }
+
     /// Replicated tenant offboarding: removes every stream in the bucket, the
     /// bucket, and its quota in this group. Monotonic aggregate usage remains
     /// available to asynchronous accounting readers. Default unsupported.
@@ -410,6 +595,39 @@ pub trait GroupEngine: Send + 'static {
         _placement: ShardPlacement,
     ) -> GroupPlanColdGcFuture<'a> {
         Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Leader-side cold-index page repair for one step of the group's stream
+    /// cursor (bounded-state F19 step 2). It runs in the group actor, one at a
+    /// time with every other page writer. Default repairs nothing and ends
+    /// the cycle.
+    fn repair_cold_index<'a>(
+        &'a mut self,
+        _request: crate::cold_index::RepairColdIndexRequest,
+        _placement: ShardPlacement,
+    ) -> GroupRepairColdIndexFuture<'a> {
+        Box::pin(async { Ok(crate::cold_index::RepairColdIndexResponse::default()) })
+    }
+
+    /// Leader-local discovery for the shared pack-reference compaction
+    /// driver (bounded-state F2): the streams to compact next and the run of
+    /// shared refs to compact for each. Default finds none.
+    fn plan_shared_ref_compaction<'a>(
+        &'a mut self,
+        _request: ursula_stream::SharedRefCompactionRequest,
+        _placement: ShardPlacement,
+    ) -> GroupPlanSharedRefCompactionFuture<'a> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// What applied state references for one orphan-sweep step (bounded-state
+    /// F14h). Default reports a non-leader with nothing to sweep.
+    fn plan_cold_orphan_sweep<'a>(
+        &'a mut self,
+        _request: crate::cold_refs::ColdOrphanSweepRequest,
+        _placement: ShardPlacement,
+    ) -> GroupPlanColdOrphanSweepFuture<'a> {
+        Box::pin(async { Ok(crate::cold_refs::ColdOrphanSweepPlan::default()) })
     }
 
     fn append<'a>(
@@ -779,8 +997,19 @@ pub trait GroupEngine: Send + 'static {
                     )
                     .await
                     .map(GroupWriteResponse::UpdateStreamAttrs),
-                StreamCommand::FlushCold { stream_id, chunk } => self
-                    .flush_cold(FlushColdRequest { stream_id, chunk }, placement)
+                StreamCommand::FlushCold {
+                    stream_id,
+                    chunk,
+                    cold_generation,
+                } => self
+                    .flush_cold(
+                        FlushColdRequest {
+                            stream_id,
+                            chunk,
+                            cold_generation,
+                        },
+                        placement,
+                    )
                     .await
                     .map(GroupWriteResponse::FlushCold),
                 StreamCommand::CompactCold {
@@ -825,6 +1054,10 @@ pub trait GroupEngine: Send + 'static {
                     .ack_cold_gc(up_to_seq, placement)
                     .await
                     .map(GroupWriteResponse::AckColdGc),
+                StreamCommand::DeferColdGc { seq, not_before_ms } => self
+                    .defer_cold_gc(seq, not_before_ms, placement)
+                    .await
+                    .map(GroupWriteResponse::DeferColdGc),
                 StreamCommand::PurgeBucket { bucket_id } => self
                     .purge_bucket(bucket_id, placement)
                     .await
@@ -848,9 +1081,20 @@ pub trait GroupEngine: Send + 'static {
                     )
                     .await
                     .map(GroupWriteResponse::SetBucketQuota),
+                StreamCommand::SetFeatureLevel { level } => self
+                    .set_feature_level(SetFeatureLevelRequest { level }, placement)
+                    .await
+                    .map(GroupWriteResponse::SetFeatureLevel),
+                StreamCommand::TidyStream { stream_id, now_ms } => self
+                    .tidy_stream(stream_id, now_ms, placement)
+                    .await
+                    .map(GroupWriteResponse::TidyStream),
                 StreamCommand::CreateBucket { .. } | StreamCommand::DeleteBucket { .. } => Err(
                     GroupEngineError::new("bucket commands are not valid group writes"),
                 ),
+                StreamCommand::OffloadColdRefs { .. } => Err(GroupEngineError::new(
+                    "OffloadColdRefs is proposed only by the leader's offload pass",
+                )),
             }
         })
     }
@@ -1097,6 +1341,12 @@ pub enum GroupEngineError {
     ForwardToLeader {
         message: String,
         leader_hint: GroupLeaderHint,
+        /// True only when the node checked leadership locally before it
+        /// proposed anything (RT1). A forward reported by OpenRaft after
+        /// `client_write` (a responder dropped on step-down or log purge) may
+        /// follow a committed entry, so it stays `false`: ambiguous.
+        #[serde(default)]
+        before_proposal: bool,
     },
 }
 
@@ -1165,6 +1415,9 @@ impl GroupEngineError {
         })
     }
 
+    /// A forward-to-leader error whose command may already have been
+    /// proposed (and even committed): callers must not treat it as a
+    /// definite rejection.
     pub fn forward_to_leader(
         message: impl Into<String>,
         node_id: Option<u64>,
@@ -1173,7 +1426,30 @@ impl GroupEngineError {
         Self::ForwardToLeader {
             message: message.into(),
             leader_hint: GroupLeaderHint { node_id, address },
+            before_proposal: false,
         }
+    }
+
+    /// A forward-to-leader error raised by a local leadership check before
+    /// anything was proposed: the command definitely did not commit here.
+    pub fn forward_to_leader_before_proposal(
+        message: impl Into<String>,
+        node_id: Option<u64>,
+        address: Option<String>,
+    ) -> Self {
+        Self::ForwardToLeader {
+            message: message.into(),
+            leader_hint: GroupLeaderHint { node_id, address },
+            before_proposal: true,
+        }
+    }
+
+    /// True when this is a forward-to-leader error raised before proposal.
+    pub fn is_forward_before_proposal(&self) -> bool {
+        matches!(self, Self::ForwardToLeader {
+            before_proposal: true,
+            ..
+        })
     }
 
     pub fn message(&self) -> Cow<'_, str> {

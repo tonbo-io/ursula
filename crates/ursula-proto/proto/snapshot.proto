@@ -34,6 +34,14 @@ message SnapshotHeaderV1 {
   // Permanent bucket-erasure fences. Absent in snapshots written before
   // tenant physical-erasure proof became part of the contract.
   repeated string erased_buckets = 9;
+  // Replicated group feature level (keyed-streams C0). Absent in snapshots
+  // written before feature levels, which decode as level 0. Never lowered;
+  // a binary refuses snapshots above its supported level.
+  uint32 feature_level = 10;
+  // Largest stream created_at_ms the group assigned at feature level 1 or
+  // later (keyed-streams C7). Absent in older snapshots, which decode as 0;
+  // restore raises it to every live stream's created_at_ms at level 1.
+  uint64 last_created_at_ms = 11;
 }
 
 message SharedColdObjectOwnersV1 {
@@ -76,8 +84,21 @@ message StreamSnapshotEntryV1 {
   StreamVisibleSnapshotV1 visible_snapshot = 12;
   repeated ProducerSnapshotV1 producer_states = 13;
   optional uint64 first_record = 14;
+  // Exact start offsets of the dense (unflushed) records, from
+  // dense_first_record (field 19) when present, else from first_record.
   repeated uint64 record_offsets = 15;
   optional uint64 retained_offset = 16;
+  // Sparse cold record marks (bounded-state F1, feature level 2): one
+  // (record, offset) pair per 1 MiB block of sealed log that holds a record
+  // start, as two parallel lists. Absent means all-dense.
+  repeated uint64 record_mark_records = 17;
+  repeated uint64 record_mark_offsets = 18;
+  // First record with a dense offset. Absent means first_record.
+  optional uint64 dense_first_record = 19;
+  // Start offsets of the messages at or above the seal point, for streams
+  // without a record index (bounded-state F4b, feature level 4). From that
+  // level message_records (field 10) is empty once a stream converted.
+  repeated uint64 hot_append_starts = 20;
 }
 
 message StreamMetadataV1 {
@@ -145,8 +166,14 @@ message ProducerSnapshotV1 {
   uint64 last_start_offset = 4;
   uint64 last_next_offset = 5;
   bool last_closed = 6;
+  // Written only below feature level 1; level 1 answers from the newest
+  // receipt, which the receipt window never evicts (bounded-state F3).
   repeated ProducerAppendRecordV1 last_items = 7;
   repeated ProducerReceiptV1 receipts = 8;
+  // now_ms of the producer's newest accepted write, kept from feature level
+  // 1 on for idle expiry (bounded-state F3). Absent for producers last
+  // written below level 1 and in older snapshots.
+  optional uint64 last_seen_ms = 9;
 }
 
 message ProducerReceiptV1 {
@@ -178,6 +205,13 @@ message ColdGcEntryV1 {
   }
   uint64 not_before_ms = 4;
   string bucket_id = 5;
+  // Cold generation of the removed stream incarnation for a stream target
+  // enqueued at feature level 1 or later (bounded-state F14g). Absent marks
+  // a legacy entry.
+  optional uint64 cold_generation = 6;
+  // Failed attempts the leader's GC worker deferred (DeferColdGc, F14b,
+  // feature level 1); it backs off exponentially in it.
+  uint32 defer_attempts = 7;
 }
 
 message ColdGcPathsV1 {

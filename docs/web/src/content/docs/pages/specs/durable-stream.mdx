@@ -326,7 +326,9 @@ if epoch > state.epoch:
 # Same epoch: sequence validation
 if seq <= state.lastSeq:
   -> 204 No Content (duplicate, idempotent success)
-  -> Return the exact original byte and record ranges for this seq
+  -> Return the exact original byte and record ranges for this seq when its
+     receipt is retained (the stream's receipt window, and always the newest
+     seq); beyond the window, return no byte or record ranges
 
 if seq == state.lastSeq + 1:
   -> Accept, update state.lastSeq = seq

@@ -38,6 +38,14 @@ pub struct StreamSnapshot {
     /// Per-bucket data-plane quota records. Absent in legacy snapshots.
     #[serde(default)]
     pub bucket_quotas: Vec<BucketQuotaSnapshot>,
+    /// Replicated group feature level (C0). Absent in legacy snapshots,
+    /// which decode as level 0.
+    #[serde(default)]
+    pub feature_level: u32,
+    /// Largest `created_at_ms` assigned at feature level 1 or later (C7,
+    /// F14g). Absent in legacy snapshots, which decode as 0.
+    #[serde(default)]
+    pub last_created_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,7 +68,14 @@ pub struct StreamSnapshotEntry {
     pub cold_index_generation: u64,
     pub cold_chunks: Vec<ColdChunkRef>,
     pub external_segments: Vec<ObjectPayloadRef>,
+    /// Legacy message boundaries. Empty from feature level 4 (F4b) once
+    /// the stream converted; snapshots then carry `hot_append_starts`.
     pub message_records: Vec<StreamMessageRecord>,
+    /// F4b (level 4): start offsets of the messages at or above the seal
+    /// point, for streams without a record index. Absent in older
+    /// snapshots.
+    #[serde(default)]
+    pub hot_append_starts: Vec<u64>,
     #[serde(default)]
     pub record_index: Option<StreamRecordIndex>,
     pub integrity: StreamIntegritySnapshot,
@@ -111,4 +126,9 @@ pub enum StreamSnapshotError {
         snapshot_offset: u64,
         tail_offset: u64,
     },
+    #[error(
+        "snapshot feature level {level} exceeds this binary's supported level {supported}; \
+         a binary that cannot apply that level must not run this group"
+    )]
+    UnsupportedFeatureLevel { level: u32, supported: u32 },
 }

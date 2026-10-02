@@ -3203,14 +3203,6 @@
             "phase": "before_cold_read"
           },
           {
-            "event": "runtime_raft_network_cold_read_fault_recovered",
-            "stream": {
-              "bucket_id": "benchcmp",
-              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized"
-            },
-            "returned_len": 0
-          },
-          {
             "event": "runtime_raft_network_cold_live_read_verified",
             "stream": {
               "bucket_id": "benchcmp",
@@ -3220,6 +3212,14 @@
             "flushed_count": 12,
             "upload_count": 1,
             "publish_count": 12
+          },
+          {
+            "event": "runtime_raft_network_cold_read_fault_recovered",
+            "stream": {
+              "bucket_id": "benchcmp",
+              "stream_id": "ursula-sim-schedule-155-runtime-raft-network-randomized-s1"
+            },
+            "returned_len": 0
           },
           {
             "event": "runtime_raft_network_cold_live_read_verified",

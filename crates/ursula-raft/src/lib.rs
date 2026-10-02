@@ -17,6 +17,10 @@
 //! - [`engine`]: [`RaftGroupEngine`] + `GroupEngine` impl, with the engine
 //!   factories under `engine::factory`.
 //! - [`forward`]: leader-forwarding helpers used by the engine when a node is a follower.
+//! - [`snapshot_cadence`]: the byte-based snapshot cadence policy (F12e) and
+//!   the per-group log gauges the snapshot driver reads.
+//! - [`snapshot_codec`]: the group-snapshot frame codec; [`group_snapshot_frames`]
+//!   and [`decode_group_snapshot`] are re-exported for measurement tools.
 
 pub mod raft_internal_proto {
     tonic::include_proto!("ursula.raft.v1");
@@ -32,6 +36,7 @@ mod registry;
 mod rt;
 #[cfg(madsim)]
 mod sim_runtime;
+pub mod snapshot_cadence;
 mod snapshot_codec;
 mod state_machine;
 mod telemetry;
@@ -90,6 +95,8 @@ pub use registry::SingleNodeRaftNetwork;
 pub use registry::SingleNodeRaftNetworkFactory;
 #[cfg(madsim)]
 pub use sim_runtime::MadsimOpenRaftRuntime;
+pub use snapshot_codec::decode_group_snapshot;
+pub use snapshot_codec::group_snapshot_frames;
 pub use state_machine::RaftGroupSnapshotBuilder;
 pub use state_machine::RaftGroupStateMachine;
 pub use types::RaftGroupMetricsSnapshot;
@@ -105,3 +112,6 @@ pub use types::UrsulaVoteResponse;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cold_correctness_tests;

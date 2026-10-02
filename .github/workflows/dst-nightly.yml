@@ -45,7 +45,9 @@ jobs:
             --seed-family http-protocol-surface-randomized \
             --seed-family runtime-raft-network-randomized-extended \
             --seed-family runtime-raft-network-cold-live-write-recovery \
-            --seed-family runtime-interleaving
+            --seed-family runtime-interleaving \
+            --seed-family keyed-indexer \
+            --seed-family keyed-indexer-extended
           RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-runtime-raft-network-randomized-read-corruption \
             --expect-failures \
@@ -122,6 +124,18 @@ jobs:
             --seed-family runtime-raft-network-cold-live-write-failures \
             --expect-failures \
             --failure-dir target/ursula-sim-runtime-raft-cold-live-write-failures
+
+      # Bounded-state seed families (§7.4) beyond the PR subset that
+      # keyed-streams-ci runs: same tests, larger seed ranges.
+      - name: Run bounded-state seed families (nightly ranges)
+        env:
+          SPARSE_MARKS_SEEDS: "2000..=2039"
+          EXTERNAL_LOCATOR_AMBIGUITY_SEEDS: "1..=60"
+          EXTERNAL_LOCATOR_SNAPSHOT_SEEDS: "1..=30"
+          AMBIGUOUS_COMPACTION_SEEDS: "1..=30"
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
+            sparse_marks_survive external_locators_survive --nocapture
 
       - name: Write simulation result summary
         if: always()

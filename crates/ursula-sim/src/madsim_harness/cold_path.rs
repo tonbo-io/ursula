@@ -159,6 +159,7 @@ async fn cold_path_publish(
     let flushed = setup.engines[setup.leader_index]
         .flush_cold(
             FlushColdRequest {
+                cold_generation: None,
                 stream_id: config.stream.clone(),
                 chunk: ursula_runtime::ColdChunkRef {
                     start_offset: setup.candidate.start_offset,
@@ -312,6 +313,7 @@ pub(super) async fn run_cold_read_fault_inner(
                 record: None,
                 max_records: None,
                 leader_only: false,
+                record_anchor: None,
             },
             placement(),
         )
@@ -498,6 +500,7 @@ pub(super) async fn run_cold_write_delay_inner(
     let flushed = setup.engines[setup.leader_index]
         .flush_cold(
             FlushColdRequest {
+                cold_generation: None,
                 stream_id: config.stream.clone(),
                 chunk: ursula_runtime::ColdChunkRef {
                     start_offset: setup.candidate.start_offset,
@@ -577,6 +580,8 @@ pub(super) async fn run_cold_delete_fault_inner(
                 min_hot_bytes: old_payload.len(),
                 max_flush_bytes: old_payload.len(),
                 max_batch_bytes: old_payload.len(),
+                pressure: None,
+                max_hot_age: None,
             },
             1,
         )
@@ -647,6 +652,7 @@ pub(super) async fn run_cold_delete_fault_inner(
             record: None,
             max_records: None,
             leader_only: false,
+            record_anchor: None,
         })
         .await
         .expect("read recreated stream after cold cleanup delete fault");
@@ -802,6 +808,7 @@ pub(super) async fn run_cold_read_truncate_inner(
                 record: None,
                 max_records: None,
                 leader_only: false,
+                record_anchor: None,
             },
             placement(),
         )

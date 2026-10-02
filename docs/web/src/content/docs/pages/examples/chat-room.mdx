@@ -37,7 +37,7 @@ curl 'http://127.0.0.1:4437/chat/room-7?tail_records=50&record_view=envelope'
 {"record":119,"value":{"sent_at":"2026-07-23T09:00:07Z","text":"hey ada","user":"lin"}}
 ```
 
-JSON records are validated and normalized on append, so key order may differ from what the sender wrote.
+JSON records are validated on append and stored exactly as the sender wrote them, minus insignificant whitespace, so member order and number spelling survive.
 
 ## Tail new messages live
 

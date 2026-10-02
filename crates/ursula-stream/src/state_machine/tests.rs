@@ -353,6 +353,7 @@ fn flush_cold_cmd(
     object_size: u64,
 ) -> StreamCommand {
     StreamCommand::FlushCold {
+        cold_generation: None,
         stream_id,
         chunk: ColdChunkRef {
             start_offset,
@@ -398,6 +399,8 @@ fn appended(offset: u64, next_offset: u64) -> StreamResponse {
         closed: false,
         deduplicated: false,
         producer: None,
+        receipt_evicted: false,
+        record_range: None,
     }
 }
 
@@ -415,6 +418,8 @@ fn appended_by(
         closed,
         deduplicated,
         producer: Some(producer),
+        receipt_evicted: false,
+        record_range: None,
     }
 }
 
@@ -501,7 +506,18 @@ fn json_record_coordinates_survive_flush_restore_and_retention() {
             now_ms: 1,
             ..Append::default()
         })),
-        appended(16, 24)
+        StreamResponse::Appended {
+            offset: 16,
+            next_offset: 24,
+            closed: false,
+            deduplicated: false,
+            producer: None,
+            receipt_evicted: false,
+            record_range: Some(StreamRecordRange {
+                first_record: 2,
+                next_record: 3,
+            }),
+        }
     );
     assert_eq!(
         machine.record_range(&stream_id),
@@ -1194,21 +1210,16 @@ fn flush_cold_compacts_message_records_to_cold_prefix() {
         }
     );
     assert_eq!(
-        machine
-            .bootstrap_plan(&stream("cold-records"))
-            .expect("bootstrap")
-            .updates,
-        vec![
-            StreamMessageRecord {
-                start_offset: 0,
-                end_offset: 4,
-            },
-            StreamMessageRecord {
-                start_offset: 4,
-                end_offset: 6,
-            },
-        ]
+        stream_message_records(&machine, "cold-records"),
+        records(&[(0, 4), (4, 6)])
     );
+    // Bootstrap must not return the collapsed cold prefix as one part.
+    let plan = machine
+        .bootstrap_plan(&stream("cold-records"))
+        .expect("bootstrap");
+    assert!(plan.updates.is_empty());
+    assert_eq!(plan.next_offset, 0);
+    assert!(!plan.up_to_date);
 
     assert_eq!(
         machine.apply(flush_cold_cmd(
@@ -1223,14 +1234,8 @@ fn flush_cold_compacts_message_records_to_cold_prefix() {
         }
     );
     assert_eq!(
-        machine
-            .bootstrap_plan(&stream("cold-records"))
-            .expect("bootstrap")
-            .updates,
-        vec![StreamMessageRecord {
-            start_offset: 0,
-            end_offset: 6,
-        }]
+        stream_message_records(&machine, "cold-records"),
+        records(&[(0, 6)])
     );
     let snapshot = machine.snapshot();
     let entry = snapshot
@@ -1255,6 +1260,309 @@ fn flush_cold_compacts_message_records_to_cold_prefix() {
             ..
         }
     ));
+}
+
+fn stream_message_records(machine: &StreamStateMachine, id: &str) -> Vec<StreamMessageRecord> {
+    machine
+        .snapshot()
+        .streams
+        .into_iter()
+        .find(|entry| entry.metadata.stream_id == stream(id))
+        .expect("stream snapshot")
+        .message_records
+}
+
+fn append_all(machine: &mut StreamStateMachine, id: &str, payloads: &[&[u8]]) {
+    for payload in payloads {
+        assert!(matches!(
+            machine.apply(append_cmd(stream(id), payload, Append::default())),
+            StreamResponse::Appended { .. }
+        ));
+    }
+}
+
+fn records(ranges: &[(u64, u64)]) -> Vec<StreamMessageRecord> {
+    ranges
+        .iter()
+        .map(|&(start_offset, end_offset)| StreamMessageRecord {
+            start_offset,
+            end_offset,
+        })
+        .collect()
+}
+
+/// Regression: a cold flush past the snapshot offset collapsed the
+/// messages between the snapshot and the flush frontier into one record that
+/// starts below the snapshot. Bootstrap used to drop that record and still
+/// claim `up_to_date` at the tail, silently skipping messages.
+#[test]
+fn bootstrap_after_cold_flush_past_snapshot_does_not_skip_messages() {
+    let mut machine = machine();
+    create_stream(&mut machine, "boot-skip");
+    append_all(&mut machine, "boot-skip", &[b"abc", b"de", b"fg"]);
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(stream("boot-skip"), 3, OCTET, b"s", 0)),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    assert_eq!(
+        machine.apply(flush_cold_cmd(
+            stream("boot-skip"),
+            0,
+            5,
+            "s3://b/boot-skip/0",
+            5
+        )),
+        StreamResponse::ColdFlushed {
+            hot_start_offset: 5
+        }
+    );
+
+    let plan = machine
+        .bootstrap_plan(&stream("boot-skip"))
+        .expect("bootstrap");
+    assert_eq!(
+        plan.snapshot.as_ref().map(|snapshot| snapshot.offset),
+        Some(3)
+    );
+    assert!(plan.updates.is_empty());
+    assert_eq!(plan.next_offset, 3);
+    assert!(!plan.up_to_date);
+    assert!(!plan.closed);
+    // The client continues with ordinary reads from S and gets every
+    // remaining message.
+    let read = machine
+        .read_plan(&stream("boot-skip"), 3, 4)
+        .expect("read from S");
+    assert_eq!(read.next_offset, 7);
+}
+
+/// Regression: when the snapshot offset equals the retained offset, the
+/// collapsed cold prefix used to come back as one bootstrap part holding
+/// several messages.
+#[test]
+fn bootstrap_never_returns_collapsed_cold_prefix_as_one_part() {
+    let mut machine = machine();
+    create_stream(&mut machine, "boot-merge");
+    append_all(&mut machine, "boot-merge", &[b"ab", b"cd", b"ef"]);
+    assert!(matches!(
+        machine.apply(flush_cold_cmd(
+            stream("boot-merge"),
+            0,
+            4,
+            "s3://b/boot-merge/0",
+            4
+        )),
+        StreamResponse::ColdFlushed { .. }
+    ));
+
+    // No snapshot: S is the retained offset 0, below the cold frontier.
+    let plan = machine
+        .bootstrap_plan(&stream("boot-merge"))
+        .expect("bootstrap");
+    assert!(plan.snapshot.is_none());
+    assert!(plan.updates.is_empty());
+    assert_eq!(plan.next_offset, 0);
+    assert!(!plan.up_to_date);
+
+    // Snapshot at the retained offset behaves the same.
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(stream("boot-merge"), 0, OCTET, b"", 0)),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    let plan = machine
+        .bootstrap_plan(&stream("boot-merge"))
+        .expect("bootstrap");
+    assert_eq!(
+        plan.snapshot.as_ref().map(|snapshot| snapshot.offset),
+        Some(0)
+    );
+    assert!(plan.updates.is_empty());
+    assert_eq!(plan.next_offset, 0);
+    assert!(!plan.up_to_date);
+}
+
+#[test]
+fn bootstrap_returns_one_part_per_message_when_snapshot_is_above_cold_frontier() {
+    let mut machine = machine();
+    create_stream(&mut machine, "boot-hot");
+    append_all(&mut machine, "boot-hot", &[b"ab", b"cd", b"ef", b"gh"]);
+    // The cold chunk ends inside message "cd", leaving the fragment [3, 4).
+    assert!(matches!(
+        machine.apply(flush_cold_cmd(
+            stream("boot-hot"),
+            0,
+            3,
+            "s3://b/boot-hot/0",
+            3
+        )),
+        StreamResponse::ColdFlushed { .. }
+    ));
+    // A snapshot at the cold frontier itself may sit inside a message whose
+    // head is cold, so the possible fragment [3, 4) must never become a part.
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(stream("boot-hot"), 3, OCTET, b"s", 0)),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    let plan = machine
+        .bootstrap_plan(&stream("boot-hot"))
+        .expect("bootstrap");
+    assert_eq!(
+        plan.snapshot.as_ref().map(|snapshot| snapshot.offset),
+        Some(3)
+    );
+    assert!(plan.updates.is_empty());
+    assert_eq!(plan.next_offset, 3);
+    assert!(!plan.up_to_date);
+
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(stream("boot-hot"), 4, OCTET, b"s", 0)),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    let plan = machine
+        .bootstrap_plan(&stream("boot-hot"))
+        .expect("bootstrap");
+    assert_eq!(plan.updates, records(&[(4, 6), (6, 8)]));
+    assert_eq!(plan.next_offset, 8);
+    assert!(plan.up_to_date);
+}
+
+#[test]
+fn bootstrap_without_cold_flush_returns_every_message() {
+    let mut machine = machine();
+    create_stream(&mut machine, "boot-all");
+    append_all(&mut machine, "boot-all", &[b"ab", b"cd"]);
+    let plan = machine
+        .bootstrap_plan(&stream("boot-all"))
+        .expect("bootstrap");
+    assert_eq!(plan.updates, records(&[(0, 2), (2, 4)]));
+    assert_eq!(plan.next_offset, 4);
+    assert!(plan.up_to_date);
+}
+
+/// bounded-stream-state F11: bootstrap updates stop at the response cap on a
+/// message boundary, as an honest partial; a single message larger than the
+/// cap is still returned whole.
+#[test]
+fn bootstrap_caps_updates_at_a_message_boundary() {
+    let mut machine = machine();
+    create_stream(&mut machine, "boot-cap");
+    append_all(&mut machine, "boot-cap", &[b"ab", b"cd", b"ef"]);
+    assert!(matches!(
+        machine.apply(close_cmd(stream("boot-cap"))),
+        StreamResponse::Closed { .. }
+    ));
+
+    let plan = machine
+        .bootstrap_plan_with_cap(&stream("boot-cap"), 5)
+        .expect("bootstrap");
+    assert_eq!(plan.updates, records(&[(0, 2), (2, 4)]));
+    assert_eq!(plan.next_offset, 4);
+    assert!(!plan.up_to_date);
+    assert!(!plan.closed);
+
+    let plan = machine
+        .bootstrap_plan_with_cap(&stream("boot-cap"), 1)
+        .expect("bootstrap");
+    assert_eq!(plan.updates, records(&[(0, 2)]));
+    assert_eq!(plan.next_offset, 2);
+    assert!(!plan.up_to_date);
+
+    let plan = machine
+        .bootstrap_plan_with_cap(&stream("boot-cap"), 6)
+        .expect("bootstrap");
+    assert_eq!(plan.updates, records(&[(0, 2), (2, 4), (4, 6)]));
+    assert_eq!(plan.next_offset, 6);
+    assert!(plan.up_to_date);
+    assert!(plan.closed);
+    assert_eq!(
+        machine
+            .bootstrap_plan(&stream("boot-cap"))
+            .expect("default cap"),
+        plan
+    );
+}
+
+#[test]
+fn bootstrap_reports_closed_only_when_complete() {
+    let mut machine = machine();
+    create_stream(&mut machine, "boot-closed");
+    append_all(&mut machine, "boot-closed", &[b"ab", b"cd"]);
+    assert!(matches!(
+        machine.apply(close_cmd(stream("boot-closed"))),
+        StreamResponse::Closed { .. }
+    ));
+    let plan = machine
+        .bootstrap_plan(&stream("boot-closed"))
+        .expect("bootstrap");
+    assert!(plan.up_to_date);
+    assert!(plan.closed);
+
+    assert!(matches!(
+        machine.apply(flush_cold_cmd(
+            stream("boot-closed"),
+            0,
+            2,
+            "s3://b/boot-closed/0",
+            2
+        )),
+        StreamResponse::ColdFlushed { .. }
+    ));
+    let plan = machine
+        .bootstrap_plan(&stream("boot-closed"))
+        .expect("bootstrap");
+    assert!(plan.updates.is_empty());
+    assert_eq!(plan.next_offset, 0);
+    assert!(!plan.up_to_date);
+    assert!(!plan.closed);
+}
+
+#[test]
+fn json_bootstrap_after_cold_flush_is_honest_partial() {
+    let mut machine = machine();
+    let stream_id = stream("boot-json");
+    assert!(matches!(
+        machine.apply(create_cmd(stream_id.clone(), Create {
+            content_type: "application/json",
+            payload: b"{\"a\":1}\n{\"b\":2}\n".to_vec(),
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+    assert!(matches!(
+        machine.apply(append_cmd(stream_id.clone(), b"{\"c\":3}\n", Append {
+            content_type: Some("application/json"),
+            ..Append::default()
+        })),
+        StreamResponse::Appended { .. }
+    ));
+    let plan = machine.bootstrap_plan(&stream_id).expect("bootstrap");
+    assert_eq!(plan.updates, records(&[(0, 8), (8, 16), (16, 24)]));
+    assert!(plan.up_to_date);
+
+    assert!(matches!(
+        machine.apply(publish_snapshot_cmd(
+            stream_id.clone(),
+            8,
+            "application/json",
+            b"{}",
+            0
+        )),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    assert!(matches!(
+        machine.apply(flush_cold_cmd(
+            stream_id.clone(),
+            0,
+            16,
+            "s3://b/boot-json/0",
+            16
+        )),
+        StreamResponse::ColdFlushed { .. }
+    ));
+    let plan = machine.bootstrap_plan(&stream_id).expect("bootstrap");
+    assert!(plan.updates.is_empty());
+    assert_eq!(plan.next_offset, 8);
+    assert!(!plan.up_to_date);
 }
 
 fn flush_one_cold_chunk(machine: &mut StreamStateMachine, id: &str) {
@@ -1330,6 +1638,7 @@ fn shared_cold_object_is_reclaimed_after_last_stream_reference() {
         machine.apply(append_cmd(stream(id), b"abcd", Append::default()));
         assert!(matches!(
             machine.apply(StreamCommand::FlushCold {
+                cold_generation: None,
                 stream_id: stream(id),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -1405,6 +1714,7 @@ fn compact_cold_enqueues_inputs_with_gc_grace() {
     };
     assert!(matches!(
         machine.apply(StreamCommand::FlushCold {
+            cold_generation: None,
             stream_id: stream("compact"),
             chunk: first.clone(),
         }),
@@ -1412,6 +1722,7 @@ fn compact_cold_enqueues_inputs_with_gc_grace() {
     ));
     assert!(matches!(
         machine.apply(StreamCommand::FlushCold {
+            cold_generation: None,
             stream_id: stream("compact"),
             chunk: second.clone(),
         }),
@@ -1640,15 +1951,18 @@ fn plan_next_cold_flush_drains_distributed_group_hot_bytes() {
         ));
     }
 
+    // F6c: the group holds 2 x (2 B + one record's overhead) real bytes.
+    let group_real = 2 * (2 + crate::HOT_RECORD_OVERHEAD_BYTES as usize);
+    assert_eq!(machine.total_hot_real_bytes(), group_real as u64);
     assert_eq!(
         machine
-            .plan_next_cold_flush_batch(4, 4, 4, 1)
+            .plan_next_cold_flush_batch(group_real, 4, 4, 1)
             .expect("plan next cold flush")
             .len(),
         1
     );
     let candidates = machine
-        .plan_next_cold_flush_batch(5, 4, 4, 1)
+        .plan_next_cold_flush_batch(group_real + 1, 4, 4, 1)
         .expect("plan next cold flush");
     assert!(candidates.is_empty());
     let candidate = machine
@@ -1691,6 +2005,202 @@ fn plan_next_cold_flush_batch_drains_triggered_group_to_batch_target() {
             .sum::<usize>(),
         4
     );
+}
+
+fn planner_request(
+    min_hot_bytes: usize,
+    max_flush_bytes: usize,
+    max_batch_bytes: usize,
+    max_candidates: usize,
+) -> ColdFlushPassRequest {
+    ColdFlushPassRequest {
+        min_hot_bytes,
+        max_flush_bytes,
+        max_batch_bytes,
+        max_candidates,
+        pressure: None,
+        max_hot_age: None,
+    }
+}
+
+fn apply_flush_pass(machine: &mut StreamStateMachine, pass: &ColdFlushPass, round: usize) {
+    for (index, candidate) in pass.candidates.iter().enumerate() {
+        assert!(matches!(
+            machine.apply(flush_candidate_cmd(
+                candidate.stream_id.clone(),
+                candidate,
+                &format!("s3://bucket/planner/{round:04}-{index:04}"),
+            )),
+            StreamResponse::ColdFlushed { .. }
+        ));
+    }
+}
+
+/// bounded-stream-state F10: with flush_size = flush_max_size = batch, the
+/// old drain pass stopped at the first stream that did not fit and always
+/// walked streams in the same order, so a stream sorting after the small ones
+/// starved and its hot bytes grew without bound.
+#[test]
+fn flush_planner_does_not_starve_a_stream_behind_small_streams() {
+    const FLUSH_SIZE: usize = 64;
+    let mut machine = machine();
+    let small = (0..10)
+        .map(|index| format!("a-{index:02}"))
+        .collect::<Vec<_>>();
+    for name in &small {
+        create_stream(&mut machine, name);
+    }
+    create_stream(&mut machine, "zz-large");
+    for round in 0..50 {
+        for name in &small {
+            append_all(&mut machine, name, &[b"abcd"]);
+        }
+        append_all(&mut machine, "zz-large", &[&[b'z'; 20]]);
+        let pass = machine
+            .plan_cold_flush_pass(planner_request(
+                FLUSH_SIZE,
+                FLUSH_SIZE,
+                FLUSH_SIZE,
+                usize::MAX,
+            ))
+            .expect("plan pass");
+        apply_flush_pass(&mut machine, &pass, round);
+        for name in small.iter().map(String::as_str).chain(["zz-large"]) {
+            let hot = machine.hot_payload_len(&stream(name)).expect("hot len");
+            assert!(
+                hot <= 2 * FLUSH_SIZE as u64,
+                "round {round}: stream {name} holds {hot} hot bytes"
+            );
+        }
+    }
+}
+
+/// bounded-stream-state F10: planner work is bounded by the streams that hold
+/// hot bytes, with one sort per pass, not by candidates times streams.
+#[test]
+fn flush_planner_cost_is_bounded_by_hot_streams() {
+    let mut machine = machine();
+    for index in 0..1_000 {
+        create_stream(&mut machine, &format!("idle-{index:04}"));
+    }
+    for name in ["hot-a", "hot-b", "hot-c"] {
+        create_stream(&mut machine, name);
+        append_all(&mut machine, name, &[b"0123456789", b"0123456789"]);
+    }
+    let pass = machine
+        .plan_cold_flush_pass(planner_request(8, 4, usize::MAX, usize::MAX))
+        .expect("plan pass");
+    assert_eq!(pass.candidates.len(), 15);
+    assert_eq!(pass.stats.streams_visited, 3);
+    assert_eq!(pass.stats.sorts, 1);
+    assert_eq!(pass.stats.bytes_copied, 60);
+
+    apply_flush_pass(&mut machine, &pass, 0);
+    let pass = machine
+        .plan_cold_flush_pass(planner_request(8, 4, usize::MAX, usize::MAX))
+        .expect("plan empty pass");
+    assert!(pass.candidates.is_empty());
+    assert_eq!(pass.stats.streams_visited, 0);
+
+    // The index survives restore without being part of the snapshot.
+    append_all(&mut machine, "hot-b", &[b"0123456789"]);
+    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore");
+    let (pass, _) = restored
+        .plan_cold_flush_pass_from(planner_request(8, 16, usize::MAX, usize::MAX), None)
+        .expect("plan restored pass");
+    assert_eq!(pass.stats.streams_visited, 1);
+    assert_eq!(pass.candidates.len(), 1);
+    assert_eq!(pass.candidates[0].stream_id, stream("hot-b"));
+}
+
+/// bounded-stream-state F10: passes rotate through equally large streams
+/// from a leader-local cursor, and candidates are a deterministic function of
+/// the index and the cursor.
+#[test]
+fn flush_planner_rotates_equal_streams_from_the_cursor() {
+    let mut machine = machine();
+    for name in ["rot-a", "rot-b", "rot-c", "rot-small"] {
+        create_stream(&mut machine, name);
+    }
+    for name in ["rot-a", "rot-b", "rot-c"] {
+        append_all(&mut machine, name, &[b"abcd"]);
+    }
+    append_all(&mut machine, "rot-small", &[b"x"]);
+    // Group hot is 13 bytes, at least min_hot_bytes = 4: the group drains,
+    // one candidate per pass, and the three equal streams take turns.
+    let mut request = planner_request(4, 4, 4, 1);
+    let mut order = Vec::new();
+    for _ in 0..4 {
+        let pass = machine.plan_cold_flush_pass(request).expect("plan pass");
+        order.push(pass.candidates[0].stream_id.stream_id.clone());
+    }
+    assert_eq!(order, ["rot-a", "rot-b", "rot-c", "rot-a"]);
+    let (pass, cursor) = machine
+        .plan_cold_flush_pass_from(request, Some(&stream("rot-b")))
+        .expect("plan from cursor");
+    assert_eq!(pass.candidates[0].stream_id, stream("rot-c"));
+    assert_eq!(cursor, Some(stream("rot-c")));
+
+    // A candidate gets at most the remaining batch budget, so a stream that
+    // does not fit is cut instead of stopping the pass.
+    request.max_candidates = usize::MAX;
+    request.max_batch_bytes = 6;
+    let (pass, _) = machine
+        .plan_cold_flush_pass_from(request, None)
+        .expect("plan budgeted pass");
+    assert_eq!(
+        pass.candidates
+            .iter()
+            .map(|candidate| (
+                candidate.stream_id.stream_id.as_str(),
+                candidate.payload.len()
+            ))
+            .collect::<Vec<_>>(),
+        vec![("rot-a", 4), ("rot-b", 2)]
+    );
+}
+
+/// bounded-stream-state F10: group drain flushes the largest streams until
+/// the group is below half of flush_size, and node pressure drains the
+/// group's proportional share of the node excess, largest first.
+#[test]
+fn flush_planner_drains_largest_streams_first() {
+    let mut machine = machine();
+    for (name, len) in [("d-10", 10usize), ("d-20", 20), ("d-30", 30), ("d-40", 40)] {
+        create_stream(&mut machine, name);
+        append_all(&mut machine, name, &[&vec![b'x'; len]]);
+    }
+    // F6c: real sizes are payload plus one record's overhead each, 196 in
+    // all. Group hot 196 >= 196: drain until below 98 (d-40 and d-30 hold
+    // 64 + 54 real bytes).
+    let group_real = 100 + 4 * crate::HOT_RECORD_OVERHEAD_BYTES as usize;
+    assert_eq!(machine.total_hot_real_bytes(), group_real as u64);
+    let (pass, _) = machine
+        .plan_cold_flush_pass_from(
+            planner_request(group_real, 64, usize::MAX, usize::MAX),
+            None,
+        )
+        .expect("plan drain");
+    assert_eq!(
+        pass.candidates
+            .iter()
+            .map(|candidate| candidate.stream_id.stream_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["d-40", "d-30"]
+    );
+
+    // Pressure: node 200 hot, target 150, so this group (100 of 200) drains
+    // at least 25 bytes: the largest stream alone.
+    let mut request = planner_request(1_000, 64, usize::MAX, usize::MAX);
+    request.pressure = Some(ColdFlushPressure {
+        node_hot_bytes: 200,
+        node_target_bytes: 150,
+    });
+    let (pass, _) = machine
+        .plan_cold_flush_pass_from(request, None)
+        .expect("plan pressure");
+    assert_eq!(pass.candidates.len(), 1);
+    assert_eq!(pass.candidates[0].stream_id, stream("d-40"));
 }
 
 #[test]
@@ -2044,6 +2554,7 @@ fn snapshot_entry(
         cold_chunks: Vec::new(),
         external_segments: Vec::new(),
         message_records: Vec::new(),
+        hot_append_starts: Vec::new(),
         record_index: None,
         integrity: empty_integrity(),
         visible_snapshot: None,
@@ -2061,6 +2572,7 @@ fn producer_snapshot(epoch: u64) -> ProducerSnapshot {
         last_closed: false,
         last_items: Vec::new(),
         receipts: Vec::new(),
+        last_seen_ms: None,
     }
 }
 
@@ -2076,6 +2588,8 @@ fn snapshot_restore_rejects_invalid_entries() {
             streams: Vec::new(),
             bucket_usage: Vec::new(),
             bucket_quotas: Vec::new(),
+            feature_level: 0,
+            last_created_at_ms: 0,
         })
         .expect_err("duplicate bucket"),
         StreamSnapshotError::DuplicateBucket("benchcmp".to_owned())
@@ -2091,6 +2605,8 @@ fn snapshot_restore_rejects_invalid_entries() {
             streams: vec![entry],
             bucket_usage: Vec::new(),
             bucket_quotas: Vec::new(),
+            feature_level: 0,
+            last_created_at_ms: 0,
         })
     };
 
@@ -2141,6 +2657,8 @@ fn close_is_monotonic_and_close_only_is_idempotent() {
             closed: true,
             deduplicated: false,
             producer: None,
+            receipt_evicted: false,
+            record_range: None,
         }
     );
     assert_eq!(
@@ -2308,12 +2826,14 @@ fn producer_append_batch_deduplicates_retries_without_partial_mutation() {
             next_offset: 2,
             closed: false,
             deduplicated: false,
+            record_range: None,
         },
         StreamBatchAppendItem {
             offset: 2,
             next_offset: 3,
             closed: false,
             deduplicated: false,
+            record_range: None,
         },
     ]);
     assert!(!first.deduplicated);
@@ -2629,6 +3149,8 @@ fn append_conflict_precedence_reports_closed_before_mismatch_or_seq() {
             closed: true,
             deduplicated: false,
             producer: None,
+            receipt_evicted: false,
+            record_range: None,
         }
     );
 
@@ -3018,6 +3540,7 @@ proptest! {
                 next_offset,
                 closed: false,
                 deduplicated: true,
+                record_range: None,
             });
         }
 
@@ -3385,12 +3908,16 @@ proptest! {
             bootstrap.snapshot.as_ref(),
             expected_snapshot.as_ref()
         );
+        // The flush starts at the snapshot offset, so the messages after the
+        // snapshot are now (partly) cold: bootstrap is an honest partial.
+        prop_assert!(bootstrap.updates.is_empty());
+        prop_assert_eq!(bootstrap.next_offset, snapshot_offset);
+        prop_assert!(!bootstrap.up_to_date);
         prop_assert!(message_records_cover_retained_suffix(
-            &bootstrap.updates,
+            &stream_message_records(&machine, "prop-snapshot-cold"),
             snapshot_offset,
             tail_offset
         ));
-        prop_assert_eq!(bootstrap.next_offset, tail_offset);
 
         let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
         prop_assert_eq!(
@@ -3820,4 +4347,1146 @@ fn quota_survives_snapshot_round_trip() {
             ..
         }
     ));
+}
+
+fn set_feature_level_cmd(level: u32) -> StreamCommand {
+    StreamCommand::SetFeatureLevel { level }
+}
+
+#[test]
+fn feature_level_defaults_to_zero_and_only_rises() {
+    let mut machine = StreamStateMachine::new();
+    assert_eq!(machine.feature_level(), 0);
+
+    assert_eq!(
+        machine.apply(set_feature_level_cmd(1)),
+        StreamResponse::FeatureLevelSet {
+            level: 1,
+            previous_level: 0,
+        }
+    );
+    // Idempotent under replay.
+    assert_eq!(
+        machine.apply(set_feature_level_cmd(1)),
+        StreamResponse::FeatureLevelSet {
+            level: 1,
+            previous_level: 1,
+        }
+    );
+    // Never lowered.
+    assert_eq!(
+        machine.apply(set_feature_level_cmd(0)),
+        StreamResponse::FeatureLevelSet {
+            level: 1,
+            previous_level: 1,
+        }
+    );
+    assert_eq!(machine.feature_level(), 1);
+    assert_eq!(
+        machine.apply(set_feature_level_cmd(3)),
+        StreamResponse::FeatureLevelSet {
+            level: 3,
+            previous_level: 1,
+        }
+    );
+    assert_eq!(machine.feature_level(), 3);
+}
+
+#[test]
+fn feature_gate_rejects_below_required_level_deterministically() {
+    let mut machine = machine();
+    let Err(StreamResponse::Error {
+        code,
+        message,
+        next_offset,
+        context,
+    }) = machine.require_feature_level(1, "keyed stream create")
+    else {
+        panic!("level 0 must not satisfy level 1");
+    };
+    assert_eq!(code, StreamErrorCode::FeatureNotEnabled);
+    assert!(
+        message.contains("requires group feature level 1"),
+        "{message}"
+    );
+    assert_eq!(next_offset, None);
+    assert!(context.is_empty());
+
+    machine.apply(set_feature_level_cmd(1));
+    assert_eq!(
+        machine.require_feature_level(1, "keyed stream create"),
+        Ok(())
+    );
+    assert_eq!(machine.require_feature_level(0, "anything"), Ok(()));
+}
+
+#[test]
+fn feature_level_survives_snapshot_round_trip() {
+    let mut machine = machine();
+    machine.apply(set_feature_level_cmd(1));
+    let snapshot = machine.snapshot();
+    assert_eq!(snapshot.feature_level, 1);
+    let restored = StreamStateMachine::restore(snapshot).expect("restore snapshot");
+    assert_eq!(restored.feature_level(), 1);
+}
+
+#[test]
+fn legacy_snapshot_without_feature_level_restores_at_zero() {
+    let mut value = serde_json::to_value(machine().snapshot()).expect("encode snapshot");
+    value
+        .as_object_mut()
+        .expect("snapshot object")
+        .remove("feature_level");
+    let legacy: StreamSnapshot = serde_json::from_value(value).expect("decode legacy snapshot");
+    assert_eq!(legacy.feature_level, 0);
+    let restored = StreamStateMachine::restore(legacy).expect("restore legacy snapshot");
+    assert_eq!(restored.feature_level(), 0);
+}
+
+#[test]
+fn restore_refuses_a_snapshot_above_the_supported_level() {
+    let mut snapshot = machine().snapshot();
+    snapshot.feature_level = crate::MAX_SUPPORTED_FEATURE_LEVEL + 1;
+    assert_eq!(
+        StreamStateMachine::restore(snapshot).expect_err("future level"),
+        StreamSnapshotError::UnsupportedFeatureLevel {
+            level: crate::MAX_SUPPORTED_FEATURE_LEVEL + 1,
+            supported: crate::MAX_SUPPORTED_FEATURE_LEVEL,
+        }
+    );
+}
+
+#[test]
+fn import_snapshot_never_lowers_the_feature_level() {
+    let backup = machine().snapshot();
+    assert_eq!(backup.feature_level, 0);
+
+    let mut target = StreamStateMachine::new();
+    target.apply(set_feature_level_cmd(1));
+    assert!(matches!(
+        target.apply(StreamCommand::ImportSnapshot {
+            snapshot: Box::new(backup),
+        }),
+        StreamResponse::SnapshotImported { .. }
+    ));
+    assert_eq!(target.feature_level(), 1);
+
+    let mut raised = machine();
+    raised.apply(set_feature_level_cmd(1));
+    let mut fresh = StreamStateMachine::new();
+    fresh.apply(set_feature_level_cmd(1));
+    assert!(matches!(
+        fresh.apply(StreamCommand::ImportSnapshot {
+            snapshot: Box::new(raised.snapshot()),
+        }),
+        StreamResponse::SnapshotImported { .. }
+    ));
+    assert_eq!(fresh.feature_level(), 1);
+}
+
+#[test]
+fn import_snapshot_never_raises_the_feature_level() {
+    // SM2: an import must not bypass enable-feature's all-nodes support
+    // check. A backup above the group's level fails closed on every replica
+    // and leaves the group untouched.
+    let mut raised = machine();
+    raised.apply(set_feature_level_cmd(1));
+    create_stream(&mut raised, "a");
+    let mut fresh = StreamStateMachine::new();
+    match fresh.apply(StreamCommand::ImportSnapshot {
+        snapshot: Box::new(raised.snapshot()),
+    }) {
+        StreamResponse::Error { code, message, .. } => {
+            assert_eq!(code, StreamErrorCode::ImportConflict);
+            assert!(message.contains("feature level 1"), "{message}");
+        }
+        other => panic!("expected ImportConflict, got {other:?}"),
+    }
+    assert_eq!(fresh.feature_level(), 0);
+    assert_eq!(fresh.snapshot(), StreamStateMachine::new().snapshot());
+}
+
+#[test]
+fn import_snapshot_never_lowers_last_created_at_ms() {
+    // SM3: a group that created and deleted streams at level 1 keeps its
+    // C7 counter when it imports an older backup, so the next incarnation
+    // never reuses a `created_at_ms` its objects may still be scoped to.
+    let mut target = machine();
+    target.apply(set_feature_level_cmd(1));
+    assert_eq!(
+        target.apply(create_cmd(stream("gone"), Create {
+            now_ms: 5_000,
+            ..Create::default()
+        })),
+        created(stream("gone"), 0)
+    );
+    assert_eq!(
+        target.apply(delete_cmd(stream("gone"))),
+        StreamResponse::Deleted
+    );
+    assert_eq!(
+        target.apply(StreamCommand::DeleteBucket {
+            bucket_id: "benchcmp".to_owned(),
+        }),
+        StreamResponse::BucketDeleted {
+            bucket_id: "benchcmp".to_owned(),
+        }
+    );
+    assert_eq!(target.last_created_at_ms(), 5_000);
+
+    let mut backup = machine();
+    backup.apply(set_feature_level_cmd(1));
+    create_stream(&mut backup, "a");
+    assert_eq!(backup.last_created_at_ms(), 1);
+    assert!(matches!(
+        target.apply(StreamCommand::ImportSnapshot {
+            snapshot: Box::new(backup.snapshot()),
+        }),
+        StreamResponse::SnapshotImported { .. }
+    ));
+    assert_eq!(target.last_created_at_ms(), 5_000);
+    create_stream(&mut target, "b");
+    assert_eq!(created_at_ms(&target, "b"), 5_001);
+}
+
+fn created_at_ms(machine: &StreamStateMachine, id: &str) -> u64 {
+    machine
+        .head(&stream(id))
+        .expect("stream exists")
+        .created_at_ms
+}
+
+fn flush_and_delete(machine: &mut StreamStateMachine, id: &str) {
+    assert!(matches!(
+        machine.apply(append_cmd(stream(id), b"cold", Append::default())),
+        StreamResponse::Appended { .. }
+    ));
+    assert!(matches!(
+        machine.apply(flush_cold_cmd(stream(id), 0, 4, "chunk", 4)),
+        StreamResponse::ColdFlushed { .. }
+    ));
+    assert_eq!(
+        machine.apply(delete_cmd(stream(id))),
+        StreamResponse::Deleted
+    );
+}
+
+#[test]
+fn c7_created_at_ms_is_unique_under_a_frozen_clock_only_from_level_one() {
+    // Level 0 keeps today's behavior: a delete and recreate at the same
+    // instant reuses the incarnation.
+    let mut legacy = machine();
+    create_stream(&mut legacy, "frozen");
+    assert_eq!(created_at_ms(&legacy, "frozen"), 0);
+    assert_eq!(
+        legacy.apply(delete_cmd(stream("frozen"))),
+        StreamResponse::Deleted
+    );
+    create_stream(&mut legacy, "frozen");
+    assert_eq!(created_at_ms(&legacy, "frozen"), 0);
+    assert_eq!(legacy.last_created_at_ms(), 0);
+
+    let mut machine = machine();
+    machine.apply(set_feature_level_cmd(1));
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        create_stream(&mut machine, "frozen");
+        seen.push(created_at_ms(&machine, "frozen"));
+        assert_eq!(
+            machine.apply(delete_cmd(stream("frozen"))),
+            StreamResponse::Deleted
+        );
+    }
+    create_stream(&mut machine, "other");
+    seen.push(created_at_ms(&machine, "other"));
+    assert_eq!(seen, vec![1, 2, 3, 4]);
+    assert_eq!(machine.last_created_at_ms(), 4);
+
+    // A later clock wins over the counter.
+    assert_eq!(
+        machine.apply(create_cmd(stream("later"), Create {
+            now_ms: 1_000,
+            ..Create::default()
+        })),
+        created(stream("later"), 0)
+    );
+    assert_eq!(created_at_ms(&machine, "later"), 1_000);
+    assert_eq!(machine.last_created_at_ms(), 1_000);
+}
+
+#[test]
+fn c7_raise_starts_after_every_live_incarnation() {
+    let mut machine = machine();
+    assert_eq!(
+        machine.apply(create_cmd(stream("old"), Create {
+            now_ms: 500,
+            ..Create::default()
+        })),
+        created(stream("old"), 0)
+    );
+    machine.apply(set_feature_level_cmd(1));
+    assert_eq!(machine.last_created_at_ms(), 500);
+    create_stream(&mut machine, "new");
+    assert_eq!(created_at_ms(&machine, "new"), 501);
+}
+
+#[test]
+fn c7_last_created_at_ms_survives_snapshot_round_trip_and_legacy_decode() {
+    let mut machine = machine();
+    machine.apply(set_feature_level_cmd(1));
+    create_stream(&mut machine, "a");
+    assert_eq!(
+        machine.apply(delete_cmd(stream("a"))),
+        StreamResponse::Deleted
+    );
+    let snapshot = machine.snapshot();
+    assert_eq!(snapshot.last_created_at_ms, 1);
+    let mut restored = StreamStateMachine::restore(snapshot).expect("restore snapshot");
+    assert_eq!(restored.last_created_at_ms(), 1);
+    create_stream(&mut restored, "a");
+    assert_eq!(created_at_ms(&restored, "a"), 2);
+
+    // A snapshot without the field restores below every live incarnation's
+    // creation time only at level 0; at level 1 it is normalized upwards.
+    let mut value = serde_json::to_value(restored.snapshot()).expect("encode snapshot");
+    value
+        .as_object_mut()
+        .expect("snapshot object")
+        .remove("last_created_at_ms");
+    let legacy: StreamSnapshot = serde_json::from_value(value).expect("decode legacy snapshot");
+    assert_eq!(legacy.last_created_at_ms, 0);
+    let mut restored = StreamStateMachine::restore(legacy).expect("restore legacy snapshot");
+    assert_eq!(restored.last_created_at_ms(), 2);
+    create_stream(&mut restored, "b");
+    assert_eq!(created_at_ms(&restored, "b"), 3);
+}
+
+#[test]
+fn c8_keyed_state_affinity_stream_is_reserved_on_apply_only_from_level_one() {
+    let keyed_state = BucketStreamId::with_affinity("benchcmp", "session", "keyed-state");
+    let mut legacy = machine();
+    assert_eq!(
+        legacy.apply(create_cmd(keyed_state.clone(), Create::default())),
+        created(keyed_state.clone(), 0)
+    );
+
+    let mut machine = machine();
+    machine.apply(set_feature_level_cmd(1));
+    assert_error_code(
+        machine.apply(create_cmd(keyed_state, Create::default())),
+        StreamErrorCode::InvalidStreamId,
+    );
+    // The two-segment stream named `keyed-state` stays valid.
+    assert_eq!(
+        machine.apply(create_cmd(stream("keyed-state"), Create::default())),
+        created(stream("keyed-state"), 0)
+    );
+}
+
+#[test]
+fn f14g_stream_gc_entries_name_the_incarnation_only_from_level_one() {
+    let mut legacy = machine();
+    create_stream(&mut legacy, "gc");
+    flush_and_delete(&mut legacy, "gc");
+    let entries = legacy.pending_cold_gc_batch(8);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].target, ColdGcTarget::Stream(stream("gc")));
+    assert_eq!(entries[0].cold_generation, None);
+
+    let mut machine = machine();
+    machine.apply(set_feature_level_cmd(1));
+    create_stream(&mut machine, "gc");
+    let first = created_at_ms(&machine, "gc");
+    assert_eq!(machine.cold_index_generation(&stream("gc")), Some(first));
+    flush_and_delete(&mut machine, "gc");
+    create_stream(&mut machine, "gc");
+    let second = created_at_ms(&machine, "gc");
+    assert_ne!(first, second);
+
+    let planned = machine.plan_cold_gc_batch(8);
+    assert_eq!(planned.len(), 1);
+    assert_eq!(planned[0].entry.target, ColdGcTarget::Stream(stream("gc")));
+    assert_eq!(planned[0].entry.cold_generation, Some(first));
+    assert_eq!(planned[0].live_cold_generation, Some(second));
+
+    // Generations and GC entries survive a snapshot round trip.
+    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
+    assert_eq!(restored.cold_index_generation(&stream("gc")), Some(second));
+    assert_eq!(restored.plan_cold_gc_batch(8), planned);
+}
+
+#[test]
+fn f14g_external_create_at_level_one_keeps_its_payload_in_state_for_gc() {
+    let mut machine = machine();
+    machine.apply(set_feature_level_cmd(1));
+    let external = ExternalPayloadRef {
+        s3_path: "benchcmp/ext/external/initial.bin".to_owned(),
+        payload_len: 4,
+        object_size: 4,
+    };
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateExternal {
+            stream_id: stream("ext"),
+            content_type: OCTET.to_owned(),
+            initial_payload: external.clone(),
+            record_ends: Vec::new(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            attrs: None,
+            now_ms: 0,
+        }),
+        StreamResponse::Created { .. }
+    ));
+    let plan = machine
+        .read_plan(&stream("ext"), 0, 4)
+        .expect("read plan for external create");
+    assert!(matches!(
+        plan.segments.as_slice(),
+        [StreamReadSegment::Object(segment)] if segment.object.s3_path == external.s3_path
+    ));
+    assert_eq!(
+        machine.apply(delete_cmd(stream("ext"))),
+        StreamResponse::Deleted
+    );
+    let entries = machine.pending_cold_gc_batch(8);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries[1].target,
+        ColdGcTarget::Paths(vec![external.s3_path.clone()])
+    );
+}
+
+#[test]
+fn set_feature_level_command_round_trips_through_serde() {
+    let command = set_feature_level_cmd(1);
+    let bytes = serde_json::to_vec(&command).expect("encode command");
+    let decoded: StreamCommand = serde_json::from_slice(&bytes).expect("decode command");
+    assert_eq!(decoded, command);
+    assert_eq!(command.to_string(), "set_feature_level:1");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Bootstrap is either complete (one part per appended message from the
+    /// snapshot to the tail, every part hot) or an honest partial that hands
+    /// the client back to ordinary reads at the snapshot offset.
+    #[test]
+    fn prop_bootstrap_is_complete_per_message_or_honest_partial(
+        payloads in payloads_strategy(),
+        flush_bytes in 0_usize..=96,
+        snapshot_index_seed in 0_usize..=24,
+        publish_snapshot in any::<bool>(),
+    ) {
+        let mut machine = machine();
+        create_stream(&mut machine, "prop-boot");
+        let stream_id = stream("prop-boot");
+        let mut messages = Vec::with_capacity(payloads.len());
+        let mut tail = 0_u64;
+        for payload in &payloads {
+            let response = append_payload(&mut machine, "prop-boot", payload.clone(), false, None);
+            let appended = matches!(response, StreamResponse::Appended { .. });
+            prop_assert!(appended);
+            let end = tail + u64::try_from(payload.len()).expect("len fits u64");
+            messages.push(StreamMessageRecord { start_offset: tail, end_offset: end });
+            tail = end;
+        }
+        if flush_bytes > 0
+            && let Some(candidate) = machine
+                .plan_cold_flush(&stream_id, 1, flush_bytes)
+                .expect("plan cold flush")
+        {
+            let flushed = matches!(
+                machine.apply(flush_candidate_cmd(stream_id.clone(), &candidate, "s3://b/prop-boot/0")),
+                StreamResponse::ColdFlushed { .. }
+            );
+            prop_assert!(flushed);
+        }
+        let mut snapshot_offset = 0;
+        if publish_snapshot {
+            let index = snapshot_index_seed % (messages.len() + 1);
+            snapshot_offset = if index == 0 { 0 } else { messages[index - 1].end_offset };
+            let published = matches!(
+                machine.apply(publish_snapshot_cmd(stream_id.clone(), snapshot_offset, OCTET, b"s", 0)),
+                StreamResponse::SnapshotPublished { .. }
+            );
+            prop_assert!(published);
+        }
+
+        let plan = machine.bootstrap_plan(&stream_id).expect("bootstrap");
+        let hot_start = machine.hot_start_offset(&stream_id);
+        if plan.up_to_date {
+            prop_assert_eq!(plan.next_offset, tail);
+            let expected = messages
+                .iter()
+                .filter(|record| record.start_offset >= snapshot_offset)
+                .cloned()
+                .collect::<Vec<_>>();
+            prop_assert_eq!(&plan.updates, &expected);
+            prop_assert!(plan.updates.iter().all(|record| record.start_offset >= hot_start));
+        } else {
+            prop_assert!(plan.updates.is_empty());
+            prop_assert_eq!(plan.next_offset, snapshot_offset);
+            // Only a cold flush that reaches the snapshot makes bootstrap
+            // partial. A flush ending exactly at the snapshot counts: the
+            // state machine cannot tell whether that cut split a message.
+            prop_assert!(hot_start > 0 && hot_start >= snapshot_offset);
+        }
+    }
+}
+
+#[test]
+fn keyed_stream_create_is_gated_at_keyed_feature_level() {
+    const KEYED: &str = "application/json; profile=keyed-batch-v1";
+    let mut machine = machine();
+    let before = machine.snapshot();
+    assert_error_code(
+        machine.apply(create_cmd(stream("keyed"), Create {
+            content_type: KEYED,
+            ..Create::default()
+        })),
+        StreamErrorCode::FeatureNotEnabled,
+    );
+    assert_error_code(
+        machine.apply(StreamCommand::CreateExternal {
+            stream_id: stream("keyed-external"),
+            content_type: KEYED.to_owned(),
+            initial_payload: ExternalPayloadRef {
+                s3_path: "external/keyed.json".to_owned(),
+                payload_len: 11,
+                object_size: 11,
+            },
+            record_ends: vec![11],
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            attrs: None,
+            now_ms: 0,
+        }),
+        StreamErrorCode::FeatureNotEnabled,
+    );
+    assert_eq!(machine.snapshot(), before);
+
+    // Plain JSON and a quoted profile are not keyed and stay ungated.
+    for (name, content_type) in [
+        ("plain", "application/json"),
+        ("quoted", "application/json; profile=\"keyed-batch-v1\""),
+    ] {
+        assert!(matches!(
+            machine.apply(create_cmd(stream(name), Create {
+                content_type,
+                ..Create::default()
+            })),
+            StreamResponse::Created { .. }
+        ));
+    }
+
+    machine.apply(set_feature_level_cmd(crate::FEATURE_LEVEL_KEYED_STREAMS));
+    assert!(matches!(
+        machine.apply(create_cmd(stream("keyed"), Create {
+            content_type: KEYED,
+            payload: b"{\"ops\":[]}\n".to_vec(),
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+}
+
+#[test]
+fn list_bucket_streams_filters_sorts_pages_and_hides_expired() {
+    let mut machine = machine();
+    assert_eq!(machine.list_bucket_streams("absent", "", None, 10, 0), None);
+    assert_eq!(
+        machine.list_bucket_streams("benchcmp", "", None, 10, 0),
+        Some(Vec::new())
+    );
+    for id in ["user-2", "user-1", "admin"] {
+        create_stream(&mut machine, id);
+    }
+    assert!(matches!(
+        machine.apply(create_cmd(
+            BucketStreamId::with_affinity("benchcmp", "run-42", "journal"),
+            Create::default()
+        )),
+        StreamResponse::Created { .. }
+    ));
+    assert!(matches!(
+        machine.apply(create_cmd(stream("user-3"), Create {
+            content_type: "application/json",
+            close_after: true,
+            now_ms: 7,
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+    assert!(matches!(
+        machine.apply(create_cmd(stream("user-expiring"), Create {
+            expires_at_ms: Some(100),
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+    let ids = |listing: Option<Vec<BucketStreamListing>>| {
+        listing
+            .expect("bucket exists")
+            .into_iter()
+            .map(|entry| entry.stream_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(machine.list_bucket_streams("benchcmp", "", None, 10, 0)),
+        vec![
+            "admin",
+            "run-42/journal",
+            "user-1",
+            "user-2",
+            "user-3",
+            "user-expiring"
+        ]
+    );
+    assert_eq!(
+        ids(machine.list_bucket_streams("benchcmp", "user-", None, 10, 100)),
+        vec!["user-1", "user-2", "user-3"]
+    );
+    assert_eq!(
+        ids(machine.list_bucket_streams("benchcmp", "user-", Some("user-1"), 1, 100)),
+        vec!["user-2"]
+    );
+    let listing = machine
+        .list_bucket_streams("benchcmp", "user-3", None, 10, 0)
+        .expect("bucket exists");
+    assert_eq!(listing, vec![BucketStreamListing {
+        stream_id: "user-3".to_owned(),
+        status: StreamStatus::Closed,
+        content_type: "application/json".to_owned(),
+        tail_offset: 0,
+        created_at_ms: 7,
+    }]);
+}
+
+fn append_external_cmd(stream_id: BucketStreamId, s3_path: &str, len: u64) -> StreamCommand {
+    StreamCommand::AppendExternal {
+        stream_id,
+        content_type: Some(OCTET.to_owned()),
+        payload: ExternalPayloadRef {
+            s3_path: s3_path.to_owned(),
+            payload_len: len,
+            object_size: len,
+        },
+        record_ends: Vec::new(),
+        close_after: false,
+        stream_seq: None,
+        producer: None,
+        now_ms: 0,
+        record_match: None,
+    }
+}
+
+/// Bounded-state D1: hot bytes, then an external append above them, then a
+/// flush of the hot prefix. The flush used to assign the scalar frontier
+/// below the external, which left `[2, 5)` without a payload source.
+fn d1_regressed_frontier_machine(id: &str) -> StreamStateMachine {
+    let mut machine = machine();
+    create_stream(&mut machine, id);
+    assert!(matches!(
+        machine.apply(append_cmd(stream(id), b"ab", Append::default())),
+        StreamResponse::Appended { .. }
+    ));
+    let response = machine.apply(append_external_cmd(stream(id), "external/xyz.bin", 3));
+    assert!(
+        matches!(response, StreamResponse::Appended { .. }),
+        "{response:?}"
+    );
+    assert!(matches!(
+        machine.apply(flush_cold_cmd(stream(id), 0, 2, "chunks/ab.bin", 2)),
+        StreamResponse::ColdFlushed { .. }
+    ));
+    machine
+}
+
+#[test]
+fn d1_read_plan_serves_external_bytes_above_a_flushed_hot_prefix() {
+    let machine = d1_regressed_frontier_machine("d1-read");
+    let plan = machine
+        .read_plan(&stream("d1-read"), 0, 16)
+        .expect("plan covers the external above the flushed prefix");
+    assert_eq!(plan.next_offset, 5);
+    let covered = plan
+        .segments
+        .iter()
+        .map(|segment| match segment {
+            StreamReadSegment::ColdIndex(segment) => (segment.read_start_offset, segment.len),
+            other => panic!("expected cold-index segments only, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(covered, vec![(0, 5)]);
+    let tail_plan = machine
+        .read_plan(&stream("d1-read"), 2, 16)
+        .expect("plan from inside the external");
+    assert_eq!(tail_plan.next_offset, 5);
+}
+
+#[test]
+fn d1_snapshot_with_regressed_frontier_restores() {
+    let machine = d1_regressed_frontier_machine("d1-restore");
+    let snapshot = machine.snapshot();
+    let entry = snapshot
+        .streams
+        .iter()
+        .find(|entry| entry.metadata.stream_id == stream("d1-restore"))
+        .expect("snapshot entry");
+    // Replicated state is unchanged: the snapshot still carries the
+    // regressed frontier (F18 step 1 is a read/restore rule only).
+    assert_eq!(entry.cold_frontier_offset, 2);
+    let restored = StreamStateMachine::restore(snapshot).expect("restore regressed frontier");
+    let plan = restored
+        .read_plan(&stream("d1-restore"), 0, 16)
+        .expect("restored plan");
+    assert_eq!(plan.next_offset, 5);
+    assert_eq!(restored.snapshot(), machine.snapshot());
+}
+
+#[test]
+fn d1_read_plan_keeps_hot_bytes_between_cold_ranges() {
+    let mut machine = d1_regressed_frontier_machine("d1-hot-gap");
+    assert!(matches!(
+        machine.apply(append_cmd(stream("d1-hot-gap"), b"cd", Append::default())),
+        StreamResponse::Appended { .. }
+    ));
+    assert!(matches!(
+        machine.apply(append_external_cmd(
+            stream("d1-hot-gap"),
+            "external/uvw.bin",
+            3
+        )),
+        StreamResponse::Appended { .. }
+    ));
+    let plan = machine
+        .read_plan(&stream("d1-hot-gap"), 0, 64)
+        .expect("plan");
+    assert_eq!(plan.next_offset, 10);
+    let shape = plan
+        .segments
+        .iter()
+        .map(|segment| match segment {
+            StreamReadSegment::ColdIndex(segment) => ("cold", segment.read_start_offset),
+            StreamReadSegment::Hot(_) => ("hot", 0),
+            StreamReadSegment::Object(_) => ("object", 0),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(shape, vec![("cold", 0), ("hot", 0), ("cold", 7)]);
+    StreamStateMachine::restore(machine.snapshot()).expect("restore with a hot gap");
+}
+
+#[test]
+fn u22_keyed_stream_delete_enqueues_its_incarnation_namespace_prefix() {
+    const KEYED: &str = "application/json; profile=keyed-batch-v1";
+    let mut machine = machine();
+    machine.apply(set_feature_level_cmd(crate::FEATURE_LEVEL_KEYED_STREAMS));
+    let keyed = Create {
+        content_type: KEYED,
+        ..Create::default()
+    };
+    assert!(matches!(
+        machine.apply(create_cmd(stream("harness"), keyed.clone())),
+        StreamResponse::Created { .. }
+    ));
+    // A plain JSON stream is not keyed and has no projection namespace.
+    assert!(matches!(
+        machine.apply(create_cmd(stream("plain"), Create {
+            content_type: "application/json",
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+    let first = created_at_ms(&machine, "harness");
+    assert_eq!(
+        machine.apply(delete_cmd(stream("plain"))),
+        StreamResponse::Deleted
+    );
+    assert_eq!(
+        machine.apply(delete_cmd(stream("harness"))),
+        StreamResponse::Deleted
+    );
+    assert!(matches!(
+        machine.apply(create_cmd(stream("harness"), keyed)),
+        StreamResponse::Created { .. }
+    ));
+    let second = created_at_ms(&machine, "harness");
+    assert_ne!(first, second);
+
+    // The stream had no cold objects, so the namespace prefix is the only
+    // entry, and it names the deleted incarnation, never the recreated one.
+    let entries = machine.pending_cold_gc_batch(8);
+    let expected =
+        ursula_shard::keyed_namespace::keyed_incarnation_prefix(&stream("harness"), first);
+    assert_eq!(expected, format!(".keyed/benchcmp/harness/{first:016x}/"));
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].bucket_id, "benchcmp");
+    assert_eq!(entries[0].target, ColdGcTarget::Paths(vec![expected]));
+}
+
+#[test]
+fn u22_keyed_stream_purge_enqueues_each_namespace_prefix() {
+    const KEYED: &str = "application/json; profile=keyed-batch-v1";
+    let mut machine = machine();
+    machine.apply(set_feature_level_cmd(crate::FEATURE_LEVEL_KEYED_STREAMS));
+    let affinity = BucketStreamId::with_affinity("benchcmp", "run", "log");
+    assert!(matches!(
+        machine.apply(create_cmd(affinity.clone(), Create {
+            content_type: KEYED,
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+    assert!(matches!(
+        machine.apply(StreamCommand::PurgeBucket {
+            bucket_id: "benchcmp".to_owned(),
+        }),
+        StreamResponse::BucketPurged {
+            removed_streams: 1,
+            pending_cold_gc_entries: 1,
+            ..
+        }
+    ));
+    let entries = machine.pending_cold_gc_batch(8);
+    let ColdGcTarget::Paths(paths) = &entries[0].target else {
+        panic!("expected a path entry: {entries:?}");
+    };
+    assert_eq!(paths.len(), 1);
+    assert!(
+        paths[0].starts_with(".keyed/benchcmp/run%2Flog/"),
+        "{paths:?}"
+    );
+}
+
+/// Publishes one shared slice `[start, end)` of `pack` for `id`.
+fn flush_shared_slice(
+    machine: &mut StreamStateMachine,
+    id: &str,
+    start: u64,
+    end: u64,
+    pack: &str,
+) -> ColdChunkRef {
+    let chunk = ColdChunkRef {
+        start_offset: start,
+        end_offset: end,
+        s3_path: pack.to_owned(),
+        object_size: 1_024,
+        object_offset: 0,
+        shared_object: true,
+        payload_digest: String::new(),
+    };
+    assert!(matches!(
+        machine.apply(StreamCommand::FlushCold {
+            stream_id: stream(id),
+            chunk: chunk.clone(),
+            cold_generation: None,
+        }),
+        StreamResponse::ColdFlushed { .. }
+    ));
+    chunk
+}
+
+/// F2 discovery: a stream qualifies at T shared refs, or with one shared
+/// ref once its tail has stayed put for the idle period; candidates come
+/// fewest-live-slices first, and compacting a stream's run releases the
+/// packs it was the last reference of.
+#[test]
+fn shared_ref_candidates_follow_threshold_idle_and_pack_occupancy() {
+    let mut machine = machine();
+    for id in ["busy", "idle", "quiet"] {
+        create_stream(&mut machine, id);
+    }
+    // `busy` holds 3 slices of three single-slice packs; `idle` and `quiet`
+    // share one pack with each other.
+    for index in 0..3_u64 {
+        machine.apply(append_cmd(stream("busy"), b"abcd", Append::default()));
+        flush_shared_slice(
+            &mut machine,
+            "busy",
+            index * 4,
+            index * 4 + 4,
+            &format!("benchcmp/_packs/00000000/busy-{index}.bin"),
+        );
+    }
+    for id in ["idle", "quiet"] {
+        machine.apply(append_cmd(stream(id), b"abcd", Append::default()));
+        flush_shared_slice(&mut machine, id, 0, 4, "benchcmp/_packs/00000000/two.bin");
+    }
+
+    let mut tracker = SharedRefIdleTracker::default();
+    let mut request = SharedRefCompactionRequest {
+        min_refs: 3,
+        idle_ms: 1_000,
+        now_ms: 10_000,
+        max_run_bytes: 8,
+        limit: 16,
+        legacy_packs_only: false,
+    };
+    let candidates = machine.shared_ref_candidates(&request, &mut tracker);
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|c| c.stream_id.stream_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["busy"],
+        "only the stream at the threshold qualifies before anyone is idle"
+    );
+    let busy = &candidates[0];
+    assert_eq!(busy.shared_refs, 3);
+    assert_eq!(busy.run_bytes(), 8, "the run stops at max_run_bytes");
+    assert_eq!(busy.min_pack_live_slices, 1);
+    assert_eq!(tracker.len(), 3);
+
+    // `quiet` keeps appending (hot bytes only), so only `idle` goes idle.
+    machine.apply(append_cmd(stream("quiet"), b"e", Append::default()));
+    request.now_ms = 11_500;
+    let candidates = machine.shared_ref_candidates(&request, &mut tracker);
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|c| (c.stream_id.stream_id.as_str(), c.min_pack_live_slices))
+            .collect::<Vec<_>>(),
+        vec![("busy", 1), ("idle", 2)],
+        "fewest live slices first"
+    );
+
+    // Compacting `busy`'s whole run releases its packs with the grace.
+    let run = plan_shared_ref_run(machine.cold_chunks(&stream("busy")), u64::MAX);
+    assert_eq!(run.len(), 3);
+    assert!(matches!(
+        machine.apply(StreamCommand::CompactCold {
+            stream_id: stream("busy"),
+            old_chunks: run,
+            replacement: ColdChunkRef {
+                start_offset: 0,
+                end_offset: 12,
+                s3_path: "benchcmp/busy/chunks/0-12.bin".to_owned(),
+                object_size: 12,
+                object_offset: 0,
+                shared_object: false,
+                payload_digest: String::new(),
+            },
+            gc_not_before_ms: 99_000,
+        }),
+        StreamResponse::ColdCompacted { .. }
+    ));
+    let referenced = machine.group_referenced_cold_paths();
+    for index in 0..3 {
+        assert!(
+            referenced.contains(&format!("benchcmp/_packs/00000000/busy-{index}.bin")),
+            "released packs stay referenced by their GC entry until it is acked"
+        );
+    }
+    assert!(referenced.contains("benchcmp/_packs/00000000/two.bin"));
+    assert!(
+        machine
+            .shared_ref_candidates(&request, &mut tracker)
+            .iter()
+            .all(|c| c.stream_id != stream("busy"))
+    );
+    assert_eq!(
+        tracker.len(),
+        2,
+        "streams without shared refs leave the tracker"
+    );
+    assert_eq!(machine.stream_referenced_cold_paths(&stream("idle")), vec![
+        "benchcmp/_packs/00000000/two.bin".to_owned()
+    ]);
+    assert_eq!(machine.bucket_ids(), vec!["benchcmp".to_owned()]);
+
+    let pending = machine.pending_cold_gc_batch(16);
+    let last = pending.last().expect("pack releases queued").seq;
+    machine.apply(StreamCommand::AckColdGc { up_to_seq: last });
+    let referenced = machine.group_referenced_cold_paths();
+    assert!(!referenced.contains("benchcmp/_packs/00000000/busy-0.bin"));
+}
+
+/// The legacy-pack filter (#278) on F2 discovery: only slices of packs
+/// outside the stream's own `{bucket}/_packs/` count, any one makes the
+/// stream a candidate, the run covers only them, and the idle tracker is not
+/// touched.
+#[test]
+fn shared_ref_candidates_legacy_filter_selects_only_legacy_pack_slices() {
+    let mut machine = machine();
+    for id in ["legacy", "modern"] {
+        create_stream(&mut machine, id);
+    }
+    for (index, pack) in [
+        "_packs/old-0.bin",
+        "_packs/old-1.bin",
+        "benchcmp/_packs/0/new.bin",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let start = u64::try_from(index).unwrap() * 4;
+        machine.apply(append_cmd(stream("legacy"), b"abcd", Append::default()));
+        flush_shared_slice(&mut machine, "legacy", start, start + 4, pack);
+    }
+    machine.apply(append_cmd(stream("modern"), b"abcd", Append::default()));
+    flush_shared_slice(&mut machine, "modern", 0, 4, "benchcmp/_packs/0/new.bin");
+
+    let mut tracker = SharedRefIdleTracker::default();
+    let candidates = machine.shared_ref_candidates(
+        &SharedRefCompactionRequest::legacy_packs(u64::MAX, 16),
+        &mut tracker,
+    );
+    assert_eq!(candidates.len(), 1);
+    let legacy = &candidates[0];
+    assert_eq!(legacy.stream_id, stream("legacy"));
+    assert_eq!(legacy.shared_refs, 2, "only legacy slices count");
+    assert_eq!(
+        legacy
+            .run
+            .iter()
+            .map(|chunk| chunk.s3_path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["_packs/old-0.bin", "_packs/old-1.bin"]
+    );
+    assert!(
+        tracker.is_empty(),
+        "the legacy filter leaves the idle tracker alone"
+    );
+    assert!(crate::is_legacy_cross_bucket_pack(
+        &stream("legacy"),
+        &legacy.run[0]
+    ));
+}
+
+/// bounded-stream-state F10 maximum hot age: in a group below its flush
+/// threshold, a stream's small hot tail is flushed whole once it has been
+/// hot for `flush_max_hot_age`; younger tails stay hot.
+#[test]
+fn flush_planner_flushes_tails_older_than_the_max_hot_age() {
+    const AGE_MS: u64 = 300_000;
+    let mut machine = machine();
+    for name in ["old", "young"] {
+        create_stream(&mut machine, name);
+    }
+    append_all(&mut machine, "old", &[b"abcd", b"efgh"]);
+    let aged_request = |now_ms: u64| {
+        let mut request = planner_request(1 << 20, 1 << 20, 1 << 20, usize::MAX);
+        request.max_hot_age = Some(ColdFlushHotAge {
+            now_ms,
+            max_age_ms: AGE_MS,
+        });
+        request
+    };
+    // Without the age the group (8 B) is far below its 1 MiB threshold.
+    let pass = machine
+        .plan_cold_flush_pass(planner_request(1 << 20, 1 << 20, 1 << 20, usize::MAX))
+        .expect("plan pass");
+    assert!(pass.candidates.is_empty());
+    let pass = machine
+        .plan_cold_flush_pass(aged_request(1_000))
+        .expect("plan pass");
+    assert!(pass.candidates.is_empty(), "nothing is old yet");
+    append_all(&mut machine, "young", &[b"ij"]);
+    let pass = machine
+        .plan_cold_flush_pass(aged_request(1_000 + AGE_MS / 2))
+        .expect("plan pass");
+    assert!(pass.candidates.is_empty());
+
+    let pass = machine
+        .plan_cold_flush_pass(aged_request(1_000 + AGE_MS))
+        .expect("plan pass");
+    assert_eq!(pass.candidates.len(), 1);
+    let candidate = &pass.candidates[0];
+    assert_eq!(candidate.stream_id, stream("old"));
+    assert_eq!((candidate.start_offset, candidate.end_offset), (0, 8));
+    apply_flush_pass(&mut machine, &pass, 0);
+    assert_eq!(machine.hot_payload_len(&stream("old")).expect("hot"), 0);
+    assert_eq!(machine.hot_payload_len(&stream("young")).expect("hot"), 2);
+
+    // `young` was first seen hot at AGE/2 + 1s and ages out on its own clock.
+    let pass = machine
+        .plan_cold_flush_pass(aged_request(1_000 + AGE_MS / 2 + AGE_MS))
+        .expect("plan pass");
+    assert_eq!(pass.candidates.len(), 1);
+    assert_eq!(pass.candidates[0].stream_id, stream("young"));
+}
+
+/// bounded-stream-state F6c: the group's hot-record gauge, and so its real
+/// hot size, follows appends, failed transactions, flushes, retention,
+/// deletes and snapshot restore, and agrees with a recount.
+#[test]
+fn hot_real_bytes_track_records_across_every_hot_transition() {
+    const OVERHEAD: u64 = crate::HOT_RECORD_OVERHEAD_BYTES;
+    let mut machine = machine();
+    let first = BucketStreamId::with_affinity("benchcmp", "run-7", "a");
+    let second = BucketStreamId::with_affinity("benchcmp", "run-7", "b");
+    for stream_id in [&first, &second] {
+        assert!(matches!(
+            machine.apply(create_cmd(stream_id.clone(), Create {
+                content_type: "application/json",
+                ..Create::default()
+            })),
+            StreamResponse::Created { .. }
+        ));
+    }
+    let json_append =
+        |stream_id: &BucketStreamId, body: &'static [u8], record_match| StreamCommand::Append {
+            stream_id: stream_id.clone(),
+            content_type: Some("application/json".to_owned()),
+            payload: bytes::Bytes::from_static(body),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            now_ms: 0,
+            record_match,
+        };
+    let recount = |machine: &StreamStateMachine| -> u64 {
+        [&first, &second]
+            .into_iter()
+            .map(|stream_id| machine.hot_real_len(stream_id).unwrap_or(0))
+            .sum()
+    };
+    // Three records of 8 bytes, then two of 8 bytes on the other stream.
+    machine.apply(json_append(
+        &first,
+        b"{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n",
+        None,
+    ));
+    machine.apply(json_append(&second, b"{\"b\":1}\n{\"b\":2}\n", None));
+    assert_eq!(machine.total_hot_records(), 5);
+    assert_eq!(machine.total_hot_real_bytes(), 40 + 5 * OVERHEAD);
+    assert_eq!(machine.total_hot_real_bytes(), recount(&machine));
+
+    // A failed transaction adds nothing.
+    let error = machine.append_transaction(vec![
+        json_append(&first, b"{\"a\":4}\n", Some(3)),
+        json_append(&second, b"{\"b\":3}\n", Some(0)),
+    ]);
+    assert!(error.is_err());
+    assert_eq!(machine.total_hot_records(), 5);
+    assert_eq!(machine.total_hot_real_bytes(), recount(&machine));
+
+    // Flushing the first record of the first stream removes one record.
+    assert!(matches!(
+        machine.apply(flush_cold_cmd(first.clone(), 0, 8, "first-0", 8)),
+        StreamResponse::ColdFlushed { .. }
+    ));
+    assert_eq!(machine.total_hot_records(), 4);
+    assert_eq!(machine.total_hot_real_bytes(), 32 + 4 * OVERHEAD);
+
+    // Snapshot restore re-derives the same gauge.
+    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore");
+    assert_eq!(restored.total_hot_records(), 4);
+    assert_eq!(
+        restored.total_hot_real_bytes(),
+        machine.total_hot_real_bytes()
+    );
+
+    // Deleting a stream drops its records.
+    machine.apply(delete_cmd(second.clone()));
+    assert_eq!(machine.total_hot_records(), 2);
+    assert_eq!(machine.total_hot_real_bytes(), 16 + 2 * OVERHEAD);
+    assert_eq!(machine.total_hot_real_bytes(), recount(&machine));
 }

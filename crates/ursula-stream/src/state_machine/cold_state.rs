@@ -1,13 +1,22 @@
 //! Cold-tier reference state: flushed chunks, external segments, and the cold frontier.
+//!
+//! The scalar cold frontier is a level-0 representation. From bounded-state
+//! level Lb1 (feature level 1, F18 step 2) apply derives cold coverage from
+//! the hot buffer and never reads it.
 
 use super::ColdChunkRef;
 use super::ObjectPayloadRef;
+use super::hot_buffer::shrink_vec_if_slack;
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct StreamColdState {
     cold_chunks: Vec<ColdChunkRef>,
     external_segments: Vec<ObjectPayloadRef>,
     cold_frontier: u64,
+    /// Cold-index page generation of this stream incarnation (F14g). Zero
+    /// for streams created below feature level 1, whose pages and chunk names
+    /// carry no incarnation; otherwise the stream's unique `created_at_ms`.
+    cold_generation: u64,
 }
 
 impl StreamColdState {
@@ -20,7 +29,37 @@ impl StreamColdState {
     }
 
     pub(super) fn cold_generation(&self) -> u64 {
-        0
+        self.cold_generation
+    }
+
+    /// Cold state of a new incarnation whose objects are scoped to
+    /// `cold_generation` (F14g step 2).
+    pub(super) fn with_generation(cold_generation: u64) -> Self {
+        Self {
+            cold_generation,
+            ..Self::default()
+        }
+    }
+
+    /// Keeps an external payload as a direct state reference instead of a
+    /// cold-index page entry. A create's initial payload is staged before
+    /// apply assigns the incarnation, so no page generation exists for it
+    /// yet (F14g step 2).
+    pub(super) fn push_direct_external_segment(&mut self, object: ObjectPayloadRef) {
+        self.cold_frontier = self.cold_frontier.max(object.end_offset);
+        self.external_segments.push(object);
+    }
+
+    /// Removes exactly the listed external refs that state still holds
+    /// (F5 `OffloadColdRefs`) and returns how many it removed.
+    pub(super) fn remove_external_segments(&mut self, refs: &[ObjectPayloadRef]) -> u64 {
+        let before = self.external_segments.len();
+        self.external_segments
+            .retain(|object| !refs.iter().any(|offloaded| offloaded == object));
+        if self.external_segments.len() < before {
+            self.external_segments.shrink_to_fit();
+        }
+        u64::try_from(before.saturating_sub(self.external_segments.len())).unwrap_or(u64::MAX)
     }
 
     pub(super) fn push_cold_chunk(&mut self, chunk: ColdChunkRef) {
@@ -37,7 +76,7 @@ impl StreamColdState {
 
     pub(super) fn restore(
         cold_frontier_offset: u64,
-        _cold_index_generation: u64,
+        cold_index_generation: u64,
         cold_chunks: Vec<ColdChunkRef>,
         external_segments: Vec<ObjectPayloadRef>,
     ) -> Self {
@@ -45,11 +84,18 @@ impl StreamColdState {
             cold_chunks,
             external_segments,
             cold_frontier: cold_frontier_offset,
+            cold_generation: cold_index_generation,
         }
     }
 
+    /// Legacy (level 0) test: the scalar frontier ever moved, or state holds
+    /// a cold ref.
     pub(super) fn has_cold_objects(&self) -> bool {
-        self.cold_frontier > 0 || !self.cold_chunks.is_empty() || !self.external_segments.is_empty()
+        self.cold_frontier > 0 || self.has_state_refs()
+    }
+
+    pub(super) fn has_state_refs(&self) -> bool {
+        !self.cold_chunks.is_empty() || !self.external_segments.is_empty()
     }
 
     pub(super) fn compact_before(&mut self, retained_offset: u64) -> Vec<String> {
@@ -63,6 +109,9 @@ impl StreamColdState {
         });
         self.external_segments
             .retain(|object| object.end_offset > retained_offset);
+        // F7: return the capacity retention freed.
+        shrink_vec_if_slack(&mut self.cold_chunks);
+        shrink_vec_if_slack(&mut self.external_segments);
         dropped_cold_paths
     }
 
@@ -77,7 +126,17 @@ impl StreamColdState {
         let before = self.cold_chunks.len();
         self.cold_chunks
             .retain(|chunk| !old_chunks.iter().any(|old| old == chunk));
+        // F7: compaction removes up to a whole run of refs at once.
+        shrink_vec_if_slack(&mut self.cold_chunks);
         before.saturating_sub(self.cold_chunks.len()) == old_chunks.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn ref_capacities(&self) -> (usize, usize) {
+        (
+            self.cold_chunks.capacity(),
+            self.external_segments.capacity(),
+        )
     }
 
     pub(super) fn cold_frontier_offset(&self, retained_offset: u64) -> u64 {

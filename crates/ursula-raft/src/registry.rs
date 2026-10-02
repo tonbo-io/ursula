@@ -35,8 +35,11 @@ use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
 use openraft::type_config::alias::SnapshotOf as TypeConfigSnapshotOf;
 use tokio::sync::watch;
+use ursula_runtime::ColdIndexPageCache;
+use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::SharedSnapshotStore;
+use ursula_runtime::SnapshotEnvelope;
 use ursula_runtime::SnapshotLocation;
 use ursula_runtime::SnapshotPointer;
 use ursula_runtime::default_snapshot_store;
@@ -827,9 +830,15 @@ impl fmt::Display for LeadershipShedState {
 /// generics.
 pub type RaftGroupHandle = Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>;
 
+/// A group's shared cold-index page cache.
+pub type GroupColdIndexCache = Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>;
+
 #[derive(Debug, Clone)]
 pub struct RaftGroupHandleRegistry {
     groups: Arc<Mutex<BTreeMap<u32, Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>>>>,
+    /// Each group's cold-index page cache, the one its state machine
+    /// invalidates on apply, so forwarded gRPC reads share it (F13).
+    cold_index_caches: Arc<Mutex<BTreeMap<u32, GroupColdIndexCache>>>,
     dynamic_hosted_groups: Arc<Mutex<BTreeSet<RaftGroupId>>>,
     leadership_shed: LeadershipShedFlag,
     transport_shutdown: watch::Sender<bool>,
@@ -843,6 +852,7 @@ impl Default for RaftGroupHandleRegistry {
         let (transport_shutdown, _) = watch::channel(false);
         Self {
             groups: Arc::new(Mutex::new(BTreeMap::new())),
+            cold_index_caches: Arc::new(Mutex::new(BTreeMap::new())),
             dynamic_hosted_groups: Arc::new(Mutex::new(BTreeSet::new())),
             leadership_shed: Arc::new(AtomicU8::new(0)),
             transport_shutdown,
@@ -936,6 +946,36 @@ impl RaftGroupHandleRegistry {
         groups.insert(placement.raft_group_id.0, raft);
     }
 
+    /// Records the group's shared cold-index page cache, so forwarded reads
+    /// use the cache that apply-time invalidation reaches (bounded-state F13).
+    pub fn register_cold_index_cache(
+        &self,
+        raft_group_id: RaftGroupId,
+        cache: Option<GroupColdIndexCache>,
+    ) {
+        let mut caches = self
+            .cold_index_caches
+            .lock()
+            .expect("raft group cold index cache mutex");
+        match cache {
+            Some(cache) => {
+                caches.insert(raft_group_id.0, cache);
+            }
+            None => {
+                caches.remove(&raft_group_id.0);
+            }
+        }
+    }
+
+    /// The group's shared cold-index page cache, if one was registered.
+    pub fn cold_index_cache(&self, raft_group_id: RaftGroupId) -> Option<GroupColdIndexCache> {
+        self.cold_index_caches
+            .lock()
+            .expect("raft group cold index cache mutex")
+            .get(&raft_group_id.0)
+            .cloned()
+    }
+
     pub fn get(&self, raft_group_id: RaftGroupId) -> Option<RaftGroupHandle> {
         self.groups
             .lock()
@@ -982,11 +1022,11 @@ impl RaftGroupHandleRegistry {
     }
 
     pub fn set_snapshot_build_max_concurrency(&self, max_concurrency: usize) {
-        *self
+        let mut coordinator = self
             .snapshot_build
             .lock()
-            .expect("raft group snapshot build coordinator mutex") =
-            SnapshotBuildCoordinator::new(max_concurrency);
+            .expect("raft group snapshot build coordinator mutex");
+        *coordinator = coordinator.with_max_concurrency(max_concurrency);
     }
 
     pub fn set_snapshot_store(&self, snapshot_store: Option<SharedSnapshotStore>) {
@@ -1074,8 +1114,13 @@ impl RaftGroupHandleRegistry {
             .map(|(raft_group_id, raft)| (*raft_group_id, raft.clone()))
             .collect::<Vec<_>>();
 
+        let log_progress = self.snapshot_build_coordinator().log_progress();
         let mut snapshots = Vec::with_capacity(groups.len());
         for (raft_group_id, raft) in groups {
+            let log = log_progress
+                .get(&raft_group_id)
+                .copied()
+                .unwrap_or_default();
             let metrics = raft.metrics().borrow_watched().clone();
             let membership = metrics.membership_config.membership();
             snapshots.push(RaftGroupMetricsSnapshot {
@@ -1090,6 +1135,7 @@ impl RaftGroupHandleRegistry {
                 purged: metrics.purged.map(log_progress_snapshot),
                 voter_ids: membership.voter_ids().collect(),
                 learner_ids: membership.learner_ids().collect(),
+                log,
             });
         }
         snapshots
@@ -1141,6 +1187,9 @@ impl RaftGroupHandleRegistry {
         let pointer = SnapshotPointer::decode(&pointer_bytes).map_err(|err| {
             GroupEngineError::new(format!("decode OpenRaft snapshot pointer: {err}"))
         })?;
+        // Re-encode in the envelope the leader sent (F12a), so the installed
+        // pointer and its persisted record keep the group's envelope.
+        let envelope = SnapshotEnvelope::detect(&pointer_bytes);
         let SnapshotPointer {
             snapshot_id,
             location,
@@ -1161,15 +1210,16 @@ impl RaftGroupHandleRegistry {
                 "prefetch OpenRaft snapshot {snapshot_id} before install: {err}"
             ))
         })?;
-        decode_group_snapshot(&snapshot_bytes).map_err(|err| {
+        let group_snapshot = decode_group_snapshot(&snapshot_bytes).map_err(|err| {
             GroupEngineError::new(format!(
                 "decode prefetched OpenRaft snapshot {snapshot_id}: {err}"
             ))
         })?;
+        drop(snapshot_bytes);
         // Keep fallible object-store I/O outside OpenRaft's state-machine
         // worker: a write-snapshot error there is fatal to RaftCore. Keep the
         // original external pointer so large snapshots are not duplicated in
-        // the Raft RPC payload; install_snapshot consumes the cached bytes.
+        // the Raft RPC payload; install_snapshot consumes the decoded group.
         let pointer = SnapshotPointer {
             snapshot_id,
             location,
@@ -1177,13 +1227,13 @@ impl RaftGroupHandleRegistry {
         let cache_key = self.snapshot_install.cache_prefetched(
             &pointer.snapshot_id,
             &pointer.location,
-            snapshot_bytes,
+            group_snapshot,
         );
         let guard = PrefetchedSnapshotGuard {
             snapshot_install: self.snapshot_install.clone(),
             cache_key,
         };
-        let pointer_bytes = pointer.encode().map_err(|err| {
+        let pointer_bytes = envelope.encode(&pointer).map_err(|err| {
             GroupEngineError::new(format!(
                 "encode prefetched OpenRaft snapshot pointer: {err}"
             ))
@@ -1258,6 +1308,25 @@ mod tests {
 
     use super::*;
 
+    /// F13: forwarded gRPC reads look up the group's shared page cache here.
+    #[test]
+    fn registry_hands_out_the_registered_group_page_cache() {
+        let registry = RaftGroupHandleRegistry::default();
+        let group = ursula_shard::RaftGroupId(3);
+        assert!(registry.cold_index_cache(group).is_none());
+        let cache: GroupColdIndexCache = Arc::new(ColdIndexPageCache::new(
+            Arc::new(ColdStoreColdIndexPageStore::new(Arc::new(
+                ursula_runtime::ColdStore::memory().expect("memory cold store"),
+            ))),
+            8,
+        ));
+        registry.register_cold_index_cache(group, Some(cache.clone()));
+        let shared = registry.cold_index_cache(group).expect("registered cache");
+        assert!(Arc::ptr_eq(&shared, &cache));
+        registry.register_cold_index_cache(group, None);
+        assert!(registry.cold_index_cache(group).is_none());
+    }
+
     #[derive(Debug)]
     struct StaticSnapshotStore {
         bytes: Option<Vec<u8>>,
@@ -1300,7 +1369,7 @@ mod tests {
     }
 
     fn group_snapshot_bytes() -> Vec<u8> {
-        crate::snapshot_codec::group_snapshot_frames(GroupSnapshot {
+        crate::snapshot_codec::group_snapshot_frames(Arc::new(GroupSnapshot {
             placement: ShardPlacement {
                 core_id: ursula_shard::CoreId(0),
                 shard_id: ursula_shard::ShardId(0),
@@ -1309,7 +1378,7 @@ mod tests {
             group_commit_index: 0,
             stream_snapshot: Default::default(),
             stream_append_counts: Vec::new(),
-        })
+        }))
         .collect::<Result<Vec<_>, _>>()
         .expect("encode test group snapshot")
         .into_iter()
@@ -1349,11 +1418,11 @@ mod tests {
         let pointer = SnapshotPointer::decode(prefetched.snapshot.snapshot.get_ref()).unwrap();
         assert_eq!(pointer.snapshot_id, "snapshot-a");
         assert!(matches!(pointer.location, SnapshotLocation::S3 { .. }));
-        let bytes = registry
+        let cached = registry
             .snapshot_install_coordinator()
             .take_prefetched(&pointer)
             .expect("external snapshot is cached for install");
-        decode_group_snapshot(&bytes).unwrap();
+        assert_eq!(cached.group_commit_index, 0);
     }
 
     #[tokio::test]
@@ -1387,10 +1456,16 @@ mod tests {
             coordinator,
             None,
         );
+        let decodes_before_install = crate::snapshot_codec::decode_calls_on_this_thread();
         state_machine
             .install_snapshot(&prefetched.snapshot.meta, prefetched.snapshot.snapshot)
             .await
             .expect("prefetched external snapshot installs without external store");
+        // F12c: the prefetch decoded the snapshot; install reuses it.
+        assert_eq!(
+            crate::snapshot_codec::decode_calls_on_this_thread(),
+            decodes_before_install
+        );
     }
 
     #[tokio::test]

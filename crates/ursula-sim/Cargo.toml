@@ -25,6 +25,7 @@ madsim = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 ursula = { workspace = true }
 ursula-ctl = { workspace = true }
+ursula-index = { workspace = true }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }

@@ -69,6 +69,7 @@ use ursula_runtime::GroupEngineCreateFuture;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineFactory;
 use ursula_runtime::GroupEngineMetrics;
+use ursula_runtime::GroupFeatureLevelFuture;
 use ursula_runtime::GroupFlushColdFuture;
 use ursula_runtime::GroupGetStreamAttrsFuture;
 use ursula_runtime::GroupHeadStreamFuture;
@@ -82,9 +83,11 @@ use ursula_runtime::GroupReadStreamFuture;
 use ursula_runtime::GroupReadStreamPartsFuture;
 use ursula_runtime::GroupRequireLiveReadOwnerFuture;
 use ursula_runtime::GroupSetBucketQuotaFuture;
+use ursula_runtime::GroupSetFeatureLevelFuture;
 use ursula_runtime::GroupShutdownFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
+use ursula_runtime::GroupStateGaugesFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
 use ursula_runtime::GroupUpdateStreamAttrsFuture;
 use ursula_runtime::GroupWriteBatchFuture;
@@ -101,6 +104,7 @@ use ursula_runtime::RuntimeConfig;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::RuntimeThreading;
 use ursula_runtime::SetBucketQuotaRequest;
+use ursula_runtime::SetFeatureLevelRequest;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::UpdateStreamAttrsRequest;
 use ursula_shard::BucketStreamId;
@@ -162,6 +166,7 @@ pub enum SimScenario {
     HttpLiveProtocolSurface,
     HttpProducerProtocolSurface,
     HttpProtocolSurface,
+    KeyedIndexer,
 }
 
 #[derive(Clone)]
@@ -202,6 +207,7 @@ impl SimScenario {
             Self::HttpLiveProtocolSurface => "http-live-protocol-surface",
             Self::HttpProducerProtocolSurface => "http-producer-protocol-surface",
             Self::HttpProtocolSurface => "http-protocol-surface",
+            Self::KeyedIndexer => "keyed-indexer",
         }
     }
 }
@@ -529,6 +535,7 @@ pub use self::trace::SimTrace;
 
 mod cold_path;
 mod generators;
+mod keyed_indexer;
 use cold_path::run_cold_delete_fault_inner;
 use cold_path::run_cold_live_read_inner;
 use cold_path::run_cold_read_delay_inner;
@@ -536,6 +543,8 @@ use cold_path::run_cold_read_fault_inner;
 use cold_path::run_cold_read_truncate_inner;
 use cold_path::run_cold_write_delay_inner;
 use cold_path::run_cold_write_fault_inner;
+pub use keyed_indexer::KeyedIndexerPlan;
+use keyed_indexer::run_keyed_indexer_inner;
 mod http;
 use http::run_http_live_limit_protocol_surface_inner;
 use http::run_http_live_protocol_surface_inner;
@@ -585,6 +594,7 @@ use introspect::has_stop_seeded_follower_in_fault_plan;
 use introspect::has_verify_runtime_cold_live_reads_in_fault_plan;
 use introspect::http_protocol_surface_plan_from_fault_plan;
 use introspect::invariant_failed;
+use introspect::keyed_indexer_plan_from_fault_plan;
 use introspect::panic_payload_to_string;
 use introspect::runtime_interleaving_plan_from_fault_plan;
 use introspect::runtime_raft_network_workload_plan_from_fault_plan;
@@ -1162,6 +1172,28 @@ impl GroupEngine for MadsimScopedGroupEngine {
         }))
     }
 
+    fn feature_level<'a>(&'a mut self, placement: ShardPlacement) -> GroupFeatureLevelFuture<'a> {
+        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
+            self.inner.feature_level(placement).await
+        }))
+    }
+
+    fn state_gauges<'a>(&'a mut self, placement: ShardPlacement) -> GroupStateGaugesFuture<'a> {
+        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
+            self.inner.state_gauges(placement).await
+        }))
+    }
+
+    fn set_feature_level<'a>(
+        &'a mut self,
+        request: SetFeatureLevelRequest,
+        placement: ShardPlacement,
+    ) -> GroupSetFeatureLevelFuture<'a> {
+        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
+            self.inner.set_feature_level(request, placement).await
+        }))
+    }
+
     fn head_stream<'a>(
         &'a mut self,
         request: ursula_runtime::HeadStreamRequest,
@@ -1598,6 +1630,7 @@ pub(super) async fn verify_runtime_raft_partial_read(
             record: None,
             max_records: None,
             leader_only: false,
+            record_anchor: None,
         })
         .await
         .expect("runtime raft partial read");
@@ -1647,6 +1680,7 @@ pub(super) async fn verify_runtime_raft_tail_read(
             record: None,
             max_records: None,
             leader_only: false,
+            record_anchor: None,
         })
         .await
         .expect("runtime raft tail read");
@@ -1716,6 +1750,7 @@ pub(super) async fn verify_runtime_raft_close_stream(
             record: None,
             max_records: None,
             leader_only: false,
+            record_anchor: None,
         })
         .await
         .expect("read closed runtime raft stream");
@@ -2109,6 +2144,7 @@ pub(super) async fn read_local_payload_eventually(
                     record: None,
                     max_records: None,
                     leader_only: false,
+                    record_anchor: None,
                 },
                 placement(),
             )
@@ -2234,6 +2270,13 @@ async fn build_restartable_three_node_cluster_with_cold_store(
 pub(super) async fn build_lagging_learner_snapshot_cluster(
     policy: InProcessRaftNetworkPolicy,
 ) -> (InProcessRaftRegistry, Vec<RaftGroupEngine>, u64) {
+    build_lagging_learner_snapshot_cluster_with_cold_store(policy, None).await
+}
+
+pub(super) async fn build_lagging_learner_snapshot_cluster_with_cold_store(
+    policy: InProcessRaftNetworkPolicy,
+    cold_store: Option<ColdStoreHandle>,
+) -> (InProcessRaftRegistry, Vec<RaftGroupEngine>, u64) {
     let registry = InProcessRaftRegistry::default();
     let config = Arc::new(
         Config {
@@ -2262,7 +2305,7 @@ pub(super) async fn build_lagging_learner_snapshot_cluster(
                 .with_policy(policy.clone()),
             RaftGroupLogStore::shared(),
             None,
-            None,
+            cold_store.clone(),
         )
         .await
         .expect("create simulated raft group node");

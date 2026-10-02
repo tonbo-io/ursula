@@ -1,0 +1,83 @@
+---
+title: List streams
+api: "GET /{bucket}/streams"
+---
+
+Lists the live streams of a bucket in lexicographic order of their bucket-local path, one page at a time.
+
+<ParamField path="bucket" type="string" required>
+ Bucket ID.
+</ParamField>
+
+<ParamField query="prefix" type="string">
+ Only list streams whose bucket-local path starts with this prefix. Default: every stream.
+</ParamField>
+
+<ParamField query="after" type="string">
+ Exclusive cursor: only list streams whose path sorts after this value. Pass the previous page's `next_cursor`.
+</ParamField>
+
+<ParamField query="limit" type="number">
+ Page size, `1` to `1000`. Default `1000`.
+</ParamField>
+
+## Response
+
+| Status | Meaning |
+| ------ | ------- |
+| `200` | One page of matching streams, possibly empty. |
+| `400` | Invalid bucket ID or `limit` out of range. |
+| `404` | The bucket does not exist. |
+
+The body is a JSON object:
+
+| Field | Description |
+| ----- | ----------- |
+| `bucket_id` | The bucket. |
+| `prefix` | The requested prefix, `""` when none was given. |
+| `stream_count` | Number of entries in `streams` on this page (not the bucket total). |
+| `streams` | Entries sorted by `stream_id`. |
+| `has_more` | `true` when more matching streams follow this page. |
+| `next_cursor` | When `has_more` is `true`, the last entry's `stream_id`, to pass as `after`. Otherwise `null`. |
+
+Each entry has:
+
+| Field | Description |
+| ----- | ----------- |
+| `stream_id` | Bucket-local path: `stream`, or `affinity/stream` for a stream created through the [path affinity](/docs/specs/extensions#17-path-affinity) form. |
+| `status` | `Open` or `Closed`. |
+| `content_type` | The stream's content type, for example `application/json; profile=keyed-batch-v1`. |
+| `tail_offset` | Current tail as an integer byte offset. |
+| `created_at_ms` | Creation time in Unix milliseconds. Unique per Raft group from feature level 1, so it also identifies a stream incarnation. |
+
+Streams whose TTL or expiry time has passed are not listed. Ursula does not report `last_write_at_ms`, which the specification makes optional.
+
+<RequestExample>
+```bash First page
+curl 'http://127.0.0.1:4437/agents/streams?prefix=user-&limit=2'
+```
+
+```bash Next page
+curl 'http://127.0.0.1:4437/agents/streams?prefix=user-&limit=2&after=user-2'
+```
+</RequestExample>
+
+<ResponseExample>
+```json 200
+{
+  "bucket_id": "agents",
+  "prefix": "user-",
+  "stream_count": 2,
+  "streams": [
+    {"stream_id": "user-1", "status": "Open", "content_type": "application/json", "tail_offset": 42, "created_at_ms": 1735689600000},
+    {"stream_id": "user-2", "status": "Closed", "content_type": "text/plain", "tail_offset": 7, "created_at_ms": 1735689600123}
+  ],
+  "next_cursor": "user-2",
+  "has_more": true
+}
+```
+</ResponseExample>
+
+<Note>
+The node that serves the request assembles the page from its local replica of every Raft group, so a stream created a moment ago may be missing from a page served by a follower. Use the listing as a catalog, not as a check that a stream you just created exists; `HEAD` the stream for that.
+</Note>

@@ -251,6 +251,10 @@ impl GroupEngineFactory for RegisteredRaftGroupEngineFactory {
                 RaftGroupEngine::new_single_node_with_optional_metrics(placement, Some(metrics))
                     .await?;
             self.registry.register(placement, engine.raft.clone());
+            self.registry.register_cold_index_cache(
+                placement.raft_group_id,
+                engine.cold_index_cache.clone(),
+            );
             let engine: Box<dyn GroupEngine> = Box::new(engine);
             Ok(engine)
         })
@@ -734,6 +738,10 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 .await?
             };
             self.registry.register(placement, engine.raft_handle());
+            self.registry.register_cold_index_cache(
+                placement.raft_group_id,
+                engine.cold_index_cache.clone(),
+            );
             if self.should_initialize_membership(placement.raft_group_id) {
                 let rejoin_existing_cluster = self.snapshot_store.is_some()
                     && engine

@@ -37,6 +37,15 @@ pub enum StreamResponse {
         closed: bool,
         deduplicated: bool,
         producer: Option<ProducerRequest>,
+        /// A duplicate whose receipt the stream's receipt window evicted
+        /// (F3, feature level 1). It is answered as deduplicated without
+        /// byte or record ranges: `offset` and `next_offset` are the stream
+        /// tail and carry no information about the original append.
+        receipt_evicted: bool,
+        /// Records of this append as apply computed them, or the stored
+        /// receipt's range for a duplicate (F1, RC-10/RC-11). Never derived
+        /// from the record index afterwards, which may have sealed them.
+        record_range: Option<StreamRecordRange>,
     },
     Closed {
         next_offset: u64,
@@ -70,6 +79,13 @@ pub enum StreamResponse {
     ColdGcAcked {
         removed: u64,
     },
+    /// Result of [`StreamCommand::DeferColdGc`]: the entry's new sequence
+    /// number, or `None` when no pending entry had the given `seq`.
+    ///
+    /// [`StreamCommand::DeferColdGc`]: crate::StreamCommand::DeferColdGc
+    ColdGcDeferred {
+        new_seq: Option<u64>,
+    },
     /// A whole-bucket purge accepted by [`StreamCommand::PurgeBucket`].
     ///
     /// [`StreamCommand::PurgeBucket`]: crate::StreamCommand::PurgeBucket
@@ -84,6 +100,30 @@ pub enum StreamResponse {
     SnapshotImported {
         buckets: u64,
         streams: u64,
+    },
+    /// Result of [`StreamCommand::SetFeatureLevel`]: the group's level after
+    /// apply and the level it held before.
+    ///
+    /// [`StreamCommand::SetFeatureLevel`]: crate::StreamCommand::SetFeatureLevel
+    FeatureLevelSet {
+        level: u32,
+        previous_level: u32,
+    },
+    /// Result of [`StreamCommand::TidyStream`]: whether the stream still has
+    /// normalization debt after this bounded step.
+    ///
+    /// [`StreamCommand::TidyStream`]: crate::StreamCommand::TidyStream
+    StreamTidied {
+        debt_remaining: bool,
+    },
+    /// Result of [`StreamCommand::OffloadColdRefs`]: how many of the listed
+    /// refs were still in state and removed, and how many state-held external
+    /// refs the stream keeps.
+    ///
+    /// [`StreamCommand::OffloadColdRefs`]: crate::StreamCommand::OffloadColdRefs
+    ColdRefsOffloaded {
+        removed: u64,
+        remaining: u64,
     },
     Error {
         code: StreamErrorCode,
@@ -126,6 +166,12 @@ pub enum StreamErrorCode {
     /// A state import payload failed snapshot validation.
     ImportInvalid,
     QuotaExceeded,
+    /// The command needs a higher group feature level than the group holds.
+    /// Deterministic: every replica rejects it the same way.
+    FeatureNotEnabled,
+    /// A new producer would exceed the stream's producer cap and no producer
+    /// has been idle long enough to evict (F3, feature level 1).
+    ProducerLimit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

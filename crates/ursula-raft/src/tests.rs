@@ -273,6 +273,7 @@ fn read_req(stream_id: ursula_shard::BucketStreamId, max_len: usize) -> ReadStre
         record: None,
         max_records: None,
         leader_only: false,
+        record_anchor: None,
     }
 }
 
@@ -487,6 +488,7 @@ fn raft_group_write_response_round_trips_through_wire_codec() {
         already_exists: false,
         group_commit_index: 11,
         record_range: None,
+        hot_backlog: None,
     });
 
     let encoded = encode_wire(&response);
@@ -2630,4 +2632,168 @@ async fn openraft_snapshot_round_trips_group_state() {
         }
         other => panic!("unexpected append response: {other:?}"),
     }
+}
+
+/// C0 parity: the in-memory engine and the Raft engine apply the same
+/// `SetFeatureLevel` sequence identically, report the same levels, and carry
+/// the level through their group snapshots.
+#[tokio::test]
+async fn feature_level_matches_between_in_memory_and_raft_engines() {
+    let mut in_memory = ursula_runtime::InMemoryGroupEngine::default();
+    let mut raft = RaftGroupEngine::new_single_node(placement())
+        .await
+        .expect("create raft group engine");
+
+    for level in [1, 1, 0] {
+        let request = ursula_runtime::SetFeatureLevelRequest { level };
+        let expected = in_memory
+            .set_feature_level(request, placement())
+            .await
+            .expect("in-memory set feature level");
+        let actual = raft
+            .set_feature_level(request, placement())
+            .await
+            .expect("raft set feature level");
+        assert_eq!(
+            (actual.level, actual.previous_level),
+            (expected.level, expected.previous_level),
+            "level {level}"
+        );
+    }
+    assert_eq!(
+        GroupEngine::feature_level(&mut in_memory, placement())
+            .await
+            .expect("level"),
+        1
+    );
+    assert_eq!(raft.feature_level(placement()).await.expect("level"), 1);
+
+    let in_memory_snapshot = in_memory.snapshot(placement()).await.expect("snapshot");
+    let raft_snapshot = raft.snapshot(placement()).await.expect("snapshot");
+    assert_eq!(in_memory_snapshot.stream_snapshot.feature_level, 1);
+    assert_eq!(
+        raft_snapshot.stream_snapshot,
+        in_memory_snapshot.stream_snapshot
+    );
+    raft.shutdown().await.expect("shutdown raft group engine");
+}
+
+#[tokio::test]
+async fn feature_level_replicates_to_followers_and_rejects_follower_proposals() {
+    let (_registry, mut engines, leader_id) =
+        build_three_node_cluster("ursula-feature-level-test", None).await;
+    for engine in &engines {
+        engine
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .current_leader(leader_id, "all nodes observe the same leader")
+            .await
+            .expect("wait for shared leader");
+    }
+    let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
+    let follower_index = (leader_index + 1) % engines.len();
+
+    let err = engines[follower_index]
+        .set_feature_level(
+            ursula_runtime::SetFeatureLevelRequest { level: 1 },
+            placement(),
+        )
+        .await
+        .expect_err("follower must not propose locally");
+    assert!(err.leader_hint().is_some(), "{err:?}");
+
+    let response = engines[leader_index]
+        .set_feature_level(
+            ursula_runtime::SetFeatureLevelRequest { level: 1 },
+            placement(),
+        )
+        .await
+        .expect("leader proposes feature level");
+    assert_eq!((response.level, response.previous_level), (1, 0));
+
+    let applied = engines[leader_index]
+        .raft
+        .metrics()
+        .borrow_watched()
+        .last_applied
+        .map(|log_id| log_id.index());
+    for engine in &mut engines {
+        engine
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index_at_least(applied, "feature level replicated")
+            .await
+            .expect("wait for replication");
+        assert_eq!(engine.feature_level(placement()).await.expect("level"), 1);
+    }
+    shutdown_all(&engines).await;
+}
+
+#[tokio::test]
+async fn openraft_snapshot_carries_feature_level() {
+    let mut source = RaftGroupStateMachine::new(placement());
+    let entries = vec![normal_entry(
+        1,
+        GroupWriteCommand::from(ursula_stream::StreamCommand::SetFeatureLevel { level: 1 }),
+    )];
+    source
+        .apply(stream::iter(
+            entries.into_iter().map(|entry| Ok((entry, None))),
+        ))
+        .await
+        .expect("apply source");
+
+    let mut builder = source.get_snapshot_builder().await;
+    let snapshot = builder.build_snapshot().await.expect("build snapshot");
+    let mut target = RaftGroupStateMachine::new(placement());
+    target
+        .install_snapshot(&snapshot.meta, snapshot.snapshot)
+        .await
+        .expect("install snapshot");
+    assert_eq!(target.engine.feature_level(), 1);
+}
+
+/// F1 follow-up: a forwarded read carries the continuation anchor to the
+/// leader over gRPC, so a follower's SSE or record read continues from it;
+/// a request from an older follower (no field) decodes with no anchor.
+#[test]
+fn forwarded_reads_carry_the_record_anchor_over_grpc() {
+    use prost::Message;
+
+    let request = ursula_runtime::ReadStreamRequest {
+        stream_id: bsid("anchor-forward"),
+        offset: 0,
+        max_len: 4096,
+        now_ms: 77,
+        record: Some(1_234),
+        max_records: Some(5),
+        leader_only: false,
+        record_anchor: Some(ursula_runtime::RecordAnchor {
+            incarnation: 42,
+            record: 1_234,
+            offset: 987_654,
+        }),
+    };
+    let wire = crate::forward::read_stream_read_v1(&request)
+        .expect("wire read")
+        .encode_to_vec();
+    let decoded =
+        crate::raft_internal_proto::ReadStreamReadV1::decode(wire.as_slice()).expect("decode");
+    let served = crate::grpc::read_stream_request_from_v1(request.stream_id.clone(), 77, decoded)
+        .expect("served request");
+    assert_eq!(served, request);
+
+    let legacy = crate::raft_internal_proto::ReadStreamReadV1 {
+        offset: 0,
+        max_len: 4096,
+        record: Some(1_234),
+        max_records: Some(5),
+        record_anchor: None,
+    }
+    .encode_to_vec();
+    let decoded =
+        crate::raft_internal_proto::ReadStreamReadV1::decode(legacy.as_slice()).expect("decode");
+    let served = crate::grpc::read_stream_request_from_v1(request.stream_id.clone(), 77, decoded)
+        .expect("served request");
+    assert_eq!(served.record_anchor, None);
 }

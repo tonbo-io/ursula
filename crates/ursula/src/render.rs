@@ -50,6 +50,7 @@ use crate::HEADER_STREAM_TTL;
 use crate::HEADER_STREAM_UP_TO_DATE;
 use crate::HEADER_X_CONTENT_TYPE_OPTIONS;
 use crate::HttpMetricsSnapshot;
+use crate::insert_keyed_extension_for;
 use crate::insert_record_extension;
 use crate::insert_record_head_headers;
 use crate::insert_record_operation_headers;
@@ -97,7 +98,10 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         | StreamErrorCode::StreamSeqConflict
         | StreamErrorCode::SnapshotConflict
         | StreamErrorCode::ProducerSeqConflict
-        | StreamErrorCode::ImportConflict => StatusCode::CONFLICT,
+        | StreamErrorCode::ImportConflict
+        // Below the required group feature level (C0); the plain-text body
+        // names the level the operation needs.
+        | StreamErrorCode::FeatureNotEnabled => StatusCode::CONFLICT,
         StreamErrorCode::RecordPreconditionFailed => StatusCode::PRECONDITION_FAILED,
         StreamErrorCode::ProducerEpochStale => StatusCode::FORBIDDEN,
         StreamErrorCode::OffsetOutOfRange => StatusCode::RANGE_NOT_SATISFIABLE,
@@ -117,6 +121,8 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         // Retry-After accompanies them; 429 still tells the client which
         // class of rejection this is versus 503 backpressure.
         StreamErrorCode::QuotaExceeded => StatusCode::TOO_MANY_REQUESTS,
+        // F3 producer cap; the plain-text body starts with `producer_limit`.
+        StreamErrorCode::ProducerLimit => StatusCode::TOO_MANY_REQUESTS,
     }
 }
 
@@ -443,6 +449,11 @@ pub(crate) fn render_raft_group_metrics_array(values: &[RaftGroupMetricsSnapshot
                     "purged_index": value.purged.map(|progress| progress.index),
                     "voter_ids": value.voter_ids,
                     "learner_ids": value.learner_ids,
+                    // F12e cadence inputs (bounded-state §7.5 soak gauges).
+                    "log_bytes_since_snapshot": value.log.log_bytes,
+                    "log_entries_since_snapshot": value.log.log_entries,
+                    "last_snapshot_bytes": value.log.last_snapshot_bytes,
+                    "has_snapshot": value.log.has_snapshot,
                 })
             })
             .collect(),
@@ -475,7 +486,8 @@ pub(crate) fn read_response(
     request_headers: &HeaderMap,
     request_cursor: Option<&str>,
 ) -> Response {
-    read_response_with_etag(response, request_headers, request_cursor, None)
+    let keyed = ursula_shard::is_keyed_batch_content_type(&response.content_type);
+    read_response_with_etag(response, request_headers, request_cursor, None, keyed)
 }
 
 pub(crate) fn record_envelope_response(
@@ -484,6 +496,8 @@ pub(crate) fn record_envelope_response(
     request_cursor: Option<&str>,
 ) -> Response {
     let canonical_etag = read_etag(&response);
+    // The envelope replaces the content type; decide keyed beforehand.
+    let keyed = ursula_shard::is_keyed_batch_content_type(&response.content_type);
     if let Err(message) = apply_record_envelope(&mut response) {
         return (StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
     }
@@ -492,6 +506,7 @@ pub(crate) fn record_envelope_response(
         request_headers,
         request_cursor,
         Some(canonical_etag),
+        keyed,
     )
 }
 
@@ -500,22 +515,18 @@ pub(crate) fn apply_record_envelope(response: &mut ReadStreamResponse) -> Result
         return Err("missing record range".to_owned());
     };
     let mut record = record_range.first_record;
-    let mut payload = Vec::new();
+    // The stored message text is spliced in verbatim (P1): re-parsing it would
+    // rewrite literal text and refuse lone-surrogate escapes.
+    let mut payload = Vec::with_capacity(response.payload.len().saturating_add(64));
     for line in response.payload.split(|byte| *byte == b'\n') {
         if line.is_empty() {
             continue;
         }
-        let value = match serde_json::from_slice::<serde_json::Value>(line) {
-            Ok(value) => value,
-            Err(err) => return Err(format!("decode canonical JSON record: {err}")),
-        };
-        let envelope = serde_json::json!({ "record": record, "value": value });
-        let encoded = match serde_json::to_vec(&envelope) {
-            Ok(encoded) => encoded,
-            Err(err) => return Err(format!("encode record envelope: {err}")),
-        };
-        payload.extend_from_slice(&encoded);
-        payload.push(b'\n');
+        payload.extend_from_slice(b"{\"record\":");
+        payload.extend_from_slice(record.to_string().as_bytes());
+        payload.extend_from_slice(b",\"value\":");
+        payload.extend_from_slice(line);
+        payload.extend_from_slice(b"}\n");
         record = record.saturating_add(1);
     }
     if record != record_range.next_record {
@@ -531,6 +542,7 @@ fn read_response_with_etag(
     request_headers: &HeaderMap,
     request_cursor: Option<&str>,
     canonical_etag: Option<String>,
+    keyed: bool,
 ) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
@@ -542,6 +554,9 @@ fn read_response_with_etag(
             insert_record_head_headers(&mut headers, retained_record_range);
             insert_record_operation_headers(&mut headers, record_range);
         }
+    }
+    if keyed {
+        insert_keyed_extension_for(&mut headers, ursula_shard::KEYED_BATCH_CONTENT_TYPE);
     }
     let etag = canonical_etag.unwrap_or_else(|| read_etag(&response));
     if let Ok(value) = HeaderValue::from_str(&etag) {
@@ -673,6 +688,7 @@ pub(crate) fn offset_now_response(response: ReadStreamResponse) -> Response {
             insert_record_operation_headers(&mut headers, record_range);
         }
     }
+    insert_keyed_extension_for(&mut headers, &response.content_type);
     insert_cache_control(&mut headers, "no-store");
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
@@ -694,6 +710,7 @@ pub(crate) fn long_poll_no_content_response(
         insert_record_head_headers(&mut headers, retained_record_range);
         insert_record_operation_headers(&mut headers, record_range);
     }
+    insert_keyed_extension_for(&mut headers, &response.content_type);
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
     } else {
@@ -730,26 +747,9 @@ pub(crate) fn normalize_http_write_payload(
     if !is_json_content_type(content_type) || body.is_empty() {
         return Ok(body);
     }
-
-    let value: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|err| format!("invalid JSON payload: {err}"))?;
-    let messages = match value {
-        serde_json::Value::Array(items) => {
-            if items.is_empty() && !allow_empty_array {
-                return Err("JSON append array must not be empty".to_owned());
-            }
-            items
-        }
-        other => vec![other],
-    };
-
-    let mut out = Vec::new();
-    for message in messages {
-        serde_json::to_writer(&mut out, &message)
-            .map_err(|err| format!("failed to encode JSON message: {err}"))?;
-        out.push(b'\n');
-    }
-    Ok(Bytes::from(out))
+    crate::json_text::normalize_json_messages(&body, allow_empty_array)
+        .map(Bytes::from)
+        .map_err(|err| err.to_string())
 }
 
 pub(crate) fn clamp_sse_text_read(read: &mut ReadStreamResponse, encode_base64: bool) {

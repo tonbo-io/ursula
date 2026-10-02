@@ -260,17 +260,23 @@ Query one registration at `/v1/indexes/{id}/events`; inspect or resume it at `/v
 
 ## Snapshot Store
 
-The default snapshot backend is `inline`, which is also Ursula's runtime
-default, so the chart renders an explicit `storage.snapshot.backend = "inline"`
-entry without changing runtime semantics. To externalize Raft snapshot bytes to S3:
+The default snapshot backend is `auto`, Ursula's own default: the chart renders
+`storage.snapshot.backend = "auto"`, which stores Raft snapshots in S3 whenever
+`coldStorage.enabled=true` and inline (inside the Raft log stores) otherwise. Pin
+a backend explicitly to override that choice:
 
 ```yaml
 snapshotStore:
-  backend: s3
+  backend: s3     # or inline to keep snapshots out of S3 even with cold storage
 ```
 
+Releases that relied on the old `inline` default and enable cold storage switch
+to S3 snapshots on upgrade. That is the intended production setting; set
+`snapshotStore.backend=inline` to keep the old behaviour.
+
 When `snapshotStore.backend=s3`, the generated config sets
-`storage.snapshot.backend = "s3"` and shares the top-level `s3` bucket/credential
+`storage.snapshot.backend = "s3"` (with `auto` and cold storage, the same S3
+settings apply) and shares the top-level `s3` bucket/credential
 settings. The runtime drives one due group every 5 seconds by default. Set
 `snapshotStore.driveIntervalMs=10000` to render
 `storage.snapshot.drive_interval = "10000ms"`, or `0` to disable the manual driver.
@@ -282,6 +288,49 @@ keys are built under the resolved `storage.cold.root` plus
 when cold storage is disabled while `snapshotStore.backend=s3`, the chart does not
 render `storage.cold.root`, so snapshot keys are relative to the S3 bucket root
 plus `snapshotStore.prefix`.
+
+## Keyed-State Indexer
+
+[Keyed streams](../../docs/architecture/keyed-streams-pi-durable.md) serve their
+key-value state at `{stream}/keyed-state`, which the stream's leader proxies to
+`ursula indexer` running in keyed mode. Enable it with cold storage:
+
+```yaml
+coldStorage:
+  enabled: true
+
+keyedIndexer:
+  enabled: true
+```
+
+The chart then renders:
+
+- a `<release>-keyed-indexer` StatefulSet (no volumes beyond an `emptyDir`
+  cache; pods start in parallel) running `ursula indexer --keyed-source-url
+  http://<release>:4437 --s3-bucket <s3.bucket> --keyed-s3-root
+  <s3.prefix>/<coldStorage.prefix>`, so the keyed namespaces live under the
+  nodes' cold root at `.keyed/`;
+- a headless Service `<release>-keyed-indexer-headless` whose per-pod names
+  fill `keyed_state.indexer_urls` in pod order. The nodes send every
+  keyed-state read to the first healthy pod (pod 0 is the primary, the others
+  standbys) and fail over down the list; bucket purge drains every pod;
+- a ClusterIP Service `<release>-keyed-indexer` for operators and tools (the
+  nodes do not route through it);
+- a PodDisruptionBudget and a namespace-scoped NetworkPolicy.
+
+The indexer runs as the server ServiceAccount by default, because it writes
+under the cold root. Set `keyedIndexer.serviceAccount.create=true` (with its own
+workload-identity annotation) to give it a narrower identity: read, write, list
+and delete on `{cold root}/.keyed/` are enough.
+
+Keyed streams can be created only after the cluster feature level is raised
+(`ursulactl cluster enable-feature --level 1` once every node supports it). To
+point nodes at an indexer the chart does not manage, leave
+`keyedIndexer.enabled=false` and set `keyedState.upstream` for a single pod,
+or `keyedState.indexerUrls` (primary first) for an active/standby set. The
+default `keyedIndexer.replicaCount: 2` is one primary and one warm standby;
+this is availability, not load sharding (spreading streams over several active
+pods belongs to the horizontal-scaling work).
 
 ## Upgrade Limitations
 
@@ -416,6 +465,7 @@ container receives only chart-managed container settings plus explicit
 | `coldStorage.flush.maxBytes` | `8388608` | Maximum bytes flushed into one group-scoped cold object per tick. |
 | `coldStorage.flush.maxConcurrency` | `4` | Maximum concurrent cold writes. |
 | `coldStorage.flush.maxHotBytesPerGroup` | `67108864` | Hot-byte backpressure ceiling per group; `0` disables the cap. |
+| `coldStorage.compaction.enabled` | `true` | Same-stream cold chunk compaction (`storage.cold.compaction_enabled`). Set `false` to turn it off. |
 | `coldStorage.cache.maxSizeBytes` | `null` | Optional cold-read cache size override. Renders `storage.cold.cache.max_size`; `0` disables the cache, and omitted lets the runtime install its default cache. |
 | `coldStorage.cache.blockSizeBytes` | `null` | Optional cold-read cache block size override. Renders `storage.cold.cache.block_size`. |
 | `coldStorage.cache.readaheadBlocks` | `null` | Optional cold-read cache readahead override. Renders `storage.cold.cache.readahead_blocks`. |
@@ -424,7 +474,7 @@ container receives only chart-managed container settings plus explicit
 
 | Value | Default | Description |
 | --- | --- | --- |
-| `snapshotStore.backend` | `inline` | OpenRaft snapshot backend: `inline` or `s3`. Rendered as `storage.snapshot.backend` in the generated config. |
+| `snapshotStore.backend` | `auto` | OpenRaft snapshot backend: `auto` (S3 with cold storage, inline otherwise), `inline` or `s3`. Rendered as `storage.snapshot.backend` in the generated config. |
 | `snapshotStore.prefix` | `snapshots` | Snapshot object suffix rendered as `storage.snapshot.s3_prefix`; resolved against `storage.cold.root` when present, otherwise against the S3 bucket root for S3 snapshots. |
 | `snapshotStore.driveIntervalMs` | `null` | Optional manual snapshot driver interval in milliseconds. Renders `storage.snapshot.drive_interval`; omitted drives one due group every 5 seconds for external stores, and `0` disables the manual driver. |
 
@@ -517,6 +567,25 @@ container receives only chart-managed container settings plus explicit
 | `indexer.podDisruptionBudget.enabled` | `true` | Protect multi-worker query and ingestion availability; rejected for one replica. |
 | `indexer.networkPolicy.enabled` | `true` | Limit indexer HTTP ingress to pods in the release namespace; egress stays open for DNS, source reads, and S3. |
 | `indexer.resources` | production defaults | Per worker: requests 250m CPU, 512Mi memory, and 2Gi ephemeral storage; limits 2 CPU, 2Gi memory, and 3Gi ephemeral storage. |
+
+### Keyed State
+
+| Value | Default | Description |
+| --- | --- | --- |
+| `keyedState.upstream` | `""` | Node `server.keyed_state_upstream`: a single indexer (one pod or a load balancer), used only when no indexer pods are listed. Empty: unset. |
+| `keyedState.indexerUrls` | `[]` | Node `keyed_state.indexer_urls`: the active/standby failover order for keyed-state reads (primary first; takes precedence over `upstream`), all drained on bucket purge. Empty lists every chart keyed indexer pod (pod 0 first) when enabled; otherwise the node reads from and drains its upstream. |
+| `keyedState.drainTimeoutMs` | `null` | Optional `keyed_state.drain_timeout` per pod; null keeps 60 s. |
+| `keyedIndexer.enabled` | `false` | Deploy the keyed-state indexer. Requires `coldStorage.enabled=true`. |
+| `keyedIndexer.replicaCount` | `2` | Keyed indexer pods: pod 0 is the primary that takes every read, the others warm standbys the nodes fail over to. Any pod can serve any stream; they coordinate through object-store compare-and-swap. |
+| `keyedIndexer.sourceUrl` | `""` | Node or gateway URL records are read from. Empty uses the internal node Service. |
+| `keyedIndexer.serviceAccount.create` | `false` | `false` runs as the server ServiceAccount (or `keyedIndexer.serviceAccount.name`); `true` creates a dedicated one. |
+| `keyedIndexer.cache.maxBytes` | `1073741824` | Local namespace-part cache budget per pod. |
+| `keyedIndexer.minPublishIntervalMs` | `5000` | Minimum spacing of one namespace's publications. |
+| `keyedIndexer.gcGraceSeconds` | `600` | Grace before unreachable keyed objects are deleted. |
+| `keyedIndexer.maxWaiters` | `10000` | Maximum concurrent waiting keyed-state reads per pod. |
+| `keyedIndexer.podDisruptionBudget.enabled` | `true` | Render a PDB; requires `replicaCount` above 1. |
+| `keyedIndexer.networkPolicy.enabled` | `true` | Restrict ingress to the release namespace. |
+| `keyedIndexer.resources` | production defaults | Requests 250m CPU, 512Mi memory, 2Gi ephemeral storage; limits 2 CPU, 2Gi memory, 3Gi ephemeral storage. |
 
 ### Helm Test
 
