@@ -544,6 +544,61 @@ async fn f14h_orphan_sweep_reclaims_only_unreferenced_objects_after_the_grace() 
     assert_eq!(again.orphans_deleted, 0, "a second sweep finds nothing");
 }
 
+/// RT6: a page read-modify-write by a deposed leader can drop the entry of
+/// a committed exclusive chunk. The sweep must not delete that chunk once it
+/// is older than the grace: no other referenced object covers its retained
+/// range, so it holds the only copy. It is kept and counted as an alert.
+#[tokio::test]
+async fn rt6_orphan_sweep_keeps_an_unreferenced_chunk_whose_range_nothing_covers() {
+    use crate::cold_index::ColdIndexPageKey;
+    use crate::cold_index::ColdIndexPageStore;
+    use crate::cold_index::ColdStoreColdIndexPageStore;
+
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = spawn(cold_store.clone());
+    let a = stream("lost-entry");
+    create(&runtime, &a).await;
+    append(&runtime, &a, b"a1").await;
+    pack_flush(&runtime).await;
+    runtime
+        .compact_shared_refs_group_once(GROUP, &SharedRefCompactionConfig {
+            max_streams: 16,
+            ..driver(1, 60 * 60 * 1_000)
+        })
+        .await
+        .expect("compact into an exclusive chunk");
+    let chunk_dir = crate::cold_store::cold_chunk_dir(&a, 0);
+    let chunks = cold_store.list_file_names(&chunk_dir).await.unwrap();
+    assert_eq!(chunks.len(), 1, "the compaction replacement");
+    let chunk = format!("{chunk_dir}{}", chunks[0]);
+
+    // A deposed leader rewrites the page without the committed entry.
+    let pages = ColdStoreColdIndexPageStore::new(cold_store.clone());
+    let key = ColdIndexPageKey {
+        stream_id: a.clone(),
+        generation: 0,
+        page_id: 0,
+    };
+    let mut page = pages.get_page(&key).await.unwrap().expect("page");
+    page.cold_chunks.retain(|entry| entry.s3_path != chunk);
+    pages.put_page(&key, &page).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let swept = runtime
+        .sweep_cold_orphans_group_once(GROUP, 16, 0)
+        .await
+        .expect("sweep after the grace");
+    assert!(exists(&cold_store, &chunk).await, "the only copy is kept");
+    assert_eq!(swept.uncovered_chunks_kept, 1);
+    assert_eq!(
+        runtime
+            .metrics()
+            .snapshot()
+            .cold_orphan_uncovered_chunks_kept,
+        1
+    );
+}
+
 /// The sweep walks a group's streams in bounded steps and sweeps the pack
 /// prefix once per cycle.
 #[tokio::test]

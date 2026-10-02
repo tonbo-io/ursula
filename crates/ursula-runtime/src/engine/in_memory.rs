@@ -1578,6 +1578,22 @@ impl InMemoryGroupEngine {
                     .cold_index_generation(&stream_id)
                     .unwrap_or(0),
                 referenced: self.state_machine.stream_referenced_cold_paths(&stream_id),
+                cold_range: (
+                    self.state_machine.retained_offset(&stream_id),
+                    self.state_machine.hot_start_offset(&stream_id),
+                ),
+                referenced_ranges: self
+                    .state_machine
+                    .cold_chunks(&stream_id)
+                    .iter()
+                    .map(|chunk| (chunk.start_offset, chunk.end_offset))
+                    .chain(
+                        self.state_machine
+                            .external_segments(&stream_id)
+                            .iter()
+                            .map(|object| (object.start_offset, object.end_offset)),
+                    )
+                    .collect(),
                 stream_id,
             })
             .collect();

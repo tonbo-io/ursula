@@ -22,6 +22,14 @@
 //! Objects are listed before the references are read, and only objects older
 //! than the grace are candidates, so a reference added after the plan can
 //! only name a newer object.
+//!
+//! RT6 guard: an unreferenced exclusive chunk is still kept when part of its
+//! range lies in the stream's cold range (retained bytes below the hot
+//! buffer) and no referenced object covers that part. Its page entry was
+//! lost (a page read-modify-write by a deposed leader, or a rollback after an
+//! ambiguous redirect), so it may hold the only copy of committed bytes. The
+//! sweep logs an error and counts `cold_orphan_uncovered_chunks_kept` for an
+//! operator to repair the stream's cold index.
 
 use std::collections::BTreeSet;
 
@@ -36,8 +44,10 @@ use crate::cold_index::ColdStoreColdIndexPageStore;
 use crate::cold_refs::ColdOrphanSweepReport;
 use crate::cold_refs::ColdOrphanSweepRequest;
 use crate::cold_refs::cold_object_written_unix_ms;
+use crate::cold_refs::ranges_cover;
 use crate::cold_store::ColdStoreHandle;
 use crate::cold_store::cold_chunk_dir;
+use crate::cold_store::cold_chunk_file_range;
 use crate::cold_store::cold_external_dir;
 use crate::cold_store::is_cold_chunk_file_name;
 use crate::cold_store::is_external_payload_file_name;
@@ -128,6 +138,9 @@ impl ShardRuntime {
 
         // Then read what state and pages reference now.
         let mut referenced = BTreeSet::new();
+        // Per live chunk directory: the stream's cold range and the ranges
+        // its referenced objects cover (RT6).
+        let mut chunk_guards: Vec<(String, (u64, u64), Vec<(u64, u64)>)> = Vec::new();
         if !aged.is_empty() {
             let plan = self
                 .plan_cold_orphan_sweep(raft_group_id, ColdOrphanSweepRequest {
@@ -156,11 +169,18 @@ impl ShardRuntime {
                     continue;
                 };
                 referenced.extend(current.referenced.iter().cloned());
+                let mut covered = current.referenced_ranges.clone();
                 for generation in [stream.generation, current.generation] {
-                    referenced.extend(
-                        page_referenced_paths(cold_store, &stream.stream_id, generation).await?,
-                    );
+                    let (paths, ranges) =
+                        page_references(cold_store, &stream.stream_id, generation).await?;
+                    referenced.extend(paths);
+                    covered.extend(ranges);
                 }
+                chunk_guards.push((
+                    cold_chunk_dir(&stream.stream_id, stream.generation),
+                    current.cold_range,
+                    covered,
+                ));
             }
         }
 
@@ -169,9 +189,29 @@ impl ShardRuntime {
             objects_scanned,
             ..ColdOrphanSweepReport::default()
         };
-        for (path, _) in aged {
+        for (path, name) in aged {
             if referenced.contains(&path) {
                 continue;
+            }
+            if let Some((chunk_start, chunk_end)) = cold_chunk_file_range(&name)
+                && let Some((_, (cold_start, cold_end), covered)) = chunk_guards
+                    .iter()
+                    .find(|(dir, _, _)| path.strip_prefix(dir.as_str()) == Some(name.as_str()))
+            {
+                let start = chunk_start.max(*cold_start);
+                let end = chunk_end.min(*cold_end);
+                if start < end && !ranges_cover(covered, start, end) {
+                    self.metrics.record_cold_orphan_uncovered_chunk_kept();
+                    report.uncovered_chunks_kept = report.uncovered_chunks_kept.saturating_add(1);
+                    tracing::error!(
+                        path = %path,
+                        uncovered_start = start,
+                        uncovered_end = end,
+                        "unreferenced cold chunk holds retained bytes no index entry covers; \
+                         keeping it (lost cold-index page entry, repair the stream)"
+                    );
+                    continue;
+                }
             }
             let bytes = cold_store.object_size(&path).await.unwrap_or(0);
             match cold_store.delete_chunk(&path).await {
@@ -243,14 +283,16 @@ impl ShardRuntime {
     }
 }
 
-/// Every object path the pages of one stream generation reference.
-async fn page_referenced_paths(
+/// Every object path the pages of one stream generation reference, and the
+/// byte ranges those entries cover.
+async fn page_references(
     cold_store: &ColdStoreHandle,
     stream_id: &ursula_shard::BucketStreamId,
     generation: u64,
-) -> Result<BTreeSet<String>, RuntimeError> {
+) -> Result<(BTreeSet<String>, Vec<(u64, u64)>), RuntimeError> {
     let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
     let mut paths = BTreeSet::new();
+    let mut ranges = Vec::new();
     for page_id in list_cold_index_page_ids(cold_store, stream_id, generation)
         .await
         .map_err(cold_io)?
@@ -263,12 +305,14 @@ async fn page_referenced_paths(
         let Some(page) = store.get_page(&key).await.map_err(cold_io)? else {
             continue;
         };
-        paths.extend(page.cold_chunks.iter().map(|chunk| chunk.s3_path.clone()));
-        paths.extend(
-            page.external_segments
-                .iter()
-                .map(|object| object.s3_path.clone()),
-        );
+        for chunk in &page.cold_chunks {
+            paths.insert(chunk.s3_path.clone());
+            ranges.push((chunk.start_offset, chunk.end_offset));
+        }
+        for object in &page.external_segments {
+            paths.insert(object.s3_path.clone());
+            ranges.push((object.start_offset, object.end_offset));
+        }
     }
-    Ok(paths)
+    Ok((paths, ranges))
 }
