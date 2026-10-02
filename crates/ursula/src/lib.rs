@@ -122,6 +122,7 @@ use ursula_runtime::ProducerRequest;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::ReadStreamResponse;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::StreamAttrs;
@@ -222,6 +223,11 @@ const MALLOC_CONF_ENV_VAR: &str = if cfg!(target_vendor = "apple") {
 const APPEND_BATCH_MAX_ITEMS: usize = 512;
 const APPEND_BATCH_MAX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Server-side cap on one read response (bounded-stream-state F11), the same
+/// 8 MiB that caps bootstrap updates. A request's `max_bytes` is clamped to
+/// it; a capped response is partial (`Stream-Up-To-Date` absent) and the
+/// client continues from `Stream-Next-Offset`.
+const READ_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_HTTP_INFLIGHT_BODY_BYTES: usize = MAX_HTTP_BODY_BYTES * 8;
 const DEFAULT_LONG_POLL_TIMEOUT_MS: u64 = 1_000;
 const MAX_LONG_POLL_TIMEOUT_MS: u64 = 60_000;
@@ -3670,6 +3676,9 @@ pub(crate) async fn read_stream_by_id(
     // On a record-aware read `max_bytes` bounds complete records (P7,
     // extensions.md §6.6) and must be a positive integer; offset reads keep
     // the base protocol's lenient parsing.
+    // F11: every read is capped at READ_MAX_RESPONSE_BYTES. Without a
+    // client `max_bytes`, a capped offset read of a JSON stream ends at a
+    // record boundary (see `end_capped_json_read_at_record_boundary`).
     let max_len = match query.get("max_bytes") {
         Some(raw) if record_aware => match raw.parse::<usize>() {
             Ok(value) if value > 0 => value,
@@ -3680,6 +3689,9 @@ pub(crate) async fn read_stream_by_id(
         Some(raw) => raw.parse::<usize>().unwrap_or(usize::MAX),
         None => usize::MAX,
     };
+    let server_capped = max_len > READ_MAX_RESPONSE_BYTES;
+    let max_len = max_len.min(READ_MAX_RESPONSE_BYTES);
+    let trim_json = server_capped && !record_aware && !offset_is_now;
 
     match live_mode {
         Some("sse") => {
@@ -3708,6 +3720,7 @@ pub(crate) async fn read_stream_by_id(
                 envelope_view,
                 &query,
                 headers,
+                trim_json,
             )
             .await;
         }
@@ -3715,10 +3728,10 @@ pub(crate) async fn read_stream_by_id(
         None => {}
     }
 
-    match state
+    let read = state
         .runtime
         .read_stream(ReadStreamRequest {
-            stream_id,
+            stream_id: stream_id.clone(),
             offset,
             max_len,
             now_ms: state.unix_time_ms(),
@@ -3726,8 +3739,14 @@ pub(crate) async fn read_stream_by_id(
             max_records,
             leader_only,
         })
-        .await
-    {
+        .await;
+    let read = match read {
+        Ok(response) if trim_json => {
+            end_capped_json_read_at_record_boundary(&state, &stream_id, response, leader_only).await
+        }
+        other => other,
+    };
+    match read {
         Ok(response) if offset_is_now => offset_now_response(response),
         Ok(response) if envelope_view => record_envelope_response(response, &headers, None),
         Ok(response) => read_response(response, &headers, None),
@@ -4199,6 +4218,58 @@ pub(crate) async fn read_offset(
     }
 }
 
+/// F11: an offset read of a JSON stream that the server cap cut (no client
+/// `max_bytes`) ends at the last record boundary within the cap, so clients
+/// never see a partial record they did not ask for. A single record larger
+/// than the cap is returned whole (the body cap bounds it), through one more
+/// read of at most one record.
+async fn end_capped_json_read_at_record_boundary(
+    state: &HttpState,
+    stream_id: &BucketStreamId,
+    mut response: ReadStreamResponse,
+    leader_only: bool,
+) -> Result<ReadStreamResponse, RuntimeError> {
+    if response.up_to_date
+        || response.payload.len() < READ_MAX_RESPONSE_BYTES
+        || !render::is_json_content_type(&response.content_type)
+        || response.payload.ends_with(b"\n")
+    {
+        return Ok(response);
+    }
+    if let Some(newline) = response.payload.iter().rposition(|byte| *byte == b'\n') {
+        let len = newline.saturating_add(1);
+        response.payload.truncate(len);
+        response.next_offset = response
+            .offset
+            .saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+        response.up_to_date = false;
+        return Ok(response);
+    }
+    let mut whole = state
+        .runtime
+        .read_stream(ReadStreamRequest {
+            stream_id: stream_id.clone(),
+            offset: response.offset,
+            max_len: MAX_HTTP_BODY_BYTES.saturating_add(1),
+            now_ms: state.unix_time_ms(),
+            record: None,
+            max_records: None,
+            leader_only,
+        })
+        .await?;
+    if let Some(newline) = whole.payload.iter().position(|byte| *byte == b'\n') {
+        let len = newline.saturating_add(1);
+        if len < whole.payload.len() {
+            whole.payload.truncate(len);
+            whole.next_offset = whole
+                .offset
+                .saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+            whole.up_to_date = false;
+        }
+    }
+    Ok(whole)
+}
+
 pub(crate) async fn long_poll_stream(
     state: HttpState,
     request_target: String,
@@ -4210,6 +4281,7 @@ pub(crate) async fn long_poll_stream(
     envelope_view: bool,
     query: &HashMap<String, String>,
     headers: HeaderMap,
+    trim_json: bool,
 ) -> Response {
     let timeout_ms = long_poll_timeout_ms(query);
     let read = state.runtime.wait_read_stream(ReadStreamRequest {
@@ -4221,6 +4293,14 @@ pub(crate) async fn long_poll_stream(
         max_records,
         leader_only: false,
     });
+    let read = async {
+        match read.await {
+            Ok(response) if trim_json => {
+                end_capped_json_read_at_record_boundary(&state, &stream_id, response, false).await
+            }
+            other => other,
+        }
+    };
     match http_time::timeout(Duration::from_millis(timeout_ms), read).await {
         Ok(Ok(response)) if response.payload.is_empty() && response.up_to_date => {
             long_poll_no_content_response(&response, query.get("cursor").map(String::as_str))

@@ -8971,3 +8971,136 @@ async fn duplicate_beyond_receipt_window_answers_204_without_ranges() {
         tail_offset
     );
 }
+
+/// bounded-stream-state F11: ordinary reads are capped at 8 MiB, like
+/// bootstrap. An offset read of a byte stream ends at the cap; a JSON offset
+/// read without `max_bytes` ends at the last record boundary within it; a
+/// record read ends at a record; a capped response is partial and the
+/// continuation from `Stream-Next-Offset` returns the rest.
+#[tokio::test]
+async fn reads_are_capped_at_the_server_response_limit() {
+    const CAP: usize = 8 * 1024 * 1024;
+    let app = test_router();
+
+    // Byte stream: 9 MiB in one append.
+    let response = http_put(
+        &app,
+        "/benchcmp/capped-bytes",
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let payload = vec![b'x'; CAP + 1024 * 1024];
+    let response = http_post(
+        &app,
+        "/benchcmp/capped-bytes",
+        &[(CONTENT_TYPE.as_str(), "application/octet-stream")],
+        Body::from(payload.clone()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = http_get(&app, "/benchcmp/capped-bytes?offset=-1").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        format!("{CAP:020}")
+    );
+    assert_eq!(body_bytes(response).await.len(), CAP);
+    // A larger client max_bytes is clamped to the cap.
+    let response = http_get(&app, "/benchcmp/capped-bytes?offset=-1&max_bytes=99999999").await;
+    assert_eq!(body_bytes(response).await.len(), CAP);
+    let response = http_get(&app, &format!("/benchcmp/capped-bytes?offset={CAP:020}")).await;
+    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(body_bytes(response).await.len(), payload.len() - CAP);
+
+    // JSON stream: 10,000 records of about 1 KiB (just over 9.5 MiB).
+    let response = http_put(
+        &app,
+        "/benchcmp/capped-json",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let value = "v".repeat(1_000);
+    let records = (0..10_000)
+        .map(|index| format!(r#"{{"i":{index},"v":"{value}"}}"#))
+        .collect::<Vec<_>>();
+    let response = http_post(
+        &app,
+        "/benchcmp/capped-json",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(format!("[{}]", records.join(","))),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let mut offset = "-1".to_owned();
+    let mut seen = Vec::new();
+    loop {
+        let response = http_get(&app, &format!("/benchcmp/capped-json?offset={offset}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let up_to_date = response.headers().get(HEADER_STREAM_UP_TO_DATE).is_some();
+        offset = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+        let body = body_bytes(response).await;
+        assert!(body.len() <= CAP);
+        assert!(body.ends_with(b"\n"), "capped JSON reads end at a record");
+        seen.extend_from_slice(&body);
+        if up_to_date {
+            break;
+        }
+    }
+    let expected = records
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>();
+    assert_eq!(seen, expected.as_bytes());
+
+    // Record read without max_records stops at a record within the cap.
+    let response = http_get(&app, "/benchcmp/capped-json?record=0").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
+    let next_record = header_str(&response, HEADER_STREAM_RECORD_NEXT)
+        .parse::<u64>()
+        .unwrap();
+    assert!(next_record > 0 && next_record < 10_000);
+    let body = body_bytes(response).await;
+    assert!(body.len() <= CAP && body.ends_with(b"\n"));
+}
+
+/// F11: a single JSON record larger than the read cap is returned whole.
+#[tokio::test]
+async fn a_json_record_larger_than_the_read_cap_is_returned_whole() {
+    const CAP: usize = 8 * 1024 * 1024;
+    let app = test_router();
+    let response = http_put(
+        &app,
+        "/benchcmp/capped-big-record",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let big = format!(r#"{{"v":"{}"}}"#, "b".repeat(CAP + 4096));
+    for body in [big.clone(), r#"{"v":"small"}"#.to_owned()] {
+        let response = http_post(
+            &app,
+            "/benchcmp/capped-big-record",
+            &[(CONTENT_TYPE.as_str(), "application/json")],
+            Body::from(body),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    let response = http_get(&app, "/benchcmp/capped-big-record?offset=-1").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get(HEADER_STREAM_UP_TO_DATE).is_none());
+    let next = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+    let body = body_bytes(response).await;
+    assert_eq!(body, format!("{big}\n").as_bytes());
+    assert_eq!(next, format!("{:020}", big.len() + 1));
+    let response = http_get(&app, &format!("/benchcmp/capped-big-record?offset={next}")).await;
+    assert_eq!(header_str(&response, HEADER_STREAM_UP_TO_DATE), "true");
+    assert_eq!(body_bytes(response).await, "{\"v\":\"small\"}\n".as_bytes());
+}
