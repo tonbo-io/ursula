@@ -55,6 +55,8 @@ serviceAccount:
     eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-s3
 ```
 
+With cold storage enabled the chart also turns on cold-chunk compaction and lets Ursula pick S3 for Raft snapshots (`snapshotStore.backend: auto`). Set `coldStorage.compaction.enabled=false` or `snapshotStore.backend=inline` to opt out.
+
 For MinIO or another S3-compatible backend, set `s3.endpoint`. Prefer workload identity over static S3 credentials. To use a registry mirror, set `global.image.repository`, `global.image.tag`, and optionally `global.imagePullSecrets`.
 
 `server.replicaCount` controls the voter set for a **fresh** cluster and supports `1`, `3`, and `5`. Production should use `3`, or `5` only when tolerating two simultaneous voter failures justifies the larger write quorum. Changing it on an initialized cluster is not safe Raft voter reconfiguration. Safe scaling needs the future operator workflow.
@@ -103,40 +105,37 @@ Register streams dynamically with `PUT /v1/indexes/{id}` on the internal indexer
 
 ## Optional: keyed-state indexer
 
-[Keyed streams](/docs/concepts/keyed-streams) serve their key-value state through `{stream}/keyed-state`, which the stream's leader proxies to an `ursula indexer` running in keyed mode. Without one, keyed streams still accept writes, and `keyed-state` answers `404`. The Helm chart does not deploy the keyed indexer yet; run it as its own Deployment or process next to the cluster.
+[Keyed streams](/docs/concepts/keyed-streams) serve their key-value state through `{stream}/keyed-state`, which the stream's leader proxies to an `ursula indexer` running in keyed mode. Without one, keyed streams still accept writes, and `keyed-state` answers `404`. The chart deploys it next to the cluster:
 
-1. Raise the feature level, once every node runs a release that supports level 1, so keyed streams can be created:
+```yaml
+coldStorage:
+  enabled: true      # required: projections live under the nodes' cold root
 
-   ```bash
-   ursulactl cluster enable-feature --config cluster.json --level 1
-   ```
+keyedIndexer:
+  enabled: true
+  replicaCount: 2
+```
 
-2. Run the indexer against the nodes' cold-store bucket and root, reading records from a node Service:
+This renders:
 
-   ```bash
-   ursula indexer \
-     --keyed-source-url http://ursula:4437 \
-     --s3-bucket my-ursula-bucket --keyed-s3-root ursula-prod \
-     --s3-region us-east-1 \
-     --cache-dir /var/cache/ursula-keyed \
-     --listen 0.0.0.0:4493
-   ```
+- a `ursula-keyed-indexer` StatefulSet running `ursula indexer --keyed-source-url http://ursula:4437 --s3-bucket <s3.bucket> --keyed-s3-root <s3.prefix>/<coldStorage.prefix>`. Its only volume is an `emptyDir` cache; the object store is the source of truth, so pods start and roll in parallel.
+- a ClusterIP Service `ursula-keyed-indexer`, which every node gets as `server.keyed_state_upstream`.
+- a headless Service `ursula-keyed-indexer-headless`. The address of each pod goes into the nodes' `keyed_state.indexer_urls`, so [bucket purge](/docs/operations#tenant-offboarding-bucket-purge) drains every pod before it erases projections.
+- a PodDisruptionBudget and a NetworkPolicy that admits only the release namespace. Keep the listener internal; it trusts the node to have authorized the request.
 
-   The indexer reads records over HTTP, so its object-store identity needs only read, write, list and delete on `{root}/.keyed/`. Its local disk is only a cache. `/readyz` reports readiness.
+The indexer runs as the server ServiceAccount by default, because it writes under the same cold root. For a narrower identity, set `keyedIndexer.serviceAccount.create=true` with its own workload-identity annotation; it needs read, write, list and delete on `{cold root}/.keyed/` only.
 
-3. Point every node at it and list every indexer pod for bucket purge:
+Then raise the feature level so keyed streams can be created, once every node runs a release that supports level 1:
 
-   ```toml
-   [server]
-   keyed_state_upstream = "http://ursula-keyed-indexer:4493"
+```bash
+ursulactl cluster enable-feature --config cluster.json --level 1
+```
 
-   [keyed_state]
-   indexer_urls = ["http://ursula-keyed-indexer-0.ursula-keyed-indexer:4493"]
-   ```
+Enabling the indexer changes the generated node config, so the upgrade rolls the voters. Use the chart's OnDelete graceful rollout or the usual drain procedure. Afterwards `HEAD` on a keyed stream advertises `keyed-state-v1`.
 
-   Roll the nodes with the usual drain procedure. Afterwards `HEAD` on a keyed stream advertises `keyed-state-v1`.
+Several indexer pods share one Service: they coordinate through compare-and-swap on object storage, so any pod can serve any stream. To point the nodes at an indexer the chart does not manage, leave `keyedIndexer.enabled=false` and set `keyedState.upstream` (plus `keyedState.indexerUrls` when it has several pods). `keyedIndexer.sourceUrl` reads records through a gateway instead of the node Service. See [Configuration](/docs/configuration#keyed-indexer-flags) for every indexer flag and the [chart README](https://github.com/tonbo-io/ursula/tree/main/charts/ursula#keyed-state-indexer) for every value.
 
-Several indexer pods may sit behind one Service: they coordinate through compare-and-swap on object storage, so any pod can serve any stream. Keep the indexer's listener internal; it trusts the node to have authorized the request. See [Configuration](/docs/configuration#keyed-indexer-flags) for every flag.
+Outside Kubernetes, run the same command by hand and set `[server] keyed_state_upstream` and `[keyed_state] indexer_urls` in every node's config.
 
 Clusters that serve [Pi Durable](/docs/examples/pi-durable) also need per-group admission caps of at least 64 MiB (`standard` or `large` preset) so a 32 MiB commit can be admitted.
 

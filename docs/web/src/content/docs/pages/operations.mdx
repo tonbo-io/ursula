@@ -113,7 +113,10 @@ The per-group gauges under `group_state_gauges` in `/__ursula/metrics` show what
 
 ## Keyed state
 
-Keyed streams need a keyed-state indexer ([Deploy](/docs/deploy-cluster#optional-keyed-state-indexer)). Day-2 notes:
+Keyed streams need a keyed-state indexer. With Helm, set `keyedIndexer.enabled=true` with cold storage enabled ([Deploy](/docs/deploy-cluster#optional-keyed-state-indexer)); the chart wires every node's `keyed_state_upstream` and `keyed_state.indexer_urls` to it. Day-2 notes:
+
+- **Scaling the indexer.** `keyedIndexer.replicaCount` sets both the pod count and the list of pods the nodes drain on purge. Changing it changes the node config, so the upgrade rolls the voters as well; do it through the graceful rollout or drain procedure. Until every node has the new list, a purge may miss a new pod's in-flight work or fail on a removed one, so avoid purges during the change. Retry a purge that reports `keyed_drain_complete=false`.
+- **Rolling the indexer.** Indexer pods hold only a cache, so restarting them is safe at any time. Keyed-state reads may answer `503` while no pod is ready, and readers retry.
 
 - **Requests.** `keyed_state_requests` in `/__ursula/metrics` counts the node's keyed-state responses by status (`status_200`, `status_204`, `status_400`, `status_404`, `status_500`, `status_503`, `status_other`). A rising `status_503` means the indexer is unreachable or rebuilding; `status_500` means a stream's state cannot advance (see below).
 - **Indexer restarts and loss.** The indexer's local disk is a cache and its object-store projections are rebuildable from the log. Restarting or replacing pods only costs latency. Deleting `.keyed/` makes every keyed stream rebuild from record 0 on its next read.

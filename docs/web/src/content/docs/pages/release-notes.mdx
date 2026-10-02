@@ -12,7 +12,7 @@ This release adds [keyed streams](/docs/concepts/keyed-streams) and the [keyed-s
 1. **Roll out as usual, then raise the feature level.** The new release applies replicated commands exactly like the previous one until you raise the cluster's [feature level](/docs/operations#feature-levels). After every voter and learner runs this release, run `ursulactl cluster enable-feature --config cluster.json --level 1`. Keyed streams, the producer receipt window and the other level-1 changes start only then. Levels 2 to 4 (below) are raised the same way; levels 2 and above wait until every group's leader has completed a cold-index page-repair cycle (`enable-feature` checks it).
 2. **No downgrade after the raise.** Once a group is at level 1, a binary that supports only level 0 must not run it; it refuses the group's snapshots. Rolling back to the previous release is possible only before the raise. Raise the level only when you no longer need that rollback.
 3. **JSON text changes take effect per node, without a level.** A node running this release stores JSON messages verbatim (see below) as soon as it serves writes. During the rollout, a write may be stored with the old normalization or the new text depending on which node handled it. Clients that compare stored bytes, such as `Stream-Record-Match` writers that read records back, should finish the rollout before relying on byte equality.
-4. **Keyed state is opt-in.** Nothing changes for existing streams until you create a keyed stream. To serve keyed state, run a keyed-state indexer and set `server.keyed_state_upstream` on every node ([Deploy](/docs/deploy-cluster#optional-keyed-state-indexer)).
+4. **Keyed state is opt-in.** Nothing changes for existing streams until you create a keyed stream. To serve keyed state, run a keyed-state indexer and set `server.keyed_state_upstream` on every node; with Helm, `keyedIndexer.enabled=true` does both ([Deploy](/docs/deploy-cluster#optional-keyed-state-indexer)).
 
 ### Observable changes for JSON streams
 
@@ -59,6 +59,7 @@ Every `application/json` stream now follows [JSON message text](/docs/specs/exte
 - **Reads are capped at 8 MiB.** A larger `max_bytes` is clamped. Without `max_bytes`, a capped JSON offset read ends at a record boundary.
 - **Hot tails are flushed after `storage.cold.flush_max_hot_age`** (default 5 minutes, `0` disables), even when the group is below its flush threshold.
 - **Defaults.** `storage.cold.compaction_enabled` now defaults to `true`, and `storage.snapshot.backend` defaults to `auto` (S3 when the cold backend is S3, inline otherwise). Raft snapshots are taken by log bytes against a node-wide `raft.snapshot_log_budget` (default 1 GiB) with a `raft.snapshot_backstop_logs` entry backstop. Cold admission and the hot backlog count 24 bytes per hot record on top of the payload (8 bytes at level 4).
+- **Helm chart defaults.** The chart now renders `coldStorage.compaction.enabled: true` and `snapshotStore.backend: auto` (previously `false` and `inline`), so releases with cold storage get compaction and S3 snapshots on upgrade. Set the old values to keep the old behaviour. The chart also gains an optional keyed-state indexer (`keyedIndexer.*`) and node keyed-state settings (`keyedState.*`).
 
 ### Fixed
 
