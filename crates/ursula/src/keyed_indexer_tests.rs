@@ -93,7 +93,7 @@ async fn keyed_engine_folds_a_real_node_log() {
         .await
         .expect("feature level");
     assert!(raised.status().is_success(), "{}", raised.status());
-    let stream_url = format!("{base}/kb/aff/s1");
+    let stream_url = format!("{base}/kbkt/aff/s1");
     let created = client
         .put(&stream_url)
         .header("content-type", KEYED_CT)
@@ -102,7 +102,7 @@ async fn keyed_engine_folds_a_real_node_log() {
         .expect("create");
     assert!(created.status().is_success(), "{}", created.status());
     let listing = client
-        .get(format!("{base}/kb/streams?prefix=aff/s1"))
+        .get(format!("{base}/kbkt/streams?prefix=aff/s1"))
         .send()
         .await
         .expect("listing")
@@ -126,7 +126,7 @@ async fn keyed_engine_folds_a_real_node_log() {
         },
     );
     let source = KeyedSource {
-        bucket: "kb".to_owned(),
+        bucket: "kbkt".to_owned(),
         key: "aff/s1".to_owned(),
         incarnation,
     };
@@ -185,7 +185,7 @@ async fn keyed_engine_folds_a_real_node_log() {
     // The incarnation check found the stream: the namespace remains.
     assert!(
         dir.path()
-            .join(".keyed/kb/aff%2Fs1")
+            .join(".keyed/kbkt/aff%2Fs1")
             .join(format!("{incarnation:016x}"))
             .join("v1/CURRENT")
             .exists()
