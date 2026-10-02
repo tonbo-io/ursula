@@ -15,6 +15,12 @@
 //! Readers push a lower bound and an exclusive upper bound down to the page
 //! index of `key`, and decode lazily in small batches, so `after`/`limit`
 //! reads touch only the pages they return.
+//!
+//! A part's footer (Parquet metadata with its page index, the range
+//! tombstones and, for the object-store reader, the verified tail and block
+//! layout) is decoded and verified once and shared by every later read of
+//! the part ([`PartFooter`], [`FooterCache`]), so a point read costs the
+//! same whatever the size of the part or the namespace (design §9.3).
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -34,6 +40,7 @@ use futures_util::FutureExt;
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::arrow_reader::RowSelection;
 use parquet::arrow::async_reader::AsyncFileReader;
@@ -323,13 +330,228 @@ pub fn encode_part(
     Ok(EncodedPart { meta, bytes })
 }
 
+/// A part's decoded footer: its Parquet metadata (with the page index and
+/// the Arrow schema) and its range tombstones. Decoded once per part and
+/// shared by every read of it.
+#[derive(Debug)]
+pub struct PartFooter {
+    metadata: ArrowReaderMetadata,
+    tombstones: Vec<RangeTombstone>,
+}
+
+impl PartFooter {
+    /// Decodes and checks the footer through `reader` (the page index is
+    /// required).
+    pub async fn load(reader: &mut Box<dyn AsyncFileReader>) -> Result<Self, IndexError> {
+        let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
+        let metadata = ArrowReaderMetadata::load_async(reader, options).await?;
+        check_schema(metadata.schema())?;
+        let tombstones = footer_tombstones(metadata.metadata())?;
+        Ok(Self {
+            metadata,
+            tombstones,
+        })
+    }
+
+    /// The part's range tombstones.
+    pub fn tombstones(&self) -> &[RangeTombstone] {
+        &self.tombstones
+    }
+
+    /// Approximate heap footprint, for cache weighting.
+    fn weight(&self) -> usize {
+        self.tombstones
+            .iter()
+            .map(|t| t.start.len().saturating_add(t.end.len()).saturating_add(64))
+            .fold(
+                self.metadata.metadata().memory_size(),
+                usize::saturating_add,
+            )
+    }
+}
+
+/// A part opened for reading: a verified reader and its decoded footer.
+pub struct OpenedPart {
+    /// Reader over the part's bytes.
+    pub reader: Box<dyn AsyncFileReader>,
+    /// The part's footer.
+    pub footer: Arc<PartFooter>,
+}
+
+impl OpenedPart {
+    /// Opens `reader`, decoding its footer.
+    pub async fn load(mut reader: Box<dyn AsyncFileReader>) -> Result<Self, IndexError> {
+        let footer = Arc::new(PartFooter::load(&mut reader).await?);
+        Ok(Self { reader, footer })
+    }
+}
+
 /// Opens part files for readers. Implementations verify what they return.
 pub trait PartOpener: Send + Sync {
-    /// Returns a reader over the part's bytes.
-    fn open<'a>(
-        &'a self,
-        part: &'a KeyedPartMeta,
-    ) -> BoxFuture<'a, Result<Box<dyn AsyncFileReader>, IndexError>>;
+    /// Returns a reader over the part's bytes and its decoded footer.
+    fn open<'a>(&'a self, part: &'a KeyedPartMeta)
+    -> BoxFuture<'a, Result<OpenedPart, IndexError>>;
+}
+
+/// Default capacity of a [`FooterCache`] made by an opener on its own.
+pub const DEFAULT_FOOTER_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// A verified, decoded part tail as cached by the object-store reader.
+#[derive(Debug)]
+pub struct CachedTail {
+    tail_hash: String,
+    tail: Bytes,
+    layout: Arc<PartLayout>,
+    footer: Arc<PartFooter>,
+}
+
+impl CachedTail {
+    fn weight(&self) -> usize {
+        self.tail
+            .len()
+            .saturating_add(self.footer.weight())
+            .saturating_add(self.layout.units.len().saturating_mul(96))
+    }
+}
+
+/// Decoded part footers by object key, bounded by approximate bytes
+/// (oldest inserted evicted first). Parts are immutable and
+/// content-addressed, so an entry never goes stale; the manifest's tail
+/// digest is still compared on every hit. One cache is shared by every
+/// namespace of a pod. Deterministic (no hashing seeds, no clocks), so it
+/// keeps simulation runs reproducible.
+#[derive(Clone)]
+pub struct FooterCache {
+    capacity: usize,
+    state: Arc<std::sync::Mutex<FooterCacheState>>,
+}
+
+#[derive(Default)]
+struct FooterCacheState {
+    entries: std::collections::BTreeMap<String, (Arc<CachedTail>, usize)>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+
+impl std::fmt::Debug for FooterCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FooterCache")
+            .field("capacity", &self.capacity)
+            .field("bytes", &self.lock().bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FooterCache {
+    /// A cache holding about `capacity_bytes` of footers.
+    pub fn new(capacity_bytes: usize) -> Self {
+        Self {
+            capacity: capacity_bytes,
+            state: Arc::new(std::sync::Mutex::new(FooterCacheState::default())),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, FooterCacheState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn get(&self, object_key: &str, tail_hash: &str) -> Option<Arc<CachedTail>> {
+        self.lock()
+            .entries
+            .get(object_key)
+            .map(|(tail, _weight)| Arc::clone(tail))
+            .filter(|tail| tail.tail_hash == tail_hash)
+    }
+
+    fn insert(&self, object_key: String, tail: Arc<CachedTail>) {
+        let weight = object_key.len().saturating_add(tail.weight());
+        if weight > self.capacity {
+            return;
+        }
+        let mut state = self.lock();
+        if let Some((_old, old_weight)) = state.entries.remove(&object_key) {
+            state.bytes = state.bytes.saturating_sub(old_weight);
+            state.order.retain(|key| *key != object_key);
+        }
+        state.bytes = state.bytes.saturating_add(weight);
+        state.order.push_back(object_key.clone());
+        state.entries.insert(object_key, (tail, weight));
+        while state.bytes > self.capacity {
+            let Some(oldest) = state.order.pop_front() else {
+                break;
+            };
+            if let Some((_evicted, evicted_weight)) = state.entries.remove(&oldest) {
+                state.bytes = state.bytes.saturating_sub(evicted_weight);
+            }
+        }
+    }
+}
+
+/// Checks `bytes` (a whole part) against the manifest's size and tail
+/// digest.
+fn verify_whole_part(key: &str, bytes: &Bytes, part: &KeyedPartMeta) -> Result<(), IndexError> {
+    let start = usize::try_from(part.data_bytes).map_err(|_error| invalid("part is too large"))?;
+    let tail = bytes
+        .get(start..)
+        .ok_or_else(|| IndexError::PartSizeMismatch {
+            file: key.to_owned(),
+            expected: part.bytes,
+            actual: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        })?;
+    if u64::try_from(bytes.len()).ok() != Some(part.bytes) || digest(tail) != part.tail_hash {
+        return Err(IndexError::ObjectHashMismatch(key.to_owned()));
+    }
+    Ok(())
+}
+
+/// A whole part held in memory with its footer decoded on first use (the
+/// write cache and [`MemoryParts`]).
+#[derive(Debug)]
+pub(crate) struct ResidentPart {
+    bytes: Bytes,
+    /// Set once the bytes were verified against a manifest entry and the
+    /// footer decoded; keyed by the tail digest it was verified against.
+    footer: std::sync::OnceLock<(String, Arc<PartFooter>)>,
+}
+
+impl ResidentPart {
+    pub(crate) fn new(bytes: Bytes) -> Self {
+        Self {
+            bytes,
+            footer: std::sync::OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Opens the part for `part`, verifying and decoding only on first use.
+    pub(crate) async fn open(
+        &self,
+        key: &str,
+        part: &KeyedPartMeta,
+    ) -> Result<OpenedPart, IndexError> {
+        let reader = Box::new(BytesReader(Bytes::clone(&self.bytes))) as Box<dyn AsyncFileReader>;
+        if let Some((tail_hash, footer)) = self.footer.get()
+            && *tail_hash == part.tail_hash
+            && u64::try_from(self.bytes.len()).ok() == Some(part.bytes)
+        {
+            return Ok(OpenedPart {
+                reader,
+                footer: Arc::clone(footer),
+            });
+        }
+        verify_whole_part(key, &self.bytes, part)?;
+        let opened = OpenedPart::load(reader).await?;
+        let _first = self
+            .footer
+            .set((part.tail_hash.clone(), Arc::clone(&opened.footer)));
+        Ok(opened)
+    }
 }
 
 /// An in-memory part source: parts freshly written (a cache filled on
@@ -337,7 +559,7 @@ pub trait PartOpener: Send + Sync {
 /// and tail digest.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryParts {
-    parts: HashMap<String, Bytes>,
+    parts: HashMap<String, Arc<ResidentPart>>,
 }
 
 impl MemoryParts {
@@ -348,8 +570,10 @@ impl MemoryParts {
 
     /// Adds a part.
     pub fn insert(&mut self, part: &EncodedPart) {
-        self.parts
-            .insert(part.meta.key.clone(), Bytes::clone(&part.bytes));
+        self.parts.insert(
+            part.meta.key.clone(),
+            Arc::new(ResidentPart::new(Bytes::clone(&part.bytes))),
+        );
     }
 
     /// Removes a part.
@@ -372,26 +596,13 @@ impl PartOpener for MemoryParts {
     fn open<'a>(
         &'a self,
         part: &'a KeyedPartMeta,
-    ) -> BoxFuture<'a, Result<Box<dyn AsyncFileReader>, IndexError>> {
+    ) -> BoxFuture<'a, Result<OpenedPart, IndexError>> {
         async move {
-            let bytes = self
+            let resident = self
                 .parts
                 .get(&part.key)
                 .ok_or_else(|| IndexError::MissingObject(part.key.clone()))?;
-            let start =
-                usize::try_from(part.data_bytes).map_err(|_error| invalid("part is too large"))?;
-            let tail = bytes
-                .get(start..)
-                .ok_or_else(|| IndexError::PartSizeMismatch {
-                    file: part.key.clone(),
-                    expected: part.bytes,
-                    actual: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-                })?;
-            if u64::try_from(bytes.len()).ok() != Some(part.bytes) || digest(tail) != part.tail_hash
-            {
-                return Err(IndexError::ObjectHashMismatch(part.key.clone()));
-            }
-            Ok(Box::new(BytesReader(Bytes::clone(bytes))) as Box<dyn AsyncFileReader>)
+            resident.open(&part.key, part).await
         }
         .boxed()
     }
@@ -405,6 +616,7 @@ pub struct StorePartOpener {
     store: ObjectStore,
     prefix: String,
     ranges: Option<VerifiedRangeCache>,
+    footers: FooterCache,
 }
 
 impl StorePartOpener {
@@ -414,7 +626,15 @@ impl StorePartOpener {
             store,
             prefix: prefix.into(),
             ranges: None,
+            footers: FooterCache::new(DEFAULT_FOOTER_CACHE_BYTES),
         }
+    }
+
+    /// Keeps decoded footers in `footers` (shared across namespaces).
+    #[must_use]
+    pub fn with_footer_cache(mut self, footers: FooterCache) -> Self {
+        self.footers = footers;
+        self
     }
 
     /// Serves blocks through a serving cache's verified range cache.
@@ -424,56 +644,96 @@ impl StorePartOpener {
     }
 }
 
+impl StorePartOpener {
+    /// A verified reader over the part, given its verified tail and layout.
+    fn reader(&self, tail: &CachedTail) -> Box<dyn AsyncFileReader> {
+        match &self.ranges {
+            Some(ranges) => Box::new(VerifiedParquetReader::new(
+                self.store.clone(),
+                ranges.clone(),
+                Arc::clone(&tail.layout),
+            )),
+            None => Box::new(UncachedVerifiedReader {
+                store: self.store.clone(),
+                layout: Arc::clone(&tail.layout),
+                tail_start: tail.layout.units.last().map_or(0, |unit| unit.start),
+                tail: Bytes::clone(&tail.tail),
+            }),
+        }
+    }
+
+    /// Fetches and verifies the tail of `part`, then decodes its layout and
+    /// footer.
+    async fn load_tail(
+        &self,
+        object_key: &str,
+        part: &KeyedPartMeta,
+    ) -> Result<CachedTail, IndexError> {
+        let tail = self
+            .store
+            .get_range(object_key, part.data_bytes..part.bytes)
+            .await?
+            .ok_or_else(|| IndexError::MissingObject(object_key.to_owned()))?;
+        if digest(&tail) != part.tail_hash {
+            return Err(IndexError::ObjectHashMismatch(object_key.to_owned()));
+        }
+        let layout = footer_layout(&tail, part)
+            .map_err(|_error| IndexError::InvalidPartLayout(object_key.to_owned()))?;
+        let mut units: Vec<PartUnit> = layout
+            .units
+            .into_iter()
+            .map(|(start, end, hash)| PartUnit { start, end, hash })
+            .collect();
+        units.push(PartUnit {
+            start: part.data_bytes,
+            end: part.bytes,
+            hash: part.tail_hash.clone(),
+        });
+        let layout = Arc::new(PartLayout {
+            version: 1,
+            part_key: object_key.to_owned(),
+            bytes: part.bytes,
+            units,
+        });
+        let tail = Bytes::from(tail);
+        let mut reader: Box<dyn AsyncFileReader> = Box::new(UncachedVerifiedReader {
+            store: self.store.clone(),
+            layout: Arc::clone(&layout),
+            tail_start: part.data_bytes,
+            tail: Bytes::clone(&tail),
+        });
+        let footer = Arc::new(PartFooter::load(&mut reader).await?);
+        Ok(CachedTail {
+            tail_hash: part.tail_hash.clone(),
+            tail,
+            layout,
+            footer,
+        })
+    }
+}
+
 impl PartOpener for StorePartOpener {
     fn open<'a>(
         &'a self,
         part: &'a KeyedPartMeta,
-    ) -> BoxFuture<'a, Result<Box<dyn AsyncFileReader>, IndexError>> {
+    ) -> BoxFuture<'a, Result<OpenedPart, IndexError>> {
         async move {
             let object_key = format!("{}{}", self.prefix, part.key);
             if part.data_bytes >= part.bytes {
                 return Err(IndexError::InvalidPartLayout(object_key));
             }
-            let tail = self
-                .store
-                .get_range(&object_key, part.data_bytes..part.bytes)
-                .await?
-                .ok_or_else(|| IndexError::MissingObject(object_key.clone()))?;
-            if digest(&tail) != part.tail_hash {
-                return Err(IndexError::ObjectHashMismatch(object_key));
-            }
-            let layout = footer_layout(&tail, part)
-                .map_err(|_error| IndexError::InvalidPartLayout(object_key.clone()))?;
-            let mut units: Vec<PartUnit> = layout
-                .units
-                .into_iter()
-                .map(|(start, end, hash)| PartUnit { start, end, hash })
-                .collect();
-            units.push(PartUnit {
-                start: part.data_bytes,
-                end: part.bytes,
-                hash: part.tail_hash.clone(),
-            });
-            let layout = Arc::new(PartLayout {
-                version: 1,
-                part_key: object_key,
-                bytes: part.bytes,
-                units,
-            });
-            let reader: Box<dyn AsyncFileReader> = match &self.ranges {
-                Some(ranges) => Box::new(VerifiedParquetReader::new(
-                    self.store.clone(),
-                    ranges.clone(),
-                    layout,
-                )),
-                None => Box::new(UncachedVerifiedReader {
-                    store: self.store.clone(),
-                    layout,
-                    tail_start: part.data_bytes,
-                    tail: Bytes::from(tail),
-                }),
+            let tail = match self.footers.get(&object_key, &part.tail_hash) {
+                Some(tail) if tail.layout.bytes == part.bytes => tail,
+                _ => {
+                    let tail = Arc::new(self.load_tail(&object_key, part).await?);
+                    self.footers.insert(object_key, Arc::clone(&tail));
+                    tail
+                }
             };
-            Ok(reader)
+            Ok(OpenedPart {
+                reader: self.reader(&tail),
+                footer: Arc::clone(&tail.footer),
+            })
         }
         .boxed()
     }
@@ -633,7 +893,7 @@ impl UncachedVerifiedReader {
         if range.start > range.end || range.end > self.layout.bytes {
             return Err(IndexError::InvalidPartLayout(key.clone()));
         }
-        let mut out = Vec::new();
+        let mut pieces: Vec<Bytes> = Vec::new();
         for unit in self
             .layout
             .units
@@ -657,13 +917,12 @@ impl UncachedVerifiedReader {
                 .map_err(|_error| IndexError::InvalidPartLayout(key.clone()))?;
             let to = usize::try_from(range.end.min(unit.end).saturating_sub(unit.start))
                 .map_err(|_error| IndexError::InvalidPartLayout(key.clone()))?;
-            out.extend_from_slice(
-                bytes
-                    .get(from..to)
-                    .ok_or_else(|| IndexError::InvalidPartLayout(key.clone()))?,
-            );
+            if from > to || to > bytes.len() {
+                return Err(IndexError::InvalidPartLayout(key.clone()));
+            }
+            pieces.push(bytes.slice(from..to));
         }
-        Ok(Bytes::from(out))
+        Ok(join_pieces(pieces))
     }
 }
 
@@ -689,6 +948,19 @@ impl AsyncFileReader for UncachedVerifiedReader {
     }
 }
 
+/// Concatenates verified block slices; one slice (the common case of a
+/// page within one block) is returned without copying.
+pub(crate) fn join_pieces(mut pieces: Vec<Bytes>) -> Bytes {
+    if pieces.len() == 1 {
+        return pieces.pop().unwrap_or_default();
+    }
+    let mut out = Vec::with_capacity(pieces.iter().map(Bytes::len).sum());
+    for piece in &pieces {
+        out.extend_from_slice(piece);
+    }
+    Bytes::from(out)
+}
+
 /// A lazily decoded scan of one part's rows within `[from, end)`.
 pub struct PartScan {
     stream: Option<ParquetRecordBatchStream<Box<dyn AsyncFileReader>>>,
@@ -702,18 +974,16 @@ pub struct PartScan {
 /// and the part's range tombstones. Pages of `key` entirely below `from` or
 /// at or above `end` are skipped through the page index.
 pub async fn open_part(
-    reader: Box<dyn AsyncFileReader>,
+    opened: OpenedPart,
     from: Option<&[u8]>,
     end: Option<&[u8]>,
     options: &PartOptions,
 ) -> Result<(PartScan, Vec<RangeTombstone>), IndexError> {
-    let reader_options =
-        ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Required);
-    let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, reader_options).await?;
-    check_schema(builder.schema())?;
-    let metadata = Arc::clone(builder.metadata());
-    let tombstones = footer_tombstones(&metadata)?;
-    let selection = select_pages(&metadata, from, end)?;
+    let OpenedPart { reader, footer } = opened;
+    let builder =
+        ParquetRecordBatchStreamBuilder::new_with_metadata(reader, footer.metadata.clone());
+    let tombstones = footer.tombstones.clone();
+    let selection = select_pages(footer.metadata.metadata(), from, end)?;
     let empty = !selection.selects_any();
     let stream = if empty {
         None
@@ -902,10 +1172,10 @@ fn column<'b, T: 'static>(
 /// Reads a whole part: its rows and tombstones (verification, tests,
 /// compaction of small inputs).
 pub async fn read_part(
-    reader: Box<dyn AsyncFileReader>,
+    opened: OpenedPart,
     options: &PartOptions,
 ) -> Result<(Vec<KeyedEntry>, Vec<RangeTombstone>), IndexError> {
-    let (mut scan, tombstones) = open_part(reader, None, None, options).await?;
+    let (mut scan, tombstones) = open_part(opened, None, None, options).await?;
     let mut rows = Vec::new();
     while let Some(entry) = scan.next().await? {
         rows.push(entry);
@@ -986,7 +1256,9 @@ mod tests {
             "key range covers tombstone ends"
         );
         let (rows, tombs) = read_part(
-            Box::new(BytesReader(part.bytes.clone())),
+            OpenedPart::load(Box::new(BytesReader(part.bytes.clone())))
+                .await
+                .unwrap(),
             &PartOptions::default(),
         )
         .await
@@ -1009,7 +1281,9 @@ mod tests {
             (vec![0], vec![1])
         );
         let (rows, tombs) = read_part(
-            Box::new(BytesReader(part.bytes.clone())),
+            OpenedPart::load(Box::new(BytesReader(part.bytes.clone())))
+                .await
+                .unwrap(),
             &PartOptions::default(),
         )
         .await
@@ -1030,7 +1304,8 @@ mod tests {
             fetched: Arc::clone(&fetched),
         };
         let from = 19_990_u32.to_be_bytes();
-        let (mut scan, _) = open_part(Box::new(reader), Some(&from), None, &options)
+        let opened = OpenedPart::load(Box::new(reader)).await.unwrap();
+        let (mut scan, _) = open_part(opened, Some(&from), None, &options)
             .await
             .unwrap();
         let mut keys = Vec::new();
@@ -1082,6 +1357,57 @@ mod tests {
         std::fs::write(path, &corrupt).unwrap();
         let reader = opener.open(&part.meta).await.unwrap();
         read_part(reader, &options).await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn store_opener_decodes_a_footer_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = crate::FsObjectStore::new(dir.path()).unwrap();
+        let store = ObjectStore::from(fs.clone());
+        let options = PartOptions {
+            layout_block_bytes: 1024,
+            ..PartOptions::default()
+        };
+        let part = encode_part(&many(5_000), &[], &options).unwrap();
+        store
+            .put_if_absent(&format!("ns/{}", part.meta.key), &part.bytes)
+            .await
+            .unwrap();
+        let footers = FooterCache::new(DEFAULT_FOOTER_CACHE_BYTES);
+        let opener = StorePartOpener::new(store.clone(), "ns/").with_footer_cache(footers.clone());
+        let first = opener.open(&part.meta).await.unwrap();
+        let tail_reads = fs.range_read_count();
+        let tail_bytes = fs.range_read_bytes();
+        // Later opens, also through another opener sharing the cache, fetch
+        // no tail: only the data blocks a scan touches.
+        let other = StorePartOpener::new(store, "ns/").with_footer_cache(footers);
+        for opener in [&opener, &other] {
+            let opened = opener.open(&part.meta).await.unwrap();
+            assert!(Arc::ptr_eq(&opened.footer, &first.footer));
+        }
+        assert_eq!(fs.range_read_count(), tail_reads);
+        let key = 4_321_u32.to_be_bytes();
+        let mut end = key.to_vec();
+        end.push(0);
+        let (mut scan, _) = open_part(first, Some(&key), Some(&end), &options)
+            .await
+            .unwrap();
+        assert_eq!(scan.next().await.unwrap().unwrap().key, key.to_vec());
+        assert!(scan.next().await.unwrap().is_none());
+        let read = fs.range_read_bytes() - tail_bytes;
+        assert!(
+            read * 8 < part.meta.data_bytes,
+            "a point read fetched {read} of {} data bytes",
+            part.meta.data_bytes
+        );
+
+        // A manifest entry pinning another tail misses the cache.
+        let mut wrong = part.meta.clone();
+        wrong.tail_hash = digest(b"other");
+        assert!(matches!(
+            opener.open(&wrong).await,
+            Err(IndexError::ObjectHashMismatch(_))
+        ));
     }
 
     #[tokio::test]

@@ -9,10 +9,14 @@
 //!   rate-limited and parallel by record range, and swaps the result in
 //!   blue/green: the old manifest keeps being served until the rebuilt one,
 //!   caught up to at least the old `D`, replaces it with one CAS of
-//!   `CURRENT`. Served `D` never decreases.
+//!   `CURRENT`. Served `D` never decreases. At another projection format
+//!   (`v{fmt}/`, a new namespace next to the served one) it builds the
+//!   namespace from record 0 up to the source's tail and publishes its
+//!   first `CURRENT`, so a pod at that format starts warm.
 //! - [`sweep`]: one LIST of the namespace; deletes part and manifest objects
 //!   older than the GC grace that no manifest a reader may still hold
-//!   references (crash orphans, §9.4).
+//!   references (crash orphans, §9.4). The rule is
+//!   [`KeyedNamespace::sweep`], shared with the engine.
 //! - [`dump`]: the published pointer and manifest, optionally every row.
 
 use std::collections::HashSet;
@@ -20,7 +24,6 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
-use std::time::SystemTime;
 
 use anyhow::Context;
 use anyhow::bail;
@@ -31,15 +34,17 @@ use tokio::time::Instant;
 use super::engine::stored_digest;
 use super::fold::Lower;
 use super::fold::RangeQuery;
-use super::manifest::KEYED_CURRENT_KEY;
+use super::manifest::DEFAULT_GC_GRACE;
 use super::manifest::KEYED_MANIFEST_VERSION;
 use super::manifest::KEYED_PROJECTION_FORMAT;
 use super::manifest::KeyedManifest;
 use super::manifest::KeyedNamespace;
 use super::manifest::KeyedRunMeta;
 use super::manifest::KeyedSource;
+use super::manifest::ObjectWrite;
 use super::manifest::PublishOutcome;
 use super::manifest::PublishedKeyedManifest;
+pub use super::manifest::SweepReport;
 use super::merge::KeyedRow;
 use super::merge::read_range;
 use super::part::MemoryParts;
@@ -403,6 +408,12 @@ pub struct RebuildOptions {
     pub max_attempts: usize,
     /// Source reads.
     pub read: SourceReadOptions,
+    /// Projection format of the namespace rebuilt (`v{fmt}/`).
+    pub projection_format: u32,
+    /// The GC grace of the namespace's deleters: parts found already
+    /// present are settled for it before they are published
+    /// ([`KeyedNamespace::settle`]).
+    pub gc_grace: Duration,
 }
 
 impl Default for RebuildOptions {
@@ -411,6 +422,8 @@ impl Default for RebuildOptions {
             parallelism: 4,
             max_attempts: 8,
             read: SourceReadOptions::default(),
+            projection_format: KEYED_PROJECTION_FORMAT,
+            gc_grace: DEFAULT_GC_GRACE,
         }
     }
 }
@@ -461,19 +474,24 @@ pub async fn rebuild(
     if !(1..=MAX_REBUILD_PARALLELISM).contains(&options.parallelism) {
         bail!("parallelism must be in 1..={MAX_REBUILD_PARALLELISM}");
     }
-    let namespace = KeyedNamespace::new(store, source.clone());
-    let mut base = namespace
-        .load()
-        .await
-        .context("load CURRENT")?
-        .context("the namespace has no published state; a keyed-state read builds it")?;
-    let target = base.manifest.through_record;
+    let namespace = KeyedNamespace::with_format(store, source.clone(), options.projection_format)
+        .with_grace(options.gc_grace);
+    let mut reused = Vec::new();
+    let mut base = namespace.load().await.context("load CURRENT")?;
+    let target = match &base {
+        Some(base) => base.manifest.through_record,
+        None if options.projection_format != KEYED_PROJECTION_FORMAT => client
+            .tail(&source.bucket, &source.key)
+            .await
+            .context("read the source tail")?,
+        None => bail!("the namespace has no published state; a keyed-state read builds it"),
+    };
     if target == 0 {
         bail!("the namespace is at D = 0; there is nothing to rebuild");
     }
     let mut report = RebuildReport {
-        previous_through: target,
-        previous_generation: base.manifest.generation,
+        previous_through: base.as_ref().map_or(0, |base| base.manifest.through_record),
+        previous_generation: base.as_ref().map_or(0, |base| base.manifest.generation),
         ..RebuildReport::default()
     };
     let limiter = Arc::new(RateLimiter::new(options.read.max_bytes_per_second));
@@ -497,21 +515,36 @@ pub async fn rebuild(
         let folded = task.await.context("join range fold")??;
         report.source_bytes = report.source_bytes.saturating_add(folded.bytes);
         digest = folded.last_digest.or(digest);
-        if let Some(run) = store_run(&namespace, folded.builder, options, &mut report).await? {
+        if let Some(run) = store_run(
+            &namespace,
+            folded.builder,
+            options,
+            &mut report,
+            &mut reused,
+        )
+        .await?
+        {
             runs.push(run);
         }
     }
     let mut through = target;
     for _ in 0..options.max_attempts {
-        if digest != base.manifest.through_digest {
+        if base
+            .as_ref()
+            .is_some_and(|base| digest != base.manifest.through_digest)
+        {
             bail!(
                 "continuity check failed: source record {} differs from the record the \
                  namespace was built from (the engine rebuilds such a namespace itself)",
                 through.saturating_sub(1)
             );
         }
-        let manifest = replacement(&base, &runs, through, digest.clone())?;
-        match namespace.publish(Some(&base), &manifest).await? {
+        let manifest = replacement(&namespace, base.as_ref(), &runs, through, digest.clone())?;
+        namespace
+            .settle(&std::mem::take(&mut reused), options.gc_grace)
+            .await
+            .context("settle reused parts")?;
+        match namespace.publish(base.as_ref(), &manifest).await? {
             PublishOutcome::Published(published) => {
                 report.through_record = published.manifest.through_record;
                 report.generation = published.manifest.generation;
@@ -523,12 +556,13 @@ pub async fn rebuild(
             }
         }
         // The old namespace moved on meanwhile: catch up to its new D.
-        base = namespace
+        let reloaded = namespace
             .load()
             .await
             .context("reload CURRENT")?
             .context("the namespace disappeared during the rebuild")?;
-        let next = base.manifest.through_record;
+        let next = reloaded.manifest.through_record;
+        base = Some(reloaded);
         if next < through {
             bail!("the namespace went back from D = {through} to D = {next} during the rebuild");
         }
@@ -544,7 +578,15 @@ pub async fn rebuild(
             .await?;
             report.source_bytes = report.source_bytes.saturating_add(folded.bytes);
             digest = folded.last_digest;
-            if let Some(run) = store_run(&namespace, folded.builder, options, &mut report).await? {
+            if let Some(run) = store_run(
+                &namespace,
+                folded.builder,
+                options,
+                &mut report,
+                &mut reused,
+            )
+            .await?
+            {
                 runs.push(run);
             }
             through = next;
@@ -561,35 +603,46 @@ async fn store_run(
     builder: RunBuilder,
     options: &RebuildOptions,
     report: &mut RebuildReport,
+    reused: &mut Vec<(String, bytes::Bytes)>,
 ) -> anyhow::Result<Option<KeyedRunMeta>> {
     let Some(built) = finish(builder, options.read.part_options).await? else {
         return Ok(None);
     };
     for part in &built.parts {
-        namespace.put_part(part).await?;
+        if namespace.put_part(part).await? == ObjectWrite::Refreshed {
+            reused.push((part.meta.key.clone(), bytes::Bytes::clone(&part.bytes)));
+        }
     }
     report.parts = report.parts.saturating_add(built.parts.len());
     Ok((!built.meta.parts.is_empty()).then_some(built.meta))
 }
 
-/// The rebuilt manifest replacing `base`: every old part it does not reuse
-/// and the old manifest become obsolete.
+/// The rebuilt manifest replacing `base` (if any): every old part it does
+/// not reuse and the old manifest become obsolete.
 fn replacement(
-    base: &PublishedKeyedManifest,
+    namespace: &KeyedNamespace,
+    base: Option<&PublishedKeyedManifest>,
     runs: &[KeyedRunMeta],
     through: u64,
     digest: Option<String>,
 ) -> anyhow::Result<KeyedManifest> {
     let mut manifest = KeyedManifest {
         version: KEYED_MANIFEST_VERSION,
-        format: KEYED_PROJECTION_FORMAT,
+        format: namespace.format(),
         generation: 0,
-        source: base.manifest.source.clone(),
+        source: namespace.source().clone(),
         through_record: through,
         through_digest: digest,
         runs: runs.to_vec(),
         published_at_ms: SystemClock.now_ms(),
-        obsoleted: vec![base.manifest_key.clone()],
+        obsoleted: base
+            .map(|base| base.manifest_key.clone())
+            .into_iter()
+            .collect(),
+    };
+    let Some(base) = base else {
+        manifest.validate()?;
+        return Ok(manifest);
     };
     let kept: HashSet<String> = manifest.part_keys().map(str::to_owned).collect();
     manifest.obsoleted.extend(
@@ -602,118 +655,19 @@ fn replacement(
     Ok(manifest)
 }
 
-/// Result of [`sweep`].
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct SweepReport {
-    /// Objects listed.
-    pub listed: usize,
-    /// Objects a manifest that readers may still hold references.
-    pub referenced: usize,
-    /// Unreferenced objects younger than the grace period (kept).
-    pub young: usize,
-    /// Objects deleted (or, in a dry run, that would be).
-    pub deleted: Vec<String>,
-}
-
-/// Generation of a manifest object key, `manifests/{generation:020}-{hash}.json`.
-fn manifest_generation(key: &str) -> Option<u64> {
-    key.strip_prefix("manifests/")?
-        .strip_suffix(".json")?
-        .split_once('-')?
-        .0
-        .parse()
-        .ok()
-}
-
-fn sweepable(key: &str) -> bool {
-    (key.starts_with("parts/") && key.ends_with(".parquet")) || manifest_generation(key).is_some()
-}
-
-/// Deletes the namespace's unreferenced part and manifest objects older
-/// than `grace` at wall-clock time `now` (one LIST, plus a GET of each
-/// manifest readers may hold).
-///
-/// A manifest is protected when a reader may still use it: the published
-/// one; every manifest up to the published generation written within the
-/// grace period; and the newest manifest written before it, which may have
-/// been the published one when the period began. Everything they reference
-/// is kept. `CURRENT`, unknown objects and objects of unknown age are never
-/// deleted.
+/// The orphan sweep of `source`'s namespace at the host's wall clock:
+/// [`KeyedNamespace::sweep`], the one rule shared with the engine.
 pub async fn sweep(
     store: ObjectStore,
     source: &KeyedSource,
     grace: Duration,
-    now: SystemTime,
     dry_run: bool,
 ) -> anyhow::Result<SweepReport> {
-    let namespace = KeyedNamespace::new(store, source.clone());
-    let objects = namespace.objects().await.context("list the namespace")?;
-    let published = namespace.load().await.context("load CURRENT")?;
-    let cutoff = now.checked_sub(grace);
-    let young = |modified: Option<SystemTime>| match (modified, cutoff) {
-        (Some(modified), Some(cutoff)) => modified >= cutoff,
-        _ => true,
-    };
-    let current_generation = published
-        .as_ref()
-        .map_or(0, |published| published.manifest.generation);
-    let mut protected: HashSet<String> = HashSet::new();
-    let mut referenced: HashSet<String> = HashSet::new();
-    if let Some(published) = &published {
-        protected.insert(published.manifest_key.clone());
-        referenced.extend(published.manifest.part_keys().map(str::to_owned));
-        let manifests: Vec<(u64, &str, bool)> = objects
-            .iter()
-            .filter_map(|object| {
-                manifest_generation(&object.key)
-                    .filter(|generation| *generation <= current_generation)
-                    .map(|generation| (generation, object.key.as_str(), young(object.modified)))
-            })
-            .collect();
-        let window_start = manifests
-            .iter()
-            .filter(|(_, _, young)| !young)
-            .map(|(generation, _, _)| *generation)
-            .max();
-        for (generation, key, young) in &manifests {
-            let at_window_start =
-                Some(*generation) == window_start && *generation < current_generation;
-            if *young || at_window_start {
-                protected.insert((*key).to_owned());
-            }
-        }
-        for key in &protected {
-            if *key == published.manifest_key {
-                continue;
-            }
-            if let Some(manifest) = namespace.manifest(key).await? {
-                referenced.extend(manifest.part_keys().map(str::to_owned));
-            }
-        }
-    }
-    referenced.extend(protected);
-    let mut report = SweepReport {
-        listed: objects.len(),
-        ..SweepReport::default()
-    };
-    for object in objects {
-        if object.key == KEYED_CURRENT_KEY || !sweepable(&object.key) {
-            continue;
-        }
-        if referenced.contains(&object.key) {
-            report.referenced = report.referenced.saturating_add(1);
-            continue;
-        }
-        if young(object.modified) {
-            report.young = report.young.saturating_add(1);
-            continue;
-        }
-        if !dry_run {
-            namespace.delete(&object.key).await?;
-        }
-        report.deleted.push(object.key);
-    }
-    Ok(report)
+    KeyedNamespace::new(store, source.clone())
+        .with_grace(grace)
+        .sweep(&SystemClock, grace, dry_run)
+        .await
+        .context("sweep the namespace")
 }
 
 #[derive(Serialize)]
@@ -761,6 +715,8 @@ pub async fn dump(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keyed::manifest::manifest_generation;
+    use crate::keyed::manifest::sweepable;
 
     #[test]
     fn split_covers_the_range_in_order() {

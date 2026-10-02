@@ -19,6 +19,7 @@ use foyer::DeviceBuilder;
 use foyer::FsDeviceBuilder;
 use foyer::HybridCache;
 use foyer::HybridCacheBuilder;
+use foyer::Source;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
@@ -262,7 +263,12 @@ impl VerifiedRangeCache {
             .await
             .map_err(|error| IndexError::ObjectStore(error.to_string()))?;
         let bytes = Bytes::clone(entry.value());
-        if digest(&bytes) != unit.hash {
+        // A fetched block was verified before insertion, and a memory hit
+        // holds bytes verified on their way in; a block read back from disk
+        // is verified again, and evicted when it fails.
+        if entry.source() == Source::Disk && digest(&bytes) != unit.hash {
+            drop(entry);
+            self.cache().await?.remove(&cache_key);
             return Err(IndexError::ObjectHashMismatch(part_key.to_owned()));
         }
         Ok(bytes)
@@ -291,7 +297,7 @@ impl VerifiedParquetReader {
         }
         let capacity = usize::try_from(range.end.saturating_sub(range.start))
             .map_err(|_error| IndexError::InvalidPartLayout(self.layout.part_key.clone()))?;
-        let mut result = Vec::with_capacity(capacity);
+        let mut pieces = Vec::new();
         for unit in self
             .layout
             .units
@@ -306,15 +312,16 @@ impl VerifiedParquetReader {
                 .map_err(|_error| IndexError::InvalidPartLayout(self.layout.part_key.clone()))?;
             let slice_end = usize::try_from(range.end.min(unit.end).saturating_sub(unit.start))
                 .map_err(|_error| IndexError::InvalidPartLayout(self.layout.part_key.clone()))?;
-            let slice = bytes
-                .get(slice_start..slice_end)
-                .ok_or_else(|| IndexError::InvalidPartLayout(self.layout.part_key.clone()))?;
-            result.extend_from_slice(slice);
+            if slice_start > slice_end || slice_end > bytes.len() {
+                return Err(IndexError::InvalidPartLayout(self.layout.part_key.clone()));
+            }
+            pieces.push(bytes.slice(slice_start..slice_end));
         }
+        let result = crate::keyed::part::join_pieces(pieces);
         if result.len() != capacity {
             return Err(IndexError::InvalidPartLayout(self.layout.part_key.clone()));
         }
-        Ok(Bytes::from(result))
+        Ok(result)
     }
 }
 

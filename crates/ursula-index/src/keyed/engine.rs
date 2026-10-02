@@ -66,7 +66,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
-use parquet::arrow::async_reader::AsyncFileReader;
 use tokio::sync::Notify;
 use tokio::sync::watch;
 
@@ -76,8 +75,11 @@ use super::manifest::KeyedManifest;
 use super::manifest::KeyedNamespace;
 use super::manifest::KeyedPartMeta;
 use super::manifest::KeyedSource;
+use super::manifest::ObjectWrite;
 use super::manifest::PublishOutcome;
 use super::manifest::PublishedKeyedManifest;
+use super::manifest::SweepReport;
+use super::manifest::delete_decision_ttl;
 use super::merge::KeyedPage;
 use super::merge::get;
 use super::merge::read_range;
@@ -85,10 +87,12 @@ use super::metrics::KeyedMetrics;
 use super::metrics::KeyedMetricsSnapshot;
 use super::metrics::NamespaceMetrics;
 use super::metrics::bump;
-use super::part::BytesReader;
 use super::part::EncodedPart;
+use super::part::FooterCache;
+use super::part::OpenedPart;
 use super::part::PartOpener;
 use super::part::PartOptions;
+use super::part::ResidentPart;
 use super::part::StorePartOpener;
 use super::run::CompactionPolicy;
 use super::run::RunBuilder;
@@ -103,7 +107,6 @@ use crate::clock::Clock;
 use crate::clock::SystemClock;
 use crate::object_store::ObjectRequestCounters;
 use crate::object_store::ObjectStore;
-use crate::object_store::digest;
 use crate::rt;
 use crate::rt::time::Instant;
 
@@ -137,6 +140,9 @@ pub struct KeyedEngineConfig {
     pub compaction_budget_bytes: u64,
     /// Bytes of freshly written parts kept in memory for reads.
     pub write_cache_bytes: usize,
+    /// Bytes of decoded part footers (metadata, page index, tombstones and
+    /// verified tails) kept in memory, shared by every namespace.
+    pub footer_cache_bytes: usize,
     /// A namespace with no activity for this long is dropped from memory.
     pub idle_namespace: Duration,
     /// How long a drained bucket stays blocked (the purge erases it
@@ -168,6 +174,7 @@ impl Default for KeyedEngineConfig {
             max_ingest_bytes: 256 * 1024 * 1024,
             compaction_budget_bytes: 4 * 1024 * 1024 * 1024,
             write_cache_bytes: 256 * 1024 * 1024,
+            footer_cache_bytes: super::part::DEFAULT_FOOTER_CACHE_BYTES,
             idle_namespace: Duration::from_secs(600),
             drain_hold: Duration::from_secs(600),
             part_options: PartOptions::default(),
@@ -417,7 +424,7 @@ struct WrittenParts {
 
 #[derive(Debug, Default)]
 struct WrittenState {
-    parts: HashMap<String, Bytes>,
+    parts: HashMap<String, Arc<ResidentPart>>,
     order: VecDeque<String>,
     bytes: usize,
 }
@@ -433,7 +440,7 @@ impl WrittenParts {
         }
         state.bytes = state.bytes.saturating_add(bytes.len());
         state.order.push_back(key.clone());
-        state.parts.insert(key, bytes);
+        state.parts.insert(key, Arc::new(ResidentPart::new(bytes)));
         while state.bytes > self.capacity {
             let Some(oldest) = state.order.pop_front() else {
                 break;
@@ -444,13 +451,14 @@ impl WrittenParts {
         }
     }
 
-    fn get(&self, key: &str) -> Option<Bytes> {
+    fn get(&self, key: &str) -> Option<Arc<ResidentPart>> {
         lock(&self.state).parts.get(key).cloned()
     }
 }
 
-/// Reads parts from the write cache when present, else through the verified
-/// object-store reader.
+/// Reads parts from the write cache when present (its footer decoded once
+/// per part), else through the verified object-store reader and the pod's
+/// footer cache.
 #[derive(Clone)]
 struct LayeredOpener {
     prefix: String,
@@ -462,18 +470,11 @@ impl PartOpener for LayeredOpener {
     fn open<'a>(
         &'a self,
         part: &'a KeyedPartMeta,
-    ) -> BoxFuture<'a, Result<Box<dyn AsyncFileReader>, IndexError>> {
+    ) -> BoxFuture<'a, Result<OpenedPart, IndexError>> {
         async move {
             let object_key = format!("{}{}", self.prefix, part.key);
-            if let Some(bytes) = self.written.get(&object_key) {
-                let tail = usize::try_from(part.data_bytes)
-                    .ok()
-                    .and_then(|start| bytes.get(start..));
-                let size_matches = u64::try_from(bytes.len()).ok() == Some(part.bytes);
-                if size_matches && tail.is_some_and(|tail| digest(tail) == part.tail_hash) {
-                    return Ok(Box::new(BytesReader(bytes)) as Box<dyn AsyncFileReader>);
-                }
-                return Err(IndexError::ObjectHashMismatch(object_key));
+            if let Some(resident) = self.written.get(&object_key) {
+                return resident.open(&object_key, part).await;
             }
             self.store.open(part).await
         }
@@ -579,6 +580,8 @@ struct Inner {
     clock: Arc<dyn Clock>,
     cache: Option<EventIndexCache>,
     written: Arc<WrittenParts>,
+    /// Decoded part footers of every namespace of the pod.
+    footers: FooterCache,
     config: KeyedEngineConfig,
     namespaces: Mutex<HashMap<NamespaceId, Arc<Namespace>>>,
     buckets: Mutex<HashMap<String, BucketState>>,
@@ -591,6 +594,9 @@ struct Inner {
     deletions: Notify,
     /// Garbage-collection passes run one at a time.
     gc_pass: tokio::sync::Mutex<()>,
+    /// Objects this process created, and when (pruned after half the
+    /// grace).
+    created: Mutex<HashMap<String, Instant>>,
 }
 
 /// The keyed projection engine of one indexer pod.
@@ -662,6 +668,7 @@ impl KeyedEngine {
                 clock,
                 cache,
                 written,
+                footers: FooterCache::new(config.footer_cache_bytes),
                 config,
                 namespaces: Mutex::new(HashMap::new()),
                 buckets: Mutex::new(HashMap::new()),
@@ -672,6 +679,7 @@ impl KeyedEngine {
                 guards: Arc::new(Mutex::new(KeyGuards::default())),
                 deletions: Notify::new(),
                 gc_pass: tokio::sync::Mutex::new(()),
+                created: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -711,20 +719,29 @@ impl KeyedEngine {
         self.inner.collect_garbage().await
     }
 
-    /// The orphan sweep of `source`'s namespace: deletes unreferenced parts
-    /// and manifests older than the GC grace period (objects a crash left
-    /// behind, or whose queued deletion a crash lost). Returns the number of
-    /// objects deleted.
-    pub async fn sweep(&self, source: &KeyedSource) -> Result<usize, IndexError> {
-        KeyedNamespace::new(self.inner.store.clone(), source.clone())
-            .sweep(self.inner.clock.now_ms(), self.inner.config.gc_grace)
-            .await
+    /// The orphan sweep of `source`'s namespace ([`KeyedNamespace::sweep`],
+    /// the rule shared with `ursula indexer keyed sweep`): deletes parts and
+    /// manifests older than the GC grace period that no manifest a reader
+    /// may still hold references (objects a crash left behind, or whose
+    /// queued deletion a crash lost).
+    pub async fn sweep(&self, source: &KeyedSource) -> Result<SweepReport, IndexError> {
+        let grace = self.inner.config.gc_grace;
+        KeyedNamespace::with_format(
+            self.inner.store.clone(),
+            source.clone(),
+            self.inner.config.projection_format,
+        )
+        .with_grace(grace)
+        .sweep(&*self.inner.clock, grace, false)
+        .await
     }
 
     /// Runs garbage collection every `gc_tick` until `shutdown` turns true.
     pub async fn run_maintenance(&self, mut shutdown: watch::Receiver<bool>) {
         loop {
+            // Biased: a fixed poll order keeps simulation runs reproducible.
             tokio::select! {
+                biased;
                 () = rt::time::sleep(self.inner.config.gc_tick) => {}
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
@@ -780,8 +797,9 @@ impl Inner {
             self.store.clone().counted(Arc::clone(&requests)),
             source.clone(),
             self.config.projection_format,
-        );
-        let mut store = namespace.opener();
+        )
+        .with_grace(self.config.gc_grace);
+        let mut store = namespace.opener().with_footer_cache(self.footers.clone());
         if let Some(cache) = &self.cache {
             store = store.with_cache(cache)?;
         }
@@ -968,7 +986,10 @@ impl Inner {
             if view.through() >= wanted {
                 return self.serve(&namespace, &view, &request.selection).await;
             }
+            // Biased: a publication and the deadline at the same instant
+            // resolve the same way on every run (simulation determinism).
             tokio::select! {
+                biased;
                 changed = receiver.changed() => {
                     if changed.is_err() {
                         return KeyedReadOutcome::Unavailable("keyed namespace closed".to_owned());
@@ -1406,7 +1427,10 @@ impl Inner {
     }
 
     /// Pins and stores `parts`; the pins last until the caller's commit
-    /// has published them or queued them for deletion.
+    /// has published them or queued them for deletion. A part found already
+    /// present that this process did not create recently is settled before
+    /// returning: another pod's GC or a sweep may have decided to delete
+    /// that copy (`manifest` module docs).
     async fn store_parts(
         &self,
         namespace: &Namespace,
@@ -1415,16 +1439,35 @@ impl Inner {
         let pins = self
             .pin(namespace, parts.iter().map(|part| part.meta.key.as_str()))
             .await;
+        let mut reused = Vec::new();
         for part in parts {
-            namespace
+            let object = format!("{}{}", namespace.namespace.prefix(), part.meta.key);
+            let write = namespace
                 .namespace
                 .put_part(part)
                 .await
                 .map_err(transient)?;
-            self.written.insert(
-                format!("{}{}", namespace.namespace.prefix(), part.meta.key),
-                Bytes::clone(&part.bytes),
+            match write {
+                ObjectWrite::Created => {
+                    lock(&self.created).insert(object.clone(), Instant::now());
+                }
+                ObjectWrite::Refreshed if !self.created_recently(&object) => {
+                    reused.push((part.meta.key.clone(), Bytes::clone(&part.bytes)));
+                }
+                ObjectWrite::Refreshed => {}
+            }
+            self.written.insert(object, Bytes::clone(&part.bytes));
+        }
+        if !reused.is_empty() {
+            bump(
+                &self.metrics.reused_settled,
+                u64::try_from(reused.len()).unwrap_or(u64::MAX),
             );
+            namespace
+                .namespace
+                .settle(&reused, self.config.gc_grace)
+                .await
+                .map_err(transient)?;
         }
         Ok(pins)
     }
@@ -1640,21 +1683,15 @@ impl Inner {
         }
         let mut deleted = 0_usize;
         let retry = now.checked_add(self.config.gc_tick).unwrap_or(now);
+        let ttl = delete_decision_ttl(self.config.gc_grace);
+        self.forget_created();
         for (namespace, keys) in by_namespace {
             if self.draining(&namespace.source.bucket) {
                 continue;
             }
-            let started = Instant::now();
-            let referenced: HashSet<String> = match namespace.namespace.load().await {
-                Ok(Some(published)) => {
-                    namespace.mark_checked(started);
-                    let mut referenced: HashSet<String> =
-                        published.manifest.part_keys().map(str::to_owned).collect();
-                    referenced.insert(published.manifest_key.clone());
-                    self.adopt_loaded(&namespace, published);
-                    referenced
-                }
-                Ok(None) => HashSet::new(),
+            let mut loaded_at = Instant::now();
+            let mut referenced = match self.gc_referenced(&namespace).await {
+                Ok(referenced) => referenced,
                 Err(error) => {
                     tracing::warn!(%error, "keyed GC cannot load CURRENT; retrying later");
                     self.requeue_gc(&namespace, keys, retry);
@@ -1662,8 +1699,55 @@ impl Inner {
                 }
             };
             let mut failed = Vec::new();
-            for (key, decided) in keys {
+            let mut keys = keys.into_iter();
+            while let Some((key, decided)) = keys.next() {
                 if referenced.contains(&key) {
+                    continue;
+                }
+                // Observe the object's age, then CURRENT when that load is
+                // stale, and delete within the decision TTL of both (the
+                // cross-pod reuse protocol, `manifest` module docs).
+                let observed = Instant::now();
+                let modified = match namespace.namespace.modified_ms(&key).await {
+                    Ok(Some(modified)) => modified,
+                    // Gone, or of unknown age: nothing to do.
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(%error, key, "keyed GC cannot stat; retrying later");
+                        failed.push((key, decided));
+                        continue;
+                    }
+                };
+                let age = Duration::from_millis(self.now_ms().saturating_sub(modified));
+                if let Some(young) = self
+                    .config
+                    .gc_grace
+                    .checked_sub(age)
+                    .filter(|d| !d.is_zero())
+                {
+                    // Rewritten since (a writer reused it): due again once
+                    // it is old, unless a manifest references it by then.
+                    let due = Instant::now().checked_add(young).unwrap_or(retry);
+                    self.requeue_gc(&namespace, vec![(key, decided)], due);
+                    continue;
+                }
+                if loaded_at.elapsed() > ttl {
+                    loaded_at = Instant::now();
+                    match self.gc_referenced(&namespace).await {
+                        Ok(fresh) => referenced = fresh,
+                        Err(error) => {
+                            tracing::warn!(%error, "keyed GC cannot load CURRENT; retrying later");
+                            failed.push((key, decided));
+                            failed.extend(keys.by_ref());
+                            break;
+                        }
+                    }
+                    if referenced.contains(&key) {
+                        continue;
+                    }
+                }
+                if observed.elapsed() > ttl {
+                    failed.push((key, decided));
                     continue;
                 }
                 let object = format!("{}{key}", namespace.namespace.prefix());
@@ -1708,6 +1792,47 @@ impl Inner {
             u64::try_from(deleted).unwrap_or(u64::MAX),
         );
         deleted
+    }
+
+    /// The objects `CURRENT` references (adopting it when newer).
+    async fn gc_referenced(
+        &self,
+        namespace: &Arc<Namespace>,
+    ) -> Result<HashSet<String>, IndexError> {
+        let started = Instant::now();
+        let Some(published) = namespace.namespace.load().await? else {
+            return Ok(HashSet::new());
+        };
+        namespace.mark_checked(started);
+        let mut referenced: HashSet<String> =
+            published.manifest.part_keys().map(str::to_owned).collect();
+        referenced.insert(published.manifest_key.clone());
+        self.adopt_loaded(namespace, published);
+        Ok(referenced)
+    }
+
+    /// Whether this process created `object` within half the grace: no
+    /// deleter can have decided to delete it as old, so reusing it needs no
+    /// settling. With a zero grace (tests) nothing is protected anyway, and
+    /// the process's own objects are reused without settling.
+    fn created_recently(&self, object: &str) -> bool {
+        let fresh = self.config.gc_grace.checked_div(2).unwrap_or_default();
+        if fresh.is_zero() {
+            return lock(&self.created).contains_key(object);
+        }
+        lock(&self.created)
+            .get(object)
+            .is_some_and(|created| created.elapsed() < fresh)
+    }
+
+    fn forget_created(&self) {
+        let fresh = self
+            .config
+            .gc_grace
+            .checked_div(2)
+            .unwrap_or_default()
+            .max(self.config.gc_tick);
+        lock(&self.created).retain(|_, created| created.elapsed() < fresh);
     }
 
     fn forget_idle(&self) {

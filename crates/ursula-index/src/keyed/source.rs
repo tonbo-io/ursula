@@ -334,6 +334,20 @@ impl KeyedSourceClient {
         read_page(record, &headers, &body)
     }
 
+    /// The stream's record tail `N` (`Stream-Record-Next` of a HEAD).
+    pub async fn tail(&self, bucket: &str, key: &str) -> Result<u64, SourceError> {
+        let url = self.stream_url(bucket, key)?;
+        let response = self.client.head(url).send().await.map_err(transient)?;
+        match response.status() {
+            StatusCode::NOT_FOUND => Err(SourceError::NotFound),
+            status if !status.is_success() => {
+                Err(transient(format!("source HEAD returned HTTP {status}")))
+            }
+            _ => header_u64(response.headers(), "stream-record-next")
+                .ok_or_else(|| transient("source HEAD omitted Stream-Record-Next")),
+        }
+    }
+
     /// Whether incarnation `incarnation` of the stream still exists: a HEAD
     /// of the stream, then the bucket listing's `created_at_ms`. Absent or
     /// lagging listing entries are inconclusive and count as present.

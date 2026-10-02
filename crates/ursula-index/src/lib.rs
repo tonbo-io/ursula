@@ -14,11 +14,13 @@
 //!   and the keyed engine service (ingest, publish, compaction, GC, the
 //!   internal `/v1/keyed` API).
 //! - [`manifest`]: the conditionally published manifest state model.
-//! - [`memory_store`]: the in-memory conditional object store with
-//!   deterministic fault hooks (latency, failures, CAS conflicts, ambiguous
-//!   writes) for the indexer simulation.
-//! - [`object_store`]: conditional object operations for S3 and local tests,
-//!   with request counting by S3 class and fault injection for crash tests.
+//! - [`memory_store`]: the in-memory conditional object store of the
+//!   indexer simulation.
+//! - `object_store` (private; types re-exported): conditional object
+//!   operations for S3, the filesystem and memory, with request counting by
+//!   S3 class and the one fault-injection mechanism, [`ObjectHooks`]
+//!   (latency, failures, CAS conflicts, ambiguous writes, observation of
+//!   applied mutations), used by crash tests and the simulation.
 //! - [`part`]: immutable sorted Parquet parts.
 //! - `rt` (private): the task and timer seam, madsim under `cfg(madsim)`.
 //! - [`service`]: command arguments and the long-running indexer service entrypoint.
@@ -48,8 +50,11 @@ pub use manifest::CompletedRecordRange;
 pub use manifest::GarbageCollectionReport;
 pub use manifest::RecordSegmentLease;
 pub use memory_store::MemoryObjectStore;
+pub use object_store::AppliedChange;
+pub use object_store::FaultDecision;
 pub use object_store::FsObjectStore;
-pub use object_store::ObjectFaults;
+pub use object_store::ObjectFault;
+pub use object_store::ObjectHooks;
 pub use object_store::ObjectOp;
 pub use object_store::ObjectRequestCounters;
 pub use object_store::ObjectRequestCounts;

@@ -49,7 +49,12 @@ use tower::ServiceExt;
 use ursula::HttpState;
 use ursula::WallClock;
 use ursula::router_with_http_state;
+use ursula_index::AppliedChange;
+use ursula_index::FaultDecision;
 use ursula_index::MemoryObjectStore;
+use ursula_index::ObjectFault;
+use ursula_index::ObjectHooks;
+use ursula_index::ObjectOp;
 use ursula_index::ObjectStore;
 use ursula_index::clock::Clock;
 use ursula_index::keyed::CompactionPolicy;
@@ -74,11 +79,6 @@ use ursula_index::keyed::encode_key;
 use ursula_index::keyed::read_range;
 use ursula_index::keyed::read_response;
 use ursula_index::keyed::record_digest;
-use ursula_index::memory_store::AppliedChange;
-use ursula_index::memory_store::FaultDecision;
-use ursula_index::memory_store::MemoryStoreHooks;
-use ursula_index::memory_store::ObjectFault;
-use ursula_index::memory_store::ObjectOp;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::RuntimeThreading;
@@ -313,6 +313,65 @@ impl Checker {
     }
 }
 
+/// Generation of a manifest key, `manifests/{generation:020}-{hash}.json`.
+fn manifest_generation(name: &str) -> Option<u64> {
+    name.strip_prefix("manifests/")?
+        .split_once('-')?
+        .0
+        .parse()
+        .ok()
+}
+
+/// What the orphan sweep must keep (the U20 rule, `KeyedNamespace::sweep`):
+/// everything the published manifest references, plus every manifest up to
+/// the published generation written within the grace period, and the newest
+/// one written before it (it may have been `CURRENT` when the period began),
+/// with the parts they reference.
+fn readers_may_hold(
+    state: &CheckerState,
+    at_rest: &[(String, u64)],
+    now: u64,
+    grace_ms: u64,
+) -> HashSet<String> {
+    let mut keep = state.referenced.clone();
+    let current_generation = state
+        .publications
+        .last()
+        .and_then(|pointer| serde_json::from_slice::<Pointer>(pointer).ok())
+        .map_or(0, |pointer| pointer.generation);
+    let manifests: Vec<(u64, &str, bool)> = at_rest
+        .iter()
+        .filter_map(|(name, modified_ms)| {
+            manifest_generation(name)
+                .filter(|generation| *generation <= current_generation)
+                .map(|generation| {
+                    let young = now.saturating_sub(*modified_ms) < grace_ms;
+                    (generation, name.as_str(), young)
+                })
+        })
+        .collect();
+    let window_start = manifests
+        .iter()
+        .filter(|(_, _, young)| !young)
+        .map(|(generation, _, _)| *generation)
+        .max();
+    for (generation, name, young) in manifests {
+        let at_window_start = Some(generation) == window_start && generation < current_generation;
+        if !(young || at_window_start) {
+            continue;
+        }
+        keep.insert(name.to_owned());
+        if let Some(manifest) = state
+            .archive
+            .get(name)
+            .and_then(|bytes| serde_json::from_slice::<KeyedManifest>(bytes).ok())
+        {
+            keep.extend(manifest.part_keys().map(str::to_owned));
+        }
+    }
+    keep
+}
+
 struct S3Faults {
     plan: KeyedIndexerPlan,
     enabled: AtomicBool,
@@ -321,7 +380,7 @@ struct S3Faults {
     checker: Arc<Checker>,
 }
 
-impl MemoryStoreHooks for S3Faults {
+impl ObjectHooks for S3Faults {
     fn decide(&self, op: ObjectOp, _key: &str) -> FaultDecision {
         if !self.enabled.load(Ordering::SeqCst) {
             return FaultDecision::default();
@@ -511,7 +570,7 @@ impl Indexer {
     fn start(
         generation: u32,
         seed: u64,
-        store: &MemoryObjectStore,
+        store: &ObjectStore,
         source: &Arc<SimSource>,
         config: &KeyedEngineConfig,
         clock: &Arc<VirtualClock>,
@@ -521,7 +580,7 @@ impl Indexer {
             .name(format!("keyed-indexer-{generation}"))
             .build();
         let engine = KeyedEngine::with_clock(
-            ObjectStore::from(store.clone()),
+            store.clone(),
             SharedSource(Arc::clone(source)),
             None,
             config.clone(),
@@ -793,7 +852,8 @@ pub(super) async fn run_keyed_indexer_inner(
         checker: Arc::clone(&checker),
     });
     let raw_store = MemoryObjectStore::new(Arc::clone(&clock) as Arc<dyn Clock>);
-    let store = raw_store.with_hooks(Arc::clone(&faults) as Arc<dyn MemoryStoreHooks>);
+    let store = ObjectStore::from(raw_store.clone())
+        .with_hooks(Arc::clone(&faults) as Arc<dyn ObjectHooks>);
     let source = Arc::new(SimSource {
         app: app.clone(),
         routes: Mutex::new(HashMap::new()),
@@ -1004,12 +1064,19 @@ pub(super) async fn run_keyed_indexer_inner(
     // Stop the indexer, then check its store at rest.
     indexer.crash();
     let state = std::mem::take(&mut *lock(&checker.state));
-    for (key, modified_ms) in raw_store.snapshot() {
-        let Some(name) = key.strip_prefix(&checker.prefix) else {
-            continue;
-        };
+    let at_rest: Vec<(String, u64)> = raw_store
+        .snapshot()
+        .into_iter()
+        .filter_map(|(key, modified_ms)| {
+            key.strip_prefix(&checker.prefix)
+                .map(|name| (name.to_owned(), modified_ms))
+        })
+        .collect();
+    let may_hold = readers_may_hold(&state, &at_rest, now, grace_ms);
+    for (name, modified_ms) in &at_rest {
+        let name = name.as_str();
         let data = name.starts_with("parts/") || name.starts_with("manifests/");
-        if data && !state.referenced.contains(name) && now.saturating_sub(modified_ms) >= grace_ms {
+        if data && !may_hold.contains(name) && now.saturating_sub(*modified_ms) >= grace_ms {
             violations.push(format!(
                 "orphan {name} older than the grace period after the sweep"
             ));
@@ -1084,7 +1151,7 @@ pub(super) async fn run_keyed_indexer_inner(
         publications,
         through: max_through,
         deleted,
-        swept: swept as u64,
+        swept: swept.deleted.len() as u64,
         collected: collected as u64,
     });
     assert!(

@@ -37,9 +37,9 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::get;
 use reqwest::Url;
+use ursula_index::FaultDecision;
 use ursula_index::FsObjectStore;
-use ursula_index::IndexError;
-use ursula_index::ObjectFaults;
+use ursula_index::ObjectHooks;
 use ursula_index::ObjectOp;
 use ursula_index::ObjectStore;
 use ursula_index::keyed::CompactionPolicy;
@@ -150,11 +150,18 @@ async fn fake_get(
     (StatusCode::OK, headers, body).into_response()
 }
 
-async fn fake_head(Path((bucket, rest)): Path<(String, String)>) -> StatusCode {
+async fn fake_head(
+    State(log): State<FakeLog>,
+    Path((bucket, rest)): Path<(String, String)>,
+) -> Response {
     if bucket == BUCKET && rest == KEY {
-        StatusCode::OK
+        (StatusCode::OK, [(
+            "stream-record-next",
+            log.tail().to_string(),
+        )])
+            .into_response()
     } else {
-        StatusCode::NOT_FOUND
+        StatusCode::NOT_FOUND.into_response()
     }
 }
 
@@ -209,25 +216,25 @@ impl Crash {
     }
 }
 
-impl ObjectFaults for Crash {
-    fn check(&self, op: ObjectOp, key: &str) -> Result<(), IndexError> {
+impl ObjectHooks for Crash {
+    fn decide(&self, op: ObjectOp, key: &str) -> FaultDecision {
         if self.dead.load(Ordering::SeqCst) {
-            return Err(IndexError::ObjectStore("injected: process is dead".into()));
+            return FaultDecision::fail();
         }
         if !self.armed.load(Ordering::SeqCst) {
-            return Ok(());
+            return FaultDecision::default();
         }
         if (self.trigger)(op, key) {
             self.dead.store(true, Ordering::SeqCst);
-            return Err(IndexError::ObjectStore("injected crash".into()));
+            return FaultDecision::fail();
         }
-        if op == ObjectOp::Put {
+        if op.is_write() {
             self.written
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(key.to_owned());
         }
-        Ok(())
+        FaultDecision::default()
     }
 }
 
@@ -238,8 +245,8 @@ struct Interleave {
     action: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
-impl ObjectFaults for Interleave {
-    fn check(&self, op: ObjectOp, key: &str) -> Result<(), IndexError> {
+impl ObjectHooks for Interleave {
+    fn decide(&self, op: ObjectOp, key: &str) -> FaultDecision {
         if (self.trigger)(op, key) {
             let action = self
                 .action
@@ -250,7 +257,7 @@ impl ObjectFaults for Interleave {
                 tokio::task::block_in_place(action);
             }
         }
-        Ok(())
+        FaultDecision::default()
     }
 }
 
@@ -494,7 +501,7 @@ async fn crash_scenario(
 ) {
     let world = World::new().await;
     let crash = Crash::new(trigger);
-    let pod = world.pod(world.raw.clone().with_faults(crash.clone()), pod_config);
+    let pod = world.pod(world.raw.clone().with_hooks(crash.clone()), pod_config);
     let mut rng = Lcg(0xc0ffee);
     world.append(6, &mut rng);
     assert_eq!(read_checked(&pod, &world, 6).await, 6);
@@ -527,22 +534,15 @@ async fn crash_scenario(
         world.raw.clone(),
         &source(),
         Duration::from_secs(3600),
-        std::time::SystemTime::now(),
         false,
     )
     .await
     .unwrap();
     assert!(young.deleted.is_empty(), "{name}: {young:?}");
     // ... and reclaims the orphans once they are older.
-    let swept = tools::sweep(
-        world.raw.clone(),
-        &source(),
-        Duration::ZERO,
-        std::time::SystemTime::now(),
-        false,
-    )
-    .await
-    .unwrap();
+    let swept = tools::sweep(world.raw.clone(), &source(), Duration::ZERO, false)
+        .await
+        .unwrap();
     assert_eq!(
         swept.deleted.iter().cloned().collect::<HashSet<_>>(),
         orphans,
@@ -559,7 +559,7 @@ async fn crash_scenario(
 }
 
 fn is_put(op: ObjectOp, key: &str, needle: &str) -> bool {
-    op == ObjectOp::Put && key.contains(needle)
+    op.is_write() && key.contains(needle)
 }
 
 /// Ingest to `D = 12` while armed; the crash makes it fail.
@@ -617,7 +617,7 @@ async fn crash_after_cas_before_read_back_publishes_a_valid_state() {
                 return false;
             }
             match op {
-                ObjectOp::Put => {
+                ObjectOp::CompareAndSwap | ObjectOp::PutIfAbsent => {
                     cas_done.store(true, Ordering::SeqCst);
                     false
                 }
@@ -720,7 +720,7 @@ async fn lost_cas_leaves_no_orphans_after_grace() {
             });
         }))),
     });
-    let pod = world.pod(world.raw.clone().with_faults(interleave), config());
+    let pod = world.pod(world.raw.clone().with_hooks(interleave), config());
     assert_eq!(read_checked(&pod, &world, 5).await, 5);
     let first_manifest = world.published().await.manifest_key;
     world.append(5, &mut rng);
@@ -854,7 +854,7 @@ async fn rebuild_swaps_blue_green_and_catches_up() {
 
     // While the rebuild writes its manifest, the old namespace advances to
     // D = 15 (the pod keeps serving and publishing it).
-    let rebuild_store = world.raw.clone().with_faults(Arc::new(Interleave {
+    let rebuild_store = world.raw.clone().with_hooks(Arc::new(Interleave {
         trigger: Box::new(|op, key| is_put(op, key, "/manifests/")),
         action: Mutex::new(Some(Box::new({
             let pod = pod.clone();
@@ -892,6 +892,7 @@ async fn rebuild_swaps_blue_green_and_catches_up() {
                 max_bytes_per_second: Some(1 << 30),
                 ..read_options()
             },
+            gc_grace: Duration::ZERO,
             ..tools::RebuildOptions::default()
         },
     )
@@ -915,15 +916,9 @@ async fn rebuild_swaps_blue_green_and_catches_up() {
         other => panic!("{other:?}"),
     }
     pod.collect_garbage().await;
-    let swept = tools::sweep(
-        world.raw.clone(),
-        &source(),
-        Duration::ZERO,
-        std::time::SystemTime::now(),
-        false,
-    )
-    .await
-    .unwrap();
+    let swept = tools::sweep(world.raw.clone(), &source(), Duration::ZERO, false)
+        .await
+        .unwrap();
     assert_eq!(
         swept.deleted.len(),
         1,
@@ -932,6 +927,74 @@ async fn rebuild_swaps_blue_green_and_catches_up() {
     assert_eq!(world.objects(), world.referenced().await);
     let rows = read_checked(&pod, &world, 15).await;
     assert_eq!(rows, 15);
+}
+
+/// The blue/green drill's path: `rebuild` at another projection format
+/// builds a new `v{fmt}/` namespace from record 0 to the source tail next
+/// to the served one, and a pod at that format starts from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rebuild_builds_another_projection_format_next_to_the_served_one() {
+    let world = World::new().await;
+    let mut rng = Lcg(21);
+    world.append(10, &mut rng);
+    let blue = world.pod(world.raw.clone(), config());
+    read_checked(&blue, &world, 10).await;
+    world.append(4, &mut rng);
+    let served = world.published().await;
+    let report = tools::rebuild(
+        world.raw.clone(),
+        &world.client,
+        &source(),
+        &tools::RebuildOptions {
+            parallelism: 2,
+            read: read_options(),
+            projection_format: 2,
+            gc_grace: Duration::ZERO,
+            ..tools::RebuildOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (report.previous_through, report.previous_generation),
+        (0, 0)
+    );
+    assert_eq!(
+        report.through_record, 14,
+        "built to the source tail: {report:?}"
+    );
+    // The served namespace is untouched.
+    assert_eq!(world.published().await.manifest_key, served.manifest_key);
+    let green_namespace = KeyedNamespace::with_format(world.raw.clone(), source(), 2);
+    let green_state = green_namespace.load().await.unwrap().unwrap();
+    assert_eq!(green_state.manifest.format, 2);
+    assert_eq!(green_state.manifest.through_record, 14);
+    // A green pod serves it as built, without refolding from record 0.
+    let green = world.pod(world.raw.clone(), KeyedEngineConfig {
+        projection_format: 2,
+        ..config()
+    });
+    match read(&green, &world, None).await {
+        KeyedReadOutcome::Rows { through, page } => {
+            assert_eq!(through, 14);
+            assert_eq!(page.body(), world.expected(14));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(green.metrics().publishes, 0);
+    // At the served format, an empty namespace is still refused.
+    let other = KeyedSource {
+        incarnation: INCARNATION + 1,
+        ..source()
+    };
+    tools::rebuild(
+        world.raw.clone(),
+        &world.client,
+        &other,
+        &tools::RebuildOptions::default(),
+    )
+    .await
+    .unwrap_err();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -964,7 +1027,6 @@ async fn sweep_keeps_what_readers_may_hold() {
         world.raw.clone(),
         &source(),
         Duration::from_secs(3600),
-        std::time::SystemTime::now(),
         true,
     )
     .await
@@ -973,30 +1035,18 @@ async fn sweep_keeps_what_readers_may_hold() {
     assert_eq!(world.objects(), objects);
     // A dry run at zero grace names the unreferenced objects without
     // deleting them; the real run deletes exactly those.
-    let dry = tools::sweep(
-        world.raw.clone(),
-        &source(),
-        Duration::ZERO,
-        std::time::SystemTime::now(),
-        true,
-    )
-    .await
-    .unwrap();
+    let dry = tools::sweep(world.raw.clone(), &source(), Duration::ZERO, true)
+        .await
+        .unwrap();
     let unreferenced: HashSet<String> = objects.difference(&referenced).cloned().collect();
     assert_eq!(
         dry.deleted.iter().cloned().collect::<HashSet<_>>(),
         unreferenced
     );
     assert_eq!(world.objects(), objects);
-    tools::sweep(
-        world.raw.clone(),
-        &source(),
-        Duration::ZERO,
-        std::time::SystemTime::now(),
-        false,
-    )
-    .await
-    .unwrap();
+    tools::sweep(world.raw.clone(), &source(), Duration::ZERO, false)
+        .await
+        .unwrap();
     assert_eq!(world.objects(), referenced);
     assert!(world.verify().await.is_ok());
 }
@@ -1050,11 +1100,70 @@ async fn sweep_protects_the_manifest_current_at_the_grace_horizon() {
         world.raw.clone(),
         &source(),
         Duration::from_secs(3600),
-        std::time::SystemTime::now(),
         false,
     )
     .await
     .unwrap();
+    assert!(!report.deleted.is_empty(), "older garbage is reclaimed");
+    let objects = world.objects();
+    assert!(objects.contains(&horizon.manifest_key), "{report:?}");
+    for part in horizon.manifest.part_keys() {
+        assert!(objects.contains(part), "{part} of the horizon manifest");
+    }
+    assert!(world.referenced().await.is_subset(&objects));
+    assert!(world.verify().await.is_ok());
+}
+
+/// The engine's sweep (`KeyedEngine::sweep`, used by the simulation)
+/// applies the same rule as the tool: it keeps the manifest that was
+/// `CURRENT` when the grace period began, and its parts, not only what the
+/// published manifest references.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_sweep_protects_the_manifest_current_at_the_grace_horizon() {
+    let world = World::new().await;
+    let mut rng = Lcg(12);
+    let pod = world.pod(world.raw.clone(), KeyedEngineConfig {
+        gc_grace: Duration::from_secs(3600),
+        ..eager_compaction()
+    });
+    let settle = async || {
+        for _ in 0..250 {
+            if world.published().await.manifest.runs.len() == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("compaction never settled");
+    };
+    for step in 0..3 {
+        world.append(3, &mut rng);
+        read_checked(&pod, &world, 3 * (step + 1)).await;
+        settle().await;
+    }
+    // Everything so far is two hours old; the manifest published last was
+    // CURRENT when the one-hour grace period began.
+    let horizon = world.published().await;
+    let two_hours_ago = std::time::SystemTime::now() - Duration::from_secs(7200);
+    let mut pending = vec![world.dir.path().to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(two_hours_ago)
+                    .unwrap();
+            }
+        }
+    }
+    world.append(3, &mut rng);
+    read_checked(&pod, &world, 12).await;
+    settle().await;
+    let report = pod.sweep(&source()).await.unwrap();
     assert!(!report.deleted.is_empty(), "older garbage is reclaimed");
     let objects = world.objects();
     assert!(objects.contains(&horizon.manifest_key), "{report:?}");

@@ -219,6 +219,16 @@ pub struct KeyedRebuildArgs {
     /// Record ranges folded concurrently (1..=8).
     #[arg(long, default_value_t = 4)]
     parallelism: usize,
+    /// Projection format of the namespace to rebuild (`v{fmt}/`). At the
+    /// served format the namespace is rebuilt in place (blue/green by one
+    /// CAS of `CURRENT`); at another format a new namespace is built from
+    /// record 0 next to the served one, so a pod at that format starts warm.
+    #[arg(long, default_value_t = crate::keyed::KEYED_PROJECTION_FORMAT)]
+    projection_format: u32,
+    /// GC grace of the namespace's deleters (pods and sweeps): parts found
+    /// already present are settled for it before being published.
+    #[arg(long, default_value_t = 600)]
+    gc_grace_seconds: u64,
 }
 
 /// `ursula indexer keyed sweep`.
@@ -318,6 +328,8 @@ async fn run_keyed_command(command: KeyedCommand) -> anyhow::Result<()> {
             let options = tools::RebuildOptions {
                 parallelism: args.parallelism,
                 read,
+                projection_format: args.projection_format,
+                gc_grace: Duration::from_secs(args.gc_grace_seconds),
                 ..tools::RebuildOptions::default()
             };
             print_json(&tools::rebuild(store, &client, &source, &options).await?)?;
@@ -325,8 +337,7 @@ async fn run_keyed_command(command: KeyedCommand) -> anyhow::Result<()> {
         KeyedCommand::Sweep(args) => {
             let (store, source) = args.target.open()?;
             let grace = Duration::from_secs(args.grace_seconds);
-            let now = SystemTime::now();
-            print_json(&tools::sweep(store, &source, grace, now, args.dry_run).await?)?;
+            print_json(&tools::sweep(store, &source, grace, args.dry_run).await?)?;
         }
         KeyedCommand::Dump(args) => {
             let (store, source) = args.target.open()?;

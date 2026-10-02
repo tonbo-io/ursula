@@ -1,17 +1,16 @@
-//! In-memory conditional object store with deterministic fault hooks
-//! (design §6.1 U21, §11.7).
+//! In-memory conditional object store (design §6.1 U21, §11.7).
 //!
-//! The simulator runs the keyed engine against this store. Every operation
-//! first asks the [`MemoryStoreHooks`] for a [`FaultDecision`]: a latency
-//! (slept on the task seam, so it is virtual time under `cfg(madsim)`) and a
-//! fault — a failure without effect, a conditional write that reports a
-//! conflict without effect, or an ambiguous write or delete that takes
-//! effect and then reports a failure. Applied mutations are reported to the
-//! hooks synchronously, in the order they take effect, which lets a checker
-//! observe every published `CURRENT` and every deletion.
+//! The simulator runs the keyed engine against this store. Faults and
+//! mutation observation are not part of it: they are the one hook mechanism
+//! of every store, [`ObjectStore::with_hooks`] with [`ObjectHooks`]
+//! (latency, failures, spurious CAS conflicts, ambiguous mutations). The
+//! store's operations never suspend, so the hooks see its mutations in the
+//! exact order they take effect.
 //!
 //! Entity tags are content digests, as with the filesystem store, and
 //! modification times come from the injected [`Clock`].
+//!
+//! [`ObjectHooks`]: crate::ObjectHooks
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -30,90 +29,6 @@ use crate::object_store::ObjectStore;
 use crate::object_store::StoredObject;
 use crate::object_store::digest;
 
-/// An object-store operation, as seen by [`MemoryStoreHooks::decide`].
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ObjectOp {
-    /// Whole-object read with its entity tag.
-    Get,
-    /// Byte-range read.
-    GetRange,
-    /// Create-only write.
-    PutIfAbsent,
-    /// Write conditional on the current entity tag.
-    CompareAndSwap,
-    /// Prefix listing.
-    List,
-    /// Deletion.
-    Delete,
-}
-
-impl ObjectOp {
-    /// Whether the operation mutates the store.
-    pub fn is_mutation(self) -> bool {
-        matches!(
-            self,
-            Self::PutIfAbsent | Self::CompareAndSwap | Self::Delete
-        )
-    }
-}
-
-/// The fault injected into one operation.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ObjectFault {
-    /// The operation runs normally.
-    #[default]
-    None,
-    /// The operation fails without effect.
-    Fail,
-    /// A conditional write reports a conflict without effect (a spurious
-    /// precondition failure); other operations run normally.
-    Conflict,
-    /// A mutation takes effect and then reports a failure (a lost response);
-    /// reads fail without effect.
-    Ambiguous,
-}
-
-/// Latency and fault of one operation.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct FaultDecision {
-    /// Delay before the operation runs.
-    pub delay: Duration,
-    /// The injected fault.
-    pub fault: ObjectFault,
-}
-
-/// A mutation that took effect.
-#[derive(Clone, Copy, Debug)]
-pub enum AppliedChange<'a> {
-    /// `key` now holds `bytes`.
-    Put {
-        /// Object key.
-        key: &'a str,
-        /// The written bytes.
-        bytes: &'a [u8],
-    },
-    /// `key`, which existed, was deleted.
-    Delete {
-        /// Object key.
-        key: &'a str,
-    },
-}
-
-/// Fault injection and mutation observation for a [`MemoryObjectStore`].
-pub trait MemoryStoreHooks: Send + Sync {
-    /// The latency and fault of the next operation `op` on `key` (the
-    /// prefix for [`ObjectOp::List`]).
-    fn decide(&self, op: ObjectOp, key: &str) -> FaultDecision {
-        let _unused = (op, key);
-        FaultDecision::default()
-    }
-
-    /// Called under the store lock right after a mutation takes effect.
-    fn applied(&self, change: AppliedChange<'_>) {
-        let _unused = change;
-    }
-}
-
 #[derive(Clone, Debug)]
 struct MemoryObject {
     bytes: Arc<[u8]>,
@@ -126,7 +41,6 @@ struct MemoryObject {
 pub struct MemoryObjectStore {
     objects: Arc<Mutex<BTreeMap<String, MemoryObject>>>,
     clock: Arc<dyn Clock>,
-    hooks: Option<Arc<dyn MemoryStoreHooks>>,
 }
 
 impl std::fmt::Debug for MemoryObjectStore {
@@ -142,38 +56,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn injected(op: ObjectOp, key: &str) -> IndexError {
-    IndexError::ObjectStore(format!("injected {op:?} failure on `{key}`"))
-}
-
 impl MemoryObjectStore {
     /// An empty store whose modification times come from `clock`.
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             objects: Arc::new(Mutex::new(BTreeMap::new())),
             clock,
-            hooks: None,
-        }
-    }
-
-    /// A handle over the same objects whose operations go through `hooks`.
-    #[must_use]
-    pub fn with_hooks(&self, hooks: Arc<dyn MemoryStoreHooks>) -> Self {
-        Self {
-            objects: Arc::clone(&self.objects),
-            clock: Arc::clone(&self.clock),
-            hooks: Some(hooks),
-        }
-    }
-
-    /// A handle over the same objects without hooks (no faults, no
-    /// observation), for checkers.
-    #[must_use]
-    pub fn without_hooks(&self) -> Self {
-        Self {
-            objects: Arc::clone(&self.objects),
-            clock: Arc::clone(&self.clock),
-            hooks: None,
         }
     }
 
@@ -186,53 +74,32 @@ impl MemoryObjectStore {
             .collect()
     }
 
-    /// The bytes of `key`, bypassing hooks (for checkers).
+    /// The bytes of `key` (for checkers).
     pub fn object_bytes(&self, key: &str) -> Option<Vec<u8>> {
         lock(&self.objects)
             .get(key)
             .map(|object| object.bytes.to_vec())
     }
 
-    async fn decide(&self, op: ObjectOp, key: &str) -> ObjectFault {
-        let Some(hooks) = &self.hooks else {
-            return ObjectFault::None;
-        };
-        let decision = hooks.decide(op, key);
-        if !decision.delay.is_zero() {
-            crate::rt::time::sleep(decision.delay).await;
-        }
-        decision.fault
+    pub(crate) fn get(&self, key: &str) -> Option<StoredObject> {
+        lock(&self.objects).get(key).map(|object| StoredObject {
+            bytes: object.bytes.to_vec(),
+            etag: object.etag.clone(),
+        })
     }
 
-    fn notify(&self, change: AppliedChange<'_>) {
-        if let Some(hooks) = &self.hooks {
-            hooks.applied(change);
-        }
+    pub(crate) fn stat(&self, key: &str) -> Option<ObjectInfo> {
+        lock(&self.objects).get(key).map(|object| ObjectInfo {
+            key: key.to_owned(),
+            modified: modified(object),
+        })
     }
 
-    pub(crate) async fn get(&self, key: &str) -> Result<Option<StoredObject>, IndexError> {
-        match self.decide(ObjectOp::Get, key).await {
-            ObjectFault::Fail | ObjectFault::Ambiguous => Err(injected(ObjectOp::Get, key)),
-            ObjectFault::None | ObjectFault::Conflict => {
-                Ok(lock(&self.objects).get(key).map(|object| StoredObject {
-                    bytes: object.bytes.to_vec(),
-                    etag: object.etag.clone(),
-                }))
-            }
-        }
-    }
-
-    pub(crate) async fn get_range(
+    pub(crate) fn get_range(
         &self,
         key: &str,
         range: Range<u64>,
     ) -> Result<Option<Vec<u8>>, IndexError> {
-        if matches!(
-            self.decide(ObjectOp::GetRange, key).await,
-            ObjectFault::Fail | ObjectFault::Ambiguous
-        ) {
-            return Err(injected(ObjectOp::GetRange, key));
-        }
         let objects = lock(&self.objects);
         let Some(object) = objects.get(key) else {
             return Ok(None);
@@ -255,90 +122,58 @@ impl MemoryObjectStore {
             etag: digest(bytes),
             modified_ms: self.clock.now_ms(),
         });
-        self.notify(AppliedChange::Put { key, bytes });
     }
 
-    async fn conditional_write(
-        &self,
-        op: ObjectOp,
-        key: &str,
-        bytes: &[u8],
-        may_write: impl FnOnce(Option<&MemoryObject>) -> bool,
-    ) -> Result<ConditionalWrite, IndexError> {
-        let fault = self.decide(op, key).await;
-        match fault {
-            ObjectFault::Fail => return Err(injected(op, key)),
-            ObjectFault::Conflict => return Ok(ConditionalWrite::Conflict),
-            ObjectFault::None | ObjectFault::Ambiguous => {}
-        }
+    pub(crate) fn put_if_absent(&self, key: &str, bytes: &[u8]) -> ConditionalWrite {
         let mut objects = lock(&self.objects);
-        if !may_write(objects.get(key)) {
-            return Ok(ConditionalWrite::Conflict);
+        if objects.contains_key(key) {
+            return ConditionalWrite::Conflict;
         }
         self.install(&mut objects, key, bytes);
-        drop(objects);
-        if fault == ObjectFault::Ambiguous {
-            return Err(injected(op, key));
-        }
-        Ok(ConditionalWrite::Written)
+        ConditionalWrite::Written
     }
 
-    pub(crate) async fn put_if_absent(
-        &self,
-        key: &str,
-        bytes: &[u8],
-    ) -> Result<ConditionalWrite, IndexError> {
-        self.conditional_write(ObjectOp::PutIfAbsent, key, bytes, |current| {
-            current.is_none()
-        })
-        .await
-    }
-
-    pub(crate) async fn compare_and_swap(
+    pub(crate) fn compare_and_swap(
         &self,
         key: &str,
         expected_etag: &str,
         bytes: &[u8],
-    ) -> Result<ConditionalWrite, IndexError> {
-        self.conditional_write(ObjectOp::CompareAndSwap, key, bytes, |current| {
-            current.is_some_and(|object| object.etag == expected_etag)
-        })
-        .await
+    ) -> ConditionalWrite {
+        let mut objects = lock(&self.objects);
+        if objects
+            .get(key)
+            .is_none_or(|object| object.etag != expected_etag)
+        {
+            return ConditionalWrite::Conflict;
+        }
+        self.install(&mut objects, key, bytes);
+        ConditionalWrite::Written
     }
 
-    pub(crate) async fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>, IndexError> {
-        if matches!(
-            self.decide(ObjectOp::List, prefix).await,
-            ObjectFault::Fail | ObjectFault::Ambiguous
-        ) {
-            return Err(injected(ObjectOp::List, prefix));
-        }
-        Ok(lock(&self.objects)
+    pub(crate) fn put(&self, key: &str, bytes: &[u8]) {
+        let mut objects = lock(&self.objects);
+        self.install(&mut objects, key, bytes);
+    }
+
+    pub(crate) fn list(&self, prefix: &str) -> Vec<ObjectInfo> {
+        lock(&self.objects)
             .range(prefix.to_owned()..)
             .take_while(|(key, _)| key.starts_with(prefix))
             .map(|(key, object)| ObjectInfo {
                 key: key.clone(),
-                modified: SystemTime::UNIX_EPOCH
-                    .checked_add(Duration::from_millis(object.modified_ms)),
+                modified: modified(object),
             })
-            .collect())
+            .collect()
     }
 
-    pub(crate) async fn delete(&self, key: &str) -> Result<(), IndexError> {
-        let fault = self.decide(ObjectOp::Delete, key).await;
-        if fault == ObjectFault::Fail {
-            return Err(injected(ObjectOp::Delete, key));
-        }
-        let mut objects = lock(&self.objects);
-        if objects.remove(key).is_some() {
-            self.notify(AppliedChange::Delete { key });
-        }
-        drop(objects);
-        if fault == ObjectFault::Ambiguous {
-            return Err(injected(ObjectOp::Delete, key));
-        }
-        Ok(())
+    /// Deletes `key`; returns whether it existed.
+    pub(crate) fn delete(&self, key: &str) -> bool {
+        lock(&self.objects).remove(key).is_some()
     }
+}
+
+fn modified(object: &MemoryObject) -> Option<SystemTime> {
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(object.modified_ms))
 }
 
 impl From<MemoryObjectStore> for ObjectStore {
@@ -353,6 +188,11 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+    use crate::object_store::AppliedChange;
+    use crate::object_store::FaultDecision;
+    use crate::object_store::ObjectFault;
+    use crate::object_store::ObjectHooks;
+    use crate::object_store::ObjectOp;
 
     struct FixedClock(AtomicU64);
 
@@ -367,7 +207,7 @@ mod tests {
         applied: Mutex<Vec<String>>,
     }
 
-    impl MemoryStoreHooks for Script {
+    impl ObjectHooks for Script {
         fn decide(&self, op: ObjectOp, _key: &str) -> FaultDecision {
             let fault = if op.is_mutation() {
                 lock(&self.faults).pop().unwrap_or_default()
@@ -396,8 +236,8 @@ mod tests {
             faults: Mutex::new(Vec::new()),
             applied: Mutex::new(Vec::new()),
         });
-        let store = MemoryObjectStore::new(clock.clone()).with_hooks(script.clone());
-        let as_object = ObjectStore::from(store.clone());
+        let store = MemoryObjectStore::new(clock.clone());
+        let as_object = ObjectStore::from(store.clone()).with_hooks(script.clone());
 
         assert_eq!(
             as_object.put_if_absent("a/x", b"one").await.unwrap(),
@@ -457,6 +297,12 @@ mod tests {
             listed[0].modified,
             SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(5_000))
         );
+        // An unconditional put restarts the object's age.
+        as_object.put("a/x", b"two").await.unwrap();
+        assert_eq!(
+            as_object.stat("a/x").await.unwrap().unwrap().modified,
+            SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(9_000))
+        );
         as_object.delete("a/y").await.unwrap();
         as_object.delete("a/y").await.unwrap();
         assert_eq!(*lock(&script.applied), [
@@ -464,8 +310,9 @@ mod tests {
             "put a/x",
             "put a/y",
             "put b/z",
+            "put a/x",
             "delete a/y"
         ]);
-        assert_eq!(store.without_hooks().snapshot().len(), 2);
+        assert_eq!(store.snapshot().len(), 2);
     }
 }

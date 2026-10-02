@@ -31,6 +31,7 @@ pub(crate) struct KeyedMetrics {
     pub(crate) compaction_input_bytes: AtomicU64,
     pub(crate) compaction_output_bytes: AtomicU64,
     pub(crate) gc_deleted: AtomicU64,
+    pub(crate) reused_settled: AtomicU64,
     pub(crate) current_revalidations: AtomicU64,
     /// Every object-store request of the pod.
     pub(crate) requests: Arc<ObjectRequestCounters>,
@@ -104,6 +105,9 @@ pub struct KeyedMetricsSnapshot {
     pub compaction_output_bytes: u64,
     /// Objects deleted by garbage collection.
     pub gc_deleted: u64,
+    /// Parts found already present (not created by this pod recently) and
+    /// settled before being referenced: cross-pod reuse.
+    pub reused_settled: u64,
     /// Objects waiting in the garbage-collection queue.
     pub gc_backlog: usize,
     /// `CURRENT` revalidations of reads without `min_through_record`.
@@ -148,6 +152,7 @@ impl KeyedMetrics {
             compaction_input_bytes: load(&self.compaction_input_bytes),
             compaction_output_bytes: load(&self.compaction_output_bytes),
             gc_deleted: load(&self.gc_deleted),
+            reused_settled: load(&self.reused_settled),
             gc_backlog,
             current_revalidations: load(&self.current_revalidations),
             waiters,
