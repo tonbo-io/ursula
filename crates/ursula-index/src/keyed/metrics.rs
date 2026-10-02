@@ -16,6 +16,7 @@ use std::sync::atomic::Ordering;
 
 use serde::Serialize;
 
+use super::admission::AdmissionMetrics;
 use crate::object_store::ObjectRequestCounters;
 use crate::object_store::ObjectRequestCounts;
 
@@ -126,6 +127,9 @@ pub struct KeyedMetricsSnapshot {
     pub runs_max: usize,
     /// Every object-store request of the pod.
     pub s3_requests: S3Requests,
+    /// The process-wide admission controller: budget in use, queue depth,
+    /// rejections.
+    pub admission: AdmissionMetrics,
     /// Per-namespace detail, largest lag first.
     pub namespace_detail: Vec<NamespaceMetrics>,
 }
@@ -135,6 +139,7 @@ impl KeyedMetrics {
         &self,
         waiters: usize,
         gc_backlog: usize,
+        admission: AdmissionMetrics,
         mut detail: Vec<NamespaceMetrics>,
     ) -> KeyedMetricsSnapshot {
         detail.sort_by(|left, right| {
@@ -176,6 +181,7 @@ impl KeyedMetrics {
                 .max()
                 .unwrap_or(0),
             s3_requests: self.requests.snapshot().into(),
+            admission,
             namespace_detail: detail,
         }
     }

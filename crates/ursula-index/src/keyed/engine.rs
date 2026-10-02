@@ -37,6 +37,13 @@
 //! a `D` below what another pod or a previous process published (P3.6).
 //! Object-store requests are counted per namespace and per pod (U24).
 //!
+//! Resource admission is process-wide ([`super::admission`]): a worker
+//! takes a place in a bounded admission queue (a full queue answers 503
+//! with `Retry-After` to the read that would start it), an ingest slot
+//! before it reloads `CURRENT`, and reservations from the byte budget for
+//! each source page and the records it has folded; a compaction takes a
+//! compaction slot and reserves its buffers, waiting rather than failing.
+//!
 //! Objects a crash leaves behind are removed by the orphan sweep
 //! ([`KeyedEngine::sweep`], or the `keyed sweep` tool).
 //!
@@ -69,6 +76,10 @@ use futures_util::future::BoxFuture;
 use tokio::sync::Notify;
 use tokio::sync::watch;
 
+use super::admission::Admission;
+use super::admission::AdmissionLimits;
+use super::admission::QueueTicket;
+use super::admission::Reservation;
 use super::fold::RangeQuery;
 use super::manifest::KEYED_PROJECTION_FORMAT;
 use super::manifest::KeyedManifest;
@@ -116,6 +127,10 @@ const COMPACTIONS_PER_PASS: usize = 4;
 const COMPACTION_COMMIT_ATTEMPTS: usize = 3;
 /// Pause before retrying a cycle that made no progress (a lagging replica).
 const NO_PROGRESS_BACKOFF: Duration = Duration::from_millis(100);
+/// Default process-wide admission budget: 1 GiB.
+pub const DEFAULT_ADMISSION_BUDGET_BYTES: u64 = 1 << 30;
+/// Default bound of the admission queue.
+pub const DEFAULT_ADMISSION_QUEUE: usize = 4_096;
 
 /// Tuning of the engine. Defaults follow the design.
 #[derive(Clone, Debug)]
@@ -161,6 +176,30 @@ pub struct KeyedEngineConfig {
     /// (`v{fmt}/`). A pod at another format builds its own namespaces from
     /// record 0 next to the served ones: the blue/green rebuild (§6.1 U20).
     pub projection_format: u32,
+    /// Process-wide byte budget of ingest pages, folded-but-unpublished
+    /// records and compaction buffers ([`super::admission`]). A single
+    /// reservation larger than this is clamped to it and runs alone.
+    pub admission_budget_bytes: u64,
+    /// Ingests (source reads, fold, publication) running at once.
+    pub max_concurrent_ingests: usize,
+    /// Compactions running at once.
+    pub max_concurrent_compactions: usize,
+    /// Namespaces admitted for ingestion but not yet ingesting; when full,
+    /// reads that need ingestion answer 503 with `Retry-After`.
+    pub admission_queue: usize,
+}
+
+/// Default concurrency: the host's CPU count (fixed under the simulator, so
+/// runs reproduce on any host).
+fn default_parallelism() -> usize {
+    #[cfg(madsim)]
+    {
+        4
+    }
+    #[cfg(not(madsim))]
+    {
+        std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
+    }
 }
 
 impl Default for KeyedEngineConfig {
@@ -181,6 +220,10 @@ impl Default for KeyedEngineConfig {
             policy: CompactionPolicy::default(),
             current_revalidate: Duration::from_secs(1),
             projection_format: KEYED_PROJECTION_FORMAT,
+            admission_budget_bytes: DEFAULT_ADMISSION_BUDGET_BYTES,
+            max_concurrent_ingests: default_parallelism(),
+            max_concurrent_compactions: default_parallelism().div_ceil(2),
+            admission_queue: DEFAULT_ADMISSION_QUEUE,
         }
     }
 }
@@ -597,6 +640,9 @@ struct Inner {
     /// Objects this process created, and when (pruned after half the
     /// grace).
     created: Mutex<HashMap<String, Instant>>,
+    /// Process-wide byte budget, ingest and compaction slots, and the
+    /// admission queue.
+    admission: Admission,
 }
 
 /// The keyed projection engine of one indexer pod.
@@ -661,6 +707,12 @@ impl KeyedEngine {
         });
         let metrics = KeyedMetrics::default();
         let store = store.counted(Arc::clone(&metrics.requests));
+        let admission = Admission::new(AdmissionLimits {
+            budget_bytes: config.admission_budget_bytes,
+            ingests: config.max_concurrent_ingests,
+            compactions: config.max_concurrent_compactions,
+            queue: config.admission_queue,
+        });
         Self {
             inner: Arc::new(Inner {
                 store,
@@ -680,6 +732,7 @@ impl KeyedEngine {
                 deletions: Notify::new(),
                 gc_pass: tokio::sync::Mutex::new(()),
                 created: Mutex::new(HashMap::new()),
+                admission,
             }),
         }
     }
@@ -710,6 +763,7 @@ impl KeyedEngine {
         self.inner.metrics.snapshot(
             self.inner.waiters.load(Ordering::SeqCst),
             lock(&self.inner.gc).len(),
+            self.inner.admission.metrics(),
             detail,
         )
     }
@@ -935,14 +989,14 @@ impl Inner {
         let view = Arc::clone(&receiver.borrow_and_update());
         if view.invalid {
             // Restart the rebuild if its worker stopped (a transient failure).
-            self.request_work(&namespace, None, true);
+            let _admitted = self.request_work(&namespace, None, true);
             return match &view.status {
                 Status::Failed(reason) => KeyedReadOutcome::Failed(reason.clone()),
                 _ => KeyedReadOutcome::Unavailable("keyed state is being rebuilt".to_owned()),
             };
         }
         if view.through() > request.source_next {
-            self.request_work(&namespace, None, true);
+            let _admitted = self.request_work(&namespace, None, true);
             return KeyedReadOutcome::Unavailable(
                 "keyed state is ahead of its source log and is being re-validated".to_owned(),
             );
@@ -964,11 +1018,15 @@ impl Inner {
         let deadline = Instant::now()
             .checked_add(request.timeout)
             .unwrap_or_else(Instant::now);
-        self.request_work(
+        if !self.request_work(
             &namespace,
             Some((wanted, request.source_next, deadline)),
             false,
-        );
+        ) {
+            return KeyedReadOutcome::Unavailable(
+                "the keyed indexer's admission queue is full".to_owned(),
+            );
+        }
         loop {
             let view = Arc::clone(&receiver.borrow_and_update());
             match &view.status {
@@ -1044,14 +1102,24 @@ impl Inner {
     }
 
     /// Registers a want (or a re-validation) and starts the namespace's
-    /// worker unless one runs (single flight).
+    /// worker unless one runs (single flight). A new worker needs a place in
+    /// the admission queue; returns false, registering nothing, when the
+    /// queue is full.
     fn request_work(
         self: &Arc<Self>,
         namespace: &Arc<Namespace>,
         want: Option<(u64, u64, Instant)>,
         verify: bool,
-    ) {
+    ) -> bool {
         let mut work = lock(&namespace.work);
+        let ticket = if work.running {
+            None
+        } else {
+            let Some(ticket) = self.admission.try_enqueue() else {
+                return false;
+            };
+            Some(ticket)
+        };
         if let Some((record, next, until)) = want {
             work.want_record = work.want_record.max(record);
             work.want_next = work.want_next.max(next);
@@ -1060,18 +1128,25 @@ impl Inner {
         }
         work.verify |= verify;
         if work.running {
-            return;
+            return true;
         }
         work.running = true;
         drop(work);
         let inner = Arc::clone(self);
         let namespace = Arc::clone(namespace);
         let _worker = rt::spawn(async move {
-            inner.run_worker(namespace).await;
+            inner.run_worker(namespace, ticket).await;
         });
+        true
     }
 
-    async fn run_worker(self: Arc<Self>, namespace: Arc<Namespace>) {
+    /// The namespace's worker. `ticket` is its place in the admission
+    /// queue, left when the first ingest slot is granted.
+    async fn run_worker(
+        self: Arc<Self>,
+        namespace: Arc<Namespace>,
+        mut ticket: Option<QueueTicket>,
+    ) {
         let Some(_busy) = self.enter(&namespace.source.bucket) else {
             namespace.stop_work();
             return;
@@ -1096,7 +1171,7 @@ impl Inner {
                 work.verify = false;
                 (work.want_next, verify)
             };
-            match self.cycle(&namespace, want_next, verify).await {
+            match self.cycle(&namespace, want_next, verify, &mut ticket).await {
                 Ok(true) => {}
                 Ok(false) => rt::time::sleep(NO_PROGRESS_BACKOFF).await,
                 Err(error) => {
@@ -1145,13 +1220,15 @@ impl Inner {
         }
     }
 
-    /// Waits for the publish interval, reloads `CURRENT` and ingests up to
-    /// `want_next`. Returns whether `D` advanced (or a re-validation ran).
+    /// Waits for the publish interval and an ingest slot, reloads `CURRENT`
+    /// and ingests up to `want_next`. Returns whether `D` advanced (or a
+    /// re-validation ran).
     async fn cycle(
         &self,
         namespace: &Arc<Namespace>,
         want_next: u64,
         verify: bool,
+        ticket: &mut Option<QueueTicket>,
     ) -> Result<bool, CycleError> {
         let before = namespace.through();
         if !namespace.backlog.load(Ordering::SeqCst)
@@ -1169,6 +1246,8 @@ impl Inner {
                 rt::time::sleep(Duration::from_millis(wait)).await;
             }
         }
+        let _slot = self.admission.ingest_slot().await;
+        drop(ticket.take());
         let base = self.reload(namespace).await?;
         let through = base
             .as_ref()
@@ -1198,6 +1277,7 @@ impl Inner {
         // replica can be behind a namespace built from the leader.
         let d = published.manifest.through_record;
         let previous = d.saturating_sub(1);
+        let _page = self.admission.reserve(self.config.source_page_bytes).await;
         match self
             .source
             .read(
@@ -1271,6 +1351,9 @@ impl Inner {
         let mut last_digest = None;
         let mut bytes = 0_u64;
         let mut truncated = false;
+        // Admission: the folded records this ingest holds plus the next
+        // page, kept until the publication is done.
+        let mut held: Option<Reservation> = None;
         let bucket = namespace.source.bucket.as_str();
         let key = namespace.source.key.as_str();
         'pages: loop {
@@ -1280,6 +1363,23 @@ impl Inner {
             if expected.is_none() && bytes >= self.config.max_ingest_bytes && cursor >= floor {
                 truncated = true;
                 break;
+            }
+            let needed = bytes.saturating_add(self.config.source_page_bytes);
+            let grown = held
+                .as_mut()
+                .is_some_and(|reservation| self.admission.try_grow(reservation, needed));
+            if !grown {
+                if held.is_some() && expected.is_none() && last_digest.is_some() && cursor >= floor
+                {
+                    // The budget is taken: publish what is folded and
+                    // continue in the next cycle without the interval.
+                    self.admission.truncated();
+                    truncated = true;
+                    break;
+                }
+                // Never wait while holding a reservation.
+                drop(held.take());
+                held = Some(self.admission.reserve(needed).await);
             }
             let page = match self
                 .source
@@ -1387,6 +1487,7 @@ impl Inner {
         }
         self.commit(namespace, base, manifest, new_keys).await?;
         drop(pins);
+        drop(held);
         Ok(Folded::Done)
     }
 
@@ -1574,6 +1675,11 @@ impl Inner {
                 );
                 return Ok(());
             }
+            // Admission: a compaction slot, then its input and output
+            // buffers (each at most the input size) from the budget. Both
+            // wait rather than fail; a stale plan is caught by the rebase.
+            let _slot = self.admission.compaction_slot().await;
+            let _buffers = self.admission.reserve(input_bytes.saturating_mul(2)).await;
             let output = compact(&namespace.opener, runs, range, &self.config.part_options)
                 .await
                 .map_err(transient)?;
