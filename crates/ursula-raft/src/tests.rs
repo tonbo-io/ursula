@@ -2752,3 +2752,48 @@ async fn openraft_snapshot_carries_feature_level() {
         .expect("install snapshot");
     assert_eq!(target.engine.feature_level(), 1);
 }
+
+/// F1 follow-up: a forwarded read carries the continuation anchor to the
+/// leader over gRPC, so a follower's SSE or record read continues from it;
+/// a request from an older follower (no field) decodes with no anchor.
+#[test]
+fn forwarded_reads_carry_the_record_anchor_over_grpc() {
+    use prost::Message;
+
+    let request = ursula_runtime::ReadStreamRequest {
+        stream_id: bsid("anchor-forward"),
+        offset: 0,
+        max_len: 4096,
+        now_ms: 77,
+        record: Some(1_234),
+        max_records: Some(5),
+        leader_only: false,
+        record_anchor: Some(ursula_runtime::RecordAnchor {
+            incarnation: 42,
+            record: 1_234,
+            offset: 987_654,
+        }),
+    };
+    let wire = crate::forward::read_stream_read_v1(&request)
+        .expect("wire read")
+        .encode_to_vec();
+    let decoded =
+        crate::raft_internal_proto::ReadStreamReadV1::decode(wire.as_slice()).expect("decode");
+    let served = crate::grpc::read_stream_request_from_v1(request.stream_id.clone(), 77, decoded)
+        .expect("served request");
+    assert_eq!(served, request);
+
+    let legacy = crate::raft_internal_proto::ReadStreamReadV1 {
+        offset: 0,
+        max_len: 4096,
+        record: Some(1_234),
+        max_records: Some(5),
+        record_anchor: None,
+    }
+    .encode_to_vec();
+    let decoded =
+        crate::raft_internal_proto::ReadStreamReadV1::decode(legacy.as_slice()).expect("decode");
+    let served = crate::grpc::read_stream_request_from_v1(request.stream_id.clone(), 77, decoded)
+        .expect("served request");
+    assert_eq!(served.record_anchor, None);
+}

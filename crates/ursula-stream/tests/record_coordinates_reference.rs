@@ -1364,7 +1364,10 @@ mod sparse_marks_differential {
         // Retain to record 10 of 16, the external's first: past every hot
         // byte, so nothing hot remains below the external's records.
         harness.retain(625);
-        assert_eq!(harness.machine.hot_start_offset(&harness.stream), harness.oracle.next_offset());
+        assert_eq!(
+            harness.machine.hot_start_offset(&harness.stream),
+            harness.oracle.next_offset()
+        );
         let gauges = harness.machine.state_gauges();
         assert_eq!(
             gauges.dense_record_entries, 0,
