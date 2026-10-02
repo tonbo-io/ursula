@@ -6,6 +6,8 @@
 //!   page ranges.
 //! - [`catalog`]: dynamic index registrations shared by a worker pool.
 //! - [`index`]: the S3-authoritative ingest/flush/query/compact/GC engine.
+//! - [`keyed`]: the `keyed-batch-v1` record format (validator and parser) and
+//!   the reference fold of keyed state.
 //! - [`manifest`]: the conditionally published manifest state model.
 //! - [`object_store`]: conditional object operations for S3 and local tests.
 //! - [`part`]: immutable sorted Parquet parts.
@@ -16,6 +18,7 @@
 mod cache;
 mod catalog;
 mod index;
+pub mod keyed;
 mod manifest;
 mod object_store;
 mod part;

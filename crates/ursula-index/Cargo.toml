@@ -18,6 +18,7 @@ anyhow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 axum = { workspace = true }
+base64 = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
@@ -28,7 +29,7 @@ parquet = { workspace = true }
 opendal = { workspace = true, features = ["services-s3"] }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
@@ -40,4 +41,5 @@ workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true }
+proptest = { workspace = true }
 tower = { workspace = true, features = ["util"] }
