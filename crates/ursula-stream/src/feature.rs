@@ -18,8 +18,11 @@
 //!   bounded-state Lb1 — C7 unique stream incarnation (`created_at_ms`
 //!   strictly increases per group), C8 apply-time reservation of the
 //!   `keyed-state` stream name, F14a/F14g incarnation-scoped cold objects and
-//!   stream GC, and creation of `application/json; profile=keyed-batch-v1`
-//!   streams.
+//!   stream GC, creation of `application/json; profile=keyed-batch-v1`
+//!   streams, F3 producer-state bounds (a 1,024-item receipt window beyond
+//!   each producer's newest receipt, duplicates beyond it deduplicated
+//!   without ranges, 7-day idle-producer expiry), F4a message-record
+//!   collapse at every cold transition, and `TidyStream`.
 //!
 //! Later core-track changes (C1, C3, C4, C6, U22) take the next levels in
 //! release order.

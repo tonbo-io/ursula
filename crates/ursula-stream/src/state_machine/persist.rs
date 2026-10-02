@@ -260,7 +260,8 @@ impl StreamStateMachine {
             if machine.registry.contains_key(&stream_id) {
                 return Err(StreamSnapshotError::DuplicateStream(stream_id));
             }
-            let producer_states = restore_producer_states(&stream_id, entry.producer_states)?;
+            let producer_states =
+                restore_producer_states(&stream_id, entry.producer_states, snapshot.feature_level)?;
             let visible_snapshot = entry.visible_snapshot.map(|mut snapshot| {
                 if snapshot.digest.is_empty() {
                     snapshot.digest =
@@ -289,6 +290,7 @@ impl StreamStateMachine {
                 integrity,
                 retained_offset,
                 visible_snapshot,
+                receipt_window: super::producers::ReceiptWindow::rebuild(&producer_states),
                 producers: producer_states,
                 append_count: 0,
             };
@@ -370,7 +372,8 @@ fn producer_snapshot(states: &HashMap<String, ProducerState>) -> Vec<ProducerSna
             last_next_offset: state.last_next_offset,
             last_closed: state.last_closed,
             last_items: state.last_items.clone(),
-            receipts: state.receipts.clone(),
+            receipts: state.receipts.iter().cloned().collect(),
+            last_seen_ms: state.last_seen_ms,
         })
         .collect::<Vec<_>>();
     producer_states.sort_by(|left, right| left.producer_id.cmp(&right.producer_id));
@@ -380,10 +383,15 @@ fn producer_snapshot(states: &HashMap<String, ProducerState>) -> Vec<ProducerSna
 fn restore_producer_states(
     stream_id: &BucketStreamId,
     snapshots: Vec<ProducerSnapshot>,
+    feature_level: u32,
 ) -> Result<HashMap<String, ProducerState>, StreamSnapshotError> {
     let mut states = HashMap::with_capacity(snapshots.len());
     for snapshot in snapshots {
-        let receipts = if snapshot.receipts.is_empty() {
+        // Only level-0 snapshots synthesize a receipt from `last_*`; at level
+        // 1 an empty list restores as empty, as a live replica holds it (F3).
+        let receipts = if snapshot.receipts.is_empty()
+            && feature_level < crate::feature::FEATURE_LEVEL_KEYED_STREAMS
+        {
             vec![ProducerReceipt {
                 producer_seq: snapshot.producer_seq,
                 start_offset: snapshot.last_start_offset,
@@ -402,7 +410,8 @@ fn restore_producer_states(
                 last_next_offset: snapshot.last_next_offset,
                 last_closed: snapshot.last_closed,
                 last_items: snapshot.last_items,
-                receipts,
+                receipts: receipts.into(),
+                last_seen_ms: snapshot.last_seen_ms,
             })
             .is_some()
         {

@@ -80,6 +80,8 @@ use crate::request::SetBucketQuotaRequest;
 use crate::request::SetBucketQuotaResponse;
 use crate::request::SetFeatureLevelRequest;
 use crate::request::SetFeatureLevelResponse;
+use crate::request::TidyStreamsRequest;
+use crate::request::TidyStreamsResponse;
 use crate::request::UpdateStreamAttrsRequest;
 use crate::request::UpdateStreamAttrsResponse;
 use crate::rt::sync::Semaphore;
@@ -1225,6 +1227,25 @@ impl CoreWorker {
                 elapsed_ns(exec_started_at),
             );
         }
+        response
+    }
+
+    pub(crate) async fn tidy_streams(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        request: TidyStreamsRequest,
+        placement: ShardPlacement,
+    ) -> Result<TidyStreamsResponse, RuntimeError> {
+        let exec_started_at = Instant::now();
+        let response = group
+            .tidy_streams(request, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err));
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(exec_started_at),
+        );
         response
     }
 

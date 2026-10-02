@@ -164,6 +164,16 @@ pub enum StreamCommand {
     SetFeatureLevel {
         level: u32,
     },
+    /// Bounded normalization of one stream's replicated state (bounded-state
+    /// F0 `TidyStream`, feature level 1): collapses message records below
+    /// the seal point (F4a), stamps and expires idle producers and trims the
+    /// receipt window (F3). Each command does bounded work; a leader-side
+    /// driver repeats it while debt remains. Idempotent. Appended last so
+    /// older variants keep their serialized positions.
+    TidyStream {
+        stream_id: BucketStreamId,
+        now_ms: u64,
+    },
 }
 
 impl fmt::Display for StreamCommand {
@@ -250,6 +260,7 @@ impl fmt::Display for StreamCommand {
                 write!(f, "set_bucket_quota:{bucket_id}")
             }
             Self::SetFeatureLevel { level } => write!(f, "set_feature_level:{level}"),
+            Self::TidyStream { stream_id, .. } => write!(f, "tidy_stream:{stream_id}"),
         }
     }
 }

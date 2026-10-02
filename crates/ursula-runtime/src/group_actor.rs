@@ -69,6 +69,8 @@ use crate::request::SetBucketQuotaRequest;
 use crate::request::SetBucketQuotaResponse;
 use crate::request::SetFeatureLevelRequest;
 use crate::request::SetFeatureLevelResponse;
+use crate::request::TidyStreamsRequest;
+use crate::request::TidyStreamsResponse;
 use crate::request::UpdateStreamAttrsRequest;
 use crate::request::UpdateStreamAttrsResponse;
 use crate::rt::sync::Semaphore;

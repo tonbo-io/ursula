@@ -107,6 +107,8 @@ use crate::request::SetBucketQuotaRequest;
 use crate::request::SetBucketQuotaResponse;
 use crate::request::SetFeatureLevelRequest;
 use crate::request::SetFeatureLevelResponse;
+use crate::request::TidyStreamsRequest;
+use crate::request::TidyStreamsResponse;
 use crate::request::UpdateStreamAttrsRequest;
 use crate::request::UpdateStreamAttrsResponse;
 use crate::rt::sync::Semaphore;
@@ -832,6 +834,45 @@ impl ShardRuntime {
             ));
         }
         responses
+    }
+
+    /// One leader-side `TidyStream` pass over every Raft group
+    /// (bounded-state F0): each group this node leads proposes `TidyStream`
+    /// for at most `max_streams_per_group` streams with normalization debt.
+    /// A failing group does not stop the others; the first error is
+    /// returned after every group had its pass.
+    pub async fn tidy_streams_all_groups_once(
+        &self,
+        max_streams_per_group: usize,
+        now_ms: u64,
+    ) -> Result<TidyStreamsResponse, RuntimeError> {
+        let mut total = TidyStreamsResponse::default();
+        let mut first_error = None;
+        for group_id in 0..self.shard_map.raft_group_count() {
+            let request = TidyStreamsRequest {
+                max_streams: max_streams_per_group,
+                now_ms,
+            };
+            match self.tidy_streams(RaftGroupId(group_id), request).await {
+                Ok(report) => {
+                    total.tidied = total.tidied.saturating_add(report.tidied);
+                    total.debt_remaining =
+                        total.debt_remaining.saturating_add(report.debt_remaining);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        raft_group_id = group_id,
+                        error = %err,
+                        "tidy pass failed; continuing with remaining groups"
+                    );
+                    first_error.get_or_insert(err);
+                }
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(total),
+        }
     }
 
     pub async fn flush_cold_all_groups_once(
@@ -1771,7 +1812,7 @@ async fn list_cold_index_page_ids(
 }
 
 #[cfg(not(madsim))]
-fn unix_time_ms() -> u64 {
+pub(crate) fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
@@ -1779,7 +1820,7 @@ fn unix_time_ms() -> u64 {
 }
 
 #[cfg(madsim)]
-fn unix_time_ms() -> u64 {
+pub(crate) fn unix_time_ms() -> u64 {
     0
 }
 

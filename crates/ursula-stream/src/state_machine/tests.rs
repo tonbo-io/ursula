@@ -398,6 +398,7 @@ fn appended(offset: u64, next_offset: u64) -> StreamResponse {
         closed: false,
         deduplicated: false,
         producer: None,
+        receipt_evicted: false,
     }
 }
 
@@ -415,6 +416,7 @@ fn appended_by(
         closed,
         deduplicated,
         producer: Some(producer),
+        receipt_evicted: false,
     }
 }
 
@@ -2541,6 +2543,7 @@ fn producer_snapshot(epoch: u64) -> ProducerSnapshot {
         last_closed: false,
         last_items: Vec::new(),
         receipts: Vec::new(),
+        last_seen_ms: None,
     }
 }
 
@@ -2625,6 +2628,7 @@ fn close_is_monotonic_and_close_only_is_idempotent() {
             closed: true,
             deduplicated: false,
             producer: None,
+            receipt_evicted: false,
         }
     );
     assert_eq!(
@@ -3113,6 +3117,7 @@ fn append_conflict_precedence_reports_closed_before_mismatch_or_seq() {
             closed: true,
             deduplicated: false,
             producer: None,
+            receipt_evicted: false,
         }
     );
 

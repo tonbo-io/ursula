@@ -1596,7 +1596,11 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
 pub(crate) fn append_http_response(response: AppendResponse) -> Response {
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
-    insert_offset(&mut headers, response.next_offset);
+    // A duplicate beyond the receipt window (bounded-state F3) is answered
+    // `204` with `Producer-Seq` and without byte or record ranges.
+    if !response.receipt_evicted {
+        insert_offset(&mut headers, response.next_offset);
+    }
     insert_producer_ack(&mut headers, response.producer.as_ref());
     if let Some(record_range) = response.record_range {
         insert_record_operation_headers(&mut headers, record_range);

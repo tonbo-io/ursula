@@ -61,6 +61,8 @@ use super::GroupSetBucketQuotaFuture;
 use super::GroupSetFeatureLevelFuture;
 use super::GroupSnapshotFuture;
 use super::GroupStateGaugesFuture;
+use super::GroupTidyStreamFuture;
+use super::GroupTidyStreamsFuture;
 use super::GroupTouchStreamAccessFuture;
 use super::GroupUpdateStreamAttrsFuture;
 use super::GroupWriteResponse;
@@ -132,6 +134,8 @@ use crate::request::SetBucketQuotaResponse;
 use crate::request::SetFeatureLevelRequest;
 use crate::request::SetFeatureLevelResponse;
 use crate::request::StreamAppendCount;
+use crate::request::TidyStreamsRequest;
+use crate::request::TidyStreamsResponse;
 use crate::request::TouchStreamAccessResponse;
 use crate::request::UpdateStreamAttrsRequest;
 use crate::request::UpdateStreamAttrsResponse;
@@ -343,6 +347,34 @@ impl InMemoryGroupEngine {
                 .map_err(stream_response_error)?;
             let old_commit_index = self.commit_index;
             let old_append_count = self.state_machine.stream_append_count(&stream_id);
+            if batch.receipt_evicted {
+                // F3: a duplicate beyond the receipt window, answered once
+                // for the whole batch and without ranges.
+                let tail = self
+                    .state_machine
+                    .head(&stream_id)
+                    .map_or(0, |head| head.tail_offset);
+                return Ok(GroupWriteResponse::AppendBatch(GroupAppendBatchResponse {
+                    placement,
+                    items: vec![Ok(AppendResponse {
+                        placement,
+                        start_offset: tail,
+                        next_offset: tail,
+                        stream_append_count: old_append_count,
+                        group_commit_index: old_commit_index,
+                        closed: false,
+                        deduplicated: true,
+                        producer: None,
+                        record_range: None,
+                        stream_hot_bytes: self
+                            .state_machine
+                            .hot_payload_len(&stream_id)
+                            .unwrap_or(0),
+                        group_hot_bytes: self.state_machine.total_hot_payload_bytes(),
+                        receipt_evicted: true,
+                    })],
+                }));
+            }
             if !batch.deduplicated {
                 let count = u64::try_from(batch.items.len()).expect("item count fits u64");
                 self.commit_index += count;
@@ -387,6 +419,7 @@ impl InMemoryGroupEngine {
                             })?,
                         stream_hot_bytes,
                         group_hot_bytes,
+                        receipt_evicted: false,
                     })
                 })
                 .collect();
@@ -472,12 +505,17 @@ impl InMemoryGroupEngine {
                 closed,
                 deduplicated,
                 producer,
+                receipt_evicted,
             } => {
                 let stream_id = require_response_stream_id(stream_id, "appended")?;
-                let record_range = self
-                    .state_machine
-                    .record_range_for_append(&stream_id, offset, next_offset, producer.as_ref())
-                    .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?;
+                // F3: an evicted duplicate never gets a recomputed range.
+                let record_range = if receipt_evicted {
+                    None
+                } else {
+                    self.state_machine
+                        .record_range_for_append(&stream_id, offset, next_offset, producer.as_ref())
+                        .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?
+                };
                 let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
                 let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
                 if !deduplicated {
@@ -497,6 +535,7 @@ impl InMemoryGroupEngine {
                     record_range,
                     stream_hot_bytes,
                     group_hot_bytes,
+                    receipt_evicted,
                 }))
             }
             StreamResponse::SnapshotPublished {
@@ -521,6 +560,17 @@ impl InMemoryGroupEngine {
                     placement,
                     group_commit_index: self.commit_index,
                 }))
+            }
+            StreamResponse::StreamTidied { debt_remaining } => {
+                require_response_stream_id(stream_id, "tidied")?;
+                self.commit_index += 1;
+                Ok(GroupWriteResponse::TidyStream(
+                    crate::request::TidyStreamResponse {
+                        placement,
+                        debt_remaining,
+                        group_commit_index: self.commit_index,
+                    },
+                ))
             }
             StreamResponse::FeatureLevelSet {
                 level,
@@ -912,14 +962,18 @@ impl InMemoryGroupEngine {
                 closed,
                 deduplicated,
                 producer,
-                ..
+                receipt_evicted,
             } => {
                 let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
                 let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
-                let record_range = self
-                    .state_machine
-                    .record_range_for_append(&stream_id, offset, next_offset, producer.as_ref())
-                    .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?;
+                // F3: an evicted duplicate never gets a recomputed range.
+                let record_range = if receipt_evicted {
+                    None
+                } else {
+                    self.state_machine
+                        .record_range_for_append(&stream_id, offset, next_offset, producer.as_ref())
+                        .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?
+                };
                 if !deduplicated {
                     self.commit_index += 1;
                     self.state_machine.add_stream_append_count(&stream_id, 1);
@@ -937,6 +991,7 @@ impl InMemoryGroupEngine {
                     record_range,
                     stream_hot_bytes,
                     group_hot_bytes,
+                    receipt_evicted,
                 })
             }
             StreamResponse::Error {
@@ -1118,6 +1173,12 @@ impl InMemoryGroupEngine {
     /// `bounded-stream-state.md`). Public so the Raft engine can serve them.
     pub fn state_gauges(&self) -> ursula_stream::GroupStateGauges {
         self.state_machine.state_gauges()
+    }
+
+    /// Streams with `TidyStream` debt (bounded-state F0), for the leader's
+    /// tidy driver. Public so the Raft engine can serve it.
+    pub fn tidy_candidates(&self, now_ms: u64, limit: usize) -> Vec<BucketStreamId> {
+        self.state_machine.tidy_candidates(now_ms, limit)
     }
 
     pub fn head_stream_after_access(
@@ -1730,6 +1791,43 @@ impl GroupEngine for InMemoryGroupEngine {
 
     fn state_gauges<'a>(&'a mut self, _placement: ShardPlacement) -> GroupStateGaugesFuture<'a> {
         Box::pin(async move { Ok(self.state_machine.state_gauges()) })
+    }
+
+    fn tidy_stream<'a>(
+        &'a mut self,
+        stream_id: BucketStreamId,
+        now_ms: u64,
+        placement: ShardPlacement,
+    ) -> GroupTidyStreamFuture<'a> {
+        Box::pin(async move {
+            let command = GroupWriteCommand::from(StreamCommand::TidyStream { stream_id, now_ms });
+            match self.apply_committed_write(command, placement)? {
+                GroupWriteResponse::TidyStream(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected tidy stream write response: {other:?}"
+                ))),
+            }
+        })
+    }
+
+    fn tidy_streams<'a>(
+        &'a mut self,
+        request: TidyStreamsRequest,
+        placement: ShardPlacement,
+    ) -> GroupTidyStreamsFuture<'a> {
+        Box::pin(async move {
+            let mut report = TidyStreamsResponse::default();
+            for stream_id in self.tidy_candidates(request.now_ms, request.max_streams) {
+                let response = self
+                    .tidy_stream(stream_id, request.now_ms, placement)
+                    .await?;
+                report.tidied = report.tidied.saturating_add(1);
+                if response.debt_remaining {
+                    report.debt_remaining = report.debt_remaining.saturating_add(1);
+                }
+            }
+            Ok(report)
+        })
     }
 
     fn set_feature_level<'a>(
@@ -2455,7 +2553,8 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::FlushCold { stream_id, .. }
         | StreamCommand::CompactCold { stream_id, .. }
         | StreamCommand::Close { stream_id, .. }
-        | StreamCommand::DeleteStream { stream_id } => Some(stream_id.clone()),
+        | StreamCommand::DeleteStream { stream_id }
+        | StreamCommand::TidyStream { stream_id, .. } => Some(stream_id.clone()),
     }
 }
 

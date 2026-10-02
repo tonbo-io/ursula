@@ -399,6 +399,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             record_range: None,
             stream_hot_bytes: 3,
             group_hot_bytes: 3,
+            receipt_evicted: false,
         })
     );
 
@@ -4516,6 +4517,7 @@ impl GroupEngine for RecordingEngine {
                 record_range: None,
                 stream_hot_bytes: 0,
                 group_hot_bytes: 0,
+                receipt_evicted: false,
             })
         })
     }
@@ -4553,6 +4555,7 @@ impl GroupEngine for RecordingEngine {
                     record_range: None,
                     stream_hot_bytes: 0,
                     group_hot_bytes: 0,
+                    receipt_evicted: false,
                 }));
             }
             Ok(GroupAppendBatchResponse { placement, items })

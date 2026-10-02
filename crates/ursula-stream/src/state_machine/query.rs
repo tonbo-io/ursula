@@ -69,8 +69,12 @@ impl StreamStateMachine {
         };
         if let Some(producer) = producer
             && let Some(record) = slot.producers.get(&producer.producer_id).and_then(|state| {
-                state.last_items.iter().find(|item| {
-                    item.start_offset == start_offset && item.next_offset == next_offset
+                // The newest receipt's items (F3 keeps it at every level;
+                // level 0 also mirrors it in `last_items`).
+                state.receipts.back().and_then(|receipt| {
+                    receipt.items.iter().find(|item| {
+                        item.start_offset == start_offset && item.next_offset == next_offset
+                    })
                 })
             })
             && let (Some(first_record), Some(next_record)) =
