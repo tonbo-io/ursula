@@ -4,8 +4,8 @@
 // >1 KiB kinds and keys on the digest path, with random reopen.
 import { type DocumentRecord, MemoryStorage, type Storage, type StorageWrite } from "@earendil-works/pi-durable";
 import { expect, it } from "vitest";
-import { ctx, FakeUrsula, freshPath, openOn } from "./helpers.ts";
-import { reopen, rng, trials } from "./fuzz-util.ts";
+import { ctx, freshPath, openOn } from "./helpers.ts";
+import { type OwnerVariant, reopen, rng, trials, VARIANTS } from "./fuzz-util.ts";
 
 type Scope = DocumentRecord["scope"];
 const SCOPES: { scope: Scope; history?: "latest" | "rewindable"; fork?: string }[] = [
@@ -18,14 +18,14 @@ const SCOPES: { scope: Scope; history?: "latest" | "rewindable"; fork?: string }
 const KINDS = ["a", "a\u0000z", "\ud800", "D".repeat(1200)];
 const KEYS = [undefined, "", "\u0000", "k", "k\u0000z", "/very/long/path/".repeat(80), "/very/long/path/".repeat(80) + "x"];
 
-async function runSeed(seed: number, rounds: number): Promise<string[]> {
+async function runSeed(seed: number, rounds: number, variant: OwnerVariant): Promise<string[]> {
 	const { rnd, pick } = rng(seed);
 	const divergences: string[] = [];
 	for (let trial = 0; trial < rounds && divergences.length === 0; trial++) {
-		const fake = new FakeUrsula();
+		const fake = variant.fake();
 		const path = freshPath();
 		const memory = new MemoryStorage();
-		let ursula = await openOn(fake, path);
+		let ursula = await openOn(fake, path, variant.options);
 		const seqPairs: [number, number][] = [];
 		const setup: StorageWrite[] = [
 			{ type: "conversation", value: { id: 1 } as never },
@@ -93,7 +93,7 @@ async function runSeed(seed: number, rounds: number): Promise<string[]> {
 				break;
 			}
 			if (ms !== undefined && us !== undefined) seqPairs.push([ms, us]);
-			if (rnd() < 0.3) ursula = await reopen(fake, path, ursula, rnd() < 0.5);
+			if (rnd() < 0.3) ursula = await reopen(fake, path, ursula, rnd() < 0.5, variant.options);
 			const toMem = (u: number) => seqPairs.find(([, x]) => x === u)?.[0] ?? `?${u}`;
 			const fixRec = (r: DocumentRecord | undefined) =>
 				r === undefined ? r : { ...r, createdAt: toMem(r.createdAt), ...(r.retiredAt !== undefined ? { retiredAt: toMem(r.retiredAt) } : {}) };
@@ -144,8 +144,12 @@ async function runSeed(seed: number, rounds: number): Promise<string[]> {
 	return divergences;
 }
 
-for (const seed of [1, 2, 3]) {
-	it(`document fuzz seed ${seed}: 0 divergences vs MemoryStorage`, async () => {
-		expect(await runSeed(seed, trials("FUZZ_DOC_TRIALS", 80))).toEqual([]);
-	});
+// Seeds 1–3 run the default (bounded) owner; the other variants run with fewer trials.
+for (const [i, variant] of VARIANTS.entries()) {
+	for (const seed of i === 0 ? [1, 2, 3] : [10 * i + 1]) {
+		it(`document fuzz seed ${seed} (${variant.name}): 0 divergences vs MemoryStorage`, async () => {
+			const n = trials("FUZZ_DOC_TRIALS", 80);
+			expect(await runSeed(seed, Math.ceil(n * variant.share), variant)).toEqual([]);
+		});
+	}
 }

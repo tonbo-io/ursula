@@ -4,8 +4,8 @@
 // (graceful and crash takeover).
 import { MemoryStorage, type Storage, type StorageWrite } from "@earendil-works/pi-durable";
 import { expect, it } from "vitest";
-import { ctx, FakeUrsula, freshPath, openOn } from "./helpers.ts";
-import { reopen, rng, trials } from "./fuzz-util.ts";
+import { ctx, freshPath, openOn } from "./helpers.ts";
+import { type OwnerVariant, reopen, rng, trials, VARIANTS } from "./fuzz-util.ts";
 
 const CONVS = [1, 2];
 const KINDS = ["k1", "k", "\ud800", "k\u0000x", "k\u0000", "L".repeat(1100), "L".repeat(1099) + "\ud800"];
@@ -15,7 +15,7 @@ const REQS = ["a", "b", "\ud801", "R".repeat(2000), "R".repeat(1999) + "S", unde
 const TSTAT = ["pending", "running", "waiting", "completing", "terminal"] as const;
 const SSTAT = ["queued", "placed", "done", "unanswered"] as const;
 
-async function runSeed(seed: number, rounds: number): Promise<string[]> {
+async function runSeed(seed: number, rounds: number, variant: OwnerVariant): Promise<string[]> {
 	const { rnd, pick } = rng(seed);
 	const task = (id: number): StorageWrite => {
 		const status = pick(TSTAT);
@@ -80,10 +80,10 @@ async function runSeed(seed: number, rounds: number): Promise<string[]> {
 
 	const divergences: string[] = [];
 	for (let trial = 0; trial < rounds && divergences.length === 0; trial++) {
-		const fake = new FakeUrsula();
+		const fake = variant.fake();
 		const path = freshPath();
 		const memory = new MemoryStorage();
-		let ursula = await openOn(fake, path);
+		let ursula = await openOn(fake, path, variant.options);
 		const setup: StorageWrite[] = [
 			{ type: "conversation", value: { id: 1 } as never },
 			{ type: "conversation", value: { id: 2 } as never },
@@ -112,7 +112,7 @@ async function runSeed(seed: number, rounds: number): Promise<string[]> {
 				divergences.push(`seed ${seed} trial ${trial} step ${step}: commit outcome memory=${me} ursula=${mo}`);
 				break;
 			}
-			if (rnd() < 0.3) ursula = await reopen(fake, path, ursula, rnd() < 0.5);
+			if (rnd() < 0.3) ursula = await reopen(fake, path, ursula, rnd() < 0.5, variant.options);
 			const a = await snapshot(memory);
 			const b = await snapshot(ursula);
 			if (a !== b) {
@@ -130,8 +130,12 @@ async function runSeed(seed: number, rounds: number): Promise<string[]> {
 	return divergences;
 }
 
-for (const seed of [1, 2, 3]) {
-	it(`table fuzz seed ${seed}: 0 divergences vs MemoryStorage`, async () => {
-		expect(await runSeed(seed, trials("FUZZ_TABLE_TRIALS", 150))).toEqual([]);
-	});
+// Seeds 1–3 run the default (bounded) owner; the other variants run with fewer trials.
+for (const [i, variant] of VARIANTS.entries()) {
+	for (const seed of i === 0 ? [1, 2, 3] : [10 * i + 1]) {
+		it(`table fuzz seed ${seed} (${variant.name}): 0 divergences vs MemoryStorage`, async () => {
+			const n = trials("FUZZ_TABLE_TRIALS", 150);
+			expect(await runSeed(seed, Math.ceil(n * variant.share), variant)).toEqual([]);
+		});
+	}
 }
