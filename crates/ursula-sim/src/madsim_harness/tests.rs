@@ -1819,3 +1819,224 @@ fn smoke_corpus_replays() {
         record.assert_replays();
     }
 }
+
+/// Bounded-state Invariant 12 (§7.4): after the same log prefix every
+/// replica holds the same producers, receipt windows and newest
+/// acknowledgements, whether it replayed the log or installed a snapshot.
+/// A learner installs a level-1 snapshot taken mid-stream (receipt window
+/// already evicting), then every replica applies the same suffix.
+#[test]
+fn producer_state_matches_after_snapshot_install_mid_stream() {
+    let _guard = sim_test_guard();
+    let producer_states = run_with_madsim(1_212, async {
+        let policy = sim_network_policy();
+        let (registry, mut engines, leader_id) =
+            build_lagging_learner_snapshot_cluster(policy).await;
+        let leader_index = usize::try_from(leader_id - 1).expect("leader id fits usize");
+        let learner_id = 3;
+        let learner_index = usize::try_from(learner_id - 1).expect("learner id fits usize");
+        let stream = BucketStreamId::new("simulated", "producers");
+
+        engines[leader_index]
+            .set_feature_level(SetFeatureLevelRequest { level: 1 }, placement())
+            .await
+            .expect("raise feature level");
+        engines[leader_index]
+            .create_stream(
+                CreateStreamRequest::new(stream.clone(), "application/octet-stream"),
+                placement(),
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("create stream");
+        let append = |seq: u64, producer_id: &str, now_ms: u64| {
+            let mut request = AppendRequest::from_bytes(stream.clone(), b"rec".to_vec());
+            request.producer = Some(ProducerRequest {
+                producer_id: producer_id.to_owned(),
+                producer_epoch: 1,
+                producer_seq: seq,
+            });
+            request.now_ms = now_ms;
+            request
+        };
+        // Prefix: "quiet" writes twice, "busy" fills and overflows the
+        // window, so the snapshot carries evicted state.
+        let mut last_index = 0;
+        for seq in 0..2 {
+            last_index = engines[leader_index]
+                .append(
+                    append(seq, "quiet", 5),
+                    placement(),
+                    ColdWriteAdmission::default(),
+                )
+                .await
+                .expect("quiet append")
+                .group_commit_index;
+        }
+        for seq in 0..1_100 {
+            last_index = engines[leader_index]
+                .append(
+                    append(seq, "busy", 10 + seq),
+                    placement(),
+                    ColdWriteAdmission::default(),
+                )
+                .await
+                .expect("busy append")
+                .group_commit_index;
+        }
+        // Raft log index of the prefix (the engine's commit index counts
+        // mutations only).
+        let leader = engines[leader_index].raft_handle();
+        last_index = last_index.max(
+            openraft::rt::WatchReceiver::borrow_watched(&leader.metrics())
+                .last_applied
+                .map(|log_id| log_id.index)
+                .expect("leader applied index"),
+        );
+        for engine in &engines[..2] {
+            engine
+                .raft_handle()
+                .wait(Some(Duration::from_secs(10)))
+                .applied_index_at_least(Some(last_index), "voters applied prefix")
+                .await
+                .expect("wait for voter apply");
+        }
+        leader.trigger().snapshot().await.expect("trigger snapshot");
+        leader
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |metrics| {
+                    metrics
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|log_id| log_id.index() >= last_index)
+                },
+                "leader snapshot covers prefix",
+            )
+            .await
+            .expect("wait for snapshot");
+        leader
+            .trigger()
+            .purge_log(last_index)
+            .await
+            .expect("purge log");
+        leader
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |metrics| {
+                    metrics
+                        .purged
+                        .as_ref()
+                        .is_some_and(|log_id| log_id.index() >= last_index)
+                },
+                "leader purged prefix",
+            )
+            .await
+            .expect("wait for purge");
+
+        registry.register(learner_id, engines[learner_index].raft_handle());
+        let added = leader
+            .add_learner(learner_id, BasicNode::new("node-3"), true)
+            .await
+            .expect("add learner");
+        assert!(added.log_id.index() >= last_index);
+        assert!(
+            registry.full_snapshot_count(learner_id) >= 1,
+            "learner must catch up through a full snapshot"
+        );
+
+        // Suffix after the install: more window churn, a retry of the
+        // newest sequence, a duplicate beyond the window and an idle
+        // expiry; every replica applies it from its own state.
+        for seq in 1_100..1_300 {
+            last_index = engines[leader_index]
+                .append(
+                    append(seq, "busy", 10 + seq),
+                    placement(),
+                    ColdWriteAdmission::default(),
+                )
+                .await
+                .expect("busy suffix append")
+                .group_commit_index;
+        }
+        let newest = engines[leader_index]
+            .append(
+                append(1, "quiet", 2_000),
+                placement(),
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("quiet retry");
+        assert!(newest.deduplicated && !newest.receipt_evicted);
+        let evicted = engines[leader_index]
+            .append(
+                append(3, "busy", 2_000),
+                placement(),
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("evicted retry");
+        assert!(evicted.deduplicated && evicted.receipt_evicted);
+        let idle_at = 5 + 7 * 24 * 60 * 60 * 1_000;
+        engines[leader_index]
+            .append(
+                append(0, "quiet", idle_at),
+                placement(),
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("quiet after idle expiry");
+        // Wait on the leader's applied Raft log index, which covers every
+        // entry above (the engine's commit index counts mutations only).
+        let leader_applied = openraft::rt::WatchReceiver::borrow_watched(&leader.metrics())
+            .last_applied
+            .map(|log_id| log_id.index)
+            .expect("leader applied index");
+        last_index = leader_applied;
+        for engine in &engines {
+            engine
+                .raft_handle()
+                .wait(Some(Duration::from_secs(10)))
+                .applied_index_at_least(Some(last_index), "every replica applied suffix")
+                .await
+                .expect("wait for replica apply");
+        }
+        let mut producer_states = Vec::new();
+        for engine in &engines {
+            let snapshot = engine
+                .sim_local_group_snapshot()
+                .await
+                .expect("local group snapshot");
+            producer_states.push(
+                snapshot
+                    .stream_snapshot
+                    .streams
+                    .into_iter()
+                    .map(|entry| entry.producer_states)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        producer_states
+    });
+    assert_eq!(producer_states.len(), 3);
+    assert_eq!(producer_states[0], producer_states[1]);
+    assert_eq!(producer_states[0], producer_states[2]);
+    let stream = &producer_states[0][0];
+    let busy = stream
+        .iter()
+        .find(|producer| producer.producer_id == "busy")
+        .expect("busy producer");
+    let items: usize = stream
+        .iter()
+        .flat_map(|producer| producer.receipts.iter())
+        .map(|receipt| receipt.items.len().max(1))
+        .sum();
+    assert!(items <= 1_024, "receipt items {items}");
+    assert_eq!(busy.receipts.last().map(|r| r.producer_seq), Some(1_299));
+    let quiet = stream
+        .iter()
+        .find(|producer| producer.producer_id == "quiet")
+        .expect("quiet producer");
+    assert_eq!(quiet.receipts.len(), 1, "quiet restarted after idle expiry");
+    assert_eq!(quiet.last_seen_ms, Some(5 + 7 * 24 * 60 * 60 * 1_000));
+}
