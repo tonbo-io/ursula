@@ -121,7 +121,7 @@ jobs:
           npm test
 
   typescript-e2e:
-    name: TypeScript owner e2e (single-node ursula)
+    name: TypeScript owner e2e (single-node ursula + keyed indexer)
     runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
     steps:
       - name: Checkout
@@ -140,8 +140,13 @@ jobs:
       - name: Build ursula
         run: cargo build --release -p ursula --bin ursula
 
-      - name: Pi conformance and open/claim/fencing against a real node
+      # The global setup starts `ursula server` with `server.keyed_state_upstream` pointing at a
+      # keyed-mode `ursula indexer` (filesystem object store, source = the node), raises the
+      # feature level to 1, and the suite runs the bounded owner (LocalStore over keyed-state):
+      # Pi conformance 23 x {direct, reopen} x both open modes, open/claim/fencing, takeover and
+      # indexer-restart scenarios.
+      - name: Pi conformance, takeover and indexer restart against the real keyed stack
         run: |
           cd clients/pi-durable-ursula
           npm ci
-          URSULA_BIN="$GITHUB_WORKSPACE/target/release/ursula" npm run test:e2e
+          URSULA_BIN="$GITHUB_WORKSPACE/target/release/ursula" E2E_STATE_STORE=bounded npm run test:e2e
