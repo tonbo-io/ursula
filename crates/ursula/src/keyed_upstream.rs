@@ -29,12 +29,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use std::time::Instant;
 
 use axum::body::Bytes;
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use futures_util::future::join_all;
+use tokio::time::Instant;
 
 /// How often the prober looks for unhealthy pods whose backoff elapsed.
 const PROBE_TICK: Duration = Duration::from_millis(200);
