@@ -284,6 +284,7 @@ fn retention_into_sealed_history_lands_on_the_mark_at_or_below() {
         offset: MIB
     });
     index.validate(MIB, tail).unwrap();
+    assert!(index.marks_capacity() <= 2 * index.marks().len() + 64);
     // A mark retains exactly; ordinals never change.
     assert_eq!(index.retain_from_offset(2 * MIB, tail), Ok(8));
     assert_eq!(index.offset_for(9, tail).unwrap().upper_bound(), tail);

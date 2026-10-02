@@ -302,7 +302,7 @@ pub struct StreamReadPlan {
     /// window around the requested records, and materialization trims it
     /// by counting LFs, then rewrites `offset`, `next_offset`,
     /// `record_range` and `up_to_date`. Until then `up_to_date` is false.
-    pub record_trim: Option<crate::RecordTrim>,
+    pub record_trim: Option<Box<crate::RecordTrim>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

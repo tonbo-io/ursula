@@ -300,7 +300,7 @@ impl GroupReadStreamParts {
 
     pub async fn into_response(mut self) -> Result<ReadStreamResponse, GroupEngineError> {
         let record_trim = match &self.body {
-            GroupReadStreamBody::Planned { plan, .. } => plan.record_trim.clone(),
+            GroupReadStreamBody::Planned { plan, .. } => plan.record_trim.as_deref().cloned(),
             _ => None,
         };
         let payload = match &self.body {

@@ -58,6 +58,14 @@ pub struct W1Args {
     /// Also restore the final snapshot and report restored heap.
     #[arg(long)]
     pub restore: bool,
+    /// Group feature level to run at (2 = F1 sparse record marks).
+    #[arg(long, default_value_t = 0)]
+    pub level: u32,
+    /// F1 legacy migration: append and flush at level 1, then raise to 2 and
+    /// seal through `TidyStream`, reporting each command's sealed records
+    /// and apply time (B4 exit: at most 1M records and 10 ms per command).
+    #[arg(long)]
+    pub legacy_seal: bool,
     /// Output name (JSONL file stem).
     #[arg(long)]
     pub name: Option<String>,
@@ -89,12 +97,21 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
         &json!({"workload": name, "records": args.records, "rec_bytes": args.rec_bytes,
         "recs_per_append": args.recs_per_append, "retain_every": args.retain_every,
         "retain_keep": args.retain_keep, "flush_threshold_mib": args.flush_mib,
-        "forced_flush": args.forced_flush}),
+        "forced_flush": args.forced_flush, "level": args.level,
+        "legacy_seal": args.legacy_seal}),
     )?;
 
     let mut rng = payload::Rng::new(1);
     let base = Baseline::now();
     let mut m = StreamStateMachine::new();
+    let level = if args.legacy_seal {
+        ursula_stream::FEATURE_LEVEL_KEYED_STREAMS
+    } else {
+        args.level
+    };
+    if level > 0 {
+        smx::raise_feature_level(&mut m, level)?;
+    }
     smx::create_bucket(&mut m, "bkt1")?;
     let id = smx::sid("bkt1", "h0001", "log");
     smx::create_stream(&mut m, &id, None, None, smx::T0)?;
@@ -142,6 +159,10 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
         }
         if args.forced_flush {
             while !smx::flush_pass(&mut m, 1, flush_bytes, &mut packs, &mut stats)?.is_empty() {}
+        }
+        if args.legacy_seal && n == args.records {
+            // Measure the final checkpoint after the migration.
+            legacy_seal(&mut m, &id, n, sink, &mut outcome)?;
         }
         let range = m
             .record_range(&id)
@@ -206,6 +227,11 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
             measured.snap.record_offsets_bytes,
         );
         outcome.metric_u64("dense_entries", measured.gauges.dense_record_entries);
+        outcome.metric_u64("record_marks", measured.gauges.record_marks);
+        outcome.metric_u64(
+            "snapshot_record_marks_bytes",
+            measured.snap.record_marks_bytes,
+        );
         outcome.metric_u64("message_records", measured.gauges.message_records);
         outcome.metric_u64("flush_passes", stats.passes);
         outcome.metric_u64("hot_chunks", measured.gauges.hot_chunks);
@@ -236,4 +262,74 @@ pub fn run(args: &W1Args, sink: &mut Sink) -> Result<Outcome> {
         }))?;
     }
     Ok(outcome)
+}
+
+/// Raises a level-1 group to level 2 and seals the stream through repeated
+/// `TidyStream` commands (F1 migration). Each command's sealed records and
+/// apply time go to the JSONL; the deterministic counts are metrics and a
+/// check.
+fn legacy_seal(
+    m: &mut StreamStateMachine,
+    id: &ursula_shard::BucketStreamId,
+    records: u64,
+    sink: &mut Sink,
+    outcome: &mut Outcome,
+) -> Result<()> {
+    smx::raise_feature_level(m, ursula_stream::FEATURE_LEVEL_SPARSE_MARKS)?;
+    let mut commands = 0_u64;
+    let mut max_sealed = 0_u64;
+    let mut max_apply_ms = 0_f64;
+    loop {
+        let before = m.state_gauges().dense_record_entries;
+        let started = Instant::now();
+        let response = smx::ok(
+            m.apply(ursula_stream::StreamCommand::TidyStream {
+                stream_id: id.clone(),
+                now_ms: smx::T0,
+            }),
+            "tidy stream",
+        )?;
+        let apply_ms = started.elapsed().as_secs_f64() * 1e3;
+        let sealed = before.saturating_sub(m.state_gauges().dense_record_entries);
+        commands += 1;
+        max_sealed = max_sealed.max(sealed);
+        max_apply_ms = max_apply_ms.max(apply_ms);
+        sink.row(&json!({
+            "workload": "w1_legacy_seal",
+            "command": commands,
+            "sealed_records": sealed,
+            "apply_ms": round3(apply_ms),
+        }))?;
+        let debt = matches!(response, ursula_stream::StreamResponse::StreamTidied {
+            debt_remaining: true
+        });
+        if !debt || commands > records {
+            break;
+        }
+    }
+    let gauges = m.state_gauges();
+    sink.row(&json!({
+        "workload": "w1_legacy_seal",
+        "records": records,
+        "tidy_commands": commands,
+        "max_sealed_per_command": max_sealed,
+        "max_apply_ms": round3(max_apply_ms),
+        "record_marks": gauges.record_marks,
+        "dense_entries": gauges.dense_record_entries,
+    }))?;
+    outcome.metric_u64("legacy_seal_commands", commands);
+    outcome.metric_u64("legacy_seal_max_records_per_command", max_sealed);
+    outcome.check(
+        "f1_legacy_seal_bounded_commands",
+        "a legacy stream seals in commands of at most 1M records (F1)",
+        max_sealed as f64,
+        ursula_stream::SEAL_BUDGET_RECORDS as f64,
+    );
+    outcome.check(
+        "f1_legacy_seal_converges",
+        "every record below the seal point is sealed after ceil(N / 1M) commands (F1)",
+        commands as f64,
+        records.div_ceil(ursula_stream::SEAL_BUDGET_RECORDS) as f64 + 1.0,
+    );
+    Ok(())
 }

@@ -310,7 +310,7 @@ impl StreamStateMachine {
             first_record: record,
             next_record: window_end,
         });
-        plan.record_trim = Some(RecordTrim {
+        plan.record_trim = Some(Box::new(RecordTrim {
             window_record: from_record,
             leading_lf,
             skip,
@@ -319,7 +319,7 @@ impl StreamStateMachine {
             anchors: self.record_anchors_between(stream_id, from_offset, window_end_offset),
             tail_offset,
             claim_up_to_date: true,
-        });
+        }));
         Ok(plan)
     }
 

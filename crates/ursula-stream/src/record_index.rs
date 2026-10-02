@@ -38,24 +38,13 @@ pub const MARK_BLOCK_BYTES: u64 = 1 << MARK_BLOCK_SHIFT;
 /// commands without stalling the group's apply.
 pub const SEAL_BUDGET_RECORDS: u64 = 1_000_000;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "StreamRecordIndexWire", into = "StreamRecordIndexWire")]
 pub struct StreamRecordIndex {
     first_record: u64,
     marks: Vec<RecordMark>,
     dense_first_record: u64,
     dense_offsets: VecDeque<u64>,
-}
-
-impl Default for StreamRecordIndex {
-    fn default() -> Self {
-        Self {
-            first_record: 0,
-            marks: Vec::new(),
-            dense_first_record: 0,
-            dense_offsets: VecDeque::new(),
-        }
-    }
 }
 
 /// Serde form shared by backup export (#154) and `ImportSnapshot`. Absent
@@ -604,7 +593,10 @@ impl StreamRecordIndex {
             self.dense_first_record = self.dense_first_record.saturating_add(1);
             sealed = sealed.saturating_add(1);
         }
-        if sealed > 0 {
+        // F7, bounded per command: releasing capacity copies the remaining
+        // dense offsets, so a legacy stream mid-migration (more than one
+        // budget of dense records left) shrinks once it gets below that.
+        if sealed > 0 && to_u64(self.dense_offsets.len()).is_ok_and(|len| len <= budget) {
             shrink_deque(&mut self.dense_offsets);
         }
         sealed

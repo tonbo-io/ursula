@@ -2090,6 +2090,12 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
     let group_state_gauges = group_state_gauges_json(&state).await;
     if let Some(object) = body.as_object_mut() {
         object.insert("group_state_gauges".to_owned(), group_state_gauges);
+        // F1 anchor verification (RC-21): record reads failed because cold
+        // bytes disagreed with the record marks.
+        object.insert(
+            "record_coordinate_corruptions".to_owned(),
+            serde_json::Value::from(ursula_runtime::record_coordinate_corruptions()),
+        );
         object.insert(
             "keyed_state_requests".to_owned(),
             serde_json::to_value(state.keyed_state_metrics.snapshot())

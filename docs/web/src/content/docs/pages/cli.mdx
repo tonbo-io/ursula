@@ -39,7 +39,7 @@ The naive procedure of "restart followers, then leader" does **not** wait for `a
 | `status` | Per-node group counts and leadership distribution |
 | `wait-ready` | Block until every node reports the expected group count and every group has a leader |
 | `verify-cluster` | Require every configured voter to be present and caught up in two consecutive samples before the next rollout step |
-| `cluster enable-feature --level N` | Raise every Raft group's replicated feature level to `N`. Refuses unless every voter, learner, and manifest node reports support for `N`; then proposes through each group's leader and verifies every replica. Levels are never lowered |
+| `cluster enable-feature --level N` | Raise every Raft group's replicated feature level to `N`. Refuses unless every voter, learner, and manifest node reports support for `N` (and, from level 2, unless every group reports a completed cold-index page-repair cycle); then proposes through each group's leader and verifies every replica. Levels are never lowered |
 | `cluster feature-level` | Print each node's supported feature level and each group's current level |
 
 Mutating verbs exit `0` on success and `2` on an abort (drain timeout, no safe transfer target, catch-up stall). Anything else is a configuration or transport error with a single-line, machine-greppable message.
@@ -172,7 +172,7 @@ ursulactl cluster feature-level --config cluster.json
 ursulactl cluster enable-feature --config cluster.json --level 1
 ```
 
-`GET /__ursula/feature-level` reports `supported_level` (the highest level this binary can apply) and each group's `level` from the node's local replica. `POST /__ursula/feature-level` proposes the level for the groups the node leads (others come back as `not_leader`) and refuses with `409` a level above the node's own support; `enable-feature` therefore calls it on every node and re-checks until every replica agrees.
+`GET /__ursula/feature-level` reports `supported_level` (the highest level this binary can apply) and each group's `level` from the node's local replica. `POST /__ursula/feature-level` proposes the level for the groups the node leads (others come back as `not_leader`) and refuses with `409` a level above the node's own support; `enable-feature` therefore calls it on every node and re-checks until every replica agrees. Level 2 (sparse cold record marks) trusts cold bytes, so each group's report also carries `page_repair_completed`, true once the node completed a cold-index page-repair cycle as the group's leader (always true without a cold store); a node proposes level 2 or higher only for such groups and answers `repair_pending` for the others.
 
 <Warning>
 Feature levels never go down. Once a group is raised, a binary that does not support that level must not run it: such a binary refuses to load a snapshot recorded at a higher level. Downgrade below the release that introduced a raised level is not supported.

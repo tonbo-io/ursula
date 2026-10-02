@@ -269,7 +269,7 @@ Publishing a snapshot MUST NOT change the earliest retained offset. Retention is
 PUT {stream_url}/retention/{retained_offset}
 ```
 
-The server MUST reject a retention boundary that is not aligned to committed data, moves backward, or is newer than the latest published snapshot. After success, offsets less than `retained_offset` MUST return `410 Gone`.
+The server MUST reject a retention boundary that is not aligned to committed data, moves backward, or is newer than the latest published snapshot. After success, offsets less than `retained_offset` MUST return `410 Gone`. A server MAY retain less than requested, at a committed boundary at or below `retained_offset` (Ursula keeps exact boundaries for older history only once per MiB of log); the success response's `Stream-Retained-Offset` (and, for record-aware streams, `Stream-Record-First`) then reports the effective boundary, and offsets below it MUST return `410 Gone`.
 
 For record-aware JSON streams, servers also expose:
 
@@ -824,7 +824,7 @@ A reconnecting client MAY use either the last `streamNextRecord` or `streamNextO
 
 ### 6.10. Retention, Snapshots, and Bootstrap
 
-Retention MUST advance `F` only at a record boundary. A trimmed ordinal MUST return `410 Gone`; surviving records keep their original ordinals.
+Retention MUST advance `F` only at a record boundary. A trimmed ordinal MUST return `410 Gone`; surviving records keep their original ordinals. When retention lands below its target (Section 2.2), `F` is the ordinal of the effective boundary; a retention or snapshot target at an intra-record offset MUST return `400 Bad Request`.
 
 When a snapshot advances the earliest retained offset, that offset MUST map to one record boundary. Snapshot publication at an intra-record offset MUST return `400 Bad Request`. Snapshot and bootstrap responses SHOULD include `Stream-Record-First` and `Stream-Record-Next` when the underlying stream implements this extension. Bootstrap update parts MUST preserve one logical JSON message per update part.
 

@@ -438,6 +438,16 @@ mod tests {
                     "body: {:?}",
                     body
                 );
+                // RC-1 (bounded-state F1): record boundaries are exactly the
+                // LFs of the stored bytes, one per message, so sparse marks
+                // can recover them by counting LFs.
+                let messages = match &value {
+                    Json::Array(items) => items.len(),
+                    _ => 1,
+                };
+                let stored = result.clone().unwrap();
+                prop_assert_eq!(stored.iter().filter(|byte| **byte == b'\n').count(), messages);
+                prop_assert!(stored.is_empty() || stored.ends_with(b"\n"));
                 // Every stored line is itself valid JSON text.
                 for line in result.unwrap().split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
                     let text = std::str::from_utf8(line).unwrap();
