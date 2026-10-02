@@ -58,6 +58,16 @@ fn tiny_workloads_produce_metrics_and_checks() {
     assert!(check_met(&w3, "f4_message_records_per_stream"));
     assert!(check_met(&w3, "f5_staged_external_refs_per_stream"));
 
+    // F5 (level 3): locators stay in state until the modeled offload pass
+    // moves them into pages; never more than T_ext = 16 per stream.
+    let w3_lb3 = Workload::W3(parse::<W3Args>("--appends=60 --external-locators"))
+        .run(&dir, false)
+        .expect("w3 lb3");
+    assert!(w3_lb3.metrics["max_staged_external_refs"] > 0.0);
+    assert!(w3_lb3.metrics["max_staged_external_refs"] <= 16.0);
+    assert!(check_met(&w3_lb3, "f5_max_staged_external_refs"));
+    assert!(check_met(&w3_lb3, "f5_staged_external_refs_per_stream"));
+
     let w4 = Workload::W4(parse::<W4Args>("--appends=2000 --checkpoints=2000"))
         .run(&dir, false)
         .expect("w4");
