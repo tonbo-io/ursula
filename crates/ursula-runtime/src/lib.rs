@@ -3,6 +3,9 @@
 //! Module map:
 //!
 //! - [`cold_store`]: opendal-backed cold tier handle and object path helpers.
+//! - [`cold_index`]: cold-index pages (binary format, stores, cache), their
+//!   writes with the clip rule and rollback, and leader-side page repair.
+//! - [`cold_worker`]: background flush, compaction, GC and page-repair loops.
 //! - [`request`]: HTTP/gRPC request and response value types for each engine op.
 //! - [`command`]: the replicated [`GroupWriteCommand`] envelope around the
 //!   canonical [`ursula_stream::StreamCommand`], plus `From` conversions from
@@ -42,11 +45,17 @@ pub use cold_index::ColdIndexPage;
 pub use cold_index::ColdIndexPageCache;
 pub use cold_index::ColdIndexPageKey;
 pub use cold_index::ColdIndexPageStore;
+pub use cold_index::ColdIndexRepairInput;
+pub use cold_index::ColdIndexRepairReport;
 pub use cold_index::ColdStoreColdIndexPageStore;
 pub use cold_index::InMemoryColdIndexPageStore;
+pub use cold_index::RepairColdIndexRequest;
+pub use cold_index::RepairColdIndexResponse;
+pub use cold_index::clipped_entries;
 pub use cold_index::cold_index_generation_dir;
 pub use cold_index::cold_index_prefix;
 pub use cold_index::load_cold_chunks_from_pages;
+pub use cold_index::repair_cold_index_streams;
 pub use cold_index::replace_cold_chunk_index_pages;
 pub use cold_index::replace_cold_chunk_index_pages_with_rollback;
 pub use cold_index::replace_cold_chunk_index_pages_with_rollback_in_generation;
@@ -54,6 +63,7 @@ pub use cold_index::rollback_cold_index_pages;
 pub use cold_index::select_cold_chunk_compaction;
 pub use cold_index::write_cold_chunk_index_pages;
 pub use cold_index::write_cold_chunk_index_pages_in_generation;
+pub use cold_index::write_cold_chunk_index_pages_with_rollback;
 pub use cold_index::write_cold_chunk_index_pages_with_rollback_in_generation;
 pub use cold_index::write_external_segment_index_pages;
 pub use cold_index::write_external_segment_index_pages_in_generation;
@@ -75,6 +85,7 @@ pub use cold_store::new_external_payload_path;
 pub use cold_worker::spawn_cold_compaction_worker_if_configured;
 pub use cold_worker::spawn_cold_flush_worker_if_configured;
 pub use cold_worker::spawn_cold_gc_worker_if_configured;
+pub use cold_worker::spawn_cold_index_repair_worker;
 pub use command::GroupSnapshot;
 pub use command::GroupWriteCommand;
 pub use engine::GroupAckColdGcFuture;
@@ -113,6 +124,7 @@ pub use engine::GroupPurgeBucketFuture;
 pub use engine::GroupReadSnapshotFuture;
 pub use engine::GroupReadStreamFuture;
 pub use engine::GroupReadStreamPartsFuture;
+pub use engine::GroupRepairColdIndexFuture;
 pub use engine::GroupRequireLiveReadOwnerFuture;
 pub use engine::GroupSetBucketQuotaFuture;
 pub use engine::GroupSetFeatureLevelFuture;
@@ -125,6 +137,7 @@ pub use engine::GroupWriteFuture;
 pub use engine::GroupWriteResponse;
 pub use engine::in_memory::InMemoryGroupEngine;
 pub use engine::in_memory::InMemoryGroupEngineFactory;
+pub use engine::in_memory::next_repair_cursor;
 pub use error::ErrorStatus;
 pub use error::RuntimeError;
 pub use metrics::RuntimeMailboxSnapshot;
@@ -184,6 +197,7 @@ pub use request::StreamAppendCount;
 pub use request::TouchStreamAccessResponse;
 pub use request::UpdateStreamAttrsRequest;
 pub use request::UpdateStreamAttrsResponse;
+pub use runtime::ColdIndexRepairStep;
 pub use runtime::PurgeBucketReport;
 pub use runtime::RuntimeConfig;
 pub use runtime::RuntimeThreading;
@@ -228,3 +242,6 @@ pub use ursula_stream::validate_bucket_id;
 mod incarnation_gc_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cold_correctness_tests;

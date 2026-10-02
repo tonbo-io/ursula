@@ -4632,3 +4632,117 @@ fn list_bucket_streams_filters_sorts_pages_and_hides_expired() {
         created_at_ms: 7,
     }]);
 }
+
+fn append_external_cmd(stream_id: BucketStreamId, s3_path: &str, len: u64) -> StreamCommand {
+    StreamCommand::AppendExternal {
+        stream_id,
+        content_type: Some(OCTET.to_owned()),
+        payload: ExternalPayloadRef {
+            s3_path: s3_path.to_owned(),
+            payload_len: len,
+            object_size: len,
+        },
+        record_ends: Vec::new(),
+        close_after: false,
+        stream_seq: None,
+        producer: None,
+        now_ms: 0,
+        record_match: None,
+    }
+}
+
+/// Bounded-state D1: hot bytes, then an external append above them, then a
+/// flush of the hot prefix. The flush used to assign the scalar frontier
+/// below the external, which left `[2, 5)` without a payload source.
+fn d1_regressed_frontier_machine(id: &str) -> StreamStateMachine {
+    let mut machine = machine();
+    create_stream(&mut machine, id);
+    assert!(matches!(
+        machine.apply(append_cmd(stream(id), b"ab", Append::default())),
+        StreamResponse::Appended { .. }
+    ));
+    let response = machine.apply(append_external_cmd(stream(id), "external/xyz.bin", 3));
+    assert!(
+        matches!(response, StreamResponse::Appended { .. }),
+        "{response:?}"
+    );
+    assert!(matches!(
+        machine.apply(flush_cold_cmd(stream(id), 0, 2, "chunks/ab.bin", 2)),
+        StreamResponse::ColdFlushed { .. }
+    ));
+    machine
+}
+
+#[test]
+fn d1_read_plan_serves_external_bytes_above_a_flushed_hot_prefix() {
+    let machine = d1_regressed_frontier_machine("d1-read");
+    let plan = machine
+        .read_plan(&stream("d1-read"), 0, 16)
+        .expect("plan covers the external above the flushed prefix");
+    assert_eq!(plan.next_offset, 5);
+    let covered = plan
+        .segments
+        .iter()
+        .map(|segment| match segment {
+            StreamReadSegment::ColdIndex(segment) => (segment.read_start_offset, segment.len),
+            other => panic!("expected cold-index segments only, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(covered, vec![(0, 5)]);
+    let tail_plan = machine
+        .read_plan(&stream("d1-read"), 2, 16)
+        .expect("plan from inside the external");
+    assert_eq!(tail_plan.next_offset, 5);
+}
+
+#[test]
+fn d1_snapshot_with_regressed_frontier_restores() {
+    let machine = d1_regressed_frontier_machine("d1-restore");
+    let snapshot = machine.snapshot();
+    let entry = snapshot
+        .streams
+        .iter()
+        .find(|entry| entry.metadata.stream_id == stream("d1-restore"))
+        .expect("snapshot entry");
+    // Replicated state is unchanged: the snapshot still carries the
+    // regressed frontier (F18 step 1 is a read/restore rule only).
+    assert_eq!(entry.cold_frontier_offset, 2);
+    let restored = StreamStateMachine::restore(snapshot).expect("restore regressed frontier");
+    let plan = restored
+        .read_plan(&stream("d1-restore"), 0, 16)
+        .expect("restored plan");
+    assert_eq!(plan.next_offset, 5);
+    assert_eq!(restored.snapshot(), machine.snapshot());
+}
+
+#[test]
+fn d1_read_plan_keeps_hot_bytes_between_cold_ranges() {
+    let mut machine = d1_regressed_frontier_machine("d1-hot-gap");
+    assert!(matches!(
+        machine.apply(append_cmd(stream("d1-hot-gap"), b"cd", Append::default())),
+        StreamResponse::Appended { .. }
+    ));
+    assert!(matches!(
+        machine.apply(append_external_cmd(
+            stream("d1-hot-gap"),
+            "external/uvw.bin",
+            3
+        )),
+        StreamResponse::Appended { .. }
+    ));
+    let plan = machine
+        .read_plan(&stream("d1-hot-gap"), 0, 64)
+        .expect("plan");
+    assert_eq!(plan.next_offset, 10);
+    let shape = plan
+        .segments
+        .iter()
+        .map(|segment| match segment {
+            StreamReadSegment::ColdIndex(segment) => ("cold", segment.read_start_offset),
+            StreamReadSegment::Hot(_) => ("hot", 0),
+            StreamReadSegment::Object(_) => ("object", 0),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(shape, vec![("cold", 0), ("hot", 0), ("cold", 7)]);
+    StreamStateMachine::restore(machine.snapshot()).expect("restore with a hot gap");
+}

@@ -121,6 +121,31 @@ impl StreamStateMachine {
         Ok(renew_ttl && stream_ttl_renewal_due(stream, now_ms))
     }
 
+    /// Up to `max` stream ids strictly after `after`, in (bucket, affinity
+    /// key, stream) order. Leader-side cursors walk a group's streams with it.
+    pub fn stream_ids_after(
+        &self,
+        after: Option<&BucketStreamId>,
+        max: usize,
+    ) -> Vec<BucketStreamId> {
+        fn key(id: &BucketStreamId) -> (&str, Option<&str>, &str) {
+            (
+                id.bucket_id.as_str(),
+                id.affinity_key.as_deref(),
+                id.stream_id.as_str(),
+            )
+        }
+        let mut ids = self
+            .registry
+            .slots()
+            .map(|slot| &slot.metadata.stream_id)
+            .filter(|id| after.is_none_or(|after| key(id) > key(after)))
+            .collect::<Vec<_>>();
+        ids.sort_unstable_by(|left, right| key(left).cmp(&key(right)));
+        ids.truncate(max);
+        ids.into_iter().cloned().collect()
+    }
+
     pub fn hot_start_offset(&self, stream_id: &BucketStreamId) -> u64 {
         let Some(slot) = self.stream_slot(stream_id) else {
             return 0;
@@ -306,8 +331,12 @@ impl StreamStateMachine {
         let next_offset = stream.tail_offset.min(offset.saturating_add(max_len_u64));
         let mut segments = Vec::<(u64, StreamReadSegment)>::new();
         let hot_segments = slot.hot_buffer.read_segments(offset, next_offset);
-        let cold_frontier = self.cold_frontier_offset(stream_id, retained_offset);
-        let cold_index_end = next_offset.min(cold_frontier);
+        // F18 step 1: coverage is the complement of the hot buffer. Every
+        // byte of `[retained, tail)` that no hot segment holds is cold, served
+        // by state refs where they exist and by cold-index pages otherwise.
+        // The replicated scalar frontier can lag below an external append
+        // (bounded-state D1), so it no longer bounds cold-index lookups.
+        let cold_index_end = next_offset;
         let mut direct_cold_ranges = self
             .cold_chunks(stream_id)
             .iter()

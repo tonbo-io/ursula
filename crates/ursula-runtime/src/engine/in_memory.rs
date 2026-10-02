@@ -7,6 +7,7 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::AppendStreamInput;
 use ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
+use ursula_stream::ObjectPayloadRef;
 use ursula_stream::ProducerRequest;
 use ursula_stream::StreamCommand;
 use ursula_stream::StreamErrorCode;
@@ -50,6 +51,7 @@ use super::GroupPurgeBucketFuture;
 use super::GroupReadSnapshotFuture;
 use super::GroupReadStreamFuture;
 use super::GroupReadStreamPartsFuture;
+use super::GroupRepairColdIndexFuture;
 use super::GroupSetBucketQuotaFuture;
 use super::GroupSetFeatureLevelFuture;
 use super::GroupSnapshotFuture;
@@ -57,7 +59,12 @@ use super::GroupTouchStreamAccessFuture;
 use super::GroupUpdateStreamAttrsFuture;
 use super::GroupWriteResponse;
 use crate::cold_index::ColdIndexPageCache;
+use crate::cold_index::ColdIndexRepairInput;
 use crate::cold_index::ColdStoreColdIndexPageStore;
+use crate::cold_index::RepairColdIndexRequest;
+use crate::cold_index::RepairColdIndexResponse;
+use crate::cold_index::clipped_entries;
+use crate::cold_index::repair_cold_index_streams;
 use crate::cold_index::replace_cold_chunk_index_pages_with_rollback_in_generation;
 use crate::cold_index::rollback_cold_index_pages;
 use crate::cold_index::write_cold_chunk_index_pages_with_rollback_in_generation;
@@ -1386,6 +1393,76 @@ impl InMemoryGroupEngine {
             .map(|metadata| metadata.tail_offset)
     }
 
+    /// Leader-side pre-check before a cold flush writes its page entry: `Ok`
+    /// exactly when applying the flush now would succeed, so the entry's
+    /// range is proven hot and the clip rule (bounded-state F19 step 1) may
+    /// remove whatever else overlaps it. A stale candidate is rejected with
+    /// the same typed error apply would return, before any page write.
+    pub fn check_cold_flush(&self, request: &FlushColdRequest) -> Result<(), GroupEngineError> {
+        self.state_machine
+            .check_cold_flush(&request.stream_id, &request.chunk)
+            .map_err(stream_response_error)
+    }
+
+    /// What applied state proves about up to `max_streams` streams after
+    /// `after`, for cold-index page repair (bounded-state F19 step 2).
+    pub fn cold_index_repair_inputs(
+        &self,
+        after: Option<&BucketStreamId>,
+        max_streams: usize,
+    ) -> Vec<ColdIndexRepairInput> {
+        self.state_machine
+            .stream_ids_after(after, max_streams)
+            .into_iter()
+            .filter_map(|stream_id| {
+                let metadata = self.state_machine.head(&stream_id)?;
+                let hot_ranges = self
+                    .state_machine
+                    .hot_segments(&stream_id)
+                    .iter()
+                    .map(|segment| (segment.start_offset, segment.end_offset))
+                    .collect();
+                let state_refs = self
+                    .state_machine
+                    .cold_chunks(&stream_id)
+                    .iter()
+                    .map(ObjectPayloadRef::from)
+                    .chain(
+                        self.state_machine
+                            .external_segments(&stream_id)
+                            .iter()
+                            .cloned(),
+                    )
+                    .collect();
+                Some(ColdIndexRepairInput {
+                    generation: self
+                        .state_machine
+                        .cold_index_generation(&stream_id)
+                        .unwrap_or(0),
+                    retained_offset: self.state_machine.retained_offset(&stream_id),
+                    tail_offset: metadata.tail_offset,
+                    created_at_ms: metadata.created_at_ms,
+                    hot_ranges,
+                    state_refs,
+                    stream_id,
+                })
+            })
+            .collect()
+    }
+
+    /// Whether `stream_id` exists and has not expired at `now_ms`. A create
+    /// of a live stream never applies its initial payload (it answers
+    /// already-exists or a conflict), so the external create path must not
+    /// write a page entry for it: the entry would land at offset 0 of the
+    /// existing stream.
+    pub fn stream_is_live(&self, stream_id: &BucketStreamId, now_ms: u64) -> bool {
+        matches!(
+            self.state_machine
+                .access_requires_write(stream_id, now_ms, false),
+            Ok(false)
+        )
+    }
+
     pub(crate) fn install_snapshot_inner(
         &mut self,
         snapshot: GroupSnapshot,
@@ -1452,9 +1529,12 @@ impl GroupEngine for InMemoryGroupEngine {
         Box::pin(async move {
             // From feature level 1 the state keeps the initial payload as a
             // direct reference (F14g); the level never drops between this
-            // check and apply, so skipping the page is always safe.
+            // check and apply, so skipping the page is always safe. A create
+            // of a live stream never writes a page either, so a conflicting
+            // or retried create cannot replace the live stream's entry.
             if let Some(cold_store) = self.cold_store.as_ref()
                 && self.state_machine.feature_level() < FEATURE_LEVEL_KEYED_STREAMS
+                && !self.stream_is_live(&request.stream_id, request.now_ms)
             {
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
                 write_external_segment_index_pages(
@@ -1850,6 +1930,31 @@ impl GroupEngine for InMemoryGroupEngine {
         Box::pin(async move { Ok(entries) })
     }
 
+    fn repair_cold_index<'a>(
+        &'a mut self,
+        request: RepairColdIndexRequest,
+        _placement: ShardPlacement,
+    ) -> GroupRepairColdIndexFuture<'a> {
+        Box::pin(async move {
+            let Some(cold_store) = self.cold_store.as_ref() else {
+                return Ok(RepairColdIndexResponse::default());
+            };
+            let max_streams = request.max_streams.max(1);
+            let inputs = self.cold_index_repair_inputs(request.after.as_ref(), max_streams);
+            let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+            let report =
+                repair_cold_index_streams(&store, self.cold_index_cache.as_deref(), &inputs)
+                    .await
+                    .map_err(|err| GroupEngineError::new(err.to_string()))?;
+            let next_after = next_repair_cursor(&inputs, max_streams);
+            Ok(RepairColdIndexResponse {
+                report,
+                cycle_completed: next_after.is_none(),
+                next_after,
+            })
+        })
+    }
+
     fn append<'a>(
         &'a mut self,
         request: AppendRequest,
@@ -1993,6 +2098,7 @@ impl GroupEngine for InMemoryGroupEngine {
             if !request.chunk.shared_object
                 && let Some(cold_store) = self.cold_store.as_ref()
             {
+                self.check_cold_flush(&request)?;
                 let generation = self
                     .state_machine
                     .cold_index_generation(&request.stream_id)
@@ -2006,6 +2112,13 @@ impl GroupEngine for InMemoryGroupEngine {
                 )
                 .await
                 .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                // The clip rule may have removed stale entries that a cached
+                // page still holds.
+                if clipped_entries(&rollback) > 0
+                    && let Some(cache) = self.cold_index_cache.as_ref()
+                {
+                    cache.invalidate_stream(&request.stream_id);
+                }
                 index_rollback = Some((store, rollback));
             }
             let command = GroupWriteCommand::from(request);
@@ -2265,6 +2378,18 @@ fn require_response_stream_id(
             "{response} response for a command without a stream id"
         ))
     })
+}
+
+/// Where the next repair step resumes: after the last stream of a full
+/// batch, or `None` once a short batch ends the cycle.
+pub fn next_repair_cursor(
+    inputs: &[ColdIndexRepairInput],
+    max_streams: usize,
+) -> Option<BucketStreamId> {
+    if inputs.len() < max_streams {
+        return None;
+    }
+    inputs.last().map(|input| input.stream_id.clone())
 }
 
 pub(crate) fn stream_response_error(response: StreamResponse) -> GroupEngineError {

@@ -13,6 +13,8 @@ use ursula_stream::ColdGcPlanEntry;
 use crate::admission::RaftUncommittedAdmission;
 use crate::admission::SharedRaftUncommittedBytes;
 use crate::admission::UncommittedBytesGuard;
+use crate::cold_index::RepairColdIndexRequest;
+use crate::cold_index::RepairColdIndexResponse;
 use crate::command::GroupSnapshot;
 use crate::engine::GroupEngine;
 use crate::engine::GroupEngineError;
@@ -1005,6 +1007,23 @@ impl CoreWorker {
         }
         group
             .plan_cold_gc(max, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err))
+    }
+
+    pub(crate) async fn repair_cold_index(
+        group: &mut Box<dyn GroupEngine>,
+        request: RepairColdIndexRequest,
+        placement: ShardPlacement,
+    ) -> Result<RepairColdIndexResponse, RuntimeError> {
+        // Page repair rewrites pages, so only the local leader runs it, in
+        // the group actor with every other page writer. A follower reports an
+        // empty, finished step.
+        if !group.accepts_local_writes() {
+            return Ok(RepairColdIndexResponse::default());
+        }
+        group
+            .repair_cold_index(request, placement)
             .await
             .map_err(|err| RuntimeError::group_engine(placement, err))
     }

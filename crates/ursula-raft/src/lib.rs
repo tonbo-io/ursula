@@ -105,3 +105,6 @@ pub use types::UrsulaVoteResponse;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cold_correctness_tests;

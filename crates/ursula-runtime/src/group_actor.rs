@@ -11,6 +11,8 @@ use ursula_stream::ColdFlushCandidate;
 use ursula_stream::ColdGcPlanEntry;
 
 use crate::admission::UncommittedBytesGuard;
+use crate::cold_index::RepairColdIndexRequest;
+use crate::cold_index::RepairColdIndexResponse;
 use crate::command::GroupSnapshot;
 use crate::core_worker::AppendBatchRuntime;
 use crate::core_worker::CoreWorker;

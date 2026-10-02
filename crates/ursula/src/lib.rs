@@ -1476,11 +1476,56 @@ pub(crate) async fn stage_external_payload(
     })
 }
 
-pub(crate) async fn cleanup_external_payload(state: &HttpState, s3_path: &str) {
+/// Bounded-state F5 cleanup rule (ungated): a staged external object may be
+/// deleted only when its append or create definitely did not commit. That is
+/// a typed stream error (apply, or a pre-proposal check, rejected it on every
+/// replica alike), a redirect or backpressure rejection before proposal, or a
+/// request the runtime refused before dispatch. Every other failure (a lost
+/// response, a transport or storage error, an untyped engine error) may
+/// follow a committed proposal that references the object, so the object is
+/// kept; an orphan sweep or stream GC reclaims it if nothing does.
+pub(crate) fn staged_external_definitely_unreferenced(err: &RuntimeError) -> bool {
+    match err {
+        RuntimeError::GroupEngine { error, .. } => {
+            error.code().is_some() || error.leader_hint().is_some() || error.is_backpressure()
+        }
+        RuntimeError::EmptyAppend
+        | RuntimeError::InvalidAppendTransaction { .. }
+        | RuntimeError::InvalidRaftGroup { .. }
+        | RuntimeError::GroupNotHosted { .. } => true,
+        RuntimeError::InvalidConfig(_)
+        | RuntimeError::SnapshotPlacementMismatch { .. }
+        | RuntimeError::ColdStoreConfig { .. }
+        | RuntimeError::StaticMembershipConfig { .. }
+        | RuntimeError::ColdStoreIo { .. }
+        | RuntimeError::LiveReadBackpressure { .. }
+        | RuntimeError::MailboxClosed { .. }
+        | RuntimeError::ResponseDropped { .. }
+        | RuntimeError::SpawnCoreThread { .. } => false,
+    }
+}
+
+/// Deletes a staged external object after a failed append or create, but
+/// only when [`staged_external_definitely_unreferenced`] allows it.
+pub(crate) async fn cleanup_external_payload(state: &HttpState, s3_path: &str, err: &RuntimeError) {
+    if !staged_external_definitely_unreferenced(err) {
+        tracing::warn!(
+            path = %s3_path,
+            error = %err,
+            "keeping staged external payload after an ambiguous failure"
+        );
+        return;
+    }
     let Some(cold_store) = state.runtime.cold_store() else {
         return;
     };
-    let _ = cold_store.delete_chunk(s3_path).await;
+    if let Err(cleanup_err) = cold_store.delete_chunk(s3_path).await {
+        tracing::warn!(
+            path = %s3_path,
+            error = %cleanup_err,
+            "failed to remove a rejected staged external payload"
+        );
+    }
 }
 
 pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'_>) -> Response {
@@ -2709,7 +2754,7 @@ pub(crate) async fn create_stream_external_by_id(
             producer: producer.as_ref(),
         }),
         Err(err) => {
-            cleanup_external_payload(&state, &external_path).await;
+            cleanup_external_payload(&state, &external_path, &err).await;
             runtime_error_or_leader_redirect_async(&state, err, &request_target).await
         }
     }
@@ -2830,7 +2875,7 @@ pub(crate) async fn append_stream_external_by_id(
     match state.runtime.append_external(external_request).await {
         Ok(response) => append_http_response(response),
         Err(err) => {
-            cleanup_external_payload(&state, &external_path).await;
+            cleanup_external_payload(&state, &external_path, &err).await;
             runtime_error_or_leader_redirect_async(&state, err, &request_target).await
         }
     }
@@ -4514,3 +4559,6 @@ fn request_target(uri: &Uri) -> String {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod staging_cleanup_tests;

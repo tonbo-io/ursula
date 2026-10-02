@@ -70,6 +70,7 @@ use ursula_runtime::GroupReadSnapshotFuture;
 use ursula_runtime::GroupReadStreamFuture;
 use ursula_runtime::GroupReadStreamParts;
 use ursula_runtime::GroupReadStreamPartsFuture;
+use ursula_runtime::GroupRepairColdIndexFuture;
 use ursula_runtime::GroupSetBucketQuotaFuture;
 use ursula_runtime::GroupSetFeatureLevelFuture;
 use ursula_runtime::GroupSnapshot;
@@ -86,16 +87,21 @@ use ursula_runtime::PlanGroupColdFlushRequest;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::RepairColdIndexRequest;
+use ursula_runtime::RepairColdIndexResponse;
 use ursula_runtime::SetBucketQuotaRequest;
 use ursula_runtime::SetFeatureLevelRequest;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::StreamErrorCode;
 use ursula_runtime::TouchStreamAccessResponse;
 use ursula_runtime::UpdateStreamAttrsRequest;
+use ursula_runtime::clipped_entries;
 use ursula_runtime::default_snapshot_store;
+use ursula_runtime::next_repair_cursor;
+use ursula_runtime::repair_cold_index_streams;
 use ursula_runtime::replace_cold_chunk_index_pages_with_rollback_in_generation;
 use ursula_runtime::rollback_cold_index_pages;
-use ursula_runtime::write_cold_chunk_index_pages_in_generation;
+use ursula_runtime::write_cold_chunk_index_pages_with_rollback_in_generation;
 use ursula_runtime::write_external_segment_index_pages;
 use ursula_runtime::write_external_segment_index_pages_in_generation;
 use ursula_shard::BucketStreamId;
@@ -697,10 +703,21 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupCreateStreamFuture<'a> {
         Box::pin(async move {
+            // A create of a live stream never applies its initial payload, so
+            // it must not write a page entry at offset 0 of that stream.
+            let stream_is_live = {
+                let stream_id = request.stream_id.clone();
+                let now_ms = request.now_ms;
+                self.with_state_machine(move |state_machine| {
+                    Box::pin(async move { state_machine.engine.stream_is_live(&stream_id, now_ms) })
+                })
+                .await?
+            };
             // From feature level 1 the state keeps the initial payload as a
             // direct reference (F14g). The local level never exceeds the
             // level at apply, so skipping the page is always safe.
             if let Some(cold_store) = self.cold_store.as_ref()
+                && !stream_is_live
                 && self.local_cold_index_generation(None).await?.0
                     < ursula_runtime::FEATURE_LEVEL_KEYED_STREAMS
             {
@@ -1308,6 +1325,43 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
+    fn repair_cold_index<'a>(
+        &'a mut self,
+        request: RepairColdIndexRequest,
+        _placement: ShardPlacement,
+    ) -> GroupRepairColdIndexFuture<'a> {
+        Box::pin(async move {
+            let Some(cold_store) = self.cold_store.clone() else {
+                return Ok(RepairColdIndexResponse::default());
+            };
+            if !self.raft.is_leader() {
+                return Ok(RepairColdIndexResponse::default());
+            }
+            let max_streams = request.max_streams.max(1);
+            let after = request.after;
+            let inputs = self
+                .with_state_machine(move |state_machine| {
+                    Box::pin(async move {
+                        state_machine
+                            .engine
+                            .cold_index_repair_inputs(after.as_ref(), max_streams)
+                    })
+                })
+                .await?;
+            let store = ColdStoreColdIndexPageStore::new(cold_store);
+            let report =
+                repair_cold_index_streams(&store, self.cold_index_cache.as_deref(), &inputs)
+                    .await
+                    .map_err(|err| GroupEngineError::new(err.to_string()))?;
+            let next_after = next_repair_cursor(&inputs, max_streams);
+            Ok(RepairColdIndexResponse {
+                report,
+                cycle_completed: next_after.is_none(),
+                next_after,
+            })
+        })
+    }
+
     fn append_external<'a>(
         &'a mut self,
         request: AppendExternalRequest,
@@ -1550,14 +1604,23 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupFlushColdFuture<'a> {
         Box::pin(async move {
+            let mut index_rollback = None;
             if !request.chunk.shared_object
                 && let Some(cold_store) = self.cold_store.as_ref()
             {
+                // The group actor runs this flush's check, page write and
+                // proposal one at a time with every other page writer, so a
+                // passing check proves the range is hot when the write clips.
+                let check = request.clone();
+                self.with_state_machine(move |state_machine| {
+                    Box::pin(async move { state_machine.engine.check_cold_flush(&check) })
+                })
+                .await??;
                 let (_, generation) = self
                     .local_cold_index_generation(Some(request.stream_id.clone()))
                     .await?;
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-                write_cold_chunk_index_pages_in_generation(
+                let rollback = write_cold_chunk_index_pages_with_rollback_in_generation(
                     &store,
                     &request.stream_id,
                     generation,
@@ -1565,13 +1628,43 @@ impl GroupEngine for RaftGroupEngine {
                 )
                 .await
                 .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                // The clip rule may have removed stale entries that a cached
+                // page still holds.
+                if clipped_entries(&rollback) > 0
+                    && let Some(cache) = self.cold_index_cache.as_ref()
+                {
+                    cache.invalidate_stream(&request.stream_id);
+                }
+                index_rollback = Some((store, rollback));
             }
-            match self.write(GroupWriteCommand::from(request)).await? {
-                GroupWriteResponse::FlushCold(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected flush cold write response: {other:?}"
-                ))),
+            let (result, rollback_safe) = match self.write(GroupWriteCommand::from(request)).await {
+                Ok(GroupWriteResponse::FlushCold(response)) => (Ok(response), false),
+                Ok(other) => (
+                    Err(GroupEngineError::new(format!(
+                        "unexpected flush cold write response: {other:?}"
+                    ))),
+                    false,
+                ),
+                Err(err) => {
+                    // F14e: a redirect means OpenRaft rejected the write before
+                    // accepting it, and a typed stream error means apply
+                    // rejected it (a stale flush), so the page entry is
+                    // definitely unreferenced. Other failures are ambiguous:
+                    // the flush may still commit, so the entry stays.
+                    let rollback_safe = err.leader_hint().is_some() || err.code().is_some();
+                    (Err(err), rollback_safe)
+                }
+            };
+            if rollback_safe && let Some((store, rollback)) = index_rollback {
+                rollback_cold_index_pages(&store, rollback)
+                    .await
+                    .map_err(|err| {
+                        GroupEngineError::new(format!(
+                            "rollback cold index after flush rejection: {err}"
+                        ))
+                    })?;
             }
+            result
         })
     }
 

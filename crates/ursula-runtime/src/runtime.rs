@@ -26,7 +26,10 @@ use crate::admission::RaftUncommittedAdmission;
 use crate::admission::RaftUncommittedBytesTracker;
 use crate::cold_index::ColdIndexPageKey;
 use crate::cold_index::ColdIndexPageStore;
+use crate::cold_index::ColdIndexRepairReport;
 use crate::cold_index::ColdStoreColdIndexPageStore;
+use crate::cold_index::RepairColdIndexRequest;
+use crate::cold_index::RepairColdIndexResponse;
 use crate::cold_index::cold_index_generation_dir;
 use crate::cold_index::load_cold_chunks_from_pages;
 use crate::cold_index::parse_cold_index_page_file_name;
@@ -186,6 +189,22 @@ pub struct ShardRuntime {
     metrics: Arc<RuntimeMetricsInner>,
     next_waiter_id: Arc<AtomicU64>,
     cold_store: Option<ColdStoreHandle>,
+    cold_index_repair: Arc<std::sync::Mutex<HashMap<RaftGroupId, ColdIndexRepairCursor>>>,
+}
+
+/// Node-local position of one group's cold-index repair cursor.
+#[derive(Debug, Clone, Default)]
+struct ColdIndexRepairCursor {
+    after: Option<BucketStreamId>,
+    last_full_cycle_ms: Option<u64>,
+}
+
+/// Result of one repair step for one group.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColdIndexRepairStep {
+    pub report: ColdIndexRepairReport,
+    /// The step reached the end of the group's streams on its leader.
+    pub cycle_completed: bool,
 }
 
 /// Cluster-local summary of a bucket purge across all Raft groups.
@@ -262,6 +281,7 @@ impl ShardRuntime {
             metrics,
             next_waiter_id: Arc::new(AtomicU64::new(1)),
             cold_store,
+            cold_index_repair: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -423,7 +443,23 @@ impl ShardRuntime {
                     .record_cold_publish(object_size, elapsed_ns(publish_started_at));
                 Ok(response)
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                // F14e: a typed stream error (a stale candidate) or a
+                // redirect before proposal means the flush definitely did not
+                // commit, and the engine rolled back or never wrote its page
+                // entry, so nothing references the chunk. Any other failure
+                // is ambiguous and keeps the chunk.
+                if (err.stream_error_code().is_some() || err.leader_hint().is_some())
+                    && let Err(cleanup_err) = cold_store.delete_chunk(&path).await
+                {
+                    tracing::warn!(
+                        path = %path,
+                        error = %cleanup_err,
+                        "failed to remove the chunk of a rejected cold flush"
+                    );
+                }
+                Err(err)
+            }
         }
     }
 
@@ -1261,6 +1297,94 @@ impl ShardRuntime {
         Ok(())
     }
 
+    /// One step of the leader-side cold-index page repair cursor for one
+    /// group (bounded-state F19 step 2): repairs the pages of up to
+    /// `max_streams` streams after the cursor and advances it. A step that
+    /// reaches the end of the group's streams records a completed cycle. On
+    /// a follower the step repairs nothing and restarts the cursor.
+    pub async fn repair_cold_index_group_once(
+        &self,
+        raft_group_id: RaftGroupId,
+        max_streams: usize,
+    ) -> Result<ColdIndexRepairStep, RuntimeError> {
+        if self.cold_store.is_none() {
+            return Ok(ColdIndexRepairStep::default());
+        }
+        let after = self
+            .cold_index_repair
+            .lock()
+            .map_err(|_| RuntimeError::ColdStoreConfig {
+                message: "cold-index repair cursor lock poisoned".to_owned(),
+            })?
+            .get(&raft_group_id)
+            .and_then(|cursor| cursor.after.clone());
+        let response = self
+            .repair_cold_index(raft_group_id, RepairColdIndexRequest {
+                after,
+                max_streams: max_streams.max(1),
+            })
+            .await?;
+        let mut cursors =
+            self.cold_index_repair
+                .lock()
+                .map_err(|_| RuntimeError::ColdStoreConfig {
+                    message: "cold-index repair cursor lock poisoned".to_owned(),
+                })?;
+        let cursor = cursors.entry(raft_group_id).or_default();
+        cursor.after = response.next_after;
+        if response.cycle_completed {
+            cursor.last_full_cycle_ms = Some(unix_time_ms());
+        }
+        Ok(ColdIndexRepairStep {
+            report: response.report,
+            cycle_completed: response.cycle_completed,
+        })
+    }
+
+    /// When this node, as leader of `raft_group_id`, last completed a full
+    /// cold-index repair cycle over the group's streams.
+    pub fn cold_index_repair_last_full_cycle_ms(&self, raft_group_id: RaftGroupId) -> Option<u64> {
+        self.cold_index_repair
+            .lock()
+            .ok()?
+            .get(&raft_group_id)
+            .and_then(|cursor| cursor.last_full_cycle_ms)
+    }
+
+    /// One repair step in every group. A failing group is logged and
+    /// skipped, so it cannot stall the others.
+    pub async fn repair_cold_index_all_groups_once(
+        &self,
+        max_streams_per_group: usize,
+    ) -> ColdIndexRepairReport {
+        let mut report = ColdIndexRepairReport::default();
+        if self.cold_store.is_none() {
+            return report;
+        }
+        for group_id in 0..self.shard_map.raft_group_count() {
+            match self
+                .repair_cold_index_group_once(RaftGroupId(group_id), max_streams_per_group)
+                .await
+            {
+                Ok(step) => {
+                    report.add(&step.report);
+                    if step.cycle_completed {
+                        tracing::debug!(
+                            raft_group_id = group_id,
+                            "cold-index repair cycle completed"
+                        );
+                    }
+                }
+                Err(err) => tracing::warn!(
+                    raft_group_id = group_id,
+                    error = %err,
+                    "cold-index repair step failed; continuing with remaining groups"
+                ),
+            }
+        }
+        report
+    }
+
     pub async fn run_cold_gc_all_groups_once(
         &self,
         max_entries_per_group: usize,
@@ -1268,13 +1392,31 @@ impl ShardRuntime {
         if self.cold_store.is_none() {
             return Ok(0);
         }
+        // F14b: one group's failure must not stall reclamation in the groups
+        // after it. Every group runs; the first error is reported once all
+        // have had their pass.
         let mut reclaimed = 0;
+        let mut first_error = None;
         for group_id in 0..self.shard_map.raft_group_count() {
-            reclaimed += self
+            match self
                 .run_cold_gc_group_once(RaftGroupId(group_id), max_entries_per_group)
-                .await?;
+                .await
+            {
+                Ok(group_reclaimed) => reclaimed += group_reclaimed,
+                Err(err) => {
+                    tracing::warn!(
+                        raft_group_id = group_id,
+                        error = %err,
+                        "cold GC pass failed; continuing with remaining groups"
+                    );
+                    first_error.get_or_insert(err);
+                }
+            }
         }
-        Ok(reclaimed)
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(reclaimed),
+        }
     }
 
     /// Number of raft groups this runtime is sharded into. Backup tooling

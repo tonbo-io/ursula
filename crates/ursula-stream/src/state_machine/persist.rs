@@ -232,7 +232,6 @@ impl StreamStateMachine {
             };
             if !hot_segments_match_payload(&hot_segments, entry.payload.len())
                 || !payload_sources_cover_retained_suffix(
-                    entry.cold_frontier_offset,
                     &entry.cold_chunks,
                     &entry.external_segments,
                     &hot_segments,
@@ -456,8 +455,15 @@ fn hot_segments_match_payload(segments: &[HotPayloadSegment], payload_len: usize
     expected_payload_start == payload_len
 }
 
+/// F18 step 1: coverage is the complement of the hot buffer, so every byte
+/// of `[retained, tail)` that no hot segment holds is cold and served by
+/// state refs or cold-index pages. Restore therefore no longer requires the
+/// replicated scalar frontier to reach the hot buffer or the tail; snapshots
+/// that carry a regressed frontier (bounded-state D1) restore and install.
+/// What remains checked is that every source is well formed: refs are
+/// valid, and hot segments are non-empty, ordered, disjoint and end at or
+/// below the tail.
 fn payload_sources_cover_retained_suffix(
-    cold_frontier_offset: u64,
     cold_chunks: &[ColdChunkRef],
     external_segments: &[ObjectPayloadRef],
     hot_segments: &[HotPayloadSegment],
@@ -467,45 +473,22 @@ fn payload_sources_cover_retained_suffix(
     if tail_offset < retained_offset {
         return false;
     }
-    let mut ranges =
-        Vec::with_capacity(1 + cold_chunks.len() + external_segments.len() + hot_segments.len());
-    if cold_frontier_offset > retained_offset {
-        ranges.push((retained_offset, cold_frontier_offset));
+    if !cold_chunks.iter().all(valid_cold_chunk_ref)
+        || !external_segments.iter().all(valid_object_payload_ref)
+    {
+        return false;
     }
-    for chunk in cold_chunks {
-        if !valid_cold_chunk_ref(chunk) {
-            return false;
-        }
-        ranges.push((chunk.start_offset, chunk.end_offset));
-    }
-    for object in external_segments {
-        if !valid_object_payload_ref(object) {
-            return false;
-        }
-        ranges.push((object.start_offset, object.end_offset));
-    }
+    let mut previous_end = 0;
     for segment in hot_segments {
-        if segment.end_offset <= segment.start_offset {
+        if segment.end_offset <= segment.start_offset
+            || segment.start_offset < previous_end
+            || segment.end_offset > tail_offset
+        {
             return false;
         }
-        ranges.push((segment.start_offset, segment.end_offset));
+        previous_end = segment.end_offset;
     }
-    ranges.sort_unstable();
-
-    let mut expected_start = retained_offset;
-    for (start_offset, end_offset) in ranges {
-        if end_offset <= expected_start {
-            continue;
-        }
-        if start_offset > expected_start {
-            return false;
-        }
-        expected_start = end_offset;
-        if expected_start >= tail_offset {
-            return true;
-        }
-    }
-    expected_start == tail_offset
+    true
 }
 
 pub(super) fn message_records_cover_retained_suffix(
