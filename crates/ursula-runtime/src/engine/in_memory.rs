@@ -19,6 +19,7 @@ use ursula_stream::SharedRefIdleTracker;
 use ursula_stream::StreamCommand;
 use ursula_stream::StreamErrorCode;
 use ursula_stream::StreamMessageRecord;
+use ursula_stream::StreamReadColdIndexSegment;
 use ursula_stream::StreamReadPlan;
 use ursula_stream::StreamReadSegment;
 use ursula_stream::StreamResponse;
@@ -1248,6 +1249,46 @@ impl InMemoryGroupEngine {
         })
     }
 
+    /// Reads one cold-index read segment through the page cache.
+    async fn read_cold_index_segment(
+        cold_store: &ColdStoreHandle,
+        cache: &ColdIndexPageCache<ColdStoreColdIndexPageStore>,
+        stream_id: &BucketStreamId,
+        segment: &StreamReadColdIndexSegment,
+    ) -> std::io::Result<Vec<u8>> {
+        let objects = cache.object_segments_for_read(stream_id, segment).await?;
+        let segment_end = segment
+            .read_start_offset
+            .saturating_add(u64::try_from(segment.len).expect("read len fits u64"));
+        let mut payload = Vec::new();
+        let mut cursor = segment.read_start_offset;
+        for object in objects {
+            // A retried cold flush can leave overlapping objects in an index
+            // page. They describe the same byte range, so materialize each
+            // byte once while still using the original object start for range
+            // addressing.
+            let start = object
+                .start_offset
+                .max(segment.read_start_offset)
+                .max(cursor);
+            let end = object.end_offset.min(segment_end);
+            if start >= end {
+                continue;
+            }
+            let bytes = cold_store
+                .read_object_range_for_stream(
+                    stream_id,
+                    &object,
+                    start,
+                    usize::try_from(end - start).expect("object read len fits usize"),
+                )
+                .await?;
+            payload.extend_from_slice(&bytes);
+            cursor = end;
+        }
+        Ok(payload)
+    }
+
     pub async fn read_payload_from_plan(
         cold_store: Option<&ColdStoreHandle>,
         cold_index_cache: Option<&Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>>,
@@ -1273,39 +1314,29 @@ impl InMemoryGroupEngine {
                             Some(plan.next_offset),
                         ));
                     };
-                    let objects = cache
-                        .object_segments_for_read(stream_id, segment)
-                        .await
-                        .map_err(|err| GroupEngineError::new(err.to_string()))?;
-                    let segment_end = segment
-                        .read_start_offset
-                        .saturating_add(u64::try_from(segment.len).expect("read len fits u64"));
-                    let mut cursor = segment.read_start_offset;
-                    for object in objects {
-                        // A retried cold flush can leave overlapping objects in
-                        // an index page. They describe the same byte range, so
-                        // materialize each byte once while still using the
-                        // original object start for range addressing.
-                        let start = object
-                            .start_offset
-                            .max(segment.read_start_offset)
-                            .max(cursor);
-                        let end = object.end_offset.min(segment_end);
-                        if start >= end {
-                            continue;
-                        }
-                        let bytes = cold_store
-                            .read_object_range_for_stream(
-                                stream_id,
-                                &object,
-                                start,
-                                usize::try_from(end - start).expect("object read len fits usize"),
-                            )
+                    let bytes =
+                        match Self::read_cold_index_segment(cold_store, cache, stream_id, segment)
                             .await
-                            .map_err(|err| GroupEngineError::new(err.to_string()))?;
-                        payload.extend_from_slice(&bytes);
-                        cursor = end;
-                    }
+                        {
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                                // RT2: the cached page may name an object that a
+                                // compaction already deleted. Refresh the page
+                                // once and retry before failing the read.
+                                cache
+                                    .refresh_page(&ColdIndexPageKey {
+                                        stream_id: stream_id.clone(),
+                                        generation: segment.generation,
+                                        page_id: segment.page_id,
+                                    })
+                                    .await
+                                    .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                                Self::read_cold_index_segment(cold_store, cache, stream_id, segment)
+                                    .await
+                            }
+                            other => other,
+                        }
+                        .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                    payload.extend_from_slice(&bytes);
                 }
                 StreamReadSegment::Object(segment) => {
                     let Some(cold_store) = cold_store else {
@@ -1547,6 +1578,22 @@ impl InMemoryGroupEngine {
                     .cold_index_generation(&stream_id)
                     .unwrap_or(0),
                 referenced: self.state_machine.stream_referenced_cold_paths(&stream_id),
+                cold_range: (
+                    self.state_machine.retained_offset(&stream_id),
+                    self.state_machine.hot_start_offset(&stream_id),
+                ),
+                referenced_ranges: self
+                    .state_machine
+                    .cold_chunks(&stream_id)
+                    .iter()
+                    .map(|chunk| (chunk.start_offset, chunk.end_offset))
+                    .chain(
+                        self.state_machine
+                            .external_segments(&stream_id)
+                            .iter()
+                            .map(|object| (object.start_offset, object.end_offset)),
+                    )
+                    .collect(),
                 stream_id,
             })
             .collect();

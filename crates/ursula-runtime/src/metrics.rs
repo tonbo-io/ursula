@@ -426,6 +426,7 @@ runtime_metrics! {
     counter cold_flush_publish_ns;
     counter cold_orphan_cleanup_attempts;
     counter cold_orphan_cleanup_errors;
+    counter cold_orphan_uncovered_chunks_kept;
     counter cold_orphan_bytes;
     counter cold_gc_reclaimed;
     counter cold_gc_errors;
@@ -750,6 +751,13 @@ impl RuntimeMetricsInner {
         }
     }
 
+    /// RT6 alert: the orphan sweep kept an unreferenced exclusive chunk
+    /// because no referenced object covers its retained range (a lost page
+    /// entry); an operator must repair the stream's cold index.
+    pub(crate) fn record_cold_orphan_uncovered_chunk_kept(&self) {
+        self.cold_orphan_uncovered_chunks_kept.fetch_add_relaxed(1);
+    }
+
     pub(crate) fn record_cold_flush_write_error(&self) {
         self.cold_flush_write_errors.fetch_add_relaxed(1);
     }
@@ -941,7 +949,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 151] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 152] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -1074,6 +1082,7 @@ mod metric_manifest_tests {
         "cold_flush_publish_ns",
         "cold_orphan_cleanup_attempts",
         "cold_orphan_cleanup_errors",
+        "cold_orphan_uncovered_chunks_kept",
         "cold_orphan_bytes",
         "cold_gc_reclaimed",
         "cold_gc_errors",

@@ -3185,6 +3185,136 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
     }
 }
 
+/// RT3: with subset voter placement no node hosts every group. A bucket
+/// listing on such a node fetches the missing groups' share from one of their
+/// voters instead of failing with 503 (or silently skipping the group).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn static_grpc_bucket_listing_spans_groups_this_node_does_not_host() {
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    for node_id in 1..=4u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        peers.push((node_id, format!("http://{addr}")));
+        listeners.push(listener);
+    }
+    let group_voters = BTreeMap::from([
+        (RaftGroupId(0), BTreeSet::from([1, 2, 3])),
+        (RaftGroupId(1), BTreeSet::from([2, 3, 4])),
+    ]);
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        nodes.push(
+            spawn_static_grpc_test_node(
+                node_id,
+                listener,
+                peers.clone(),
+                peers.clone(),
+                true,
+                2,
+                StaticGrpcTestNodeStorage {
+                    per_group_initializers: true,
+                    per_group_voters: group_voters.clone(),
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    for (raft_group_id, voters) in &group_voters {
+        for (index, node) in nodes.iter().enumerate() {
+            let node_id = u64::try_from(index + 1).expect("node id fits u64");
+            if voters.contains(&node_id) {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    node.runtime.warm_group(*raft_group_id),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("warm node {node_id} group {} timed out", raft_group_id.0)
+                })
+                .expect("warm voter group");
+            }
+        }
+    }
+
+    let in_group = |group: u32| {
+        (0..10_000)
+            .map(|index| format!("listing-{index}"))
+            .find(|name| {
+                nodes[0]
+                    .runtime
+                    .locate(&BucketStreamId::new("listing", name.clone()))
+                    .raft_group_id
+                    == RaftGroupId(group)
+            })
+            .expect("find stream in group")
+    };
+    let mut expected = vec![in_group(0), in_group(1)];
+    expected.sort();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("build reqwest client");
+    for name in &expected {
+        // Retry while the groups still elect their leaders (503).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = client
+                .put(format!("{}/listing/{name}", peers[1].1))
+                .header(CONTENT_TYPE, "text/plain")
+                .send()
+                .await
+                .expect("create stream");
+            if response.status() == StatusCode::SERVICE_UNAVAILABLE
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            assert_eq!(response.status(), StatusCode::CREATED, "create {name}");
+            break;
+        }
+    }
+
+    // Node 1 does not host group 1 and node 4 does not host group 0.
+    for peer in [&peers[0].1, &peers[3].1] {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = client
+                .get(format!("{peer}/listing/streams"))
+                .send()
+                .await
+                .expect("list bucket");
+            let status = response.status();
+            let body = response.text().await.expect("listing body");
+            assert_eq!(status, StatusCode::OK, "listing on {peer}: {body}");
+            let listing: serde_json::Value = serde_json::from_str(&body).expect("listing json");
+            let listed = listing["streams"]
+                .as_array()
+                .expect("streams array")
+                .iter()
+                .map(|entry| entry["stream_id"].as_str().expect("id").to_owned())
+                .collect::<Vec<_>>();
+            if listed == expected {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "listing on {peer} never converged: {listed:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    for node in nodes {
+        node.shutdown().await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn static_grpc_follower_serves_replicated_catch_up_read_without_leader_proxy() {
     let mut listeners = Vec::new();
@@ -7904,6 +8034,34 @@ async fn keyed_create_is_refused_below_feature_level_1_and_allowed_after_raising
     assert_keyed_advertised(&response);
 }
 
+/// RT4: a close-only POST (empty body, no content type) to a keyed stream
+/// advertises `keyed-batch-v1` like every other successful write (§9.1.5);
+/// one to a plain stream does not.
+#[tokio::test]
+async fn keyed_close_only_post_advertises_keyed_batch() {
+    let app = keyed_router_at_level_1().await;
+    for (uri, content_type, keyed) in [
+        ("/benchcmp/keyed-close-only", KEYED_CT, true),
+        ("/benchcmp/plain-close-only", "application/json", false),
+    ] {
+        let response = http_put(
+            &app,
+            uri,
+            &[(CONTENT_TYPE.as_str(), content_type)],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let response = http_post(&app, uri, &[(HEADER_STREAM_CLOSED, "true")], Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        if keyed {
+            assert_keyed_advertised(&response);
+        } else {
+            assert_keyed_not_advertised(&response);
+        }
+    }
+}
+
 #[tokio::test]
 async fn keyed_create_body_is_validated_before_the_feature_gate() {
     let app = test_router();
@@ -8184,6 +8342,15 @@ async fn keyed_transaction_ops_are_validated_and_advertised() {
         let response = http_head(&app, &format!("/benchcmp/txn-keyed/{stream}")).await;
         assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "0");
     }
+
+    // RT5 (§9.1.3): invalid JSON in a later op is 400 even when an earlier
+    // op is valid JSON with invalid keyed grammar (422).
+    let response = post_transaction(&app, txn, vec![
+        transaction_op("keyed", KEYED_CT, r#"{"ops":[["q","AQ"]]}"#),
+        transaction_op("plain", "application/json", r#"{"a":"#),
+    ])
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     // Plain-only transactions do not advertise keyed-batch-v1.
     let response = post_transaction(&app, txn, vec![transaction_op(

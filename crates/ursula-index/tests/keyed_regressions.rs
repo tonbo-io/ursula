@@ -539,3 +539,190 @@ async fn sweep_observes_again_before_acting_on_a_stale_listing() {
         "the reused part survived the sweep"
     );
 }
+
+/// IX1: a pod holding an older manifest serves reads with
+/// `min_through_record <= D` without revalidating `CURRENT`. After another
+/// pod's compaction and GC removed that manifest's parts, the read must
+/// reload `CURRENT` and retry instead of answering 503 indefinitely.
+#[tokio::test(start_paused = true)]
+async fn stale_pod_reloads_current_when_its_parts_were_collected() {
+    let log = Arc::new(FakeLog::default());
+    let clock: Arc<dyn Clock> = Arc::new(TestClock(tokio::time::Instant::now()));
+    let raw = MemoryObjectStore::new(Arc::clone(&clock));
+    let config = KeyedEngineConfig {
+        min_publish_interval: Duration::ZERO,
+        gc_grace: GRACE,
+        gc_tick: Duration::from_secs(3_600),
+        // Reads go to the store, so a deleted part is noticed.
+        write_cache_bytes: 0,
+        footer_cache_bytes: 0,
+        // Two runs merge at once.
+        policy: ursula_index::keyed::CompactionPolicy {
+            ratio: 1_000,
+            width: 2,
+            amp_percent: 1,
+            max_runs: 8,
+        },
+        ..KeyedEngineConfig::default()
+    };
+    let pod_a = KeyedEngine::with_clock(
+        ObjectStore::from(raw.clone()),
+        Arc::clone(&log),
+        None,
+        config.clone(),
+        Arc::clone(&clock),
+    );
+    let pod_b = KeyedEngine::with_clock(
+        ObjectStore::from(raw.clone()),
+        Arc::clone(&log),
+        None,
+        config,
+        Arc::clone(&clock),
+    );
+
+    log.records.lock().unwrap().extend((0..2).map(record));
+    let KeyedReadOutcome::Rows { through: 2, .. } = read(&pod_a, 2, Duration::from_secs(5)).await
+    else {
+        panic!("pod A publishes generation 1");
+    };
+    let first_parts: Vec<String> = raw
+        .snapshot()
+        .into_iter()
+        .map(|(key, _)| key)
+        .filter(|key| key.contains("/parts/"))
+        .collect();
+    assert!(!first_parts.is_empty());
+
+    // Pod B ingests more records, compacts the two runs into one and, past
+    // the grace period, collects generation 1's parts.
+    log.records.lock().unwrap().extend((2..4).map(record));
+    let KeyedReadOutcome::Rows { through: 4, .. } = read(&pod_b, 4, Duration::from_secs(5)).await
+    else {
+        panic!("pod B publishes");
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(GRACE + Duration::from_secs(1)).await;
+    pod_b.collect_garbage().await;
+    let remaining: Vec<String> = raw.snapshot().into_iter().map(|(key, _)| key).collect();
+    assert!(
+        first_parts.iter().any(|part| !remaining.contains(part)),
+        "pod B's compaction and GC removed a part of generation 1"
+    );
+
+    // Pod A still holds generation 1; a read it can answer from that view
+    // must reload CURRENT and succeed.
+    let KeyedReadOutcome::Rows { through, page } = read(&pod_a, 2, Duration::from_secs(5)).await
+    else {
+        panic!("stale pod cannot read after another pod's GC");
+    };
+    assert_eq!(through, 4);
+    let records = log.records.lock().unwrap().clone();
+    let state = KeyedState::fold(records.iter().map(String::as_str)).unwrap();
+    assert_eq!(page.body(), state.range(&all_rows()).body());
+}
+
+/// IX2: engine GC checked a queued orphan only against `CURRENT`. Parts are
+/// content-addressed, so another pod can publish the same part in a later
+/// manifest; once a newer manifest replaces that one, the part is still in
+/// use by readers of the recent manifest for the grace period. The orphan's
+/// deletion must respect every manifest written within the grace.
+#[tokio::test(start_paused = true)]
+async fn gc_spares_an_orphan_referenced_by_a_recent_manifest() {
+    let log = Arc::new(FakeLog::default());
+    let clock: Arc<dyn Clock> = Arc::new(TestClock(tokio::time::Instant::now()));
+    let raw = MemoryObjectStore::new(Arc::clone(&clock));
+    let config = KeyedEngineConfig {
+        min_publish_interval: Duration::ZERO,
+        gc_grace: GRACE,
+        gc_tick: Duration::from_secs(3_600),
+        write_cache_bytes: 0,
+        // Tier merges never include the oldest run: the third run merges
+        // with the second (the reused one), two runs never merge.
+        policy: ursula_index::keyed::CompactionPolicy {
+            ratio: 1_000,
+            width: 2,
+            amp_percent: 1_000_000,
+            max_runs: 8,
+        },
+        ..KeyedEngineConfig::default()
+    };
+    let pod_a = KeyedEngine::with_clock(
+        ObjectStore::from(raw.clone()),
+        Arc::clone(&log),
+        None,
+        config.clone(),
+        Arc::clone(&clock),
+    );
+    let script = Arc::new(Script {
+        log: Arc::clone(&log),
+        conflict_next_cas: AtomicBool::new(false),
+        delete_delay: Mutex::new(Duration::ZERO),
+        deleted: Mutex::new(Vec::new()),
+    });
+    let pod_b = KeyedEngine::with_clock(
+        ObjectStore::from(raw.clone()).with_hooks(script.clone()),
+        Arc::clone(&log),
+        None,
+        config,
+        Arc::clone(&clock),
+    );
+
+    log.records.lock().unwrap().extend((0..2).map(record));
+    let KeyedReadOutcome::Rows { through: 2, .. } = read(&pod_a, 2, Duration::from_secs(5)).await
+    else {
+        panic!("generation 1");
+    };
+    let parts = || -> Vec<String> {
+        raw.snapshot()
+            .into_iter()
+            .map(|(key, _)| key)
+            .filter(|key| key.contains("/parts/"))
+            .collect()
+    };
+    let before = parts();
+    // Pod B folds records 2..4 and loses its CAS: its parts are orphans in
+    // its GC queue.
+    log.records.lock().unwrap().extend((2..4).map(record));
+    script.conflict_next_cas.store(true, Ordering::SeqCst);
+    let _lost = read(&pod_b, 4, Duration::from_secs(1)).await;
+    log.failing.store(false, Ordering::SeqCst);
+    let orphans: Vec<String> = parts()
+        .into_iter()
+        .filter(|key| !before.contains(key))
+        .collect();
+    assert!(!orphans.is_empty());
+
+    // Pod A publishes the same records, reusing pod B's parts.
+    let KeyedReadOutcome::Rows { through: 4, .. } = read(&pod_a, 4, Duration::from_secs(30)).await
+    else {
+        panic!("generation 2");
+    };
+    // Shortly before pod B's GC, pod A ingests more and compacts the three
+    // runs: CURRENT no longer references the reused parts, but the manifest
+    // just before the compaction (written within the grace) does.
+    tokio::time::sleep(GRACE.checked_sub(Duration::from_secs(1)).unwrap()).await;
+    log.records.lock().unwrap().extend((4..6).map(record));
+    let KeyedReadOutcome::Rows { through: 6, .. } = read(&pod_a, 6, Duration::from_secs(30)).await
+    else {
+        panic!("generation 3");
+    };
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let current_parts = referenced_objects(&raw);
+    let reused_in_current = orphans.iter().any(|orphan| {
+        current_parts
+            .iter()
+            .any(|(key, _)| orphan.ends_with(key.as_str()))
+    });
+    assert!(
+        !reused_in_current,
+        "the compaction replaced the reused parts"
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    pod_b.collect_garbage().await;
+    let deleted = script.deleted.lock().unwrap().clone();
+    assert!(
+        !orphans.iter().any(|orphan| deleted.contains(orphan)),
+        "pod B deleted a part a manifest within the grace references: {deleted:?}"
+    );
+}

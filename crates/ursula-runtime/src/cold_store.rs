@@ -1411,7 +1411,14 @@ impl ColdReadCache {
 }
 
 fn cold_store_io_error(path: &str, err: opendal::Error) -> io::Error {
-    io::Error::other(format!("cold object '{path}': {err}"))
+    // Keep NotFound distinguishable: a read that names a compacted object
+    // refreshes its cold-index page and retries (RT2).
+    let kind = if err.kind() == opendal::ErrorKind::NotFound {
+        io::ErrorKind::NotFound
+    } else {
+        io::ErrorKind::Other
+    };
+    io::Error::new(kind, format!("cold object '{path}': {err}"))
 }
 
 #[cfg(not(madsim))]
@@ -1474,6 +1481,18 @@ pub fn cold_external_dir(stream_id: &BucketStreamId) -> String {
 /// for exclusive chunks, `{start:016x}-{end:016x}-{nanos:032x}-{seq:016x}.bin`.
 pub fn is_cold_chunk_file_name(name: &str) -> bool {
     hex_fields_with_suffix(name, ".bin", &[16, 16, 32, 16])
+}
+
+/// The `[start, end)` byte range an exclusive chunk's file name encodes, or
+/// `None` for any other name.
+pub fn cold_chunk_file_range(name: &str) -> Option<(u64, u64)> {
+    if !is_cold_chunk_file_name(name) {
+        return None;
+    }
+    let mut fields = name.split('-');
+    let start = u64::from_str_radix(fields.next()?, 16).ok()?;
+    let end = u64::from_str_radix(fields.next()?, 16).ok()?;
+    Some((start, end))
 }
 
 /// Whether `name` has the form Ursula uses for staged external payloads,

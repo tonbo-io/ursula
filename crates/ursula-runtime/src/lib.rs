@@ -241,6 +241,7 @@ pub use runtime::PurgeBucketReport;
 pub use runtime::RuntimeConfig;
 pub use runtime::RuntimeThreading;
 pub use runtime::ShardRuntime;
+pub use runtime::merge_bucket_stream_listings;
 pub use snapshot_store::InlineSnapshotStore;
 #[cfg(not(madsim))]
 pub use snapshot_store::S3SnapshotStore;

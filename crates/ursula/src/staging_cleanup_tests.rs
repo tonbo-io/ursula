@@ -399,6 +399,15 @@ fn cleanup_rule_classifies_runtime_errors() {
             message: "write page".to_owned()
         }
     ));
+    // RT1: OpenRaft reports ForwardToLeader from a dropped responder after
+    // step-down or log purge, when the entry may already have committed. Only
+    // the local pre-proposal leadership check is a definite rejection.
+    assert!(!staged_external_definitely_unreferenced(&engine(
+        GroupEngineError::forward_to_leader("client_write responder", Some(2), None)
+    )));
+    assert!(staged_external_definitely_unreferenced(&engine(
+        GroupEngineError::forward_to_leader_before_proposal("not leader", Some(2), None)
+    )));
     assert!(staged_external_definitely_unreferenced(
         &RuntimeError::GroupNotHosted {
             core_id: CoreId(0),

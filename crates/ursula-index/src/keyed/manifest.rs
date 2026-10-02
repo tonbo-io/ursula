@@ -691,6 +691,19 @@ impl KeyedNamespace {
         Ok(protected)
     }
 
+    /// [`Self::protected`] over a fresh LIST of the namespace: every object
+    /// a reader may still use at `now_ms` (IX2: engine GC checks queued
+    /// orphans against it, not only against `CURRENT`, because
+    /// content-addressed parts may be referenced by a recent manifest).
+    pub(crate) async fn protected_now(
+        &self,
+        now_ms: u64,
+        grace: Duration,
+    ) -> Result<HashSet<String>, IndexError> {
+        let objects = self.objects().await?;
+        self.protected(&objects, now_ms, grace).await
+    }
+
     /// The orphan sweep (U20 `sweep`, also run by the engine): one LIST of
     /// the namespace, then deletes every part and manifest that is older
     /// than `grace` at `clock`'s time and that no manifest a reader may

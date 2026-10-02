@@ -1006,12 +1006,65 @@ impl Inner {
         }
     }
 
+    /// Serves `selection` from `view`. When the read fails, the view's parts
+    /// may have been removed by another pod's compaction and GC after this
+    /// pod last loaded `CURRENT` (IX1): reload `CURRENT` once and, when it
+    /// is newer, retry on it before answering 503.
     async fn serve(
+        &self,
+        namespace: &Arc<Namespace>,
+        view: &View,
+        selection: &Selection,
+    ) -> KeyedReadOutcome {
+        let error = match self.serve_view(namespace, view, selection).await {
+            Ok(outcome) => return outcome,
+            Err(error) => error,
+        };
+        let held = view.generation();
+        let started = Instant::now();
+        match namespace.namespace.load().await {
+            Ok(Some(published)) if published.manifest.generation > held => {
+                self.adopt_loaded(namespace, published);
+                namespace.mark_checked(started);
+                let reloaded = namespace.view();
+                if reloaded.generation() > held && reloaded.through() >= view.through() {
+                    match self.serve_view(namespace, &reloaded, selection).await {
+                        Ok(outcome) => return outcome,
+                        Err(retry_error) => {
+                            return self.read_failed(namespace, &retry_error);
+                        }
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(load_error) => {
+                tracing::warn!(
+                    error = %load_error,
+                    bucket = %namespace.source.bucket,
+                    key = %namespace.source.key,
+                    "keyed CURRENT reload after a failed read failed"
+                );
+            }
+        }
+        self.read_failed(namespace, &error)
+    }
+
+    fn read_failed(&self, namespace: &Namespace, error: &IndexError) -> KeyedReadOutcome {
+        tracing::warn!(
+            %error,
+            bucket = %namespace.source.bucket,
+            key = %namespace.source.key,
+            "keyed-state read failed"
+        );
+        KeyedReadOutcome::Unavailable("keyed state cannot be read".to_owned())
+    }
+
+    async fn serve_view(
         &self,
         namespace: &Namespace,
         view: &View,
         selection: &Selection,
-    ) -> KeyedReadOutcome {
+    ) -> Result<KeyedReadOutcome, IndexError> {
         let through = view.through();
         let runs = view
             .published
@@ -1028,19 +1081,8 @@ impl Inner {
                     })
             }
             Selection::Range(query) => read_range(&namespace.opener, runs, query, options).await,
-        };
-        match page {
-            Ok(page) => KeyedReadOutcome::Rows { through, page },
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    bucket = %namespace.source.bucket,
-                    key = %namespace.source.key,
-                    "keyed-state read failed"
-                );
-                KeyedReadOutcome::Unavailable("keyed state cannot be read".to_owned())
-            }
-        }
+        }?;
+        Ok(KeyedReadOutcome::Rows { through, page })
     }
 
     /// Registers a want (or a re-validation) and starts the namespace's
@@ -1794,7 +1836,11 @@ impl Inner {
         deleted
     }
 
-    /// The objects `CURRENT` references (adopting it when newer).
+    /// The objects a reader may still use: what `CURRENT` references
+    /// (adopting it when newer), plus every manifest written within the
+    /// grace period and what it references (IX2). Queued orphans of a lost
+    /// CAS or an abandoned compaction are content-addressed, so a recent
+    /// manifest other than `CURRENT` may reference them.
     async fn gc_referenced(
         &self,
         namespace: &Arc<Namespace>,
@@ -1808,6 +1854,12 @@ impl Inner {
             published.manifest.part_keys().map(str::to_owned).collect();
         referenced.insert(published.manifest_key.clone());
         self.adopt_loaded(namespace, published);
+        referenced.extend(
+            namespace
+                .namespace
+                .protected_now(self.now_ms(), self.config.gc_grace)
+                .await?,
+        );
         Ok(referenced)
     }
 

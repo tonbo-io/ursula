@@ -317,6 +317,7 @@ pub(crate) async fn write_commands_on_raft(
                 err.leader_id,
                 err.leader_node.as_ref(),
                 raft.metrics().borrow_watched().id,
+                false,
             )),
         };
         responses.push(response);
@@ -375,25 +376,35 @@ pub(crate) fn group_engine_client_write_error(
             forward.leader_id,
             forward.leader_node.as_ref(),
             self_id,
+            false,
         );
     }
     GroupEngineError::new(format!("OpenRaft client_write: {err}"))
 }
 
+/// `before_proposal` is true only for a local leadership check that runs
+/// before anything is proposed (RT1); a forward OpenRaft reports after
+/// `client_write` is ambiguous, because the entry may already have committed.
 pub(crate) fn group_engine_forward_to_leader_error(
     message: impl Into<String>,
     leader_id: Option<u64>,
     leader_node: Option<&BasicNode>,
     self_id: u64,
+    before_proposal: bool,
 ) -> GroupEngineError {
+    let build = if before_proposal {
+        GroupEngineError::forward_to_leader_before_proposal
+    } else {
+        GroupEngineError::forward_to_leader
+    };
     // The write bounced because this node is not the leader. If the reported
     // leader is *this* node, leadership is in a transient step-down/election
     // window: redirecting the client back to ourselves would just loop, so
     // report leader-unknown and let the HTTP layer answer with a retryable 503.
     if leader_id == Some(self_id) {
-        return GroupEngineError::forward_to_leader(message, None, None);
+        return build(message, None, None);
     }
-    GroupEngineError::forward_to_leader(
+    build(
         message,
         leader_id,
         leader_node.map(|node| node.addr.clone()),

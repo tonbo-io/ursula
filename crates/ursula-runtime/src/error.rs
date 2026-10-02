@@ -116,6 +116,16 @@ impl RuntimeError {
         }
     }
 
+    /// True for a forward-to-leader error raised by a local leadership
+    /// check before anything was proposed (RT1): the command definitely did
+    /// not commit. A forward OpenRaft reports after `client_write` is not.
+    pub fn is_forward_before_proposal(&self) -> bool {
+        match self {
+            Self::GroupEngine { error, .. } => error.is_forward_before_proposal(),
+            _ => false,
+        }
+    }
+
     pub fn status(&self) -> ErrorStatus {
         match self {
             Self::LiveReadBackpressure { .. } | Self::GroupNotHosted { .. } => {

@@ -554,7 +554,7 @@ impl ShardRuntime {
                 // commit, and the engine rolled back or never wrote its page
                 // entry, so nothing references the chunk. Any other failure
                 // is ambiguous and keeps the chunk.
-                if (err.stream_error_code().is_some() || err.leader_hint().is_some())
+                if (err.stream_error_code().is_some() || err.is_forward_before_proposal())
                     && let Err(cleanup_err) = cold_store.delete_chunk(&path).await
                 {
                     tracing::warn!(
@@ -841,25 +841,14 @@ impl ShardRuntime {
             now_ms,
         };
         let group_count = self.shard_map.raft_group_count();
-        let mut bucket_known = false;
-        let mut streams = Vec::new();
+        let mut shares = Vec::new();
         for group_id in 0..group_count {
-            if let Some(group_streams) = self
-                .list_bucket_streams(RaftGroupId(group_id), request.clone())
-                .await?
-            {
-                bucket_known = true;
-                streams.extend(group_streams);
-            }
+            shares.push(
+                self.list_bucket_streams(RaftGroupId(group_id), request.clone())
+                    .await?,
+            );
         }
-        if !bucket_known {
-            return Ok(None);
-        }
-        streams.sort_by(|left, right| left.stream_id.cmp(&right.stream_id));
-        streams.dedup_by(|right, left| right.stream_id == left.stream_id);
-        let has_more = streams.len() > limit;
-        streams.truncate(limit);
-        Ok(Some(ListBucketStreamsResponse { streams, has_more }))
+        Ok(merge_bucket_stream_listings(shares, limit))
     }
 
     /// Replicates one bucket's quota record to every Raft group so each
@@ -1233,7 +1222,7 @@ impl ShardRuntime {
                 .await;
             if let Err(err) = compact_result {
                 let rollback_safe =
-                    err.leader_hint().is_some() || err.stream_error_code().is_some();
+                    err.is_forward_before_proposal() || err.stream_error_code().is_some();
                 if !rollback_safe {
                     return Err(err);
                 }
@@ -2225,4 +2214,27 @@ async fn erase_prefix_and_prove(cold_store: &ColdStore, prefix: &str) -> Result<
         });
     }
     Ok(())
+}
+
+/// Merges per-group bucket listing shares (`extensions.md` §1.4): each share
+/// is one group's first `limit + 1` eligible streams, or `None` when that
+/// group does not know the bucket. Returns `None` when no group knows it.
+pub fn merge_bucket_stream_listings(
+    shares: impl IntoIterator<Item = Option<Vec<ursula_stream::BucketStreamListing>>>,
+    limit: usize,
+) -> Option<ListBucketStreamsResponse> {
+    let mut bucket_known = false;
+    let mut streams = Vec::new();
+    for share in shares.into_iter().flatten() {
+        bucket_known = true;
+        streams.extend(share);
+    }
+    if !bucket_known {
+        return None;
+    }
+    streams.sort_by(|left, right| left.stream_id.cmp(&right.stream_id));
+    streams.dedup_by(|right, left| right.stream_id == left.stream_id);
+    let has_more = streams.len() > limit;
+    streams.truncate(limit);
+    Some(ListBucketStreamsResponse { streams, has_more })
 }

@@ -11,10 +11,14 @@
 //!   drain fan-out to keyed-state indexers (U23) and keyed-state request
 //!   counters (U24).
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
+//! - `bucket_listing`: `GET /{bucket}/streams` across Raft groups, fetching
+//!   the share of a group this node does not host from one of its voters
+//!   (RT3).
 //! - [`bootstrap`]: typed-config `spawn_*_runtime` constructors and cold-flush worker.
 //! - [`server`]: command arguments and the long-running server service entrypoint.
 
 mod bootstrap;
+mod bucket_listing;
 pub mod json_text;
 mod keyed_lifecycle;
 pub mod keyed_state;
@@ -592,11 +596,17 @@ struct HttpMetricsSnapshot {
 /// `server.cluster_listen` address when it is set. Peer URLs are also used as
 /// HTTP leader-redirect targets, so clients and gateways must be able to reach
 /// them too.
+/// Timeout of one node-to-node fan-out request.
+const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
     peers: Arc<BTreeMap<u64, String>>,
     node_id: Option<u64>,
     per_group_voters: Arc<BTreeMap<RaftGroupId, BTreeSet<u64>>>,
+    /// Node-to-node HTTP client for fan-out reads such as a bucket listing
+    /// share of a group this node does not host (RT3).
+    peer_client: reqwest::Client,
 }
 
 impl ClientWriteLeaderRouter {
@@ -618,7 +628,28 @@ impl ClientWriteLeaderRouter {
             ),
             node_id: node_id.into(),
             per_group_voters: Arc::new(per_group_voters),
+            peer_client: reqwest::Client::builder()
+                .timeout(PEER_REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
         }
+    }
+
+    pub(crate) fn peer_client(&self) -> &reqwest::Client {
+        &self.peer_client
+    }
+
+    /// Base URLs of `group`'s voters other than this node.
+    pub(crate) fn group_voter_bases(&self, group: RaftGroupId) -> Vec<String> {
+        self.per_group_voters
+            .get(&group)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|node_id| Some(*node_id) != self.node_id)
+            .filter_map(|node_id| self.peers.get(&node_id))
+            .map(|base| base.trim_end_matches('/').to_owned())
+            .collect()
     }
 
     fn leader_base(&self, err: &RuntimeError) -> Option<(u64, String)> {
@@ -1382,6 +1413,10 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         .route("/{bucket}", put(create_bucket))
         .route("/{bucket}/streams", get(list_bucket_streams))
         .route(
+            bucket_listing::GROUP_SHARE_PATH,
+            get(bucket_listing::group_share),
+        )
+        .route(
             "/{bucket}/{stream}/snapshot",
             get(read_latest_snapshot).put(publish_snapshot_at_record),
         )
@@ -1517,15 +1552,17 @@ pub(crate) async fn stage_external_payload(
 /// Bounded-state F5 cleanup rule (ungated): a staged external object may be
 /// deleted only when its append or create definitely did not commit. That is
 /// a typed stream error (apply, or a pre-proposal check, rejected it on every
-/// replica alike), a redirect or backpressure rejection before proposal, or a
+/// replica alike), a redirect raised by the local pre-proposal leadership
+/// check or a backpressure rejection before proposal, or a
 /// request the runtime refused before dispatch. Every other failure (a lost
-/// response, a transport or storage error, an untyped engine error) may
+/// response, a forward-to-leader reported by OpenRaft after `client_write`
+/// (RT1), a transport or storage error, an untyped engine error) may
 /// follow a committed proposal that references the object, so the object is
 /// kept; an orphan sweep or stream GC reclaims it if nothing does.
 pub(crate) fn staged_external_definitely_unreferenced(err: &RuntimeError) -> bool {
     match err {
         RuntimeError::GroupEngine { error, .. } => {
-            error.code().is_some() || error.leader_hint().is_some() || error.is_backpressure()
+            error.code().is_some() || error.is_forward_before_proposal() || error.is_backpressure()
         }
         RuntimeError::EmptyAppend
         | RuntimeError::InvalidAppendTransaction { .. }
@@ -1814,21 +1851,18 @@ pub(crate) async fn list_bucket_streams(
     };
     let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
     let after = query.get("after").map(String::as_str);
-    let listing = match state
-        .runtime
-        .list_bucket_streams_all_groups(&bucket, prefix, after, limit, state.unix_time_ms())
-        .await
-    {
-        Ok(Some(listing)) => listing,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                format!("bucket '{bucket}' does not exist"),
-            )
-                .into_response();
-        }
-        Err(err) => return runtime_error_response(err),
-    };
+    let listing =
+        match bucket_listing::list_across_groups(&state, &bucket, prefix, after, limit).await {
+            Ok(Some(listing)) => listing,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!("bucket '{bucket}' does not exist"),
+                )
+                    .into_response();
+            }
+            Err(response) => return response,
+        };
     let next_cursor = listing
         .has_more
         .then(|| listing.streams.last().map(|entry| entry.stream_id.clone()))
@@ -2989,7 +3023,7 @@ pub(crate) async fn append_stream_by_id(
         return match state
             .runtime
             .close_stream(CloseStreamRequest {
-                stream_id,
+                stream_id: stream_id.clone(),
                 stream_seq,
                 producer: producer.clone(),
                 now_ms: state.unix_time_ms(),
@@ -2999,6 +3033,18 @@ pub(crate) async fn append_stream_by_id(
             Ok(response) => {
                 let mut headers = HeaderMap::new();
                 insert_default_response_headers(&mut headers);
+                // RT4 (§9.1.5): a close-only POST carries no content type, so
+                // learn whether the stream is keyed from its head.
+                if let Ok(head) = state
+                    .runtime
+                    .head_stream(HeadStreamRequest {
+                        stream_id,
+                        now_ms: state.unix_time_ms(),
+                    })
+                    .await
+                {
+                    insert_keyed_extension_for(&mut headers, &head.content_type);
+                }
                 insert_offset(&mut headers, response.next_offset);
                 insert_producer_ack(&mut headers, producer.as_ref());
                 if let Some(record_range) = response.record_range {
@@ -3225,9 +3271,6 @@ pub(crate) async fn append_transaction(
             Ok(payload) => payload,
             Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
         };
-        if let Err(response) = validate_keyed_write(&content_type, &payload, None) {
-            return *response;
-        }
         keyed |= ursula_shard::is_keyed_batch_content_type(&content_type);
         operations.push(AppendRequest {
             stream_id: BucketStreamId::with_affinity(
@@ -3243,6 +3286,15 @@ pub(crate) async fn append_transaction(
             now_ms,
             record_match: operation.record_match,
         });
+    }
+    // RT5 (§9.1.3): every op is decoded and normalized (400) before any op's
+    // keyed grammar is validated (422), as append-batch does.
+    for operation in &operations {
+        if let Err(response) =
+            validate_keyed_write(&operation.content_type, &operation.payload, None)
+        {
+            return *response;
+        }
     }
     let response = match state
         .runtime

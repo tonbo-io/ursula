@@ -599,6 +599,84 @@ async fn cold_index_read_materializes_overlapping_flush_objects_once() {
     assert_eq!(payload, b"abcdef");
 }
 
+/// RT2: a cached cold-index page can name a chunk that a compaction already
+/// replaced and garbage-collected. The read refreshes the page once on a
+/// missing object instead of failing until the page is evicted.
+#[tokio::test]
+async fn cold_read_refreshes_page_when_its_object_was_collected() {
+    let stream = BucketStreamId::new("benchcmp", "collected-cold-read");
+    let cold_store = Arc::new(memory_cold_store());
+    let old = ColdChunkRef {
+        start_offset: 0,
+        end_offset: 4,
+        s3_path: "benchcmp/collected-cold-read/chunks/old.bin".to_owned(),
+        object_size: 4,
+        ..Default::default()
+    };
+    let replacement = ColdChunkRef {
+        s3_path: "benchcmp/collected-cold-read/chunks/replacement.bin".to_owned(),
+        ..old.clone()
+    };
+    cold_store
+        .write_chunk(&old.s3_path, b"abcd")
+        .await
+        .expect("write old cold object");
+    let page_store = Arc::new(ColdStoreColdIndexPageStore::new(cold_store.clone()));
+    let key = ColdIndexPageKey {
+        stream_id: stream.clone(),
+        generation: 0,
+        page_id: 0,
+    };
+    let page = |chunk: ColdChunkRef| ColdIndexPage {
+        start_offset: 0,
+        end_offset: ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES,
+        cold_chunks: vec![chunk],
+        external_segments: Vec::new(),
+    };
+    page_store
+        .put_page(&key, &page(old.clone()))
+        .await
+        .expect("store old page");
+    let cache = Arc::new(ColdIndexPageCache::new(page_store.clone(), 8));
+    let plan = StreamReadPlan {
+        offset: 0,
+        next_offset: 4,
+        content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+        segments: vec![StreamReadSegment::ColdIndex(StreamReadColdIndexSegment {
+            generation: 0,
+            page_id: 0,
+            read_start_offset: 0,
+            len: 4,
+        })],
+        up_to_date: true,
+        closed: false,
+        retained_record_range: None,
+        record_trim: None,
+        record_range: None,
+    };
+    let read = || {
+        InMemoryGroupEngine::read_payload_from_plan(Some(&cold_store), Some(&cache), &stream, &plan)
+    };
+    assert_eq!(read().await.expect("read old chunk"), b"abcd");
+
+    // Compaction rewrites the page and GC deletes the input chunk; this
+    // cache missed the invalidation and still holds the old page.
+    cold_store
+        .write_chunk(&replacement.s3_path, b"abcd")
+        .await
+        .expect("write replacement");
+    page_store
+        .put_page(&key, &page(replacement))
+        .await
+        .expect("rewrite page");
+    cold_store
+        .delete_chunk(&old.s3_path)
+        .await
+        .expect("collect old chunk");
+
+    assert_eq!(read().await.expect("read after collection"), b"abcd");
+}
+
 #[tokio::test]
 async fn stale_cold_flush_rolls_back_index_page_entry() {
     let placement = placement();

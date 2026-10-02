@@ -557,6 +557,7 @@ impl RaftGroupEngine {
             leader_id,
             leader_node.as_ref(),
             self_id,
+            true,
         ))
     }
 
@@ -663,6 +664,7 @@ impl RaftGroupEngine {
             self.raft.current_leader().await,
             None,
             self_id,
+            true,
         ))
     }
 
@@ -1451,6 +1453,7 @@ impl GroupEngine for RaftGroupEngine {
                         leader_id,
                         None,
                         self_id,
+                        true,
                     ));
                 };
                 return forward_purge_bucket_to_leader(self.placement, &leader_node, bucket_id)
@@ -1897,12 +1900,13 @@ impl GroupEngine for RaftGroupEngine {
                     false,
                 ),
                 Err(err) => {
-                    // F14e: a redirect means OpenRaft rejected the write before
-                    // accepting it, and a typed stream error means apply
+                    // F14e: a pre-proposal redirect means the write was never
+                    // proposed (RT1: OpenRaft's own ForwardToLeader may follow
+                    // a committed entry), and a typed stream error means apply
                     // rejected it (a stale flush), so the page entry is
                     // definitely unreferenced. Other failures are ambiguous:
                     // the flush may still commit, so the entry stays.
-                    let rollback_safe = err.leader_hint().is_some() || err.code().is_some();
+                    let rollback_safe = err.is_forward_before_proposal() || err.code().is_some();
                     (Err(err), rollback_safe)
                 }
             };
@@ -1974,13 +1978,13 @@ impl GroupEngine for RaftGroupEngine {
                     false,
                 ),
                 Err(err) => {
-                    // A redirect means OpenRaft rejected the write before
-                    // accepting it. A typed stream error was committed but the
+                    // A pre-proposal redirect means the write was never
+                    // proposed (RT1). A typed stream error was committed but the
                     // state machine rejected it without enqueueing GC. Other
                     // Raft failures have an ambiguous commit outcome, so keep
                     // the replacement index rather than risk restoring inputs
                     // that a committed GC command will later delete.
-                    let rollback_safe = err.leader_hint().is_some() || err.code().is_some();
+                    let rollback_safe = err.is_forward_before_proposal() || err.code().is_some();
                     (Err(err), rollback_safe)
                 }
             };

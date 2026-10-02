@@ -53,6 +53,11 @@ pub struct ColdOrphanSweepStream {
     pub generation: u64,
     /// Paths the stream's replicated state references directly.
     pub referenced: Vec<String>,
+    /// `[retained, hot start)`: the retained bytes no longer in the hot
+    /// buffer, which state refs or cold-index pages must cover (RT6).
+    pub cold_range: (u64, u64),
+    /// Byte ranges of the objects the stream's state references directly.
+    pub referenced_ranges: Vec<(u64, u64)>,
 }
 
 /// Outcome of one orphan-sweep step.
@@ -63,6 +68,11 @@ pub struct ColdOrphanSweepReport {
     pub orphans_deleted: u64,
     pub orphan_bytes: u64,
     pub delete_errors: u64,
+    /// RT6 alert: unreferenced exclusive chunks kept because no referenced
+    /// object covers their part of the stream's cold range, so their page
+    /// entry was lost (a page write by a deposed leader, or a rollback after
+    /// an ambiguous redirect). Deleting them would lose committed data.
+    pub uncovered_chunks_kept: u64,
     /// The step ran on the leader and reached the end of the group's streams.
     pub cycle_completed: bool,
 }
@@ -74,7 +84,31 @@ impl ColdOrphanSweepReport {
         self.orphans_deleted = self.orphans_deleted.saturating_add(other.orphans_deleted);
         self.orphan_bytes = self.orphan_bytes.saturating_add(other.orphan_bytes);
         self.delete_errors = self.delete_errors.saturating_add(other.delete_errors);
+        self.uncovered_chunks_kept = self
+            .uncovered_chunks_kept
+            .saturating_add(other.uncovered_chunks_kept);
     }
+}
+
+/// Whether `ranges` cover every byte of `[start, end)`.
+pub fn ranges_cover(ranges: &[(u64, u64)], start: u64, end: u64) -> bool {
+    let mut sorted = ranges
+        .iter()
+        .copied()
+        .filter(|(range_start, range_end)| range_start < range_end)
+        .collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let mut cursor = start;
+    for (range_start, range_end) in sorted {
+        if cursor >= end {
+            break;
+        }
+        if range_start > cursor {
+            return false;
+        }
+        cursor = cursor.max(range_end);
+    }
+    cursor >= end
 }
 
 /// Settings of the shared pack-reference compaction driver (F2).
