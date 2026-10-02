@@ -79,9 +79,11 @@ export class FaultProxy {
 		}
 	}
 
+	/** Stops accepting, destroys every open connection and waits until the listener has closed. */
 	async close(): Promise<void> {
 		this.down();
-		this.server.close();
+		const closed = new Promise<void>((resolve) => this.server.close(() => resolve()));
 		this.server.unref();
+		await closed;
 	}
 }

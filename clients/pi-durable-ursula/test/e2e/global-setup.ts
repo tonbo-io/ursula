@@ -80,8 +80,9 @@ export default async function setup(project: TestProject): Promise<() => Promise
 	project.provide("controlUrl", `http://127.0.0.1:${controlPort}`);
 	project.provide("stackInfo", JSON.stringify(info));
 	return async () => {
-		control.close();
+		const closed = new Promise<void>((resolve) => control.close(() => resolve()));
 		control.closeAllConnections();
+		await closed;
 		await stack.stop();
 	};
 }
