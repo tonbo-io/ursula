@@ -353,14 +353,12 @@ impl EventIndex {
     }
 
     fn envelope_entry(&self, envelope: &SourceEnvelope) -> Result<EventEntry, IndexError> {
-        let captured_at_ms = envelope
-            .value
-            .get(&self.config.timestamp_field)
-            .and_then(crate::store::parse_timestamp)
-            .ok_or_else(|| IndexError::InvalidTimestamp {
-                record: envelope.record,
-                field: self.config.timestamp_field.clone(),
-            })?;
+        let captured_at_ms =
+            crate::store::record_timestamp(&envelope.value, &self.config.timestamp_field)
+                .ok_or_else(|| IndexError::InvalidTimestamp {
+                    record: envelope.record,
+                    field: self.config.timestamp_field.clone(),
+                })?;
         Ok(EventEntry {
             captured_at_ms,
             record: envelope.record,

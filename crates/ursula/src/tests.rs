@@ -1322,6 +1322,231 @@ async fn json_mode_normalizes_appends_and_reads_ndjson() {
 }
 
 #[tokio::test]
+async fn json_message_text_is_stored_verbatim_minus_whitespace() {
+    let app = test_router();
+    let create_body = " [ { \"z\" : 1 , \"a\" : 2 } ] ";
+    let response = http_put(
+        &app,
+        "/benchcmp/json-fidelity",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(create_body),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // Member order, duplicate members, number text and escapes (including a
+    // lone surrogate) survive; only insignificant whitespace is removed.
+    let append_body = "[\n  {\"b\": 1.50e3, \"a\": -0, \"a\": 1e400},\n  \"\\ud800 \\u00e9 \\/ \\\"x\\\"\",\n  [ 1 ,\t2 ]\r\n]";
+    let response = http_post(
+        &app,
+        "/benchcmp/json-fidelity",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(append_body),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_START), "1");
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "4");
+
+    let batch = batch_body(&[b"{ \"k\" : [ ] }", b"[ 7 , { } ]"]);
+    let response = http_post(
+        &app,
+        "/benchcmp/json-fidelity/append-batch",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(batch),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let expected = "{\"z\":1,\"a\":2}\n\
+                    {\"b\":1.50e3,\"a\":-0,\"a\":1e400}\n\
+                    \"\\ud800 \\u00e9 \\/ \\\"x\\\"\"\n\
+                    [1,2]\n\
+                    {\"k\":[]}\n\
+                    7\n\
+                    {}\n";
+    let response = http_get(&app, "/benchcmp/json-fidelity").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    assert_eq!(std::str::from_utf8(&body).unwrap(), expected);
+
+    let response = http_head(&app, "/benchcmp/json-fidelity").await;
+    assert_eq!(
+        header_str(&response, HEADER_STREAM_NEXT_OFFSET),
+        format!("{:020}", expected.len())
+    );
+
+    // The envelope view splices the stored text; a lone surrogate must not
+    // turn it into a 500.
+    let response = http_get(
+        &app,
+        "/benchcmp/json-fidelity?record=1&max_records=2&record_view=envelope",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    assert_eq!(
+        std::str::from_utf8(&body).unwrap(),
+        "{\"record\":1,\"value\":{\"b\":1.50e3,\"a\":-0,\"a\":1e400}}\n\
+         {\"record\":2,\"value\":\"\\ud800 \\u00e9 \\/ \\\"x\\\"\"}\n"
+    );
+
+    // Close the stream so the SSE response ends at the tail.
+    let response = http_post(
+        &app,
+        "/benchcmp/json-fidelity",
+        &[
+            (CONTENT_TYPE.as_str(), "application/json"),
+            (HEADER_STREAM_CLOSED, "true"),
+        ],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = http_get(&app, "/benchcmp/json-fidelity?offset=-1&live=sse").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    let body = std::str::from_utf8(&body).unwrap();
+    assert!(
+        body.contains("data:{\"b\":1.50e3,\"a\":-0,\"a\":1e400}\n"),
+        "{body}"
+    );
+    assert!(
+        body.contains("data:\"\\ud800 \\u00e9 \\/ \\\"x\\\"\"\n"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn invalid_json_bodies_are_refused_without_committing() {
+    let app = test_router();
+    let response = http_put(
+        &app,
+        "/benchcmp/json-invalid",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from("{\"seed\":true}"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let deep_object = format!("{}1{}", "{\"k\":".repeat(128), "}".repeat(128));
+    let deep_wrapped = format!("[1,{}{}]", "[".repeat(128), "]".repeat(128));
+    let bodies: Vec<Vec<u8>> = vec![
+        b"{\"a\":1".to_vec(),
+        b"[1,2,]".to_vec(),
+        b"\"\\x\"".to_vec(),
+        b"\"\xff\xfe\"".to_vec(),
+        b"[{\"ok\":1}, \"\xc3\"]".to_vec(),
+        b"1 2".to_vec(),
+        deep_object.into_bytes(),
+        deep_wrapped.into_bytes(),
+    ];
+    for body in bodies {
+        let response = http_post(
+            &app,
+            "/benchcmp/json-invalid",
+            &[(CONTENT_TYPE.as_str(), "application/json")],
+            Body::from(body.clone()),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    let response = http_post(
+        &app,
+        "/benchcmp/json-invalid/append-batch",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(batch_body(&[b"{\"ok\":1}", b"{\"bad\":"])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = http_put(
+        &app,
+        "/benchcmp/json-invalid-create",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from("[{\"a\":1},"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = http_head(&app, "/benchcmp/json-invalid-create").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = http_head(&app, "/benchcmp/json-invalid").await;
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "1");
+    let response = http_get(&app, "/benchcmp/json-invalid").await;
+    let body = body_bytes(response).await;
+    assert_eq!(&body[..], b"{\"seed\":true}\n");
+}
+
+#[tokio::test]
+async fn json_depth_limit_applies_per_message_after_flattening() {
+    let app = test_router();
+    let response = http_put(
+        &app,
+        "/benchcmp/json-depth",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let object = |depth: usize| format!("{}1{}", "{\"k\":".repeat(depth), "}".repeat(depth));
+    let cases = [
+        (object(127), StatusCode::NO_CONTENT),
+        (object(128), StatusCode::BAD_REQUEST),
+        (format!("[{}]", object(127)), StatusCode::NO_CONTENT),
+        (format!("[{}]", object(128)), StatusCode::BAD_REQUEST),
+        // A 128-deep bare array body is flattened into one 127-deep message.
+        (
+            format!("{}{}", "[".repeat(128), "]".repeat(128)),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            format!("{}{}", "[".repeat(129), "]".repeat(129)),
+            StatusCode::BAD_REQUEST,
+        ),
+    ];
+    for (body, status) in cases {
+        let response = http_post(
+            &app,
+            "/benchcmp/json-depth",
+            &[(CONTENT_TYPE.as_str(), "application/json")],
+            Body::from(body.clone()),
+        )
+        .await;
+        assert_eq!(response.status(), status, "{}", &body[..16]);
+    }
+    let response = http_head(&app, "/benchcmp/json-depth").await;
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "3");
+
+    let response = http_get(
+        &app,
+        "/benchcmp/json-depth?record=0&max_records=3&record_view=envelope",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    let lines: Vec<&[u8]> = body
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(
+        lines[2],
+        format!(
+            "{{\"record\":2,\"value\":{}{}}}",
+            "[".repeat(127),
+            "]".repeat(127)
+        )
+        .as_bytes()
+    );
+}
+
+#[tokio::test]
 async fn finite_json_reads_negotiate_gzip_without_compressing_sse() {
     let app = test_router();
     let value = "a".repeat(4_096);
@@ -2212,7 +2437,9 @@ async fn sse_json_max_bytes_does_not_split_utf8_codepoints() {
             (CONTENT_TYPE.as_str(), "application/json"),
             (HEADER_STREAM_CLOSED, "true"),
         ],
-        Body::from(r#"{"m":"\u00e9"}"#),
+        // A literal two-byte code point: P1 stores escapes verbatim, so a
+        // `\u00e9` escape would stay ASCII and not exercise the split.
+        Body::from("{\"m\":\"\u{00e9}\"}"),
     )
     .await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);

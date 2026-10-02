@@ -147,7 +147,9 @@ async fn invalid_timestamp_does_not_advance_the_source_record() -> anyhow::Resul
     let result = index
         .ingest_envelope(SourceEnvelope {
             record: 0,
-            value: serde_json::json!({"captured_at": "not-a-time"}),
+            value: serde_json::value::to_raw_value(
+                &serde_json::json!({"captured_at": "not-a-time"}),
+            )?,
         })
         .await;
     assert!(matches!(

@@ -503,22 +503,18 @@ pub(crate) fn apply_record_envelope(response: &mut ReadStreamResponse) -> Result
         return Err("missing record range".to_owned());
     };
     let mut record = record_range.first_record;
-    let mut payload = Vec::new();
+    // The stored message text is spliced in verbatim (P1): re-parsing it would
+    // rewrite literal text and refuse lone-surrogate escapes.
+    let mut payload = Vec::with_capacity(response.payload.len().saturating_add(64));
     for line in response.payload.split(|byte| *byte == b'\n') {
         if line.is_empty() {
             continue;
         }
-        let value = match serde_json::from_slice::<serde_json::Value>(line) {
-            Ok(value) => value,
-            Err(err) => return Err(format!("decode canonical JSON record: {err}")),
-        };
-        let envelope = serde_json::json!({ "record": record, "value": value });
-        let encoded = match serde_json::to_vec(&envelope) {
-            Ok(encoded) => encoded,
-            Err(err) => return Err(format!("encode record envelope: {err}")),
-        };
-        payload.extend_from_slice(&encoded);
-        payload.push(b'\n');
+        payload.extend_from_slice(b"{\"record\":");
+        payload.extend_from_slice(record.to_string().as_bytes());
+        payload.extend_from_slice(b",\"value\":");
+        payload.extend_from_slice(line);
+        payload.extend_from_slice(b"}\n");
         record = record.saturating_add(1);
     }
     if record != record_range.next_record {
@@ -733,26 +729,9 @@ pub(crate) fn normalize_http_write_payload(
     if !is_json_content_type(content_type) || body.is_empty() {
         return Ok(body);
     }
-
-    let value: serde_json::Value =
-        serde_json::from_slice(&body).map_err(|err| format!("invalid JSON payload: {err}"))?;
-    let messages = match value {
-        serde_json::Value::Array(items) => {
-            if items.is_empty() && !allow_empty_array {
-                return Err("JSON append array must not be empty".to_owned());
-            }
-            items
-        }
-        other => vec![other],
-    };
-
-    let mut out = Vec::new();
-    for message in messages {
-        serde_json::to_writer(&mut out, &message)
-            .map_err(|err| format!("failed to encode JSON message: {err}"))?;
-        out.push(b'\n');
-    }
-    Ok(Bytes::from(out))
+    crate::json_text::normalize_json_messages(&body, allow_empty_array)
+        .map(Bytes::from)
+        .map_err(|err| err.to_string())
 }
 
 pub(crate) fn clamp_sse_text_read(read: &mut ReadStreamResponse, encode_base64: bool) {
