@@ -19,11 +19,13 @@
 //!   removed then; `TidyStream` removes idle producers in bulk.
 //! - **Producer cap.** A stream holds at most [`MAX_PRODUCERS_PER_STREAM`]
 //!   producers. A new producer beyond it evicts the least recently seen
-//!   producers idle for at least an hour, at the enforcement point; when none
-//!   is idle that long the write fails with `ProducerLimit` (`429`).
+//!   producers idle for at least an hour, at the enforcement point, at most
+//!   [`PRODUCER_CAP_EVICT_BUDGET`] per command (`TidyStream` drains a larger
+//!   excess, such as a level-0 stream's after the raise); when none is idle
+//!   that long the write fails with `ProducerLimit` (`429`).
 //! - **`TidyStream`.** Converges one stream in bounded steps: message-record
 //!   collapse below the seal point (F4a), idle-producer stamping and expiry,
-//!   receipt trimming and dropping the level-0 `last_items` copy.
+//!   producer-cap eviction, receipt trimming and dropping the level-0 `last_items` copy.
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -50,6 +52,10 @@ pub const MAX_PRODUCERS_PER_STREAM: usize = 4_096;
 /// A producer idle this long may be evicted to admit a new producer once the
 /// stream holds [`MAX_PRODUCERS_PER_STREAM`] (F3 producer cap).
 pub const PRODUCER_CAP_EVICT_IDLE_MS: u64 = 60 * 60 * 1_000;
+
+/// Producers one command may evict for the producer cap; `TidyStream`
+/// drains the rest of the excess (F3 bounded catch-up).
+pub const PRODUCER_CAP_EVICT_BUDGET: usize = 1_024;
 
 /// Producers one `TidyStream` may stamp, expire or strip of `last_items`.
 pub const TIDY_PRODUCER_BUDGET: usize = 4_096;
@@ -201,23 +207,44 @@ impl StreamSlot {
 
     /// Evicts least recently seen producers idle for an hour, oldest
     /// `(last_seen_ms, producer_id)` first, until the stream holds at most
-    /// [`MAX_PRODUCERS_PER_STREAM`]. O(P) per eviction, and it runs only while
-    /// the stream is over the cap.
-    pub(super) fn evict_producers_over_cap(&mut self, now_ms: u64) {
-        while self.producers.len() > MAX_PRODUCERS_PER_STREAM {
-            let Some(victim) = self
-                .producers
-                .iter()
-                .filter(|(_, state)| producer_cap_evictable(state, now_ms))
-                .min_by(|left, right| {
-                    (left.1.last_seen_ms, left.0).cmp(&(right.1.last_seen_ms, right.0))
-                })
-                .map(|(producer_id, _)| producer_id.clone())
-            else {
-                return;
-            };
+    /// [`MAX_PRODUCERS_PER_STREAM`] or `budget` producers were evicted.
+    /// One O(P) pass collects the candidates and selects the oldest excess,
+    /// so a stream far over the cap (raised from level 0) costs O(P) per
+    /// command, and `TidyStream` drains what the budget leaves.
+    pub(super) fn evict_producers_over_cap(&mut self, now_ms: u64, budget: usize) {
+        let excess = self
+            .producers
+            .len()
+            .saturating_sub(MAX_PRODUCERS_PER_STREAM)
+            .min(budget);
+        if excess == 0 {
+            return;
+        }
+        let mut candidates = self
+            .producers
+            .iter()
+            .filter(|(_, state)| producer_cap_evictable(state, now_ms))
+            .map(|(producer_id, state)| (state.last_seen_ms, producer_id.clone()))
+            .collect::<Vec<_>>();
+        if candidates.len() > excess {
+            // Keys are unique, so the selected set is the same on every
+            // replica whatever the map's iteration order.
+            candidates.select_nth_unstable(excess);
+            candidates.truncate(excess);
+        }
+        for (_, victim) in candidates {
             self.remove_producer(&victim);
         }
+    }
+
+    /// Whether the stream is over the producer cap with an evictable
+    /// producer at `now_ms`.
+    fn producer_cap_over(&self, now_ms: u64) -> bool {
+        self.producers.len() > MAX_PRODUCERS_PER_STREAM
+            && self
+                .producers
+                .values()
+                .any(|state| producer_cap_evictable(state, now_ms))
     }
 
     /// Whether the window has evictable excess.
@@ -240,7 +267,7 @@ impl StreamStateMachine {
             return;
         }
         if let Some(slot) = self.stream_slot_mut(stream_id) {
-            slot.evict_producers_over_cap(now_ms);
+            slot.evict_producers_over_cap(now_ms, PRODUCER_CAP_EVICT_BUDGET);
             slot.trim_receipt_window(RECEIPT_TRIM_BUDGET);
         }
     }
@@ -289,6 +316,7 @@ impl StreamStateMachine {
         collapsible
             || self.stream_has_seal_debt(stream_id)
             || slot.receipt_window_over()
+            || slot.producer_cap_over(now_ms)
             || slot.producers.values().any(|state| {
                 state.last_seen_ms.is_none()
                     || !state.last_items.is_empty()
@@ -374,6 +402,7 @@ impl StreamStateMachine {
                 state.last_items = Vec::new();
             }
         }
+        slot.evict_producers_over_cap(now_ms, PRODUCER_CAP_EVICT_BUDGET);
         slot.trim_receipt_window(RECEIPT_TRIM_BUDGET);
         if slot.producers.capacity() > slot.producers.len().saturating_mul(2).saturating_add(8) {
             slot.producers.shrink_to_fit();

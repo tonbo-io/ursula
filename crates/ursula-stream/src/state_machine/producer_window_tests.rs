@@ -985,3 +985,67 @@ fn producer_cap_does_not_apply_below_level_one() {
         MAX_PRODUCERS_PER_STREAM + 1
     );
 }
+
+#[test]
+fn producer_cap_excess_after_the_raise_drains_in_bounded_commands() {
+    use super::producers::MAX_PRODUCERS_PER_STREAM;
+    use super::producers::PRODUCER_CAP_EVICT_BUDGET;
+    use super::producers::PRODUCER_CAP_EVICT_IDLE_MS;
+    // SM1: a level-0 stream far over the cap must not evict its whole
+    // excess in one apply after the raise; each command evicts at most the
+    // budget, oldest `(last_seen_ms, producer_id)` first, and `TidyStream`
+    // drains the rest.
+    let total = MAX_PRODUCERS_PER_STREAM + 3 * PRODUCER_CAP_EVICT_BUDGET + 7;
+    let mut machine = machine_at(0);
+    let stream_id = create(&mut machine, "cap-drain", OCTET);
+    for index in 0..total {
+        appended(append(
+            &mut machine,
+            &stream_id,
+            &format!("p{index:05}"),
+            0,
+            0,
+        ));
+    }
+    machine.apply(StreamCommand::SetFeatureLevel { level: 1 });
+    let tidy = |machine: &mut StreamStateMachine, now_ms: u64| match machine.apply(
+        StreamCommand::TidyStream {
+            stream_id: stream_id.clone(),
+            now_ms,
+        },
+    ) {
+        StreamResponse::StreamTidied { debt_remaining } => debt_remaining,
+        other => panic!("expected StreamTidied, got {other:?}"),
+    };
+    // Stamp every pre-raise producer at 0; nobody is evictable yet.
+    while tidy(&mut machine, 0) {}
+    let count =
+        |machine: &StreamStateMachine| machine.stream_slot(&stream_id).unwrap().producers.len();
+    assert_eq!(count(&machine), total);
+
+    let later = PRODUCER_CAP_EVICT_IDLE_MS;
+    appended(append(&mut machine, &stream_id, "new", 0, later));
+    assert_eq!(count(&machine), total + 1 - PRODUCER_CAP_EVICT_BUDGET);
+    assert!(machine.stream_has_tidy_debt(&stream_id, later));
+    let restored = StreamStateMachine::restore(machine.snapshot()).unwrap();
+    assert_eq!(producer_snapshot(&restored), producer_snapshot(&machine));
+
+    let mut tidies = 0;
+    while tidy(&mut machine, later) {
+        tidies += 1;
+        assert!(tidies <= 4, "tidy does not converge");
+    }
+    assert_eq!(count(&machine), MAX_PRODUCERS_PER_STREAM);
+    assert!(!machine.stream_has_tidy_debt(&stream_id, later));
+    let slot = machine.stream_slot(&stream_id).unwrap();
+    assert!(slot.producers.contains_key("new"));
+    // Every producer was stamped at 0, so the smallest ids went first.
+    let first_kept = total + 1 - MAX_PRODUCERS_PER_STREAM;
+    assert!(
+        !slot
+            .producers
+            .contains_key(&format!("p{:05}", first_kept - 1))
+    );
+    assert!(slot.producers.contains_key(&format!("p{first_kept:05}")));
+    window_items(&machine, &stream_id);
+}
