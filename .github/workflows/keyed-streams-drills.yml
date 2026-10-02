@@ -2,8 +2,8 @@ name: Keyed fault drills (nightly)
 
 # The keyed-streams fault drills at the design's durations (docs/architecture/keyed-streams-drills.md):
 # 10-minute indexer and S3 outages, rolling upgrade from main's binary, purge, restore plus
-# continuity rebuild, blue/green projection format rebuild. The keyed-streams CI runs the same
-# drills with short knobs on every push.
+# continuity rebuild, blue/green projection format rebuild. The drills run only here (and on
+# workflow_dispatch, where shorter knobs can be passed); pull requests run the e2e suites instead.
 
 on:
   schedule:
