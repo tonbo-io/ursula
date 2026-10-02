@@ -929,6 +929,98 @@ mod tests {
         assert_eq!(restored.state_gauges(), machine.state_gauges());
     }
 
+    /// Bounded-state F1 (RC-16): sparse record marks survive the group
+    /// snapshot codec in stream entry fields 17-19, an all-dense entry
+    /// writes none of them, and a snapshot below level 2 that carries marks
+    /// is refused at restore.
+    #[test]
+    fn sparse_record_marks_round_trip() {
+        let mut machine = ursula_stream::StreamStateMachine::new();
+        machine.apply(ursula_stream::StreamCommand::SetFeatureLevel {
+            level: ursula_stream::FEATURE_LEVEL_SPARSE_MARKS,
+        });
+        machine.apply(ursula_stream::StreamCommand::CreateBucket {
+            bucket_id: "bucket".to_owned(),
+        });
+        let stream_id = BucketStreamId::new("bucket", "marks");
+        machine.apply(ursula_stream::StreamCommand::CreateStream {
+            stream_id: stream_id.clone(),
+            content_type: "application/json".to_owned(),
+            initial_payload: bytes::Bytes::new(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            attrs: None,
+            now_ms: 1,
+        });
+        let record = format!("\"{}\"\n", "x".repeat(997));
+        let payload = record.repeat(3_000);
+        let response = machine.apply(ursula_stream::StreamCommand::Append {
+            stream_id: stream_id.clone(),
+            content_type: Some("application/json".to_owned()),
+            payload: bytes::Bytes::from(payload.clone().into_bytes()),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            now_ms: 2,
+            record_match: None,
+        });
+        assert!(matches!(
+            response,
+            ursula_stream::StreamResponse::Appended { .. }
+        ));
+        let dense_entry = |machine: &ursula_stream::StreamStateMachine| {
+            stream_to_proto(machine.snapshot().streams[0].clone()).expect("encode entry")
+        };
+        let entry = dense_entry(&machine);
+        assert!(entry.record_mark_records.is_empty() && entry.dense_first_record.is_none());
+        machine.apply(ursula_stream::StreamCommand::FlushCold {
+            stream_id: stream_id.clone(),
+            chunk: ursula_stream::ColdChunkRef {
+                start_offset: 0,
+                end_offset: 2_000_000,
+                s3_path: "bucket/marks/chunks/0.bin".to_owned(),
+                object_size: 2_000_000,
+                ..Default::default()
+            },
+            cold_generation: None,
+        });
+        let entry = dense_entry(&machine);
+        assert_eq!(entry.record_mark_records, vec![0, 1_049]);
+        assert_eq!(entry.record_mark_offsets, vec![0, 1_049_000]);
+        assert_eq!(entry.dense_first_record, Some(2_000));
+        assert_eq!(entry.record_offsets.len(), 1_000);
+
+        let snapshot = GroupSnapshot {
+            placement: ShardPlacement {
+                core_id: CoreId(0),
+                shard_id: ShardId(0),
+                raft_group_id: RaftGroupId(0),
+            },
+            group_commit_index: 3,
+            stream_snapshot: machine.snapshot(),
+            stream_append_counts: Vec::new(),
+        };
+        let bytes = group_snapshot_frames(Arc::new(snapshot.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("encode frames")
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let decoded = decode_group_snapshot(&bytes).expect("decode frames");
+        assert_eq!(decoded, snapshot);
+        let restored = ursula_stream::StreamStateMachine::restore(decoded.stream_snapshot.clone())
+            .expect("restore decoded snapshot");
+        assert_eq!(restored.snapshot(), machine.snapshot());
+        assert_eq!(restored.state_gauges(), machine.state_gauges());
+
+        let mut below = decoded.stream_snapshot;
+        below.feature_level = ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
+        assert!(ursula_stream::StreamStateMachine::restore(below).is_err());
+    }
+
     #[test]
     fn rejects_missing_footer() {
         let header = encode_frame(proto::SnapshotFrameV1 {

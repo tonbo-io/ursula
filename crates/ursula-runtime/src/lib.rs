@@ -264,6 +264,7 @@ pub use ursula_stream::ExternalPayloadRef;
 pub use ursula_stream::FEATURE_LEVEL_BASELINE;
 pub use ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
 pub use ursula_stream::FEATURE_LEVEL_SPARSE_MARKS;
+pub use ursula_stream::MARK_BLOCK_BYTES;
 pub use ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL;
 pub use ursula_stream::ProducerRequest;
 pub use ursula_stream::StreamAttrs;

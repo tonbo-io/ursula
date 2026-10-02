@@ -4885,3 +4885,5 @@ mod staging_cleanup_tests;
 mod keyed_lifecycle_tests;
 #[cfg(test)]
 mod keyed_state_tests;
+#[cfg(test)]
+mod sparse_marks_http_tests;
