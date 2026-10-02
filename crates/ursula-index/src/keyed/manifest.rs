@@ -74,14 +74,19 @@ pub fn unique_object_nonce() -> String {
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
     static FALLBACK: AtomicU64 = AtomicU64::new(0);
-    let mut bytes = [0_u8; 16];
-    if getrandom::fill(&mut bytes).is_err() {
+    let nonce = crate::rt::random_u128().unwrap_or_else(|| {
         let counter = FALLBACK.fetch_add(1, Ordering::Relaxed);
         let seed = format!("{}-{counter}", std::process::id());
-        let hashed = blake3::hash(seed.as_bytes());
-        bytes.copy_from_slice(hashed.as_bytes().get(..16).unwrap_or(&[0; 16]));
-    }
-    format!("{:032x}", u128::from_le_bytes(bytes))
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(
+            blake3::hash(seed.as_bytes())
+                .as_bytes()
+                .get(..16)
+                .unwrap_or(&[0; 16]),
+        );
+        u128::from_le_bytes(bytes)
+    });
+    format!("{nonce:032x}")
 }
 
 /// Result of [`KeyedNamespace::sweep`].

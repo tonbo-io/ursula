@@ -519,8 +519,8 @@ async fn a_blocking_encode_past_the_deadline_keeps_its_slot_and_budget() {
     let entered_tx = Mutex::new(entered_tx);
     let release_rx = Mutex::new(release_rx);
     engine.set_blocking_encode_hook(Some(Arc::new(move || {
-        let _ = entered_tx.lock().unwrap().send(());
-        let _ = release_rx
+        let _sent = entered_tx.lock().unwrap().send(());
+        let _released = release_rx
             .lock()
             .unwrap()
             .recv_timeout(Duration::from_secs(30));

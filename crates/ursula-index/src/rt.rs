@@ -12,6 +12,21 @@ pub(crate) use tokio::spawn;
 #[cfg(not(madsim))]
 pub(crate) use tokio::time;
 
+/// 128 random bits from the OS, or `None` when it has none to give.
+#[cfg(not(madsim))]
+pub(crate) fn random_u128() -> Option<u128> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes).ok()?;
+    Some(u128::from_le_bytes(bytes))
+}
+
+/// 128 random bits from the simulator's seeded generator (replayable).
+#[cfg(madsim)]
+#[expect(clippy::unnecessary_wraps, reason = "same signature as the OS version")]
+pub(crate) fn random_u128() -> Option<u128> {
+    Some(madsim::rand::random::<u128>())
+}
+
 /// Runs CPU-bound `work` off the async workers; inline under the simulator,
 /// which has no blocking pool.
 #[cfg(not(madsim))]
