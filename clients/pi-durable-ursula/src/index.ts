@@ -9,11 +9,21 @@
 // - pi-layer.ts    — read plans of the Storage methods (§4.5) over a StateView.
 // - planner.ts     — StorageWrite → ops (§4.4), MemoryStorage-ported validation, pre-checks, claims.
 // - transport.ts   — LogTransport / KeyedStateTransport interfaces (1:1 with the HTTP API).
+// - http.ts        — HttpLogTransport / HttpKeyedStateTransport over fetch (NDJSON records, raw keyed rows).
 // - storage.ts     — UrsulaStorage: commit outcome policy, open/claim, close, poison.
 // - errors.ts      — FencedError, OwnershipActive, OwnershipContention, ClaimTimeout, OpenRefused.
 // - fake/          — in-memory fake Ursula with fault injection (tests and local development).
 export { ClaimTimeout, FencedError, OpenRefused, OwnershipActive, OwnershipContention } from "./errors.ts";
 export { K, TAG } from "./families.ts";
+export {
+	HttpKeyedStateTransport,
+	HttpLogTransport,
+	type HttpTransportOptions,
+	httpTransports,
+	parseKeyedRows,
+	splitRecords,
+	streamUrl,
+} from "./http.ts";
 export { encodeRecord, type KeyedOp, KeyedBatchError, normalizeJsonMessage, parseKeyedBatch } from "./keyed-batch.ts";
 export { EXT_KEYED_BATCH, EXT_KEYED_STATE, H, KEYED_CONTENT_TYPE, KEYED_ROWS_MEDIA_TYPE, LIMITS } from "./protocol.ts";
 export { FullResidentStateStore, type Row, type StateStore, type StateView } from "./state-store.ts";
