@@ -406,3 +406,89 @@ fn cleanup_rule_classifies_runtime_errors() {
         }
     ));
 }
+
+/// A deduplicated retry never references its own staged object: the
+/// original append committed with another one. The cleanup rule deletes it
+/// at once instead of leaving it to the day-long orphan-sweep grace.
+#[tokio::test]
+async fn deduplicated_external_append_deletes_its_staged_object() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        RuntimeConfig::new(1, 1),
+        ursula_runtime::InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
+        Some(cold_store.clone()),
+    )
+    .expect("runtime");
+    let app = router(runtime);
+    let response = send(
+        &app,
+        "PUT",
+        "/benchcmp/dedup",
+        &[("content-type", "application/octet-stream")],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let producer = [
+        ("content-type", "application/octet-stream"),
+        ("producer-id", "writer"),
+        ("producer-epoch", "0"),
+        ("producer-seq", "0"),
+    ];
+    let response = send(&app, "POST", "/benchcmp/dedup", &producer, vec![
+        b'd';
+        LARGE
+    ])
+    .await;
+    assert!(response.status().is_success(), "{}", response.status());
+
+    let events = observe(&cold_store);
+    let response = send(&app, "POST", "/benchcmp/dedup", &producer, vec![
+        b'd';
+        LARGE
+    ])
+    .await;
+    assert!(response.status().is_success(), "{}", response.status());
+    let staged = staged_external_paths(&events);
+    assert_eq!(staged.len(), 1, "the retry staged its own object");
+    assert_eq!(deleted_paths(&events), staged);
+
+    // The original append's bytes stay readable.
+    let response = send(
+        &app,
+        "GET",
+        &format!("/benchcmp/dedup?offset=0&max_bytes={LARGE}"),
+        &[],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert_eq!(body.len(), LARGE);
+}
+
+/// A create of a live stream never applies its initial payload, so the
+/// object it staged is referenced by nothing and is deleted at once.
+#[tokio::test]
+async fn create_of_a_live_stream_deletes_its_staged_object() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+        RuntimeConfig::new(1, 1),
+        ursula_runtime::InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
+        Some(cold_store.clone()),
+    )
+    .expect("runtime");
+    let app = router(runtime);
+    let headers = [("content-type", "application/octet-stream")];
+    let response = send(&app, "PUT", "/benchcmp/live", &headers, vec![b'l'; LARGE]).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let events = observe(&cold_store);
+    let response = send(&app, "PUT", "/benchcmp/live", &headers, vec![b'l'; LARGE]).await;
+    assert!(response.status().is_success(), "{}", response.status());
+    let staged = staged_external_paths(&events);
+    assert_eq!(staged.len(), 1, "the repeated create staged its own object");
+    assert_eq!(deleted_paths(&events), staged);
+}
