@@ -123,9 +123,22 @@ mod shared_ref_compaction;
 
 pub use orphan_sweep::COLD_ORPHAN_SWEEP_GRACE_MS;
 
-/// Backoff before the cold GC retries an entry it deferred after a failure
-/// (bounded-state F14b, feature level 1).
+/// Backoff before the cold GC retries an entry it deferred after its first
+/// failure (bounded-state F14b, feature level 1). Each further deferral
+/// doubles it, up to [`COLD_GC_DEFER_MAX_BACKOFF_MS`].
 pub const COLD_GC_DEFER_BACKOFF_MS: u64 = 60_000;
+
+/// Longest backoff between retries of a failing cold GC entry (one hour).
+pub const COLD_GC_DEFER_MAX_BACKOFF_MS: u64 = 60 * 60 * 1_000;
+
+/// Backoff for an entry that has already been deferred `attempts` times:
+/// 1 min, 2 min, 4 min, ... capped at one hour.
+pub fn cold_gc_defer_backoff_ms(attempts: u32) -> u64 {
+    COLD_GC_DEFER_BACKOFF_MS
+        .checked_shl(attempts.min(32))
+        .unwrap_or(u64::MAX)
+        .min(COLD_GC_DEFER_MAX_BACKOFF_MS)
+}
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -1171,7 +1184,8 @@ impl ShardRuntime {
                         message: err.to_string(),
                     };
                     if defer_failures {
-                        let not_before_ms = unix_time_ms().saturating_add(COLD_GC_DEFER_BACKOFF_MS);
+                        let not_before_ms = unix_time_ms()
+                            .saturating_add(cold_gc_defer_backoff_ms(entry.defer_attempts));
                         match self
                             .defer_cold_gc(raft_group_id, entry.seq, not_before_ms)
                             .await

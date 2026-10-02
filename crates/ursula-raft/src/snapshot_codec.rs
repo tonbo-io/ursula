@@ -692,6 +692,7 @@ fn cold_gc_to_proto(entry: ColdGcEntry) -> proto::ColdGcEntryV1 {
         bucket_id: entry.bucket_id,
         not_before_ms: entry.not_before_ms,
         cold_generation: entry.cold_generation,
+        defer_attempts: entry.defer_attempts,
         target: Some(match entry.target {
             ColdGcTarget::Stream(stream_id) => {
                 proto::cold_gc_entry_v1::Target::Stream(stream_id.into())
@@ -709,6 +710,7 @@ fn cold_gc_from_proto(entry: proto::ColdGcEntryV1) -> Result<ColdGcEntry, Snapsh
         bucket_id: entry.bucket_id,
         not_before_ms: entry.not_before_ms,
         cold_generation: entry.cold_generation,
+        defer_attempts: entry.defer_attempts,
         target: match required(entry.target, "snapshot cold gc target")? {
             proto::cold_gc_entry_v1::Target::Stream(stream_id) => {
                 ColdGcTarget::Stream(stream_id.into())
@@ -758,6 +760,7 @@ mod tests {
                         not_before_ms: 0,
                         target: ColdGcTarget::Stream(BucketStreamId::new("bucket", "legacy")),
                         cold_generation: None,
+                        defer_attempts: 0,
                     },
                     ColdGcEntry {
                         seq: 8,
@@ -765,6 +768,7 @@ mod tests {
                         not_before_ms: 0,
                         target: ColdGcTarget::Stream(BucketStreamId::new("bucket", "scoped")),
                         cold_generation: Some(1_234),
+                        defer_attempts: 3,
                     },
                 ],
                 next_cold_gc_seq: 9,

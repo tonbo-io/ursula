@@ -202,6 +202,7 @@ async fn f14b_failing_gc_head_is_deferred_and_the_rest_drains_at_level_one() {
     assert_eq!(after[0].target, ColdGcTarget::Stream(streams[0].clone()));
     assert!(after[0].seq > before[1].seq);
     assert!(after[0].not_before_ms >= started_ms + crate::runtime::COLD_GC_DEFER_BACKOFF_MS);
+    assert_eq!(after[0].defer_attempts, 1, "the deferral counts an attempt");
     assert!(runtime.metrics().snapshot().cold_gc_errors >= 1);
 
     // While the backoff runs the entry is not retried.
@@ -444,4 +445,16 @@ async fn applying_flush_cold_drops_cached_pages_of_the_flushed_range() {
         )
         .expect("apply flush");
     assert_eq!(cache.cached_page_count(), 0);
+}
+
+/// F14b: a failing GC entry backs off exponentially in its replicated
+/// attempt counter, from one minute up to one hour.
+#[test]
+fn f14b_gc_defer_backoff_doubles_per_attempt_up_to_an_hour() {
+    use crate::runtime::cold_gc_defer_backoff_ms;
+    assert_eq!(cold_gc_defer_backoff_ms(0), 60_000);
+    assert_eq!(cold_gc_defer_backoff_ms(1), 120_000);
+    assert_eq!(cold_gc_defer_backoff_ms(5), 60_000 * 32);
+    assert_eq!(cold_gc_defer_backoff_ms(6), 60 * 60 * 1_000);
+    assert_eq!(cold_gc_defer_backoff_ms(u32::MAX), 60 * 60 * 1_000);
 }

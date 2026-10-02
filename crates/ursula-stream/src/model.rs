@@ -213,6 +213,15 @@ pub struct ColdGcEntry {
     /// same name exists (F14g step 1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cold_generation: Option<u64>,
+    /// How many times the leader's GC worker deferred this entry after a
+    /// failure (`DeferColdGc`, F14b, feature level 1). The worker backs off
+    /// exponentially in it.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub defer_attempts: u32,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 /// A pending GC entry as planned for the leader's GC worker, with the cold
