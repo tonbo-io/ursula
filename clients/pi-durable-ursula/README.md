@@ -30,7 +30,20 @@ npm test          # FUZZ_TABLE_TRIALS / FUZZ_DOC_TRIALS scale the differential f
 # End to end against a real single-node ursula (memory engine, free port), spawned by the suite:
 cargo build --release -p ursula --bin ursula
 URSULA_BIN=../../target/release/ursula npm run test:e2e   # requires keyed-batch-v1; E2E_REQUIRE_KEYED=0 for an older node
+# The same suite on S3 (MinIO: URSULA_S3_ENDPOINT, or a local `minio` / MINIO_BIN) and/or on a 3-node cluster behind the gateway:
+E2E_S3=1 URSULA_BIN=../../target/release/ursula npm run test:e2e
+E2E_NODES=3 E2E_S3=1 URSULA_BIN=../../target/release/ursula npm run test:e2e
+
+# The M4 drills (docs/architecture/keyed-streams-drills.md); each starts its own stack. DRILL_OUTAGE_S
+# (default 600), DRILL_OWNERS, DRILL_SETTLE_S, DRILL_RECOVERY_S, DRILL_COMMIT_DEADLINE_MS shorten them;
+# the rolling-upgrade drill needs main's binary (scripts/ks_build_old_ursula.sh) in URSULA_OLD_BIN.
+URSULA_BIN=../../target/release/ursula URSULA_OLD_BIN=../../target/ks-old/e6d8d70/ursula npm run test:drills
 ```
+
+`test/stack/` holds the stack the e2e suite and the drills share: process control, a MinIO launcher and a
+minimal SigV4 S3 client, a TCP fault proxy (S3 and indexer outages, blue/green cutover), the cluster
+(nodes, gateway, indexer, feature-level raise) and a fleet of live owners that captures every append for
+byte-for-byte verification.
 
 ```ts
 import { httpTransports, UrsulaStorage } from "@tonbo-io/pi-durable-ursula";
