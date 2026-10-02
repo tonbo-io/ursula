@@ -145,6 +145,9 @@ The keyed-state indexer is the `ursula indexer` subcommand started with `--keyed
 | `--keyed-max-concurrent-ingests N` | CPU count | Streams ingesting at once |
 | `--keyed-max-concurrent-compactions N` | half the CPU count | Compactions running at once; more wait |
 | `--keyed-admission-queue N` | `4096` | Streams admitted for ingestion but not yet ingesting; beyond it, reads that need new ingestion answer `503` with `Retry-After` |
+| `--keyed-source-timeout-ms MS` | `30000` | Total timeout of one record read from the source node (connect, headers and body). A stalled response fails as transient and is retried |
+| `--keyed-work-deadline-ms MS` | `120000` | Longest one admitted ingest step or compaction may run. Past it the work is dropped, its slot and budget are released, waiting reads answer `503`, and the next read retries |
+| `--keyed-shutdown-grace-ms MS` | `10000` | On shutdown, new keyed-state reads answer `503`; in-flight ingests and compactions get this long to finish and are then cancelled |
 
 ## Complete examples
 

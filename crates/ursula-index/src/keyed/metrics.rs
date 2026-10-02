@@ -34,6 +34,7 @@ pub(crate) struct KeyedMetrics {
     pub(crate) gc_deleted: AtomicU64,
     pub(crate) reused_settled: AtomicU64,
     pub(crate) current_revalidations: AtomicU64,
+    pub(crate) work_deadlines: AtomicU64,
     /// Every object-store request of the pod.
     pub(crate) requests: Arc<ObjectRequestCounters>,
 }
@@ -113,6 +114,8 @@ pub struct KeyedMetricsSnapshot {
     pub gc_backlog: usize,
     /// `CURRENT` revalidations of reads without `min_through_record`.
     pub current_revalidations: u64,
+    /// Ingest cycles and compactions dropped at the per-work deadline.
+    pub work_deadlines: u64,
     /// Reads waiting for `min_through_record`.
     pub waiters: usize,
     /// Namespaces held in memory.
@@ -160,6 +163,7 @@ impl KeyedMetrics {
             reused_settled: load(&self.reused_settled),
             gc_backlog,
             current_revalidations: load(&self.current_revalidations),
+            work_deadlines: load(&self.work_deadlines),
             waiters,
             namespaces: detail.len(),
             lag_records_total: detail

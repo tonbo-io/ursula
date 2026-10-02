@@ -144,6 +144,18 @@ pub struct IndexerArgs {
     /// beyond it, reads that need ingestion answer 503 with Retry-After.
     #[arg(long, default_value_t = crate::keyed::engine::DEFAULT_ADMISSION_QUEUE)]
     keyed_admission_queue: usize,
+    /// Keyed mode: total timeout of one source request (connect, headers
+    /// and body).
+    #[arg(long, default_value_t = 30_000)]
+    keyed_source_timeout_ms: u64,
+    /// Keyed mode: longest one admitted ingest cycle or compaction may run
+    /// before it is dropped and its slot and budget released.
+    #[arg(long, default_value_t = 120_000)]
+    keyed_work_deadline_ms: u64,
+    /// Keyed mode: on shutdown, how long in-flight ingests and compactions
+    /// may finish before they are cancelled.
+    #[arg(long, default_value_t = 10_000)]
+    keyed_shutdown_grace_ms: u64,
     /// Keyed mode, drills only: the projection format (`v{fmt}/`) this pod
     /// reads and writes. Another format rehearses the blue/green rebuild
     /// (docs/architecture/keyed-streams-drills.md); the layout is the same.
@@ -720,11 +732,14 @@ async fn run_keyed(args: IndexerArgs, source_url: Url) -> anyhow::Result<()> {
         || args.keyed_max_concurrent_ingests == Some(0)
         || args.keyed_max_concurrent_compactions == Some(0)
         || args.keyed_admission_queue == 0
+        || args.keyed_source_timeout_ms == 0
+        || args.keyed_work_deadline_ms == 0
     {
         anyhow::bail!(
             "--keyed-gc-grace-seconds, --keyed-max-waiters, --keyed-projection-format, \
              --keyed-max-concurrent-ingests, --keyed-max-concurrent-compactions and \
-             --keyed-admission-queue must be positive, and --keyed-admission-budget-bytes at \
+             --keyed-admission-queue, --keyed-source-timeout-ms and --keyed-work-deadline-ms \
+             must be positive, and --keyed-admission-budget-bytes at \
              least 1024"
         );
     }
@@ -744,8 +759,11 @@ async fn run_keyed(args: IndexerArgs, source_url: Url) -> anyhow::Result<()> {
     };
     let store = target.open("").context("open object store")?;
     let cache = EventIndexCache::serving(args.cache_dir().join("keyed"), args.cache_max_bytes)?;
-    let source = crate::keyed::KeyedSourceClient::new(source_url.clone())
-        .context("configure keyed source client")?;
+    let source = crate::keyed::KeyedSourceClient::with_timeout(
+        source_url.clone(),
+        Duration::from_millis(args.keyed_source_timeout_ms),
+    )
+    .context("configure keyed source client")?;
     let defaults = crate::keyed::KeyedEngineConfig::default();
     let config = crate::keyed::KeyedEngineConfig {
         min_publish_interval: Duration::from_millis(args.keyed_min_publish_interval_ms),
@@ -760,6 +778,7 @@ async fn run_keyed(args: IndexerArgs, source_url: Url) -> anyhow::Result<()> {
             .keyed_max_concurrent_compactions
             .unwrap_or(defaults.max_concurrent_compactions),
         admission_queue: args.keyed_admission_queue,
+        work_deadline: Duration::from_millis(args.keyed_work_deadline_ms),
         ..defaults
     };
     let engine = crate::keyed::KeyedEngine::new(store, source, Some(cache), config);
@@ -774,8 +793,25 @@ async fn run_keyed(args: IndexerArgs, source_url: Url) -> anyhow::Result<()> {
         cache_dir = %args.cache_dir().display(),
         "keyed indexer starting"
     );
-    serve(crate::keyed::http::router(engine), args.listen, shutdown_tx).await?;
+    let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    let grace = Duration::from_millis(args.keyed_shutdown_grace_ms);
+    axum::serve(listener, crate::keyed::http::router(engine.clone()))
+        .with_graceful_shutdown({
+            let engine = engine.clone();
+            async move {
+                shutdown_signal().await;
+                // New keyed reads answer 503 from here; in-flight work gets
+                // the grace, then is cancelled, so the connections drain.
+                engine.shutdown(grace).await;
+                if shutdown_tx.send(true).is_err() {
+                    tracing::debug!("keyed maintenance loop already stopped");
+                }
+            }
+        })
+        .await?;
     maintenance.await.context("join keyed maintenance loop")?;
+    // Workers a read started while the connections drained.
+    engine.shutdown(Duration::ZERO).await;
     Ok(())
 }
 

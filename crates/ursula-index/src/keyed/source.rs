@@ -14,6 +14,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
@@ -188,6 +189,9 @@ fn read_page(record: u64, headers: &HeaderMap, body: &str) -> Result<SourcePage,
     })
 }
 
+/// Default total timeout of one source request.
+pub const DEFAULT_SOURCE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// HTTP client of the source log.
 #[derive(Clone, Debug)]
 pub struct KeyedSourceClient {
@@ -233,11 +237,20 @@ impl KeyedSourceClient {
     /// A client of the node or gateway at `base` (stream URLs are
     /// `{base}/{bucket}/{key}`).
     pub fn new(base: Url) -> Result<Self, SourceError> {
+        Self::with_timeout(base, DEFAULT_SOURCE_TIMEOUT)
+    }
+
+    /// [`Self::new`] with a total per-request timeout (connect, headers
+    /// and the whole body): a response that stalls mid-body fails as
+    /// transient instead of holding the caller.
+    pub fn with_timeout(base: Url, timeout: Duration) -> Result<Self, SourceError> {
         if base.cannot_be_a_base() {
             return Err(transient("source base URL cannot carry a path"));
         }
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(4))
+            .timeout(timeout)
+            .connect_timeout(timeout)
             .build()
             .map_err(transient)?;
         Ok(Self {

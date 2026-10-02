@@ -1,7 +1,10 @@
 //! Process-wide admission of the keyed engine: many namespaces cold-start
 //! at once under a small byte budget without exceeding it, a full
 //! admission queue answers 503 with `Retry-After`, and compaction under
-//! contention waits and completes.
+//! contention waits and completes. Also the bounds on background work: a
+//! source response that stalls mid-body times out, a stalled ingest is
+//! dropped at the per-work deadline (releasing its slot and budget), and
+//! shutdown finishes or cancels every worker within its grace.
 
 #![allow(
     clippy::arithmetic_side_effects,
@@ -30,6 +33,7 @@ use ursula_index::keyed::KeyedEngineConfig;
 use ursula_index::keyed::KeyedReadOutcome;
 use ursula_index::keyed::KeyedReadRequest;
 use ursula_index::keyed::KeyedSource;
+use ursula_index::keyed::KeyedSourceClient;
 use ursula_index::keyed::KeyedState;
 use ursula_index::keyed::Lower;
 use ursula_index::keyed::PartOptions;
@@ -417,4 +421,171 @@ async fn compaction_under_contention_completes() {
         assert_eq!(through, tail);
         assert_eq!(page.body(), expected(&logs, &key), "{key}");
     }
+}
+
+#[tokio::test]
+async fn a_source_response_stalled_mid_body_times_out() {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let _read = socket.read(&mut request).await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\
+                  stream-extensions: keyed-batch-v1\r\nstream-record-start: 0\r\n\
+                  stream-record-next: 10\r\n\r\n{\"ops\":",
+            )
+            .await
+            .unwrap();
+        // Never finish the body.
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        drop(socket);
+    });
+    let client = KeyedSourceClient::with_timeout(
+        format!("http://{address}").parse().unwrap(),
+        Duration::from_millis(300),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.read(BUCKET, "s", 0, 1024, None, false),
+    )
+    .await
+    .expect("the source read must end on its own timeout");
+    assert!(
+        matches!(result, Err(SourceError::Transient(_))),
+        "{result:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(5));
+    server.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stalled_ingest_is_dropped_at_the_work_deadline() {
+    let logs = Arc::new(FakeLogs::new());
+    logs.append("s0", (0..10).map(record));
+    let engine = engine(&logs, KeyedEngineConfig {
+        work_deadline: Duration::from_secs(2),
+        ..config()
+    });
+    // The source accepts the read and never answers.
+    logs.open.send_replace(false);
+    let outcome = read(&engine, "s0", 10, Duration::from_millis(500)).await;
+    assert!(
+        matches!(outcome, KeyedReadOutcome::NotYet { through: 0 }),
+        "{outcome:?}"
+    );
+    assert_eq!(engine.background_workers(), 1);
+    assert_eq!(engine.metrics().admission.ingests_running, 1);
+
+    // Past the deadline the worker is gone with its slot and budget.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let metrics = engine.metrics();
+    assert_eq!(metrics.work_deadlines, 1, "{metrics:?}");
+    assert_eq!(engine.background_workers(), 0);
+    assert_eq!(metrics.admission.ingests_running, 0, "{metrics:?}");
+    assert_eq!(metrics.admission.in_use_bytes, 0, "{metrics:?}");
+
+    // The next read retries and succeeds once the source answers.
+    logs.open.send_replace(true);
+    let KeyedReadOutcome::Rows { through: 10, page } =
+        read(&engine, "s0", 10, Duration::from_secs(30)).await
+    else {
+        panic!("retry after the deadline");
+    };
+    assert_eq!(page.body(), expected(&logs, "s0"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_lets_in_flight_ingests_finish_within_the_grace() {
+    let logs = Arc::new(FakeLogs::new());
+    for key in ["s0", "s1", "s2"] {
+        logs.append(key, (0..10).map(record));
+    }
+    let engine = engine(&logs, config());
+    logs.open.send_replace(false);
+    let reads: Vec<_> = ["s0", "s1", "s2"]
+        .into_iter()
+        .map(|key| {
+            let engine = engine.clone();
+            tokio::spawn(async move { read(&engine, key, 10, Duration::from_secs(60)).await })
+        })
+        .collect();
+    while engine.background_workers() < 3 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    // The source answers half-way through the grace.
+    let opener = tokio::spawn({
+        let logs = Arc::clone(&logs);
+        async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            logs.open.send_replace(true);
+        }
+    });
+    let started = tokio::time::Instant::now();
+    engine.shutdown(Duration::from_secs(2)).await;
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(engine.background_workers(), 0);
+    opener.await.unwrap();
+    for read in reads {
+        let outcome = read.await.unwrap();
+        assert!(
+            matches!(outcome, KeyedReadOutcome::Rows { through: 10, .. }),
+            "{outcome:?}"
+        );
+    }
+    // New requests are refused.
+    let outcome = read(&engine, "s0", 10, Duration::from_secs(1)).await;
+    assert!(
+        matches!(outcome, KeyedReadOutcome::Unavailable(_)),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_cancels_stalled_ingests_after_the_grace() {
+    let logs = Arc::new(FakeLogs::new());
+    for key in ["s0", "s1", "s2", "s3"] {
+        logs.append(key, (0..10).map(record));
+    }
+    let engine = engine(&logs, config());
+    logs.open.send_replace(false);
+    let reads: Vec<_> = ["s0", "s1", "s2", "s3"]
+        .into_iter()
+        .map(|key| {
+            let engine = engine.clone();
+            tokio::spawn(async move { read(&engine, key, 10, Duration::from_secs(60)).await })
+        })
+        .collect();
+    while engine.background_workers() < 4 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let started = tokio::time::Instant::now();
+    engine.shutdown(Duration::from_secs(2)).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(3),
+        "{elapsed:?}"
+    );
+    // Nothing is left running, and every reservation is returned.
+    assert_eq!(engine.background_workers(), 0);
+    let admission = engine.metrics().admission;
+    assert_eq!(admission.ingests_running, 0, "{admission:?}");
+    assert_eq!(admission.in_use_bytes, 0, "{admission:?}");
+    assert_eq!(admission.queue_depth, 0, "{admission:?}");
+    // The waiters were answered 503, well before their own timeout.
+    for read in reads {
+        let outcome = read.await.unwrap();
+        assert!(
+            matches!(outcome, KeyedReadOutcome::Unavailable(_)),
+            "{outcome:?}"
+        );
+    }
+    assert!(started.elapsed() < Duration::from_secs(10));
 }
