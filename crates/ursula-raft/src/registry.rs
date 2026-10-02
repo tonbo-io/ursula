@@ -1161,15 +1161,16 @@ impl RaftGroupHandleRegistry {
                 "prefetch OpenRaft snapshot {snapshot_id} before install: {err}"
             ))
         })?;
-        decode_group_snapshot(&snapshot_bytes).map_err(|err| {
+        let group_snapshot = decode_group_snapshot(&snapshot_bytes).map_err(|err| {
             GroupEngineError::new(format!(
                 "decode prefetched OpenRaft snapshot {snapshot_id}: {err}"
             ))
         })?;
+        drop(snapshot_bytes);
         // Keep fallible object-store I/O outside OpenRaft's state-machine
         // worker: a write-snapshot error there is fatal to RaftCore. Keep the
         // original external pointer so large snapshots are not duplicated in
-        // the Raft RPC payload; install_snapshot consumes the cached bytes.
+        // the Raft RPC payload; install_snapshot consumes the decoded group.
         let pointer = SnapshotPointer {
             snapshot_id,
             location,
@@ -1177,7 +1178,7 @@ impl RaftGroupHandleRegistry {
         let cache_key = self.snapshot_install.cache_prefetched(
             &pointer.snapshot_id,
             &pointer.location,
-            snapshot_bytes,
+            group_snapshot,
         );
         let guard = PrefetchedSnapshotGuard {
             snapshot_install: self.snapshot_install.clone(),
@@ -1300,7 +1301,7 @@ mod tests {
     }
 
     fn group_snapshot_bytes() -> Vec<u8> {
-        crate::snapshot_codec::group_snapshot_frames(GroupSnapshot {
+        crate::snapshot_codec::group_snapshot_frames(Arc::new(GroupSnapshot {
             placement: ShardPlacement {
                 core_id: ursula_shard::CoreId(0),
                 shard_id: ursula_shard::ShardId(0),
@@ -1309,7 +1310,7 @@ mod tests {
             group_commit_index: 0,
             stream_snapshot: Default::default(),
             stream_append_counts: Vec::new(),
-        })
+        }))
         .collect::<Result<Vec<_>, _>>()
         .expect("encode test group snapshot")
         .into_iter()
@@ -1349,11 +1350,11 @@ mod tests {
         let pointer = SnapshotPointer::decode(prefetched.snapshot.snapshot.get_ref()).unwrap();
         assert_eq!(pointer.snapshot_id, "snapshot-a");
         assert!(matches!(pointer.location, SnapshotLocation::S3 { .. }));
-        let bytes = registry
+        let cached = registry
             .snapshot_install_coordinator()
             .take_prefetched(&pointer)
             .expect("external snapshot is cached for install");
-        decode_group_snapshot(&bytes).unwrap();
+        assert_eq!(cached.group_commit_index, 0);
     }
 
     #[tokio::test]
@@ -1387,10 +1388,16 @@ mod tests {
             coordinator,
             None,
         );
+        let decodes_before_install = crate::snapshot_codec::decode_calls_on_this_thread();
         state_machine
             .install_snapshot(&prefetched.snapshot.meta, prefetched.snapshot.snapshot)
             .await
             .expect("prefetched external snapshot installs without external store");
+        // F12c: the prefetch decoded the snapshot; install reuses it.
+        assert_eq!(
+            crate::snapshot_codec::decode_calls_on_this_thread(),
+            decodes_before_install
+        );
     }
 
     #[tokio::test]

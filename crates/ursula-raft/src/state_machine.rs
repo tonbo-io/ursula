@@ -97,6 +97,18 @@ impl SnapshotBuildCoordinator {
             .await
             .map_err(|err| GroupEngineError::new(format!("snapshot build gate closed: {err}")))
     }
+
+    /// Takes a build permit only if one is free right now. The policy path
+    /// uses this so that one group's apply worker never waits behind another
+    /// group's snapshot build (bounded-stream-state F12d).
+    pub fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        self.inner.semaphore.clone().try_acquire_owned().ok()
+    }
+
+    #[cfg(test)]
+    fn available_permits(&self) -> usize {
+        self.inner.semaphore.available_permits()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -107,7 +119,9 @@ pub struct SnapshotInstallCoordinator {
 #[derive(Debug)]
 struct SnapshotInstallCoordinatorInner {
     semaphore: Arc<Semaphore>,
-    prefetched: Mutex<BTreeMap<String, Arc<Vec<u8>>>>,
+    /// Snapshots downloaded and decoded before OpenRaft's install, keyed by
+    /// pointer. Install consumes the decoded group, so it decodes once.
+    prefetched: Mutex<BTreeMap<String, GroupSnapshot>>,
 }
 
 impl Default for SnapshotInstallCoordinator {
@@ -162,23 +176,23 @@ impl SnapshotInstallCoordinator {
         &self,
         snapshot_id: &str,
         location: &SnapshotLocation,
-        bytes: Vec<u8>,
+        snapshot: GroupSnapshot,
     ) -> String {
         let key = Self::cache_key(snapshot_id, location);
         self.inner
             .prefetched
             .lock()
             .expect("snapshot install prefetch cache mutex")
-            .insert(key.clone(), Arc::new(bytes));
+            .insert(key.clone(), snapshot);
         key
     }
 
-    pub fn take_prefetched(&self, pointer: &SnapshotPointer) -> Option<Arc<Vec<u8>>> {
+    pub fn take_prefetched(&self, pointer: &SnapshotPointer) -> Option<GroupSnapshot> {
         let key = Self::cache_key(&pointer.snapshot_id, &pointer.location);
         self.clear_prefetched_key(&key)
     }
 
-    pub fn clear_prefetched_key(&self, key: &str) -> Option<Arc<Vec<u8>>> {
+    pub fn clear_prefetched_key(&self, key: &str) -> Option<GroupSnapshot> {
         self.inner
             .prefetched
             .lock()
@@ -513,6 +527,26 @@ impl RaftGroupStateMachine {
         self.engine.install_snapshot(snapshot).await
     }
 
+    async fn snapshot_builder_with_permit(
+        &mut self,
+        build_permit: OwnedSemaphorePermit,
+    ) -> RaftGroupSnapshotBuilder {
+        let snapshot = self
+            .group_snapshot()
+            .await
+            .expect("in-memory group snapshot should not fail");
+        RaftGroupSnapshotBuilder {
+            placement: self.placement,
+            snapshot: Arc::new(snapshot),
+            meta: self.snapshot_meta(),
+            current_snapshot: self.current_snapshot.clone(),
+            snapshot_store: self.snapshot_store.clone(),
+            metrics: self.metrics.clone(),
+            _build_permit: build_permit,
+            snapshot_metadata_path: self.snapshot_metadata_path.clone(),
+        }
+    }
+
     pub(crate) fn snapshot_meta(&self) -> SnapshotMetaOf<UrsulaRaftTypeConfig> {
         SnapshotMetaOf::<UrsulaRaftTypeConfig> {
             last_log_id: self.last_applied_log_id,
@@ -588,26 +622,30 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         Ok(())
     }
 
+    async fn try_create_snapshot_builder(&mut self, force: bool) -> Option<Self::SnapshotBuilder> {
+        if force {
+            return Some(self.get_snapshot_builder().await);
+        }
+        // A policy-triggered build defers instead of waiting for the
+        // node-wide permit on this group's state-machine worker; OpenRaft
+        // retries on a later trigger.
+        let Some(build_permit) = self.snapshot_build.try_acquire() else {
+            tracing::debug!(
+                raft_group_id = self.placement.raft_group_id.0,
+                "deferring OpenRaft snapshot build while another group holds the build permit"
+            );
+            return None;
+        };
+        Some(self.snapshot_builder_with_permit(build_permit).await)
+    }
+
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         let build_permit = self
             .snapshot_build
             .acquire()
             .await
             .expect("snapshot build coordinator should not close");
-        let snapshot = self
-            .group_snapshot()
-            .await
-            .expect("in-memory group snapshot should not fail");
-        RaftGroupSnapshotBuilder {
-            placement: self.placement,
-            snapshot,
-            meta: self.snapshot_meta(),
-            current_snapshot: self.current_snapshot.clone(),
-            snapshot_store: self.snapshot_store.clone(),
-            metrics: self.metrics.clone(),
-            _build_permit: build_permit,
-            snapshot_metadata_path: self.snapshot_metadata_path.clone(),
-        }
+        self.snapshot_builder_with_permit(build_permit).await
     }
 
     async fn begin_receiving_snapshot(
@@ -624,23 +662,25 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         let pointer_bytes = snapshot.into_inner();
         let pointer = SnapshotPointer::decode(&pointer_bytes)
             .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
-        let snapshot_bytes = match &pointer.location {
-            SnapshotLocation::Inline { bytes } => Arc::new(bytes.clone()),
-            location => {
-                if let Some(bytes) = self.snapshot_install.take_prefetched(&pointer) {
-                    bytes
-                } else {
-                    Arc::new(
-                        self.snapshot_store
-                            .download(location)
-                            .await
-                            .map_err(|err| err.into_io())?,
-                    )
-                }
+        // Decode exactly once (bounded-stream-state F12c): inline bytes are
+        // decoded in place, and a prefetched external snapshot arrives
+        // already decoded.
+        let group_snapshot = match &pointer.location {
+            SnapshotLocation::Inline { bytes } => {
+                decode_group_snapshot(bytes).map_err(|err| err.into_io())?
             }
+            location => match self.snapshot_install.take_prefetched(&pointer) {
+                Some(group_snapshot) => group_snapshot,
+                None => {
+                    let bytes = self
+                        .snapshot_store
+                        .download(location)
+                        .await
+                        .map_err(|err| err.into_io())?;
+                    decode_group_snapshot(&bytes).map_err(|err| err.into_io())?
+                }
+            },
         };
-        let group_snapshot =
-            decode_group_snapshot(snapshot_bytes.as_slice()).map_err(|err| err.into_io())?;
         self.engine
             .install_snapshot(group_snapshot)
             .await
@@ -678,7 +718,9 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
 
 pub struct RaftGroupSnapshotBuilder {
     placement: ShardPlacement,
-    snapshot: GroupSnapshot,
+    /// Shared with the frame iterators, so an upload and any inline fallback
+    /// encode the same group without deep-cloning it (F12c).
+    snapshot: Arc<GroupSnapshot>,
     pub(crate) meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
     current_snapshot: Arc<Mutex<Option<CurrentSnapshot>>>,
     snapshot_store: SharedSnapshotStore,
@@ -698,7 +740,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
         };
         let location = match self
             .snapshot_store
-            .upload_iter(key, group_snapshot_frames(self.snapshot.clone()))
+            .upload_iter(key, group_snapshot_frames(Arc::clone(&self.snapshot)))
             .await
         {
             Ok(location) => {
@@ -716,7 +758,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                             "falling back to inline OpenRaft snapshot after external snapshot verification failed"
                         );
                         SnapshotLocation::Inline {
-                            bytes: group_snapshot_frames(self.snapshot.clone())
+                            bytes: group_snapshot_frames(Arc::clone(&self.snapshot))
                                 .collect::<Result<Vec<_>, _>>()
                                 .map_err(|err| err.into_io())?
                                 .into_iter()
@@ -733,7 +775,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                     "falling back to inline OpenRaft snapshot after external snapshot upload failed"
                 );
                 SnapshotLocation::Inline {
-                    bytes: group_snapshot_frames(self.snapshot.clone())
+                    bytes: group_snapshot_frames(Arc::clone(&self.snapshot))
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|err| err.into_io())?
                         .into_iter()
@@ -771,7 +813,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                 );
             }
             pointer.location = SnapshotLocation::Inline {
-                bytes: group_snapshot_frames(self.snapshot.clone())
+                bytes: group_snapshot_frames(Arc::clone(&self.snapshot))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|err| err.into_io())?
                     .into_iter()
@@ -931,7 +973,7 @@ mod tests {
         let current_snapshot = Arc::new(Mutex::new(None));
         let mut builder = RaftGroupSnapshotBuilder {
             placement,
-            snapshot: test_group_snapshot(placement, 42),
+            snapshot: Arc::new(test_group_snapshot(placement, 42)),
             meta: test_snapshot_meta(42),
             current_snapshot,
             snapshot_store: default_snapshot_store(),
@@ -995,7 +1037,7 @@ mod tests {
 
         let mut first = RaftGroupSnapshotBuilder {
             placement,
-            snapshot: test_group_snapshot(placement, 1),
+            snapshot: Arc::new(test_group_snapshot(placement, 1)),
             meta: test_snapshot_meta(1),
             current_snapshot: current_snapshot.clone(),
             snapshot_store: snapshot_store.clone(),
@@ -1009,7 +1051,7 @@ mod tests {
 
         let mut second = RaftGroupSnapshotBuilder {
             placement,
-            snapshot: test_group_snapshot(placement, 2),
+            snapshot: Arc::new(test_group_snapshot(placement, 2)),
             meta: test_snapshot_meta(2),
             current_snapshot: current_snapshot.clone(),
             snapshot_store: snapshot_store.clone(),
@@ -1040,7 +1082,7 @@ mod tests {
         let current_snapshot = Arc::new(Mutex::new(None));
         let mut third = RaftGroupSnapshotBuilder {
             placement,
-            snapshot: test_group_snapshot(placement, 3),
+            snapshot: Arc::new(test_group_snapshot(placement, 3)),
             meta: test_snapshot_meta(3),
             current_snapshot,
             snapshot_store,
@@ -1119,7 +1161,7 @@ mod tests {
         let current_snapshot = Arc::new(Mutex::new(None));
         let mut builder = RaftGroupSnapshotBuilder {
             placement,
-            snapshot: test_group_snapshot(placement, 3),
+            snapshot: Arc::new(test_group_snapshot(placement, 3)),
             meta: test_snapshot_meta(3),
             current_snapshot: current_snapshot.clone(),
             snapshot_store: Arc::new(FailingSnapshotStore),
@@ -1137,6 +1179,9 @@ mod tests {
         let group = decode_group_snapshot(&bytes).expect("decode inline snapshot");
         assert_eq!(group.group_commit_index, 3);
         assert!(current_snapshot.lock().expect("snapshot mutex").is_some());
+        // F12c: the upload attempt and the inline fallback both encoded from
+        // the shared group without keeping or deep-cloning it.
+        assert_eq!(Arc::strong_count(&builder.snapshot), 1);
     }
 
     #[tokio::test]
@@ -1159,5 +1204,100 @@ mod tests {
 
         drop(permit);
         assert_eq!(coordinator.available_permits(), 1);
+    }
+
+    #[cfg(not(madsim))]
+    fn test_state_machine(
+        build: SnapshotBuildCoordinator,
+        install: SnapshotInstallCoordinator,
+    ) -> RaftGroupStateMachine {
+        use ursula_shard::CoreId;
+        use ursula_shard::RaftGroupId;
+        use ursula_shard::ShardId;
+
+        RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+            ShardPlacement {
+                core_id: CoreId(0),
+                shard_id: ShardId(0),
+                raft_group_id: RaftGroupId(7),
+            },
+            None,
+            None,
+            default_snapshot_store(),
+            build,
+            install,
+            None,
+        )
+    }
+
+    /// F12d: a policy-triggered snapshot never waits on the node-wide build
+    /// permit; it defers while another group builds, and a forced one (needed
+    /// for replication) still waits for the permit.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn policy_snapshot_build_defers_while_another_group_holds_the_permit() {
+        let build = SnapshotBuildCoordinator::new(1);
+        let mut state_machine =
+            test_state_machine(build.clone(), SnapshotInstallCoordinator::default());
+        let held = build.acquire().await.expect("other group's build permit");
+
+        let deferred = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state_machine.try_create_snapshot_builder(false),
+        )
+        .await
+        .expect("policy build must not wait for the permit");
+        assert!(deferred.is_none());
+
+        drop(held);
+        let builder = state_machine
+            .try_create_snapshot_builder(false)
+            .await
+            .expect("free permit builds");
+        assert_eq!(build.available_permits(), 0);
+        drop(builder);
+        assert_eq!(build.available_permits(), 1);
+        assert!(
+            state_machine
+                .try_create_snapshot_builder(true)
+                .await
+                .is_some()
+        );
+    }
+
+    /// F12c: installing an inline snapshot decodes it exactly once.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn inline_snapshot_install_decodes_once() {
+        use crate::snapshot_codec::decode_calls_on_this_thread;
+
+        let mut state_machine = test_state_machine(
+            SnapshotBuildCoordinator::default(),
+            SnapshotInstallCoordinator::default(),
+        );
+        let placement = state_machine.placement;
+        let bytes = group_snapshot_frames(Arc::new(test_group_snapshot(placement, 9)))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("encode group snapshot")
+            .concat();
+        let meta = test_snapshot_meta(9);
+        let pointer = SnapshotPointer {
+            snapshot_id: meta.snapshot_id.clone(),
+            location: SnapshotLocation::Inline { bytes },
+        };
+        let before = decode_calls_on_this_thread();
+        state_machine
+            .install_snapshot(&meta, Cursor::new(pointer.encode().expect("pointer")))
+            .await
+            .expect("install inline snapshot");
+        assert_eq!(decode_calls_on_this_thread() - before, 1);
+        assert_eq!(
+            state_machine
+                .group_snapshot()
+                .await
+                .expect("installed group")
+                .group_commit_index,
+            9
+        );
     }
 }
