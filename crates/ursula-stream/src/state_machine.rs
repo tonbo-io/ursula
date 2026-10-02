@@ -28,6 +28,7 @@ use ursula_shard::BucketStreamId;
 
 use self::cold_gc::ColdGcQueue;
 use self::cold_state::StreamColdState;
+pub use self::gauges::GroupStateGauges;
 use self::hot_buffer::HotBuffer;
 use self::registry::StreamRegistry;
 use self::ttl::TtlEntry;
@@ -87,6 +88,7 @@ mod cold;
 mod cold_gc;
 mod cold_state;
 mod flush_planner;
+mod gauges;
 mod hot_buffer;
 
 pub use self::flush_planner::ColdFlushPass;

@@ -791,6 +791,24 @@ impl ShardRuntime {
         levels
     }
 
+    /// Bounded-state gauges (`docs/architecture/bounded-stream-state.md`
+    /// §7.5) of every Raft group as held by this node's applied replica state.
+    /// Groups are asked concurrently; per-group results, like
+    /// [`Self::feature_levels_all_groups`].
+    pub async fn state_gauges_all_groups(
+        &self,
+    ) -> Vec<(
+        RaftGroupId,
+        Result<ursula_stream::GroupStateGauges, RuntimeError>,
+    )> {
+        let group_count = self.shard_map.raft_group_count();
+        let requests = (0..group_count).map(|group_id| {
+            let group = RaftGroupId(group_id);
+            async move { (group, self.state_gauges(group).await) }
+        });
+        futures_util::future::join_all(requests).await
+    }
+
     /// Proposes `SetFeatureLevel { level }` to every Raft group (C0), serially
     /// like the other all-group admin sweeps. Each group ends at
     /// `max(current, level)`, so re-running after a partial failure is safe.

@@ -1151,6 +1151,24 @@ impl CoreWorker {
         response
     }
 
+    pub(crate) async fn state_gauges(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        placement: ShardPlacement,
+    ) -> Result<ursula_stream::GroupStateGauges, RuntimeError> {
+        let exec_started_at = Instant::now();
+        let response = group
+            .state_gauges(placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err));
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(exec_started_at),
+        );
+        response
+    }
+
     pub(crate) async fn set_feature_level(
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,

@@ -7593,6 +7593,79 @@ async fn bucket_quota_endpoint_enforces_and_clears_backstops() {
     assert_eq!(response.status(), StatusCode::CREATED);
 }
 
+// Bounded-state §7.5: per-group state gauges exported in /__ursula/metrics.
+#[tokio::test]
+async fn metrics_expose_per_group_state_gauges() {
+    let app = test_router();
+    let response = http_put(
+        &app,
+        "/benchcmp/gauge-stream",
+        &[
+            (CONTENT_TYPE.as_str(), "application/json"),
+            ("Stream-TTL", "3600"),
+        ],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    for seq in 0..3 {
+        let seq = seq.to_string();
+        let response = http_post(
+            &app,
+            "/benchcmp/gauge-stream",
+            &[
+                (CONTENT_TYPE.as_str(), "application/json"),
+                ("Producer-Id", "writer-1"),
+                ("Producer-Epoch", "0"),
+                ("Producer-Seq", seq.as_str()),
+            ],
+            Body::from(r#"[{"a":1},{"b":2}]"#),
+        )
+        .await;
+        assert!(response.status().is_success(), "{}", response.status());
+    }
+
+    let response = http_get(&app, "/__ursula/metrics").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let metrics: serde_json::Value =
+        serde_json::from_slice(&body_bytes(response).await).expect("metrics json");
+    let groups = metrics["group_state_gauges"]
+        .as_array()
+        .expect("group_state_gauges array");
+    assert_eq!(groups.len(), 8, "{metrics}");
+    assert!(
+        groups
+            .iter()
+            .all(|group| group["hosted"] == true && group["feature_level"] == 0)
+    );
+    let streams: u64 = groups.iter().filter_map(|g| g["streams"].as_u64()).sum();
+    assert_eq!(streams, 1);
+    let group = groups
+        .iter()
+        .find(|group| group["streams"] == 1)
+        .expect("group holding the stream");
+    assert_eq!(group["dense_record_entries"], 6, "{group}");
+    assert_eq!(group["record_marks"], 0);
+    assert_eq!(group["producers"], 1);
+    assert_eq!(group["receipts"], 3);
+    assert_eq!(group["ttl_streams"], 1);
+    assert!(group["ttl_heap_entries"].as_u64().expect("ttl heap") >= 1);
+    assert_eq!(group["hot_chunks"], 3);
+    for key in [
+        "message_records",
+        "shared_refs",
+        "live_packs",
+        "staged_external_refs",
+        "receipt_items",
+        "producer_bytes",
+        "hot_payload_bytes",
+        "hot_overhead_bytes",
+        "pending_cold_gc",
+    ] {
+        assert!(group[key].is_u64(), "missing {key}: {group}");
+    }
+}
+
 // Keyed-streams C0: replicated group feature level admin surface.
 #[tokio::test]
 async fn feature_level_endpoint_reports_and_raises_every_group() {

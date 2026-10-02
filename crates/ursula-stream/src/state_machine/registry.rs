@@ -111,6 +111,11 @@ impl StreamRegistry {
         slot
     }
 
+    /// Entries in the TTL min-heap, stale ones included (bounded-state gauge).
+    pub(super) fn ttl_heap_len(&self) -> usize {
+        self.ttl.entries.len()
+    }
+
     /// Re-stamp a stream's TTL entry after its expiry may have changed.
     pub(super) fn refresh_ttl(&mut self, stream_id: &BucketStreamId) {
         if let Some(key) = self.key(stream_id) {

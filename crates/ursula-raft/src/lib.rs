@@ -17,6 +17,8 @@
 //! - [`engine`]: [`RaftGroupEngine`] + `GroupEngine` impl, with the engine
 //!   factories under `engine::factory`.
 //! - [`forward`]: leader-forwarding helpers used by the engine when a node is a follower.
+//! - [`snapshot_codec`]: the group-snapshot frame codec; [`group_snapshot_frames`]
+//!   and [`decode_group_snapshot`] are re-exported for measurement tools.
 
 pub mod raft_internal_proto {
     tonic::include_proto!("ursula.raft.v1");
@@ -90,6 +92,8 @@ pub use registry::SingleNodeRaftNetwork;
 pub use registry::SingleNodeRaftNetworkFactory;
 #[cfg(madsim)]
 pub use sim_runtime::MadsimOpenRaftRuntime;
+pub use snapshot_codec::decode_group_snapshot;
+pub use snapshot_codec::group_snapshot_frames;
 pub use state_machine::RaftGroupSnapshotBuilder;
 pub use state_machine::RaftGroupStateMachine;
 pub use types::RaftGroupMetricsSnapshot;

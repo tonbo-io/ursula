@@ -8,7 +8,9 @@
 //! - [`model`]: persistent data types (metadata, segments, producer state, plans).
 //! - [`record_index`]: exact retained record-ordinal to offset boundaries.
 //! - [`snapshot`]: snapshot wire format and restoration errors.
-//! - [`state_machine`]: the deterministic [`StreamStateMachine`] that drives a Raft group.
+//! - [`state_machine`]: the deterministic [`StreamStateMachine`] that drives a Raft group,
+//!   plus [`GroupStateGauges`], the per-group bounded-state gauges
+//!   (`docs/architecture/bounded-stream-state.md` §7.5).
 //! - [`validate`]: bucket/stream id validation used by HTTP and Raft entry points.
 
 mod command;
@@ -80,6 +82,7 @@ pub use state_machine::ColdFlushPass;
 pub use state_machine::ColdFlushPassRequest;
 pub use state_machine::ColdFlushPlanStats;
 pub use state_machine::ColdFlushPressure;
+pub use state_machine::GroupStateGauges;
 pub use state_machine::StreamStateMachine;
 pub use validate::validate_bucket_id;
 pub use validate::validate_stream_id;

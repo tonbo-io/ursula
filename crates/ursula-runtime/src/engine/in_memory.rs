@@ -55,6 +55,7 @@ use super::GroupRepairColdIndexFuture;
 use super::GroupSetBucketQuotaFuture;
 use super::GroupSetFeatureLevelFuture;
 use super::GroupSnapshotFuture;
+use super::GroupStateGaugesFuture;
 use super::GroupTouchStreamAccessFuture;
 use super::GroupUpdateStreamAttrsFuture;
 use super::GroupWriteResponse;
@@ -1100,6 +1101,12 @@ impl InMemoryGroupEngine {
         self.state_machine.feature_level()
     }
 
+    /// Bounded-state gauges of the applied state (§7.5 of
+    /// `bounded-stream-state.md`). Public so the Raft engine can serve them.
+    pub fn state_gauges(&self) -> ursula_stream::GroupStateGauges {
+        self.state_machine.state_gauges()
+    }
+
     pub fn head_stream_after_access(
         &mut self,
         request: &HeadStreamRequest,
@@ -1628,6 +1635,10 @@ impl GroupEngine for InMemoryGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupListBucketStreamsFuture<'a> {
         Box::pin(async move { Ok(self.list_bucket_streams_report(&request)) })
+    }
+
+    fn state_gauges<'a>(&'a mut self, _placement: ShardPlacement) -> GroupStateGaugesFuture<'a> {
+        Box::pin(async move { Ok(self.state_machine.state_gauges()) })
     }
 
     fn set_feature_level<'a>(

@@ -37,6 +37,9 @@ from scripts.dst.common import (
 EXEMPT_PATH_PREFIXES = (
     "crates/ursula-bench/",
     "crates/ursula-sim/",
+    # Measurement harness (bounded-stream-state.md §7.1): times its own
+    # workloads and spawns its own runtime; never built under cfg(madsim).
+    "crates/ursula-state-probe/",
 )
 EXEMPT_PATH_SUBSTRINGS = (
     "/tests/",

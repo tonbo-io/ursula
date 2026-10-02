@@ -66,6 +66,19 @@ impl HotBuffer {
         self.chunks.is_empty()
     }
 
+    /// Number of append-ordered hot chunks (bounded-state gauge).
+    pub(super) fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Per-chunk bookkeeping bytes beyond the payload itself (bounded-state
+    /// gauge): one `HotChunk` header per chunk, ignoring allocator slack.
+    pub(super) fn chunk_overhead_bytes(&self) -> usize {
+        self.chunks
+            .len()
+            .saturating_mul(std::mem::size_of::<HotChunk>())
+    }
+
     pub(super) fn hot_start_offset(&self) -> u64 {
         self.chunks
             .front()

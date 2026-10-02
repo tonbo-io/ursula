@@ -87,6 +87,7 @@ use ursula_runtime::GroupSetFeatureLevelFuture;
 use ursula_runtime::GroupShutdownFuture;
 use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
+use ursula_runtime::GroupStateGaugesFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
 use ursula_runtime::GroupUpdateStreamAttrsFuture;
 use ursula_runtime::GroupWriteBatchFuture;
@@ -1168,6 +1169,12 @@ impl GroupEngine for MadsimScopedGroupEngine {
     fn feature_level<'a>(&'a mut self, placement: ShardPlacement) -> GroupFeatureLevelFuture<'a> {
         Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
             self.inner.feature_level(placement).await
+        }))
+    }
+
+    fn state_gauges<'a>(&'a mut self, placement: ShardPlacement) -> GroupStateGaugesFuture<'a> {
+        Box::pin(MadsimOpenRaftRuntime::scope(self.seed, async move {
+            self.inner.state_gauges(placement).await
         }))
     }
 

@@ -1974,7 +1974,9 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
     // status-publishing pipeline survives SSM exec failures).
     let rss = state.node_memory.last_rss_bytes();
     let cap = state.node_memory.abort_cap_bytes().unwrap_or_default();
+    let group_state_gauges = group_state_gauges_json(&state).await;
     if let Some(object) = body.as_object_mut() {
+        object.insert("group_state_gauges".to_owned(), group_state_gauges);
         object.insert("process_rss_bytes".to_owned(), serde_json::json!(rss));
         object.insert(
             "node_memory_abort_cap_bytes".to_owned(),
@@ -2007,6 +2009,47 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         );
     }
     json_response(StatusCode::OK, body.to_string())
+}
+
+/// Upper bound on how long a metrics scrape waits for the per-group
+/// bounded-state gauges; a busy or wedged group must not stall the scrape.
+const GROUP_STATE_GAUGES_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Per-group bounded-state gauges (`docs/architecture/bounded-stream-state.md`
+/// §7.5) for `/__ursula/metrics`: one object per Raft group with the group id,
+/// whether this node hosts it, and either the gauges or an error.
+async fn group_state_gauges_json(state: &HttpState) -> serde_json::Value {
+    let Ok(groups) = http_time::timeout(
+        GROUP_STATE_GAUGES_TIMEOUT,
+        state.runtime.state_gauges_all_groups(),
+    )
+    .await
+    else {
+        return serde_json::json!({ "error": "timed out collecting group state gauges" });
+    };
+    let groups = groups
+        .into_iter()
+        .map(|(group, result)| match result {
+            Ok(gauges) => {
+                let mut value = serde_json::to_value(gauges).unwrap_or(serde_json::Value::Null);
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("raft_group_id".to_owned(), serde_json::json!(group.0));
+                    object.insert("hosted".to_owned(), serde_json::json!(true));
+                }
+                value
+            }
+            Err(RuntimeError::GroupNotHosted { .. }) => serde_json::json!({
+                "raft_group_id": group.0,
+                "hosted": false,
+            }),
+            Err(err) => serde_json::json!({
+                "raft_group_id": group.0,
+                "hosted": true,
+                "error": err.to_string(),
+            }),
+        })
+        .collect::<Vec<_>>();
+    serde_json::Value::Array(groups)
 }
 
 #[cfg(feature = "jemalloc-prof")]

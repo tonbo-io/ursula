@@ -324,6 +324,13 @@ macro_rules! runtime_operations {
                 handle { call feature_level(engine, metrics, placement) }
                 client { pub group fn feature_level }
             }
+            op StateGauges {
+                fields {}
+                reply { response_tx: ursula_stream::GroupStateGauges }
+                guard { none }
+                handle { call state_gauges(engine, metrics, placement) }
+                client { pub group fn state_gauges }
+            }
             op SetFeatureLevel {
                 fields { request: SetFeatureLevelRequest }
                 reply { response_tx: SetFeatureLevelResponse }

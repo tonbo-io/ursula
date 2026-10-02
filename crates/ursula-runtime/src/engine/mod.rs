@@ -120,6 +120,9 @@ pub type GroupListBucketStreamsFuture<'a> = Pin<
 >;
 pub type GroupFeatureLevelFuture<'a> =
     Pin<Box<dyn Future<Output = Result<u32, GroupEngineError>> + Send + 'a>>;
+pub type GroupStateGaugesFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<ursula_stream::GroupStateGauges, GroupEngineError>> + Send + 'a>,
+>;
 pub type GroupReadSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ReadSnapshotResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupDeleteSnapshotFuture<'a> =
@@ -365,6 +368,19 @@ pub trait GroupEngine: Send + 'static {
         Box::pin(async move {
             Err(GroupEngineError::new(format!(
                 "feature levels are not supported for group {}",
+                placement.raft_group_id.0
+            )))
+        })
+    }
+
+    /// Bounded-state gauges of this replica's applied state
+    /// (`docs/architecture/bounded-stream-state.md` §7.5). Served from local
+    /// state, leader or follower, like [`GroupEngine::feature_level`].
+    /// Default unsupported.
+    fn state_gauges<'a>(&'a mut self, placement: ShardPlacement) -> GroupStateGaugesFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "state gauges are not supported for group {}",
                 placement.raft_group_id.0
             )))
         })
