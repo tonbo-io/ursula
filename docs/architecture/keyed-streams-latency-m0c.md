@@ -193,7 +193,7 @@ Model against measurement:
 
 - **Below saturation the model is conservative.** For `ramdisk` with no background it predicts 15–22 ms against 9–12 ms measured, and for `memwal` 8–10 ms against 5–7 ms. Most of the gap is the 4th blocking commit, which is 3 in the current Pi. With 3 commits the model gives about 11–17 ms for `ramdisk`. The rest is the 1.1 ms per-commit overhead, which looks smaller with a real network client.
 - **At saturation the model is optimistic.** For `apfs` N=16 it predicts 530 ms against 820 ms measured. The FIFO model assumes each partial source re-arms only after its own commit settles and that the blocking commits interleave fairly. The real harness keeps more partials queued ahead of a submit.
-- **The model's exit-criterion arithmetic still holds** (N=1 submit→provider ≤ 4·L̄ + 5 ms). On `ramdisk`, 4·2.8 + 5 = 16.2 against 12.0 measured; on `apfs`, 4·13.2 + 5 = 57.8 against 52.0. The N=16 criterion (≥ 130 commits/s and ≤ 100 ms) is met locally on `ramdisk` and `memwal` without background, met on `ramdisk` with background (126 commits/s, 87 ms), and missed on `apfs`.
+- **The model's exit-criterion arithmetic still holds** (N=1 submit→provider ≤ 4·L̄ + 5 ms). On `ramdisk`, 4·2.8 + 5 = 16.2 against 12.0 measured; on `apfs`, 4·13.2 + 5 = 57.8 against 52.0. The N=16 criterion (≥ 130 commits/s and ≤ 100 ms) is met locally on `ramdisk` and `memwal` without background, narrowly missed on `ramdisk` with background (126 commits/s against ≥ 130, at 87 ms), and missed on `apfs`.
 
 ## 6. Conclusions
 
