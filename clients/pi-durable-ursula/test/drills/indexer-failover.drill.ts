@@ -1,6 +1,6 @@
-// Keyed indexer active/standby failover (node keyed-state proxy, `keyed_state.indexer_urls` in
-// failover order). The file starts its own single-node stack with two indexers on one filesystem
-// object store; it runs once, alongside the single-node filesystem suite.
+// Drill: keyed indexer active/standby failover (node keyed-state proxy, `keyed_state.indexer_urls`
+// in failover order). One node and two indexers on one object store (S3 when available, else the
+// filesystem); drills run one file at a time, so the timing is not disturbed by other stacks.
 //
 // Live bounded owners commit while the primary indexer is SIGKILLed: owners keep committing with
 // zero poison, their keyed reads (flush-waits raising E) are served by the standby, and the
@@ -10,7 +10,7 @@ import { afterAll, expect, it } from "vitest";
 import { Stack } from "../stack/cluster.ts";
 import { delta, OwnerFleet } from "../stack/fleet.ts";
 import { sleep, until } from "../stack/proc.ts";
-import { stackInfo } from "./env.ts";
+import { s3Available } from "../stack/s3.ts";
 
 interface PodMetrics {
 	readonly url: string;
@@ -49,9 +49,8 @@ async function untilECatchesUp(what: string, timeoutMs = 60_000): Promise<void> 
 	await until(what, () => (owners.every((owner, i) => (owner.storage?.localStore?.overlayFloor ?? 0) >= (targets[i] ?? 0)) ? true : undefined), timeoutMs, 100);
 }
 
-// Once per CI pass: the filesystem e2e job (its own stack runs next to the shared one).
-it.runIf(stackInfo().nodes.length === 1 && process.env.E2E_S3 !== "1")("primary indexer killed mid-run: the standby serves, D never decreases, traffic returns to the restarted primary", async () => {
-	stack = await Stack.start({ standbyIndexer: true });
+it("primary indexer killed mid-run: the standby serves, D never decreases, traffic returns to the restarted primary", async () => {
+	stack = await Stack.start({ s3: s3Available(), standbyIndexer: true });
 	await stack.createBucket("failover");
 	fleet = new OwnerFleet({
 		baseUrl: stack.url,

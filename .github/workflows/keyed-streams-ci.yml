@@ -219,8 +219,8 @@ jobs:
           cd clients/pi-durable-ursula
           E2E_NODES=3 E2E_S3=1 URSULA_BIN="$GITHUB_WORKSPACE/target/release/ursula" npm run test:e2e
 
-  drills:
-    name: M4 drills (short knobs)
+  fault-drills:
+    name: Keyed fault drills (short)
     runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 60
     env:
