@@ -625,3 +625,71 @@ async fn raft_read_path_shares_the_page_cache_that_apply_invalidates() {
     assert_eq!(read.payload, b"abcdefgh");
     engine.shutdown().await.expect("shutdown");
 }
+
+/// F13: the leader writes an external append's page entry before proposing,
+/// straight to the page store. A page that a replica cached earlier (here
+/// holding a rejected append's stale entry over the same offsets) must not
+/// keep serving the old entries once the append applies: apply drops the
+/// stream's cached pages on every replica.
+#[tokio::test]
+async fn external_append_apply_invalidates_a_cached_page_holding_a_stale_entry() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let mut engine = cold_engine(cold_store.clone()).await;
+    let stream_id = bsid("raft-external-cache");
+    engine
+        .create_stream(
+            CreateStreamRequest::new(stream_id.clone(), OCTET),
+            placement(),
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("create stream");
+    engine
+        .append(
+            append_req(&stream_id, b"ab", Some("5")),
+            placement(),
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("append with stream seq");
+    let flushed = "benchcmp/raft-external-cache/chunks/ab.bin";
+    stage(&cold_store, flushed, b"ab").await;
+    engine
+        .flush_cold(
+            FlushColdRequest {
+                cold_generation: None,
+                stream_id: stream_id.clone(),
+                chunk: chunk(0, 2, flushed),
+            },
+            placement(),
+        )
+        .await
+        .expect("flush");
+    let rejected = "benchcmp/raft-external-cache/external/rejected.bin";
+    stage(&cold_store, rejected, b"0123456789").await;
+    engine
+        .append_external(
+            append_external_req(&stream_id, rejected, 10, Some("1")),
+            placement(),
+        )
+        .await
+        .expect_err("a regressed stream seq rejects the external append");
+    // Cache the page, stale entry included, through the read path.
+    let read = engine
+        .read_stream(read_req(stream_id.clone(), 0, 2), placement())
+        .await
+        .expect("cold read");
+    assert_eq!(read.payload, b"ab");
+    let live = "benchcmp/raft-external-cache/external/live.bin";
+    stage(&cold_store, live, b"WXYZ").await;
+    engine
+        .append_external(append_external_req(&stream_id, live, 4, None), placement())
+        .await
+        .expect("append external");
+    let read = engine
+        .read_stream(read_req(stream_id, 2, 64), placement())
+        .await
+        .expect("read external");
+    assert_eq!(read.payload, b"WXYZ");
+    engine.shutdown().await.expect("shutdown");
+}

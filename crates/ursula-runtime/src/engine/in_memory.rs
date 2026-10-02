@@ -141,6 +141,7 @@ use crate::request::TidyStreamsResponse;
 use crate::request::TouchStreamAccessResponse;
 use crate::request::UpdateStreamAttrsRequest;
 use crate::request::UpdateStreamAttrsResponse;
+use crate::request::WriteHotBacklog;
 
 pub(crate) struct AppendPayloadInput<'a> {
     stream_id: BucketStreamId,
@@ -307,8 +308,16 @@ impl InMemoryGroupEngine {
             command => {
                 let stream_id = command_stream_id(&command);
                 let command_producer = command_producer(&command);
+                // Commands whose pages the leader rewrote before proposing:
+                // compaction, and external appends and creates, whose entries
+                // the leader writes straight to the page store (bounded-state
+                // F13). Every replica drops the stream's cached pages, so a
+                // page cached earlier (possibly holding a stale entry over the
+                // same offsets) is reloaded.
                 let compacted_stream_id = match &command {
-                    StreamCommand::CompactCold { stream_id, .. } => Some(stream_id.clone()),
+                    StreamCommand::CompactCold { stream_id, .. }
+                    | StreamCommand::AppendExternal { stream_id, .. }
+                    | StreamCommand::CreateExternal { stream_id, .. } => Some(stream_id.clone()),
                     _ => None,
                 };
                 // Pages an exclusive cold flush rewrote (and possibly clipped)
@@ -485,6 +494,17 @@ impl InMemoryGroupEngine {
         }))
     }
 
+    /// The stream's and the group's hot bytes after a write (F6a); a missing
+    /// or deleted stream holds none.
+    fn write_hot_backlog(&self, stream_id: Option<&BucketStreamId>) -> WriteHotBacklog {
+        WriteHotBacklog {
+            stream_hot_bytes: stream_id
+                .and_then(|stream_id| self.state_machine.hot_payload_len(stream_id).ok())
+                .unwrap_or(0),
+            group_hot_bytes: self.state_machine.total_hot_payload_bytes(),
+        }
+    }
+
     /// Lifts a [`StreamResponse`] into the matching [`GroupWriteResponse`],
     /// advancing the group commit index for every mutating outcome.
     fn group_response_from_stream(
@@ -512,6 +532,7 @@ impl InMemoryGroupEngine {
                         .state_machine
                         .record_range(&stream_id)
                         .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?,
+                    hot_backlog: Some(self.write_hot_backlog(Some(&stream_id))),
                 }))
             }
             StreamResponse::AlreadyExists {
@@ -525,6 +546,7 @@ impl InMemoryGroupEngine {
                 already_exists: true,
                 group_commit_index: self.commit_index,
                 record_range: None,
+                hot_backlog: Some(self.write_hot_backlog(stream_id.as_ref())),
             })),
             StreamResponse::Appended {
                 offset,
@@ -578,6 +600,7 @@ impl InMemoryGroupEngine {
                         snapshot_digest,
                         group_commit_index: self.commit_index,
                         record_range,
+                        hot_backlog: Some(self.write_hot_backlog(stream_id.as_ref())),
                     },
                 ))
             }
@@ -624,6 +647,7 @@ impl InMemoryGroupEngine {
                         retained_offset,
                         group_commit_index: self.commit_index,
                         record_range,
+                        hot_backlog: Some(self.write_hot_backlog(stream_id.as_ref())),
                     },
                 ))
             }
@@ -669,6 +693,7 @@ impl InMemoryGroupEngine {
                     placement,
                     hot_start_offset,
                     group_commit_index: self.commit_index,
+                    hot_backlog: Some(self.write_hot_backlog(stream_id.as_ref())),
                 }))
             }
             StreamResponse::ColdCompacted {
@@ -710,11 +735,12 @@ impl InMemoryGroupEngine {
                 }))
             }
             StreamResponse::Deleted => {
-                require_response_stream_id(stream_id, "deleted")?;
+                let stream_id = require_response_stream_id(stream_id, "deleted")?;
                 self.commit_index += 1;
                 Ok(GroupWriteResponse::DeleteStream(DeleteStreamResponse {
                     placement,
                     group_commit_index: self.commit_index,
+                    hot_backlog: Some(self.write_hot_backlog(Some(&stream_id))),
                 }))
             }
             StreamResponse::ColdGcAcked { removed } => {
@@ -2501,6 +2527,12 @@ impl GroupEngine for InMemoryGroupEngine {
                     max_batch_bytes: request.max_batch_bytes,
                     max_candidates,
                     pressure: request.pressure,
+                    max_hot_age: request
+                        .max_hot_age
+                        .map(|age| ursula_stream::ColdFlushHotAge {
+                            now_ms: crate::runtime::unix_time_ms(),
+                            max_age_ms: u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+                        }),
                 })
                 .map(|pass| pass.candidates)
                 .map_err(stream_response_error)

@@ -74,6 +74,7 @@ impl ColdGcQueue {
             not_before_ms,
             target,
             cold_generation,
+            defer_attempts: 0,
         });
     }
 
@@ -102,6 +103,7 @@ impl ColdGcQueue {
         self.next_seq = self.next_seq.saturating_add(1);
         entry.seq = new_seq;
         entry.not_before_ms = entry.not_before_ms.max(not_before_ms);
+        entry.defer_attempts = entry.defer_attempts.saturating_add(1);
         self.pending.push_back(entry);
         Some(new_seq)
     }
@@ -146,6 +148,7 @@ mod tests {
             not_before_ms: 0,
             target: ColdGcTarget::Paths(vec![path.to_owned()]),
             cold_generation: None,
+            defer_attempts: 0,
         }
     }
 
@@ -158,6 +161,16 @@ mod tests {
             .map(|entry| (entry.seq, entry.not_before_ms))
             .collect::<Vec<_>>();
         assert_eq!(order, vec![(4, 0), (5, 1_000)]);
+        assert_eq!(
+            queue.batch(2)[1].defer_attempts,
+            1,
+            "deferral counts an attempt"
+        );
+        assert_eq!(queue.defer(5, 2_000), Some(6));
+        assert_eq!(queue.batch(2)[1].defer_attempts, 2);
+        assert_eq!(queue.next_seq(), 7);
+        let mut queue = ColdGcQueue::from_parts(vec![paths_entry(3, "a"), paths_entry(4, "b")], 5);
+        assert_eq!(queue.defer(3, 1_000), Some(5));
         assert_eq!(queue.next_seq(), 6);
         // Acking the entry behind it must not pop the deferred one.
         assert_eq!(queue.ack(4), 1);
@@ -189,6 +202,7 @@ mod tests {
                 not_before_ms: 0,
                 target: ColdGcTarget::Paths(vec!["_packs/legacy.bin".to_owned()]),
                 cold_generation: None,
+                defer_attempts: 0,
             }],
             8,
         );

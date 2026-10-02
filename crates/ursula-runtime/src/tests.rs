@@ -367,6 +367,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             already_exists: false,
             group_commit_index: 1,
             record_range: None,
+            hot_backlog: Some(crate::request::WriteHotBacklog::default()),
         })
     );
 
@@ -425,6 +426,11 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             placement,
             hot_start_offset: 2,
             group_commit_index: 3,
+            // F6a: the write response carries the backlog it left.
+            hot_backlog: Some(crate::request::WriteHotBacklog {
+                stream_hot_bytes: 1,
+                group_hot_bytes: 1,
+            }),
         })
     );
 
@@ -2147,6 +2153,7 @@ async fn flush_cold_group_batch_once_publishes_multiple_chunks() {
                 max_flush_bytes: 1,
                 max_batch_bytes: 4,
                 pressure: None,
+                max_hot_age: None,
             },
             4,
         )
@@ -2233,6 +2240,7 @@ async fn packed_cold_object_survives_until_last_stream_is_deleted() {
                 max_flush_bytes: 4,
                 max_batch_bytes: 8,
                 pressure: None,
+                max_hot_age: None,
             },
             8,
         )
@@ -2317,6 +2325,7 @@ async fn cold_packs_are_bucket_scoped_erasure_domains_within_one_raft_group() {
                 max_flush_bytes: 4,
                 max_batch_bytes: 16,
                 pressure: None,
+                max_hot_age: None,
             },
             16,
         )
@@ -2426,6 +2435,7 @@ async fn node_pressure_drains_small_groups_below_the_watermark() {
         max_flush_bytes: FLUSH_SIZE,
         max_batch_bytes: FLUSH_SIZE,
         pressure: None,
+        max_hot_age: None,
     };
     assert_eq!(
         runtime
@@ -2609,6 +2619,7 @@ async fn all_stale_packed_candidates_reclaim_unpublished_object() {
                 max_flush_bytes: 4,
                 max_batch_bytes: 8,
                 pressure: None,
+                max_hot_age: None,
             },
             8,
         )
@@ -2851,6 +2862,7 @@ async fn stale_cold_flush_batch_after_delete_recreate_is_classified_for_cleanup(
                 max_flush_bytes: 18,
                 max_batch_bytes: 18,
                 pressure: None,
+                max_hot_age: None,
             },
             1,
         )
@@ -3183,6 +3195,7 @@ async fn flush_cold_group_once_selects_stream_inside_owner_group() {
             max_flush_bytes: 4,
             max_batch_bytes: 4,
             pressure: None,
+            max_hot_age: None,
         })
         .await
         .expect("flush group")
@@ -3214,6 +3227,7 @@ async fn flush_cold_all_groups_once_bounded_flushes_multiple_groups() {
                 max_flush_bytes: 4,
                 max_batch_bytes: 8,
                 pressure: None,
+                max_hot_age: None,
             },
             2,
         )
@@ -3271,6 +3285,7 @@ async fn repeated_cold_flush_keeps_hot_bytes_bounded_while_writes_continue() {
                     max_flush_bytes: 4,
                     max_batch_bytes: 4,
                     pressure: None,
+                    max_hot_age: None,
                 },
                 streams.len(),
             )
@@ -3695,6 +3710,7 @@ async fn background_cold_flush_skips_groups_that_cannot_accept_local_writes() {
                 max_flush_bytes: 1,
                 max_batch_bytes: 4,
                 pressure: None,
+                max_hot_age: None,
             },
             4,
         )
@@ -4403,6 +4419,7 @@ impl GroupEngine for RecordingEngine {
                 already_exists: false,
                 group_commit_index: self.commit_index,
                 record_range: None,
+                hot_backlog: None,
             })
         })
     }
@@ -4500,6 +4517,7 @@ impl GroupEngine for RecordingEngine {
             Ok(DeleteStreamResponse {
                 placement,
                 group_commit_index: self.commit_index,
+                hot_backlog: None,
             })
         })
     }

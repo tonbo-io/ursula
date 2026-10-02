@@ -2003,6 +2003,7 @@ fn planner_request(
         max_batch_bytes,
         max_candidates,
         pressure: None,
+        max_hot_age: None,
     }
 }
 
@@ -5131,6 +5132,7 @@ fn shared_ref_candidates_follow_threshold_idle_and_pack_occupancy() {
         now_ms: 10_000,
         max_run_bytes: 8,
         limit: 16,
+        legacy_packs_only: false,
     };
     let candidates = machine.shared_ref_candidates(&request, &mut tracker);
     assert_eq!(
@@ -5209,4 +5211,109 @@ fn shared_ref_candidates_follow_threshold_idle_and_pack_occupancy() {
     machine.apply(StreamCommand::AckColdGc { up_to_seq: last });
     let referenced = machine.group_referenced_cold_paths();
     assert!(!referenced.contains("benchcmp/_packs/00000000/busy-0.bin"));
+}
+
+/// The legacy-pack filter (#278) on F2 discovery: only slices of packs
+/// outside the stream's own `{bucket}/_packs/` count, any one makes the
+/// stream a candidate, the run covers only them, and the idle tracker is not
+/// touched.
+#[test]
+fn shared_ref_candidates_legacy_filter_selects_only_legacy_pack_slices() {
+    let mut machine = machine();
+    for id in ["legacy", "modern"] {
+        create_stream(&mut machine, id);
+    }
+    for (index, pack) in [
+        "_packs/old-0.bin",
+        "_packs/old-1.bin",
+        "benchcmp/_packs/0/new.bin",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let start = u64::try_from(index).unwrap() * 4;
+        machine.apply(append_cmd(stream("legacy"), b"abcd", Append::default()));
+        flush_shared_slice(&mut machine, "legacy", start, start + 4, pack);
+    }
+    machine.apply(append_cmd(stream("modern"), b"abcd", Append::default()));
+    flush_shared_slice(&mut machine, "modern", 0, 4, "benchcmp/_packs/0/new.bin");
+
+    let mut tracker = SharedRefIdleTracker::default();
+    let candidates = machine.shared_ref_candidates(
+        &SharedRefCompactionRequest::legacy_packs(u64::MAX, 16),
+        &mut tracker,
+    );
+    assert_eq!(candidates.len(), 1);
+    let legacy = &candidates[0];
+    assert_eq!(legacy.stream_id, stream("legacy"));
+    assert_eq!(legacy.shared_refs, 2, "only legacy slices count");
+    assert_eq!(
+        legacy
+            .run
+            .iter()
+            .map(|chunk| chunk.s3_path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["_packs/old-0.bin", "_packs/old-1.bin"]
+    );
+    assert!(
+        tracker.is_empty(),
+        "the legacy filter leaves the idle tracker alone"
+    );
+    assert!(crate::is_legacy_cross_bucket_pack(
+        &stream("legacy"),
+        &legacy.run[0]
+    ));
+}
+
+/// bounded-stream-state F10 maximum hot age: in a group below its flush
+/// threshold, a stream's small hot tail is flushed whole once it has been
+/// hot for `flush_max_hot_age`; younger tails stay hot.
+#[test]
+fn flush_planner_flushes_tails_older_than_the_max_hot_age() {
+    const AGE_MS: u64 = 300_000;
+    let mut machine = machine();
+    for name in ["old", "young"] {
+        create_stream(&mut machine, name);
+    }
+    append_all(&mut machine, "old", &[b"abcd", b"efgh"]);
+    let aged_request = |now_ms: u64| {
+        let mut request = planner_request(1 << 20, 1 << 20, 1 << 20, usize::MAX);
+        request.max_hot_age = Some(ColdFlushHotAge {
+            now_ms,
+            max_age_ms: AGE_MS,
+        });
+        request
+    };
+    // Without the age the group (8 B) is far below its 1 MiB threshold.
+    let pass = machine
+        .plan_cold_flush_pass(planner_request(1 << 20, 1 << 20, 1 << 20, usize::MAX))
+        .expect("plan pass");
+    assert!(pass.candidates.is_empty());
+    let pass = machine
+        .plan_cold_flush_pass(aged_request(1_000))
+        .expect("plan pass");
+    assert!(pass.candidates.is_empty(), "nothing is old yet");
+    append_all(&mut machine, "young", &[b"ij"]);
+    let pass = machine
+        .plan_cold_flush_pass(aged_request(1_000 + AGE_MS / 2))
+        .expect("plan pass");
+    assert!(pass.candidates.is_empty());
+
+    let pass = machine
+        .plan_cold_flush_pass(aged_request(1_000 + AGE_MS))
+        .expect("plan pass");
+    assert_eq!(pass.candidates.len(), 1);
+    let candidate = &pass.candidates[0];
+    assert_eq!(candidate.stream_id, stream("old"));
+    assert_eq!((candidate.start_offset, candidate.end_offset), (0, 8));
+    apply_flush_pass(&mut machine, &pass, 0);
+    assert_eq!(machine.hot_payload_len(&stream("old")).expect("hot"), 0);
+    assert_eq!(machine.hot_payload_len(&stream("young")).expect("hot"), 2);
+
+    // `young` was first seen hot at AGE/2 + 1s and ages out on its own clock.
+    let pass = machine
+        .plan_cold_flush_pass(aged_request(1_000 + AGE_MS / 2 + AGE_MS))
+        .expect("plan pass");
+    assert_eq!(pass.candidates.len(), 1);
+    assert_eq!(pass.candidates[0].stream_id, stream("young"));
 }

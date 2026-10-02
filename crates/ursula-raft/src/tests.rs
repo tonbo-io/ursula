@@ -487,6 +487,7 @@ fn raft_group_write_response_round_trips_through_wire_codec() {
         already_exists: false,
         group_commit_index: 11,
         record_range: None,
+        hot_backlog: None,
     });
 
     let encoded = encode_wire(&response);

@@ -196,6 +196,9 @@ message ColdGcEntryV1 {
   // enqueued at feature level 1 or later (bounded-state F14g). Absent marks
   // a legacy entry.
   optional uint64 cold_generation = 6;
+  // Failed attempts the leader's GC worker deferred (DeferColdGc, F14b,
+  // feature level 1); it backs off exponentially in it.
+  uint32 defer_attempts = 7;
 }
 
 message ColdGcPathsV1 {

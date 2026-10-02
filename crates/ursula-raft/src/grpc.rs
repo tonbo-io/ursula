@@ -647,16 +647,20 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 placement,
                 metrics: None,
                 cold_store: self.cold_store.clone(),
-                // A request-scoped cache: forwarded reads load pages fresh, so
-                // they never serve entries a leader-side clip or repair
-                // removed (bounded-state F19 follow-up). Sharing the group's
-                // cache is F13's remaining step.
-                cold_index_cache: self.cold_store.as_ref().map(|cold_store| {
-                    Arc::new(ColdIndexPageCache::new(
-                        Arc::new(ColdStoreColdIndexPageStore::new(cold_store.clone())),
-                        1024,
-                    ))
-                }),
+                // The group's shared page cache (bounded-state F13), which
+                // apply-time invalidation reaches; a request-scoped cache only
+                // when none was registered.
+                cold_index_cache: self
+                    .registry
+                    .cold_index_cache(placement.raft_group_id)
+                    .or_else(|| {
+                        self.cold_store.as_ref().map(|cold_store| {
+                            Arc::new(ColdIndexPageCache::new(
+                                Arc::new(ColdStoreColdIndexPageStore::new(cold_store.clone())),
+                                1024,
+                            ))
+                        })
+                    }),
             };
             let stream_id = match request.affinity_key {
                 Some(affinity_key) => BucketStreamId::with_affinity(

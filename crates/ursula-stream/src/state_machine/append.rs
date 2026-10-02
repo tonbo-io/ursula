@@ -115,6 +115,14 @@ impl StreamStateMachine {
         }
 
         let hot_payload_bytes = self.hot_payload_bytes;
+        let enforce_now_ms = commands
+            .iter()
+            .filter_map(|command| match command {
+                StreamCommand::Append { now_ms, .. } => Some(*now_ms),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
         let mut responses = Vec::with_capacity(commands.len());
         for command in commands {
             let StreamCommand::Append {
@@ -150,7 +158,7 @@ impl StreamStateMachine {
         // applied, so a failed transaction evicts nothing.
         for (stream_id, undo) in &stream_undo {
             if !undo.producers.is_empty() {
-                self.enforce_producer_window(stream_id);
+                self.enforce_producer_window(stream_id, enforce_now_ms);
             }
         }
         Ok(responses)
@@ -207,9 +215,10 @@ impl StreamStateMachine {
     /// Applies one append, then enforces the F3 receipt window once.
     pub fn append_borrowed(&mut self, input: AppendStreamInput<'_>) -> StreamResponse {
         let enforce_on = input.producer.as_ref().map(|_| input.stream_id.clone());
+        let now_ms = input.now_ms;
         let response = self.append_borrowed_unenforced(input);
         if let Some(stream_id) = enforce_on {
-            self.enforce_producer_window(&stream_id);
+            self.enforce_producer_window(&stream_id, now_ms);
         }
         response
     }
@@ -472,9 +481,10 @@ impl StreamStateMachine {
 
     pub(super) fn append_external(&mut self, input: AppendExternalInput<'_>) -> StreamResponse {
         let enforce_on = input.producer.as_ref().map(|_| input.stream_id.clone());
+        let now_ms = input.now_ms;
         let response = self.append_external_unenforced(input);
         if let Some(stream_id) = enforce_on {
-            self.enforce_producer_window(&stream_id);
+            self.enforce_producer_window(&stream_id, now_ms);
         }
         response
     }
@@ -713,7 +723,7 @@ impl StreamStateMachine {
             now_ms,
         );
         if enforce {
-            self.enforce_producer_window(&enforce_on);
+            self.enforce_producer_window(&enforce_on, now_ms);
         }
         response
     }
@@ -1047,6 +1057,20 @@ impl StreamStateMachine {
             .filter(|state| !(bounded && super::producers::producer_is_idle(state, now_ms)));
         let Some(state) = state else {
             if producer.producer_seq == 0 {
+                // F3 producer cap: a new producer needs room, either below
+                // the cap or by evicting producers idle for an hour.
+                if bounded
+                    && let Some(slot) = self.stream_slot(stream_id)
+                    && !slot.producer_cap_admits(&producer.producer_id, now_ms)
+                {
+                    return Err(StreamResponse::error(
+                        StreamErrorCode::ProducerLimit,
+                        format!(
+                            "producer_limit: stream '{stream_id}' already has {} producers active within the last hour",
+                            super::producers::MAX_PRODUCERS_PER_STREAM
+                        ),
+                    ));
+                }
                 return Ok(ProducerDecision::Accept);
             }
             return Err(StreamResponse::error_with_context(

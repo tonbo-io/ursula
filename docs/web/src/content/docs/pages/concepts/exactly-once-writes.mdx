@@ -28,7 +28,7 @@ When a producer crashes and restarts, **bump `Producer-Epoch`**. Otherwise the s
 
 Dedup state is scoped per stream. The same `Producer-Id` writing to two different streams maintains two independent epoch/seq counters, so you do not have to elect a single global writer per producer.
 
-The server retains exact receipts for the current epoch per `(producer_id, stream)` pair, bounded by the stream's receipt window. Older epochs and their receipts are dropped once a higher epoch is observed. A producer that has not written to a stream for 7 days is forgotten: its next append must start at sequence `0` (a later sequence gets `409`), so bump the epoch or restart the sequence after long pauses.
+The server retains exact receipts for the current epoch per `(producer_id, stream)` pair, bounded by the stream's receipt window. Older epochs and their receipts are dropped once a higher epoch is observed. A producer that has not written to a stream for 7 days is forgotten: its next append must start at sequence `0` (a later sequence gets `409`), so bump the epoch or restart the sequence after long pauses. A stream holds at most 4,096 producers: a new producer beyond that replaces the least recently seen producer idle for at least an hour, and when none has been idle that long its append is rejected with `429` and a `producer_limit` body.
 
 ## When you don't need this
 

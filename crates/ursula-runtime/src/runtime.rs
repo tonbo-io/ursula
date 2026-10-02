@@ -123,15 +123,21 @@ mod shared_ref_compaction;
 
 pub use orphan_sweep::COLD_ORPHAN_SWEEP_GRACE_MS;
 
-/// Backoff before the cold GC retries an entry it deferred after a failure
-/// (bounded-state F14b, feature level 1).
+/// Backoff before the cold GC retries an entry it deferred after its first
+/// failure (bounded-state F14b, feature level 1). Each further deferral
+/// doubles it, up to [`COLD_GC_DEFER_MAX_BACKOFF_MS`].
 pub const COLD_GC_DEFER_BACKOFF_MS: u64 = 60_000;
 
-fn is_legacy_cross_bucket_pack(stream_id: &BucketStreamId, chunk: &ColdChunkRef) -> bool {
-    chunk.shared_object
-        && !chunk
-            .s3_path
-            .starts_with(&format!("{}/_packs/", stream_id.bucket_id))
+/// Longest backoff between retries of a failing cold GC entry (one hour).
+pub const COLD_GC_DEFER_MAX_BACKOFF_MS: u64 = 60 * 60 * 1_000;
+
+/// Backoff for an entry that has already been deferred `attempts` times:
+/// 1 min, 2 min, 4 min, ... capped at one hour.
+pub fn cold_gc_defer_backoff_ms(attempts: u32) -> u64 {
+    COLD_GC_DEFER_BACKOFF_MS
+        .checked_shl(attempts.min(32))
+        .unwrap_or(u64::MAX)
+        .min(COLD_GC_DEFER_MAX_BACKOFF_MS)
 }
 
 #[derive(Debug, Clone)]
@@ -1100,100 +1106,6 @@ impl ShardRuntime {
         Ok(compacted)
     }
 
-    /// Rewrites a bounded number of pre-erasure-domain shared pack slices as
-    /// stream-exclusive objects. Each replacement is published through the
-    /// same group mutation and cold-index rollback contract as compaction.
-    pub async fn migrate_legacy_shared_cold_once(
-        &self,
-        max_chunks: usize,
-        gc_grace_ms: u64,
-    ) -> Result<LegacySharedMigrationReport, RuntimeError> {
-        let Some(cold_store) = self.cold_store.as_ref() else {
-            return Ok(LegacySharedMigrationReport::default());
-        };
-        let mut candidates = Vec::new();
-        for group_id in 0..self.shard_map.raft_group_count() {
-            let snapshot = self.snapshot_group(RaftGroupId(group_id)).await?;
-            for stream in snapshot.stream_snapshot.streams {
-                let stream_id = stream.metadata.stream_id;
-                for chunk in stream.cold_chunks {
-                    if is_legacy_cross_bucket_pack(&stream_id, &chunk) {
-                        candidates.push((stream_id.clone(), stream.cold_index_generation, chunk));
-                    }
-                }
-            }
-        }
-        candidates.sort_by(|left, right| {
-            left.0
-                .bucket_id
-                .cmp(&right.0.bucket_id)
-                .then_with(|| left.0.affinity_key.cmp(&right.0.affinity_key))
-                .then_with(|| left.0.stream_id.cmp(&right.0.stream_id))
-                .then_with(|| left.2.start_offset.cmp(&right.2.start_offset))
-        });
-
-        let observed_chunks = candidates.len();
-        let mut migrated_chunks = 0usize;
-        for (stream_id, generation, chunk) in candidates.into_iter().take(max_chunks) {
-            let logical_bytes = chunk.end_offset.saturating_sub(chunk.start_offset);
-            let len = usize::try_from(logical_bytes).map_err(|_| RuntimeError::ColdStoreIo {
-                message: "legacy shared chunk exceeds addressable memory".to_owned(),
-            })?;
-            let payload = cold_store
-                .read_chunk_range(&chunk, chunk.start_offset, len)
-                .await
-                .map_err(|err| RuntimeError::ColdStoreIo {
-                    message: err.to_string(),
-                })?;
-            let path = new_cold_chunk_path_in_generation(
-                &stream_id,
-                generation,
-                chunk.start_offset,
-                chunk.end_offset,
-            );
-            let object_size = cold_store
-                .write_chunk(&path, &payload)
-                .await
-                .map_err(|err| RuntimeError::ColdStoreIo {
-                    message: err.to_string(),
-                })?;
-            let replacement = ColdChunkRef {
-                start_offset: chunk.start_offset,
-                end_offset: chunk.end_offset,
-                object_size,
-                s3_path: path.clone(),
-                object_offset: 0,
-                shared_object: false,
-                payload_digest: blake3::hash(&payload).to_hex().to_string(),
-            };
-            if let Err(err) = self
-                .compact_cold(CompactColdRequest {
-                    stream_id: stream_id.clone(),
-                    old_chunks: vec![chunk],
-                    replacement,
-                    gc_not_before_ms: unix_time_ms().saturating_add(gc_grace_ms),
-                })
-                .await
-            {
-                if let Err(cleanup_err) = cold_store.delete_chunk(&path).await {
-                    tracing::warn!(
-                        stream = %stream_id,
-                        path,
-                        error = %cleanup_err,
-                        "failed to remove unpublished legacy pack replacement"
-                    );
-                }
-                return Err(err);
-            }
-            migrated_chunks = migrated_chunks.saturating_add(1);
-        }
-        Ok(LegacySharedMigrationReport {
-            observed_chunks,
-            migrated_chunks,
-            pending_chunks: observed_chunks.saturating_sub(migrated_chunks),
-        })
-    }
-
     /// Drains the leader-side cold-GC queue for one group: physically reclaims
     /// each queued target from cold storage, then replicates an ack that pops
     /// the reclaimed entries. Deletions are idempotent, so a crash or leader
@@ -1272,7 +1184,8 @@ impl ShardRuntime {
                         message: err.to_string(),
                     };
                     if defer_failures {
-                        let not_before_ms = unix_time_ms().saturating_add(COLD_GC_DEFER_BACKOFF_MS);
+                        let not_before_ms = unix_time_ms()
+                            .saturating_add(cold_gc_defer_backoff_ms(entry.defer_attempts));
                         match self
                             .defer_cold_gc(raft_group_id, entry.seq, not_before_ms)
                             .await

@@ -156,6 +156,9 @@ pub enum StreamErrorCode {
     /// The command needs a higher group feature level than the group holds.
     /// Deterministic: every replica rejects it the same way.
     FeatureNotEnabled,
+    /// A new producer would exceed the stream's producer cap and no producer
+    /// has been idle long enough to evict (F3, feature level 1).
+    ProducerLimit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

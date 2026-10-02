@@ -6,6 +6,7 @@
 
 use super::ColdChunkRef;
 use super::ObjectPayloadRef;
+use super::hot_buffer::shrink_vec_if_slack;
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct StreamColdState {
@@ -96,6 +97,9 @@ impl StreamColdState {
         });
         self.external_segments
             .retain(|object| object.end_offset > retained_offset);
+        // F7: return the capacity retention freed.
+        shrink_vec_if_slack(&mut self.cold_chunks);
+        shrink_vec_if_slack(&mut self.external_segments);
         dropped_cold_paths
     }
 
@@ -110,7 +114,17 @@ impl StreamColdState {
         let before = self.cold_chunks.len();
         self.cold_chunks
             .retain(|chunk| !old_chunks.iter().any(|old| old == chunk));
+        // F7: compaction removes up to a whole run of refs at once.
+        shrink_vec_if_slack(&mut self.cold_chunks);
         before.saturating_sub(self.cold_chunks.len()) == old_chunks.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn ref_capacities(&self) -> (usize, usize) {
+        (
+            self.cold_chunks.capacity(),
+            self.external_segments.capacity(),
+        )
     }
 
     pub(super) fn cold_frontier_offset(&self, retained_offset: u64) -> u64 {

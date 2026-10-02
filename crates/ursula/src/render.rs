@@ -121,6 +121,8 @@ pub(crate) fn stream_error_code_status(code: StreamErrorCode) -> StatusCode {
         // Retry-After accompanies them; 429 still tells the client which
         // class of rejection this is versus 503 backpressure.
         StreamErrorCode::QuotaExceeded => StatusCode::TOO_MANY_REQUESTS,
+        // F3 producer cap; the plain-text body starts with `producer_limit`.
+        StreamErrorCode::ProducerLimit => StatusCode::TOO_MANY_REQUESTS,
     }
 }
 

@@ -565,3 +565,57 @@ fn flush_cold_generation_is_not_checked_at_level_zero() {
         StreamResponse::ColdFlushed { .. }
     ));
 }
+
+/// A group raised from level 0 can hold a legacy collapsed message record
+/// that starts at the retained offset, which is also the seal point, and
+/// folds a hot message and an external into one record. At Lb1 bootstrap
+/// must not return it as one part (never more than one message per part):
+/// it answers the honest partial instead.
+#[test]
+fn bootstrap_after_a_raise_does_not_return_a_legacy_collapsed_record_as_one_part() {
+    let mut machine = machine_at(0);
+    create(&mut machine, "raised", 1);
+    append(&mut machine, "raised", b"ab");
+    append(&mut machine, "raised", b"cd");
+    append_external(&mut machine, "raised", "lb1/external/r.bin", 3);
+    assert!(matches!(
+        publish_snapshot(&mut machine, "raised", 2),
+        StreamResponse::SnapshotPublished { .. }
+    ));
+    assert!(matches!(
+        retain(&mut machine, "raised", 2, 0),
+        StreamResponse::RetentionAdvanced { .. }
+    ));
+    // Level 0 collapsed `[2, 7)`: the hot `cd` and the external.
+    let records = &machine
+        .stream_slot(&stream("raised"))
+        .expect("slot")
+        .message_records;
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (record.start_offset, record.end_offset))
+            .collect::<Vec<_>>(),
+        vec![(2, 7)]
+    );
+    assert!(matches!(
+        machine.apply(StreamCommand::SetFeatureLevel { level: 1 }),
+        StreamResponse::FeatureLevelSet { .. }
+    ));
+    assert_eq!(machine.seal_point(&stream("raised")), 2);
+    let plan = machine
+        .bootstrap_plan(&stream("raised"))
+        .expect("bootstrap plan");
+    assert!(plan.updates.is_empty(), "{plan:?}");
+    assert!(!plan.up_to_date);
+    assert_eq!(plan.next_offset, 2);
+
+    // A whole hot message at the seal point stays a complete bootstrap.
+    let mut fresh = machine_at(1);
+    create(&mut fresh, "fresh", 1);
+    append(&mut fresh, "fresh", b"ab");
+    append(&mut fresh, "fresh", b"cd");
+    let plan = fresh.bootstrap_plan(&stream("fresh")).expect("plan");
+    assert!(plan.up_to_date);
+    assert_eq!(plan.updates.len(), 2);
+}

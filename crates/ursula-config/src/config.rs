@@ -319,6 +319,11 @@ pub struct ColdConfig {
     /// Upper bound on bytes flushed per group per pass.
     /// Falls back to [`flush_size`](Self::flush_size) when unset.
     pub flush_max_size: Option<HumanSize>,
+    /// Maximum hot age: a stream's hot tail older than this is flushed even
+    /// when its group is below the flush threshold, which bounds how long a
+    /// quiet stream's records stay hot (bounded-stream-state F10). `0`
+    /// disables it.
+    pub flush_max_hot_age: HumanDuration,
     /// Max groups flushed concurrently.
     pub flush_max_concurrency: usize,
     /// Enable background cold compaction: the same-stream chunk compactor
@@ -375,6 +380,7 @@ impl Default for ColdConfig {
             flush_min_hot_size: None,
             flush_pressure_hot_size: HumanSize::mib(128),
             flush_max_size: None,
+            flush_max_hot_age: HumanDuration::min(5),
             flush_max_concurrency: 4,
             compaction_enabled: false,
             compaction_interval: HumanDuration::sec(30),

@@ -90,6 +90,11 @@ impl HotBuffer {
         self.chunks.front().map(|chunk| chunk.start_offset)
     }
 
+    /// End of the first hot append (chunk), if any.
+    pub(super) fn first_end_offset(&self) -> Option<u64> {
+        self.chunks.front().map(|chunk| chunk.end_offset)
+    }
+
     pub(super) fn payload(&self) -> Vec<u8> {
         let mut payload = Vec::with_capacity(self.len());
         for chunk in &self.chunks {

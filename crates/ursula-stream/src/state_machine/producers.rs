@@ -17,6 +17,10 @@
 //!   [`PRODUCER_IDLE_EXPIRY_MS`] old (by the persisted `last_seen_ms` and the
 //!   command's `now_ms`) is treated as absent at its own next write and
 //!   removed then; `TidyStream` removes idle producers in bulk.
+//! - **Producer cap.** A stream holds at most [`MAX_PRODUCERS_PER_STREAM`]
+//!   producers. A new producer beyond it evicts the least recently seen
+//!   producers idle for at least an hour, at the enforcement point; when none
+//!   is idle that long the write fails with `ProducerLimit` (`429`).
 //! - **`TidyStream`.** Converges one stream in bounded steps: message-record
 //!   collapse below the seal point (F4a), idle-producer stamping and expiry,
 //!   receipt trimming and dropping the level-0 `last_items` copy.
@@ -40,6 +44,13 @@ pub const PRODUCER_IDLE_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 /// Receipts one command may evict from one stream (F3 bounded catch-up).
 pub const RECEIPT_TRIM_BUDGET: usize = 65_536;
 
+/// Producers a stream holds at most (F3 producer cap).
+pub const MAX_PRODUCERS_PER_STREAM: usize = 4_096;
+
+/// A producer idle this long may be evicted to admit a new producer once the
+/// stream holds [`MAX_PRODUCERS_PER_STREAM`] (F3 producer cap).
+pub const PRODUCER_CAP_EVICT_IDLE_MS: u64 = 60 * 60 * 1_000;
+
 /// Producers one `TidyStream` may stamp, expire or strip of `last_items`.
 pub const TIDY_PRODUCER_BUDGET: usize = 4_096;
 
@@ -55,6 +66,15 @@ pub(super) fn producer_is_idle(state: &ProducerState, now_ms: u64) -> bool {
     state
         .last_seen_ms
         .is_some_and(|seen| now_ms.saturating_sub(seen) >= PRODUCER_IDLE_EXPIRY_MS)
+}
+
+/// Whether the producer cap may evict `state` at `now_ms`: idle for at least
+/// [`PRODUCER_CAP_EVICT_IDLE_MS`]. Unstamped producers (written below level 1)
+/// are never evicted by the cap.
+fn producer_cap_evictable(state: &ProducerState, now_ms: u64) -> bool {
+    state
+        .last_seen_ms
+        .is_some_and(|seen| now_ms.saturating_sub(seen) >= PRODUCER_CAP_EVICT_IDLE_MS)
 }
 
 /// Derived per-stream receipt window: the total receipt items held and, for
@@ -162,6 +182,44 @@ impl StreamSlot {
         Some(state)
     }
 
+    /// Whether a write by `producer_id` at `now_ms` fits the producer cap: the
+    /// producer exists already, the stream is below the cap, or enough
+    /// producers are idle for an hour to make room after the command.
+    pub(super) fn producer_cap_admits(&self, producer_id: &str, now_ms: u64) -> bool {
+        if self.producers.len() < MAX_PRODUCERS_PER_STREAM
+            || self.producers.contains_key(producer_id)
+        {
+            return true;
+        }
+        let active = self
+            .producers
+            .values()
+            .filter(|state| !producer_cap_evictable(state, now_ms))
+            .count();
+        active < MAX_PRODUCERS_PER_STREAM
+    }
+
+    /// Evicts least recently seen producers idle for an hour, oldest
+    /// `(last_seen_ms, producer_id)` first, until the stream holds at most
+    /// [`MAX_PRODUCERS_PER_STREAM`]. O(P) per eviction, and it runs only while
+    /// the stream is over the cap.
+    pub(super) fn evict_producers_over_cap(&mut self, now_ms: u64) {
+        while self.producers.len() > MAX_PRODUCERS_PER_STREAM {
+            let Some(victim) = self
+                .producers
+                .iter()
+                .filter(|(_, state)| producer_cap_evictable(state, now_ms))
+                .min_by(|left, right| {
+                    (left.1.last_seen_ms, left.0).cmp(&(right.1.last_seen_ms, right.0))
+                })
+                .map(|(producer_id, _)| producer_id.clone())
+            else {
+                return;
+            };
+            self.remove_producer(&victim);
+        }
+    }
+
     /// Whether the window has evictable excess.
     fn receipt_window_over(&self) -> bool {
         self.receipt_window.items > RECEIPT_WINDOW_ITEMS
@@ -175,12 +233,14 @@ impl StreamStateMachine {
         self.feature_level >= crate::feature::FEATURE_LEVEL_KEYED_STREAMS
     }
 
-    /// F3 enforcement point, run once per command after it fully applied.
-    pub(super) fn enforce_producer_window(&mut self, stream_id: &BucketStreamId) {
+    /// F3 enforcement point, run once per command after it fully applied:
+    /// the producer cap, then the receipt window.
+    pub(super) fn enforce_producer_window(&mut self, stream_id: &BucketStreamId, now_ms: u64) {
         if !self.producer_bounds_enabled() {
             return;
         }
         if let Some(slot) = self.stream_slot_mut(stream_id) {
+            slot.evict_producers_over_cap(now_ms);
             slot.trim_receipt_window(RECEIPT_TRIM_BUDGET);
         }
     }

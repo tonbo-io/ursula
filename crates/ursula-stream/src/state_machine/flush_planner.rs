@@ -11,6 +11,14 @@
 //! - **Node pressure**: the group drains, largest first, its proportional
 //!   share of the node's excess over the pressure target.
 //!
+//! - **Maximum hot age**: with `max_hot_age`, a stream whose hot tail has
+//!   been hot for at least the age is flushed whole, ahead of the others and
+//!   even when the group is below its threshold, so quiet streams do not keep
+//!   small tails hot forever. The age is observed leader-locally: a pass
+//!   records when it first saw a stream's current first hot offset (a flush
+//!   that moves it restarts the clock), so a tail stays hot at most about
+//!   twice the age plus one pass interval.
+//!
 //! Streams of equal hot size are ordered starting after a leader-local
 //! rotation cursor (the last stream planned by the previous pass), so many
 //! equally slow streams take turns. Every candidate gets at most the
@@ -20,6 +28,7 @@
 //! hot buffers.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 use super::BucketStreamId;
@@ -36,6 +45,9 @@ pub(super) struct FlushPlannerState {
     /// The stream that produced the last candidate of the previous pass;
     /// among equally large streams the next pass starts after it.
     cursor: Option<BucketStreamId>,
+    /// Leader-local hot age: per hot stream, its first hot offset and when a
+    /// pass first observed it there. Entries leave with the hot index.
+    hot_since: HashMap<BucketStreamId, (u64, u64)>,
 }
 
 impl FlushPlannerState {
@@ -47,7 +59,17 @@ impl FlushPlannerState {
 
     pub(super) fn unmark_hot(&mut self, stream_id: &BucketStreamId) {
         self.hot_streams.remove(stream_id);
+        self.hot_since.remove(stream_id);
     }
+}
+
+/// The maximum hot age for one pass (`flush_max_hot_age`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColdFlushHotAge {
+    /// Leader wall clock for this pass.
+    pub now_ms: u64,
+    /// A hot tail at least this old is flushed whole.
+    pub max_age_ms: u64,
 }
 
 /// Node-level flush pressure, shared by every group of the node in one pass.
@@ -85,6 +107,8 @@ pub struct ColdFlushPassRequest {
     pub max_batch_bytes: usize,
     pub max_candidates: usize,
     pub pressure: Option<ColdFlushPressure>,
+    /// Flush hot tails older than this, even below the group threshold.
+    pub max_hot_age: Option<ColdFlushHotAge>,
 }
 
 /// Deterministic planner work counters for one pass.
@@ -120,6 +144,8 @@ enum PassMode {
     GroupDrain,
     /// Stop once this many bytes are planned.
     Pressure(u64),
+    /// The group is below its threshold: flush only aged streams.
+    AgedOnly,
 }
 
 /// Equal-size tie order: streams after the cursor first, then planner order.
@@ -142,12 +168,52 @@ impl StreamStateMachine {
         &mut self,
         request: ColdFlushPassRequest,
     ) -> Result<ColdFlushPass, StreamResponse> {
+        if let Some(age) = request.max_hot_age {
+            self.observe_hot_ages(age.now_ms);
+        }
         let cursor = self.flush_planner.cursor.clone();
         let (pass, next_cursor) = self.plan_cold_flush_pass_from(request, cursor.as_ref())?;
         if next_cursor.is_some() {
             self.flush_planner.cursor = next_cursor;
         }
         Ok(pass)
+    }
+
+    /// Records, for every hot stream, when a pass first saw its current first
+    /// hot offset. O(hot streams).
+    fn observe_hot_ages(&mut self, now_ms: u64) {
+        let observed = self
+            .flush_planner
+            .hot_streams
+            .iter()
+            .filter_map(|stream_id| {
+                let start = self
+                    .stream_slot(stream_id)?
+                    .hot_buffer
+                    .first_start_offset()?;
+                Some((stream_id.clone(), start))
+            })
+            .collect::<Vec<_>>();
+        for (stream_id, start) in observed {
+            let entry = self
+                .flush_planner
+                .hot_since
+                .entry(stream_id)
+                .or_insert((start, now_ms));
+            if entry.0 != start {
+                *entry = (start, now_ms);
+            }
+        }
+    }
+
+    /// Whether `stream_id`'s hot tail has reached the pass's maximum age.
+    fn hot_tail_aged(&self, stream_id: &BucketStreamId, age: Option<ColdFlushHotAge>) -> bool {
+        age.is_some_and(|age| {
+            self.flush_planner
+                .hot_since
+                .get(stream_id)
+                .is_some_and(|(_, since)| age.now_ms.saturating_sub(*since) >= age.max_age_ms)
+        })
     }
 
     /// Plans one pass without touching the cursor. The candidates are a
@@ -170,6 +236,8 @@ impl StreamStateMachine {
         let mode = match request.pressure {
             Some(pressure) => PassMode::Pressure(pressure.group_drain_bytes(group_hot_bytes)),
             None if group_hot_bytes >= min_hot_bytes => PassMode::GroupDrain,
+            // Below the threshold only aged tails flush (maximum hot age).
+            None if request.max_hot_age.is_some() => PassMode::AgedOnly,
             // No stream can hold `min_hot_bytes` while its group holds less.
             None => return Ok((ColdFlushPass { candidates, stats }, None)),
         };
@@ -182,14 +250,20 @@ impl StreamStateMachine {
             };
             let hot_len = slot.hot_buffer.len();
             if hot_len > 0 {
-                hot.push((stream_id, hot_len));
+                let aged = self.hot_tail_aged(stream_id, request.max_hot_age);
+                hot.push((stream_id, hot_len, aged));
             }
         }
+        if mode == PassMode::AgedOnly && !hot.iter().any(|(_, _, aged)| *aged) {
+            return Ok((ColdFlushPass { candidates, stats }, None));
+        }
         stats.sorts += 1;
+        // Aged tails first, then largest first.
         hot.sort_by(|left, right| {
             right
-                .1
-                .cmp(&left.1)
+                .2
+                .cmp(&left.2)
+                .then_with(|| right.1.cmp(&left.1))
                 .then_with(|| rotated_order(left.0, right.0, cursor))
         });
 
@@ -204,15 +278,17 @@ impl StreamStateMachine {
                     < min_hot_bytes
             }
             PassMode::Pressure(target) => planned_total >= target,
+            PassMode::AgedOnly => true,
         };
-        'streams: for (stream_id, hot_len) in hot {
+        'streams: for (stream_id, hot_len, aged) in hot {
             let mut start = self.hot_start_offset(stream_id);
             let mut planned_for_stream = 0usize;
             loop {
                 if candidates.len() >= request.max_candidates || budget == 0 {
                     break 'streams;
                 }
-                if drained(planned_total) {
+                // Aged tails flush whole; the others stop once drained.
+                if !aged && drained(planned_total) {
                     break 'streams;
                 }
                 let remaining = hot_len.saturating_sub(planned_for_stream);
