@@ -4516,6 +4516,7 @@ dependencies = [
  "tracing",
  "url",
  "ursula-observability",
+ "ursula-shard",
 ]
 
 [[package]]

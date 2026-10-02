@@ -323,8 +323,11 @@ pub enum PublishOutcome {
 
 /// Percent-encodes a stream's local name as one path component
 /// (`%` → `%25`, `/` → `%2F`).
+///
+/// Shared with the node's stream-delete GC and bucket purge
+/// (`ursula_shard::keyed_namespace`), so both name the same objects.
 pub fn encode_stream_component(key: &str) -> String {
-    key.replace('%', "%25").replace('/', "%2F")
+    ursula_shard::keyed_namespace::encode_key_component(key)
 }
 
 /// `.keyed/{bucket}/{key}/{c:016x}/v{fmt}/`.
@@ -550,6 +553,20 @@ mod tests {
             namespace_prefix(&source(), 1),
             ".keyed/b/a%2Fs%251/0000000000001234/v1/"
         );
+    }
+
+    /// The node's stream-delete GC removes `keyed_incarnation_prefix` as a
+    /// prefix; every namespace this engine writes must sit under it.
+    #[test]
+    fn namespace_prefix_sits_under_the_node_gc_prefix() {
+        let source = source();
+        let stream = ursula_shard::BucketStreamId::new(source.bucket.clone(), source.key.clone());
+        let gc =
+            ursula_shard::keyed_namespace::keyed_incarnation_prefix(&stream, source.incarnation);
+        assert!(ursula_shard::keyed_namespace::is_keyed_incarnation_prefix(
+            &gc
+        ));
+        assert!(namespace_prefix(&source, 1).starts_with(&gc), "{gc}");
     }
 
     #[tokio::test]

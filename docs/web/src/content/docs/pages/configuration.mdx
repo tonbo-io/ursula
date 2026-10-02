@@ -114,7 +114,8 @@ Helm and the EC2 scripts map their deployment inputs onto these same keys, so th
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `keyed_state.indexer_urls` | `[]` | Base URL of every keyed-state indexer pod. Bucket purge sends `POST {url}/v1/keyed/drain` to each one and erases `.keyed/{bucket}/` only after all acknowledge |
+| `server.keyed_state_upstream` | unset | Base URL of the keyed-state indexer (`ursula indexer --keyed-source-url …`) behind `{stream}/keyed-state`. Unset: `keyed-state` answers `404` and nothing advertises `keyed-state-v1`. CLI: `ursula server --keyed-state-upstream <url>` |
+| `keyed_state.indexer_urls` | `[]` | Base URL of every keyed-state indexer pod. Bucket purge sends `POST {url}/v1/keyed/drain` to each one and erases `.keyed/{bucket}/` only after all acknowledge. Empty with `server.keyed_state_upstream` set: purge drains the upstream |
 | `keyed_state.drain_timeout` | `60s` | Per-indexer timeout of one drain request; a pod that does not acknowledge leaves the purge incomplete, and the idempotent purge is retried |
 
 ## Complete examples

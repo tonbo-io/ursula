@@ -305,6 +305,7 @@ tokio_console = false
 # ------------------------------------------------------------------------------
 [keyed_state]
 # Base URL of every keyed-state indexer pod. Bucket purge drains each one
-# (POST {url}/v1/keyed/drain) before erasing .keyed/{bucket}/.
+# (POST {url}/v1/keyed/drain) before erasing .keyed/{bucket}/. Empty with
+# server.keyed_state_upstream set: purge drains that upstream.
 indexer_urls = []
 drain_timeout = "60s"
