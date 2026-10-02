@@ -27,6 +27,7 @@ use ursula_shard::BucketStreamId;
 
 use self::cold_gc::ColdGcQueue;
 use self::cold_state::StreamColdState;
+pub use self::gauges::GroupStateGauges;
 use self::hot_buffer::HotBuffer;
 use self::registry::StreamRegistry;
 use self::ttl::TtlEntry;
@@ -82,6 +83,7 @@ mod append;
 mod cold;
 mod cold_gc;
 mod cold_state;
+mod gauges;
 mod hot_buffer;
 mod lifecycle;
 mod persist;
