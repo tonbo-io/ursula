@@ -3,6 +3,8 @@ import type { StorageWrite } from "@earendil-works/pi-durable";
 import { expect, it } from "vitest";
 import { K } from "../src/families.ts";
 import { encodeRecord } from "../src/keyed-batch.ts";
+import { H } from "../src/protocol.ts";
+import type { LogTransport } from "../src/transport.ts";
 import { b64 } from "../src/tuple.ts";
 import { ctx, FakeUrsula, freshPath, openOn } from "./helpers.ts";
 
@@ -54,3 +56,39 @@ it("a fence open whose catch-up replay fails rejects instead of spinning", async
 	};
 	await expect(openOn(fake, path, { stateStore: "bounded", mode: "fence", timing: { openDeadlineMs: 300 } })).rejects.toThrow(/deadline/);
 }, 10_000);
+
+it("a bounded open whose replay hits a lagging replica catches up instead of failing as active", async () => {
+	// The replay used `consistency=local` reads and did not check that it reached HEAD's N0. A
+	// lagging replica then left store.tail < N0, and the activity long-poll at that tail saw the
+	// owner's old records: a spurious OwnershipActive.
+	const fake = new FakeUrsula({ publishTarget: () => 1 });
+	const path = freshPath();
+	const a = await openOn(fake, path, { stateStore: "bounded" });
+	for (let id = 1; id <= 4; id++) await a.commit([{ type: "conversation", value: { id } } as StorageWrite], ctx);
+	// The previous owner stops without a close marker; it is stale, not active.
+	const n0 = fake.records(path).length;
+	const inner = fake.logTransport(path);
+	let laggingReads = 0;
+	const log: LogTransport = {
+		...inner,
+		readRecords: async (from, options) => {
+			const page = await inner.readRecords(from, options);
+			if (options?.leader === true || options?.longPollMs !== undefined) return page;
+			// A replica two records behind: everything at or above n0 − 2 is not there yet.
+			const visible = n0 - 2;
+			laggingReads++;
+			const records = page.records.slice(0, Math.max(0, visible - from));
+			const next = from + records.length;
+			return {
+				...page,
+				status: records.length > 0 ? 200 : 204,
+				records,
+				headers: { ...page.headers, [H.recordNext]: String(next), [H.upToDate]: "true" },
+			};
+		},
+	};
+	const b = await openOn(fake, path, { stateStore: "bounded", mode: "fail-if-active", log });
+	expect(laggingReads).toBeGreaterThan(0);
+	expect(b.localStore?.tail).toBeGreaterThan(n0);
+	await b.close(ctx);
+});

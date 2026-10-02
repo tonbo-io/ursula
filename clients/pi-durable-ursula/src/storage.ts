@@ -817,7 +817,11 @@ interface OpenProbe {
 const META_LO = K.m("").slice(0, 1);
 const META_HI = strinc(META_LO);
 
-/** Read the parsed records `[from, up to date)`, giving up (undefined) past `capBytes`. */
+/**
+ * Read the parsed records `[from, up to date)`, giving up (undefined) past `capBytes`. A read that
+ * reports up to date below `atLeast` (HEAD's N0) came from a lagging replica: keep reading from
+ * there with `consistency=leader` until the open deadline, so open never decides on a stale tail.
+ */
 async function readLog(
 	log: LogTransport,
 	from: number,
@@ -826,17 +830,21 @@ async function readLog(
 	timing: Timing,
 	deadline: number,
 	capBytes: number,
+	atLeast: number,
 ): Promise<ReplayedRecord[] | undefined> {
 	const out: ReplayedRecord[] = [];
 	let next = from;
 	let bytes = 0;
+	let leader = false;
+	const backoff = new Backoff(clock, timing);
 	for (;;) {
 		const at = next;
+		const size = p7 ? { maxBytes: timing.replayPageBytes } : { maxRecords: timing.replayPageRecords };
 		const page = await retryIdempotent(
 			clock,
 			timing,
 			deadline,
-			() => log.readRecords(at, p7 ? { maxBytes: timing.replayPageBytes } : { maxRecords: timing.replayPageRecords }),
+			() => log.readRecords(at, leader ? { ...size, leader: true } : size),
 			(last) => new Error(`UrsulaStorage open: replay from record ${at} did not succeed before the deadline: ${last}`),
 		);
 		if (page.status !== 200 && page.status !== 204) throw new Error(`UrsulaStorage open: replay from record ${at} failed with ${describe(page)}`);
@@ -854,7 +862,13 @@ async function readLog(
 			next++;
 		}
 		if (bytes > capBytes) return undefined;
-		if (page.records.length === 0 || page.headers[H.upToDate] === "true") return out;
+		if (page.records.length === 0 || page.headers[H.upToDate] === "true") {
+			if (next >= atLeast) return out;
+			// A lagging replica: HEAD already saw N0. Ask the leader, backing off until the deadline.
+			if (clock.now() > deadline) throw new Error(`UrsulaStorage open: replay ended at ${next} below HEAD's ${atLeast} before the deadline`);
+			if (leader) await backoff.wait(deadline);
+			leader = true;
+		}
 	}
 }
 
@@ -912,7 +926,7 @@ async function openBounded(
 	for (;;) {
 		const meta = n0 > 0 ? await readMeta(keyedState, minThrough, clock, timing, deadline) : undefined;
 		const d = meta?.through ?? 0;
-		const records = await readLog(log, d, p7, clock, timing, deadline, timing.openReplayCapBytes);
+		const records = await readLog(log, d, p7, clock, timing, deadline, timing.openReplayCapBytes, n0);
 		if (records === undefined) {
 			// The replay outgrew its cap: ask keyed-state for a higher D (§3.6 step 3).
 			minThrough = Math.max(minThrough + 1, n0);
