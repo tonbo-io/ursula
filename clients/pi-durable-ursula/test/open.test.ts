@@ -205,6 +205,18 @@ describe("open", () => {
 		);
 	});
 
+	it("opens on a node without keyed-batch-v1 only when requireKeyedBatch is false", async () => {
+		const fake = new FakeUrsula({ advertiseKeyedBatch: false, advertiseKeyedState: false });
+		const path = freshPath();
+		const a = await openOn(fake, path, { requireKeyedBatch: false });
+		await a.commit(conv(10), ctx);
+		await a.close(ctx);
+		await expect(openOn(fake, path)).rejects.toBeInstanceOf(OpenRefused);
+		const b = await openOn(fake, path, { requireKeyedBatch: false });
+		expect(await b.conversation(10 as never, ctx)).toEqual({ id: 10 });
+		await b.close(ctx);
+	});
+
 	it("works without P7 (max_records replay) when keyed-state is not advertised", async () => {
 		const fake = new FakeUrsula({ advertiseKeyedState: false });
 		const path = freshPath();

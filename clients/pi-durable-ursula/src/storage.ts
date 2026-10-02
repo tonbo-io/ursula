@@ -97,6 +97,11 @@ export interface UrsulaStorageOptions {
 	readonly keyedState?: KeyedStateTransport;
 	/** Default `fail-if-active` (§13 Q4). */
 	readonly mode?: OpenMode;
+	/**
+	 * Refuse to open unless the node advertises `keyed-batch-v1` (default true, §3.6 step 1). An ungated
+	 * node silently accepts invalid batches, so only tests against a node without P2 turn this off.
+	 */
+	readonly requireKeyedBatch?: boolean;
 	/** Refuse to open unless the node advertises `keyed-state-v1`. */
 	readonly requireKeyedState?: boolean;
 	readonly host?: string;
@@ -240,7 +245,9 @@ export class UrsulaStorage implements Storage {
 		}
 		if (!is2xx(head.status)) throw new Error(`UrsulaStorage open: HEAD failed with ${describe(head)}`);
 		const tokens = extensionTokens(head.headers);
-		if (!tokens.has(EXT_KEYED_BATCH)) throw new OpenRefused(`the node does not advertise ${EXT_KEYED_BATCH} for this stream`);
+		if (options.requireKeyedBatch !== false && !tokens.has(EXT_KEYED_BATCH)) {
+			throw new OpenRefused(`the node does not advertise ${EXT_KEYED_BATCH} for this stream`);
+		}
 		if (options.requireKeyedState === true && !tokens.has(EXT_KEYED_STATE)) {
 			throw new OpenRefused(`the node does not advertise ${EXT_KEYED_STATE} for this stream`);
 		}
