@@ -1387,6 +1387,17 @@ impl ShardRuntime {
             .and_then(|cursor| cursor.last_full_cycle_ms)
     }
 
+    /// Whether this node has completed a cold-index page-repair cycle as
+    /// leader of `raft_group_id` (F19), which the raise to feature level 2
+    /// (F1 sparse marks) requires. Without a cold store no page exists, so
+    /// the cycle is vacuously complete.
+    pub fn cold_index_repair_completed(&self, raft_group_id: RaftGroupId) -> bool {
+        self.cold_store.is_none()
+            || self
+                .cold_index_repair_last_full_cycle_ms(raft_group_id)
+                .is_some()
+    }
+
     /// One repair step in every group. A failing group is logged and
     /// skipped, so it cannot stall the others.
     pub async fn repair_cold_index_all_groups_once(

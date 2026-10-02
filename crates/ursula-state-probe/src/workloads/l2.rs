@@ -235,7 +235,7 @@ async fn w1(args: &L2Args, sink: &mut Sink) -> Result<Outcome> {
         let entry = snapshot.stream_snapshot.streams.first();
         let record_index_len = entry
             .and_then(|e| e.record_index.as_ref())
-            .map_or(0, |r| r.record_offsets().len());
+            .map_or(0, |r| r.dense_len());
         let message_records = entry.map_or(0, |e| e.message_records.len());
         let cold_chunks = entry.map_or(0, |e| e.cold_chunks.len());
         sink.row(&json!({

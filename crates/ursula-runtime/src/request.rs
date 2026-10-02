@@ -10,6 +10,7 @@ use ursula_stream::ColdFlushPressure;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::ProducerRequest;
 use ursula_stream::StreamAttrs;
+use ursula_stream::StreamErrorCode;
 use ursula_stream::StreamIntegritySnapshot;
 use ursula_stream::StreamReadPlan;
 use ursula_stream::StreamReadSegment;
@@ -188,6 +189,20 @@ pub struct ReadStreamRequest {
     /// write; ordinary catch-up consumers keep the cheaper follower-local
     /// behavior.
     pub leader_only: bool,
+    /// Server-side continuation anchor (F1): the exact start of `record`
+    /// taken from this reader's own previous response. Used only when its
+    /// incarnation matches and it validates; otherwise the read resolves
+    /// from the record index. Never parsed from client input.
+    pub record_anchor: Option<RecordAnchor>,
+}
+
+/// Where record `record` of stream incarnation `incarnation` (its
+/// `created_at_ms`) starts, as a previous read returned it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordAnchor {
+    pub incarnation: u64,
+    pub record: u64,
+    pub offset: u64,
 }
 
 impl ReadStreamRequest {
@@ -198,6 +213,7 @@ impl ReadStreamRequest {
             && self.record == other.record
             && self.max_records == other.max_records
             && self.leader_only == other.leader_only
+            && self.record_anchor == other.record_anchor
     }
 }
 
@@ -284,7 +300,21 @@ impl GroupReadStreamParts {
         }
     }
 
-    pub async fn into_response(self) -> Result<ReadStreamResponse, GroupEngineError> {
+    /// Followers never let a trimmed record read claim `up_to_date`; they
+    /// forward or hold reads that reach the tail (F1, design §5.2).
+    pub fn forbid_trimmed_up_to_date(&mut self) {
+        if let GroupReadStreamBody::Planned { plan, .. } = &mut self.body
+            && let Some(trim) = plan.record_trim.as_mut()
+        {
+            trim.claim_up_to_date = false;
+        }
+    }
+
+    pub async fn into_response(mut self) -> Result<ReadStreamResponse, GroupEngineError> {
+        let record_trim = match &self.body {
+            GroupReadStreamBody::Planned { plan, .. } => plan.record_trim.as_deref().cloned(),
+            _ => None,
+        };
         let payload = match &self.body {
             GroupReadStreamBody::Materialized(payload) => payload.clone(),
             GroupReadStreamBody::Planned {
@@ -313,6 +343,30 @@ impl GroupReadStreamParts {
                 release.notified().await;
                 payload.clone()
             }
+        };
+        let payload = match record_trim {
+            Some(trim) => {
+                // F1: cut the bracketed window to the requested records.
+                let trimmed = ursula_stream::trim_record_window(&payload, self.offset, &trim)
+                    .map_err(|err| {
+                        tracing::error!(
+                            offset = self.offset,
+                            error = %err,
+                            "record read found bytes that disagree with the record index"
+                        );
+                        crate::metrics::record_coordinate_corruption();
+                        GroupEngineError::stream(StreamErrorCode::InvalidColdFlush, err.to_string())
+                    })?;
+                self.offset = trimmed.offset;
+                self.next_offset = trimmed.next_offset;
+                self.record_range = Some(trimmed.record_range);
+                self.up_to_date = trimmed.up_to_date;
+                let mut payload = payload;
+                payload.truncate(trimmed.end);
+                payload.drain(..trimmed.start);
+                payload
+            }
+            None => payload,
         };
         Ok(ReadStreamResponse {
             placement: self.placement,

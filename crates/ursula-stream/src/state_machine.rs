@@ -11,6 +11,8 @@
 //! - [`persist`]: snapshot / restore / integrity serialization.
 //! - [`producers`]: F3 receipt window, idle-producer expiry, F4a collapse and
 //!   `TidyStream` (feature level 1).
+//! - [`marks`]: F1 sparse cold record marks — sealing at cold transitions and
+//!   record lookups (feature level 2).
 //! - [`hot_buffer`], [`cold_state`], [`ttl`]: internal per-stream data structures.
 //!
 //! The root keeps the [`StreamStateMachine`] type, its core slot/TTL accessors,
@@ -32,6 +34,9 @@ use self::cold_gc::ColdGcQueue;
 use self::cold_state::StreamColdState;
 pub use self::gauges::GroupStateGauges;
 use self::hot_buffer::HotBuffer;
+pub use self::marks::RecordPlanError;
+pub use self::marks::RecordReadAnchor;
+pub use self::marks::RecordReadRequest;
 use self::registry::StreamRegistry;
 use self::ttl::TtlEntry;
 use self::ttl::TtlIndex;
@@ -93,6 +98,7 @@ mod cold_state;
 mod flush_planner;
 mod gauges;
 mod hot_buffer;
+mod marks;
 
 pub use self::cold_refs::SHARED_REF_COMPACTION_THRESHOLD;
 pub use self::cold_refs::SHARED_REF_IDLE_MS;
@@ -738,6 +744,7 @@ impl StreamStateMachine {
                             deduplicated: true,
                             producer: None,
                             receipt_evicted: true,
+                            record_range: None,
                         }
                     }
                     Ok(batch) => batch
@@ -750,6 +757,7 @@ impl StreamStateMachine {
                             deduplicated: item.deduplicated,
                             producer: None,
                             receipt_evicted: false,
+                            record_range: item.record_range,
                         })
                         .unwrap_or_else(|| {
                             StreamResponse::error(

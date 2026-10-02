@@ -282,6 +282,7 @@ impl StreamStateMachine {
             .get(1)
             .is_some_and(|record| record.end_offset <= seal_point);
         collapsible
+            || self.stream_has_seal_debt(stream_id)
             || slot.receipt_window_over()
             || slot.producers.values().any(|state| {
                 state.last_seen_ms.is_none()
@@ -329,6 +330,9 @@ impl StreamStateMachine {
             );
         }
         self.collapse_sealed_message_records(stream_id);
+        // F1 (level 2): legacy and idle streams seal here, at most
+        // `SEAL_BUDGET_RECORDS` per command.
+        self.seal_record_index(stream_id);
         let Some(slot) = self.stream_slot_mut(stream_id) else {
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,

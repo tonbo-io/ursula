@@ -166,6 +166,7 @@ pub use error::RuntimeError;
 pub use metrics::RuntimeMailboxSnapshot;
 pub use metrics::RuntimeMetrics;
 pub use metrics::RuntimeMetricsSnapshot;
+pub use metrics::record_coordinate_corruptions;
 pub use request::AckColdGcResponse;
 pub use request::AdvanceRetentionRequest;
 pub use request::AdvanceRetentionResponse;
@@ -213,6 +214,7 @@ pub use request::ReadSnapshotRequest;
 pub use request::ReadSnapshotResponse;
 pub use request::ReadStreamRequest;
 pub use request::ReadStreamResponse;
+pub use request::RecordAnchor;
 pub use request::SetBucketQuotaRequest;
 pub use request::SetBucketQuotaResponse;
 pub use request::SetFeatureLevelRequest;
@@ -262,6 +264,8 @@ pub use ursula_stream::ColdGcTarget;
 pub use ursula_stream::ExternalPayloadRef;
 pub use ursula_stream::FEATURE_LEVEL_BASELINE;
 pub use ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
+pub use ursula_stream::FEATURE_LEVEL_SPARSE_MARKS;
+pub use ursula_stream::MARK_BLOCK_BYTES;
 pub use ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL;
 pub use ursula_stream::ProducerRequest;
 pub use ursula_stream::StreamAttrs;
@@ -280,6 +284,8 @@ mod keyed_lifecycle_tests;
 mod lb1_cold_tests;
 #[cfg(test)]
 mod producer_window_tests;
+#[cfg(all(test, not(madsim)))]
+mod sparse_marks_tests;
 #[cfg(test)]
 mod tests;
 

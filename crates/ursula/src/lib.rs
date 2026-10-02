@@ -1946,6 +1946,9 @@ pub(crate) async fn feature_level_status(State(state): State<HttpState>) -> Resp
                 "raft_group_id": group.0,
                 "hosted": true,
                 "level": level,
+                // F19: the raise to level 2 needs a completed page-repair
+                // cycle in every group (reported by its leader).
+                "page_repair_completed": state.runtime.cold_index_repair_completed(group),
             }),
             Err(RuntimeError::GroupNotHosted { .. }) => serde_json::json!({
                 "raft_group_id": group.0,
@@ -1999,32 +2002,66 @@ pub(crate) async fn set_feature_level(
         )
             .into_response();
     }
-    let groups = state
-        .runtime
-        .set_feature_level_all_groups(body.level)
-        .await
+    let results = if body.level >= ursula_runtime::FEATURE_LEVEL_SPARSE_MARKS {
+        // F1 (bounded-state §5.1): sealing trusts cold bytes, so a group
+        // reaches level 2 only through a leader that completed a cold-index
+        // page-repair cycle (F19). Other groups report `repair_pending`.
+        let mut results = Vec::new();
+        for group_id in 0..state.runtime.raft_group_count() {
+            let group = RaftGroupId(group_id);
+            let result = if state.runtime.cold_index_repair_completed(group) {
+                Some(
+                    state
+                        .runtime
+                        .set_feature_level(group, ursula_runtime::SetFeatureLevelRequest {
+                            level: body.level,
+                        })
+                        .await,
+                )
+            } else {
+                None
+            };
+            results.push((group, result));
+        }
+        results
+    } else {
+        state
+            .runtime
+            .set_feature_level_all_groups(body.level)
+            .await
+            .into_iter()
+            .map(|(group, result)| (group, Some(result)))
+            .collect()
+    };
+    let groups = results
         .into_iter()
         .map(|(group, result)| match result {
-            Ok(response) => serde_json::json!({
+            None => serde_json::json!({
                 "raft_group_id": group.0,
-                "status": "set",
-                "level": response.level,
-                "previous_level": response.previous_level,
+                "status": "repair_pending",
             }),
-            Err(err) if err.leader_hint().is_some() => serde_json::json!({
-                "raft_group_id": group.0,
-                "status": "not_leader",
-                "leader_id": err.leader_hint().and_then(|hint| hint.node_id),
-            }),
-            Err(RuntimeError::GroupNotHosted { .. }) => serde_json::json!({
-                "raft_group_id": group.0,
-                "status": "not_hosted",
-            }),
-            Err(err) => serde_json::json!({
-                "raft_group_id": group.0,
-                "status": "error",
-                "error": err.to_string(),
-            }),
+            Some(result) => match result {
+                Ok(response) => serde_json::json!({
+                    "raft_group_id": group.0,
+                    "status": "set",
+                    "level": response.level,
+                    "previous_level": response.previous_level,
+                }),
+                Err(err) if err.leader_hint().is_some() => serde_json::json!({
+                    "raft_group_id": group.0,
+                    "status": "not_leader",
+                    "leader_id": err.leader_hint().and_then(|hint| hint.node_id),
+                }),
+                Err(RuntimeError::GroupNotHosted { .. }) => serde_json::json!({
+                    "raft_group_id": group.0,
+                    "status": "not_hosted",
+                }),
+                Err(err) => serde_json::json!({
+                    "raft_group_id": group.0,
+                    "status": "error",
+                    "error": err.to_string(),
+                }),
+            },
         })
         .collect::<Vec<_>>();
     json_response(
@@ -2059,6 +2096,12 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
     let group_state_gauges = group_state_gauges_json(&state).await;
     if let Some(object) = body.as_object_mut() {
         object.insert("group_state_gauges".to_owned(), group_state_gauges);
+        // F1 anchor verification (RC-21): record reads failed because cold
+        // bytes disagreed with the record marks.
+        object.insert(
+            "record_coordinate_corruptions".to_owned(),
+            serde_json::Value::from(ursula_runtime::record_coordinate_corruptions()),
+        );
         object.insert(
             "keyed_state_requests".to_owned(),
             serde_json::to_value(state.keyed_state_metrics.snapshot())
@@ -3737,6 +3780,7 @@ pub(crate) async fn read_stream_by_id(
             record,
             max_records,
             leader_only,
+            record_anchor: None,
         })
         .await;
     let read = match read {
@@ -3834,15 +3878,81 @@ pub(crate) async fn publish_snapshot(
         Ok(offset) => offset,
         Err(response) => return *response,
     };
+    let request_target = request_target(&uri);
+    if let Err(response) =
+        check_json_record_boundary(&state, &stream_id, snapshot_offset, &request_target).await
+    {
+        return *response;
+    }
     publish_snapshot_by_offset(
         state,
-        request_target(&uri),
+        request_target,
         stream_id,
         snapshot_offset,
         headers,
         body,
     )
     .await
+}
+
+/// Leader-side record-boundary check for the raw-offset snapshot and
+/// retention routes (F1, RC-12, RC-14). Stored JSON records end with LF and
+/// contain no other LF, so an offset strictly inside the retained log is a
+/// record boundary exactly when the byte before it is LF. Rejects an
+/// intra-record offset with 400 before proposing; apply still lands on a
+/// real boundary if a racing delete or recreate makes this check stale.
+/// Streams without record coordinates, offsets at the retained offset or
+/// tail, and failed lookups are left to apply.
+async fn check_json_record_boundary(
+    state: &HttpState,
+    stream_id: &BucketStreamId,
+    offset: u64,
+    request_target: &str,
+) -> Result<(), BoxResponse> {
+    let head = match state
+        .runtime
+        .head_stream(HeadStreamRequest {
+            stream_id: stream_id.clone(),
+            now_ms: state.unix_time_ms(),
+        })
+        .await
+    {
+        Ok(head) => head,
+        Err(err) => {
+            return Err(Box::new(
+                runtime_error_or_leader_redirect_async(state, err, request_target).await,
+            ));
+        }
+    };
+    if head.record_range.is_none() || offset <= head.retained_offset || offset >= head.tail_offset {
+        return Ok(());
+    }
+    let Ok(read) = state
+        .runtime
+        .read_stream(ReadStreamRequest {
+            stream_id: stream_id.clone(),
+            offset: offset - 1,
+            max_len: 1,
+            now_ms: state.unix_time_ms(),
+            record: None,
+            max_records: None,
+            leader_only: false,
+            record_anchor: None,
+        })
+        .await
+    else {
+        return Ok(());
+    };
+    match read.payload.first() {
+        Some(b'\n') | None => Ok(()),
+        Some(_) => Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                format!("offset {offset} is not a JSON record boundary"),
+            )
+                .into_response(),
+        )),
+    }
 }
 
 async fn publish_snapshot_by_offset(
@@ -3942,6 +4052,7 @@ async fn resolve_record_offset(
             record: Some(record),
             max_records: Some(1),
             leader_only: false,
+            record_anchor: None,
         })
         .await
     {
@@ -3960,7 +4071,13 @@ pub(crate) async fn advance_retention(
         Ok(offset) => offset,
         Err(response) => return *response,
     };
-    advance_retention_by_offset(state, request_target(&uri), stream_id, retained_offset).await
+    let request_target = request_target(&uri);
+    if let Err(response) =
+        check_json_record_boundary(&state, &stream_id, retained_offset, &request_target).await
+    {
+        return *response;
+    }
+    advance_retention_by_offset(state, request_target, stream_id, retained_offset).await
 }
 
 pub(crate) async fn advance_retention_at_record(
@@ -4253,6 +4370,7 @@ async fn end_capped_json_read_at_record_boundary(
             now_ms: state.unix_time_ms(),
             record: None,
             max_records: None,
+            record_anchor: None,
             leader_only,
         })
         .await?;
@@ -4293,6 +4411,7 @@ pub(crate) async fn long_poll_stream(
         record,
         max_records,
         leader_only: false,
+        record_anchor: None,
     });
     let read = async {
         match read.await {
@@ -4370,6 +4489,11 @@ struct SseState {
     record: Option<u64>,
     max_records: Option<u64>,
     envelope_view: bool,
+    /// Stream incarnation seen when the session opened (F1 anchors).
+    incarnation: Option<u64>,
+    /// Where `record` starts, from this session's previous response (F1):
+    /// lets a sealed continuation skip the scan from its mark.
+    record_anchor: Option<ursula_runtime::RecordAnchor>,
 }
 
 pub(crate) async fn sse_stream(
@@ -4422,6 +4546,8 @@ pub(crate) async fn sse_stream(
         record,
         max_records,
         envelope_view,
+        incarnation: head.created_at_ms,
+        record_anchor: None,
     };
     let body_stream = stream::unfold(Some(sse_state), |state| async move {
         let mut state = match state {
@@ -4444,6 +4570,7 @@ pub(crate) async fn sse_stream(
                 state.max_records
             },
             leader_only: false,
+            record_anchor: state.record_anchor,
         };
         let read = if state.initial_read {
             state.initial_read = false;
@@ -4472,6 +4599,14 @@ pub(crate) async fn sse_stream(
 
         state.offset = read.next_offset;
         state.record = read.record_range.map(|range| range.next_record);
+        state.record_anchor = match (state.incarnation, read.record_range) {
+            (Some(incarnation), Some(range)) => Some(ursula_runtime::RecordAnchor {
+                incarnation,
+                record: range.next_record,
+                offset: read.next_offset,
+            }),
+            _ => None,
+        };
         let done = read.closed && read.up_to_date;
         if !read.payload.is_empty() {
             state
@@ -4838,3 +4973,5 @@ mod staging_cleanup_tests;
 mod keyed_lifecycle_tests;
 #[cfg(test)]
 mod keyed_state_tests;
+#[cfg(test)]
+mod sparse_marks_http_tests;

@@ -42,6 +42,10 @@ pub enum StreamResponse {
         /// byte or record ranges: `offset` and `next_offset` are the stream
         /// tail and carry no information about the original append.
         receipt_evicted: bool,
+        /// Records of this append as apply computed them, or the stored
+        /// receipt's range for a duplicate (F1, RC-10/RC-11). Never derived
+        /// from the record index afterwards, which may have sealed them.
+        record_range: Option<StreamRecordRange>,
     },
     Closed {
         next_offset: u64,

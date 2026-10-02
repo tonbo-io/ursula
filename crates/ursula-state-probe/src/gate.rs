@@ -62,13 +62,19 @@ pub fn pr_suite() -> Result<Vec<Job>> {
         job(
             "w1",
             Workload::W1(parse::<W1Args>(
-                "--records=300000 --checkpoints=75000,300000 --forced-flush --name=w1_inline",
+                "--records=300000 --checkpoints=75000,300000 --forced-flush --level=2 --name=w1_inline",
             )?),
         ),
         job(
             "w6_w1",
             Workload::W1(parse::<W1Args>(
-                "--records=200000 --retain-every=10000 --retain-keep=2000 --checkpoints=100000,200000",
+                "--records=200000 --retain-every=10000 --retain-keep=2000 --checkpoints=100000,200000 --level=2",
+            )?),
+        ),
+        job(
+            "w1_legacy",
+            Workload::W1(parse::<W1Args>(
+                "--records=1200000 --recs-per-append=100 --checkpoints=1200000 --forced-flush --legacy-seal --name=w1_legacy_seal",
             )?),
         ),
         job("w3_r1", Workload::W3(parse::<W3Args>("--appends=1000")?)),
@@ -140,7 +146,15 @@ pub fn nightly_suite() -> Result<Vec<Job>> {
     Ok(vec![
         job(
             "w1",
-            Workload::W1(parse::<W1Args>("--records=3000000 --zstd --restore")?),
+            Workload::W1(parse::<W1Args>(
+                "--records=3000000 --zstd --restore --level=2",
+            )?),
+        ),
+        job(
+            "w1_legacy",
+            Workload::W1(parse::<W1Args>(
+                "--records=10000000 --recs-per-append=100 --checkpoints=10000000 --forced-flush --legacy-seal --name=w1_legacy_seal",
+            )?),
         ),
         job(
             "w1_batch10",
@@ -239,7 +253,7 @@ pub fn nightly_suite() -> Result<Vec<Job>> {
         job(
             "w6_w1",
             Workload::W1(parse::<W1Args>(
-                "--records=1000000 --retain-every=10000 --retain-keep=2000",
+                "--records=1000000 --retain-every=10000 --retain-keep=2000 --level=2",
             )?),
         ),
         job(

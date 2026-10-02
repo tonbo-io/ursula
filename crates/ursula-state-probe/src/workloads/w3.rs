@@ -3,8 +3,9 @@
 //! into K records. `--inline-every=N` adds one small inline append plus a flush
 //! pass every N external appends. `--retain-every=N` (W6): checkpoint and
 //! retention every N external appends, keeping the last `--retain-keep` records.
-//! Runs at feature level 1, where external appends collapse message records
-//! below the seal point (F4a).
+//! Runs at feature level 2: external appends collapse message records below
+//! the seal point (F4a, level 1) and seal their records into sparse marks
+//! (F1).
 
 use anyhow::Result;
 use clap::Args;
@@ -82,7 +83,7 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
     let mut rng = payload::Rng::new(5);
     let base = Baseline::now();
     let mut m = StreamStateMachine::new();
-    smx::raise_feature_level(&mut m, ursula_stream::FEATURE_LEVEL_KEYED_STREAMS)?;
+    smx::raise_feature_level(&mut m, ursula_stream::FEATURE_LEVEL_SPARSE_MARKS)?;
     smx::create_bucket(&mut m, "bkt1")?;
     let id = smx::sid("bkt1", "h0001", "log");
     smx::create_stream(&mut m, &id, None, None, smx::T0)?;

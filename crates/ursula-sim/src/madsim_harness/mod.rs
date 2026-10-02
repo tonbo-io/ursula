@@ -1624,6 +1624,7 @@ pub(super) async fn verify_runtime_raft_partial_read(
             record: None,
             max_records: None,
             leader_only: false,
+            record_anchor: None,
         })
         .await
         .expect("runtime raft partial read");
@@ -1673,6 +1674,7 @@ pub(super) async fn verify_runtime_raft_tail_read(
             record: None,
             max_records: None,
             leader_only: false,
+            record_anchor: None,
         })
         .await
         .expect("runtime raft tail read");
@@ -1742,6 +1744,7 @@ pub(super) async fn verify_runtime_raft_close_stream(
             record: None,
             max_records: None,
             leader_only: false,
+            record_anchor: None,
         })
         .await
         .expect("read closed runtime raft stream");
@@ -2135,6 +2138,7 @@ pub(super) async fn read_local_payload_eventually(
                     record: None,
                     max_records: None,
                     leader_only: false,
+                    record_anchor: None,
                 },
                 placement(),
             )
@@ -2260,6 +2264,13 @@ async fn build_restartable_three_node_cluster_with_cold_store(
 pub(super) async fn build_lagging_learner_snapshot_cluster(
     policy: InProcessRaftNetworkPolicy,
 ) -> (InProcessRaftRegistry, Vec<RaftGroupEngine>, u64) {
+    build_lagging_learner_snapshot_cluster_with_cold_store(policy, None).await
+}
+
+pub(super) async fn build_lagging_learner_snapshot_cluster_with_cold_store(
+    policy: InProcessRaftNetworkPolicy,
+    cold_store: Option<ColdStoreHandle>,
+) -> (InProcessRaftRegistry, Vec<RaftGroupEngine>, u64) {
     let registry = InProcessRaftRegistry::default();
     let config = Arc::new(
         Config {
@@ -2288,7 +2299,7 @@ pub(super) async fn build_lagging_learner_snapshot_cluster(
                 .with_policy(policy.clone()),
             RaftGroupLogStore::shared(),
             None,
-            None,
+            cold_store.clone(),
         )
         .await
         .expect("create simulated raft group node");

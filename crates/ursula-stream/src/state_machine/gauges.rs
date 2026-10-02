@@ -24,8 +24,7 @@ pub struct GroupStateGauges {
     pub feature_level: u32,
     /// Live streams in the group.
     pub streams: u64,
-    /// Sparse cold record marks (F1, level 2). Always 0 until sparse marks
-    /// exist; kept so dashboards and the harness need no schema change.
+    /// Sparse cold record marks (F1, level 2). Always 0 below level 2.
     pub record_marks: u64,
     /// Dense record-index entries across JSON streams (F1 target: unflushed
     /// records only).
@@ -135,7 +134,12 @@ impl StreamStateMachine {
             let dense = slot
                 .record_index
                 .as_ref()
-                .map_or(0, |index| as_u64(index.record_offsets().len()));
+                .map_or(0, |index| as_u64(index.dense_len()));
+            let marks = slot
+                .record_index
+                .as_ref()
+                .map_or(0, |index| as_u64(index.marks().len()));
+            gauges.record_marks = gauges.record_marks.saturating_add(marks);
             gauges.dense_record_entries = gauges.dense_record_entries.saturating_add(dense);
             gauges.max_dense_record_entries_per_stream =
                 gauges.max_dense_record_entries_per_stream.max(dense);

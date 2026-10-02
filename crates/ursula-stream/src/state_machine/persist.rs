@@ -219,10 +219,13 @@ impl StreamStateMachine {
                     tail_offset: entry.metadata.tail_offset,
                 });
             }
+            // Sealed records (marks) exist only at feature level 2 (F1).
             if let Some(record_index) = entry.record_index.as_ref()
-                && record_index
+                && (record_index
                     .validate(retained_offset, entry.metadata.tail_offset)
                     .is_err()
+                    || (!record_index.marks().is_empty()
+                        && snapshot.feature_level < crate::feature::FEATURE_LEVEL_SPARSE_MARKS))
             {
                 return Err(StreamSnapshotError::RecordBoundaryMismatch { stream_id });
             }

@@ -28,7 +28,16 @@
 //!   `DeferColdGc`, F14i retention grace for dropped pack slices, the
 //!   `FlushCold` incarnation check, and F12a MessagePack snapshot envelopes.
 //!
-//! Later core-track changes (C1, C3, C4, C6, U22) take the next levels in
+//! - [`FEATURE_LEVEL_SPARSE_MARKS`] (2): bounded-state Lb2 — F1 sparse cold
+//!   record marks. `FlushCold`, `AppendExternal`, external creates and
+//!   `TidyStream` seal dense record offsets below the seal point into one
+//!   mark per 1 MiB block (at most [`crate::SEAL_BUDGET_RECORDS`] per
+//!   command), retention into sealed history lands on the mark at or below
+//!   its target, and snapshots carry the marks (stream entry fields 17-19).
+//!   Operators raise it only after every group completed a cold-index
+//!   page-repair cycle (F19).
+//!
+//! Later core-track changes (C3, C4, C6, U22) take the next levels in
 //! release order.
 //!
 //! No downgrade: once a group's level is raised, a binary whose
@@ -46,10 +55,13 @@ pub const FEATURE_LEVEL_BASELINE: u32 = 0;
 /// reservation, and `keyed-batch-v1` stream creation.
 pub const FEATURE_LEVEL_KEYED_STREAMS: u32 = 1;
 
-/// Highest group feature level this binary can apply.
-pub const MAX_SUPPORTED_FEATURE_LEVEL: u32 = FEATURE_LEVEL_KEYED_STREAMS;
+/// Bounded-state Lb2: F1 sparse cold record marks.
+pub const FEATURE_LEVEL_SPARSE_MARKS: u32 = 2;
 
-const _: () = assert!(MAX_SUPPORTED_FEATURE_LEVEL >= FEATURE_LEVEL_KEYED_STREAMS);
+/// Highest group feature level this binary can apply.
+pub const MAX_SUPPORTED_FEATURE_LEVEL: u32 = FEATURE_LEVEL_SPARSE_MARKS;
+
+const _: () = assert!(MAX_SUPPORTED_FEATURE_LEVEL >= FEATURE_LEVEL_SPARSE_MARKS);
 
 /// Pure form of the apply-time gate: `Ok` when a group at `current` may run
 /// an operation that needs `required`, otherwise the plain-text reason that

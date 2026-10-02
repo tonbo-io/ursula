@@ -33,14 +33,20 @@ pub fn per_stream_checks(outcome: &mut Outcome, m: &Measured, shared_refs_interv
         let cold_mib = s.cold_mib_ceil();
         outcome.check(
             "f1_dense_entries_eq_unflushed",
-            "dense record entries = unflushed records (F1)",
+            "dense record entries = unflushed records, plus the one straddling the seal point (F1)",
             s.dense_entries as f64,
-            s.unflushed_records as f64,
+            (s.unflushed_records + 1) as f64,
         );
         outcome.check(
             "f1_mark_snapshot_bytes_per_cold_mib",
-            "snapshot bytes of mark/index fields <= 32 per cold MiB (F1)",
-            s.record_offsets_bytes as f64,
+            "snapshot bytes of the mark fields 17-19 <= 32 per cold MiB, and every record \
+             below the seal point sealed into them (F1)",
+            if s.dense_entries > s.unflushed_records + 1 {
+                // Dense offsets below the seal point stand in for marks.
+                (s.record_marks_bytes + s.record_offsets_bytes) as f64
+            } else {
+                s.record_marks_bytes as f64
+            },
             (MARK_SNAPSHOT_BYTES_PER_COLD_MIB * cold_mib.max(1)) as f64,
         );
         outcome.check(
