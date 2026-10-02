@@ -89,6 +89,8 @@ use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
 use crate::request::SetBucketQuotaRequest;
 use crate::request::SetBucketQuotaResponse;
+use crate::request::SetFeatureLevelRequest;
+use crate::request::SetFeatureLevelResponse;
 use crate::request::UpdateStreamAttrsRequest;
 use crate::request::UpdateStreamAttrsResponse;
 use crate::rt::sync::Semaphore;
@@ -685,6 +687,44 @@ impl ShardRuntime {
             .await?;
         }
         Ok(())
+    }
+
+    /// Replicated feature level (C0) of every Raft group as held by this
+    /// node's applied replica state. Per-group results, so a group this node
+    /// does not host reports its own error instead of hiding the others.
+    pub async fn feature_levels_all_groups(&self) -> Vec<(RaftGroupId, Result<u32, RuntimeError>)> {
+        let group_count = self.shard_map.raft_group_count();
+        let mut levels = Vec::new();
+        for group_id in 0..group_count {
+            let group = RaftGroupId(group_id);
+            levels.push((group, self.feature_level(group).await));
+        }
+        levels
+    }
+
+    /// Proposes `SetFeatureLevel { level }` to every Raft group (C0), serially
+    /// like the other all-group admin sweeps. Each group ends at
+    /// `max(current, level)`, so re-running after a partial failure is safe.
+    /// Results are per group: on a Raft cluster a group led by another node
+    /// fails with a forward-to-leader error, and the operator (`ursulactl
+    /// cluster enable-feature`) asks every node so each leader proposes for
+    /// its own groups. Callers must ensure every voter and learner supports
+    /// `level`.
+    pub async fn set_feature_level_all_groups(
+        &self,
+        level: u32,
+    ) -> Vec<(RaftGroupId, Result<SetFeatureLevelResponse, RuntimeError>)> {
+        let group_count = self.shard_map.raft_group_count();
+        let mut responses = Vec::new();
+        for group_id in 0..group_count {
+            let group = RaftGroupId(group_id);
+            responses.push((
+                group,
+                self.set_feature_level(group, SetFeatureLevelRequest { level })
+                    .await,
+            ));
+        }
+        responses
     }
 
     pub async fn flush_cold_all_groups_once(

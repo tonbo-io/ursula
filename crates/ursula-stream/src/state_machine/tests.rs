@@ -2076,6 +2076,7 @@ fn snapshot_restore_rejects_invalid_entries() {
             streams: Vec::new(),
             bucket_usage: Vec::new(),
             bucket_quotas: Vec::new(),
+            feature_level: 0,
         })
         .expect_err("duplicate bucket"),
         StreamSnapshotError::DuplicateBucket("benchcmp".to_owned())
@@ -2091,6 +2092,7 @@ fn snapshot_restore_rejects_invalid_entries() {
             streams: vec![entry],
             bucket_usage: Vec::new(),
             bucket_quotas: Vec::new(),
+            feature_level: 0,
         })
     };
 
@@ -3820,4 +3822,147 @@ fn quota_survives_snapshot_round_trip() {
             ..
         }
     ));
+}
+
+fn set_feature_level_cmd(level: u32) -> StreamCommand {
+    StreamCommand::SetFeatureLevel { level }
+}
+
+#[test]
+fn feature_level_defaults_to_zero_and_only_rises() {
+    let mut machine = StreamStateMachine::new();
+    assert_eq!(machine.feature_level(), 0);
+
+    assert_eq!(
+        machine.apply(set_feature_level_cmd(1)),
+        StreamResponse::FeatureLevelSet {
+            level: 1,
+            previous_level: 0,
+        }
+    );
+    // Idempotent under replay.
+    assert_eq!(
+        machine.apply(set_feature_level_cmd(1)),
+        StreamResponse::FeatureLevelSet {
+            level: 1,
+            previous_level: 1,
+        }
+    );
+    // Never lowered.
+    assert_eq!(
+        machine.apply(set_feature_level_cmd(0)),
+        StreamResponse::FeatureLevelSet {
+            level: 1,
+            previous_level: 1,
+        }
+    );
+    assert_eq!(machine.feature_level(), 1);
+    assert_eq!(
+        machine.apply(set_feature_level_cmd(3)),
+        StreamResponse::FeatureLevelSet {
+            level: 3,
+            previous_level: 1,
+        }
+    );
+    assert_eq!(machine.feature_level(), 3);
+}
+
+#[test]
+fn feature_gate_rejects_below_required_level_deterministically() {
+    let mut machine = machine();
+    let Err(StreamResponse::Error {
+        code,
+        message,
+        next_offset,
+        context,
+    }) = machine.require_feature_level(1, "keyed stream create")
+    else {
+        panic!("level 0 must not satisfy level 1");
+    };
+    assert_eq!(code, StreamErrorCode::FeatureNotEnabled);
+    assert!(
+        message.contains("requires group feature level 1"),
+        "{message}"
+    );
+    assert_eq!(next_offset, None);
+    assert!(context.is_empty());
+
+    machine.apply(set_feature_level_cmd(1));
+    assert_eq!(
+        machine.require_feature_level(1, "keyed stream create"),
+        Ok(())
+    );
+    assert_eq!(machine.require_feature_level(0, "anything"), Ok(()));
+}
+
+#[test]
+fn feature_level_survives_snapshot_round_trip() {
+    let mut machine = machine();
+    machine.apply(set_feature_level_cmd(1));
+    let snapshot = machine.snapshot();
+    assert_eq!(snapshot.feature_level, 1);
+    let restored = StreamStateMachine::restore(snapshot).expect("restore snapshot");
+    assert_eq!(restored.feature_level(), 1);
+}
+
+#[test]
+fn legacy_snapshot_without_feature_level_restores_at_zero() {
+    let mut value = serde_json::to_value(machine().snapshot()).expect("encode snapshot");
+    value
+        .as_object_mut()
+        .expect("snapshot object")
+        .remove("feature_level");
+    let legacy: StreamSnapshot = serde_json::from_value(value).expect("decode legacy snapshot");
+    assert_eq!(legacy.feature_level, 0);
+    let restored = StreamStateMachine::restore(legacy).expect("restore legacy snapshot");
+    assert_eq!(restored.feature_level(), 0);
+}
+
+#[test]
+fn restore_refuses_a_snapshot_above_the_supported_level() {
+    let mut snapshot = machine().snapshot();
+    snapshot.feature_level = crate::MAX_SUPPORTED_FEATURE_LEVEL + 1;
+    assert_eq!(
+        StreamStateMachine::restore(snapshot).expect_err("future level"),
+        StreamSnapshotError::UnsupportedFeatureLevel {
+            level: crate::MAX_SUPPORTED_FEATURE_LEVEL + 1,
+            supported: crate::MAX_SUPPORTED_FEATURE_LEVEL,
+        }
+    );
+}
+
+#[test]
+fn import_snapshot_never_lowers_the_feature_level() {
+    let backup = machine().snapshot();
+    assert_eq!(backup.feature_level, 0);
+
+    let mut target = StreamStateMachine::new();
+    target.apply(set_feature_level_cmd(1));
+    assert!(matches!(
+        target.apply(StreamCommand::ImportSnapshot {
+            snapshot: Box::new(backup),
+        }),
+        StreamResponse::SnapshotImported { .. }
+    ));
+    assert_eq!(target.feature_level(), 1);
+
+    let mut raised = machine();
+    raised.apply(set_feature_level_cmd(1));
+    let mut fresh = StreamStateMachine::new();
+    assert!(matches!(
+        fresh.apply(StreamCommand::ImportSnapshot {
+            snapshot: Box::new(raised.snapshot()),
+        }),
+        StreamResponse::SnapshotImported { .. }
+    ));
+    assert_eq!(fresh.feature_level(), 1);
+}
+
+#[test]
+fn set_feature_level_command_round_trips_through_serde() {
+    let command = set_feature_level_cmd(1);
+    let bytes = serde_json::to_vec(&command).expect("encode command");
+    let decoded: StreamCommand = serde_json::from_slice(&bytes).expect("decode command");
+    assert_eq!(decoded, command);
+    assert_eq!(command.to_string(), "set_feature_level:1");
 }

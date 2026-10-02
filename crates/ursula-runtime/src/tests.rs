@@ -1599,6 +1599,7 @@ async fn install_group_snapshot_rejects_mismatched_placement_before_routing() {
             shared_cold_object_owners: Vec::new(),
             bucket_usage: Vec::new(),
             bucket_quotas: Vec::new(),
+            feature_level: 0,
         },
         stream_append_counts: Vec::new(),
     };
@@ -4147,6 +4148,7 @@ impl GroupEngine for BlockingReadEngine {
                     shared_cold_object_owners: Vec::new(),
                     bucket_usage: Vec::new(),
                     bucket_quotas: Vec::new(),
+                    feature_level: 0,
                 },
                 stream_append_counts: Vec::new(),
             })
@@ -4383,6 +4385,7 @@ impl GroupEngine for RecordingEngine {
                     shared_cold_object_owners: Vec::new(),
                     bucket_usage: Vec::new(),
                     bucket_quotas: Vec::new(),
+                    feature_level: 0,
                 },
                 stream_append_counts: Vec::new(),
             })

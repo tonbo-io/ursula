@@ -127,6 +127,10 @@ pub struct StreamStateMachine {
     /// Per-bucket data-plane quota backstops enforced against this group's
     /// local counters; see [`BucketQuota`] for the enforcement semantics.
     bucket_quotas: HashMap<String, BucketQuota>,
+    /// Replicated group feature level (C0). Raised only by
+    /// [`StreamCommand::SetFeatureLevel`], never lowered; gated apply-time
+    /// behavior checks it through [`StreamStateMachine::require_feature_level`].
+    feature_level: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -385,6 +389,36 @@ impl StreamStateMachine {
             ));
         }
         Ok(())
+    }
+
+    /// This group's replicated feature level (C0).
+    pub fn feature_level(&self) -> u32 {
+        self.feature_level
+    }
+
+    /// Apply-time feature gate (C0). Gated commands call this before any
+    /// mutation; below `required` the command fails deterministically on
+    /// every replica with [`StreamErrorCode::FeatureNotEnabled`], whose
+    /// plain-text message names the required level.
+    pub fn require_feature_level(
+        &self,
+        required: u32,
+        operation: &str,
+    ) -> Result<(), StreamResponse> {
+        crate::feature::check_feature_level(self.feature_level, required, operation)
+            .map_err(|message| StreamResponse::error(StreamErrorCode::FeatureNotEnabled, message))
+    }
+
+    /// Applies [`StreamCommand::SetFeatureLevel`]: `max(current, level)`.
+    /// Lower or equal levels are accepted as no-ops so replays and repeated
+    /// operator runs are idempotent.
+    fn set_feature_level(&mut self, level: u32) -> StreamResponse {
+        let previous_level = self.feature_level;
+        self.feature_level = previous_level.max(level);
+        StreamResponse::FeatureLevelSet {
+            level: self.feature_level,
+            previous_level,
+        }
     }
 
     /// Current per-bucket quotas for this group, sorted for deterministic
@@ -672,6 +706,7 @@ impl StreamStateMachine {
                 max_streams,
                 max_retained_bytes,
             } => self.set_bucket_quota(bucket_id, max_streams, max_retained_bytes),
+            StreamCommand::SetFeatureLevel { level } => self.set_feature_level(level),
         }
     }
 }

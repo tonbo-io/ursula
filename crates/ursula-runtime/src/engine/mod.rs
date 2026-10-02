@@ -63,6 +63,8 @@ use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
 use crate::request::SetBucketQuotaRequest;
 use crate::request::SetBucketQuotaResponse;
+use crate::request::SetFeatureLevelRequest;
+use crate::request::SetFeatureLevelResponse;
 use crate::request::TouchStreamAccessResponse;
 use crate::request::UpdateStreamAttrsRequest;
 use crate::request::UpdateStreamAttrsResponse;
@@ -103,6 +105,10 @@ pub type GroupAdvanceRetentionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AdvanceRetentionResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupSetBucketQuotaFuture<'a> =
     Pin<Box<dyn Future<Output = Result<SetBucketQuotaResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupSetFeatureLevelFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<SetFeatureLevelResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupFeatureLevelFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<u32, GroupEngineError>> + Send + 'a>>;
 pub type GroupReadSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ReadSnapshotResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupDeleteSnapshotFuture<'a> =
@@ -176,6 +182,9 @@ pub enum GroupWriteResponse {
     PurgeBucket(PurgeBucketResponse),
     ImportGroupState(crate::request::ImportGroupStateResponse),
     Batch(Vec<Result<GroupWriteResponse, GroupEngineError>>),
+    // Appended last so serialized variant positions of older variants stay
+    // stable across mixed-version clusters.
+    SetFeatureLevel(SetFeatureLevelResponse),
 }
 
 pub trait GroupEngine: Send + 'static {
@@ -305,6 +314,35 @@ pub trait GroupEngine: Send + 'static {
             Err(GroupEngineError::new(format!(
                 "bucket quotas are not supported for bucket '{}'",
                 request.bucket_id
+            )))
+        })
+    }
+
+    /// Replicated group feature level (C0) held by this replica's applied
+    /// state. Like [`GroupEngine::bucket_usage`] it is served from local
+    /// state, leader or follower, so operators can verify every replica.
+    /// Default unsupported: an engine that cannot report its level must not
+    /// be counted as having reached one.
+    fn feature_level<'a>(&'a mut self, placement: ShardPlacement) -> GroupFeatureLevelFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "feature levels are not supported for group {}",
+                placement.raft_group_id.0
+            )))
+        })
+    }
+
+    /// Replicated `SetFeatureLevel` write (C0); see
+    /// `StreamCommand::SetFeatureLevel`. Default unsupported.
+    fn set_feature_level<'a>(
+        &'a mut self,
+        _request: SetFeatureLevelRequest,
+        placement: ShardPlacement,
+    ) -> GroupSetFeatureLevelFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "feature levels are not supported for group {}",
+                placement.raft_group_id.0
             )))
         })
     }
@@ -848,6 +886,10 @@ pub trait GroupEngine: Send + 'static {
                     )
                     .await
                     .map(GroupWriteResponse::SetBucketQuota),
+                StreamCommand::SetFeatureLevel { level } => self
+                    .set_feature_level(SetFeatureLevelRequest { level }, placement)
+                    .await
+                    .map(GroupWriteResponse::SetFeatureLevel),
                 StreamCommand::CreateBucket { .. } | StreamCommand::DeleteBucket { .. } => Err(
                     GroupEngineError::new("bucket commands are not valid group writes"),
                 ),

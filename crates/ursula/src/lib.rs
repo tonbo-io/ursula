@@ -945,6 +945,10 @@ fn admin_ops_router(state: HttpState) -> Router {
         .route(
             "/__ursula/leadership-shed/maintenance",
             post(mark_maintenance_drain).delete(clear_maintenance_drain),
+        )
+        .route(
+            "/__ursula/feature-level",
+            get(feature_level_status).post(set_feature_level),
         );
     #[cfg(feature = "jemalloc-prof")]
     let router = router.route("/__ursula/debug/heap-profile", get(heap_profile));
@@ -1684,6 +1688,127 @@ pub(crate) async fn set_bucket_quota(
             (status, format!("bucket quota update failed: {err}")).into_response()
         }
     }
+}
+
+/// Version of the `/__ursula/feature-level` JSON contract.
+const FEATURE_LEVEL_REPORT_VERSION: u32 = 1;
+
+/// Node id this server runs as, when it hosts Raft groups.
+fn local_raft_node_id(state: &HttpState) -> Option<u64> {
+    state.raft_registry().and_then(|registry| {
+        registry
+            .metrics_snapshot()
+            .first()
+            .map(|group| group.node_id)
+    })
+}
+
+/// `GET /__ursula/feature-level` (C0): this node's supported feature level
+/// and each group's replicated level as held by this node's applied replica
+/// state (leader or follower). A group this node does not host is reported
+/// with `hosted: false`; any other read failure carries `error`.
+pub(crate) async fn feature_level_status(State(state): State<HttpState>) -> Response {
+    let groups = state
+        .runtime
+        .feature_levels_all_groups()
+        .await
+        .into_iter()
+        .map(|(group, result)| match result {
+            Ok(level) => serde_json::json!({
+                "raft_group_id": group.0,
+                "hosted": true,
+                "level": level,
+            }),
+            Err(RuntimeError::GroupNotHosted { .. }) => serde_json::json!({
+                "raft_group_id": group.0,
+                "hosted": false,
+            }),
+            Err(err) => serde_json::json!({
+                "raft_group_id": group.0,
+                "hosted": true,
+                "error": err.to_string(),
+            }),
+        })
+        .collect::<Vec<_>>();
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "version": FEATURE_LEVEL_REPORT_VERSION,
+            "node_id": local_raft_node_id(&state),
+            "supported_level": ursula_runtime::MAX_SUPPORTED_FEATURE_LEVEL,
+            "groups": groups,
+        })
+        .to_string(),
+    )
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetFeatureLevelBody {
+    level: u32,
+}
+
+/// `POST /__ursula/feature-level` with `{"level": N}` (C0): proposes
+/// `SetFeatureLevel` to every group this node can write (on a Raft cluster,
+/// the groups it leads). Each group ends at `max(current, N)`. Groups led
+/// elsewhere are reported with `status: "not_leader"` and the leader id when
+/// known, so `ursulactl cluster enable-feature` asks every node in turn.
+///
+/// Refuses (409) a level above this node's supported level. Checking that
+/// every other voter and learner supports it is the operator tool's job.
+pub(crate) async fn set_feature_level(
+    State(state): State<HttpState>,
+    axum::Json(body): axum::Json<SetFeatureLevelBody>,
+) -> Response {
+    let supported = ursula_runtime::MAX_SUPPORTED_FEATURE_LEVEL;
+    if body.level > supported {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "feature level {} is above this node's supported level {supported}",
+                body.level
+            ),
+        )
+            .into_response();
+    }
+    let groups = state
+        .runtime
+        .set_feature_level_all_groups(body.level)
+        .await
+        .into_iter()
+        .map(|(group, result)| match result {
+            Ok(response) => serde_json::json!({
+                "raft_group_id": group.0,
+                "status": "set",
+                "level": response.level,
+                "previous_level": response.previous_level,
+            }),
+            Err(err) if err.leader_hint().is_some() => serde_json::json!({
+                "raft_group_id": group.0,
+                "status": "not_leader",
+                "leader_id": err.leader_hint().and_then(|hint| hint.node_id),
+            }),
+            Err(RuntimeError::GroupNotHosted { .. }) => serde_json::json!({
+                "raft_group_id": group.0,
+                "status": "not_hosted",
+            }),
+            Err(err) => serde_json::json!({
+                "raft_group_id": group.0,
+                "status": "error",
+                "error": err.to_string(),
+            }),
+        })
+        .collect::<Vec<_>>();
+    json_response(
+        StatusCode::OK,
+        serde_json::json!({
+            "version": FEATURE_LEVEL_REPORT_VERSION,
+            "node_id": local_raft_node_id(&state),
+            "requested_level": body.level,
+            "groups": groups,
+        })
+        .to_string(),
+    )
 }
 
 pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {

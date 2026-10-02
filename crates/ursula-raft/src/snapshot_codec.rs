@@ -87,6 +87,14 @@ pub(crate) fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, Snaps
     let snapshot_write_unit = header
         .committed_write_unit_bytes
         .unwrap_or(ursula_stream::COMMITTED_WRITE_UNIT_BYTES);
+    if header.feature_level > ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL {
+        return Err(SnapshotStoreError::Deserialize(format!(
+            "snapshot feature level {} exceeds this binary's supported level {}; \
+             a binary that cannot apply that level must not run this group",
+            header.feature_level,
+            ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL
+        )));
+    }
     if snapshot_write_unit != ursula_stream::COMMITTED_WRITE_UNIT_BYTES {
         return Err(SnapshotStoreError::Deserialize(format!(
             "snapshot committed write unit is {snapshot_write_unit} bytes; this build uses {}",
@@ -121,6 +129,7 @@ pub(crate) fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, Snaps
                 .into_iter()
                 .map(bucket_quota_from_proto)
                 .collect(),
+            feature_level: header.feature_level,
         },
         stream_append_counts,
     })
@@ -193,6 +202,7 @@ impl GroupSnapshotFrameIter {
             shared_cold_object_owners,
             bucket_usage,
             bucket_quotas,
+            feature_level,
         } = stream_snapshot;
         Self {
             header: Some(proto::SnapshotHeaderV1 {
@@ -217,6 +227,7 @@ impl GroupSnapshotFrameIter {
                     .map(bucket_quota_to_proto)
                     .collect(),
                 committed_write_unit_bytes: Some(ursula_stream::COMMITTED_WRITE_UNIT_BYTES),
+                feature_level,
             }),
             streams: streams.into_iter(),
             append_counts: stream_append_counts.into_iter(),
@@ -727,6 +738,7 @@ mod tests {
                         max_retained_bytes: Some(1024),
                     },
                 }],
+                feature_level: ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL,
             },
             stream_append_counts: vec![StreamAppendCount {
                 stream_id: BucketStreamId {
@@ -767,6 +779,7 @@ mod tests {
                     bucket_usage: Vec::new(),
                     bucket_quotas: Vec::new(),
                     committed_write_unit_bytes: None,
+                    feature_level: 0,
                 },
             )),
         })
@@ -794,6 +807,7 @@ mod tests {
             bucket_usage: Vec::new(),
             bucket_quotas: Vec::new(),
             committed_write_unit_bytes: Some(4096),
+            feature_level: 0,
         };
         let bytes = [
             encode_frame(proto::SnapshotFrameV1 {
@@ -811,5 +825,107 @@ mod tests {
 
         let error = decode_group_snapshot(&bytes).expect_err("unit mismatch must fail restore");
         assert!(error.to_string().contains("4096"), "{error}");
+    }
+
+    fn header_only_snapshot(feature_level: u32) -> Vec<u8> {
+        let header = proto::SnapshotHeaderV1 {
+            placement: Some(placement_to_proto(ShardPlacement {
+                core_id: CoreId(0),
+                shard_id: ShardId(0),
+                raft_group_id: RaftGroupId(0),
+            })),
+            group_commit_index: 0,
+            buckets: Vec::new(),
+            erased_buckets: Vec::new(),
+            next_cold_gc_seq: 0,
+            shared_cold_object_owners: Vec::new(),
+            bucket_usage: Vec::new(),
+            bucket_quotas: Vec::new(),
+            committed_write_unit_bytes: None,
+            feature_level,
+        };
+        [
+            encode_frame(proto::SnapshotFrameV1 {
+                frame: Some(proto::snapshot_frame_v1::Frame::Header(header)),
+            })
+            .expect("encode header"),
+            encode_frame(proto::SnapshotFrameV1 {
+                frame: Some(proto::snapshot_frame_v1::Frame::Footer(
+                    proto::SnapshotFooterV1 {},
+                )),
+            })
+            .expect("encode footer"),
+        ]
+        .concat()
+    }
+
+    /// The header as written before C0, without field 10.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct LegacySnapshotHeaderV1 {
+        #[prost(message, optional, tag = "1")]
+        placement: Option<proto::ShardPlacementV1>,
+        #[prost(uint64, tag = "2")]
+        group_commit_index: u64,
+        #[prost(string, repeated, tag = "3")]
+        buckets: Vec<String>,
+    }
+
+    #[test]
+    fn legacy_snapshot_without_feature_level_decodes_as_level_zero() {
+        let legacy_header = LegacySnapshotHeaderV1 {
+            placement: Some(placement_to_proto(ShardPlacement {
+                core_id: CoreId(0),
+                shard_id: ShardId(0),
+                raft_group_id: RaftGroupId(3),
+            })),
+            group_commit_index: 5,
+            buckets: vec!["bucket".to_owned()],
+        };
+        // Frame field 1 (header) carrying the legacy message, length-delimited
+        // exactly as `encode_frame` lays out a frame.
+        let mut frame = Vec::new();
+        prost::encoding::message::encode(1, &legacy_header, &mut frame);
+        let mut bytes = Vec::new();
+        prost::encoding::encode_varint(frame.len() as u64, &mut bytes);
+        bytes.extend_from_slice(&frame);
+        bytes.extend(
+            encode_frame(proto::SnapshotFrameV1 {
+                frame: Some(proto::snapshot_frame_v1::Frame::Footer(
+                    proto::SnapshotFooterV1 {},
+                )),
+            })
+            .expect("encode footer"),
+        );
+
+        let decoded = decode_group_snapshot(&bytes).expect("decode legacy snapshot");
+        assert_eq!(decoded.stream_snapshot.feature_level, 0);
+        assert_eq!(decoded.stream_snapshot.buckets, vec!["bucket".to_owned()]);
+        assert_eq!(decoded.group_commit_index, 5);
+    }
+
+    #[test]
+    fn feature_level_round_trips_through_the_header() {
+        let decoded = decode_group_snapshot(&header_only_snapshot(1)).expect("decode level 1");
+        assert_eq!(decoded.stream_snapshot.feature_level, 1);
+        let reencoded = group_snapshot_frames(decoded.clone())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("encode frames")
+            .concat();
+        assert_eq!(
+            decode_group_snapshot(&reencoded).expect("decode again"),
+            decoded
+        );
+    }
+
+    #[test]
+    fn rejects_a_snapshot_above_the_supported_feature_level() {
+        let err = decode_group_snapshot(&header_only_snapshot(
+            ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL + 1,
+        ))
+        .expect_err("future level rejected");
+        assert!(
+            matches!(&err, SnapshotStoreError::Deserialize(message) if message.contains("feature level")),
+            "{err:?}"
+        );
     }
 }

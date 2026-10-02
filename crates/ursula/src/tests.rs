@@ -7106,3 +7106,87 @@ async fn bucket_quota_endpoint_enforces_and_clears_backstops() {
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
 }
+
+// Keyed-streams C0: replicated group feature level admin surface.
+#[tokio::test]
+async fn feature_level_endpoint_reports_and_raises_every_group() {
+    let app = test_router();
+
+    let response = http_get(&app, "/__ursula/feature-level").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let report: serde_json::Value =
+        serde_json::from_slice(&body_bytes(response).await).expect("report json");
+    assert_eq!(report["version"], 1);
+    assert_eq!(
+        report["supported_level"],
+        u64::from(ursula_runtime::MAX_SUPPORTED_FEATURE_LEVEL)
+    );
+    let groups = report["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 8);
+    assert!(groups.iter().all(|group| group["level"] == 0));
+
+    let response = http_post(
+        &app,
+        "/__ursula/feature-level",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"level":1}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let outcome: serde_json::Value =
+        serde_json::from_slice(&body_bytes(response).await).expect("outcome json");
+    let groups = outcome["groups"].as_array().expect("groups");
+    assert_eq!(groups.len(), 8);
+    assert!(
+        groups
+            .iter()
+            .all(|group| group["status"] == "set" && group["level"] == 1),
+        "{outcome}"
+    );
+
+    // Lower levels are accepted as no-ops: never lowered.
+    let response = http_post(
+        &app,
+        "/__ursula/feature-level",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(r#"{"level":0}"#),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = http_get(&app, "/__ursula/feature-level").await;
+    let report: serde_json::Value =
+        serde_json::from_slice(&body_bytes(response).await).expect("report json");
+    let groups = report["groups"].as_array().expect("groups");
+    assert!(groups.iter().all(|group| group["level"] == 1), "{report}");
+}
+
+#[tokio::test]
+async fn feature_level_endpoint_refuses_levels_this_node_cannot_apply() {
+    let app = test_router();
+    let level = ursula_runtime::MAX_SUPPORTED_FEATURE_LEVEL + 1;
+    let response = http_post(
+        &app,
+        "/__ursula/feature-level",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::from(format!(r#"{{"level":{level}}}"#)),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+    assert!(body.contains("supported level"), "{body}");
+
+    let response = http_get(&app, "/__ursula/feature-level").await;
+    let report: serde_json::Value =
+        serde_json::from_slice(&body_bytes(response).await).expect("report json");
+    let groups = report["groups"].as_array().expect("groups");
+    assert!(groups.iter().all(|group| group["level"] == 0), "{report}");
+}
+
+#[test]
+fn feature_not_enabled_maps_to_conflict() {
+    assert_eq!(
+        crate::render::stream_error_code_status(ursula_runtime::StreamErrorCode::FeatureNotEnabled),
+        StatusCode::CONFLICT
+    );
+}

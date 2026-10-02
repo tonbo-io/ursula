@@ -373,6 +373,24 @@ pub struct SetBucketQuotaResponse {
     pub group_commit_index: u64,
 }
 
+/// Raises one group's replicated feature level (C0) to
+/// `max(current, level)`. The caller replicates the same request to every
+/// group, and must only send levels every replica supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetFeatureLevelRequest {
+    pub level: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetFeatureLevelResponse {
+    pub placement: ShardPlacement,
+    /// The group's level after apply.
+    pub level: u32,
+    /// The group's level before apply.
+    pub previous_level: u32,
+    pub group_commit_index: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportGroupStateRequest {
     pub snapshot: Box<ursula_stream::StreamSnapshot>,

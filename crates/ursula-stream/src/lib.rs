@@ -3,6 +3,7 @@
 //! Module map:
 //!
 //! - [`command`]: replicated command variants applied to the state machine.
+//! - [`feature`]: replicated group feature levels and the apply-time gate.
 //! - [`response`]: result variants and error codes returned per command.
 //! - [`model`]: persistent data types (metadata, segments, producer state, plans).
 //! - [`record_index`]: exact retained record-ordinal to offset boundaries.
@@ -11,6 +12,7 @@
 //! - [`validate`]: bucket/stream id validation used by HTTP and Raft entry points.
 
 mod command;
+mod feature;
 mod integrity;
 mod model;
 mod record_index;
@@ -20,6 +22,10 @@ mod state_machine;
 mod validate;
 
 pub use command::StreamCommand;
+pub use feature::FEATURE_LEVEL_BASELINE;
+pub use feature::FEATURE_LEVEL_KEYED_STREAMS;
+pub use feature::MAX_SUPPORTED_FEATURE_LEVEL;
+pub use feature::check_feature_level;
 pub use integrity::StreamIntegritySnapshot;
 pub use model::AppendStreamInput;
 pub use model::BucketQuota;

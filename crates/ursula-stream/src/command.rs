@@ -156,6 +156,14 @@ pub enum StreamCommand {
         max_streams: Option<u64>,
         max_retained_bytes: Option<u64>,
     },
+    /// Raises this group's replicated feature level to
+    /// `max(current, level)`; never lowers it. Idempotent under replay.
+    /// See [`crate::MAX_SUPPORTED_FEATURE_LEVEL`] for what each level enables.
+    /// Proposers must only send levels every replica supports; apply itself
+    /// accepts any value so that every replica applies it identically.
+    SetFeatureLevel {
+        level: u32,
+    },
 }
 
 impl fmt::Display for StreamCommand {
@@ -241,6 +249,7 @@ impl fmt::Display for StreamCommand {
             Self::SetBucketQuota { bucket_id, .. } => {
                 write!(f, "set_bucket_quota:{bucket_id}")
             }
+            Self::SetFeatureLevel { level } => write!(f, "set_feature_level:{level}"),
         }
     }
 }

@@ -18,6 +18,7 @@ use crate::request::DeleteStreamRequest;
 use crate::request::FlushColdRequest;
 use crate::request::PublishSnapshotRequest;
 use crate::request::SetBucketQuotaRequest;
+use crate::request::SetFeatureLevelRequest;
 use crate::request::StreamAppendCount;
 use crate::request::UpdateStreamAttrsRequest;
 
@@ -181,6 +182,14 @@ impl From<SetBucketQuotaRequest> for StreamCommand {
     }
 }
 
+impl From<SetFeatureLevelRequest> for StreamCommand {
+    fn from(request: SetFeatureLevelRequest) -> Self {
+        Self::SetFeatureLevel {
+            level: request.level,
+        }
+    }
+}
+
 impl From<CloseStreamRequest> for StreamCommand {
     fn from(request: CloseStreamRequest) -> Self {
         Self::Close {
@@ -240,6 +249,7 @@ group_write_from_request!(
     PublishSnapshotRequest,
     AdvanceRetentionRequest,
     SetBucketQuotaRequest,
+    SetFeatureLevelRequest,
     CloseStreamRequest,
     DeleteStreamRequest,
     FlushColdRequest,
