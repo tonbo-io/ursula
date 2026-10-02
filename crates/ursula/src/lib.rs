@@ -3227,13 +3227,6 @@ pub(crate) async fn read_stream_by_id(
         )
             .into_response();
     }
-    if record_aware && query.contains_key("max_bytes") {
-        return (
-            StatusCode::BAD_REQUEST,
-            "record-aware reads do not support max_bytes",
-        )
-            .into_response();
-    }
     if live_mode.is_some() && !query.contains_key("offset") && !record_aware {
         return (
             StatusCode::BAD_REQUEST,
@@ -3281,10 +3274,19 @@ pub(crate) async fn read_stream_by_id(
             Err(response) => return *response,
         }
     };
-    let max_len = query
-        .get("max_bytes")
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(usize::MAX);
+    // On a record-aware read `max_bytes` bounds complete records (P7,
+    // extensions.md §6.6) and must be a positive integer; offset reads keep
+    // the base protocol's lenient parsing.
+    let max_len = match query.get("max_bytes") {
+        Some(raw) if record_aware => match raw.parse::<usize>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                return (StatusCode::BAD_REQUEST, "max_bytes must be positive").into_response();
+            }
+        },
+        Some(raw) => raw.parse::<usize>().unwrap_or(usize::MAX),
+        None => usize::MAX,
+    };
 
     match live_mode {
         Some("sse") => {
@@ -3925,7 +3927,9 @@ pub(crate) async fn sse_stream(
         .http_metrics
         .sse_streams_opened
         .fetch_add(1, Ordering::Relaxed);
-    let sse_max_len = if encode_base64 {
+    // Record-aware reads always return whole records, so only offset reads
+    // need room for one complete UTF-8 code point.
+    let sse_max_len = if encode_base64 || record.is_some() {
         max_len.max(1)
     } else {
         max_len.max(4)

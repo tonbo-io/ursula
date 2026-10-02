@@ -1019,21 +1019,22 @@ impl InMemoryGroupEngine {
                 ),
             ));
         }
-        let next_record = request
+        let window_end = request
             .max_records
             .map(|limit| record.saturating_add(limit))
             .unwrap_or(retained_record_range.next_record)
             .min(retained_record_range.next_record);
-        let offset = self
-            .state_machine
-            .offset_for_record(&request.stream_id, record)
-            .map_err(|err| GroupEngineError::new(format!("record offset: {err:?}")))?
-            .ok_or_else(|| GroupEngineError::new("record stream disappeared"))?;
-        let next_offset = self
-            .state_machine
-            .offset_for_record(&request.stream_id, next_record)
-            .map_err(|err| GroupEngineError::new(format!("record offset: {err:?}")))?
-            .ok_or_else(|| GroupEngineError::new("record stream disappeared"))?;
+        let offset = self.record_offset(&request.stream_id, record)?;
+        // P7 (extensions.md §6.6): `max_len` is the request's `max_bytes`
+        // budget and cuts the planned window at the last record boundary
+        // within it, keeping at least one record.
+        let (next_record, next_offset) = self.record_byte_cut(
+            &request.stream_id,
+            record,
+            offset,
+            window_end,
+            request.max_len,
+        )?;
         let max_len = usize::try_from(next_offset.saturating_sub(offset))
             .map_err(|_| GroupEngineError::new("record read window exceeds usize"))?;
         let mut plan = self
@@ -1046,6 +1047,50 @@ impl InMemoryGroupEngine {
             next_record,
         });
         Ok(plan)
+    }
+
+    fn record_offset(
+        &self,
+        stream_id: &BucketStreamId,
+        record: u64,
+    ) -> Result<u64, GroupEngineError> {
+        self.state_machine
+            .offset_for_record(stream_id, record)
+            .map_err(|err| GroupEngineError::new(format!("record offset: {err:?}")))?
+            .ok_or_else(|| GroupEngineError::new("record stream disappeared"))
+    }
+
+    /// Returns the end `(record, offset)` of the longest run of complete
+    /// records in `[record, window_end)` whose stored bytes fit in
+    /// `max_bytes`, and never fewer than one record when the window is not
+    /// empty. Record boundaries are monotonic, so this binary-searches them.
+    fn record_byte_cut(
+        &self,
+        stream_id: &BucketStreamId,
+        record: u64,
+        offset: u64,
+        window_end: u64,
+        max_bytes: usize,
+    ) -> Result<(u64, u64), GroupEngineError> {
+        let window_end_offset = self.record_offset(stream_id, window_end)?;
+        let budget = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+        if window_end <= record || window_end_offset.saturating_sub(offset) <= budget {
+            return Ok((window_end, window_end_offset));
+        }
+        let limit = offset.saturating_add(budget);
+        // Invariant: `low` fits (or is the mandatory first record); every
+        // record end above `high` does not fit.
+        let mut low = record.saturating_add(1);
+        let mut high = window_end.saturating_sub(1);
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            if self.record_offset(stream_id, mid)? <= limit {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        Ok((low, self.record_offset(stream_id, low)?))
     }
 
     /// Per-bucket usage held by this group's state machine. Public so the
