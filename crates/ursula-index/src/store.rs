@@ -163,6 +163,10 @@ pub enum IndexError {
     UnknownIndex(String),
     #[error("index starts at source record {stored}, not configured record {configured}")]
     IndexBaseMismatch { stored: u64, configured: u64 },
+    #[error("keyed record {record} cannot be applied: {reason}")]
+    InvalidKeyedRecord { record: u64, reason: String },
+    #[error("invalid keyed projection state: {0}")]
+    InvalidKeyedState(String),
 }
 
 pub(crate) fn parse_timestamp(value: &Value) -> Option<i64> {

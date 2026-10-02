@@ -104,6 +104,25 @@ pub struct IndexerArgs {
     maintenance_interval_ms: u64,
     #[arg(long, default_value = "captured_at")]
     timestamp_field: String,
+    /// Keyed mode: serve the internal `/v1/keyed` API for keyed streams read
+    /// from this Ursula node or gateway base URL (design §3.4). Namespaces
+    /// live under `.keyed/` of the object store (`--object-dir`, or
+    /// `--s3-bucket` with `--keyed-s3-root`).
+    #[arg(long, conflicts_with = "stream_url")]
+    keyed_source_url: Option<Url>,
+    /// Keyed mode: object-store root holding `.keyed/` in the S3 bucket (the
+    /// node cold store's root; empty for the bucket root).
+    #[arg(long, default_value = "")]
+    keyed_s3_root: String,
+    /// Keyed mode: minimum spacing of one namespace's publications.
+    #[arg(long, default_value_t = 5_000)]
+    keyed_min_publish_interval_ms: u64,
+    /// Keyed mode: grace period before unreachable objects are deleted.
+    #[arg(long, default_value_t = 600)]
+    keyed_gc_grace_seconds: u64,
+    /// Keyed mode: maximum concurrent waiting keyed-state reads.
+    #[arg(long, default_value_t = 10_000)]
+    keyed_max_waiters: usize,
 }
 
 #[derive(Debug, Args)]
@@ -317,6 +336,9 @@ pub async fn run(args: IndexerArgs) -> anyhow::Result<()> {
     let _observability =
         ursula_observability::init(ursula_observability::InitOptions::new("ursula-indexer"));
     validate_args(&args)?;
+    if let Some(source_url) = args.keyed_source_url.clone() {
+        return run_keyed(args, source_url).await;
+    }
     match args.stream_url.clone() {
         Some(stream_url) => run_single(args, stream_url).await,
         None => run_pool(args).await,
@@ -426,6 +448,52 @@ async fn run_single(args: IndexerArgs, stream_url: Url) -> anyhow::Result<()> {
         .flush()
         .await
         .context("flush event index on shutdown")?;
+    Ok(())
+}
+
+/// Keyed mode: the keyed projection engine behind `/v1/keyed`.
+async fn run_keyed(args: IndexerArgs, source_url: Url) -> anyhow::Result<()> {
+    if args.keyed_gc_grace_seconds == 0 || args.keyed_max_waiters == 0 {
+        anyhow::bail!("--keyed-gc-grace-seconds and --keyed-max-waiters must be positive");
+    }
+    let target = match StoreTarget::from_args(&args)? {
+        StoreTarget::S3 {
+            bucket,
+            region,
+            endpoint,
+            ..
+        } => StoreTarget::S3 {
+            bucket,
+            root: args.keyed_s3_root.clone(),
+            region,
+            endpoint,
+        },
+        fs @ StoreTarget::Fs { .. } => fs,
+    };
+    let store = target.open("").context("open object store")?;
+    let cache = EventIndexCache::serving(args.cache_dir.join("keyed"), args.cache_max_bytes)?;
+    let source = crate::keyed::KeyedSourceClient::new(source_url.clone())
+        .context("configure keyed source client")?;
+    let config = crate::keyed::KeyedEngineConfig {
+        min_publish_interval: Duration::from_millis(args.keyed_min_publish_interval_ms),
+        gc_grace: Duration::from_secs(args.keyed_gc_grace_seconds),
+        max_waiters: args.keyed_max_waiters,
+        ..crate::keyed::KeyedEngineConfig::default()
+    };
+    let engine = crate::keyed::KeyedEngine::new(store, source, Some(cache), config);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let maintenance = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.run_maintenance(shutdown_rx).await }
+    });
+    tracing::info!(
+        listen = %args.listen,
+        source = %source_url,
+        cache_dir = %args.cache_dir.display(),
+        "keyed indexer starting"
+    );
+    serve(crate::keyed::http::router(engine), args.listen, shutdown_tx).await?;
+    maintenance.await.context("join keyed maintenance loop")?;
     Ok(())
 }
 
