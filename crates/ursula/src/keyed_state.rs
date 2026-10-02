@@ -285,7 +285,7 @@ async fn serve(
             "keyed-state only supports GET",
         )
             .into_response();
-        return advertise_if_keyed(&state, stream_id, response).await;
+        return advertise_if_keyed(state, stream_id, response).await;
     }
     let params = match parse_params(raw_query.as_deref()) {
         Ok(params) => params,
@@ -293,13 +293,13 @@ async fn serve(
             let mut headers = HeaderMap::new();
             insert_default_response_headers(&mut headers);
             let response = (StatusCode::BAD_REQUEST, headers, reason).into_response();
-            return advertise_if_keyed(&state, stream_id, response).await;
+            return advertise_if_keyed(state, stream_id, response).await;
         }
     };
-    let head = match head(&state, stream_id.clone()).await {
+    let head = match head(state, stream_id.clone()).await {
         Ok(head) => head,
         Err(err) => {
-            return runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri))
+            return runtime_error_or_leader_redirect_async(state, err, &request_target(&uri))
                 .await;
         }
     };
