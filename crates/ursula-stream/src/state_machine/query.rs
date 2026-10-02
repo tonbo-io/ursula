@@ -263,8 +263,12 @@ impl StreamStateMachine {
         let next_offset = stream.tail_offset.min(offset.saturating_add(max_len_u64));
         let mut segments = Vec::<(u64, StreamReadSegment)>::new();
         let hot_segments = slot.hot_buffer.read_segments(offset, next_offset);
-        let cold_frontier = self.cold_frontier_offset(stream_id, retained_offset);
-        let cold_index_end = next_offset.min(cold_frontier);
+        // F18 step 1: coverage is the complement of the hot buffer. Every
+        // byte of `[retained, tail)` that no hot segment holds is cold, served
+        // by state refs where they exist and by cold-index pages otherwise.
+        // The replicated scalar frontier can lag below an external append
+        // (bounded-state D1), so it no longer bounds cold-index lookups.
+        let cold_index_end = next_offset;
         let mut direct_cold_ranges = self
             .cold_chunks(stream_id)
             .iter()
