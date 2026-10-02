@@ -1878,6 +1878,9 @@ impl Inner {
         work: impl std::future::Future<Output = Result<T, CycleError>>,
     ) -> Result<T, CycleError> {
         let deadline = self.config.work_deadline;
+        if cfg!(madsim) {
+            return work.await;
+        }
         // Biased: completion and the deadline at the same instant resolve
         // the same way on every run (simulation determinism).
         tokio::select! {
