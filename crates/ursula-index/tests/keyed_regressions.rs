@@ -924,3 +924,91 @@ async fn a_repair_rebuild_never_publishes_below_the_old_d() {
     assert!(after.manifest.generation > before.manifest.generation);
     assert_eq!(after.manifest.through_record, 6);
 }
+
+/// The real service serves through the verified range cache. A missing part
+/// must be recognized there too: with the footer cached and a data block
+/// not yet in the range cache, a deleted part surfaces from the cache's
+/// fetch, and the read must schedule a rebuild instead of answering 503
+/// forever. (Real time: the range cache does disk IO.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_part_behind_the_range_cache_triggers_a_rebuild() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = ursula_index::EventIndexCache::serving(cache_dir.path(), 16 * 1024 * 1024).unwrap();
+    let log = Arc::new(FakeLog::default());
+    let clock: Arc<dyn Clock> = Arc::new(TestClock(tokio::time::Instant::now()));
+    let raw = MemoryObjectStore::new(Arc::clone(&clock));
+    let engine = KeyedEngine::with_clock(
+        ObjectStore::from(raw.clone()),
+        Arc::clone(&log),
+        Some(cache),
+        KeyedEngineConfig {
+            min_publish_interval: Duration::ZERO,
+            gc_grace: GRACE,
+            gc_tick: Duration::from_secs(3_600),
+            // Reads go to the store through the range cache.
+            write_cache_bytes: 0,
+            // Small pages and blocks: a point read fetches one block.
+            part_options: PartOptions {
+                data_page_rows: 2,
+                row_group_rows: 8,
+                layout_block_bytes: 256,
+                target_part_bytes: 1 << 20,
+                read_batch_rows: 2,
+            },
+            ..KeyedEngineConfig::default()
+        },
+        Arc::clone(&clock),
+    );
+    // Forty distinct keys in one part.
+    log.records.lock().unwrap().extend((0..40).map(|index| {
+        format!(
+            r#"{{"ops":[["p","{}",{index}]]}}"#,
+            encode_key(format!("key{index:03}").as_bytes())
+        )
+    }));
+    let KeyedReadOutcome::Rows { through: 40, .. } = engine
+        .read(KeyedReadRequest {
+            source: source(),
+            source_next: 40,
+            selection: Selection::Point(b"key000".to_vec()),
+            min_through_record: Some(40),
+            timeout: Duration::from_secs(5),
+        })
+        .await
+    else {
+        panic!("first publication and point read");
+    };
+    let namespace = KeyedNamespace::new(ObjectStore::from(raw.clone()), source());
+    let before = namespace.load().await.unwrap().unwrap();
+    assert_eq!(before.manifest.part_keys().count(), 1, "one part");
+    let lost = before.manifest.part_keys().next().unwrap().to_owned();
+    namespace.delete(&lost).await.unwrap();
+
+    // A range read needs blocks the point read never fetched.
+    let outcome = read(&engine, 40, Duration::from_secs(5)).await;
+    assert!(
+        matches!(outcome, KeyedReadOutcome::Unavailable(_)),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        engine.metrics().damaged_rebuilds,
+        1,
+        "a rebuild is scheduled"
+    );
+    let mut served = None;
+    for _ in 0..100 {
+        if let KeyedReadOutcome::Rows { through: 40, page } =
+            read(&engine, 40, Duration::from_secs(5)).await
+        {
+            served = Some(page);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let page = served.expect("the rebuilt namespace serves reads");
+    let records = log.records.lock().unwrap().clone();
+    let state = KeyedState::fold(records.iter().map(String::as_str)).unwrap();
+    assert_eq!(page.body(), state.range(&all_rows()).body());
+    let after = namespace.load().await.unwrap().unwrap();
+    assert!(after.manifest.generation > before.manifest.generation);
+}
