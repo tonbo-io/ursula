@@ -67,6 +67,10 @@ pub struct ServerConfig {
     pub admin_listen: String,
     /// Process-wide cap on accepted write body bytes held by the HTTP layer.
     pub http_inflight_body_size: HumanSize,
+    /// Base URL of the keyed-state indexer (`ursula indexer` in keyed mode)
+    /// that serves `{stream_url}/keyed-state` (keyed-streams P3). When unset,
+    /// the resource answers 404 and nothing advertises `keyed-state-v1`.
+    pub keyed_state_upstream: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -76,6 +80,7 @@ impl Default for ServerConfig {
             cluster_listen: None,
             admin_listen: "127.0.0.1:4438".to_string(),
             http_inflight_body_size: HumanSize::mib(256),
+            keyed_state_upstream: None,
         }
     }
 }

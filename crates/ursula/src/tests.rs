@@ -553,8 +553,8 @@ async fn keyed_state_resource_routes_answer_404_and_never_reach_an_affinity_stre
         assert_eq!(response.status(), StatusCode::CREATED);
     }
 
-    // Before the proxy lands, every method on the resource answers 404 for
-    // both stream forms, so `/{b}/{s}/keyed-state` is never read, written or
+    // Without a keyed-state upstream, every method on the resource answers
+    // 404 for both stream forms, so `/{b}/{s}/keyed-state` is never read, written or
     // created as the affinity stream `keyed-state` (C8, U5).
     for uri in [
         "/benchcmp/session/keyed-state",

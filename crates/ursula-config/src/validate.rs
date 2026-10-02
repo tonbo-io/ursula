@@ -90,6 +90,25 @@ impl UrsulaConfig {
             ));
         }
         self.validate_cold_health_watermarks()?;
+        self.validate_keyed_state_upstream()?;
+        Ok(())
+    }
+
+    fn validate_keyed_state_upstream(&self) -> Result<(), ValidationError> {
+        let Some(upstream) = &self.server.keyed_state_upstream else {
+            return Ok(());
+        };
+        let valid = ["http://", "https://"].iter().any(|scheme| {
+            upstream
+                .get(..scheme.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+                && upstream.len() > scheme.len()
+        });
+        if !valid {
+            return Err(ValidationError::Other(format!(
+                "server.keyed_state_upstream must be an http:// or https:// URL, got {upstream:?}"
+            )));
+        }
         Ok(())
     }
 

@@ -363,6 +363,40 @@ core_count = 2
     }
 
     #[test]
+    fn keyed_state_upstream_loads_and_requires_an_http_url() {
+        let tmp = temp_config(
+            ".toml",
+            r#"
+[server]
+keyed_state_upstream = "http://127.0.0.1:7071"
+"#,
+        );
+        let config = load_config(Some(tmp.path()), None, Some(1)).unwrap();
+        assert_eq!(
+            config.server.keyed_state_upstream.as_deref(),
+            Some("http://127.0.0.1:7071")
+        );
+        assert_eq!(
+            load_config(None, None, Some(1))
+                .unwrap()
+                .server
+                .keyed_state_upstream,
+            None
+        );
+
+        for bad in ["127.0.0.1:7071", "ftp://indexer", "http://"] {
+            let tmp = temp_config(
+                ".toml",
+                &format!("[server]\nkeyed_state_upstream = \"{bad}\"\n"),
+            );
+            let msg = load_config(Some(tmp.path()), None, Some(1))
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("keyed_state_upstream"), "{bad}: {msg}");
+        }
+    }
+
+    #[test]
     fn validation_rejects_disk_without_path() {
         let tmp = temp_config(
             ".toml",

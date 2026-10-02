@@ -5,12 +5,15 @@
 //!
 //! - [`json_text`]: JSON Message Text (P1): validation, flattening and lexical
 //!   minification of `application/json` write bodies.
+//! - [`keyed_state`]: `{stream_url}/keyed-state` (keyed-streams P3): parameter
+//!   validation, stream resolution and forwarding to the indexer's `/v1/keyed`.
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
 //! - [`bootstrap`]: typed-config `spawn_*_runtime` constructors and cold-flush worker.
 //! - [`server`]: command arguments and the long-running server service entrypoint.
 
 mod bootstrap;
 pub mod json_text;
+pub mod keyed_state;
 mod otel_metrics;
 pub mod server;
 mod http_time {
@@ -320,6 +323,7 @@ struct CreateStreamHttpResponseInput<'a> {
     stream_ttl_seconds: Option<u64>,
     stream_expires_at_ms: Option<u64>,
     producer: Option<&'a ProducerRequest>,
+    keyed_state_served: bool,
 }
 
 pub trait WallClock: Send + Sync + 'static {
@@ -350,6 +354,10 @@ pub struct HttpState {
     /// (e.g. ursulactl auto-enabling empty-log rejoin only for `memory`).
     wal_backend: &'static str,
     wal_disk: WalDiskMonitor,
+    /// Indexer serving `/v1/keyed`; `None` means keyed state is not served
+    /// (`{stream_url}/keyed-state` answers 404 and nothing advertises
+    /// `keyed-state-v1`).
+    keyed_state_upstream: Option<Arc<keyed_state::KeyedStateUpstream>>,
 }
 
 impl HttpState {
@@ -372,6 +380,7 @@ impl HttpState {
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
+            keyed_state_upstream: None,
         }
     }
 
@@ -391,6 +400,7 @@ impl HttpState {
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
+            keyed_state_upstream: None,
         }
     }
 
@@ -431,6 +441,7 @@ impl HttpState {
             external_payload_min_bytes: 1024 * 1024,
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
+            keyed_state_upstream: None,
         }
     }
 
@@ -460,6 +471,18 @@ impl HttpState {
     pub fn with_external_payload_min_bytes(mut self, min_bytes: usize) -> Self {
         self.external_payload_min_bytes = min_bytes;
         self
+    }
+
+    /// Serve `{stream_url}/keyed-state` through this indexer base URL
+    /// (keyed-streams P3, U7).
+    pub fn with_keyed_state_upstream(mut self, upstream: keyed_state::KeyedStateUpstream) -> Self {
+        self.keyed_state_upstream = Some(Arc::new(upstream));
+        self
+    }
+
+    /// Whether `keyed-state-v1` is served (and advertised) for keyed streams.
+    pub(crate) fn serves_keyed_state(&self) -> bool {
+        self.keyed_state_upstream.is_some()
     }
 
     /// Record the raft WAL backend so it appears in the metrics JSON.
@@ -1312,6 +1335,7 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
                     media_type == "application/json"
                         || media_type == "application/x-ndjson"
                         || media_type == "application/vnd.durable-stream-records+ndjson"
+                        || media_type == keyed_state::KEYED_ROWS_CONTENT_TYPE
                 })
         };
     let response_compression = CompressionLayer::new()
@@ -1365,11 +1389,11 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         .route("/{bucket}/{stream}/append-batch", post(append_batch))
         .route(
             "/{bucket}/{stream}/keyed-state",
-            any(keyed_state_not_served),
+            any(keyed_state::keyed_state),
         )
         .route(
             "/{bucket}/{affinity}/{stream}/keyed-state",
-            any(keyed_state_not_served),
+            any(keyed_state::keyed_state),
         )
         .route(
             "/{bucket}/{affinity}/$transaction",
@@ -1421,18 +1445,6 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         ))
         .layer(response_compression)
         .with_state(state)
-}
-
-/// `{stream_url}/keyed-state` (keyed-streams P3). The name is reserved
-/// for routing at once (C8, U5), so these explicit routes keep it from ever
-/// matching the affinity stream route; until the keyed-state proxy lands,
-/// every method answers 404, which P3 also uses for unkeyed streams.
-async fn keyed_state_not_served() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        "keyed-state is not served for this stream",
-    )
-        .into_response()
 }
 
 pub(crate) fn should_externalize_payload(
@@ -1536,6 +1548,7 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
         stream_ttl_seconds,
         stream_expires_at_ms,
         producer,
+        keyed_state_served,
     } = input;
     let mut headers = HeaderMap::new();
     insert_default_response_headers(&mut headers);
@@ -1548,6 +1561,7 @@ pub(crate) fn create_stream_http_response(input: CreateStreamHttpResponseInput<'
         insert_record_operation_headers(&mut headers, record_range);
     }
     insert_keyed_extension_for(&mut headers, content_type);
+    insert_keyed_state_extension_for(&mut headers, content_type, keyed_state_served);
     if response.closed {
         insert_static(&mut headers, HEADER_STREAM_CLOSED, "true");
     }
@@ -2765,6 +2779,7 @@ pub(crate) async fn create_stream_by_id(
             stream_ttl_seconds,
             stream_expires_at_ms,
             producer: producer.as_ref(),
+            keyed_state_served: state.serves_keyed_state(),
         }),
         Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
@@ -2798,6 +2813,7 @@ pub(crate) async fn create_stream_external_by_id(
             stream_ttl_seconds,
             stream_expires_at_ms,
             producer: producer.as_ref(),
+            keyed_state_served: state.serves_keyed_state(),
         }),
         Err(err) => {
             cleanup_external_payload(&state, &external_path, &err).await;
@@ -3275,6 +3291,11 @@ pub(crate) async fn head_stream_by_id(
             insert_default_response_headers(&mut headers);
             insert_content_type(&mut headers, &response.content_type);
             insert_keyed_extension_for(&mut headers, &response.content_type);
+            insert_keyed_state_extension_for(
+                &mut headers,
+                &response.content_type,
+                state.serves_keyed_state(),
+            );
             insert_offset(&mut headers, response.tail_offset);
             insert_u64_header(
                 &mut headers,
@@ -3357,6 +3378,18 @@ pub(crate) fn insert_keyed_extension_for(headers: &mut HeaderMap, content_type: 
     if ursula_shard::is_keyed_batch_content_type(content_type) {
         insert_record_extension(headers);
         insert_extension_token(headers, KEYED_BATCH_EXTENSION);
+    }
+}
+
+/// Advertises `keyed-state-v1` on the create and `HEAD` responses of a keyed
+/// stream when this node serves the resource (`extensions.md` §9.2.7).
+pub(crate) fn insert_keyed_state_extension_for(
+    headers: &mut HeaderMap,
+    content_type: &str,
+    served: bool,
+) {
+    if served && ursula_shard::is_keyed_batch_content_type(content_type) {
+        insert_extension_token(headers, keyed_state::KEYED_STATE_EXTENSION);
     }
 }
 
@@ -4650,3 +4683,6 @@ mod tests;
 
 #[cfg(test)]
 mod staging_cleanup_tests;
+
+#[cfg(test)]
+mod keyed_state_tests;
