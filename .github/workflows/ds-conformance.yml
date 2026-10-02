@@ -5,10 +5,10 @@ name: Durable Streams conformance
 # Runs on the keyed-streams integration branch and its agent task branches.
 
 on:
+  pull_request:
   push:
     branches:
-      - agent/keyed-streams
-      - "agent/ks-**"
+      - main
   workflow_dispatch:
 
 permissions:

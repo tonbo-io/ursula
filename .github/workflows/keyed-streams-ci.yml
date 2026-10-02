@@ -4,10 +4,10 @@ name: Keyed streams CI
 # Runs on pushes to the integration branch and to its agent task branches only.
 
 on:
+  pull_request:
   push:
     branches:
-      - agent/keyed-streams
-      - "agent/ks-**"
+      - main
 
 permissions:
   contents: read

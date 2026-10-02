@@ -9,10 +9,10 @@ name: Bounded state
 #   until then trigger it with workflow_dispatch.)
 
 on:
+  pull_request:
   push:
     branches:
-      - agent/keyed-streams
-      - "agent/ks-**"
+      - main
   schedule:
     - cron: "41 4 * * *"
   workflow_dispatch:
@@ -31,7 +31,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -39,7 +39,7 @@ env:
 jobs:
   state-growth:
     name: State growth ratchet
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.suite == 'pr')
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.suite == 'pr')
     runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 45
     steps:
