@@ -7637,3 +7637,150 @@ fn feature_not_enabled_maps_to_conflict() {
         StatusCode::CONFLICT
     );
 }
+
+/// bounded-stream-state F3: `Producer-Id` and `Stream-Seq` are capped at
+/// 256 bytes on every HTTP write path, ungated.
+#[tokio::test]
+async fn producer_id_and_stream_seq_length_caps_reject_with_400() {
+    let app = test_router();
+    let at_cap = "p".repeat(WRITE_IDENTIFIER_MAX_BYTES);
+    let over_cap = "p".repeat(WRITE_IDENTIFIER_MAX_BYTES + 1);
+    let producer = |id: &str| -> Vec<(&'static str, String)> {
+        vec![
+            (HEADER_PRODUCER_ID, id.to_owned()),
+            (HEADER_PRODUCER_EPOCH, "0".to_owned()),
+            (HEADER_PRODUCER_SEQ, "0".to_owned()),
+        ]
+    };
+    fn as_refs<'a>(headers: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+        headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect()
+    }
+
+    // Create.
+    let mut headers = producer(&over_cap);
+    headers.push((CONTENT_TYPE.as_str(), "text/plain".to_owned()));
+    let response = http_put(&app, "/benchcmp/caps-a", &as_refs(&headers), Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = http_put(
+        &app,
+        "/benchcmp/caps-a",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_STREAM_SEQ, over_cap.as_str()),
+        ],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = http_put(
+        &app,
+        "/benchcmp/caps-a",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // Append.
+    let mut headers = producer(&over_cap);
+    headers.push((CONTENT_TYPE.as_str(), "text/plain".to_owned()));
+    let response = http_post(
+        &app,
+        "/benchcmp/caps-a",
+        &as_refs(&headers),
+        Body::from("a"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = http_post(
+        &app,
+        "/benchcmp/caps-a",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_STREAM_SEQ, over_cap.as_str()),
+        ],
+        Body::from("a"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // Exactly at the cap is accepted.
+    let mut headers = producer(&at_cap);
+    headers.push((CONTENT_TYPE.as_str(), "text/plain".to_owned()));
+    headers.push((HEADER_STREAM_SEQ, at_cap.clone()));
+    let response = http_post(
+        &app,
+        "/benchcmp/caps-a",
+        &as_refs(&headers),
+        Body::from("a"),
+    )
+    .await;
+    assert!(response.status().is_success(), "{}", response.status());
+
+    // Append batch.
+    let response = http_post(
+        &app,
+        "/benchcmp/caps-a/append-batch",
+        &as_refs(&producer(&over_cap)),
+        Body::from(batch_body(&[b"b".as_slice()])),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Close with an empty body.
+    let mut headers = producer(&over_cap);
+    headers.push((HEADER_STREAM_CLOSED, "true".to_owned()));
+    let response = http_post(&app, "/benchcmp/caps-a", &as_refs(&headers), Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response = http_post(
+        &app,
+        "/benchcmp/caps-a",
+        &[
+            (HEADER_STREAM_CLOSED, "true"),
+            (HEADER_STREAM_SEQ, over_cap.as_str()),
+        ],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // `$transaction` JSON.
+    let response = http_put(
+        &app,
+        "/benchcmp/run-caps/journal",
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    for operation in [
+        json!({
+            "stream": "journal",
+            "content_type": "application/json",
+            "payload_base64": "eyJldmVudCI6MX0K",
+            "stream_seq": over_cap,
+        }),
+        json!({
+            "stream": "journal",
+            "content_type": "application/json",
+            "payload_base64": "eyJldmVudCI6MX0K",
+            "producer": {"producer_id": over_cap, "producer_epoch": 0, "producer_seq": 0},
+        }),
+    ] {
+        let response = http_post(
+            &app,
+            "/benchcmp/run-caps/$transaction",
+            &[(CONTENT_TYPE.as_str(), "application/json")],
+            Body::from(
+                serde_json::to_vec(&json!({"operations": [operation]}))
+                    .expect("serialize transaction"),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let journal = body_bytes(http_get(&app, "/benchcmp/run-caps/journal").await).await;
+    assert!(journal.is_empty());
+}
