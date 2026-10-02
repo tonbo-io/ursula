@@ -49,6 +49,7 @@ pub struct UrsulaConfig {
     pub storage: StorageConfig,
     pub governance: GovernanceConfig,
     pub observability: ObservabilityConfig,
+    pub keyed_state: KeyedStateConfig,
 }
 
 /// HTTP server binding and admission settings.
@@ -622,6 +623,29 @@ impl Default for ColdHealthConfig {
             hot_size_high: HumanSize::mib(48),
             hot_size_low: HumanSize::mib(32),
             errors_per_tick_high: 1,
+        }
+    }
+}
+
+/// Keyed-state projection settings (keyed-streams §3.4, §3.8).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeyedStateConfig {
+    /// Base URLs of every keyed-state indexer pod (for example
+    /// `http://indexer-0.indexer:4440`). Bucket purge sends
+    /// `POST {url}/v1/keyed/drain` to each one and erases `.keyed/{bucket}/`
+    /// only after all of them acknowledge (U23). Empty when no indexer runs.
+    pub indexer_urls: Vec<String>,
+    /// Per-indexer timeout of one drain request; a pod that does not
+    /// acknowledge in time leaves the purge incomplete (retry it).
+    pub drain_timeout: HumanDuration,
+}
+
+impl Default for KeyedStateConfig {
+    fn default() -> Self {
+        Self {
+            indexer_urls: Vec::new(),
+            drain_timeout: HumanDuration::sec(60),
         }
     }
 }

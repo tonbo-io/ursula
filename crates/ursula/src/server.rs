@@ -196,6 +196,7 @@ async fn init_state(
     };
     let mut state = state
         .with_runtime_config(&config.runtime)
+        .with_keyed_state_config(&config.keyed_state)
         .with_wal_backend(wal_backend);
     if let Some(wal_path) = config.raft.wal.resolved_path() {
         let monitor = crate::bootstrap::initialize_wal_disk_monitor(

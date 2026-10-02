@@ -727,3 +727,37 @@ kms_key_id = "arn:aws:kms:us-east-1:111122223333:key/test"
         );
     }
 }
+
+#[cfg(test)]
+mod keyed_state_tests {
+    use std::time::Duration;
+
+    use crate::config::UrsulaConfig;
+
+    #[test]
+    fn keyed_state_indexer_urls_parse_and_default_empty() {
+        let config = UrsulaConfig::default();
+        assert!(config.keyed_state.indexer_urls.is_empty());
+        assert_eq!(
+            config.keyed_state.drain_timeout.as_duration(),
+            Duration::from_secs(60)
+        );
+        let mut config: UrsulaConfig = toml::from_str(
+            r#"
+[keyed_state]
+indexer_urls = ["http://indexer-0:4440", "https://indexer-1:4440"]
+drain_timeout = "5s"
+"#,
+        )
+        .expect("valid config");
+        assert_eq!(config.keyed_state.indexer_urls.len(), 2);
+        assert_eq!(
+            config.keyed_state.drain_timeout.as_duration(),
+            Duration::from_secs(5)
+        );
+        config.raft.node_id = 1;
+        config.validate().expect("valid keyed_state config");
+        config.keyed_state.indexer_urls = vec!["indexer-0:4440".to_owned()];
+        assert!(config.validate().is_err());
+    }
+}
