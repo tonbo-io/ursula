@@ -700,7 +700,8 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                         payload: encode_wire(&response),
                     }),
                 raft_internal_proto::group_read_request_v1::Read::ReadStream(read) => {
-                    let read = read_stream_request_from_v1(stream_id, request.now_ms, read)?;
+                    let read = read_stream_request_from_v1(stream_id, request.now_ms, read)
+                        .map_err(tonic::Status::invalid_argument)?;
                     engine.read_stream(read, placement).await.map(|response| {
                         raft_internal_proto::GroupReadResponseV1 {
                             ok: true,
@@ -727,13 +728,14 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
 /// failures to `InvalidArgument`.
 /// Server half of a forwarded read: the engine request, with the F1
 /// continuation anchor the follower sent (absent from older followers).
+/// `Err` names the invalid field.
 pub(crate) fn read_stream_request_from_v1(
     stream_id: BucketStreamId,
     now_ms: u64,
     read: raft_internal_proto::ReadStreamReadV1,
-) -> Result<ReadStreamRequest, tonic::Status> {
-    let max_len = usize::try_from(read.max_len)
-        .map_err(|_| tonic::Status::invalid_argument("group_read.read_stream.max_len too large"))?;
+) -> Result<ReadStreamRequest, &'static str> {
+    let max_len =
+        usize::try_from(read.max_len).map_err(|_| "group_read.read_stream.max_len too large")?;
     Ok(ReadStreamRequest {
         stream_id,
         offset: read.offset,
