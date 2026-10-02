@@ -629,7 +629,8 @@ fn sweepable(key: &str) -> bool {
 }
 
 /// Deletes the namespace's unreferenced part and manifest objects older
-/// than `grace` (one LIST, plus a GET of each manifest readers may hold).
+/// than `grace` at wall-clock time `now` (one LIST, plus a GET of each
+/// manifest readers may hold).
 ///
 /// A manifest is protected when a reader may still use it: the published
 /// one; every manifest up to the published generation written within the
@@ -641,12 +642,13 @@ pub async fn sweep(
     store: ObjectStore,
     source: &KeyedSource,
     grace: Duration,
+    now: SystemTime,
     dry_run: bool,
 ) -> anyhow::Result<SweepReport> {
     let namespace = KeyedNamespace::new(store, source.clone());
     let objects = namespace.objects().await.context("list the namespace")?;
     let published = namespace.load().await.context("load CURRENT")?;
-    let cutoff = SystemTime::now().checked_sub(grace);
+    let cutoff = now.checked_sub(grace);
     let young = |modified: Option<SystemTime>| match (modified, cutoff) {
         (Some(modified), Some(cutoff)) => modified >= cutoff,
         _ => true,

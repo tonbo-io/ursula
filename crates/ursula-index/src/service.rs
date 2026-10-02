@@ -320,7 +320,8 @@ async fn run_keyed_command(command: KeyedCommand) -> anyhow::Result<()> {
         KeyedCommand::Sweep(args) => {
             let (store, source) = args.target.open()?;
             let grace = Duration::from_secs(args.grace_seconds);
-            print_json(&tools::sweep(store, &source, grace, args.dry_run).await?)?;
+            let now = SystemTime::now();
+            print_json(&tools::sweep(store, &source, grace, now, args.dry_run).await?)?;
         }
         KeyedCommand::Dump(args) => {
             let (store, source) = args.target.open()?;

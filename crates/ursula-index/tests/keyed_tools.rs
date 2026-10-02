@@ -527,15 +527,22 @@ async fn crash_scenario(
         world.raw.clone(),
         &source(),
         Duration::from_secs(3600),
+        std::time::SystemTime::now(),
         false,
     )
     .await
     .unwrap();
     assert!(young.deleted.is_empty(), "{name}: {young:?}");
     // ... and reclaims the orphans once they are older.
-    let swept = tools::sweep(world.raw.clone(), &source(), Duration::ZERO, false)
-        .await
-        .unwrap();
+    let swept = tools::sweep(
+        world.raw.clone(),
+        &source(),
+        Duration::ZERO,
+        std::time::SystemTime::now(),
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         swept.deleted.iter().cloned().collect::<HashSet<_>>(),
         orphans,
@@ -908,9 +915,15 @@ async fn rebuild_swaps_blue_green_and_catches_up() {
         other => panic!("{other:?}"),
     }
     pod.collect_garbage().await;
-    let swept = tools::sweep(world.raw.clone(), &source(), Duration::ZERO, false)
-        .await
-        .unwrap();
+    let swept = tools::sweep(
+        world.raw.clone(),
+        &source(),
+        Duration::ZERO,
+        std::time::SystemTime::now(),
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         swept.deleted.len(),
         1,
@@ -951,6 +964,7 @@ async fn sweep_keeps_what_readers_may_hold() {
         world.raw.clone(),
         &source(),
         Duration::from_secs(3600),
+        std::time::SystemTime::now(),
         true,
     )
     .await
@@ -959,18 +973,30 @@ async fn sweep_keeps_what_readers_may_hold() {
     assert_eq!(world.objects(), objects);
     // A dry run at zero grace names the unreferenced objects without
     // deleting them; the real run deletes exactly those.
-    let dry = tools::sweep(world.raw.clone(), &source(), Duration::ZERO, true)
-        .await
-        .unwrap();
+    let dry = tools::sweep(
+        world.raw.clone(),
+        &source(),
+        Duration::ZERO,
+        std::time::SystemTime::now(),
+        true,
+    )
+    .await
+    .unwrap();
     let unreferenced: HashSet<String> = objects.difference(&referenced).cloned().collect();
     assert_eq!(
         dry.deleted.iter().cloned().collect::<HashSet<_>>(),
         unreferenced
     );
     assert_eq!(world.objects(), objects);
-    tools::sweep(world.raw.clone(), &source(), Duration::ZERO, false)
-        .await
-        .unwrap();
+    tools::sweep(
+        world.raw.clone(),
+        &source(),
+        Duration::ZERO,
+        std::time::SystemTime::now(),
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(world.objects(), referenced);
     assert!(world.verify().await.is_ok());
 }
@@ -1024,6 +1050,7 @@ async fn sweep_protects_the_manifest_current_at_the_grace_horizon() {
         world.raw.clone(),
         &source(),
         Duration::from_secs(3600),
+        std::time::SystemTime::now(),
         false,
     )
     .await
