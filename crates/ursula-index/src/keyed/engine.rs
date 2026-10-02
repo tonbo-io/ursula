@@ -37,6 +37,13 @@
 //! a `D` below what another pod or a previous process published (P3.6).
 //! Object-store requests are counted per namespace and per pod (U24).
 //!
+//! Resource admission is process-wide ([`super::admission`]): a worker
+//! takes a place in a bounded admission queue (a full queue answers 503
+//! with `Retry-After` to the read that would start it), an ingest slot
+//! before it reloads `CURRENT`, and reservations from the byte budget for
+//! each source page and the records it has folded; a compaction takes a
+//! compaction slot and reserves its buffers, waiting rather than failing.
+//!
 //! Objects a crash leaves behind are removed by the orphan sweep
 //! ([`KeyedEngine::sweep`], or the `keyed sweep` tool).
 //!
@@ -69,6 +76,10 @@ use futures_util::future::BoxFuture;
 use tokio::sync::Notify;
 use tokio::sync::watch;
 
+use super::admission::Admission;
+use super::admission::AdmissionLimits;
+use super::admission::QueueTicket;
+use super::admission::Reservation;
 use super::fold::RangeQuery;
 use super::manifest::KEYED_PROJECTION_FORMAT;
 use super::manifest::KeyedManifest;
@@ -116,6 +127,10 @@ const COMPACTIONS_PER_PASS: usize = 4;
 const COMPACTION_COMMIT_ATTEMPTS: usize = 3;
 /// Pause before retrying a cycle that made no progress (a lagging replica).
 const NO_PROGRESS_BACKOFF: Duration = Duration::from_millis(100);
+/// Default process-wide admission budget: 1 GiB.
+pub const DEFAULT_ADMISSION_BUDGET_BYTES: u64 = 1 << 30;
+/// Default bound of the admission queue.
+pub const DEFAULT_ADMISSION_QUEUE: usize = 4_096;
 
 /// Tuning of the engine. Defaults follow the design.
 #[derive(Clone, Debug)]
@@ -161,6 +176,35 @@ pub struct KeyedEngineConfig {
     /// (`v{fmt}/`). A pod at another format builds its own namespaces from
     /// record 0 next to the served ones: the blue/green rebuild (§6.1 U20).
     pub projection_format: u32,
+    /// Process-wide byte budget of ingest pages, folded-but-unpublished
+    /// records and compaction buffers ([`super::admission`]). A single
+    /// reservation larger than this is clamped to it and runs alone.
+    pub admission_budget_bytes: u64,
+    /// Ingests (source reads, fold, publication) running at once.
+    pub max_concurrent_ingests: usize,
+    /// Compactions running at once.
+    pub max_concurrent_compactions: usize,
+    /// Namespaces admitted for ingestion but not yet ingesting; when full,
+    /// reads that need ingestion answer 503 with `Retry-After`.
+    pub admission_queue: usize,
+    /// Longest one ingest cycle or one compaction may run once admitted
+    /// (source reads, folding, part writes and the CAS). Past it the work
+    /// is dropped, releasing its slot and budget; waiters get 503 and the
+    /// next read retries.
+    pub work_deadline: Duration,
+}
+
+/// Default concurrency: the host's CPU count (fixed under the simulator, so
+/// runs reproduce on any host).
+fn default_parallelism() -> usize {
+    #[cfg(madsim)]
+    {
+        4
+    }
+    #[cfg(not(madsim))]
+    {
+        std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
+    }
 }
 
 impl Default for KeyedEngineConfig {
@@ -181,6 +225,11 @@ impl Default for KeyedEngineConfig {
             policy: CompactionPolicy::default(),
             current_revalidate: Duration::from_secs(1),
             projection_format: KEYED_PROJECTION_FORMAT,
+            admission_budget_bytes: DEFAULT_ADMISSION_BUDGET_BYTES,
+            max_concurrent_ingests: default_parallelism(),
+            max_concurrent_compactions: default_parallelism().div_ceil(2),
+            admission_queue: DEFAULT_ADMISSION_QUEUE,
+            work_deadline: Duration::from_secs(120),
         }
     }
 }
@@ -597,6 +646,33 @@ struct Inner {
     /// Objects this process created, and when (pruned after half the
     /// grace).
     created: Mutex<HashMap<String, Instant>>,
+    /// Process-wide byte budget, ingest and compaction slots, and the
+    /// admission queue.
+    admission: Admission,
+    /// Set by [`KeyedEngine::shutdown`]: reads answer 503 and no worker
+    /// starts.
+    closing: AtomicBool,
+    /// Set when shutdown cancels the workers still running, with
+    /// `cancelled` signalled. (A `Notify`, not a `watch`: a watch picks
+    /// its wait slot from tokio's thread-local RNG, which simulation
+    /// replays do not reset.)
+    cancel: AtomicBool,
+    cancelled: Notify,
+    /// Background workers alive (spawned and not yet finished).
+    workers: AtomicUsize,
+    /// Signalled when a worker finishes.
+    worker_done: Notify,
+}
+
+/// Counts one background worker; uncounted (and announced) on drop, when
+/// its task ends or is cancelled.
+struct WorkerGuard(Arc<Inner>);
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.0.workers.fetch_sub(1, Ordering::SeqCst);
+        self.0.worker_done.notify_waiters();
+    }
 }
 
 /// The keyed projection engine of one indexer pod.
@@ -661,6 +737,12 @@ impl KeyedEngine {
         });
         let metrics = KeyedMetrics::default();
         let store = store.counted(Arc::clone(&metrics.requests));
+        let admission = Admission::new(AdmissionLimits {
+            budget_bytes: config.admission_budget_bytes,
+            ingests: config.max_concurrent_ingests,
+            compactions: config.max_concurrent_compactions,
+            queue: config.admission_queue,
+        });
         Self {
             inner: Arc::new(Inner {
                 store,
@@ -680,6 +762,12 @@ impl KeyedEngine {
                 deletions: Notify::new(),
                 gc_pass: tokio::sync::Mutex::new(()),
                 created: Mutex::new(HashMap::new()),
+                admission,
+                closing: AtomicBool::new(false),
+                cancel: AtomicBool::new(false),
+                cancelled: Notify::new(),
+                workers: AtomicUsize::new(0),
+                worker_done: Notify::new(),
             }),
         }
     }
@@ -710,8 +798,35 @@ impl KeyedEngine {
         self.inner.metrics.snapshot(
             self.inner.waiters.load(Ordering::SeqCst),
             lock(&self.inner.gc).len(),
+            self.inner.admission.metrics(),
             detail,
         )
+    }
+
+    /// Stops the engine: new reads answer 503 and no new work starts; the
+    /// background workers in flight get up to `grace` to finish, and the
+    /// rest are cancelled (their waiters answer 503). When this returns,
+    /// no background worker is running. Idempotent.
+    pub async fn shutdown(&self, grace: Duration) {
+        let inner = &self.inner;
+        inner.closing.store(true, Ordering::SeqCst);
+        let deadline = Instant::now()
+            .checked_add(grace)
+            .unwrap_or_else(Instant::now);
+        if !inner.wait_workers(Some(deadline)).await {
+            tracing::warn!(
+                workers = inner.workers.load(Ordering::SeqCst),
+                "keyed workers did not finish within the shutdown grace; cancelling them"
+            );
+            inner.cancel.store(true, Ordering::SeqCst);
+            inner.cancelled.notify_waiters();
+            let _idle = inner.wait_workers(None).await;
+        }
+    }
+
+    /// Background workers running now.
+    pub fn background_workers(&self) -> usize {
+        self.inner.workers.load(Ordering::SeqCst)
     }
 
     /// Deletes due garbage now; returns the number of objects deleted.
@@ -902,7 +1017,49 @@ impl Inner {
         Ok(namespace.published())
     }
 
+    /// Resolves once shutdown cancels the background workers.
+    async fn wait_cancelled(&self) {
+        loop {
+            let cancelled = self.cancelled.notified();
+            tokio::pin!(cancelled);
+            cancelled.as_mut().enable();
+            if self.cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            cancelled.await;
+        }
+    }
+
+    /// Waits until no background worker runs, or `until` passes; returns
+    /// whether none runs.
+    async fn wait_workers(&self, until: Option<Instant>) -> bool {
+        loop {
+            let done = self.worker_done.notified();
+            tokio::pin!(done);
+            done.as_mut().enable();
+            if self.workers.load(Ordering::SeqCst) == 0 {
+                return true;
+            }
+            match until {
+                None => done.await,
+                Some(until) => {
+                    // Biased: simulation determinism.
+                    tokio::select! {
+                        biased;
+                        () = &mut done => {}
+                        () = rt::time::sleep_until(until) => {
+                            return self.workers.load(Ordering::SeqCst) == 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     async fn read(self: &Arc<Self>, request: KeyedReadRequest) -> KeyedReadOutcome {
+        if self.closing.load(Ordering::SeqCst) {
+            return KeyedReadOutcome::Unavailable("the keyed indexer is shutting down".to_owned());
+        }
         let bucket = request.source.bucket.clone();
         let Some(_busy) = self.enter(&bucket) else {
             return KeyedReadOutcome::Unavailable("the bucket is draining".to_owned());
@@ -935,14 +1092,14 @@ impl Inner {
         let view = Arc::clone(&receiver.borrow_and_update());
         if view.invalid {
             // Restart the rebuild if its worker stopped (a transient failure).
-            self.request_work(&namespace, None, true);
+            let _admitted = self.request_work(&namespace, None, true);
             return match &view.status {
                 Status::Failed(reason) => KeyedReadOutcome::Failed(reason.clone()),
                 _ => KeyedReadOutcome::Unavailable("keyed state is being rebuilt".to_owned()),
             };
         }
         if view.through() > request.source_next {
-            self.request_work(&namespace, None, true);
+            let _admitted = self.request_work(&namespace, None, true);
             return KeyedReadOutcome::Unavailable(
                 "keyed state is ahead of its source log and is being re-validated".to_owned(),
             );
@@ -964,11 +1121,15 @@ impl Inner {
         let deadline = Instant::now()
             .checked_add(request.timeout)
             .unwrap_or_else(Instant::now);
-        self.request_work(
+        if !self.request_work(
             &namespace,
             Some((wanted, request.source_next, deadline)),
             false,
-        );
+        ) {
+            return KeyedReadOutcome::Unavailable(
+                "the keyed indexer's admission queue is full".to_owned(),
+            );
+        }
         loop {
             let view = Arc::clone(&receiver.borrow_and_update());
             match &view.status {
@@ -1086,14 +1247,27 @@ impl Inner {
     }
 
     /// Registers a want (or a re-validation) and starts the namespace's
-    /// worker unless one runs (single flight).
+    /// worker unless one runs (single flight). A new worker needs a place in
+    /// the admission queue; returns false, registering nothing, when the
+    /// queue is full.
     fn request_work(
         self: &Arc<Self>,
         namespace: &Arc<Namespace>,
         want: Option<(u64, u64, Instant)>,
         verify: bool,
-    ) {
+    ) -> bool {
+        if self.closing.load(Ordering::SeqCst) {
+            return false;
+        }
         let mut work = lock(&namespace.work);
+        let ticket = if work.running {
+            None
+        } else {
+            let Some(ticket) = self.admission.try_enqueue() else {
+                return false;
+            };
+            Some(ticket)
+        };
         if let Some((record, next, until)) = want {
             work.want_record = work.want_record.max(record);
             work.want_next = work.want_next.max(next);
@@ -1102,18 +1276,45 @@ impl Inner {
         }
         work.verify |= verify;
         if work.running {
-            return;
+            return true;
         }
         work.running = true;
         drop(work);
+        // Counted before the closing check, so shutdown either sees this
+        // worker or this call sees shutdown.
+        self.workers.fetch_add(1, Ordering::SeqCst);
+        let guard = WorkerGuard(Arc::clone(self));
+        if self.closing.load(Ordering::SeqCst) {
+            *lock(&namespace.work) = Work::default();
+            return false;
+        }
         let inner = Arc::clone(self);
         let namespace = Arc::clone(namespace);
         let _worker = rt::spawn(async move {
-            inner.run_worker(namespace).await;
+            let _guard = guard;
+            // Biased: a cancellation wins over further work.
+            tokio::select! {
+                biased;
+                () = inner.wait_cancelled() => {
+                    let mut work = lock(&namespace.work);
+                    namespace.set_status(Status::Unavailable(
+                        "the keyed indexer is shutting down".to_owned(),
+                    ));
+                    *work = Work::default();
+                }
+                () = Arc::clone(&inner).run_worker(Arc::clone(&namespace), ticket) => {}
+            }
         });
+        true
     }
 
-    async fn run_worker(self: Arc<Self>, namespace: Arc<Namespace>) {
+    /// The namespace's worker. `ticket` is its place in the admission
+    /// queue, left when the first ingest slot is granted.
+    async fn run_worker(
+        self: Arc<Self>,
+        namespace: Arc<Namespace>,
+        mut ticket: Option<QueueTicket>,
+    ) {
         let Some(_busy) = self.enter(&namespace.source.bucket) else {
             namespace.stop_work();
             return;
@@ -1138,7 +1339,7 @@ impl Inner {
                 work.verify = false;
                 (work.want_next, verify)
             };
-            match self.cycle(&namespace, want_next, verify).await {
+            match self.cycle(&namespace, want_next, verify, &mut ticket).await {
                 Ok(true) => {}
                 Ok(false) => rt::time::sleep(NO_PROGRESS_BACKOFF).await,
                 Err(error) => {
@@ -1187,13 +1388,15 @@ impl Inner {
         }
     }
 
-    /// Waits for the publish interval, reloads `CURRENT` and ingests up to
-    /// `want_next`. Returns whether `D` advanced (or a re-validation ran).
+    /// Waits for the publish interval and an ingest slot, reloads `CURRENT`
+    /// and ingests up to `want_next`. Returns whether `D` advanced (or a
+    /// re-validation ran).
     async fn cycle(
         &self,
         namespace: &Arc<Namespace>,
         want_next: u64,
         verify: bool,
+        ticket: &mut Option<QueueTicket>,
     ) -> Result<bool, CycleError> {
         let before = namespace.through();
         if !namespace.backlog.load(Ordering::SeqCst)
@@ -1211,15 +1414,20 @@ impl Inner {
                 rt::time::sleep(Duration::from_millis(wait)).await;
             }
         }
-        let base = self.reload(namespace).await?;
-        let through = base
-            .as_ref()
-            .map_or(0, |published| published.manifest.through_record);
-        if !verify && through >= lock(&namespace.work).want_record {
-            return Ok(true);
-        }
-        self.ingest(namespace, base, want_next.max(through)).await?;
-        Ok(verify || namespace.through() > before)
+        let _slot = self.admission.ingest_slot().await;
+        drop(ticket.take());
+        self.within("ingest", async {
+            let base = self.reload(namespace).await?;
+            let through = base
+                .as_ref()
+                .map_or(0, |published| published.manifest.through_record);
+            if !verify && through >= lock(&namespace.work).want_record {
+                return Ok(true);
+            }
+            self.ingest(namespace, base, want_next.max(through)).await?;
+            Ok(verify || namespace.through() > before)
+        })
+        .await
     }
 
     async fn ingest(
@@ -1240,6 +1448,7 @@ impl Inner {
         // replica can be behind a namespace built from the leader.
         let d = published.manifest.through_record;
         let previous = d.saturating_sub(1);
+        let _page = self.admission.reserve(self.config.source_page_bytes).await;
         match self
             .source
             .read(
@@ -1313,6 +1522,9 @@ impl Inner {
         let mut last_digest = None;
         let mut bytes = 0_u64;
         let mut truncated = false;
+        // Admission: the folded records this ingest holds plus the next
+        // page, kept until the publication is done.
+        let mut held: Option<Reservation> = None;
         let bucket = namespace.source.bucket.as_str();
         let key = namespace.source.key.as_str();
         'pages: loop {
@@ -1322,6 +1534,23 @@ impl Inner {
             if expected.is_none() && bytes >= self.config.max_ingest_bytes && cursor >= floor {
                 truncated = true;
                 break;
+            }
+            let needed = bytes.saturating_add(self.config.source_page_bytes);
+            let grown = held
+                .as_mut()
+                .is_some_and(|reservation| self.admission.try_grow(reservation, needed));
+            if !grown {
+                if held.is_some() && expected.is_none() && last_digest.is_some() && cursor >= floor
+                {
+                    // The budget is taken: publish what is folded and
+                    // continue in the next cycle without the interval.
+                    self.admission.truncated();
+                    truncated = true;
+                    break;
+                }
+                // Never wait while holding a reservation.
+                drop(held.take());
+                held = Some(self.admission.reserve(needed).await);
             }
             let page = match self
                 .source
@@ -1429,6 +1658,7 @@ impl Inner {
         }
         self.commit(namespace, base, manifest, new_keys).await?;
         drop(pins);
+        drop(held);
         Ok(Folded::Done)
     }
 
@@ -1616,65 +1846,111 @@ impl Inner {
                 );
                 return Ok(());
             }
-            let output = compact(&namespace.opener, runs, range, &self.config.part_options)
-                .await
-                .map_err(transient)?;
-            bump(&self.metrics.compaction_input_bytes, input_bytes);
-            bump(
-                &self.metrics.compaction_output_bytes,
-                output
-                    .output
-                    .parts
-                    .iter()
-                    .map(|part| part.meta.bytes)
-                    .fold(0_u64, u64::saturating_add),
-            );
-            let _pins = self.store_parts(namespace, &output.output.parts).await?;
-            let new_keys: Vec<String> = output
-                .output
-                .parts
-                .iter()
-                .map(|part| part.meta.key.clone())
-                .collect();
-            let due = Instant::now()
-                .checked_add(self.config.gc_grace)
-                .unwrap_or_else(Instant::now);
-            let mut attempt = base;
-            let mut committed = false;
-            for _ in 0..COMPACTION_COMMIT_ATTEMPTS {
-                let Some(mut next) = attempt
-                    .manifest
-                    .after_compaction(
-                        &output.inputs,
-                        &output.output.meta,
-                        output.into_oldest,
-                        self.now_ms(),
-                    )
-                    .map_err(transient)?
-                else {
-                    break;
-                };
-                next.obsoleted.push(attempt.manifest_key.clone());
-                if self
-                    .commit(namespace, Some(&attempt), next, Vec::new())
-                    .await?
-                {
-                    bump(&self.metrics.compaction_publishes, 1);
-                    committed = true;
-                    break;
-                }
-                let Some(latest) = namespace.published() else {
-                    break;
-                };
-                attempt = latest;
-            }
-            if !committed {
-                // Abandoned: the inputs changed, or the CAS kept losing.
-                self.schedule_gc(namespace, new_keys, due);
+            // Admission: a compaction slot, then its input and output
+            // buffers (each at most the input size) from the budget. Both
+            // wait rather than fail; a stale plan is caught by the rebase.
+            let _slot = self.admission.compaction_slot().await;
+            let _buffers = self.admission.reserve(input_bytes.saturating_mul(2)).await;
+            if !self
+                .within(
+                    "compaction",
+                    self.compact_one(namespace, Arc::clone(&base), range, input_bytes),
+                )
+                .await?
+            {
                 return Ok(());
             }
         }
         Ok(())
+    }
+
+    /// Runs one planned compaction and commits it, rebasing onto newer
+    /// publications. Returns whether it committed.
+    async fn compact_one(
+        &self,
+        namespace: &Arc<Namespace>,
+        base: Arc<PublishedKeyedManifest>,
+        range: std::ops::Range<usize>,
+        input_bytes: u64,
+    ) -> Result<bool, CycleError> {
+        let runs = &base.manifest.runs;
+        let output = compact(&namespace.opener, runs, range, &self.config.part_options)
+            .await
+            .map_err(transient)?;
+        bump(&self.metrics.compaction_input_bytes, input_bytes);
+        bump(
+            &self.metrics.compaction_output_bytes,
+            output
+                .output
+                .parts
+                .iter()
+                .map(|part| part.meta.bytes)
+                .fold(0_u64, u64::saturating_add),
+        );
+        let _pins = self.store_parts(namespace, &output.output.parts).await?;
+        let new_keys: Vec<String> = output
+            .output
+            .parts
+            .iter()
+            .map(|part| part.meta.key.clone())
+            .collect();
+        let due = Instant::now()
+            .checked_add(self.config.gc_grace)
+            .unwrap_or_else(Instant::now);
+        let mut attempt = Arc::clone(&base);
+        for _ in 0..COMPACTION_COMMIT_ATTEMPTS {
+            let Some(mut next) = attempt
+                .manifest
+                .after_compaction(
+                    &output.inputs,
+                    &output.output.meta,
+                    output.into_oldest,
+                    self.now_ms(),
+                )
+                .map_err(transient)?
+            else {
+                break;
+            };
+            next.obsoleted.push(attempt.manifest_key.clone());
+            if self
+                .commit(namespace, Some(&attempt), next, Vec::new())
+                .await?
+            {
+                bump(&self.metrics.compaction_publishes, 1);
+                return Ok(true);
+            }
+            let Some(latest) = namespace.published() else {
+                break;
+            };
+            attempt = latest;
+        }
+        // Abandoned: the inputs changed, or the CAS kept losing.
+        self.schedule_gc(namespace, new_keys, due);
+        Ok(false)
+    }
+
+    /// Runs `work` within the per-work deadline: a stalled source or store
+    /// cannot hold the namespace's worker, its slot and its admission
+    /// budget forever. Dropping `work` releases them.
+    async fn within<T>(
+        &self,
+        what: &str,
+        work: impl std::future::Future<Output = Result<T, CycleError>>,
+    ) -> Result<T, CycleError> {
+        let deadline = self.config.work_deadline;
+        // Biased: completion and the deadline at the same instant resolve
+        // the same way on every run (simulation determinism).
+        tokio::select! {
+            biased;
+            result = work => result,
+            () = rt::time::sleep(deadline) => {
+                bump(&self.metrics.work_deadlines, 1);
+                Err(CycleError::Transient(format!(
+                    "keyed {what} exceeded its {} ms deadline",
+                    deadline.as_millis()
+                )))
+            }
+        }
     }
 
     fn schedule_gc(&self, namespace: &Arc<Namespace>, keys: Vec<String>, due: Instant) {

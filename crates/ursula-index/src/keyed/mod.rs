@@ -24,6 +24,8 @@
 //!   compaction, delta GC, the in-process orphan sweep and drain (U16, U20
 //!   sweep); its source, object store and clock are injectable, so it runs
 //!   under the deterministic simulator (U21).
+//! - [`admission`]: the process-wide byte budget, ingest and compaction
+//!   slots and the bounded admission queue of the engine.
 //! - [`http`]: the internal `/v1/keyed` API (U17) and the metrics endpoint.
 //! - [`metrics`]: the engine's counters and gauges (U24).
 //! - [`tools`]: namespace maintenance: verify, rebuild, sweep, dump (U20).
@@ -34,6 +36,7 @@
 //! [`KeyedNamespace::publish`]; reads go through [`read_range`] over the
 //! manifest's runs and a [`PartOpener`].
 
+pub mod admission;
 pub mod batch;
 pub mod engine;
 pub mod fold;
@@ -46,6 +49,7 @@ pub mod run;
 pub mod source;
 pub mod tools;
 
+pub use admission::AdmissionMetrics;
 pub use batch::InvalidMessage;
 pub use batch::KEYED_BATCH_PROFILE;
 pub use batch::KeyError;

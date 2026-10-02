@@ -16,6 +16,7 @@ use std::sync::atomic::Ordering;
 
 use serde::Serialize;
 
+use super::admission::AdmissionMetrics;
 use crate::object_store::ObjectRequestCounters;
 use crate::object_store::ObjectRequestCounts;
 
@@ -33,6 +34,7 @@ pub(crate) struct KeyedMetrics {
     pub(crate) gc_deleted: AtomicU64,
     pub(crate) reused_settled: AtomicU64,
     pub(crate) current_revalidations: AtomicU64,
+    pub(crate) work_deadlines: AtomicU64,
     /// Every object-store request of the pod.
     pub(crate) requests: Arc<ObjectRequestCounters>,
 }
@@ -112,6 +114,8 @@ pub struct KeyedMetricsSnapshot {
     pub gc_backlog: usize,
     /// `CURRENT` revalidations of reads without `min_through_record`.
     pub current_revalidations: u64,
+    /// Ingest cycles and compactions dropped at the per-work deadline.
+    pub work_deadlines: u64,
     /// Reads waiting for `min_through_record`.
     pub waiters: usize,
     /// Namespaces held in memory.
@@ -126,6 +130,9 @@ pub struct KeyedMetricsSnapshot {
     pub runs_max: usize,
     /// Every object-store request of the pod.
     pub s3_requests: S3Requests,
+    /// The process-wide admission controller: budget in use, queue depth,
+    /// rejections.
+    pub admission: AdmissionMetrics,
     /// Per-namespace detail, largest lag first.
     pub namespace_detail: Vec<NamespaceMetrics>,
 }
@@ -135,6 +142,7 @@ impl KeyedMetrics {
         &self,
         waiters: usize,
         gc_backlog: usize,
+        admission: AdmissionMetrics,
         mut detail: Vec<NamespaceMetrics>,
     ) -> KeyedMetricsSnapshot {
         detail.sort_by(|left, right| {
@@ -155,6 +163,7 @@ impl KeyedMetrics {
             reused_settled: load(&self.reused_settled),
             gc_backlog,
             current_revalidations: load(&self.current_revalidations),
+            work_deadlines: load(&self.work_deadlines),
             waiters,
             namespaces: detail.len(),
             lag_records_total: detail
@@ -176,6 +185,7 @@ impl KeyedMetrics {
                 .max()
                 .unwrap_or(0),
             s3_requests: self.requests.snapshot().into(),
+            admission,
             namespace_detail: detail,
         }
     }
