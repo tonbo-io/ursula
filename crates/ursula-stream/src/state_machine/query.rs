@@ -582,20 +582,21 @@ impl StreamStateMachine {
             .map_or(slot.retained_offset, |snapshot| snapshot.offset);
         let exact_frontier = self.exact_message_frontier(stream_id);
         let closed = stream.status == StreamStatus::Closed;
+        // Honest partial: the messages right after the snapshot only survive
+        // as a collapsed cold record, so bootstrap cannot split them into one
+        // part per message without reading cold storage. The client
+        // continues with ordinary reads from the snapshot, which also report
+        // closure once they reach the tail.
+        let honest_partial = |snapshot: Option<StreamVisibleSnapshot>| StreamBootstrapPlan {
+            snapshot,
+            updates: Vec::new(),
+            next_offset: snapshot_offset,
+            content_type: stream.content_type.clone(),
+            up_to_date: false,
+            closed: false,
+        };
         if snapshot_offset < exact_frontier {
-            // Honest partial: the messages right after the snapshot only
-            // survive as a collapsed cold record, so bootstrap cannot split
-            // them into one part per message without reading cold storage.
-            // The client continues with ordinary reads from the snapshot,
-            // which also report closure once they reach the tail.
-            return Ok(StreamBootstrapPlan {
-                snapshot,
-                updates: Vec::new(),
-                next_offset: snapshot_offset,
-                content_type: stream.content_type.clone(),
-                up_to_date: false,
-                closed: false,
-            });
+            return Ok(honest_partial(snapshot));
         }
         let mut updates = Vec::new();
         let mut update_bytes = 0u64;
@@ -622,6 +623,16 @@ impl StreamStateMachine {
             }
             update_bytes = next_bytes;
             updates.push(record);
+        }
+        // The parts must start exactly at the snapshot offset. A snapshot
+        // published at level 0 inside an external append (accepted below the
+        // scalar cold frontier) is no message boundary, and the next exact
+        // start lies past it; answering from there would skip bytes.
+        let first_start = updates
+            .first()
+            .map_or(stream.tail_offset, |record| record.start_offset);
+        if first_start != snapshot_offset {
+            return Ok(honest_partial(snapshot));
         }
         let (next_offset, up_to_date, closed) = match capped_at {
             Some(boundary) => (boundary, false, false),

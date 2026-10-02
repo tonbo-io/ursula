@@ -762,3 +762,36 @@ fn hot_record_gauge_matches_restore_after_a_clipping_flush_below_level_4() {
         machine.total_hot_real_bytes()
     );
 }
+
+/// SM4: a level-0 group accepts a snapshot inside an external append that
+/// lies above hot bytes (the scalar cold frontier covers it). Whatever level
+/// the group reaches later, bootstrap from that snapshot must never skip the
+/// rest of the straddled message: it answers the honest partial.
+#[test]
+fn bootstrap_from_a_level_zero_snapshot_inside_an_external_append_is_partial() {
+    for level in [0, 1, 2, 3, LB4] {
+        let mut machine = machine_at(0);
+        create(&mut machine, "mid-ext", OCTET, b"");
+        append(&mut machine, "mid-ext", OCTET, &[b'h'; 50]);
+        append_external(&mut machine, "mid-ext", "ext", 19);
+        let response = publish_snapshot(&mut machine, "mid-ext", 55);
+        assert!(
+            matches!(response, StreamResponse::SnapshotPublished { .. }),
+            "{response:?}"
+        );
+        if level > 0 {
+            raise(&mut machine, level);
+        }
+        append(&mut machine, "mid-ext", OCTET, b"tail!");
+        for machine in [
+            &machine,
+            &StreamStateMachine::restore(machine.snapshot()).expect("restore"),
+        ] {
+            let plan = machine.bootstrap_plan(&stream("mid-ext")).expect("plan");
+            assert_eq!(plan.snapshot.as_ref().map(|s| s.offset), Some(55));
+            assert!(plan.updates.is_empty(), "level {level}: {plan:?}");
+            assert_eq!(plan.next_offset, 55, "level {level}");
+            assert!(!plan.up_to_date, "level {level}");
+        }
+    }
+}
