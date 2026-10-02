@@ -3,6 +3,9 @@
 //! round-robins over P producer ids; `--epoch-every=E` bumps each producer's
 //! epoch every E of its appends; `--retain-every=N` (W6) adds retention.
 //! Runs at feature level 1, where the per-stream receipt window (F3) applies.
+//! The producer cap (F3) answers `ProducerLimit` to producers beyond 4,096
+//! that find no producer idle for an hour; the workload counts those
+//! rejections and retries the producer's sequence 0 on its next turn.
 
 use std::time::Instant;
 
@@ -97,6 +100,7 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
     let mut outcome = Outcome::default();
     let mut n = 0u64;
     let mut retentions = 0u64;
+    let mut producer_limit_rejections = 0u64;
     let checkpoint_payload = br#"{"checkpoint":1}"#;
     let flush_bytes = 8 * smx::MIB;
     for cp in points {
@@ -124,6 +128,15 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
             } = response
             {
                 bail!("unexpected deduplication at append {n}");
+            }
+            if let StreamResponse::Error {
+                code: ursula_stream::StreamErrorCode::ProducerLimit,
+                ..
+            } = response
+            {
+                producer_limit_rejections += 1;
+                n += 1;
+                continue;
             }
             smx::ok(response, "producer append")?;
             *s += 1;
@@ -185,6 +198,7 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
             "workload": name,
             "appends": n,
             "retentions": retentions,
+            "producer_limit_rejections": producer_limit_rejections,
             "receipts_total": measured.snap.receipt_count,
             "snapshot_producer_bytes": measured.snap.producer_bytes,
             "snapshot_bytes_per_receipt": round3(ratio(measured.snap.producer_bytes, measured.snap.receipt_count)),
@@ -200,6 +214,7 @@ pub fn run(args: &W4Args, sink: &mut Sink) -> Result<Outcome> {
             outcome.metric_u64("receipt_items", measured.gauges.receipt_items);
             outcome.metric_u64("producers", measured.gauges.producers);
             outcome.metric_u64("producer_bytes", measured.gauges.producer_bytes);
+            outcome.metric_u64("producer_limit_rejections", producer_limit_rejections);
         }
     }
     Ok(outcome)
