@@ -243,6 +243,8 @@ pub use ursula_stream::validate_bucket_id;
 #[cfg(test)]
 mod incarnation_gc_tests;
 #[cfg(test)]
+mod keyed_lifecycle_tests;
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]

@@ -34,6 +34,7 @@ use crate::cold_index::cold_index_generation_dir;
 use crate::cold_index::load_cold_chunks_from_pages;
 use crate::cold_index::parse_cold_index_page_file_name;
 use crate::cold_index::select_cold_chunk_compaction;
+use crate::cold_store::ColdStore;
 use crate::cold_store::ColdStoreHandle;
 use crate::cold_store::ColdStoreInfo;
 use crate::cold_store::cold_chunk_dir;
@@ -649,10 +650,12 @@ impl ShardRuntime {
     }
 
     /// Removes the entire bucket erasure domain, including external payloads
-    /// and stage-before-commit orphans, then verifies the authoritative store
-    /// no longer lists an object below that prefix. Call only after every
-    /// group has durably installed the bucket tombstone and legacy shared-pack
-    /// debt has converged to zero.
+    /// and stage-before-commit orphans, and the bucket's keyed-state
+    /// projection namespaces `.keyed/{bucket}/` (keyed-streams U23), then
+    /// verifies the authoritative store no longer lists an object below
+    /// either prefix. Call only after every group has durably installed the
+    /// bucket tombstone, legacy shared-pack debt has converged to zero, and
+    /// every keyed-state indexer has acknowledged `drain(bucket)`.
     pub async fn erase_bucket_cold_prefix_and_prove(
         &self,
         bucket_id: &str,
@@ -660,24 +663,11 @@ impl ShardRuntime {
         let Some(cold_store) = self.cold_store.as_ref() else {
             return Ok(());
         };
-        let prefix = crate::cold_bucket_prefix(bucket_id);
-        cold_store
-            .remove_all(&prefix)
-            .await
-            .map_err(|err| RuntimeError::ColdStoreIo {
-                message: err.to_string(),
-            })?;
-        let absent =
-            cold_store
-                .prefix_is_empty(&prefix)
-                .await
-                .map_err(|err| RuntimeError::ColdStoreIo {
-                    message: err.to_string(),
-                })?;
-        if !absent {
-            return Err(RuntimeError::ColdStoreIo {
-                message: format!("bucket prefix '{prefix}' still contains objects after erasure"),
-            });
+        for prefix in [
+            crate::cold_bucket_prefix(bucket_id),
+            ursula_shard::keyed_namespace::keyed_bucket_prefix(bucket_id),
+        ] {
+            erase_prefix_and_prove(cold_store, &prefix).await?;
         }
         Ok(())
     }
@@ -1185,7 +1175,16 @@ impl ShardRuntime {
                 ColdGcTarget::Paths(paths) => {
                     let mut outcome = Ok(());
                     for path in paths {
-                        if let Err(err) = cold_store.delete_chunk(path).await {
+                        // A keyed stream's deleted incarnation enqueues its
+                        // projection namespace as a prefix (U22). Every
+                        // other path names one object (F14g containment).
+                        let removed =
+                            if ursula_shard::keyed_namespace::is_keyed_incarnation_prefix(path) {
+                                cold_store.remove_all(path).await
+                            } else {
+                                cold_store.delete_chunk(path).await
+                            };
+                        if let Err(err) = removed {
                             outcome = Err(err);
                             break;
                         }
@@ -2012,4 +2011,27 @@ fn spawn_core_worker(threading: RuntimeThreading, worker: CoreWorker) -> Result<
                 })
         }
     }
+}
+
+/// Removes every object below `prefix`, then proves the store lists none.
+async fn erase_prefix_and_prove(cold_store: &ColdStore, prefix: &str) -> Result<(), RuntimeError> {
+    cold_store
+        .remove_all(prefix)
+        .await
+        .map_err(|err| RuntimeError::ColdStoreIo {
+            message: err.to_string(),
+        })?;
+    let absent =
+        cold_store
+            .prefix_is_empty(prefix)
+            .await
+            .map_err(|err| RuntimeError::ColdStoreIo {
+                message: err.to_string(),
+            })?;
+    if !absent {
+        return Err(RuntimeError::ColdStoreIo {
+            message: format!("bucket prefix '{prefix}' still contains objects after erasure"),
+        });
+    }
+    Ok(())
 }
