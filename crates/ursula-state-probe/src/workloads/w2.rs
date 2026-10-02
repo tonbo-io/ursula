@@ -10,6 +10,11 @@
 //! publishes a checkpoint and retains only its last `--retain-keep` records.
 //! `--compact` runs the existing `CompactCold` (shared to exclusive) for every
 //! stream at the end.
+//! `--driver` runs the F2 shared-ref compaction driver every
+//! `--driver-interval-sec` simulated seconds the way the leader's compaction
+//! worker does (discovery through `shared_ref_candidates`, then `CompactCold`
+//! of each planned run with the GC grace), and the GC worker acknowledges
+//! released packs once their grace has passed.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -19,6 +24,9 @@ use clap::Args;
 use serde_json::json;
 use ursula_shard::BucketStreamId;
 use ursula_stream::ColdChunkRef;
+use ursula_stream::ColdGcTarget;
+use ursula_stream::SharedRefCompactionRequest;
+use ursula_stream::SharedRefIdleTracker;
 use ursula_stream::StreamCommand;
 use ursula_stream::StreamResponse;
 use ursula_stream::StreamStateMachine;
@@ -32,9 +40,14 @@ use crate::out::round3;
 use crate::payload;
 use crate::smx;
 
-/// Refs one stream can gain between two runs of the (future) F2 compaction
-/// driver: one per flush tick over a 60 s driver interval.
+/// Refs one stream can gain between two runs of the F2 compaction driver
+/// when the driver is not modelled: one per flush tick over a 60 s interval.
 const DRIVER_INTERVAL_REFS: u64 = 60;
+/// `compaction_max_size` (16 MiB) and `compaction_gc_grace` (300 s).
+const DRIVER_MAX_RUN_BYTES: u64 = 16 * 1024 * 1024;
+const DRIVER_GC_GRACE_MS: u64 = 300_000;
+/// `compaction_max_streams_per_pass` (16).
+const DRIVER_MAX_STREAMS: usize = 16;
 
 #[derive(Debug, Clone, Args)]
 pub struct W2Args {
@@ -59,6 +72,12 @@ pub struct W2Args {
     pub max_flush_mib: usize,
     #[arg(long)]
     pub compact: bool,
+    /// Run the F2 shared-ref compaction driver during the workload.
+    #[arg(long)]
+    pub driver: bool,
+    /// Simulated seconds between driver passes (`compaction_interval`).
+    #[arg(long, default_value_t = 30)]
+    pub driver_interval_sec: u64,
     #[arg(long, default_value_t = 1.0)]
     pub measure_every_h: f64,
     #[arg(long)]
@@ -131,6 +150,18 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
     let mut max_stream_hot_seen = 0u64;
     let mut first_starved_sec: Option<u64> = None;
     let mut refs_added_interval = 0u64;
+    let mut driver = DriverStats::default();
+    let mut tracker = SharedRefIdleTracker::default();
+    let mut max_refs_seen = 0u64;
+    // Refs each stream held right after the previous driver pass, and the
+    // most refs one stream gained between two passes.
+    let mut refs_after_pass = vec![0u64; if args.driver { args.streams } else { 0 }];
+    let mut max_refs_added_between_passes = 0u64;
+    let shared_refs_interval = if args.driver {
+        args.driver_interval_sec.max(1)
+    } else {
+        DRIVER_INTERVAL_REFS
+    };
     for sec in 1..=total_secs {
         let now = smx::T0 + sec * 1000;
         for (i, id) in ids.iter().enumerate() {
@@ -159,6 +190,25 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
                 refs_added_interval += 1;
                 if let Some(index) = index_of.get(&stream_id) {
                     refs.entry(*index).or_default().push(chunk);
+                }
+            }
+        }
+        if args.driver {
+            // Refs peak right before a driver pass.
+            let max_refs = ids
+                .iter()
+                .map(|id| m.cold_chunks(id).len() as u64)
+                .max()
+                .unwrap_or(0);
+            max_refs_seen = max_refs_seen.max(max_refs);
+            if sec % args.driver_interval_sec.max(1) == 0 {
+                for (id, after) in ids.iter().zip(&refs_after_pass) {
+                    let added = (m.cold_chunks(id).len() as u64).saturating_sub(*after);
+                    max_refs_added_between_passes = max_refs_added_between_passes.max(added);
+                }
+                driver_pass(&mut m, &mut tracker, now, &mut driver)?;
+                for (id, after) in ids.iter().zip(refs_after_pass.iter_mut()) {
+                    *after = m.cold_chunks(id).len() as u64;
                 }
             }
         }
@@ -201,7 +251,7 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
         }
         if sec % measure_every == 0 || sec == total_secs {
             let measured = measure_sm(&m, &base, smx::append_counts(&ids, &appends), args.zstd)?;
-            formula::per_stream_checks(&mut outcome, &measured, DRIVER_INTERVAL_REFS);
+            formula::per_stream_checks(&mut outcome, &measured, shared_refs_interval);
             let mut ref_counts: Vec<u64> = measured
                 .snap
                 .streams
@@ -223,6 +273,7 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
                 "refs_added_this_interval": refs_added_interval,
                 "live_packs_in_group_maps": measured.gauges.live_packs,
                 "pending_cold_gc": m.pending_cold_gc_len(),
+                "driver": driver,
                 "first_starved_sim_sec": first_starved_sec,
                 "m": measured.to_json(),
             }))?;
@@ -239,6 +290,15 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
                 outcome.metric_u64("snapshot_cold_chunk_bytes", measured.snap.cold_chunks_bytes);
                 outcome.metric_i64("heap_bytes", measured.heap.bytes);
                 outcome.metric_u64("max_stream_hot_bytes_seen", max_stream_hot_seen);
+                if args.driver {
+                    outcome.metric_u64("max_shared_refs_per_stream_seen", max_refs_seen);
+                    outcome.metric_u64("driver_compactions", driver.compactions);
+                    outcome.metric_u64("driver_compacted_slices", driver.compacted_slices);
+                    outcome.metric_u64(
+                        "pending_cold_gc",
+                        u64::try_from(m.pending_cold_gc_len()).unwrap_or(u64::MAX),
+                    );
+                }
             }
         }
     }
@@ -248,6 +308,31 @@ pub fn run(args: &W2Args, sink: &mut Sink) -> Result<Outcome> {
         max_stream_hot_seen as f64,
         (2 * flush_bytes) as f64,
     );
+
+    if args.driver {
+        outcome.metric_u64(
+            "max_refs_added_between_driver_passes",
+            max_refs_added_between_passes,
+        );
+        outcome.check(
+            "f2_driver_shared_refs_per_stream",
+            "shared refs per stream <= 64 + the most refs one stream gained between two driver passes, at every second (F2 driver)",
+            max_refs_seen as f64,
+            (formula::MAX_SHARED_REFS + max_refs_added_between_passes) as f64,
+        );
+        outcome.check(
+            "f2_driver_packs_reclaimed",
+            "packs whose last ref the driver compacted are GC'd after the grace (count >= 1)",
+            -(driver.packs_reclaimed as f64),
+            -1.0,
+        );
+        outcome.check(
+            "f2_driver_overdue_pack_gc",
+            "no released pack stays queued past its grace (F2 driver, GC worker)",
+            driver.overdue_gc_entries as f64,
+            0.0,
+        );
+    }
 
     if args.compact {
         compact_all(
@@ -320,5 +405,80 @@ fn compact_all(
         "pending_cold_gc": m.pending_cold_gc_len(),
         "m": measured.to_json(),
     }))?;
+    Ok(())
+}
+
+/// What the modelled F2 driver and GC worker did.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+struct DriverStats {
+    passes: u64,
+    compactions: u64,
+    compacted_slices: u64,
+    packs_reclaimed: u64,
+    /// GC entries still queued after a GC pass although their grace passed.
+    overdue_gc_entries: u64,
+}
+
+/// One pass of the F2 driver as the leader's compaction worker runs it,
+/// followed by one GC-worker pass that acknowledges every entry whose grace
+/// has passed (objects are not modelled, so reclaiming is the ack).
+fn driver_pass(
+    m: &mut StreamStateMachine,
+    tracker: &mut SharedRefIdleTracker,
+    now_ms: u64,
+    stats: &mut DriverStats,
+) -> Result<()> {
+    stats.passes += 1;
+    let request = SharedRefCompactionRequest::new(now_ms, DRIVER_MAX_RUN_BYTES, DRIVER_MAX_STREAMS);
+    for candidate in m.shared_ref_candidates(&request, tracker) {
+        let (Some(first), Some(last)) = (candidate.run.first(), candidate.run.last()) else {
+            continue;
+        };
+        let (start, end) = (first.start_offset, last.end_offset);
+        let slices = candidate.run.len() as u64;
+        let replacement = ColdChunkRef {
+            start_offset: start,
+            end_offset: end,
+            s3_path: ursula_runtime::new_cold_chunk_path(&candidate.stream_id, start, end),
+            object_size: end - start,
+            object_offset: 0,
+            shared_object: false,
+            payload_digest: String::new(),
+        };
+        smx::ok(
+            m.apply(StreamCommand::CompactCold {
+                stream_id: candidate.stream_id,
+                old_chunks: candidate.run,
+                replacement,
+                gc_not_before_ms: now_ms + DRIVER_GC_GRACE_MS,
+            }),
+            "driver compact cold",
+        )?;
+        stats.compactions += 1;
+        stats.compacted_slices += slices;
+    }
+    let due = m
+        .pending_cold_gc_batch(usize::MAX)
+        .into_iter()
+        .take_while(|entry| entry.not_before_ms <= now_ms)
+        .collect::<Vec<_>>();
+    if let Some(last) = due.last() {
+        stats.packs_reclaimed += due
+            .iter()
+            .filter(|entry| matches!(&entry.target, ColdGcTarget::Paths(paths) if paths.iter().any(|path| path.contains("/_packs/"))))
+            .count() as u64;
+        smx::ok(
+            m.apply(StreamCommand::AckColdGc {
+                up_to_seq: last.seq,
+            }),
+            "ack cold gc",
+        )?;
+    }
+    stats.overdue_gc_entries = stats.overdue_gc_entries.max(
+        m.pending_cold_gc_batch(usize::MAX)
+            .iter()
+            .filter(|entry| entry.not_before_ms <= now_ms)
+            .count() as u64,
+    );
     Ok(())
 }

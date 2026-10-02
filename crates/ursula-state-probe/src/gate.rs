@@ -108,6 +108,12 @@ pub fn pr_suite() -> Result<Vec<Job>> {
             )?),
         ),
         job(
+            "w2_driver",
+            Workload::W2(parse::<W2Args>(
+                "--streams=50 --rate=1 --rec-bytes=2000 --hours=2.5 --measure-every-h=0.5 --driver --name=w2_driver",
+            )?),
+        ),
+        job(
             "planner",
             Workload::Planner(parse::<PlannerArgs>("--streams=100,1000")?),
         ),
@@ -159,6 +165,12 @@ pub fn nightly_suite() -> Result<Vec<Job>> {
             "w2_maxflush16",
             Workload::W2(parse::<W2Args>(
                 "--hours=24 --max-flush-mib=16 --compact --name=w2_packs_maxflush16",
+            )?),
+        ),
+        job(
+            "w2_driver",
+            Workload::W2(parse::<W2Args>(
+                "--hours=24 --driver --name=w2_packs_driver",
             )?),
         ),
         job(
