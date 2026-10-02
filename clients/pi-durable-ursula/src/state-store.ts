@@ -20,6 +20,13 @@
 import type { KeyedOp } from "./keyed-batch.ts";
 import { OrderedMap } from "./ordered-map.ts";
 
+/**
+ * Thrown by a partial-state view to abort a read pass that reached an uncovered key or range. Read
+ * passes must let it propagate; code that catches errors inside a pass (for example to convert
+ * validation failures) must rethrow it.
+ */
+export class ViewAbort extends Error {}
+
 /** A visible row of `state(D)`: the ordinal of the record holding its last put, and its value text. */
 export interface Row {
 	readonly record: number;

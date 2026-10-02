@@ -26,7 +26,7 @@ import {
 	value,
 } from "./pi-layer.ts";
 import { LIMITS } from "./protocol.ts";
-import type { StateView } from "./state-store.ts";
+import { type StateView, ViewAbort } from "./state-store.ts";
 import { isLongStr, strinc } from "./tuple.ts";
 
 export interface PlanInput {
@@ -295,7 +295,8 @@ function resolveDocumentCopies(view: StateView, writes: StorageWrite[]): Storage
 			}
 			return { type: "document.create", record: w.record, content: { kind: "base", version: stored.version, value: stored.value } };
 		} catch (error) {
-			if (error instanceof StorageRejected) throw error;
+			// A partial-state view's abort is not a copy failure: let the store fetch and re-run.
+			if (error instanceof StorageRejected || error instanceof ViewAbort) throw error;
 			throw new StorageRejected(`Document copy ${w.record.id} was rejected`, { cause: error });
 		}
 	});
