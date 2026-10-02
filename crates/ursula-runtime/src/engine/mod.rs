@@ -172,7 +172,6 @@ pub enum GroupWriteResponse {
     PublishSnapshot(PublishSnapshotResponse),
     AdvanceRetention(AdvanceRetentionResponse),
     SetBucketQuota(SetBucketQuotaResponse),
-    SetFeatureLevel(SetFeatureLevelResponse),
     TouchStreamAccess(TouchStreamAccessResponse),
     UpdateStreamAttrs(UpdateStreamAttrsResponse),
     FlushCold(FlushColdResponse),
@@ -183,6 +182,9 @@ pub enum GroupWriteResponse {
     PurgeBucket(PurgeBucketResponse),
     ImportGroupState(crate::request::ImportGroupStateResponse),
     Batch(Vec<Result<GroupWriteResponse, GroupEngineError>>),
+    // Appended last so serialized variant positions of older variants stay
+    // stable across mixed-version clusters.
+    SetFeatureLevel(SetFeatureLevelResponse),
 }
 
 pub trait GroupEngine: Send + 'static {
