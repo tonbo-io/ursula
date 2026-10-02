@@ -119,3 +119,29 @@ jobs:
           npm ci
           npm run typecheck
           npm test
+
+  typescript-e2e:
+    name: TypeScript owner e2e (single-node ursula)
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Build ursula
+        run: cargo build --release -p ursula --bin ursula
+
+      - name: Pi conformance and open/claim/fencing against a real node
+        run: |
+          cd clients/pi-durable-ursula
+          npm ci
+          URSULA_BIN="$GITHUB_WORKSPACE/target/release/ursula" npm run test:e2e
