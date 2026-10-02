@@ -4633,6 +4633,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ursula-state-probe"
+version = "0.5.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bytes",
+ "clap",
+ "prost 0.13.5",
+ "serde",
+ "serde_json",
+ "tokio",
+ "ursula-proto",
+ "ursula-raft",
+ "ursula-runtime",
+ "ursula-shard",
+ "ursula-stream",
+ "zstd",
+]
+
+[[package]]
 name = "ursula-stream"
 version = "0.5.1"
 dependencies = [

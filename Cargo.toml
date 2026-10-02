@@ -14,6 +14,7 @@ members = [
     "crates/ursula-observability",
     "crates/ursula-gateway",
     "crates/ursula-index",
+    "crates/ursula-state-probe",
 ]
 resolver = "3"
 
@@ -207,6 +208,15 @@ codegen-units = 1
 debug = true
 inherits = "release"
 lto = "fat"
+
+# Measurement builds of `ursula-state-probe` (CI gate and nightly): optimized,
+# but quick to compile. Allocation sizes do not depend on the profile.
+[profile.state-probe]
+inherits = "release"
+codegen-units = 16
+debug = 0
+lto = false
+opt-level = 3
 
 [profile.performance]
 codegen-units = 1

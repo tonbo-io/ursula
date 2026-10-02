@@ -49,6 +49,7 @@ The server uses a thread-per-core, multi-Raft architecture: each stream hashes t
 | `ursula-bench`         | HTTP/client benchmark harnesses for performance testing.                                                                                      |
 | `ursula-ctl`           | Operational CLI (`ursulactl`) for logical cluster management over the admin HTTP API: drain leaderships, wait for catch-up, readiness gates.                                 |
 | `ursula-sim`           | Deterministic simulation harnesses using madsim for fault injection and invariant checking.                                                   |
+| `ursula-state-probe`   | Bounded-state measurement harness (W1-W6, L2 engine probes, counting allocator) and the CI state-growth ratchet (`docs/architecture/bounded-stream-state.md` §7). |
 
 ### Other Top-Level Directories
 
