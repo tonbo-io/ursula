@@ -28,7 +28,14 @@
 //! objects its edit made unreachable, and they are deleted after the grace
 //! period unless the then-current manifest references them. A writer's own
 //! unpublished objects (lost CAS, abandoned compaction) go through the same
-//! queue.
+//! queue, and so does the delta of every manifest adopted from `CURRENT`
+//! that another writer published (another pod, a previous process, a
+//! rebuild).
+//!
+//! A read without `min_through_record` revalidates `CURRENT` (one HEAD)
+//! when the view is older than `current_revalidate`, so a pod never serves
+//! a `D` below what another pod or a previous process published (P3.6).
+//! Object-store requests are counted per namespace and per pod (U24).
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -38,6 +45,7 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -64,6 +72,10 @@ use super::manifest::PublishedKeyedManifest;
 use super::merge::KeyedPage;
 use super::merge::get;
 use super::merge::read_range;
+use super::metrics::KeyedMetrics;
+use super::metrics::KeyedMetricsSnapshot;
+use super::metrics::NamespaceMetrics;
+use super::metrics::bump;
 use super::part::BytesReader;
 use super::part::EncodedPart;
 use super::part::PartOpener;
@@ -78,6 +90,7 @@ use super::source::KeyedSourceClient;
 use super::source::SourceError;
 use crate::EventIndexCache;
 use crate::IndexError;
+use crate::object_store::ObjectRequestCounters;
 use crate::object_store::ObjectStore;
 use crate::object_store::digest;
 
@@ -120,6 +133,11 @@ pub struct KeyedEngineConfig {
     pub part_options: PartOptions,
     /// Size-tiered compaction policy.
     pub policy: CompactionPolicy,
+    /// A read without `min_through_record` revalidates `CURRENT` (one
+    /// HEAD, and a reload when it changed) when the namespace's view was
+    /// last checked longer ago than this, so another pod's or a previous
+    /// process's publication is never served below (P3.6).
+    pub current_revalidate: Duration,
 }
 
 impl Default for KeyedEngineConfig {
@@ -137,6 +155,7 @@ impl Default for KeyedEngineConfig {
             drain_hold: Duration::from_secs(600),
             part_options: PartOptions::default(),
             policy: CompactionPolicy::default(),
+            current_revalidate: Duration::from_secs(1),
         }
     }
 }
@@ -208,7 +227,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Wall-clock milliseconds for `published_at_ms` and the publish interval;
 /// the epoch under the simulator, which has no wall clock.
 #[cfg(not(madsim))]
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| {
@@ -217,12 +236,12 @@ fn now_ms() -> u64 {
 }
 
 #[cfg(madsim)]
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     0
 }
 
 /// blake3 of a record's stored bytes: its message text plus the LF.
-fn stored_digest(text: &str) -> String {
+pub(crate) fn stored_digest(text: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(text.as_bytes());
     hasher.update(b"\n");
@@ -284,6 +303,12 @@ struct Namespace {
     /// The last ingest stopped at `max_ingest_bytes` before its target: the
     /// next one starts without the publish interval.
     backlog: AtomicBool,
+    /// When `CURRENT` was last read or revalidated.
+    checked: Mutex<Instant>,
+    /// The highest source tail `N` seen in a request (lag metric).
+    source_next: AtomicU64,
+    /// Object-store requests issued for this namespace.
+    requests: Arc<ObjectRequestCounters>,
 }
 
 impl Namespace {
@@ -304,8 +329,8 @@ impl Namespace {
     }
 
     /// Adopts a publication newer than the one held; a new publication
-    /// clears transient and rebuilding states.
-    fn adopt(&self, published: Arc<PublishedKeyedManifest>) {
+    /// clears transient and rebuilding states. Returns whether it did.
+    fn adopt(&self, published: Arc<PublishedKeyedManifest>) -> bool {
         self.view.send_if_modified(|view| {
             if view.published.is_some() && published.manifest.generation <= view.generation() {
                 return false;
@@ -320,7 +345,7 @@ impl Namespace {
                 invalid: false,
             });
             true
-        });
+        })
     }
 
     fn set_status(&self, status: Status) {
@@ -352,6 +377,31 @@ impl Namespace {
     fn stop_work(&self) {
         let mut work = lock(&self.work);
         *work = Work::default();
+    }
+
+    fn mark_checked(&self, at: Instant) {
+        let mut checked = lock(&self.checked);
+        *checked = (*checked).max(at);
+    }
+
+    fn metrics(&self) -> NamespaceMetrics {
+        let view = self.view();
+        let through = view.through();
+        let source_next = self.source_next.load(Ordering::Relaxed);
+        NamespaceMetrics {
+            bucket: self.source.bucket.clone(),
+            key: self.source.key.clone(),
+            incarnation: self.source.incarnation,
+            through_record: through,
+            source_next,
+            lag_records: source_next.saturating_sub(through),
+            runs: view
+                .published
+                .as_ref()
+                .map_or(0, |published| published.manifest.runs.len()),
+            generation: view.generation(),
+            s3_requests: self.requests.snapshot().into(),
+        }
     }
 }
 
@@ -486,6 +536,7 @@ struct Inner {
     bucket_idle: Notify,
     waiters: AtomicUsize,
     gc: Mutex<Vec<GcItem>>,
+    metrics: KeyedMetrics,
 }
 
 /// The keyed projection engine of one indexer pod.
@@ -536,6 +587,8 @@ impl KeyedEngine {
             capacity: config.write_cache_bytes,
             state: Mutex::new(WrittenState::default()),
         });
+        let metrics = KeyedMetrics::default();
+        let store = store.counted(Arc::clone(&metrics.requests));
         Self {
             inner: Arc::new(Inner {
                 store,
@@ -548,6 +601,7 @@ impl KeyedEngine {
                 bucket_idle: Notify::new(),
                 waiters: AtomicUsize::new(0),
                 gc: Mutex::new(Vec::new()),
+                metrics,
             }),
         }
     }
@@ -567,6 +621,19 @@ impl KeyedEngine {
     /// `drain_hold`.
     pub async fn drain(&self, bucket: &str) {
         Inner::drain(&self.inner, bucket).await;
+    }
+
+    /// A snapshot of the engine's metrics (U24).
+    pub fn metrics(&self) -> KeyedMetricsSnapshot {
+        let detail: Vec<NamespaceMetrics> = lock(&self.inner.namespaces)
+            .values()
+            .map(|namespace| namespace.metrics())
+            .collect();
+        self.inner.metrics.snapshot(
+            self.inner.waiters.load(Ordering::SeqCst),
+            lock(&self.inner.gc).len(),
+            detail,
+        )
     }
 
     /// Deletes due garbage now; returns the number of objects deleted.
@@ -624,7 +691,11 @@ impl Inner {
             namespace.touch();
             return Ok(Arc::clone(namespace));
         }
-        let namespace = KeyedNamespace::new(self.store.clone(), source.clone());
+        let requests = Arc::new(ObjectRequestCounters::default());
+        let namespace = KeyedNamespace::new(
+            self.store.clone().counted(Arc::clone(&requests)),
+            source.clone(),
+        );
         let mut store = namespace.opener();
         if let Some(cache) = &self.cache {
             store = store.with_cache(cache)?;
@@ -643,6 +714,9 @@ impl Inner {
             work: Mutex::new(Work::default()),
             last_used: Mutex::new(Instant::now()),
             backlog: AtomicBool::new(false),
+            checked: Mutex::new(Instant::now()),
+            source_next: AtomicU64::new(0),
+            requests,
         });
         namespaces.insert(id, Arc::clone(&created));
         Ok(created)
@@ -655,30 +729,73 @@ impl Inner {
         if *loaded {
             return Ok(());
         }
+        let started = Instant::now();
         if let Some(published) = namespace.namespace.load().await? {
-            let published = Arc::new(published);
-            let remaining = published
-                .manifest
-                .published_at_ms
-                .saturating_add(u64::try_from(self.config.gc_grace.as_millis()).unwrap_or(u64::MAX))
-                .saturating_sub(now_ms());
+            self.adopt_loaded(namespace, published);
+        }
+        namespace.mark_checked(started);
+        *loaded = true;
+        Ok(())
+    }
+
+    /// Adopts a manifest loaded from `CURRENT`. When it is newer than the
+    /// view, it was published elsewhere (another pod, a previous process,
+    /// a rebuild), so the objects its edit made obsolete join this pod's GC
+    /// queue, due a grace period after its publication.
+    fn adopt_loaded(&self, namespace: &Arc<Namespace>, published: PublishedKeyedManifest) {
+        let published = Arc::new(published);
+        let obsoleted = published.manifest.obsoleted.clone();
+        let remaining = published
+            .manifest
+            .published_at_ms
+            .saturating_add(u64::try_from(self.config.gc_grace.as_millis()).unwrap_or(u64::MAX))
+            .saturating_sub(now_ms());
+        if namespace.adopt(published) {
             let due = Instant::now()
                 .checked_add(Duration::from_millis(remaining))
                 .unwrap_or_else(Instant::now);
-            self.schedule_gc(namespace, published.manifest.obsoleted.clone(), due);
-            namespace.adopt(published);
+            self.schedule_gc(namespace, obsoleted, due);
         }
-        *loaded = true;
+    }
+
+    /// Revalidates `CURRENT` when the namespace's view was last checked
+    /// longer ago than `current_revalidate`: one HEAD, and a reload when
+    /// the entity tag differs from the view's (P3.6 across pods and
+    /// restarts). Single flight per namespace.
+    async fn revalidate(&self, namespace: &Arc<Namespace>) -> Result<(), IndexError> {
+        let bound = self.config.current_revalidate;
+        if lock(&namespace.checked).elapsed() < bound {
+            return Ok(());
+        }
+        let _loading = namespace.loaded.lock().await;
+        if lock(&namespace.checked).elapsed() < bound {
+            return Ok(());
+        }
+        let started = Instant::now();
+        bump(&self.metrics.current_revalidations, 1);
+        let current = namespace.namespace.current_etag().await?;
+        let held = namespace
+            .published()
+            .map(|published| published.pointer_etag.clone());
+        if current.is_some()
+            && current != held
+            && let Some(published) = namespace.namespace.load().await?
+        {
+            self.adopt_loaded(namespace, published);
+        }
+        namespace.mark_checked(started);
         Ok(())
     }
 
     async fn reload(
         &self,
-        namespace: &Namespace,
+        namespace: &Arc<Namespace>,
     ) -> Result<Option<Arc<PublishedKeyedManifest>>, CycleError> {
+        let started = Instant::now();
         if let Some(published) = namespace.namespace.load().await.map_err(transient)? {
-            namespace.adopt(Arc::new(published));
+            self.adopt_loaded(namespace, published);
         }
+        namespace.mark_checked(started);
         Ok(namespace.published())
     }
 
@@ -698,8 +815,17 @@ impl Inner {
             Ok(namespace) => namespace,
             Err(error) => return KeyedReadOutcome::Unavailable(error.to_string()),
         };
+        namespace
+            .source_next
+            .fetch_max(request.source_next, Ordering::Relaxed);
         if let Err(error) = self.ensure_loaded(&namespace).await {
             tracing::warn!(%error, bucket, key = %request.source.key, "keyed namespace load failed");
+            return KeyedReadOutcome::Unavailable("keyed state cannot be loaded".to_owned());
+        }
+        if request.min_through_record.is_none()
+            && let Err(error) = self.revalidate(&namespace).await
+        {
+            tracing::warn!(%error, bucket, key = %request.source.key, "keyed CURRENT revalidation failed");
             return KeyedReadOutcome::Unavailable("keyed state cannot be loaded".to_owned());
         }
         let mut receiver = namespace.view.subscribe();
@@ -1187,13 +1313,15 @@ impl Inner {
             .unwrap_or_else(Instant::now);
         match outcome {
             PublishOutcome::Published(published) => {
+                bump(&self.metrics.publishes, 1);
                 let published = Arc::new(*published);
                 self.schedule_gc(namespace, published.manifest.obsoleted.clone(), due);
-                namespace.adopt(published);
+                let _adopted = namespace.adopt(published);
                 self.check_incarnation(namespace).await?;
                 Ok(true)
             }
             PublishOutcome::Conflict { manifest_key } => {
+                bump(&self.metrics.cas_conflicts, 1);
                 let mut orphans = new_keys;
                 orphans.push(manifest_key);
                 self.schedule_gc(namespace, orphans, due);
@@ -1266,6 +1394,16 @@ impl Inner {
             let output = compact(&namespace.opener, runs, range, &self.config.part_options)
                 .await
                 .map_err(transient)?;
+            bump(&self.metrics.compaction_input_bytes, input_bytes);
+            bump(
+                &self.metrics.compaction_output_bytes,
+                output
+                    .output
+                    .parts
+                    .iter()
+                    .map(|part| part.meta.bytes)
+                    .fold(0_u64, u64::saturating_add),
+            );
             self.store_parts(namespace, &output.output.parts).await?;
             let new_keys: Vec<String> = output
                 .output
@@ -1296,6 +1434,7 @@ impl Inner {
                     .commit(namespace, Some(&attempt), next, Vec::new())
                     .await?
                 {
+                    bump(&self.metrics.compaction_publishes, 1);
                     committed = true;
                     break;
                 }
@@ -1352,12 +1491,14 @@ impl Inner {
             if self.draining(&namespace.source.bucket) {
                 continue;
             }
+            let started = Instant::now();
             let referenced: HashSet<String> = match namespace.namespace.load().await {
                 Ok(Some(published)) => {
+                    namespace.mark_checked(started);
                     let mut referenced: HashSet<String> =
                         published.manifest.part_keys().map(str::to_owned).collect();
                     referenced.insert(published.manifest_key.clone());
-                    namespace.adopt(Arc::new(published));
+                    self.adopt_loaded(&namespace, published);
                     referenced
                 }
                 Ok(None) => HashSet::new(),
@@ -1383,6 +1524,10 @@ impl Inner {
             self.schedule_gc(&namespace, failed, retry);
         }
         self.forget_idle();
+        bump(
+            &self.metrics.gc_deleted,
+            u64::try_from(deleted).unwrap_or(u64::MAX),
+        );
         deleted
     }
 

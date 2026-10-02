@@ -7,6 +7,8 @@
 //!   node answers 404 and adds `Stream-Extensions`.
 //! - `POST /v1/keyed/drain` with `{"bucket":"<id>"}`: blocks new work for the
 //!   bucket and answers 200 once it is quiescent.
+//! - `GET /__ursula/indexer/metrics`: the engine's metrics snapshot as JSON
+//!   (U24).
 //!
 //! Row bodies are gzip-compressed when the caller accepts it.
 
@@ -41,6 +43,7 @@ use super::fold::KEYED_STATE_RESPONSE_BUDGET;
 use super::fold::Lower;
 use super::fold::RangeQuery;
 use super::manifest::KeyedSource;
+use super::metrics::INDEXER_METRICS_PATH;
 
 /// Media type of keyed-state rows.
 pub const KEYED_ROWS_CONTENT_TYPE: &str = "application/vnd.durable-stream-keyed-rows+ndjson";
@@ -54,12 +57,14 @@ const MAX_LIMIT: usize = 1000;
 const DEFAULT_TIMEOUT_MS: u64 = 1000;
 const MAX_TIMEOUT_MS: u64 = 60_000;
 
-/// The keyed-mode router: `/v1/keyed/...` plus `/livez` and `/readyz`.
+/// The keyed-mode router: `/v1/keyed/...`, the metrics snapshot, `/livez`
+/// and `/readyz`.
 pub fn router(engine: KeyedEngine) -> Router {
     Router::new()
         .route("/livez", get(|| async { StatusCode::OK }))
         .route("/readyz", get(|| async { StatusCode::OK }))
         .route("/v1/keyed/drain", post(drain))
+        .route(INDEXER_METRICS_PATH, get(metrics))
         .route("/v1/keyed/{bucket}/{key}", get(read))
         .layer(CompressionLayer::new().gzip(true))
         .with_state(engine)
@@ -76,6 +81,10 @@ async fn drain(State(engine): State<KeyedEngine>, Json(request): Json<DrainReque
     }
     engine.drain(&request.bucket).await;
     Json(serde_json::json!({ "bucket": request.bucket, "drained": true })).into_response()
+}
+
+async fn metrics(State(engine): State<KeyedEngine>) -> Response {
+    Json(engine.metrics()).into_response()
 }
 
 fn bad_request(reason: &str) -> Response {

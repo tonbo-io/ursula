@@ -19,6 +19,7 @@ use super::part::EncodedPart;
 use super::part::StorePartOpener;
 use crate::IndexError;
 use crate::object_store::ConditionalWrite;
+use crate::object_store::ObjectInfo;
 use crate::object_store::ObjectStore;
 use crate::object_store::digest;
 
@@ -340,6 +341,15 @@ pub fn namespace_prefix(source: &KeyedSource, format: u32) -> String {
     )
 }
 
+/// The content hash in a manifest key, `manifests/{generation}-{hash}.json`.
+fn manifest_hash(key: &str) -> Result<&str, IndexError> {
+    key.strip_prefix("manifests/")
+        .and_then(|name| name.strip_suffix(".json"))
+        .and_then(|name| name.split_once('-'))
+        .map(|(_, hash)| hash)
+        .ok_or_else(|| IndexError::InvalidObjectKey(key.to_owned()))
+}
+
 /// One keyed namespace in an object store.
 #[derive(Clone)]
 pub struct KeyedNamespace {
@@ -394,6 +404,17 @@ impl KeyedNamespace {
         self.store.delete(&self.object(key)).await
     }
 
+    /// Every object of the namespace (one LIST), with keys relative to it.
+    pub(crate) async fn objects(&self) -> Result<Vec<ObjectInfo>, IndexError> {
+        let mut objects = self.store.list(&self.prefix).await?;
+        for object in &mut objects {
+            if let Some(relative) = object.key.strip_prefix(&self.prefix) {
+                object.key = relative.to_owned();
+            }
+        }
+        Ok(objects)
+    }
+
     /// Deletes every object of the namespace (the stream incarnation is
     /// gone). Returns the number of objects deleted.
     pub async fn delete_all(&self) -> Result<usize, IndexError> {
@@ -403,6 +424,27 @@ impl KeyedNamespace {
             self.store.delete(&object.key).await?;
         }
         Ok(count)
+    }
+
+    /// The entity tag of `CURRENT` (one HEAD); `None` when the namespace is
+    /// missing.
+    pub async fn current_etag(&self) -> Result<Option<String>, IndexError> {
+        self.store.head(&self.object(KEYED_CURRENT_KEY)).await
+    }
+
+    /// Reads the manifest object `key` (relative to the namespace), checking
+    /// its content hash; `None` when it is gone.
+    pub async fn manifest(&self, key: &str) -> Result<Option<KeyedManifest>, IndexError> {
+        let hash = manifest_hash(key)?;
+        let Some(object) = self.store.get(&self.object(key)).await? else {
+            return Ok(None);
+        };
+        if digest(&object.bytes) != hash {
+            return Err(IndexError::ObjectHashMismatch(key.to_owned()));
+        }
+        let manifest: KeyedManifest = serde_json::from_slice(&object.bytes)?;
+        manifest.validate()?;
+        Ok(Some(manifest))
     }
 
     /// Loads the published manifest; `None` is a missing namespace
@@ -415,13 +457,7 @@ impl KeyedNamespace {
         if pointer.version != KEYED_MANIFEST_VERSION {
             return Err(IndexError::ManifestVersion(pointer.version));
         }
-        let hash = pointer
-            .manifest
-            .strip_prefix("manifests/")
-            .and_then(|name| name.strip_suffix(".json"))
-            .and_then(|name| name.split_once('-'))
-            .map(|(_, hash)| hash)
-            .ok_or_else(|| IndexError::InvalidObjectKey(pointer.manifest.clone()))?;
+        let hash = manifest_hash(&pointer.manifest)?;
         let object = self
             .store
             .get(&self.object(&pointer.manifest))

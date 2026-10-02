@@ -12,7 +12,8 @@
 //!   and the keyed engine service (ingest, publish, compaction, GC, the
 //!   internal `/v1/keyed` API).
 //! - [`manifest`]: the conditionally published manifest state model.
-//! - [`object_store`]: conditional object operations for S3 and local tests.
+//! - [`object_store`]: conditional object operations for S3 and local tests,
+//!   with request counting by S3 class and fault injection for crash tests.
 //! - [`part`]: immutable sorted Parquet parts.
 //! - [`service`]: command arguments and the long-running indexer service entrypoint.
 //! - [`source`]: HTTP client for the upstream record stream.
@@ -38,7 +39,12 @@ pub use manifest::CompletedRecordRange;
 pub use manifest::GarbageCollectionReport;
 pub use manifest::RecordSegmentLease;
 pub use object_store::FsObjectStore;
+pub use object_store::ObjectFaults;
+pub use object_store::ObjectOp;
+pub use object_store::ObjectRequestCounters;
+pub use object_store::ObjectRequestCounts;
 pub use object_store::ObjectStore;
+pub use object_store::ObservedStore;
 pub use object_store::S3ObjectStore;
 pub use object_store::S3ObjectStoreConfig;
 pub use source::SourceBatch;
