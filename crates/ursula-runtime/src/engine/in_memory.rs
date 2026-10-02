@@ -1594,6 +1594,16 @@ impl InMemoryGroupEngine {
                             .map(|object| (object.start_offset, object.end_offset)),
                     )
                     .collect(),
+                retained_range: (
+                    self.state_machine.retained_offset(&stream_id),
+                    self.stream_tail_offset(&stream_id).unwrap_or(0),
+                ),
+                hot_ranges: self
+                    .state_machine
+                    .hot_segments(&stream_id)
+                    .iter()
+                    .map(|segment| (segment.start_offset, segment.end_offset))
+                    .collect(),
                 stream_id,
             })
             .collect();

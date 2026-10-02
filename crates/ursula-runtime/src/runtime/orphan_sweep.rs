@@ -30,6 +30,15 @@
 //! ambiguous redirect), so it may hold the only copy of committed bytes. The
 //! sweep logs an error and counts `cold_orphan_uncovered_chunks_kept` for an
 //! operator to repair the stream's cold index.
+//!
+//! External payloads carry no range in their name, so the same guard works
+//! per stream: an unreferenced external payload of a stream is deleted only
+//! when the stream's retained bytes `[retained, tail)` are fully covered by
+//! its hot buffer, state refs and page entries. At feature level 3 the
+//! offload pass moves external refs into pages, so a lost page entry would
+//! otherwise make the sole payload look like an orphan. While coverage has a
+//! gap, every unreferenced external payload of the stream is kept, counted
+//! and logged as an error.
 
 use std::collections::BTreeSet;
 
@@ -56,6 +65,10 @@ use crate::error::RuntimeError;
 /// A live chunk directory, its stream's cold range and the byte ranges its
 /// referenced objects cover (RT6).
 type ChunkGuard = (String, (u64, u64), Vec<(u64, u64)>);
+
+/// A stream's external directory and, when its retained bytes are not fully
+/// covered, the first uncovered range (RT6).
+type ExternalGuard = (String, Option<(u64, u64)>);
 
 /// Default age below which the sweep never deletes an object.
 pub const COLD_ORPHAN_SWEEP_GRACE_MS: u64 = 24 * 60 * 60 * 1_000;
@@ -145,6 +158,7 @@ impl ShardRuntime {
         // Per live chunk directory: the stream's cold range and the ranges
         // its referenced objects cover (RT6).
         let mut chunk_guards: Vec<ChunkGuard> = Vec::new();
+        let mut external_guards: Vec<ExternalGuard> = Vec::new();
         if !aged.is_empty() {
             let plan = self
                 .plan_cold_orphan_sweep(raft_group_id, ColdOrphanSweepRequest {
@@ -180,6 +194,13 @@ impl ShardRuntime {
                     referenced.extend(paths);
                     covered.extend(ranges);
                 }
+                let mut retained_covered = covered.clone();
+                retained_covered.extend(current.hot_ranges.iter().copied());
+                let (retained_start, retained_end) = current.retained_range;
+                external_guards.push((
+                    cold_external_dir(&stream.stream_id),
+                    first_gap(&retained_covered, retained_start, retained_end),
+                ));
                 chunk_guards.push((
                     cold_chunk_dir(&stream.stream_id, stream.generation),
                     current.cold_range,
@@ -216,6 +237,22 @@ impl ShardRuntime {
                     );
                     continue;
                 }
+            }
+            if is_external_payload_file_name(&name)
+                && let Some((_, Some((gap_start, gap_end)))) = external_guards
+                    .iter()
+                    .find(|(dir, _)| path.strip_prefix(dir.as_str()) == Some(name.as_str()))
+            {
+                self.metrics.record_cold_orphan_uncovered_chunk_kept();
+                report.uncovered_chunks_kept = report.uncovered_chunks_kept.saturating_add(1);
+                tracing::error!(
+                    path = %path,
+                    uncovered_start = gap_start,
+                    uncovered_end = gap_end,
+                    "unreferenced external payload of a stream whose retained bytes no index \
+                     entry covers; keeping it (lost cold-index page entry, repair the stream)"
+                );
+                continue;
             }
             let bytes = cold_store.object_size(&path).await.unwrap_or(0);
             match cold_store.delete_chunk(&path).await {
@@ -285,6 +322,30 @@ impl ShardRuntime {
             .insert(raft_group_id, after);
         Ok(())
     }
+}
+
+/// The first part of `[start, end)` that `ranges` leave uncovered, if any.
+fn first_gap(ranges: &[(u64, u64)], start: u64, end: u64) -> Option<(u64, u64)> {
+    if start >= end || ranges_cover(ranges, start, end) {
+        return None;
+    }
+    let mut sorted = ranges
+        .iter()
+        .copied()
+        .filter(|(range_start, range_end)| range_start < range_end)
+        .collect::<Vec<_>>();
+    sorted.sort_unstable();
+    let mut cursor = start;
+    for (range_start, range_end) in sorted {
+        if range_start > cursor {
+            return Some((cursor, range_start.min(end)));
+        }
+        cursor = cursor.max(range_end);
+        if cursor >= end {
+            return None;
+        }
+    }
+    Some((cursor, end))
 }
 
 /// Every object path the pages of one stream generation reference, and the
