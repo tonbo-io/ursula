@@ -53,6 +53,10 @@ use crate::cold_store::is_cold_chunk_file_name;
 use crate::cold_store::is_external_payload_file_name;
 use crate::error::RuntimeError;
 
+/// A live chunk directory, its stream's cold range and the byte ranges its
+/// referenced objects cover (RT6).
+type ChunkGuard = (String, (u64, u64), Vec<(u64, u64)>);
+
 /// Default age below which the sweep never deletes an object.
 pub const COLD_ORPHAN_SWEEP_GRACE_MS: u64 = 24 * 60 * 60 * 1_000;
 
@@ -140,7 +144,7 @@ impl ShardRuntime {
         let mut referenced = BTreeSet::new();
         // Per live chunk directory: the stream's cold range and the ranges
         // its referenced objects cover (RT6).
-        let mut chunk_guards: Vec<(String, (u64, u64), Vec<(u64, u64)>)> = Vec::new();
+        let mut chunk_guards: Vec<ChunkGuard> = Vec::new();
         if !aged.is_empty() {
             let plan = self
                 .plan_cold_orphan_sweep(raft_group_id, ColdOrphanSweepRequest {

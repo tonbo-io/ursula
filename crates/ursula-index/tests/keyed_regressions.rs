@@ -700,7 +700,7 @@ async fn gc_spares_an_orphan_referenced_by_a_recent_manifest() {
     // Shortly before pod B's GC, pod A ingests more and compacts the three
     // runs: CURRENT no longer references the reused parts, but the manifest
     // just before the compaction (written within the grace) does.
-    tokio::time::sleep(GRACE - Duration::from_secs(1)).await;
+    tokio::time::sleep(GRACE.checked_sub(Duration::from_secs(1)).unwrap()).await;
     log.records.lock().unwrap().extend((4..6).map(record));
     let KeyedReadOutcome::Rows { through: 6, .. } = read(&pod_a, 6, Duration::from_secs(30)).await
     else {
