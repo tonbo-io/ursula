@@ -11,10 +11,14 @@
 //!   drain fan-out to keyed-state indexers (U23) and keyed-state request
 //!   counters (U24).
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
+//! - `bucket_listing`: `GET /{bucket}/streams` across Raft groups, fetching
+//!   the share of a group this node does not host from one of its voters
+//!   (RT3).
 //! - [`bootstrap`]: typed-config `spawn_*_runtime` constructors and cold-flush worker.
 //! - [`server`]: command arguments and the long-running server service entrypoint.
 
 mod bootstrap;
+mod bucket_listing;
 pub mod json_text;
 mod keyed_lifecycle;
 pub mod keyed_state;
@@ -592,11 +596,17 @@ struct HttpMetricsSnapshot {
 /// `server.cluster_listen` address when it is set. Peer URLs are also used as
 /// HTTP leader-redirect targets, so clients and gateways must be able to reach
 /// them too.
+/// Timeout of one node-to-node fan-out request.
+const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
     peers: Arc<BTreeMap<u64, String>>,
     node_id: Option<u64>,
     per_group_voters: Arc<BTreeMap<RaftGroupId, BTreeSet<u64>>>,
+    /// Node-to-node HTTP client for fan-out reads such as a bucket listing
+    /// share of a group this node does not host (RT3).
+    peer_client: reqwest::Client,
 }
 
 impl ClientWriteLeaderRouter {
@@ -618,7 +628,28 @@ impl ClientWriteLeaderRouter {
             ),
             node_id: node_id.into(),
             per_group_voters: Arc::new(per_group_voters),
+            peer_client: reqwest::Client::builder()
+                .timeout(PEER_REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_default(),
         }
+    }
+
+    pub(crate) fn peer_client(&self) -> &reqwest::Client {
+        &self.peer_client
+    }
+
+    /// Base URLs of `group`'s voters other than this node.
+    pub(crate) fn group_voter_bases(&self, group: RaftGroupId) -> Vec<String> {
+        self.per_group_voters
+            .get(&group)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|node_id| Some(*node_id) != self.node_id)
+            .filter_map(|node_id| self.peers.get(&node_id))
+            .map(|base| base.trim_end_matches('/').to_owned())
+            .collect()
     }
 
     fn leader_base(&self, err: &RuntimeError) -> Option<(u64, String)> {
@@ -1382,6 +1413,10 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         .route("/{bucket}", put(create_bucket))
         .route("/{bucket}/streams", get(list_bucket_streams))
         .route(
+            bucket_listing::GROUP_SHARE_PATH,
+            get(bucket_listing::group_share),
+        )
+        .route(
             "/{bucket}/{stream}/snapshot",
             get(read_latest_snapshot).put(publish_snapshot_at_record),
         )
@@ -1816,21 +1851,18 @@ pub(crate) async fn list_bucket_streams(
     };
     let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
     let after = query.get("after").map(String::as_str);
-    let listing = match state
-        .runtime
-        .list_bucket_streams_all_groups(&bucket, prefix, after, limit, state.unix_time_ms())
-        .await
-    {
-        Ok(Some(listing)) => listing,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                format!("bucket '{bucket}' does not exist"),
-            )
-                .into_response();
-        }
-        Err(err) => return runtime_error_response(err),
-    };
+    let listing =
+        match bucket_listing::list_across_groups(&state, &bucket, prefix, after, limit).await {
+            Ok(Some(listing)) => listing,
+            Ok(None) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    format!("bucket '{bucket}' does not exist"),
+                )
+                    .into_response();
+            }
+            Err(response) => return response,
+        };
     let next_cursor = listing
         .has_more
         .then(|| listing.streams.last().map(|entry| entry.stream_id.clone()))
