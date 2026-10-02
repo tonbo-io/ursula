@@ -15,6 +15,8 @@ use crate::admission::SharedRaftUncommittedBytes;
 use crate::admission::UncommittedBytesGuard;
 use crate::cold_index::RepairColdIndexRequest;
 use crate::cold_index::RepairColdIndexResponse;
+use crate::cold_refs::ColdOrphanSweepPlan;
+use crate::cold_refs::ColdOrphanSweepRequest;
 use crate::command::GroupSnapshot;
 use crate::engine::GroupEngine;
 use crate::engine::GroupEngineError;
@@ -1024,6 +1026,37 @@ impl CoreWorker {
         }
         group
             .repair_cold_index(request, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err))
+    }
+
+    pub(crate) async fn plan_shared_ref_compaction(
+        group: &mut Box<dyn GroupEngine>,
+        request: ursula_stream::SharedRefCompactionRequest,
+        placement: ShardPlacement,
+    ) -> Result<Vec<ursula_stream::SharedRefCandidate>, RuntimeError> {
+        // Compaction publishes replacements, so only the local leader plans.
+        if !group.accepts_local_writes() {
+            return Ok(Vec::new());
+        }
+        group
+            .plan_shared_ref_compaction(request, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err))
+    }
+
+    pub(crate) async fn plan_cold_orphan_sweep(
+        group: &mut Box<dyn GroupEngine>,
+        request: ColdOrphanSweepRequest,
+        placement: ShardPlacement,
+    ) -> Result<ColdOrphanSweepPlan, RuntimeError> {
+        // The sweep deletes objects, so only the local leader plans one; a
+        // follower answers with an empty, non-leader plan.
+        if !group.accepts_local_writes() {
+            return Ok(ColdOrphanSweepPlan::default());
+        }
+        group
+            .plan_cold_orphan_sweep(request, placement)
             .await
             .map_err(|err| RuntimeError::group_engine(placement, err))
     }

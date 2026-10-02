@@ -539,6 +539,7 @@ async fn d3_raft_repair_keeps_the_last_written_external_entry_at_each_start() {
             ursula_runtime::RepairColdIndexRequest {
                 after: None,
                 max_streams: 16,
+                stream: None,
             },
             placement(),
         )

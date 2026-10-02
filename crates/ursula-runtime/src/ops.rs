@@ -296,6 +296,20 @@ macro_rules! runtime_operations {
                 handle { call repair_cold_index(engine, request, placement) }
                 client { group fn repair_cold_index }
             }
+            op PlanSharedRefCompaction {
+                fields { request: ursula_stream::SharedRefCompactionRequest }
+                reply { response_tx: Vec<ursula_stream::SharedRefCandidate> }
+                guard { none }
+                handle { call plan_shared_ref_compaction(engine, request, placement) }
+                client { group fn plan_shared_ref_compaction }
+            }
+            op PlanColdOrphanSweep {
+                fields { request: ColdOrphanSweepRequest }
+                reply { response_tx: ColdOrphanSweepPlan }
+                guard { none }
+                handle { call plan_cold_orphan_sweep(engine, request, placement) }
+                client { group fn plan_cold_orphan_sweep }
+            }
             op BucketUsage {
                 fields {}
                 reply { response_tx: Vec<ursula_stream::BucketUsageSnapshot> }

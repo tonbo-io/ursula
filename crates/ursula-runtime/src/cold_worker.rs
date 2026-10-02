@@ -4,8 +4,10 @@
 
 use ursula_stream::ColdFlushPressure;
 
+use crate::COLD_ORPHAN_SWEEP_GRACE_MS;
 use crate::PlanGroupColdFlushRequest;
 use crate::ShardRuntime;
+use crate::SharedRefCompactionConfig;
 
 /// Node-level flush pressure for one pass (bounded-stream-state F10): once
 /// hot bytes across the locally led groups reach the watermark, every group
@@ -21,7 +23,10 @@ fn pass_pressure(observed_hot_bytes: u64, pressure_hot_bytes: u64) -> Option<Col
     })
 }
 
-/// Start the periodic same-stream cold chunk compactor when explicitly enabled.
+/// Start the periodic cold compactors when explicitly enabled: the
+/// same-stream chunk compactor and the shared pack-reference driver
+/// (bounded-stream-state F2), which keeps at most T = 64 shared refs per
+/// stream and releases idle packs.
 pub fn spawn_cold_compaction_worker_if_configured(
     runtime: &ShardRuntime,
     config: &ursula_config::ColdConfig,
@@ -35,6 +40,7 @@ pub fn spawn_cold_compaction_worker_if_configured(
     let max_streams = config.compaction_max_streams_per_pass.max(1);
     let gc_grace_ms =
         u64::try_from(config.compaction_gc_grace.as_duration().as_millis()).unwrap_or(u64::MAX);
+    let shared_refs = SharedRefCompactionConfig::new(max_bytes, max_streams, gc_grace_ms);
     let runtime = runtime.clone();
     tokio::spawn(async move {
         loop {
@@ -47,6 +53,21 @@ pub fn spawn_cold_compaction_worker_if_configured(
                 }
                 Ok(_) => {}
                 Err(err) => tracing::error!("cold compaction worker error: {err}"),
+            }
+            let report = runtime
+                .compact_shared_refs_all_groups_once(&shared_refs)
+                .await;
+            if report.compacted_streams > 0 || report.rejected > 0 || report.ambiguous > 0 {
+                tracing::info!(
+                    candidates = report.candidates,
+                    compacted_streams = report.compacted_streams,
+                    compacted_slices = report.compacted_slices,
+                    compacted_bytes = report.compacted_bytes,
+                    rejected = report.rejected,
+                    ambiguous = report.ambiguous,
+                    errors = report.errors,
+                    "shared-ref compaction pass completed"
+                );
             }
             tokio::time::sleep(interval).await;
         }
@@ -156,6 +177,44 @@ pub fn spawn_cold_index_repair_worker(runtime: &ShardRuntime) {
                     overlapping = report.overlapping_entries_dropped,
                     predating = report.predating_entries_dropped,
                     "cold-index repair dropped stale page entries"
+                );
+            }
+        }
+    });
+}
+
+/// Pause between cold orphan-sweep steps.
+const COLD_ORPHAN_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+/// Streams per group whose prefixes one orphan-sweep step lists.
+const COLD_ORPHAN_SWEEP_MAX_STREAMS_PER_STEP: usize = 16;
+
+/// Start the leader-side cold orphan sweep (bounded-stream-state F14h). Every
+/// interval each group the node leads sweeps a bounded number of streams
+/// after its cursor, plus its pack directories at the start of a cycle, and
+/// deletes objects older than a day that nothing references. It reclaims
+/// what ambiguous publishes leave behind, so it is not behind a config
+/// switch.
+pub fn spawn_cold_orphan_sweep_worker(runtime: &ShardRuntime) {
+    if !runtime.has_cold_store() {
+        return;
+    }
+    let runtime = runtime.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(COLD_ORPHAN_SWEEP_INTERVAL).await;
+            let report = runtime
+                .sweep_cold_orphans_all_groups_once(
+                    COLD_ORPHAN_SWEEP_MAX_STREAMS_PER_STEP,
+                    COLD_ORPHAN_SWEEP_GRACE_MS,
+                )
+                .await;
+            if report.orphans_deleted > 0 || report.delete_errors > 0 {
+                tracing::info!(
+                    objects_scanned = report.objects_scanned,
+                    orphans_deleted = report.orphans_deleted,
+                    orphan_bytes = report.orphan_bytes,
+                    delete_errors = report.delete_errors,
+                    "cold orphan sweep step completed"
                 );
             }
         }

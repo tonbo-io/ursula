@@ -1,4 +1,6 @@
 #[cfg(test)]
+mod cold_drivers_tests;
+#[cfg(test)]
 mod compact_tests;
 mod factory;
 
@@ -31,6 +33,8 @@ use ursula_runtime::AppendTransactionResponse;
 use ursula_runtime::BootstrapStreamRequest;
 use ursula_runtime::CloseStreamRequest;
 use ursula_runtime::ColdIndexPageCache;
+use ursula_runtime::ColdOrphanSweepPlan;
+use ursula_runtime::ColdOrphanSweepRequest;
 use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::ColdWriteAdmission;
@@ -65,7 +69,9 @@ use ursula_runtime::GroupInstallSnapshotFuture;
 use ursula_runtime::GroupListBucketStreamsFuture;
 use ursula_runtime::GroupPlanColdFlushFuture;
 use ursula_runtime::GroupPlanColdGcFuture;
+use ursula_runtime::GroupPlanColdOrphanSweepFuture;
 use ursula_runtime::GroupPlanNextColdFlushBatchFuture;
+use ursula_runtime::GroupPlanSharedRefCompactionFuture;
 use ursula_runtime::GroupPublishSnapshotFuture;
 use ursula_runtime::GroupPurgeBucketFuture;
 use ursula_runtime::GroupReadSnapshotFuture;
@@ -100,7 +106,7 @@ use ursula_runtime::TouchStreamAccessResponse;
 use ursula_runtime::UpdateStreamAttrsRequest;
 use ursula_runtime::clipped_entries;
 use ursula_runtime::default_snapshot_store;
-use ursula_runtime::next_repair_cursor;
+use ursula_runtime::repair_cold_index_response;
 use ursula_runtime::repair_cold_index_streams;
 use ursula_runtime::replace_cold_chunk_index_pages_with_rollback_in_generation;
 use ursula_runtime::rollback_cold_index_pages;
@@ -109,6 +115,7 @@ use ursula_runtime::write_external_segment_index_pages;
 use ursula_runtime::write_external_segment_index_pages_in_generation;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
+use ursula_stream::SharedRefCompactionRequest;
 use ursula_stream::StreamCommand;
 
 use crate::forward::forward_get_stream_attrs_to_leader;
@@ -1338,6 +1345,47 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
+    fn plan_shared_ref_compaction<'a>(
+        &'a mut self,
+        request: SharedRefCompactionRequest,
+        _placement: ShardPlacement,
+    ) -> GroupPlanSharedRefCompactionFuture<'a> {
+        Box::pin(async move {
+            if !self.raft.is_leader() {
+                return Ok(Vec::new());
+            }
+            self.with_state_machine(move |state_machine| {
+                Box::pin(async move {
+                    state_machine
+                        .engine
+                        .plan_shared_ref_compaction_candidates(&request)
+                })
+            })
+            .await
+        })
+    }
+
+    fn plan_cold_orphan_sweep<'a>(
+        &'a mut self,
+        request: ColdOrphanSweepRequest,
+        placement: ShardPlacement,
+    ) -> GroupPlanColdOrphanSweepFuture<'a> {
+        Box::pin(async move {
+            if self.cold_store.is_none() || !self.raft.is_leader() {
+                return Ok(ColdOrphanSweepPlan::default());
+            }
+            let raft_group_id = placement.raft_group_id.0;
+            self.with_state_machine(move |state_machine| {
+                Box::pin(async move {
+                    state_machine
+                        .engine
+                        .cold_orphan_sweep_plan(&request, raft_group_id)
+                })
+            })
+            .await
+        })
+    }
+
     fn repair_cold_index<'a>(
         &'a mut self,
         request: RepairColdIndexRequest,
@@ -1350,15 +1398,12 @@ impl GroupEngine for RaftGroupEngine {
             if !self.raft.is_leader() {
                 return Ok(RepairColdIndexResponse::default());
             }
-            let max_streams = request.max_streams.max(1);
-            let after = request.after;
+            let step = request.clone();
             let inputs = self
                 .with_state_machine(move |state_machine| {
-                    Box::pin(async move {
-                        state_machine
-                            .engine
-                            .cold_index_repair_inputs(after.as_ref(), max_streams)
-                    })
+                    Box::pin(
+                        async move { state_machine.engine.cold_index_repair_inputs_for(&step) },
+                    )
                 })
                 .await?;
             let store = ColdStoreColdIndexPageStore::new(cold_store);
@@ -1366,12 +1411,7 @@ impl GroupEngine for RaftGroupEngine {
                 repair_cold_index_streams(&store, self.cold_index_cache.as_deref(), &inputs)
                     .await
                     .map_err(|err| GroupEngineError::new(err.to_string()))?;
-            let next_after = next_repair_cursor(&inputs, max_streams);
-            Ok(RepairColdIndexResponse {
-                report,
-                cycle_completed: next_after.is_none(),
-                next_after,
-            })
+            Ok(repair_cold_index_response(&request, &inputs, report))
         })
     }
 

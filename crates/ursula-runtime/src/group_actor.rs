@@ -13,6 +13,8 @@ use ursula_stream::ColdGcPlanEntry;
 use crate::admission::UncommittedBytesGuard;
 use crate::cold_index::RepairColdIndexRequest;
 use crate::cold_index::RepairColdIndexResponse;
+use crate::cold_refs::ColdOrphanSweepPlan;
+use crate::cold_refs::ColdOrphanSweepRequest;
 use crate::command::GroupSnapshot;
 use crate::core_worker::AppendBatchRuntime;
 use crate::core_worker::CoreWorker;

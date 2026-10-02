@@ -1155,6 +1155,9 @@ pub struct RepairColdIndexRequest {
     /// Resume after this stream id; `None` starts a new cycle.
     pub after: Option<BucketStreamId>,
     pub max_streams: usize,
+    /// Repair only this stream and leave the cursor alone. The F2 driver
+    /// repairs a stream's pages right before compacting its shared refs.
+    pub stream: Option<BucketStreamId>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

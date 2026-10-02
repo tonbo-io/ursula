@@ -34,6 +34,8 @@ use crate::cold_index::cold_index_generation_dir;
 use crate::cold_index::load_cold_chunks_from_pages;
 use crate::cold_index::parse_cold_index_page_file_name;
 use crate::cold_index::select_cold_chunk_compaction;
+use crate::cold_refs::ColdOrphanSweepPlan;
+use crate::cold_refs::ColdOrphanSweepRequest;
 use crate::cold_store::ColdStoreHandle;
 use crate::cold_store::ColdStoreInfo;
 use crate::cold_store::cold_chunk_dir;
@@ -111,6 +113,11 @@ use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
 use crate::rt::time::Instant;
 use crate::trace::Traced;
+
+mod orphan_sweep;
+mod shared_ref_compaction;
+
+pub use orphan_sweep::COLD_ORPHAN_SWEEP_GRACE_MS;
 
 fn is_legacy_cross_bucket_pack(stream_id: &BucketStreamId, chunk: &ColdChunkRef) -> bool {
     chunk.shared_object
@@ -190,6 +197,8 @@ pub struct ShardRuntime {
     next_waiter_id: Arc<AtomicU64>,
     cold_store: Option<ColdStoreHandle>,
     cold_index_repair: Arc<std::sync::Mutex<HashMap<RaftGroupId, ColdIndexRepairCursor>>>,
+    /// Node-local cursor of each group's cold orphan sweep (F14h).
+    cold_orphan_sweep: Arc<std::sync::Mutex<HashMap<RaftGroupId, Option<BucketStreamId>>>>,
 }
 
 /// Node-local position of one group's cold-index repair cursor.
@@ -282,6 +291,7 @@ impl ShardRuntime {
             next_waiter_id: Arc::new(AtomicU64::new(1)),
             cold_store,
             cold_index_repair: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            cold_orphan_sweep: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -1340,6 +1350,7 @@ impl ShardRuntime {
             .repair_cold_index(raft_group_id, RepairColdIndexRequest {
                 after,
                 max_streams: max_streams.max(1),
+                stream: None,
             })
             .await?;
         let mut cursors =
