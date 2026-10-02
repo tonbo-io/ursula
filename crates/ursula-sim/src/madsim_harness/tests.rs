@@ -2040,3 +2040,320 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
     assert_eq!(quiet.receipts.len(), 1, "quiet restarted after idle expiry");
     assert_eq!(quiet.last_seen_ms, Some(5 + 7 * 24 * 60 * 60 * 1_000));
 }
+
+/// Seeds of the bounded-state F5 ambiguous-commit family (§7.4): each runs
+/// the variant `seed % 3` of [`external_locator_ambiguity`].
+const EXTERNAL_LOCATOR_AMBIGUITY_SEEDS: [u64; 9] = [3, 17, 41, 58, 77, 96, 112, 131, 150];
+
+/// How an external append or its offload ends ambiguously for its caller.
+#[derive(Debug, Clone, Copy)]
+enum LocatorAmbiguity {
+    /// The leader proposes `AppendExternal` while isolated; the caller gives
+    /// up, a new leader takes over, and the entry never commits.
+    UncommittedOnIsolatedLeader,
+    /// The append commits, but its caller never sees the response.
+    LostResponse,
+    /// The append commits; the leader writes the page entries for the
+    /// offload while isolated, and its `OffloadColdRefs` never commits. The
+    /// new leader's offload rewrites the same entries and commits.
+    AmbiguousOffload,
+}
+
+fn engine_index(node_id: u64) -> usize {
+    usize::try_from(node_id - 1).expect("node id fits usize")
+}
+
+fn leader_applied_index(engine: &RaftGroupEngine) -> u64 {
+    openraft::rt::WatchReceiver::borrow_watched(&engine.raft_handle().metrics())
+        .last_applied
+        .map(|log_id| log_id.index)
+        .expect("leader applied index")
+}
+
+fn external_append_request(stream: &BucketStreamId, path: &str, len: u64) -> AppendExternalRequest {
+    AppendExternalRequest {
+        stream_id: stream.clone(),
+        content_type: "application/octet-stream".to_owned(),
+        payload: ursula_runtime::ExternalPayloadRef {
+            s3_path: path.to_owned(),
+            payload_len: len,
+            object_size: len,
+        },
+        record_ends: Vec::new(),
+        close_after: false,
+        stream_seq: None,
+        producer: None,
+        now_ms: 0,
+        record_match: None,
+    }
+}
+
+/// Every external page entry of `stream` as `(start, end, path)`.
+async fn page_external_entries(
+    cold_store: &Arc<ColdStore>,
+    stream: &BucketStreamId,
+) -> Vec<(u64, u64, String)> {
+    use ursula_runtime::ColdIndexPageStore;
+
+    let store = ursula_runtime::ColdStoreColdIndexPageStore::new(cold_store.clone());
+    let mut entries = Vec::new();
+    for key in cold_store
+        .list_cold_index_pages()
+        .await
+        .expect("list cold index pages")
+    {
+        if &key.stream_id != stream {
+            continue;
+        }
+        if let Some(page) = store.get_page(&key).await.expect("get page") {
+            entries.extend(page.external_segments.iter().map(|object| {
+                (
+                    object.start_offset,
+                    object.end_offset,
+                    object.s3_path.clone(),
+                )
+            }));
+        }
+    }
+    entries
+}
+
+fn isolate(policy: &InProcessRaftNetworkPolicy, leader_id: u64) {
+    for peer in (1..=3).filter(|peer| *peer != leader_id) {
+        policy.partition_bidirectional(leader_id, peer);
+    }
+}
+
+/// Waits for the voters other than the isolated `leader_id` to elect
+/// another leader; returns its id.
+async fn replacement_leader(engines: &[RaftGroupEngine], leader_id: u64) -> u64 {
+    let observer = (1..=3)
+        .find(|peer| *peer != leader_id)
+        .expect("a connected voter");
+    engines[engine_index(observer)]
+        .raft_handle()
+        .wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| {
+                metrics
+                    .current_leader
+                    .is_some_and(|current| current != leader_id)
+            },
+            "connected voters elect a replacement leader",
+        )
+        .await
+        .expect("replacement leader")
+        .current_leader
+        .expect("replacement leader id")
+}
+
+/// One run of the F5 ambiguous-commit family at feature level 3, checking
+/// Invariant 11: after the ambiguity, readable bytes equal acknowledged bytes
+/// on every replica, no page entry overlaps differing bytes, no page entry
+/// names an object that never committed, and the ambiguous staged object was
+/// not deleted.
+async fn external_locator_ambiguity(variant: LocatorAmbiguity) {
+    let cold_store: Arc<ColdStore> = Arc::new(sim_cold_store());
+    let policy = sim_network_policy();
+    let (_registry, mut engines, mut leader_id) =
+        build_three_node_cluster_with_cold_store(policy.clone(), Some(cold_store.clone())).await;
+    let stream = BucketStreamId::new("simulated", "external-locators");
+    let leader = engine_index(leader_id);
+    engines[leader]
+        .set_feature_level(
+            SetFeatureLevelRequest {
+                level: ursula_runtime::FEATURE_LEVEL_EXTERNAL_LOCATORS,
+            },
+            placement(),
+        )
+        .await
+        .expect("raise to level 3");
+    engines[leader]
+        .create_stream(
+            CreateStreamRequest::new(stream.clone(), "application/octet-stream"),
+            placement(),
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("create stream");
+    engines[leader]
+        .append(
+            AppendRequest::from_bytes(stream.clone(), b"base;".to_vec()),
+            placement(),
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("base append");
+    let offload_now = ursula_runtime::OffloadColdRefsRequest {
+        min_age_ms: 0,
+        ..ursula_runtime::OffloadColdRefsRequest::new(0, 16)
+    };
+
+    let ambiguous = vec![b'A'; 64];
+    let ambiguous_path = ursula_runtime::new_external_payload_path(&stream);
+    cold_store
+        .write_chunk(&ambiguous_path, &ambiguous)
+        .await
+        .expect("stage ambiguous payload");
+    let ambiguous_request = external_append_request(&stream, &ambiguous_path, 64);
+    let ambiguous_committed = match variant {
+        LocatorAmbiguity::UncommittedOnIsolatedLeader => {
+            isolate(&policy, leader_id);
+            let outcome = madsim::time::timeout(
+                Duration::from_millis(300),
+                engines[leader].append_external(ambiguous_request, placement()),
+            )
+            .await;
+            assert!(
+                !matches!(outcome, Ok(Ok(_))),
+                "an isolated leader cannot commit: {outcome:?}"
+            );
+            assert!(
+                page_external_entries(&cold_store, &stream).await.is_empty(),
+                "no page entry is written before or for an uncommitted proposal"
+            );
+            leader_id = replacement_leader(&engines, leader_id).await;
+            policy.clear();
+            false
+        }
+        LocatorAmbiguity::LostResponse => {
+            let raft = engines[leader].raft_handle();
+            // The caller's response is never observed.
+            drop(madsim::task::spawn(async move {
+                let _ = raft
+                    .client_write(GroupWriteCommand::from(ambiguous_request))
+                    .await;
+            }));
+            // Let it commit before the next append claims the tail.
+            madsim::time::sleep(Duration::from_millis(200)).await;
+            true
+        }
+        LocatorAmbiguity::AmbiguousOffload => {
+            engines[leader]
+                .append_external(ambiguous_request, placement())
+                .await
+                .expect("committed external append");
+            isolate(&policy, leader_id);
+            let outcome = madsim::time::timeout(
+                Duration::from_millis(300),
+                engines[leader].offload_cold_refs(offload_now, placement()),
+            )
+            .await;
+            assert!(
+                !matches!(outcome, Ok(Ok(ref report)) if report.streams > 0),
+                "an isolated leader cannot commit its offload: {outcome:?}"
+            );
+            assert!(
+                !page_external_entries(&cold_store, &stream).await.is_empty(),
+                "the isolated leader indexed the committed ref before proposing"
+            );
+            leader_id = replacement_leader(&engines, leader_id).await;
+            policy.clear();
+            true
+        }
+    };
+
+    // A committed append at the same offsets the ambiguous one would take.
+    let leader = engine_index(leader_id);
+    let committed = vec![b'B'; 40];
+    let committed_path = ursula_runtime::new_external_payload_path(&stream);
+    cold_store
+        .write_chunk(&committed_path, &committed)
+        .await
+        .expect("stage committed payload");
+    let mut appended = None;
+    for _ in 0..50 {
+        match engines[leader]
+            .append_external(
+                external_append_request(&stream, &committed_path, 40),
+                placement(),
+            )
+            .await
+        {
+            Ok(response) => {
+                appended = Some(response);
+                break;
+            }
+            Err(_) => madsim::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    appended.expect("committed external append on the current leader");
+    for _ in 0..50 {
+        let report = engines[leader]
+            .offload_cold_refs(offload_now, placement())
+            .await
+            .expect("offload pass");
+        if report.streams == 0 {
+            break;
+        }
+    }
+
+    let applied = leader_applied_index(&engines[leader]);
+    wait_all_nodes_applied(&engines, applied, "every replica applied the offloads").await;
+    let mut acknowledged = b"base;".to_vec();
+    if ambiguous_committed {
+        acknowledged.extend_from_slice(&ambiguous);
+    }
+    acknowledged.extend_from_slice(&committed);
+    let tail = acknowledged.len();
+    for (index, engine) in engines.iter_mut().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        read_local_payload_eventually(
+            engine,
+            node_id,
+            &stream,
+            0,
+            tail + 16,
+            &acknowledged,
+            "replica reads the acknowledged bytes",
+        )
+        .await;
+        let gauges = engine
+            .state_gauges(placement())
+            .await
+            .expect("state gauges");
+        assert_eq!(gauges.staged_external_refs, 0, "node {node_id}");
+    }
+    let entries = page_external_entries(&cold_store, &stream).await;
+    assert!(
+        !entries.is_empty(),
+        "the offload indexed the committed refs"
+    );
+    for (start, end, path) in entries {
+        assert!(
+            ambiguous_committed || path != ambiguous_path,
+            "a page entry names an object that never committed"
+        );
+        let start = usize::try_from(start).expect("offset fits usize");
+        let end = usize::try_from(end).expect("offset fits usize");
+        let object = if path == ambiguous_path {
+            &ambiguous
+        } else {
+            assert_eq!(path, committed_path, "unexpected page entry {path}");
+            &committed
+        };
+        assert_eq!(
+            acknowledged.get(start..end),
+            object.get(..end - start),
+            "page entry [{start}, {end}) {path} overlaps differing bytes"
+        );
+    }
+    assert!(
+        cold_store.object_size(&ambiguous_path).await.is_ok(),
+        "the ambiguous staged object is kept for the orphan sweep"
+    );
+}
+
+/// Bounded-state F5 ambiguous-commit seeds with Invariant 11 (§7.4, B5).
+#[test]
+fn external_locators_survive_ambiguous_commits() {
+    let _guard = sim_test_guard();
+    for seed in EXTERNAL_LOCATOR_AMBIGUITY_SEEDS {
+        let variant = match seed % 3 {
+            0 => LocatorAmbiguity::UncommittedOnIsolatedLeader,
+            1 => LocatorAmbiguity::LostResponse,
+            _ => LocatorAmbiguity::AmbiguousOffload,
+        };
+        run_with_madsim(seed, external_locator_ambiguity(variant));
+    }
+}
