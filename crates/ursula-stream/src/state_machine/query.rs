@@ -248,6 +248,27 @@ impl StreamStateMachine {
         self.hot_payload_bytes
     }
 
+    /// Hot records across the group (F6c).
+    pub fn total_hot_records(&self) -> u64 {
+        self.hot_records
+    }
+
+    /// Hot payload plus per-record overhead across the group (F6c): what
+    /// admission and the flush planner count.
+    pub fn total_hot_real_bytes(&self) -> u64 {
+        super::hot_real_bytes(self.hot_payload_bytes, self.hot_records)
+    }
+
+    /// One stream's hot payload plus per-record overhead (F6c).
+    pub fn hot_real_len(&self, stream_id: &BucketStreamId) -> Option<u64> {
+        self.stream_slot(stream_id).map(|slot| {
+            super::hot_real_bytes(
+                u64::try_from(slot.hot_buffer.len()).unwrap_or(u64::MAX),
+                slot.hot_buffer.accounted_records(),
+            )
+        })
+    }
+
     pub fn bucket_exists(&self, bucket_id: &str) -> bool {
         self.buckets.contains(bucket_id)
     }

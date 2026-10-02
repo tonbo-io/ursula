@@ -152,8 +152,8 @@ pub struct FlushStats {
 
 /// One group flush pass, mirroring `ShardRuntime`'s group flush: plan with the
 /// state machine's own planner, partition by bucket (the erasure domain), pack
-/// when a bucket batch has more than one candidate, otherwise write an
-/// exclusive chunk. Returns the published chunk refs.
+/// when a bucket batch has more than one candidate or a lone candidate below
+/// 1 MiB (F14c), otherwise write an exclusive chunk. Returns the published chunk refs.
 pub fn flush_pass(
     m: &mut StreamStateMachine,
     min_hot_bytes: usize,
@@ -182,7 +182,12 @@ pub fn flush_pass(
         }
     }
     for batch in batches {
-        if batch.len() > 1 {
+        // F14c: a lone candidate below 1 MiB is packed alone, as the
+        // runtime does.
+        let small_single = batch.first().is_some_and(|candidate| {
+            candidate.payload.len() < ursula_runtime::EXCLUSIVE_FLUSH_MIN_BYTES
+        });
+        if batch.len() > 1 || small_single {
             let total: u64 = batch.iter().map(|c| c.payload.len() as u64).sum();
             let bucket = batch
                 .first()

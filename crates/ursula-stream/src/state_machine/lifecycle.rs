@@ -633,6 +633,9 @@ impl StreamStateMachine {
         self.remove_hot_payload_bytes(
             u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64"),
         );
+        self.hot_records = self
+            .hot_records
+            .saturating_sub(slot.hot_buffer.accounted_records());
         let shared_paths = slot
             .cold
             .shared_object_paths()

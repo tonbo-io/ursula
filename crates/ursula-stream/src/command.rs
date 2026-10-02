@@ -204,6 +204,49 @@ pub enum StreamCommand {
     },
 }
 
+/// Fixed per-command allowance of [`StreamCommand::log_bytes_estimate`]:
+/// ids, offsets, headers and framing.
+pub const COMMAND_LOG_OVERHEAD_BYTES: u64 = 128;
+/// Allowance per cold-chunk reference a command carries.
+const CHUNK_REF_LOG_BYTES: u64 = 160;
+
+fn len_u64(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
+}
+
+impl StreamCommand {
+    /// Approximate bytes this command occupies in the Raft log: its payload
+    /// bytes plus a fixed allowance per command, record boundary and chunk
+    /// reference. Snapshot cadence (bounded-state F12e) counts log bytes
+    /// with it, so it needs to track payload volume, not exact encodings.
+    pub fn log_bytes_estimate(&self) -> u64 {
+        let variable = match self {
+            Self::CreateStream {
+                initial_payload, ..
+            } => len_u64(initial_payload.len()),
+            Self::CreateExternal { record_ends, .. } | Self::AppendExternal { record_ends, .. } => {
+                len_u64(record_ends.len()).saturating_mul(8)
+            }
+            Self::Append { payload, .. } | Self::PublishSnapshot { payload, .. } => {
+                len_u64(payload.len())
+            }
+            Self::AppendBatch { payloads, .. } => payloads
+                .iter()
+                .map(|payload| len_u64(payload.len()).saturating_add(8))
+                .fold(0, u64::saturating_add),
+            Self::FlushCold { .. } => CHUNK_REF_LOG_BYTES,
+            Self::CompactCold { old_chunks, .. } => len_u64(old_chunks.len())
+                .saturating_add(1)
+                .saturating_mul(CHUNK_REF_LOG_BYTES),
+            Self::ImportSnapshot { snapshot } => {
+                len_u64(snapshot.streams.len()).saturating_mul(COMMAND_LOG_OVERHEAD_BYTES)
+            }
+            _ => 0,
+        };
+        COMMAND_LOG_OVERHEAD_BYTES.saturating_add(variable)
+    }
+}
+
 impl fmt::Display for StreamCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -1590,11 +1590,16 @@ impl GroupEngine for RaftGroupEngine {
                 })
                 .await?;
             let store = ColdStoreColdIndexPageStore::new(cold_store);
-            let report =
+            let (report, compaction_pages) =
                 repair_cold_index_streams(&store, self.cold_index_cache.as_deref(), &inputs)
                     .await
                     .map_err(|err| GroupEngineError::new(err.to_string()))?;
-            Ok(repair_cold_index_response(&request, &inputs, report))
+            Ok(repair_cold_index_response(
+                &request,
+                &inputs,
+                report,
+                compaction_pages,
+            ))
         })
     }
 

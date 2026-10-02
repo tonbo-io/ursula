@@ -15,7 +15,8 @@
 //! - [`smx`]: L1 command drivers (append, external append, flush and pack, retention).
 //! - [`out`]: JSONL sink, per-checkpoint measurement, and the [`out::Outcome`] metrics and checks.
 //! - [`formula`]: the §7.2 per-structure formula checks with each stream's U, K and P.
-//! - [`workloads`]: W1 to W6, the planner probe, and the L2 runtime drivers.
+//! - [`workloads`]: W1 to W6, the planner probe, the F12e snapshot-cadence
+//!   driver, and the L2 runtime drivers.
 //! - [`gate`]: the per-PR and nightly suites and the ratchet comparison.
 
 pub mod alloc;

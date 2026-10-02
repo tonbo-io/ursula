@@ -133,6 +133,30 @@ const TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE: usize = 256;
 /// validate the interpretation before using the derived counter.
 pub const COMMITTED_WRITE_UNIT_BYTES: u64 = 10 * 1024;
 
+/// Replicated bookkeeping per unflushed record beyond its payload, with hot
+/// blocks (F6b): a 16-byte message record plus an 8-byte dense record offset.
+/// Admission and flush thresholds count hot payload plus this much per hot
+/// record (F6c), so a window of tiny records is charged for its real memory.
+pub const HOT_RECORD_OVERHEAD_BYTES: u64 = 24;
+
+/// Hot records of one stream (F6c): message records that start at or above
+/// its first hot byte. Records of external appends that sit above hot bytes
+/// count too; they occupy the same bookkeeping until the next flush.
+fn slot_hot_records(slot: &StreamSlot) -> u64 {
+    let Some(hot_start) = slot.hot_buffer.first_start_offset() else {
+        return 0;
+    };
+    let below = slot
+        .message_records
+        .partition_point(|record| record.start_offset < hot_start);
+    u64::try_from(slot.message_records.len().saturating_sub(below)).unwrap_or(u64::MAX)
+}
+
+/// Payload plus per-record overhead (F6c).
+pub fn hot_real_bytes(payload_bytes: u64, records: u64) -> u64 {
+    payload_bytes.saturating_add(records.saturating_mul(HOT_RECORD_OVERHEAD_BYTES))
+}
+
 new_key_type! {
     struct StreamKey;
 }
@@ -148,6 +172,10 @@ pub struct StreamStateMachine {
     /// Group-wide hot payload gauge. Kept incrementally so append admission
     /// and responses do not scan every stream in the group.
     hot_payload_bytes: u64,
+    /// Group-wide count of hot records (F6c): message records that start at
+    /// or above each stream's first hot byte. Derived, never replicated;
+    /// kept incrementally next to `hot_payload_bytes`.
+    hot_records: u64,
     cold_gc: ColdGcQueue,
     /// Live logical references to group-scoped shared cold objects. This is
     /// derived from per-stream cold refs when snapshots are restored.
@@ -269,11 +297,14 @@ impl StreamStateMachine {
         self.registry.metadata_mut(stream_id)
     }
 
-    fn insert_stream_slot(&mut self, slot: StreamSlot) -> Option<StreamKey> {
+    fn insert_stream_slot(&mut self, mut slot: StreamSlot) -> Option<StreamKey> {
         let hot_payload_bytes = u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64");
+        let hot_records = slot_hot_records(&slot);
+        slot.hot_buffer.set_accounted_records(hot_records);
         let stream_id = (!slot.hot_buffer.is_empty()).then(|| slot.metadata.stream_id.clone());
         let key = self.registry.insert(slot)?;
         self.hot_payload_bytes = self.hot_payload_bytes.saturating_add(hot_payload_bytes);
+        self.hot_records = self.hot_records.saturating_add(hot_records);
         if let Some(stream_id) = stream_id {
             self.flush_planner.mark_hot(&stream_id);
         }
@@ -281,12 +312,20 @@ impl StreamStateMachine {
     }
 
     /// Re-derives one stream's membership in the flush planner's hot index
-    /// after its hot buffer changed.
+    /// and its share of the group's hot-record gauge (F6c) after its hot
+    /// buffer or message records changed.
     fn sync_hot_index(&mut self, stream_id: &BucketStreamId) {
-        let hot = self
-            .registry
-            .slot(stream_id)
-            .is_some_and(|slot| !slot.hot_buffer.is_empty());
+        let mut hot = false;
+        if let Some(slot) = self.registry.slot_mut(stream_id) {
+            hot = !slot.hot_buffer.is_empty();
+            let previous = slot.hot_buffer.accounted_records();
+            let current = slot_hot_records(slot);
+            slot.hot_buffer.set_accounted_records(current);
+            self.hot_records = self
+                .hot_records
+                .saturating_sub(previous)
+                .saturating_add(current);
+        }
         if hot {
             self.flush_planner.mark_hot(stream_id);
         } else {

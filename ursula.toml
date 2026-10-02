@@ -241,16 +241,20 @@ backend = "none"
 # [storage.snapshot]  — Raft snapshot store
 # ------------------------------------------------------------------------------
 [storage.snapshot]
-# Snapshot store backend: "inline" | "local" | "s3"
-#   inline  — snapshot metadata kept in memory (default, no external store)
-#   local   — snapshots written to local filesystem (requires local_root)
+# Snapshot store backend: "auto" | "inline" | "s3"
+#   auto    — s3 when [storage.cold] uses the s3 backend, inline otherwise
+#             (default)
+#   inline  — snapshot bytes ride through Raft, no external store
 #   s3      — snapshots written to S3 (shares [storage.cold.s3] credentials)
-backend = "inline"
+backend = "auto"
 
-# Interval between manual snapshot drives.  When an external store is
-# configured (local or s3) and this is omitted, it defaults to 60s so
-# snapshots are built automatically.  Set to "0s" to disable the driver.
-# drive_interval = "60s"
+# Interval of the manual snapshot driver, which snapshots each group once
+# the Raft log it applied since its last snapshot reaches
+# max(F, 2 x that snapshot's size), F = raft.snapshot_log_budget divided by
+# twice the group count (at most 16 MiB).  Omitted: 5s with an external
+# store (whose health it probes), 1s inline.  "0s" disables the driver and
+# falls back to OpenRaft's raft.snapshot_logs_since_last entry policy.
+# drive_interval = "5s"
 
 # Compatibility-only; cold flush concurrency is configured under storage.cold.
 # drive_flush_concurrency = 4

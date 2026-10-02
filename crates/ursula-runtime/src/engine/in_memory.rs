@@ -72,6 +72,7 @@ use super::GroupTouchStreamAccessFuture;
 use super::GroupUpdateStreamAttrsFuture;
 use super::GroupWriteResponse;
 use crate::cold_index::ColdIndexPageCache;
+use crate::cold_index::ColdIndexPageKey;
 use crate::cold_index::ColdIndexRepairInput;
 use crate::cold_index::ColdIndexRepairReport;
 use crate::cold_index::ColdStoreColdIndexPageStore;
@@ -408,11 +409,8 @@ impl InMemoryGroupEngine {
                         deduplicated: true,
                         producer: None,
                         record_range: None,
-                        stream_hot_bytes: self
-                            .state_machine
-                            .hot_payload_len(&stream_id)
-                            .unwrap_or(0),
-                        group_hot_bytes: self.state_machine.total_hot_payload_bytes(),
+                        stream_hot_bytes: self.state_machine.hot_real_len(&stream_id).unwrap_or(0),
+                        group_hot_bytes: self.state_machine.total_hot_real_bytes(),
                         receipt_evicted: true,
                     })],
                 }));
@@ -423,8 +421,8 @@ impl InMemoryGroupEngine {
                 self.state_machine
                     .add_stream_append_count(&stream_id, count);
             }
-            let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
-            let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
+            let stream_hot_bytes = self.state_machine.hot_real_len(&stream_id).unwrap_or(0);
+            let group_hot_bytes = self.state_machine.total_hot_real_bytes();
             let items = batch
                 .items
                 .into_iter()
@@ -497,9 +495,9 @@ impl InMemoryGroupEngine {
     fn write_hot_backlog(&self, stream_id: Option<&BucketStreamId>) -> WriteHotBacklog {
         WriteHotBacklog {
             stream_hot_bytes: stream_id
-                .and_then(|stream_id| self.state_machine.hot_payload_len(stream_id).ok())
+                .and_then(|stream_id| self.state_machine.hot_real_len(stream_id))
                 .unwrap_or(0),
-            group_hot_bytes: self.state_machine.total_hot_payload_bytes(),
+            group_hot_bytes: self.state_machine.total_hot_real_bytes(),
         }
     }
 
@@ -558,8 +556,8 @@ impl InMemoryGroupEngine {
                 let stream_id = require_response_stream_id(stream_id, "appended")?;
                 // F1 (RC-10, RC-11): apply computed the range (or kept the
                 // receipt's); F3: an evicted duplicate carries none.
-                let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
-                let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
+                let stream_hot_bytes = self.state_machine.hot_real_len(&stream_id).unwrap_or(0);
+                let group_hot_bytes = self.state_machine.total_hot_real_bytes();
                 if !deduplicated {
                     self.commit_index += 1;
                     self.state_machine.add_stream_append_count(&stream_id, 1);
@@ -800,19 +798,33 @@ impl InMemoryGroupEngine {
         &self,
         stream_id: BucketStreamId,
     ) -> Result<ColdHotBacklog, GroupEngineError> {
-        let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
+        let stream_hot_bytes = self.state_machine.hot_real_len(&stream_id).unwrap_or(0);
         Ok(ColdHotBacklog {
             stream_id,
             stream_hot_bytes,
-            group_hot_bytes: self.state_machine.total_hot_payload_bytes(),
+            group_hot_bytes: self.state_machine.total_hot_real_bytes(),
         })
     }
 
+    /// Admission for one payload of `incoming_bytes`.
     pub fn check_cold_write_admission_bytes(
         &self,
         stream_id: &BucketStreamId,
         admission: ColdWriteAdmission,
         incoming_bytes: u64,
+    ) -> Result<(), GroupEngineError> {
+        self.check_cold_write_admission(stream_id, admission, incoming_bytes, 1)
+    }
+
+    /// Cold admission (F6c): the group's real hot size (payload plus
+    /// per-record overhead) plus the incoming payload, charged as at least
+    /// `incoming_records` records, must stay within the group cap.
+    pub fn check_cold_write_admission(
+        &self,
+        stream_id: &BucketStreamId,
+        admission: ColdWriteAdmission,
+        incoming_bytes: u64,
+        incoming_records: u64,
     ) -> Result<(), GroupEngineError> {
         let Some(limit) = admission.max_hot_bytes_per_group else {
             return Ok(());
@@ -820,8 +832,11 @@ impl InMemoryGroupEngine {
         if incoming_bytes == 0 {
             return Ok(());
         }
-        let before = self.state_machine.total_hot_payload_bytes();
-        let after = before.saturating_add(incoming_bytes);
+        let before = self.state_machine.total_hot_real_bytes();
+        let after = before.saturating_add(ursula_stream::hot_real_bytes(
+            incoming_bytes,
+            incoming_records.max(1),
+        ));
         if after <= limit {
             return Ok(());
         }
@@ -918,7 +933,12 @@ impl InMemoryGroupEngine {
                 .iter()
                 .map(|payload| u64::try_from(payload.len()).expect("payload len fits u64"))
                 .sum();
-            self.check_cold_write_admission_bytes(&request.stream_id, admission, incoming_bytes)?;
+            self.check_cold_write_admission(
+                &request.stream_id,
+                admission,
+                incoming_bytes,
+                u64::try_from(request.payloads.len()).unwrap_or(u64::MAX),
+            )?;
         }
         let response =
             match self.apply_committed_write(GroupWriteCommand::from(request), placement)? {
@@ -1031,8 +1051,8 @@ impl InMemoryGroupEngine {
                 receipt_evicted,
                 record_range,
             } => {
-                let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
-                let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
+                let stream_hot_bytes = self.state_machine.hot_real_len(&stream_id).unwrap_or(0);
+                let group_hot_bytes = self.state_machine.total_hot_real_bytes();
                 // F1 (RC-10, RC-11): apply computed the range (or kept the
                 // receipt's); F3: an evicted duplicate carries none.
                 if !deduplicated {
@@ -2221,11 +2241,16 @@ impl GroupEngine for InMemoryGroupEngine {
             };
             let inputs = self.cold_index_repair_inputs_for(&request);
             let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-            let report =
+            let (report, compaction_pages) =
                 repair_cold_index_streams(&store, self.cold_index_cache.as_deref(), &inputs)
                     .await
                     .map_err(|err| GroupEngineError::new(err.to_string()))?;
-            Ok(repair_cold_index_response(&request, &inputs, report))
+            Ok(repair_cold_index_response(
+                &request,
+                &inputs,
+                report,
+                compaction_pages,
+            ))
         })
     }
 
@@ -2264,10 +2289,11 @@ impl GroupEngine for InMemoryGroupEngine {
                     "append transaction must contain at least one operation",
                 ));
             };
-            self.check_cold_write_admission_bytes(
+            self.check_cold_write_admission(
                 &first.stream_id,
                 admission,
                 request.payload_bytes(),
+                u64::try_from(request.operations.len()).unwrap_or(u64::MAX),
             )?;
             let command = GroupWriteCommand::Transaction {
                 commands: request
@@ -2691,10 +2717,12 @@ pub fn repair_cold_index_response(
     request: &RepairColdIndexRequest,
     inputs: &[ColdIndexRepairInput],
     report: ColdIndexRepairReport,
+    compaction_pages: Vec<ColdIndexPageKey>,
 ) -> RepairColdIndexResponse {
     if request.stream.is_some() {
         return RepairColdIndexResponse {
             report,
+            compaction_pages,
             next_after: None,
             cycle_completed: false,
         };
@@ -2702,6 +2730,7 @@ pub fn repair_cold_index_response(
     let next_after = next_repair_cursor(inputs, request.max_streams.max(1));
     RepairColdIndexResponse {
         report,
+        compaction_pages,
         cycle_completed: next_after.is_none(),
         next_after,
     }

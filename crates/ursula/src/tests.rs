@@ -4851,7 +4851,9 @@ async fn flush_cold_endpoint_uploads_and_reads_back_segments() {
 async fn cold_backpressure_returns_service_unavailable_and_metrics() {
     let cold_store = std::sync::Arc::new(ColdStore::memory().expect("memory cold store"));
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        RuntimeConfig::new(1, 1).with_cold_max_hot_bytes_per_group(Some(4)),
+        // F6c: the cap counts payload plus per-record overhead.
+        RuntimeConfig::new(1, 1)
+            .with_cold_max_hot_bytes_per_group(Some(4 + ursula_runtime::HOT_RECORD_OVERHEAD_BYTES)),
         InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
         Some(cold_store),
     )
@@ -4895,7 +4897,10 @@ async fn cold_backpressure_returns_service_unavailable_and_metrics() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_bytes(response).await;
     let body = std::str::from_utf8(&body).expect("utf8 body");
-    assert!(body.contains("\"cold_hot_bytes\":4"));
+    assert!(body.contains(&format!(
+        "\"cold_hot_bytes\":{}",
+        4 + ursula_runtime::HOT_RECORD_OVERHEAD_BYTES
+    )));
     assert!(body.contains("\"cold_backpressure_events\":1"));
     assert!(body.contains("\"cold_backpressure_bytes\":1"));
     assert!(body.contains("\"cold_store\":{\"backend\":\"memory\""));
@@ -5938,6 +5943,7 @@ fn raft_metrics_snapshot(
         purged: None,
         voter_ids: voters,
         learner_ids: vec![],
+        log: Default::default(),
     }
 }
 
@@ -6085,20 +6091,22 @@ mod cold_health {
 
 mod snapshot_driver {
     use ursula_raft::RaftGroupMetricsSnapshot;
-    use ursula_raft::RaftLogProgressSnapshot;
+    use ursula_raft::snapshot_cadence::GroupLogProgress;
+    use ursula_raft::snapshot_cadence::SnapshotCadence;
 
-    use crate::bootstrap::next_snapshot_to_drive;
-    use crate::bootstrap::pressure_snapshot_groups;
+    use crate::bootstrap::group_log_progress;
+    use crate::bootstrap::plan_snapshot_drive;
     use crate::bootstrap::resolve_snapshot_drive_interval_ms;
-    use crate::bootstrap::should_drive_snapshot_for_group;
-    use crate::bootstrap::unpurged_log_entries;
 
-    fn snap_with_group(
+    const MIB: u64 = 1 << 20;
+
+    fn snap(
         raft_group_id: u32,
         last_applied: Option<u64>,
         snapshot_index: Option<u64>,
+        log: GroupLogProgress,
     ) -> RaftGroupMetricsSnapshot {
-        super::raft_metrics_snapshot(
+        let mut snapshot = super::raft_metrics_snapshot(
             raft_group_id,
             1,
             Some(1),
@@ -6106,42 +6114,24 @@ mod snapshot_driver {
             last_applied,
             snapshot_index,
             vec![1, 2, 3],
-        )
+        );
+        snapshot.log = log;
+        snapshot
     }
 
-    fn snap(last_applied: Option<u64>, snapshot_index: Option<u64>) -> RaftGroupMetricsSnapshot {
-        snap_with_group(0, last_applied, snapshot_index)
-    }
-
-    #[test]
-    fn snapshot_driver_amortizes_applied_work_after_the_first_snapshot() {
-        assert!(!should_drive_snapshot_for_group(&snap(None, None), 5));
-        assert!(should_drive_snapshot_for_group(&snap(Some(42), None), 5));
-        assert!(!should_drive_snapshot_for_group(
-            &snap(Some(42), Some(41)),
-            5
-        ));
-        assert!(!should_drive_snapshot_for_group(
-            &snap(Some(46), Some(42)),
-            5
-        ));
-        assert!(should_drive_snapshot_for_group(
-            &snap(Some(47), Some(42)),
-            5
-        ));
-        assert!(!should_drive_snapshot_for_group(
-            &snap(Some(42), Some(42)),
-            5
-        ));
-        assert!(!should_drive_snapshot_for_group(
-            &snap(Some(42), Some(43)),
-            5
-        ));
+    fn log(log_bytes: u64, last_snapshot_bytes: u64) -> GroupLogProgress {
+        GroupLogProgress {
+            log_bytes,
+            log_entries: 1 + log_bytes / 256,
+            last_snapshot_bytes,
+            has_snapshot: last_snapshot_bytes > 0,
+        }
     }
 
     #[test]
     fn snapshot_driver_default_interval_follows_external_store() {
-        assert_eq!(resolve_snapshot_drive_interval_ms(None, false), 0);
+        // F12e: the inline backend runs the byte-based driver too.
+        assert_eq!(resolve_snapshot_drive_interval_ms(None, false), 1_000);
         assert_eq!(resolve_snapshot_drive_interval_ms(None, true), 5_000);
         assert_eq!(resolve_snapshot_drive_interval_ms(Some(0), false), 0);
         assert_eq!(resolve_snapshot_drive_interval_ms(Some(0), true), 0);
@@ -6156,55 +6146,68 @@ mod snapshot_driver {
     }
 
     #[test]
-    fn snapshot_driver_picks_one_due_group_round_robin() {
-        let snapshots = vec![
-            snap_with_group(0, Some(42), Some(42)),
-            snap_with_group(1, Some(42), Some(41)),
-            snap_with_group(2, Some(42), Some(41)),
-        ];
-
-        let first = next_snapshot_to_drive(&snapshots, 0, 1).expect("first due snapshot");
-        assert_eq!(first.0, 1);
-        assert_eq!(first.1.raft_group_id, 1);
-
-        let second =
-            next_snapshot_to_drive(&snapshots, first.0 + 1, 1).expect("second due snapshot");
-        assert_eq!(second.0, 2);
-        assert_eq!(second.1.raft_group_id, 2);
-
-        let wrapped =
-            next_snapshot_to_drive(&snapshots, second.0 + 1, 1).expect("wrapped snapshot");
-        assert_eq!(wrapped.0, 1);
-        assert_eq!(wrapped.1.raft_group_id, 1);
+    fn snapshot_driver_never_snapshots_a_group_without_applied_state() {
+        let empty = snap(0, None, None, log(MIB, 0));
+        assert_eq!(group_log_progress(&empty), GroupLogProgress::default());
+        // OpenRaft's snapshot counts even if the gauge has not seen one.
+        let installed = snap(1, Some(9), Some(9), GroupLogProgress {
+            log_entries: 1,
+            log_bytes: 10,
+            ..GroupLogProgress::default()
+        });
+        assert!(group_log_progress(&installed).has_snapshot);
     }
 
     #[test]
-    fn snapshot_driver_counts_unpurged_logs() {
-        assert_eq!(unpurged_log_entries(&snap(Some(99), None)), 100);
-
-        let mut partially_purged = snap(Some(99), Some(80));
-        partially_purged.purged = Some(RaftLogProgressSnapshot { term: 1, index: 63 });
-        assert_eq!(unpurged_log_entries(&partially_purged), 36);
-
-        assert_eq!(unpurged_log_entries(&snap(None, None)), 0);
-    }
-
-    #[test]
-    fn snapshot_pressure_prioritizes_largest_reclaimable_groups() {
+    fn snapshot_driver_follows_log_bytes_not_entry_counts() {
+        // 128 groups and a 1 GiB budget: a 4 MiB floor.
+        let cadence = SnapshotCadence::new(1 << 30, 128, 100_000);
         let snapshots = vec![
-            snap_with_group(0, Some(90), Some(80)),
-            snap_with_group(1, Some(150), Some(50)),
-            snap_with_group(2, Some(75), None),
-            snap_with_group(3, Some(42), Some(42)),
+            // First snapshot as soon as there is applied state.
+            snap(0, Some(3), None, log(512, 0)),
+            // Below max(4 MiB, 2 x 1 MiB).
+            snap(1, Some(50_000), Some(10), log(4 * MIB - 1, MIB)),
+            // Past max(4 MiB, 2 x 3 MiB) = 6 MiB.
+            snap(2, Some(9_000), Some(10), log(6 * MIB, 3 * MIB)),
+            // Many entries, few bytes: below the floor and the backstop.
+            snap(3, Some(90_000), Some(10), GroupLogProgress {
+                log_bytes: MIB,
+                log_entries: 89_990,
+                last_snapshot_bytes: MIB,
+                has_snapshot: true,
+            }),
         ];
-
-        let selected = pressure_snapshot_groups(&snapshots, 2);
+        let (plan, selected) = plan_snapshot_drive(&snapshots, &cadence, 16);
+        assert!(!plan.pressure);
         assert_eq!(
             selected
                 .iter()
                 .map(|snapshot| snapshot.raft_group_id)
                 .collect::<Vec<_>>(),
-            vec![1, 2]
+            vec![0, 2]
+        );
+        let (_, one) = plan_snapshot_drive(&snapshots, &cadence, 1);
+        assert_eq!(one.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_pressure_keeps_unpurged_log_within_the_node_budget() {
+        // A 64 MiB budget over 4 groups: floor 8 MiB, pressure from 48 MiB.
+        let cadence = SnapshotCadence::new(64 * MIB, 4, 100_000);
+        let snapshots = vec![
+            snap(0, Some(100), Some(1), log(14 * MIB, 8 * MIB)),
+            snap(1, Some(100), Some(1), log(12 * MIB, 16 * MIB)),
+            snap(2, Some(100), Some(1), log(14 * MIB, 10 * MIB)),
+            snap(3, Some(100), Some(1), log(10 * MIB, 6 * MIB)),
+        ];
+        let (plan, selected) = plan_snapshot_drive(&snapshots, &cadence, 16);
+        assert!(plan.pressure);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|snapshot| snapshot.raft_group_id)
+                .collect::<Vec<_>>(),
+            vec![0, 3]
         );
     }
 }
@@ -7652,7 +7655,9 @@ async fn metrics_expose_per_group_state_gauges() {
     assert_eq!(group["receipts"], 3);
     assert_eq!(group["ttl_streams"], 1);
     assert!(group["ttl_heap_entries"].as_u64().expect("ttl heap") >= 1);
-    assert_eq!(group["hot_chunks"], 3);
+    // F6b: the three contiguous appends share one hot block.
+    assert_eq!(group["hot_chunks"], 1);
+    assert_eq!(group["hot_records"], 6);
     for key in [
         "message_records",
         "shared_refs",
@@ -7662,6 +7667,7 @@ async fn metrics_expose_per_group_state_gauges() {
         "producer_bytes",
         "hot_payload_bytes",
         "hot_overhead_bytes",
+        "hot_real_bytes",
         "pending_cold_gc",
     ] {
         assert!(group[key].is_u64(), "missing {key}: {group}");

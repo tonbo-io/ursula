@@ -71,6 +71,9 @@ pub struct RaftGroupMetricsSnapshot {
     pub purged: Option<RaftLogProgressSnapshot>,
     pub voter_ids: Vec<u64>,
     pub learner_ids: Vec<u64>,
+    /// Log applied since this replica's last snapshot (F12e).
+    #[serde(default)]
+    pub log: crate::snapshot_cadence::GroupLogProgress,
 }
 
 /// Static gRPC Raft cluster membership configuration.

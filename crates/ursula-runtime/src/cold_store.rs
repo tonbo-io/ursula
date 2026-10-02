@@ -114,6 +114,8 @@ pub struct ColdStore {
     observer: Arc<Mutex<Option<ColdStoreObserver>>>,
     fault_policy: Arc<Mutex<Option<ColdStoreFaultPolicy>>>,
     delay_fn: Arc<Mutex<ColdStoreDelayFn>>,
+    /// LIST requests issued (F14d: compaction discovery issues none).
+    list_requests: Arc<std::sync::atomic::AtomicU64>,
 }
 
 pub type ColdStoreHandle = Arc<ColdStore>;
@@ -284,6 +286,7 @@ impl ColdStore {
     /// page covers 64 MiB of one stream, so this is the bounded discovery
     /// surface used by the background chunk compactor.
     pub async fn list_cold_index_pages(&self) -> io::Result<Vec<ColdIndexPageKey>> {
+        self.count_list_request();
         let mut lister = self
             .operator
             .lister_with("")
@@ -450,7 +453,19 @@ impl ColdStore {
             observer: Arc::new(Mutex::new(None)),
             fault_policy: Arc::new(Mutex::new(None)),
             delay_fn: Arc::new(Mutex::new(default_cold_store_delay_fn())),
+            list_requests: Arc::default(),
         }
+    }
+
+    /// LIST requests this store has issued.
+    pub fn list_request_count(&self) -> u64 {
+        self.list_requests
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn count_list_request(&self) {
+        self.list_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn info(&self) -> &ColdStoreInfo {
@@ -644,6 +659,7 @@ impl ColdStore {
     /// in `/`), without recursing into subdirectories. Stream GC uses it so a
     /// sweep never reaches another stream's namespace (F14g).
     pub async fn list_file_names(&self, dir: &str) -> io::Result<Vec<String>> {
+        self.count_list_request();
         let mut lister = self
             .operator
             .lister_with(dir)
@@ -673,6 +689,7 @@ impl ColdStore {
     /// uses this after recursive deletion; a successful delete request alone
     /// is not physical-absence evidence.
     pub async fn prefix_is_empty(&self, path: &str) -> io::Result<bool> {
+        self.count_list_request();
         let mut lister = self
             .operator
             .lister_with(path)

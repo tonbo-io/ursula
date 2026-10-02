@@ -31,10 +31,25 @@ pub enum WalBackend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RaftSnapshotBackend {
+    /// S3 whenever an S3 cold store is configured, inline otherwise
+    /// (bounded-stream-state F12b).
     #[default]
+    Auto,
     #[serde(alias = "default", alias = "")]
     Inline,
     S3,
+}
+
+impl RaftSnapshotBackend {
+    /// The concrete backend for a node whose cold store uses `cold_backend`:
+    /// [`Self::Auto`] picks S3 for an S3 cold store and inline otherwise.
+    pub fn resolve(self, cold_backend: ColdBackend) -> Self {
+        match self {
+            Self::Auto if cold_backend == ColdBackend::S3 => Self::S3,
+            Self::Auto => Self::Inline,
+            other => other,
+        }
+    }
 }
 
 /// Top-level Ursula server configuration.
@@ -170,17 +185,28 @@ pub struct RaftConfig {
     pub snapshot_build_max_concurrency: usize,
     /// Max concurrent snapshot installs across all groups on this node.
     pub snapshot_install_max_concurrency: usize,
-    /// Committed Raft log entries per group between automatic snapshots.
-    /// Larger values reduce full-state snapshot CPU and tail-latency spikes at
-    /// the cost of retaining more log entries for recovery.
+    /// Committed Raft log entries per group between automatic snapshots when
+    /// the manual snapshot driver is disabled (`storage.snapshot.drive_interval
+    /// = "0s"`) and OpenRaft's own policy runs. The driver snapshots by log
+    /// bytes instead (`snapshot_log_budget`).
     pub snapshot_logs_since_last: u64,
-    /// Aggregate unpurged Raft log entries on one node that trigger a
-    /// pressure snapshot pass. This bounds memory-WAL growth when traffic is
-    /// spread across many groups and no individual group reaches
-    /// `snapshot_logs_since_last`.
+    /// Retained for configuration compatibility. The snapshot driver's
+    /// pressure pass now follows `snapshot_log_budget` (bounded-stream-state
+    /// F12e).
     pub snapshot_pressure_unpurged_logs: u64,
-    /// Maximum groups snapshotted by one pressure pass.
+    /// Maximum groups snapshotted by one driver tick, including pressure
+    /// passes.
     pub snapshot_pressure_max_groups_per_tick: usize,
+    /// Node log-byte budget of the snapshot driver (bounded-stream-state
+    /// F12e). A group snapshots once the log it applied since its last
+    /// snapshot reaches `max(F, 2 × that snapshot's size)`, where the floor
+    /// `F` is this budget divided by twice the group count, at most 16 MiB;
+    /// once the node's groups hold three quarters of the budget, a pressure
+    /// pass snapshots the groups that free the most log per snapshot byte.
+    pub snapshot_log_budget: HumanSize,
+    /// Far backstop of the snapshot driver: applied entries since a group's
+    /// last snapshot after which it snapshots whatever its log bytes.
+    pub snapshot_backstop_logs: u64,
     /// Maximum number of payload-bearing Raft log entries retained per group
     /// after they are covered by a snapshot.
     pub max_in_snapshot_log_to_keep: u64,
@@ -211,6 +237,8 @@ impl Default for RaftConfig {
             snapshot_logs_since_last: 5_000,
             snapshot_pressure_unpurged_logs: 65_536,
             snapshot_pressure_max_groups_per_tick: 16,
+            snapshot_log_budget: HumanSize::gib(1),
+            snapshot_backstop_logs: 100_000,
             max_in_snapshot_log_to_keep: 64,
         }
     }
@@ -326,10 +354,12 @@ pub struct ColdConfig {
     pub flush_max_hot_age: HumanDuration,
     /// Max groups flushed concurrently.
     pub flush_max_concurrency: usize,
-    /// Enable background cold compaction: the same-stream chunk compactor
-    /// and the shared pack-reference driver, which rewrites a stream's
-    /// packed slices into one exclusive chunk once it holds 64 of them or
-    /// its tail has been idle for an hour (bounded-stream-state F2).
+    /// Enable background cold compaction (on by default, bounded-stream-state
+    /// F14d): the same-stream chunk compactor, which drains compaction debt
+    /// recorded by small flushes and the cold-index repair cursor and lists
+    /// no objects, and the shared pack-reference driver, which rewrites a
+    /// stream's packed slices into one exclusive chunk once it holds 64 of
+    /// them or its tail has been idle for an hour (F2).
     pub compaction_enabled: bool,
     /// Interval between cold chunk compaction discovery passes.
     pub compaction_interval: HumanDuration,
@@ -382,7 +412,7 @@ impl Default for ColdConfig {
             flush_max_size: None,
             flush_max_hot_age: HumanDuration::min(5),
             flush_max_concurrency: 4,
-            compaction_enabled: false,
+            compaction_enabled: true,
             compaction_interval: HumanDuration::sec(30),
             compaction_target_size: HumanSize::mib(8),
             compaction_max_size: HumanSize::mib(16),
@@ -499,11 +529,13 @@ pub struct RaftSnapshotConfig {
     /// S3 namespace for snapshot objects, relative to the cold-storage root.
     /// Used only when `backend` is `S3`.
     pub s3_prefix: Option<String>,
-    /// Interval for the manual snapshot driver.
+    /// Interval for the manual snapshot driver, which snapshots each group by
+    /// Raft log bytes (bounded-stream-state F12e).
     ///
-    /// When omitted, inline snapshot stores keep the manual driver disabled and
-    /// external snapshot stores use a 5s manual-driver default. Explicit `0s`
-    /// disables the manual driver and keeps openraft's default auto-policy.
+    /// When omitted, external snapshot stores use a 5s interval and inline
+    /// snapshot stores 1s; only external stores gate the driver on store
+    /// health. Explicit `0s` disables the manual driver and keeps openraft's
+    /// entry-count policy (`raft.snapshot_logs_since_last`).
     pub drive_interval: Option<HumanDuration>,
     /// Retained for configuration compatibility. Snapshot driving no longer
     /// forces cold flushes; the cold worker owns flush concurrency.
@@ -513,7 +545,7 @@ pub struct RaftSnapshotConfig {
 impl Default for RaftSnapshotConfig {
     fn default() -> Self {
         Self {
-            backend: RaftSnapshotBackend::Inline,
+            backend: RaftSnapshotBackend::Auto,
             s3_prefix: None,
             drive_interval: None,
             drive_flush_concurrency: 4,

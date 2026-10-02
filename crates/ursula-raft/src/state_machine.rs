@@ -60,6 +60,9 @@ use crate::log_store::elapsed_ns;
 use crate::rt::sync::OwnedSemaphorePermit;
 use crate::rt::sync::Semaphore;
 use crate::rt::time::Instant;
+use crate::snapshot_cadence::GroupLogGauge;
+use crate::snapshot_cadence::GroupLogMark;
+use crate::snapshot_cadence::GroupLogProgress;
 use crate::snapshot_codec::decode_group_snapshot;
 use crate::snapshot_codec::group_snapshot_frames;
 use crate::types::RaftGroupResponse;
@@ -73,6 +76,9 @@ pub struct SnapshotBuildCoordinator {
 #[derive(Debug)]
 struct SnapshotBuildCoordinatorInner {
     semaphore: Arc<Semaphore>,
+    /// Per-group log gauges (F12e), shared node-wide like the permit, so
+    /// the snapshot driver reads what every group's state machine counts.
+    log_gauges: Arc<Mutex<BTreeMap<u32, Arc<GroupLogGauge>>>>,
 }
 
 impl Default for SnapshotBuildCoordinator {
@@ -86,8 +92,41 @@ impl SnapshotBuildCoordinator {
         Self {
             inner: Arc::new(SnapshotBuildCoordinatorInner {
                 semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
+                log_gauges: Arc::default(),
             }),
         }
+    }
+
+    /// A coordinator with a new build concurrency that keeps this one's log
+    /// gauges.
+    pub fn with_max_concurrency(&self, max_concurrency: usize) -> Self {
+        Self {
+            inner: Arc::new(SnapshotBuildCoordinatorInner {
+                semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
+                log_gauges: Arc::clone(&self.inner.log_gauges),
+            }),
+        }
+    }
+
+    /// The log gauge of `raft_group_id`, created on first use (F12e).
+    pub fn log_gauge(&self, raft_group_id: u32) -> Arc<GroupLogGauge> {
+        let mut gauges = self
+            .inner
+            .log_gauges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(gauges.entry(raft_group_id).or_default())
+    }
+
+    /// The log progress of every group with a gauge (F12e).
+    pub fn log_progress(&self) -> BTreeMap<u32, GroupLogProgress> {
+        self.inner
+            .log_gauges
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(group, gauge)| (*group, gauge.progress()))
+            .collect()
     }
 
     pub async fn acquire(&self) -> Result<OwnedSemaphorePermit, GroupEngineError> {
@@ -229,6 +268,8 @@ pub struct RaftGroupStateMachine {
     pub(crate) snapshot_build: SnapshotBuildCoordinator,
     pub(crate) snapshot_install: SnapshotInstallCoordinator,
     snapshot_metadata_path: Option<PathBuf>,
+    /// Log applied since the last snapshot (F12e), read by the driver.
+    log_gauge: Arc<GroupLogGauge>,
 }
 
 /// Node-local record of the current snapshot (`group-N.snapshot.json`).
@@ -287,6 +328,7 @@ impl RaftGroupStateMachine {
         snapshot_install: SnapshotInstallCoordinator,
         snapshot_metadata_path: Option<PathBuf>,
     ) -> Self {
+        let log_gauge = snapshot_build.log_gauge(placement.raft_group_id.0);
         Self {
             placement,
             engine: match cold_store {
@@ -301,6 +343,7 @@ impl RaftGroupStateMachine {
             snapshot_build,
             snapshot_install,
             snapshot_metadata_path,
+            log_gauge,
         }
     }
 
@@ -337,11 +380,18 @@ impl RaftGroupStateMachine {
             .map_err(group_engine_io_error)?;
         self.last_applied_log_id = persisted.meta.last_log_id;
         self.last_membership = persisted.meta.last_membership.clone();
+        self.log_gauge
+            .record_snapshot(self.log_gauge.mark(), pointer.location.size_hint());
         *self.current_snapshot.lock().expect("snapshot mutex") = Some(CurrentSnapshot {
             meta: persisted.meta,
             pointer_bytes: persisted.pointer_bytes,
         });
         Ok(())
+    }
+
+    /// Log applied since this group's last snapshot (F12e).
+    pub fn log_progress(&self) -> GroupLogProgress {
+        self.log_gauge.progress()
     }
 
     pub async fn group_snapshot(&mut self) -> Result<GroupSnapshot, io::Error> {
@@ -478,10 +528,11 @@ impl RaftGroupStateMachine {
             .iter()
             .map(|payload| u64::try_from(payload.len()).expect("payload len fits u64"))
             .sum();
-        self.engine.check_cold_write_admission_bytes(
+        self.engine.check_cold_write_admission(
             &request.stream_id,
             admission,
             incoming_bytes,
+            u64::try_from(request.payloads.len()).unwrap_or(u64::MAX),
         )?;
         Ok(())
     }
@@ -502,8 +553,16 @@ impl RaftGroupStateMachine {
             .flat_map(|request| request.payloads.iter())
             .map(|payload| u64::try_from(payload.len()).expect("payload len fits u64"))
             .sum();
-        self.engine
-            .check_cold_write_admission_bytes(&stream_id, admission, incoming_bytes)?;
+        let incoming_records = requests
+            .iter()
+            .map(|request| u64::try_from(request.payloads.len()).unwrap_or(u64::MAX))
+            .fold(0u64, u64::saturating_add);
+        self.engine.check_cold_write_admission(
+            &stream_id,
+            admission,
+            incoming_bytes,
+            incoming_records,
+        )?;
         Ok(())
     }
 
@@ -517,10 +576,11 @@ impl RaftGroupStateMachine {
         let Some(first) = request.operations.first() else {
             return Ok(());
         };
-        self.engine.check_cold_write_admission_bytes(
+        self.engine.check_cold_write_admission(
             &first.stream_id,
             admission,
             request.payload_bytes(),
+            u64::try_from(request.operations.len()).unwrap_or(u64::MAX),
         )?;
         Ok(())
     }
@@ -549,6 +609,8 @@ impl RaftGroupStateMachine {
             metrics: self.metrics.clone(),
             _build_permit: build_permit,
             snapshot_metadata_path: self.snapshot_metadata_path.clone(),
+            log_gauge: Arc::clone(&self.log_gauge),
+            log_mark: self.log_gauge.mark(),
         }
     }
 
@@ -595,6 +657,13 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         while let Some((entry, responder)) = entries.try_next().await? {
             self.last_applied_log_id = Some(entry.log_id);
 
+            let log_bytes = match &entry.payload {
+                EntryPayload::Normal(command) => command.log_bytes_estimate(),
+                EntryPayload::Blank | EntryPayload::Membership(_) => {
+                    ursula_stream::COMMAND_LOG_OVERHEAD_BYTES
+                }
+            };
+            self.log_gauge.record_applied(log_bytes);
             let response = match entry.payload {
                 EntryPayload::Blank => RaftGroupResponse::Blank,
                 EntryPayload::Normal(command) => {
@@ -705,6 +774,8 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         }
         self.last_applied_log_id = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
+        self.log_gauge
+            .record_snapshot(self.log_gauge.mark(), pointer.location.size_hint());
         *self.current_snapshot.lock().expect("snapshot mutex") = Some(CurrentSnapshot {
             meta: meta.clone(),
             pointer_bytes,
@@ -738,6 +809,9 @@ pub struct RaftGroupSnapshotBuilder {
     metrics: Option<GroupEngineMetrics>,
     _build_permit: OwnedSemaphorePermit,
     snapshot_metadata_path: Option<PathBuf>,
+    log_gauge: Arc<GroupLogGauge>,
+    /// The applied log this snapshot covers (F12e).
+    log_mark: GroupLogMark,
 }
 
 impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
@@ -864,6 +938,8 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                 pointer_bytes: pointer_bytes.clone(),
             });
         }
+        self.log_gauge
+            .record_snapshot(self.log_mark, pointer.location.size_hint());
         if let Err(err) = self
             .snapshot_store
             .prune_retired(
@@ -998,6 +1074,8 @@ mod tests {
             snapshot_store: default_snapshot_store(),
             metrics: None,
             _build_permit: test_build_permit().await,
+            log_gauge: Arc::default(),
+            log_mark: GroupLogMark::default(),
             snapshot_metadata_path: Some(metadata_path.clone()),
         };
         builder.build_snapshot().await.expect("persist snapshot");
@@ -1061,6 +1139,8 @@ mod tests {
             snapshot_store: default_snapshot_store(),
             metrics: None,
             _build_permit: test_build_permit().await,
+            log_gauge: Arc::default(),
+            log_mark: GroupLogMark::default(),
             snapshot_metadata_path: Some(metadata_path.clone()),
         };
         builder.build_snapshot().await.expect("persist snapshot");
@@ -1143,6 +1223,8 @@ mod tests {
                 snapshot_store: default_snapshot_store(),
                 metrics: None,
                 _build_permit: test_build_permit().await,
+                log_gauge: Arc::default(),
+                log_mark: GroupLogMark::default(),
                 snapshot_metadata_path: Some(metadata_path.clone()),
             };
             let built = builder.build_snapshot().await.expect("build snapshot");
@@ -1219,6 +1301,8 @@ mod tests {
             snapshot_store: snapshot_store.clone(),
             metrics: None,
             _build_permit: test_build_permit().await,
+            log_gauge: Arc::default(),
+            log_mark: GroupLogMark::default(),
             snapshot_metadata_path: None,
         };
         let first_snapshot = first.build_snapshot().await.expect("first snapshot");
@@ -1233,6 +1317,8 @@ mod tests {
             snapshot_store: snapshot_store.clone(),
             metrics: None,
             _build_permit: test_build_permit().await,
+            log_gauge: Arc::default(),
+            log_mark: GroupLogMark::default(),
             snapshot_metadata_path: None,
         };
         let second_snapshot = second.build_snapshot().await.expect("second snapshot");
@@ -1264,6 +1350,8 @@ mod tests {
             snapshot_store,
             metrics: None,
             _build_permit: test_build_permit().await,
+            log_gauge: Arc::default(),
+            log_mark: GroupLogMark::default(),
             snapshot_metadata_path: None,
         };
         let third_snapshot = third.build_snapshot().await.expect("third snapshot");
@@ -1343,6 +1431,8 @@ mod tests {
             snapshot_store: Arc::new(FailingSnapshotStore),
             metrics: None,
             _build_permit: test_build_permit().await,
+            log_gauge: Arc::default(),
+            log_mark: GroupLogMark::default(),
             snapshot_metadata_path: None,
         };
 

@@ -1078,8 +1078,10 @@ pub fn snapshot_store_from_config(
     cold_cfg: &crate::ColdConfig,
     references: SnapshotReferenceConfig,
 ) -> Result<Option<SharedSnapshotStore>, SnapshotStoreError> {
-    match cfg.backend {
-        ursula_config::RaftSnapshotBackend::Inline => Ok(None),
+    match resolved_snapshot_backend(cfg.backend, cold_cfg.backend) {
+        ursula_config::RaftSnapshotBackend::Auto | ursula_config::RaftSnapshotBackend::Inline => {
+            Ok(None)
+        }
         #[cfg(not(madsim))]
         ursula_config::RaftSnapshotBackend::S3 => {
             // `try_new` configures the OpenDAL operator with `cold_cfg.root`, so
@@ -1095,6 +1097,19 @@ pub fn snapshot_store_from_config(
             cfg.backend
         ))),
     }
+}
+
+/// The backend a node runs (bounded-stream-state F12b): `auto` picks S3
+/// snapshots whenever the cold store is S3 and inline otherwise. Under
+/// madsim, which has no S3 I/O, `auto` stays inline.
+pub fn resolved_snapshot_backend(
+    configured: ursula_config::RaftSnapshotBackend,
+    cold_backend: ursula_config::config::ColdBackend,
+) -> ursula_config::RaftSnapshotBackend {
+    if cfg!(madsim) && configured == ursula_config::RaftSnapshotBackend::Auto {
+        return ursula_config::RaftSnapshotBackend::Inline;
+    }
+    configured.resolve(cold_backend)
 }
 
 #[cfg(not(madsim))]

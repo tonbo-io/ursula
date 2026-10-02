@@ -201,6 +201,68 @@ max_in_snapshot_log_to_keep = 128
     }
 
     #[test]
+    fn snapshot_cadence_follows_a_node_log_budget() {
+        let default = UrsulaConfig::default();
+        assert_eq!(default.raft.snapshot_log_budget.as_bytes(), 1 << 30);
+        assert_eq!(default.raft.snapshot_backstop_logs, 100_000);
+        let config: UrsulaConfig = toml::from_str(
+            r#"
+[raft]
+snapshot_log_budget = "256MiB"
+snapshot_backstop_logs = 50000
+"#,
+        )
+        .expect("snapshot cadence parses");
+        assert_eq!(config.raft.snapshot_log_budget.as_bytes(), 256 << 20);
+        assert_eq!(config.raft.snapshot_backstop_logs, 50_000);
+    }
+
+    #[test]
+    fn snapshot_backend_defaults_to_s3_with_an_s3_cold_store() {
+        use crate::config::ColdBackend;
+        use crate::config::RaftSnapshotBackend;
+        // F12b: `auto` is the default and picks S3 snapshots whenever the
+        // cold store is S3; `inline` and `s3` stay explicit choices.
+        assert_eq!(
+            UrsulaConfig::default().storage.snapshot.backend,
+            RaftSnapshotBackend::Auto
+        );
+        assert_eq!(
+            RaftSnapshotBackend::Auto.resolve(ColdBackend::S3),
+            RaftSnapshotBackend::S3
+        );
+        for cold in [ColdBackend::None, ColdBackend::Memory] {
+            assert_eq!(
+                RaftSnapshotBackend::Auto.resolve(cold),
+                RaftSnapshotBackend::Inline
+            );
+        }
+        assert_eq!(
+            RaftSnapshotBackend::Inline.resolve(ColdBackend::S3),
+            RaftSnapshotBackend::Inline
+        );
+        let explicit: UrsulaConfig = toml::from_str(
+            r#"
+[storage.snapshot]
+backend = "inline"
+"#,
+        )
+        .expect("explicit inline parses");
+        assert_eq!(
+            explicit.storage.snapshot.backend,
+            RaftSnapshotBackend::Inline
+        );
+        let auto: UrsulaConfig = toml::from_str(
+            r#"
+[storage.snapshot]
+backend = "auto"
+"#,
+        )
+        .expect("auto parses");
+        assert_eq!(auto.storage.snapshot.backend, RaftSnapshotBackend::Auto);
+    }
+
+    #[test]
     fn snapshot_drive_interval_is_optional_and_zero_is_explicit_disable() {
         use crate::human::HumanDuration;
 

@@ -12,6 +12,7 @@ use clap::ValueEnum;
 use ursula_state_probe::alloc::Counting;
 use ursula_state_probe::gate;
 use ursula_state_probe::workloads::Workload;
+use ursula_state_probe::workloads::cadence::CadenceArgs;
 use ursula_state_probe::workloads::l2::L2Args;
 use ursula_state_probe::workloads::planner::PlannerArgs;
 use ursula_state_probe::workloads::w1::W1Args;
@@ -49,6 +50,8 @@ enum SuiteName {
 enum Command {
     /// W1 (and W6 with `--retain-every`): one JSON stream of inline appends.
     W1(W1Args),
+    /// F12e snapshot cadence: snapshot bytes per log byte and node log.
+    Cadence(CadenceArgs),
     /// W2 (and W6 with `--retain-every-sec`): slow streams sharing packs.
     W2(W2Args),
     /// W3 (and W6): external-only appends.
@@ -89,6 +92,7 @@ fn run(cli: Cli) -> Result<()> {
     let echo = !cli.quiet;
     let single = match cli.command {
         Command::W1(args) => Workload::W1(args),
+        Command::Cadence(args) => Workload::Cadence(args),
         Command::W2(args) => Workload::W2(args),
         Command::W3(args) => Workload::W3(args),
         Command::W4(args) => Workload::W4(args),
