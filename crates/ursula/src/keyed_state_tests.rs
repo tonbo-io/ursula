@@ -792,10 +792,9 @@ async fn stalling_pod(head: &'static str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_primary_that_stalls_after_its_headers_fails_over_within_the_request() {
-    let primary = stalling_pod(
-        "HTTP/1.1 200 OK\r\nstream-keyed-through: 1\r\ncontent-length: 100\r\n\r\n",
-    )
-    .await;
+    let primary =
+        stalling_pod("HTTP/1.1 200 OK\r\nstream-keyed-through: 1\r\ncontent-length: 100\r\n\r\n")
+            .await;
     let standby = StubIndexer::spawn().await;
     standby.reply(StubReply::rows(1, ""));
     let upstream = KeyedStateUpstream::with_pods([primary, standby.url.clone()], FAST_FAILOVER)

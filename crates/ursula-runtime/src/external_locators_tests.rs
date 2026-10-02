@@ -409,7 +409,10 @@ async fn orphan_sweep_keeps_an_external_payload_whose_page_entry_was_lost() {
         .sweep_cold_orphans_group_once(GROUP, 16, 0)
         .await
         .expect("sweep");
-    assert_eq!(swept.orphans_deleted, 0, "nothing of an uncovered stream goes");
+    assert_eq!(
+        swept.orphans_deleted, 0,
+        "nothing of an uncovered stream goes"
+    );
     assert_eq!(swept.uncovered_chunks_kept, 2);
     assert_eq!(
         runtime
