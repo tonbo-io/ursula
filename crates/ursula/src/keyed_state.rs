@@ -299,8 +299,7 @@ async fn serve(
     let head = match head(state, stream_id.clone()).await {
         Ok(head) => head,
         Err(err) => {
-            return runtime_error_or_leader_redirect_async(state, err, &request_target(&uri))
-                .await;
+            return runtime_error_or_leader_redirect_async(state, err, &request_target(&uri)).await;
         }
     };
     if !ursula_shard::is_keyed_batch_content_type(&head.content_type) {
