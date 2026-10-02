@@ -4474,6 +4474,7 @@ fn import_snapshot_never_lowers_the_feature_level() {
     let mut raised = machine();
     raised.apply(set_feature_level_cmd(1));
     let mut fresh = StreamStateMachine::new();
+    fresh.apply(set_feature_level_cmd(1));
     assert!(matches!(
         fresh.apply(StreamCommand::ImportSnapshot {
             snapshot: Box::new(raised.snapshot()),
@@ -4481,6 +4482,71 @@ fn import_snapshot_never_lowers_the_feature_level() {
         StreamResponse::SnapshotImported { .. }
     ));
     assert_eq!(fresh.feature_level(), 1);
+}
+
+#[test]
+fn import_snapshot_never_raises_the_feature_level() {
+    // SM2: an import must not bypass enable-feature's all-nodes support
+    // check. A backup above the group's level fails closed on every replica
+    // and leaves the group untouched.
+    let mut raised = machine();
+    raised.apply(set_feature_level_cmd(1));
+    create_stream(&mut raised, "a");
+    let mut fresh = StreamStateMachine::new();
+    match fresh.apply(StreamCommand::ImportSnapshot {
+        snapshot: Box::new(raised.snapshot()),
+    }) {
+        StreamResponse::Error { code, message, .. } => {
+            assert_eq!(code, StreamErrorCode::ImportConflict);
+            assert!(message.contains("feature level 1"), "{message}");
+        }
+        other => panic!("expected ImportConflict, got {other:?}"),
+    }
+    assert_eq!(fresh.feature_level(), 0);
+    assert_eq!(fresh.snapshot(), StreamStateMachine::new().snapshot());
+}
+
+#[test]
+fn import_snapshot_never_lowers_last_created_at_ms() {
+    // SM3: a group that created and deleted streams at level 1 keeps its
+    // C7 counter when it imports an older backup, so the next incarnation
+    // never reuses a `created_at_ms` its objects may still be scoped to.
+    let mut target = machine();
+    target.apply(set_feature_level_cmd(1));
+    assert_eq!(
+        target.apply(create_cmd(stream("gone"), Create {
+            now_ms: 5_000,
+            ..Create::default()
+        })),
+        created(stream("gone"), 0)
+    );
+    assert_eq!(
+        target.apply(delete_cmd(stream("gone"))),
+        StreamResponse::Deleted
+    );
+    assert_eq!(
+        target.apply(StreamCommand::DeleteBucket {
+            bucket_id: "benchcmp".to_owned(),
+        }),
+        StreamResponse::BucketDeleted {
+            bucket_id: "benchcmp".to_owned(),
+        }
+    );
+    assert_eq!(target.last_created_at_ms(), 5_000);
+
+    let mut backup = machine();
+    backup.apply(set_feature_level_cmd(1));
+    create_stream(&mut backup, "a");
+    assert_eq!(backup.last_created_at_ms(), 1);
+    assert!(matches!(
+        target.apply(StreamCommand::ImportSnapshot {
+            snapshot: Box::new(backup.snapshot()),
+        }),
+        StreamResponse::SnapshotImported { .. }
+    ));
+    assert_eq!(target.last_created_at_ms(), 5_000);
+    create_stream(&mut target, "b");
+    assert_eq!(created_at_ms(&target, "b"), 5_001);
 }
 
 fn created_at_ms(machine: &StreamStateMachine, id: &str) -> u64 {

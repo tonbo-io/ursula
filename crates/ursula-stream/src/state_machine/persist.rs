@@ -136,13 +136,29 @@ impl StreamStateMachine {
                 ),
             );
         }
+        if snapshot.feature_level > self.feature_level {
+            // Raising the level is `SetFeatureLevel`'s job, behind the
+            // operator's all-nodes support check; an import that raised it
+            // would let replicas on an older binary diverge.
+            return StreamResponse::error(
+                StreamErrorCode::ImportConflict,
+                format!(
+                    "snapshot is at feature level {}, above this group's level {}; raise the group's feature level first",
+                    snapshot.feature_level, self.feature_level
+                ),
+            );
+        }
         let buckets = u64::try_from(snapshot.buckets.len()).unwrap_or(u64::MAX);
         let streams = u64::try_from(snapshot.streams.len()).unwrap_or(u64::MAX);
         match Self::restore(snapshot) {
             Ok(mut restored) => {
-                // The feature level is never lowered, not even by importing
-                // a backup taken at a lower level.
-                restored.feature_level = restored.feature_level.max(self.feature_level);
+                // The feature level is neither raised (checked above) nor
+                // lowered by importing a backup taken at a lower level.
+                restored.feature_level = self.feature_level;
+                // C7: the counter never goes backwards, so a later create
+                // never reuses an incarnation this group already assigned.
+                restored.last_created_at_ms =
+                    restored.last_created_at_ms.max(self.last_created_at_ms);
                 restored.normalize_last_created_at_ms();
                 *self = restored;
                 StreamResponse::SnapshotImported { buckets, streams }

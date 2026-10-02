@@ -68,13 +68,14 @@ it.runIf(s3Available())("restore: keyed-state 503 until the continuity rebuild, 
 	await until("every owner poisoned", () => (f.owners.every((owner) => owner.storage === undefined) ? true : undefined), KNOBS.commitDeadlineMs + 60_000, 200);
 	const poisonedMs = Date.now() - down;
 
-	// A fresh node on the same cold root imports the backup.
+	// A fresh node on the same cold root raises the level, then imports the backup (an import never
+	// raises the level itself: it refuses a backup above the group's level).
 	await s.startNode(node.id);
+	await s.raiseFeatureLevel(1);
 	for (const [group, bytes] of backup.entries()) {
 		const r = await fetch(`${node.adminUrl}/__ursula/backup/group/${group}/import`, { method: "POST", body: bytes });
 		if (!r.ok) throw new Error(`import group ${group}: ${r.status} ${await r.text()}`);
 	}
-	await s.raiseFeatureLevel(1);
 	const restoredTails = await Promise.all(f.owners.map((owner) => recordTail(s.url, owner.stream)));
 	f.owners.forEach((owner, i) => owner.rewind(restoredTails[i] ?? 0));
 

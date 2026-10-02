@@ -115,7 +115,7 @@ Expected: the purge completes with the indexer drained; both prefixes are empty 
 
 ### 4.5 Restore plus continuity rebuild (`restore.drill.ts`)
 
-Live owners on an S3-backed node. The drill exports every Raft group through the backup API (`GET /__ursula/backup/group/{id}`, the endpoints `ursulactl backup` uses) and lets the owners write until each projection is at least 20 records past the backup. Then the node is destroyed (SIGKILL, memory WAL). A fresh node on the same S3 cold root imports every group (`POST …/import`), and the drill raises the level. The indexer stays up throughout, so its namespaces are ahead of the restored log.
+Live owners on an S3-backed node. The drill exports every Raft group through the backup API (`GET /__ursula/backup/group/{id}`, the endpoints `ursulactl backup` uses) and lets the owners write until each projection is at least 20 records past the backup. Then the node is destroyed (SIGKILL, memory WAL). A fresh node on the same S3 cold root raises the level and then imports every group (`POST …/import`); an import refuses a backup above the group's level. The indexer stays up throughout, so its namespaces are ahead of the restored log.
 
 Expected: the owners poison at their commit deadline and never fault; the first keyed-state read of every restored stream answers 503 (its namespace is ahead); keyed-state then serves exactly the restored tail (continuity rebuild from record 0); every owner reopens and commits again; every acknowledged commit below the restored tail, and every commit after the restore, is byte-identical.
 
