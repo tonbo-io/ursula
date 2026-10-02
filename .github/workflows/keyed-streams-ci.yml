@@ -97,6 +97,16 @@ jobs:
       - name: Run madsim smoke corpus
         run: RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim smoke_corpus_replays -- --nocapture
 
+      # Bounded-state DST PR subset (§7.4): sparse marks (F1), external
+      # locators at level 3 (F5: ambiguous appends and offloads, a learner
+      # installing a snapshot with staged refs, ambiguous CompactCold). A few
+      # seeds each, a few seconds of virtual-time runs; DST Nightly sweeps
+      # larger ranges through the *_SEEDS variables.
+      - name: Run bounded-state seed families (PR subset)
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
+            sparse_marks_survive external_locators_survive --nocapture
+
       # Keyed indexer DST (keyed-streams U21): the PR seed family under S3
       # faults, Raft leader changes, indexer crashes and restores.
       - name: Run keyed indexer seed family

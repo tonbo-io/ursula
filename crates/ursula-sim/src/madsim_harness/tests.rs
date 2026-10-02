@@ -2041,6 +2041,19 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
     assert_eq!(quiet.last_seen_ms, Some(5 + 7 * 24 * 60 * 60 * 1_000));
 }
 
+/// Seeds for a `#[test]` seed family: the PR default set, or the inclusive
+/// range `start..=end` from the environment variable `var` (the nightly
+/// sweep sets larger ranges, e.g. `SPARSE_MARKS_SEEDS=2000..=2039`).
+fn seeds_from_env(var: &str, default: &[u64]) -> Vec<u64> {
+    std::env::var(var)
+        .ok()
+        .and_then(|range| {
+            let (start, end) = range.split_once("..=")?;
+            Some((start.parse().ok()?..=end.parse().ok()?).collect())
+        })
+        .unwrap_or_else(|| default.to_vec())
+}
+
 /// Bounded-state F1 seed family (§7.4): cold-path record reads across flush
 /// and seal boundaries, retention by record into sealed history, and a
 /// learner that installs a level-2 snapshot with marks mid-stream.
@@ -2056,7 +2069,7 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
 #[test]
 fn sparse_marks_survive_cold_reads_retention_and_snapshot_install() {
     let _guard = sim_test_guard();
-    for seed in [2_021, 2_022, 2_023] {
+    for seed in seeds_from_env("SPARSE_MARKS_SEEDS", &[2_021, 2_022, 2_023]) {
         run_with_madsim(seed, sparse_marks_scenario(seed));
     }
 }
@@ -2207,11 +2220,9 @@ async fn sparse_marks_scenario(seed: u64) {
         format!("{seed}-{chunk}"),
     )
     .await;
-    sparse_marks_append(leader_engine, &stream, &mut next, 25).await;
-    let last_index = openraft::rt::WatchReceiver::borrow_watched(&leader.metrics())
-        .last_applied
-        .map(|log_id| log_id.index)
-        .expect("leader applied index");
+    // The leader's metrics can lag its own apply; the append's commit index
+    // is the suffix's last entry.
+    let last_index = sparse_marks_append(leader_engine, &stream, &mut next, 25).await;
     for engine in &engines {
         engine
             .raft_handle()
@@ -2300,13 +2311,14 @@ fn sparse_marks_body(from: u64, to: u64) -> Vec<u8> {
 }
 
 /// Appends `count` records through the leader and checks the
-/// acknowledgement range comes from apply (Invariant 10).
+/// acknowledgement range comes from apply (Invariant 10). Returns the
+/// append's group commit index.
 async fn sparse_marks_append(
     leader: &mut RaftGroupEngine,
     stream: &BucketStreamId,
     next: &mut u64,
     count: u64,
-) {
+) -> u64 {
     let from = *next;
     *next += count;
     let mut request = AppendRequest::from_bytes(stream.clone(), sparse_marks_body(from, *next));
@@ -2322,6 +2334,7 @@ async fn sparse_marks_append(
             next_record: *next,
         })
     );
+    response.group_commit_index
 }
 
 /// Flushes the whole hot prefix in cuts of at most `max` bytes.
@@ -2440,6 +2453,27 @@ fn external_append_request(stream: &BucketStreamId, path: &str, len: u64) -> App
         now_ms: 0,
         record_match: None,
     }
+}
+
+/// The object path of every chunk page entry of `stream`.
+async fn page_chunk_paths(cold_store: &Arc<ColdStore>, stream: &BucketStreamId) -> Vec<String> {
+    use ursula_runtime::ColdIndexPageStore;
+
+    let store = ursula_runtime::ColdStoreColdIndexPageStore::new(cold_store.clone());
+    let mut paths = Vec::new();
+    for key in cold_store
+        .list_cold_index_pages()
+        .await
+        .expect("list cold index pages")
+    {
+        if &key.stream_id != stream {
+            continue;
+        }
+        if let Some(page) = store.get_page(&key).await.expect("get page") {
+            paths.extend(page.cold_chunks.iter().map(|chunk| chunk.s3_path.clone()));
+        }
+    }
+    paths
 }
 
 /// Every external page entry of `stream` as `(start, end, path)`.
@@ -2702,13 +2736,473 @@ async fn external_locator_ambiguity(variant: LocatorAmbiguity) {
 #[test]
 fn external_locators_survive_ambiguous_commits() {
     let _guard = sim_test_guard();
-    for seed in EXTERNAL_LOCATOR_AMBIGUITY_SEEDS {
+    for seed in seeds_from_env(
+        "EXTERNAL_LOCATOR_AMBIGUITY_SEEDS",
+        &EXTERNAL_LOCATOR_AMBIGUITY_SEEDS,
+    ) {
         let variant = match seed % 3 {
             0 => LocatorAmbiguity::UncommittedOnIsolatedLeader,
             1 => LocatorAmbiguity::LostResponse,
             _ => LocatorAmbiguity::AmbiguousOffload,
         };
         run_with_madsim(seed, external_locator_ambiguity(variant));
+    }
+}
+
+/// Waits until every replica applied everything the leader committed so
+/// far: creates a fresh stream (its commit index follows every earlier
+/// entry) and waits for all nodes to apply it. The leader's metrics can lag
+/// its own apply, so they are not a reliable barrier.
+async fn apply_barrier(engines: &mut [RaftGroupEngine], leader_index: usize, name: &str) {
+    let created = engines[leader_index]
+        .create_stream(
+            CreateStreamRequest::new(
+                BucketStreamId::new("simulated", name),
+                "application/octet-stream",
+            ),
+            placement(),
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("barrier stream");
+    wait_all_nodes_applied(engines, created.group_commit_index, "apply barrier").await;
+}
+
+/// Seeds of the level-3 snapshot-install family: a learner installs a
+/// group snapshot that holds staged external refs (not yet offloaded).
+const EXTERNAL_LOCATOR_SNAPSHOT_SEEDS: [u64; 2] = [5, 23];
+
+/// Bounded-state F5 follow-up (§7.4, Invariants 11 and 12): a learner that
+/// installs a level-3 snapshot holding staged external refs reads the
+/// acknowledged bytes, holds the same refs as the voters, and converges with
+/// them after the offload commits.
+#[test]
+fn external_locators_survive_level_three_snapshot_install_with_staged_refs() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env(
+        "EXTERNAL_LOCATOR_SNAPSHOT_SEEDS",
+        &EXTERNAL_LOCATOR_SNAPSHOT_SEEDS,
+    ) {
+        run_with_madsim(seed, external_locator_snapshot_install(seed));
+    }
+}
+
+async fn external_locator_snapshot_install(seed: u64) {
+    let cold_store: Arc<ColdStore> = Arc::new(sim_cold_store());
+    let policy = sim_network_policy();
+    let (registry, mut engines, leader_id) =
+        build_lagging_learner_snapshot_cluster_with_cold_store(policy, Some(cold_store.clone()))
+            .await;
+    let leader_index = engine_index(leader_id);
+    let learner_id = 3;
+    let stream = BucketStreamId::new("simulated", "locator-install");
+    engines[leader_index]
+        .set_feature_level(
+            SetFeatureLevelRequest {
+                level: ursula_runtime::FEATURE_LEVEL_EXTERNAL_LOCATORS,
+            },
+            placement(),
+        )
+        .await
+        .expect("raise to level 3");
+    engines[leader_index]
+        .create_stream(
+            CreateStreamRequest::new(stream.clone(), "application/octet-stream"),
+            placement(),
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("create stream");
+    let mut acknowledged = Vec::new();
+    let externals = 2 + usize::try_from(seed % 3).expect("small");
+    for index in 0..externals {
+        let hot = format!("hot-{index};").into_bytes();
+        engines[leader_index]
+            .append(
+                AppendRequest::from_bytes(stream.clone(), hot.clone()),
+                placement(),
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("hot append");
+        acknowledged.extend_from_slice(&hot);
+        let payload = vec![b'a' + u8::try_from(index).expect("small"); 32 + index];
+        let path = ursula_runtime::new_external_payload_path(&stream);
+        cold_store
+            .write_chunk(&path, &payload)
+            .await
+            .expect("stage external payload");
+        let len = u64::try_from(payload.len()).expect("len fits u64");
+        engines[leader_index]
+            .append_external(external_append_request(&stream, &path, len), placement())
+            .await
+            .expect("external append");
+        acknowledged.extend_from_slice(&payload);
+    }
+    let staged = engines[leader_index]
+        .state_gauges(placement())
+        .await
+        .expect("leader gauges")
+        .staged_external_refs;
+    assert!(staged > 0, "the snapshot holds staged refs");
+
+    // Snapshot the prefix, purge it, and install it on the learner.
+    let leader = engines[leader_index].raft_handle();
+    let last_index = leader_applied_index(&engines[leader_index]);
+    for engine in &engines[..2] {
+        engine
+            .raft_handle()
+            .wait(Some(Duration::from_secs(10)))
+            .applied_index_at_least(Some(last_index), "voters applied prefix")
+            .await
+            .expect("wait for voter apply");
+    }
+    leader.trigger().snapshot().await.expect("trigger snapshot");
+    leader
+        .wait(Some(Duration::from_secs(10)))
+        .metrics(
+            |metrics| {
+                metrics
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|log_id| log_id.index() >= last_index)
+            },
+            "leader snapshot covers prefix",
+        )
+        .await
+        .expect("wait for snapshot");
+    leader
+        .trigger()
+        .purge_log(last_index)
+        .await
+        .expect("purge log");
+    leader
+        .wait(Some(Duration::from_secs(10)))
+        .metrics(
+            |metrics| {
+                metrics
+                    .purged
+                    .as_ref()
+                    .is_some_and(|log_id| log_id.index() >= last_index)
+            },
+            "leader purged prefix",
+        )
+        .await
+        .expect("wait for purge");
+    registry.register(learner_id, engines[engine_index(learner_id)].raft_handle());
+    leader
+        .add_learner(learner_id, BasicNode::new("node-3"), true)
+        .await
+        .expect("add learner");
+    assert!(registry.full_snapshot_count(learner_id) >= 1);
+    apply_barrier(&mut engines, leader_index, "barrier-install").await;
+
+    // Invariants 11 and 12 with the refs still staged.
+    let tail = acknowledged.len();
+    let mut entries = Vec::new();
+    for (index, engine) in engines.iter_mut().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        read_local_payload_eventually(
+            engine,
+            node_id,
+            &stream,
+            0,
+            tail + 16,
+            &acknowledged,
+            "replica reads the acknowledged bytes before the offload",
+        )
+        .await;
+        let gauges = engine.state_gauges(placement()).await.expect("gauges");
+        assert_eq!(gauges.staged_external_refs, staged, "node {node_id}");
+        let snapshot = engine
+            .sim_local_group_snapshot()
+            .await
+            .expect("local group snapshot");
+        let entry = snapshot
+            .stream_snapshot
+            .streams
+            .iter()
+            .find(|entry| entry.metadata.stream_id == stream)
+            .expect("stream entry")
+            .clone();
+        entries.push((
+            entry.external_segments,
+            entry.cold_chunks,
+            entry.cold_frontier_offset,
+            entry.message_records,
+        ));
+    }
+    assert_eq!(entries[0], entries[1]);
+    assert_eq!(
+        entries[0], entries[2],
+        "the installed refs equal the voters'"
+    );
+
+    // The offload commits on every replica, the learner included.
+    let offload_now = ursula_runtime::OffloadColdRefsRequest {
+        min_age_ms: 0,
+        ..ursula_runtime::OffloadColdRefsRequest::new(0, 16)
+    };
+    for _ in 0..50 {
+        let report = engines[leader_index]
+            .offload_cold_refs(offload_now, placement())
+            .await
+            .expect("offload pass");
+        if report.streams == 0 {
+            break;
+        }
+    }
+    apply_barrier(&mut engines, leader_index, "barrier-offload").await;
+    for (index, engine) in engines.iter_mut().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        read_local_payload_eventually(
+            engine,
+            node_id,
+            &stream,
+            0,
+            tail + 16,
+            &acknowledged,
+            "replica reads the acknowledged bytes after the offload",
+        )
+        .await;
+        let gauges = engine.state_gauges(placement()).await.expect("gauges");
+        assert_eq!(gauges.staged_external_refs, 0, "node {node_id}");
+    }
+}
+
+/// Seeds of the level-3 ambiguous `CompactCold` family: `seed % 2` picks
+/// whether the compaction commits.
+const AMBIGUOUS_COMPACTION_SEEDS: [u64; 2] = [8, 13];
+
+/// Bounded-state F5/F14 follow-up (§7.4, Invariant 11): a `CompactCold` whose
+/// outcome is ambiguous to its caller at level 3 (the leader rewrote the
+/// page entries, then lost quorum) never changes readable bytes: every
+/// replica reads the acknowledged bytes, around an offloaded external ref,
+/// before and after a new leader keeps writing, and the compaction inputs
+/// are not deleted when the compaction never committed.
+#[test]
+fn external_locators_survive_ambiguous_compaction_at_level_three() {
+    let _guard = sim_test_guard();
+    for seed in seeds_from_env("AMBIGUOUS_COMPACTION_SEEDS", &AMBIGUOUS_COMPACTION_SEEDS) {
+        run_with_madsim(seed, ambiguous_compaction_at_level_three(seed % 2 == 0));
+    }
+}
+
+async fn ambiguous_compaction_at_level_three(commits: bool) {
+    let cold_store: Arc<ColdStore> = Arc::new(sim_cold_store());
+    let policy = sim_network_policy();
+    let (_registry, mut engines, mut leader_id) =
+        build_three_node_cluster_with_cold_store(policy.clone(), Some(cold_store.clone())).await;
+    let stream = BucketStreamId::new("simulated", "ambiguous-compaction");
+    let leader = engine_index(leader_id);
+    engines[leader]
+        .set_feature_level(
+            SetFeatureLevelRequest {
+                level: ursula_runtime::FEATURE_LEVEL_EXTERNAL_LOCATORS,
+            },
+            placement(),
+        )
+        .await
+        .expect("raise to level 3");
+    engines[leader]
+        .create_stream(
+            CreateStreamRequest::new(stream.clone(), "application/octet-stream"),
+            placement(),
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("create stream");
+
+    // Two flushed chunks, then an external append offloaded to the pages.
+    let mut acknowledged = Vec::new();
+    let mut chunks = Vec::new();
+    for part in [b"first-chunk;".to_vec(), b"second-chunk;".to_vec()] {
+        engines[leader]
+            .append(
+                AppendRequest::from_bytes(stream.clone(), part.clone()),
+                placement(),
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("append");
+        acknowledged.extend_from_slice(&part);
+        let candidate = engines[leader]
+            .plan_cold_flush(
+                PlanColdFlushRequest {
+                    stream_id: stream.clone(),
+                    min_hot_bytes: 1,
+                    max_flush_bytes: usize::MAX,
+                },
+                placement(),
+            )
+            .await
+            .expect("plan flush")
+            .expect("a flush candidate");
+        let path = format!(
+            "simulated/ambiguous-compaction/chunks/{}.bin",
+            candidate.start_offset
+        );
+        let object_size = cold_store
+            .write_chunk(&path, &candidate.payload)
+            .await
+            .expect("write chunk");
+        let chunk = ursula_runtime::ColdChunkRef {
+            start_offset: candidate.start_offset,
+            end_offset: candidate.end_offset,
+            s3_path: path,
+            object_size,
+            ..Default::default()
+        };
+        engines[leader]
+            .flush_cold(
+                FlushColdRequest {
+                    cold_generation: Some(candidate.cold_generation),
+                    stream_id: stream.clone(),
+                    chunk: chunk.clone(),
+                },
+                placement(),
+            )
+            .await
+            .expect("flush cold");
+        chunks.push(chunk);
+    }
+    let external = vec![b'E'; 48];
+    let external_path = ursula_runtime::new_external_payload_path(&stream);
+    cold_store
+        .write_chunk(&external_path, &external)
+        .await
+        .expect("stage external payload");
+    engines[leader]
+        .append_external(
+            external_append_request(&stream, &external_path, 48),
+            placement(),
+        )
+        .await
+        .expect("external append");
+    acknowledged.extend_from_slice(&external);
+    let offload_now = ursula_runtime::OffloadColdRefsRequest {
+        min_age_ms: 0,
+        ..ursula_runtime::OffloadColdRefsRequest::new(0, 16)
+    };
+    for _ in 0..50 {
+        let report = engines[leader]
+            .offload_cold_refs(offload_now, placement())
+            .await
+            .expect("offload pass");
+        if report.streams == 0 {
+            break;
+        }
+    }
+
+    // The compaction replacement holds the same bytes as its inputs.
+    let replacement_bytes = acknowledged
+        .get(..usize::try_from(chunks[1].end_offset).expect("offset fits usize"))
+        .expect("replacement range")
+        .to_vec();
+    let replacement_path = "simulated/ambiguous-compaction/chunks/compacted.bin".to_owned();
+    let replacement_size = cold_store
+        .write_chunk(&replacement_path, &replacement_bytes)
+        .await
+        .expect("write replacement");
+    let request = ursula_runtime::CompactColdRequest {
+        stream_id: stream.clone(),
+        old_chunks: chunks.clone(),
+        replacement: ursula_runtime::ColdChunkRef {
+            start_offset: chunks[0].start_offset,
+            end_offset: chunks[1].end_offset,
+            s3_path: replacement_path.clone(),
+            object_size: replacement_size,
+            ..Default::default()
+        },
+        gc_not_before_ms: u64::MAX,
+    };
+    apply_barrier(&mut engines, leader, "barrier-prefix").await;
+    if commits {
+        // The compaction commits; then its leader loses quorum.
+        engines[leader]
+            .compact_cold(request, placement())
+            .await
+            .expect("committed compaction");
+        isolate(&policy, leader_id);
+    } else {
+        // The leader rewrites the page entries, then loses quorum before
+        // the command commits; the caller cannot roll the pages back.
+        isolate(&policy, leader_id);
+        let outcome = madsim::time::timeout(
+            Duration::from_millis(300),
+            engines[leader].compact_cold(request, placement()),
+        )
+        .await;
+        assert!(
+            !matches!(outcome, Ok(Ok(_))),
+            "an isolated leader cannot commit its compaction: {outcome:?}"
+        );
+    }
+    leader_id = replacement_leader(&engines, leader_id).await;
+    policy.clear();
+    // Either way the pages already name the replacement, which holds the
+    // inputs' bytes.
+    let chunk_paths = page_chunk_paths(&cold_store, &stream).await;
+    assert!(
+        !chunk_paths.is_empty() && chunk_paths.iter().all(|path| *path == replacement_path),
+        "pages index the replacement: {chunk_paths:?}"
+    );
+
+    // The current leader keeps writing past the ambiguity.
+    let leader = engine_index(leader_id);
+    let tail_part = b"after-compaction;".to_vec();
+    let mut appended = false;
+    for _ in 0..50 {
+        if engines[leader]
+            .append(
+                AppendRequest::from_bytes(stream.clone(), tail_part.clone()),
+                placement(),
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .is_ok()
+        {
+            appended = true;
+            break;
+        }
+        madsim::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(appended, "the current leader accepts appends");
+    acknowledged.extend_from_slice(&tail_part);
+    apply_barrier(&mut engines, leader, "barrier-suffix").await;
+
+    // Invariant 11 on every replica.
+    let tail = acknowledged.len();
+    for (index, engine) in engines.iter_mut().enumerate() {
+        let node_id = u64::try_from(index + 1).expect("node id fits u64");
+        read_local_payload_eventually(
+            engine,
+            node_id,
+            &stream,
+            0,
+            tail + 16,
+            &acknowledged,
+            "replica reads the acknowledged bytes after the compaction",
+        )
+        .await;
+    }
+    for (start, end, path) in page_external_entries(&cold_store, &stream).await {
+        assert_eq!(path, external_path, "unexpected external page entry {path}");
+        let start = usize::try_from(start).expect("offset fits usize");
+        let end = usize::try_from(end).expect("offset fits usize");
+        assert_eq!(
+            acknowledged.get(start..end),
+            external.get(..end - start),
+            "external page entry [{start}, {end}) overlaps differing bytes"
+        );
+    }
+    if !commits {
+        for chunk in &chunks {
+            assert!(
+                cold_store.object_size(&chunk.s3_path).await.is_ok(),
+                "an uncommitted compaction deletes none of its inputs"
+            );
+        }
     }
 }
 
@@ -2719,13 +3213,7 @@ fn external_locators_survive_ambiguous_commits() {
 #[test]
 fn keyed_indexer_seed_family_holds_invariants() {
     let _guard = sim_test_guard();
-    let seeds: Vec<u64> = std::env::var("KEYED_INDEXER_SEEDS")
-        .ok()
-        .and_then(|range| {
-            let (start, end) = range.split_once("..=")?;
-            Some((start.parse().ok()?..=end.parse().ok()?).collect())
-        })
-        .unwrap_or_else(|| (600..=605).collect());
+    let seeds = seeds_from_env("KEYED_INDEXER_SEEDS", &[600, 601, 602, 603, 604, 605]);
     let mut plans = Vec::new();
     for seed in seeds {
         let schedule = SimSchedule::generate_keyed_indexer(seed);
