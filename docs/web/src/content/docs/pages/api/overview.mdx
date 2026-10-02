@@ -12,8 +12,9 @@ This API is Ursula's implementation of the [Durable Streams Protocol](/docs/spec
 | Method | Path | Description |
 | -------- | ----------------------------- | ------------------------------------------------------------ |
 | `PUT` | `/{bucket}` | [Create a bucket](/docs/api/create-bucket) |
+| `GET` | `/{bucket}/streams` | [List streams](/docs/api/list-streams) |
 
-Bucket-level `GET` (metadata), `DELETE`, and `GET /{bucket}/streams` (list) are part of the Durable Streams Protocol but are not yet implemented in Ursula. Track stream existence at the application layer for now.
+Bucket-level `GET` (metadata) and `DELETE` are part of the extensions specification but are not yet implemented in Ursula.
 
 ## Stream operations
 
@@ -21,11 +22,12 @@ Bucket-level `GET` (metadata), `DELETE`, and `GET /{bucket}/streams` (list) are 
 | -------- | ----------------------------- | ------------------------------------------------------------ |
 | `PUT` | `/{bucket}/{stream}` | [Create a stream](/docs/api/create-stream) |
 | `POST` | `/{bucket}/{stream}` | [Append data or close](/docs/api/append) |
-| `POST` | `/{bucket}/{stream}/append-batch` | Batched append. See [extensions spec](/docs/specs/extensions#append-batch) |
+| `POST` | `/{bucket}/{stream}/append-batch` | Batched append. See [extensions spec](/docs/specs/extensions#4-append-batch) |
 | `GET` | `/{bucket}/{stream}` | [Read (catch-up, long-poll, SSE)](/docs/api/read) |
 | `HEAD` | `/{bucket}/{stream}` | [Get stream metadata](/docs/api/head-stream) |
 | `GET` / `PUT` | `/{bucket}/{stream}/attrs` | [Read or replace stream attributes](/docs/api/stream-attrs) |
 | `DELETE` | `/{bucket}/{stream}` | [Delete a stream](/docs/api/delete-stream) |
+| `GET` | `/{bucket}/{stream}/keyed-state` | [Read keyed state](/docs/api/keyed-state) of a [keyed stream](/docs/concepts/keyed-streams) |
 
 ## Bootstrap and snapshots
 
@@ -72,3 +74,4 @@ curl 'http://127.0.0.1:4437/demo/hello?offset=-1&live=sse'
 - [Snapshots](/docs/concepts/snapshots): snapshot lifecycle
 - [Exactly-once writes](/docs/concepts/exactly-once-writes): producer deduplication
 - [Conditional writes](/docs/concepts/conditional-writes): sequence and JSON record-tail guards
+- [Keyed streams](/docs/concepts/keyed-streams): key-value batches and the keyed-state resource

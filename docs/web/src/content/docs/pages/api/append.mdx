@@ -12,7 +12,7 @@ api: "POST /{bucket}/{stream}"
 </ParamField>
 
 <ParamField header="Content-Type" type="string" required>
- Must match the stream's content type (set at PUT or first POST). Required when the body is non-empty. Mismatch returns `400`.
+ Must match the stream's content type (set at PUT or first POST) after normalization: parameters are trimmed, lowercased and joined with `; `. Required when the body is non-empty. A mismatch returns `409`. Use `application/json; profile=keyed-batch-v1` for a [keyed stream](/docs/concepts/keyed-streams).
 </ParamField>
 
 <ParamField header="Stream-Closed" type="string">
@@ -20,11 +20,11 @@ api: "POST /{bucket}/{stream}"
 </ParamField>
 
 <ParamField header="Stream-Seq" type="string">
- Client-supplied monotonic sequence token. The server tracks the last accepted value per stream and rejects any append whose `Stream-Seq` is not lexicographically greater than the previous one.
+ Client-supplied monotonic sequence token. The server tracks the last accepted value per stream and rejects any append whose `Stream-Seq` is not lexicographically greater than the previous one. At most 256 bytes.
 </ParamField>
 
 <ParamField header="Producer-Id" type="string">
- Stable producer identity (UUID, hostname, etc.) for [exactly-once writes](/docs/concepts/exactly-once-writes). Dedup state is per-stream.
+ Stable producer identity (UUID, hostname, etc.) for [exactly-once writes](/docs/concepts/exactly-once-writes). Dedup state is per-stream. At most 256 bytes.
 </ParamField>
 
 <ParamField header="Producer-Epoch" type="string">
@@ -49,10 +49,12 @@ api: "POST /{bucket}/{stream}"
 | ------ | ------------------------------------------------------------------ |
 | `204` | Append successful (default success response, no body). |
 | `200` | Append successful with body - returned when a `Producer-Id` was supplied and the append was not deduplicated, so the response carries producer ack headers. |
-| `400` | Empty body without `Stream-Closed: true`, missing content type, or bad JSON. |
+| `400` | Empty body without `Stream-Closed: true`, missing content type, invalid JSON or UTF-8, a JSON message nested deeper than 127 levels, or a `Producer-Id` or `Stream-Seq` longer than 256 bytes. |
 | `404` | Stream not found. |
-| `409` | Stream is already closed, or sequence/producer conflict. |
+| `409` | Content type does not match the stream, stream is already closed, or sequence/producer conflict. |
 | `412` | `Stream-Record-Match` did not match the current JSON record tail. |
+| `413` | Body larger than 32 MiB. |
+| `422` | Sent as `application/json; profile=keyed-batch-v1` and a message does not match the `keyed-batch-v1` grammar. Nothing from the request is committed. Checked before the stream is looked up, so it precedes `404`, `409` and `412`. |
 | `503` | Cold-write backpressure. Retry after the duration in `Retry-After`. |
 
 Response headers include `Stream-Next-Offset` (always). When a `Producer-Id` was supplied, the server echoes the accepted `Producer-Epoch` and `Producer-Seq` so the producer can confirm what was durably recorded. `Stream-Closed: true` is set if this request closed the stream. `ETag` is set on reads only, not on appends.
@@ -84,8 +86,23 @@ curl -X POST http://127.0.0.1:4437/demo/hello \
 ```
 </RequestExample>
 
+## JSON message text
+
+Ursula validates every JSON body and stores each message as you wrote it, minus insignificant whitespace (spaces, tabs and line breaks outside strings), followed by one LF. Member order, duplicate members, number spelling such as `1.50e3` or `1e400`, and string escapes, including escapes of unpaired surrogates, are kept byte for byte, and every read returns that text. A top-level array is split into one message per element. A message may nest at most 127 levels. See [JSON message text](/docs/specs/extensions#json-message-text). Releases before this rule re-serialized messages; see the [release notes](/docs/release-notes).
+
+## Keyed streams
+
+On a [keyed stream](/docs/concepts/keyed-streams), every message must be a `keyed-batch-v1` batch, and the request must use the keyed content type. A successful response also advertises `keyed-batch-v1` in `Stream-Extensions`. A grammar error answers `422` with a plain-text body naming the message, for example `invalid keyed batch at message 1: op 0: unknown op code`.
+
+```bash
+curl -i -X POST http://127.0.0.1:4437/pi/harness-1 \
+  -H 'Content-Type: application/json; profile=keyed-batch-v1' \
+  -H 'Stream-Record-Match: 103' \
+  --data-binary '{"o":17,"ops":[["p","AW5leHRfaWQA",130],["d","QQIAAAAAAAAAgA"]]}'
+```
+
 <Note>
-Appends to JSON streams are validated and normalized. The server may coalesce multiple concurrent appends into a single batch for performance.
+The server may coalesce multiple concurrent appends into a single batch for performance.
 </Note>
 
 <Info>

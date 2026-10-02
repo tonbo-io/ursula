@@ -23,6 +23,7 @@ With no config file at all, `ursula` starts a single-node in-memory runtime. Tha
 | `--config FILE` | searches `./ursula.toml`, `/etc/ursula/ursula.toml`, then user config paths | TOML config file |
 | `--preset PRESET` | `default` when no config file is found, otherwise none | Resource preset: `default`, `dev`, `tiny`, `small`, `standard`, or `large` |
 | `--node-id ID` | config file or preset | Overrides `raft.node_id` |
+| `--keyed-state-upstream URL` | config file | Overrides `server.keyed_state_upstream` ([Keyed state](#keyed-state)) |
 
 CLI `--node-id` intentionally overrides any `raft.node_id` value in the config file so the same file can be mounted on every node. Helm derives it from the StatefulSet ordinal.
 
@@ -120,6 +121,25 @@ Helm and the EC2 scripts map their deployment inputs onto these same keys, so th
 | `server.keyed_state_upstream` | unset | Base URL of the keyed-state indexer (`ursula indexer --keyed-source-url …`) behind `{stream}/keyed-state`. Unset: `keyed-state` answers `404` and nothing advertises `keyed-state-v1`. CLI: `ursula server --keyed-state-upstream <url>` |
 | `keyed_state.indexer_urls` | `[]` | Base URL of every keyed-state indexer pod. Bucket purge sends `POST {url}/v1/keyed/drain` to each one and erases `.keyed/{bucket}/` only after all acknowledge. Empty with `server.keyed_state_upstream` set: purge drains the upstream |
 | `keyed_state.drain_timeout` | `60s` | Per-indexer timeout of one drain request; a pod that does not acknowledge leaves the purge incomplete, and the idempotent purge is retried |
+
+Set `server.keyed_state_upstream` to the same value on every node: whichever node leads a stream proxies its keyed-state reads.
+
+### Keyed indexer flags
+
+The keyed-state indexer is the `ursula indexer` subcommand started with `--keyed-source-url`. It takes flags only, no config file:
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--keyed-source-url URL` | required | Ursula node base URL the indexer reads stream records from. The indexer sends no credentials, so point it at a node or an internal Service, not at an authenticating gateway |
+| `--s3-bucket NAME` or `--object-dir DIR` | one is required | Object store for projections. Use the nodes' cold-store bucket: projections live under `.keyed/` next to the stream data, and stream delete and bucket purge erase them through the nodes' cold store |
+| `--keyed-s3-root PREFIX` | `""` | Prefix inside the S3 bucket that holds `.keyed/`. Set it to the nodes' `storage.cold.root` |
+| `--s3-region`, `--s3-endpoint` | AWS defaults | S3 region and endpoint for S3-compatible stores. Credentials come from the standard AWS SDK chain |
+| `--cache-dir DIR` | required | Local cache of projection parts. Disposable |
+| `--cache-max-bytes N` | `2147483648` | Cache budget in bytes |
+| `--listen ADDR` | `127.0.0.1:4493` | Listener for `/v1/keyed`, `/v1/keyed/drain`, `/livez` and `/readyz`. Keep it internal |
+| `--keyed-min-publish-interval-ms MS` | `5000` | Minimum spacing between two publications of one stream's state. Readers that wait coalesce onto the next publication |
+| `--keyed-gc-grace-seconds S` | `600` | Grace period before unreferenced projection objects are deleted |
+| `--keyed-max-waiters N` | `10000` | Maximum concurrent waiting keyed-state reads; beyond it reads answer `503` |
 
 ## Complete examples
 

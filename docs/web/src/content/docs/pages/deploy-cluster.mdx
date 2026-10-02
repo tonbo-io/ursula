@@ -101,6 +101,45 @@ indexer:
 
 Register streams dynamically with `PUT /v1/indexes/{id}` on the internal indexer Service. No Helm upgrade is needed. The Service is an internal ClusterIP. If remote applications need read access, front it with an authenticated, path-aware proxy and never expose the registration or administration routes.
 
+## Optional: keyed-state indexer
+
+[Keyed streams](/docs/concepts/keyed-streams) serve their key-value state through `{stream}/keyed-state`, which the stream's leader proxies to an `ursula indexer` running in keyed mode. Without one, keyed streams still accept writes, and `keyed-state` answers `404`. The Helm chart does not deploy the keyed indexer yet; run it as its own Deployment or process next to the cluster.
+
+1. Raise the feature level, once every node runs a release that supports level 1, so keyed streams can be created:
+
+   ```bash
+   ursulactl cluster enable-feature --config cluster.json --level 1
+   ```
+
+2. Run the indexer against the nodes' cold-store bucket and root, reading records from a node Service:
+
+   ```bash
+   ursula indexer \
+     --keyed-source-url http://ursula:4437 \
+     --s3-bucket my-ursula-bucket --keyed-s3-root ursula-prod \
+     --s3-region us-east-1 \
+     --cache-dir /var/cache/ursula-keyed \
+     --listen 0.0.0.0:4493
+   ```
+
+   The indexer reads records over HTTP, so its object-store identity needs only read, write, list and delete on `{root}/.keyed/`. Its local disk is only a cache. `/readyz` reports readiness.
+
+3. Point every node at it and list every indexer pod for bucket purge:
+
+   ```toml
+   [server]
+   keyed_state_upstream = "http://ursula-keyed-indexer:4493"
+
+   [keyed_state]
+   indexer_urls = ["http://ursula-keyed-indexer-0.ursula-keyed-indexer:4493"]
+   ```
+
+   Roll the nodes with the usual drain procedure. Afterwards `HEAD` on a keyed stream advertises `keyed-state-v1`.
+
+Several indexer pods may sit behind one Service: they coordinate through compare-and-swap on object storage, so any pod can serve any stream. Keep the indexer's listener internal; it trusts the node to have authorized the request. See [Configuration](/docs/configuration#keyed-indexer-flags) for every flag.
+
+Clusters that serve [Pi Durable](/docs/examples/pi-durable) also need per-group admission caps of at least 64 MiB (`standard` or `large` preset) so a 32 MiB commit can be admitted.
+
 ## Without Kubernetes (bare metal / VMs)
 
 The same static-membership model works by hand. Every node runs the same config file, and only the node ID differs:

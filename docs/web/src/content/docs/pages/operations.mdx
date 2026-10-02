@@ -82,6 +82,46 @@ Rebuild a wiped voter through committed membership: remove it from each affected
 
 `POST /__ursula/cluster-probe` also exists on the client plane, but it is machinery rather than an operator surface: nodes send each other heartbeat-sized bodies through it to verify cluster-plane egress, and it bypasses ingress admission.
 
+## Feature levels
+
+Every Raft group carries a replicated feature level, `0` until an operator raises it. A release that changes how replicated commands apply ships that behavior behind the next level and keeps applying exactly what the previous release did until the level is raised. A rolling upgrade therefore never mixes binaries that apply the same command differently, and the new behavior starts at one well-defined point in each group's log.
+
+| Level | Enables | Status |
+| --- | --- | --- |
+| 1 | Keyed streams: `application/json; profile=keyed-batch-v1` creation, the reserved `keyed-state` name under affinity paths, and unique stream incarnations. Bounded state, first step: a 1,024-item producer receipt window per stream with 7-day idle-producer expiry, message-record collapse at every cold flush, incarnation-scoped cold objects and stream GC, and a compact MessagePack snapshot envelope | Supported by this release |
+| 2 | Sparse cold record marks: the JSON record index keeps exact offsets only for unflushed records plus one mark per MiB of cold log | Next release |
+| 3 | External payload locators committed first and indexed after, so state holds only in-flight ones | Next release |
+| 4 | Compact hot-window representation (message records removed) | Next release |
+
+`GET /__ursula/feature-level` on the admin plane reports `supported_level`, the highest level this binary can apply, and each group's current `level`. The procedure to raise a level:
+
+1. Roll every voter and learner to a release whose `supported_level` covers the target, with the usual drain and wait steps. Behavior does not change yet.
+2. Check: `ursulactl cluster feature-level --config cluster.json`.
+3. Raise: `ursulactl cluster enable-feature --config cluster.json --level N`. It refuses unless every voter, learner and manifest node supports `N`, proposes the level through each group's leader, and verifies every replica. It is idempotent; rerun it after an interruption.
+
+Raising a group to `N` enables every level up to `N`. Levels are never lowered. Commands that need a higher level than their group holds fail with `409 Conflict` and a plain-text body naming the level.
+
+<Warning>
+**No downgrade.** Once a group is at level `N`, no binary whose `supported_level` is below `N` may run it: such a binary refuses to load the group's snapshots, and replaying the group's log with it would diverge. Downgrading below the release that introduced a raised level is not supported. Keep the previous release's binaries only for rolling back before the raise.
+</Warning>
+
+### Memory without retention
+
+Per-stream replicated state is meant to stay bounded however long a stream lives, without retention: about 32 KiB plus 8 bytes per unflushed record plus 16 bytes per MiB of cold log, plus bounded producer state. Each level removes one growth source, so the bound holds once every level through 3 is raised; at level 1 the producer receipts, message records and cold-object bookkeeping are bounded, and the JSON record index still costs 8 bytes per retained record until level 2. Retention stays available as a storage-cost tool, but it is not the way to bound memory, and [keyed streams](/docs/concepts/keyed-streams#retention) must not be trimmed at all.
+
+The per-group gauges under `group_state_gauges` in `/__ursula/metrics` show what each group holds.
+
+## Keyed state
+
+Keyed streams need a keyed-state indexer ([Deploy](/docs/deploy-cluster#optional-keyed-state-indexer)). Day-2 notes:
+
+- **Requests.** `keyed_state_requests` in `/__ursula/metrics` counts the node's keyed-state responses by status (`status_200`, `status_204`, `status_400`, `status_404`, `status_500`, `status_503`, `status_other`). A rising `status_503` means the indexer is unreachable or rebuilding; `status_500` means a stream's state cannot advance (see below).
+- **Indexer restarts and loss.** The indexer's local disk is a cache and its object-store projections are rebuildable from the log. Restarting or replacing pods only costs latency. Deleting `.keyed/` makes every keyed stream rebuild from record 0 on its next read.
+- **Restore.** After restoring the cluster from a backup, projections that are ahead of or different from the restored logs fail the indexer's continuity check and are rebuilt; keyed-state answers `503` for those streams until they catch up. `.keyed/` does not need to be backed up.
+- **Delete.** Deleting a keyed stream also queues its projection for cold GC. A stream recreated at the same path is a new incarnation and never sees the old state.
+- **Purge.** Bucket purge drains every indexer before erasing projections; see [Tenant offboarding](#tenant-offboarding-bucket-purge).
+- **Retention.** Do not advance retention on keyed streams. Once the first retained record passes what the projection needs, keyed state answers `500` naming the record and cannot be rebuilt.
+
 ## Usage export
 
 `GET /__ursula/usage` returns committed counters and current gauges from local replicated state, aggregated by bucket across this node's Raft groups:
@@ -133,7 +173,7 @@ Cold data lives under the `storage.cold.root` prefix. Benchmark and test runs sh
 aws s3 rm "s3://my-ursula-bucket/ursula-test-20260518T000000Z" --recursive
 ```
 
-There is no automatic retention policy. Application checkpoints and explicit stream-retention advances control which cold objects become eligible for GC.
+There is no automatic retention policy. Application checkpoints and explicit stream-retention advances control which cold objects become eligible for GC. Retention is a storage-cost tool only: replica memory does not depend on it once the [feature levels](#feature-levels) are raised.
 
 ## Backup and disaster recovery
 
