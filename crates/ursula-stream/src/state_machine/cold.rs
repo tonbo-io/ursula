@@ -330,6 +330,10 @@ impl StreamStateMachine {
             prepared_record_retain,
             gc_not_before_ms,
         );
+        // F1 (level 2): retention can drop the hot bytes below dense records
+        // (an external append above them), which moves the seal point; seal
+        // here so retention leaves no seal debt for the tidy driver.
+        self.seal_record_index(&stream_id);
         StreamResponse::RetentionAdvanced {
             retained_offset,
             record_range: self.record_range(&stream_id).ok().flatten(),
@@ -868,10 +872,14 @@ impl StreamStateMachine {
             // whole messages; at Lb1 collapse never reaches past it. A group
             // raised from level 0 may still hold a legacy collapsed record
             // that starts at the seal point (the retained offset) and folds
-            // several messages: it reaches past the end of the first hot
-            // append, which no single message starting there can. Its end
-            // is the exact frontier, so bootstrap answers a partial instead
-            // of returning it as one part.
+            // several messages. Level 0 collapses past the seal point only
+            // through the scalar cold frontier, which only an external
+            // append raises above hot bytes; externals are never hot, so
+            // such a record always ends past the first contiguous hot run,
+            // which no single hot message starting there can (B6 blocks keep
+            // no per-append ends; the sweep in `lb1_cold_tests` pins this).
+            // Its end is the exact frontier, so bootstrap answers a partial
+            // instead of returning it as one part.
             let seal_point = self.seal_point(stream_id);
             let legacy_collapsed_end = slot
                 .message_records

@@ -973,6 +973,26 @@ mod sparse_marks_differential {
                 assert!(offset - retained_offset < MARK_BLOCK_BYTES * 4);
             }
             self.oracle.retain_from(range.first_record).unwrap();
+            // Retention seals (level 2): dropping the hot bytes below dense
+            // records leaves no seal debt for the tidy driver.
+            self.assert_dense_bound(&self.machine);
+        }
+
+        /// The dense part holds the unflushed records plus at most the one
+        /// straddling the seal point.
+        fn assert_dense_bound(&self, machine: &StreamStateMachine) {
+            let seal_point = machine.hot_start_offset(&self.stream);
+            let unflushed = self
+                .oracle
+                .records
+                .iter()
+                .filter(|boundary| boundary.start_offset >= seal_point)
+                .count() as u64;
+            let dense = machine.state_gauges().dense_record_entries;
+            assert!(
+                dense <= unflushed + 1,
+                "dense {dense} unflushed {unflushed}"
+            );
         }
 
         /// RC-18: a failed transaction rolls back only dense records.
@@ -1196,10 +1216,9 @@ mod sparse_marks_differential {
                 );
             }
             // Invariant 9 (F1 terms): marks <= ceil(cold MiB) + 2, and once
-            // the tidy driver has paid any seal debt (retention can drop the
-            // hot bytes below dense records) the dense part holds the
-            // unflushed records plus at most the one straddling the seal
-            // point.
+            // the tidy driver has paid any seal debt (a budget cut can leave
+            // some) the dense part holds the unflushed records plus at most
+            // the one straddling the seal point.
             let mut tidied = self.machine.clone();
             ok(
                 tidied.apply(StreamCommand::TidyStream {
@@ -1219,17 +1238,7 @@ mod sparse_marks_differential {
                 "marks {} for {cold_mib} cold MiB",
                 gauges.record_marks
             );
-            let unflushed = self
-                .oracle
-                .records
-                .iter()
-                .filter(|boundary| boundary.start_offset >= seal_point)
-                .count() as u64;
-            assert!(
-                gauges.dense_record_entries <= unflushed + 1,
-                "dense {} unflushed {unflushed}",
-                gauges.dense_record_entries
-            );
+            self.assert_dense_bound(&tidied);
             let _ = tail;
         }
     }
@@ -1340,6 +1349,31 @@ mod sparse_marks_differential {
         assert_eq!(gauges.dense_record_entries, 0);
         harness.round_trip(false);
         harness.round_trip(true);
+        harness.check(&[(0, None, usize::MAX), (500, Some(3), 1), (999, Some(1), 1)]);
+    }
+
+    /// Regression (F1 follow-up): retention that drops the hot bytes below
+    /// an external append's dense records seals them in the same command,
+    /// so no seal debt is left for the tidy driver.
+    #[test]
+    fn retention_below_dense_external_records_leaves_no_seal_debt() {
+        let mut harness = Harness::new();
+        harness.append_inline(&[100; 10], false, false);
+        harness.append_external(&[MARK_BLOCK_BYTES / 3; 6]);
+        assert_eq!(harness.machine.state_gauges().record_marks, 0);
+        // Retain to record 10 of 16, the external's first: past every hot
+        // byte, so nothing hot remains below the external's records.
+        harness.retain(625);
+        assert_eq!(
+            harness.machine.hot_start_offset(&harness.stream),
+            harness.oracle.next_offset()
+        );
+        let gauges = harness.machine.state_gauges();
+        assert_eq!(
+            gauges.dense_record_entries, 0,
+            "the external's records sealed at retention"
+        );
+        assert!(gauges.record_marks >= 1);
         harness.check(&[(0, None, usize::MAX), (500, Some(3), 1), (999, Some(1), 1)]);
     }
 

@@ -619,3 +619,188 @@ fn bootstrap_after_a_raise_does_not_return_a_legacy_collapsed_record_as_one_part
     assert!(plan.up_to_date);
     assert_eq!(plan.updates.len(), 2);
 }
+
+/// Bootstrap after a raise from level 0 never merges or skips messages,
+/// whatever level-0 history built the stream (B6 follow-up).
+///
+/// B6 hot blocks keep no per-append boundaries, so the legacy-collapse check
+/// in `exact_message_frontier` compares against the end of the first
+/// contiguous hot run. That is exact: a level-0 collapse reaches past the
+/// seal point only through the scalar cold frontier, which only an external
+/// append raises above hot bytes, and an external is never hot, so a
+/// collapsed record that starts at the seal point always ends past the first
+/// hot run. A collapse over hot-only messages with no external gap cannot be
+/// built. This test sweeps random level-0 histories of hot appends, external
+/// appends, cold flushes (also at intra-message offsets), snapshots and
+/// retention, raises to level 1, keeps appending, and checks that every
+/// bootstrap update is exactly one appended message and that a complete
+/// bootstrap covers `[snapshot, tail)` with no gap.
+#[test]
+fn bootstrap_after_a_raise_never_merges_or_skips_messages_for_any_level_zero_history() {
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound.max(1)
+        }
+    }
+
+    fn check(
+        machine: &StreamStateMachine,
+        messages: &[(u64, u64)],
+        seed: u64,
+        phase: &str,
+    ) -> bool {
+        let plan = machine
+            .bootstrap_plan(&stream("sweep"))
+            .expect("bootstrap plan");
+        let tail = messages.last().map_or(0, |message| message.1);
+        let start = plan
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.offset)
+            .unwrap_or_else(|| {
+                machine
+                    .stream_slot(&stream("sweep"))
+                    .expect("slot")
+                    .retained_offset
+            });
+        // The invariant the legacy-collapse check relies on: a record at the
+        // seal point that folds several messages ends past the first
+        // contiguous hot run.
+        let slot = machine.stream_slot(&stream("sweep")).expect("slot");
+        let seal_point = slot.seal_point();
+        let folded = if let (Some(record), Some(first_run_end)) = (
+            slot.message_records
+                .iter()
+                .find(|record| record.start_offset == seal_point),
+            slot.hot_buffer.first_end_offset(),
+        ) && messages
+            .iter()
+            .any(|message| record.start_offset < message.1 && message.1 < record.end_offset)
+        {
+            assert!(
+                record.end_offset > first_run_end,
+                "seed {seed} {phase}: collapsed record {record:?} within the first hot run \
+                 ending at {first_run_end}; messages {messages:?}"
+            );
+            true
+        } else {
+            false
+        };
+        let mut expected_start = start;
+        for update in &plan.updates {
+            assert!(
+                messages.contains(&(update.start_offset, update.end_offset)),
+                "seed {seed} {phase}: update {update:?} is not exactly one message; \
+                 messages {messages:?}, plan {plan:?}"
+            );
+            assert_eq!(
+                update.start_offset, expected_start,
+                "seed {seed} {phase}: bootstrap skipped bytes; plan {plan:?}"
+            );
+            expected_start = update.end_offset;
+        }
+        if plan.up_to_date {
+            assert_eq!(expected_start, tail, "seed {seed} {phase}: {plan:?}");
+            assert_eq!(plan.next_offset, tail);
+        } else if plan.updates.is_empty() {
+            assert_eq!(plan.next_offset, start, "seed {seed} {phase}: {plan:?}");
+        }
+        folded
+    }
+
+    let mut folds = 0_u32;
+
+    for seed in 1..=3_000_u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let mut machine = machine_at(0);
+        create(&mut machine, "sweep", 1);
+        let mut messages: Vec<(u64, u64)> = Vec::new();
+        let mut tail = 0_u64;
+        let mut external = 0_u64;
+        let mut raised = false;
+        let steps = 4 + rng.below(12);
+        for step in 0..steps {
+            if !raised && step >= steps / 2 && rng.below(3) == 0 {
+                folds += u32::from(check(&machine, &messages, seed, "level 0"));
+                assert!(matches!(
+                    machine.apply(StreamCommand::SetFeatureLevel { level: 1 }),
+                    StreamResponse::FeatureLevelSet { .. }
+                ));
+                raised = true;
+                folds += u32::from(check(&machine, &messages, seed, "after raise"));
+            }
+            match rng.below(10) {
+                0..=3 => {
+                    let len = 1 + rng.below(3);
+                    let payload = vec![b'h'; usize::try_from(len).unwrap()];
+                    append(&mut machine, "sweep", &payload);
+                    messages.push((tail, tail + len));
+                    tail += len;
+                }
+                4..=5 => {
+                    let len = 1 + rng.below(3);
+                    external += 1;
+                    append_external(
+                        &mut machine,
+                        "sweep",
+                        &format!("lb1/external/sweep-{seed}-{external}.bin"),
+                        len,
+                    );
+                    messages.push((tail, tail + len));
+                    tail += len;
+                }
+                6..=7 => {
+                    let hot_start = machine.hot_start_offset(&stream("sweep"));
+                    if hot_start < tail {
+                        let end = hot_start + 1 + rng.below(tail - hot_start);
+                        let _ = flush(
+                            &mut machine,
+                            "sweep",
+                            hot_start,
+                            end,
+                            &format!("lb1/chunks/sweep-{seed}-{step}.bin"),
+                        );
+                    }
+                }
+                _ => {
+                    // Snapshots at message boundaries, then retention to them.
+                    if let Some(&(_, end)) =
+                        messages.get(usize::try_from(rng.below(len_u64(messages.len()))).unwrap())
+                        && matches!(
+                            publish_snapshot(&mut machine, "sweep", end),
+                            StreamResponse::SnapshotPublished { .. }
+                        )
+                        && rng.below(2) == 0
+                    {
+                        let _ = retain(&mut machine, "sweep", end, 0);
+                    }
+                }
+            }
+            if raised {
+                folds += u32::from(check(&machine, &messages, seed, "level 1"));
+            }
+        }
+        if !raised {
+            assert!(matches!(
+                machine.apply(StreamCommand::SetFeatureLevel { level: 1 }),
+                StreamResponse::FeatureLevelSet { .. }
+            ));
+        }
+        folds += u32::from(check(&machine, &messages, seed, "final"));
+    }
+    assert!(
+        folds > 0,
+        "the sweep builds legacy collapsed records at the seal point"
+    );
+}
+
+fn len_u64(len: usize) -> u64 {
+    u64::try_from(len).unwrap()
+}
