@@ -851,8 +851,25 @@ impl StreamStateMachine {
         let retained_offset = slot.retained_offset;
         let frontier = if self.bounded_lb1() {
             // F18 step 2: records that start at or above the seal point are
-            // whole messages; at Lb1 collapse never reaches past it.
-            self.seal_point(stream_id)
+            // whole messages; at Lb1 collapse never reaches past it. A group
+            // raised from level 0 may still hold a legacy collapsed record
+            // that starts at the seal point (the retained offset) and folds
+            // several messages: it reaches past the end of the first hot
+            // append, which no single message starting there can. Its end
+            // is the exact frontier, so bootstrap answers a partial instead
+            // of returning it as one part.
+            let seal_point = self.seal_point(stream_id);
+            let legacy_collapsed_end = slot
+                .message_records
+                .first()
+                .filter(|record| record.start_offset == seal_point)
+                .zip(slot.hot_buffer.first_end_offset())
+                .filter(|(record, first_append_end)| record.end_offset > *first_append_end)
+                .map(|(record, _)| record.end_offset);
+            if let Some(end) = legacy_collapsed_end {
+                return end;
+            }
+            seal_point
         } else {
             // Every retained byte below the seal point is cold (F18), and
             // F4a collapses message records there, so boundaries are exact
