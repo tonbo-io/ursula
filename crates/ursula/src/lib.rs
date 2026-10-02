@@ -3,11 +3,14 @@
 //!
 //! Module map:
 //!
+//! - [`json_text`]: JSON Message Text (P1): validation, flattening and lexical
+//!   minification of `application/json` write bodies.
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
 //! - [`bootstrap`]: typed-config `spawn_*_runtime` constructors and cold-flush worker.
 //! - [`server`]: command arguments and the long-running server service entrypoint.
 
 mod bootstrap;
+pub mod json_text;
 mod otel_metrics;
 pub mod server;
 mod http_time {

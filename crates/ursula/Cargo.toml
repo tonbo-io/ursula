@@ -35,6 +35,7 @@ clap = { workspace = true }
 console-subscriber = { workspace = true, optional = true }
 futures-util = { workspace = true }
 fs4 = { workspace = true }
+memchr = { workspace = true }
 openraft = { workspace = true }
 opentelemetry = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls"] }
@@ -63,9 +64,15 @@ ursula-shard = { workspace = true }
 madsim = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 flate2 = { workspace = true }
+proptest = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true }
+
+[[bench]]
+name = "json_text"
+harness = false
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)', 'cfg(tokio_unstable)'] }
