@@ -878,9 +878,11 @@ impl Inner {
                             Status::Failed(reason)
                         }
                     };
+                    // Under the work lock, so a want registered meanwhile
+                    // either sees this status cleared or starts a worker.
                     let mut work = lock(&namespace.work);
-                    *work = Work::default();
                     namespace.set_status(status);
+                    *work = Work::default();
                     return;
                 }
             }
