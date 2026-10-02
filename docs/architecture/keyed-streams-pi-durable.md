@@ -923,6 +923,7 @@ Every exit criterion uses metrics that exist today or are added in the same mile
     - blue/green format rebuild.
   - Replicated state per active harness ≤ 32 KB + 16 B/MiB.
   - Per streaming harness: projection ≤ 50 PUT-class/h and ≤ 50 GET/h (U24 per-namespace counters), and log ≤ 50 PUT-class/h and ≤ 250 GET/h (U24 per-group counters divided by active harnesses); idle harnesses 0.
+- **Soak status (2026-10-02).** The soak is deferred to a run on AWS (ECS or EKS) against real S3, using the committed soak script `scripts/ks_soak.sh` (the mixed harness population in `clients/pi-durable-ursula/test/soak/`, with the per-group log-bytes-since-snapshot and last-snapshot-size metrics). No soak results exist yet; the 7-day exit criterion above is open.
 
 ## 11. Validation plan
 

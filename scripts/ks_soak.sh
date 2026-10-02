@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Keyed-streams soak (docs/architecture/keyed-streams-soak.md): builds the release `ursula` unless
+# Keyed-streams soak (docs/architecture/keyed-streams-pi-durable.md §10 M4): builds the release `ursula` unless
 # URSULA_BIN is set, then runs clients/pi-durable-ursula's soak (3 nodes + gateway + keyed indexer on
 # MinIO, a mixed Pi harness population) for SOAK_DURATION_S (default 3600). Needs `minio` on PATH,
 # MINIO_BIN, or URSULA_S3_ENDPOINT. Results (samples.jsonl, summary.json, progress.log) go to
