@@ -41,7 +41,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+#[cfg(not(madsim))]
 use std::time::SystemTime;
+#[cfg(not(madsim))]
 use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
@@ -203,12 +205,20 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Wall-clock milliseconds for `published_at_ms` and the publish interval;
+/// the epoch under the simulator, which has no wall clock.
+#[cfg(not(madsim))]
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| {
             u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+#[cfg(madsim)]
+fn now_ms() -> u64 {
+    0
 }
 
 /// blake3 of a record's stored bytes: its message text plus the LF.

@@ -35,6 +35,13 @@
     "plan": "no action: gc_wall_clock_now() uses the real wall clock only under cfg(not(madsim)); cfg(madsim) returns UNIX_EPOCH, and garbage_collect accepts an injected SystemTime for deterministic tests."
   },
   {
+    "category": "system_time_now",
+    "path": "crates/ursula-index/src/keyed/engine.rs",
+    "snippet_contains": "SystemTime::now()",
+    "reason": "already-cfg-gated",
+    "plan": "no action: the keyed engine's now_ms() reads the wall clock only under cfg(not(madsim)); cfg(madsim) returns 0 (the epoch), as the event-time GC clock does. An injectable keyed clock is U21's indexer DST work."
+  },
+  {
     "category": "tokio_runtime_builder",
     "path": "crates/ursula-runtime/src/runtime.rs",
     "snippet_contains": "tokio::runtime::Builder::new_current_thread()",
