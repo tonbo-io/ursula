@@ -37,11 +37,15 @@ fn placement_to_proto(placement: ShardPlacement) -> proto::ShardPlacementV1 {
     }
 }
 
-pub(crate) fn group_snapshot_frames(snapshot: GroupSnapshot) -> SnapshotBytesIterator {
+/// Encodes a group snapshot as the length-delimited `SnapshotFrameV1` frames
+/// every snapshot store persists. Public so measurement tools
+/// (`ursula-state-probe`) size snapshots with the production codec.
+pub fn group_snapshot_frames(snapshot: GroupSnapshot) -> SnapshotBytesIterator {
     Box::new(GroupSnapshotFrameIter::new(snapshot))
 }
 
-pub(crate) fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStoreError> {
+/// Decodes the concatenated frames written by [`group_snapshot_frames`].
+pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStoreError> {
     let mut cursor = Cursor::new(bytes);
     let mut header = None;
     let mut streams = Vec::new();
