@@ -768,6 +768,23 @@ struct ColdIndexPageCacheInner {
     lru: VecDeque<(ColdIndexPageKey, u64)>,
     /// Sum of the cached pages' approximate heap bytes.
     bytes: usize,
+    /// Invalidation epochs, one per hash slot of stream ids (RT2). A reload
+    /// captures its stream's epoch before fetching and caches the page only
+    /// if no invalidation bumped it meanwhile. Slots are shared by hash, so a
+    /// collision only skips a cache insert.
+    invalidation_epochs: [u64; INVALIDATION_EPOCH_SLOTS],
+}
+
+const INVALIDATION_EPOCH_SLOTS: usize = 32;
+const INVALIDATION_EPOCH_SLOTS_U64: u64 = 32;
+
+fn invalidation_epoch_slot(stream_id: &BucketStreamId) -> usize {
+    use std::hash::Hash;
+    use std::hash::Hasher;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    stream_id.hash(&mut hasher);
+    // The modulo bounds the slot below the array length.
+    usize::try_from(hasher.finish() % INVALIDATION_EPOCH_SLOTS_U64).unwrap_or(0)
 }
 
 #[derive(Debug)]
@@ -817,6 +834,22 @@ impl ColdIndexPageCacheInner {
         self.bytes = self.bytes.saturating_sub(freed);
         self.lru.retain(|(key, _)| !remove(key));
     }
+
+    fn invalidation_epoch(&self, stream_id: &BucketStreamId) -> u64 {
+        self.invalidation_epochs
+            .get(invalidation_epoch_slot(stream_id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn bump_invalidation_epoch(&mut self, stream_id: &BucketStreamId) {
+        if let Some(epoch) = self
+            .invalidation_epochs
+            .get_mut(invalidation_epoch_slot(stream_id))
+        {
+            *epoch = epoch.wrapping_add(1);
+        }
+    }
 }
 
 impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
@@ -864,6 +897,7 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
     /// this on every replica when the replicated replacement command applies.
     pub fn invalidate_stream(&self, stream_id: &BucketStreamId) {
         let mut inner = self.inner.lock().expect("cold index cache mutex poisoned");
+        inner.bump_invalidation_epoch(stream_id);
         inner.remove_where(|key| &key.stream_id == stream_id);
     }
 
@@ -873,6 +907,9 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
         inner.pages.clear();
         inner.lru.clear();
         inner.bytes = 0;
+        for epoch in &mut inner.invalidation_epochs {
+            *epoch = epoch.wrapping_add(1);
+        }
     }
 
     /// Drops the cached pages of one stream generation that cover
@@ -899,16 +936,38 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
                 && (first_page..=last_page).contains(&key.page_id)
         };
         let mut inner = self.inner.lock().expect("cold index cache mutex poisoned");
+        inner.bump_invalidation_epoch(stream_id);
         inner.remove_where(covered);
     }
 
+    /// Fetches a page from the store. It is cached only when no
+    /// invalidation of its stream ran while the fetch was in flight (RT2):
+    /// otherwise the fetched copy may predate the invalidating command.
     async fn reload_page(&self, key: &ColdIndexPageKey) -> io::Result<Option<Arc<ColdIndexPage>>> {
+        let epoch = self
+            .inner
+            .lock()
+            .expect("cold index page cache mutex poisoned")
+            .invalidation_epoch(&key.stream_id);
         let Some(page) = self.store.get_page(key).await? else {
             return Ok(None);
         };
         let page = Arc::new(page);
-        self.insert(key.clone(), page.clone());
+        self.insert_unless_invalidated(key.clone(), page.clone(), epoch);
         Ok(Some(page))
+    }
+
+    /// Drops one cached page and fetches it again (an object it named was
+    /// missing, so the cached copy may predate a compaction or clip).
+    pub async fn refresh_page(
+        &self,
+        key: &ColdIndexPageKey,
+    ) -> io::Result<Option<Arc<ColdIndexPage>>> {
+        self.inner
+            .lock()
+            .expect("cold index page cache mutex poisoned")
+            .remove_where(|cached| cached == key);
+        self.reload_page(key).await
     }
 
     pub async fn object_segments_for_read(
@@ -975,7 +1034,45 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
             .inner
             .lock()
             .expect("cold index page cache mutex poisoned");
-        let generation = Self::touch(&mut inner, key.clone());
+        Self::insert_locked(
+            &mut inner,
+            key,
+            page,
+            self.capacity_pages,
+            self.capacity_bytes,
+        );
+    }
+
+    fn insert_unless_invalidated(
+        &self,
+        key: ColdIndexPageKey,
+        page: Arc<ColdIndexPage>,
+        epoch: u64,
+    ) {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("cold index page cache mutex poisoned");
+        if inner.invalidation_epoch(&key.stream_id) != epoch {
+            return;
+        }
+        Self::insert_locked(
+            &mut inner,
+            key,
+            page,
+            self.capacity_pages,
+            self.capacity_bytes,
+        );
+    }
+
+    fn insert_locked(
+        inner: &mut ColdIndexPageCacheInner,
+        key: ColdIndexPageKey,
+        page: Arc<ColdIndexPage>,
+        capacity_pages: usize,
+        capacity_bytes: usize,
+    ) {
+        let generation = Self::touch(inner, key.clone());
         let bytes = approximate_page_bytes(&key, &page);
         inner.bytes = inner.bytes.saturating_add(bytes);
         if let Some(replaced) = inner.pages.insert(key, ColdIndexPageCacheEntry {
@@ -985,8 +1082,8 @@ impl<S: ColdIndexPageStore + ?Sized> ColdIndexPageCache<S> {
         }) {
             inner.bytes = inner.bytes.saturating_sub(replaced.bytes);
         }
-        Self::evict_over_capacity(&mut inner, self.capacity_pages, self.capacity_bytes);
-        Self::compact_lru_if_needed(&mut inner);
+        Self::evict_over_capacity(inner, capacity_pages, capacity_bytes);
+        Self::compact_lru_if_needed(inner);
     }
 
     /// `touch` appends a fresh `(key, generation)` per lookup and leaves the
@@ -1793,6 +1890,91 @@ mod tests {
             .expect("get page")
             .expect("page exists");
         assert_eq!(page.cold_chunks, vec![first, second]);
+    }
+
+    /// A store whose `get_page` reads the page, then parks until released,
+    /// so a test can invalidate the cache while a fetch is in flight.
+    struct GatedPageStore {
+        inner: InMemoryColdIndexPageStore,
+        fetched: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl ColdIndexPageStore for GatedPageStore {
+        fn put_page<'a>(
+            &'a self,
+            key: &'a ColdIndexPageKey,
+            page: &'a ColdIndexPage,
+        ) -> ColdIndexPageStoreFuture<'a, ()> {
+            self.inner.put_page(key, page)
+        }
+
+        fn get_page<'a>(
+            &'a self,
+            key: &'a ColdIndexPageKey,
+        ) -> ColdIndexPageStoreFuture<'a, Option<ColdIndexPage>> {
+            Box::pin(async move {
+                let page = self.inner.get_page(key).await?;
+                self.fetched.notify_one();
+                self.release.notified().await;
+                Ok(page)
+            })
+        }
+    }
+
+    /// RT2: a page fetched before a concurrent invalidation must not be
+    /// cached, or a later read keeps serving entries the invalidating
+    /// command removed (a compacted or clipped chunk).
+    #[tokio::test]
+    async fn page_fetched_across_an_invalidation_is_not_cached() {
+        let store = Arc::new(GatedPageStore {
+            inner: InMemoryColdIndexPageStore::new(),
+            fetched: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let cache = Arc::new(ColdIndexPageCache::new(store.clone(), 8));
+        let key = key(0);
+        store
+            .inner
+            .put_page(&key, &page(0, 128))
+            .await
+            .expect("write old page");
+
+        let reader = tokio::spawn({
+            let cache = cache.clone();
+            let key = key.clone();
+            async move { cache.get_page(&key).await }
+        });
+        store.fetched.notified().await;
+        store
+            .inner
+            .put_page(&key, &page(0, 64))
+            .await
+            .expect("rewrite page");
+        cache.invalidate_range(&key.stream_id, key.generation, 0, 128);
+        store.release.notify_one();
+        let stale = reader
+            .await
+            .expect("reader task")
+            .expect("read")
+            .expect("page");
+        assert_eq!(stale.end_offset, 128);
+        assert_eq!(cache.cached_page_count(), 0);
+
+        let reload = tokio::spawn({
+            let cache = cache.clone();
+            let key = key.clone();
+            async move { cache.get_page(&key).await }
+        });
+        store.fetched.notified().await;
+        store.release.notify_one();
+        let fresh = reload
+            .await
+            .expect("reload task")
+            .expect("reload")
+            .expect("page");
+        assert_eq!(fresh.end_offset, 64);
+        assert_eq!(cache.cached_page_count(), 1);
     }
 
     #[tokio::test]

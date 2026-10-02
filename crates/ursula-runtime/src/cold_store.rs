@@ -1411,7 +1411,14 @@ impl ColdReadCache {
 }
 
 fn cold_store_io_error(path: &str, err: opendal::Error) -> io::Error {
-    io::Error::other(format!("cold object '{path}': {err}"))
+    // Keep NotFound distinguishable: a read that names a compacted object
+    // refreshes its cold-index page and retries (RT2).
+    let kind = if err.kind() == opendal::ErrorKind::NotFound {
+        io::ErrorKind::NotFound
+    } else {
+        io::ErrorKind::Other
+    };
+    io::Error::new(kind, format!("cold object '{path}': {err}"))
 }
 
 #[cfg(not(madsim))]
