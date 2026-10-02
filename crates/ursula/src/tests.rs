@@ -540,6 +540,44 @@ async fn path_affinity_keeps_sibling_streams_independent_and_advertises_extensio
 }
 
 #[tokio::test]
+async fn keyed_state_resource_routes_answer_404_and_never_reach_an_affinity_stream() {
+    let app = test_router();
+    for uri in ["/benchcmp/session", "/benchcmp/run-42/session"] {
+        let response = http_put(
+            &app,
+            uri,
+            &[(CONTENT_TYPE.as_str(), "text/plain")],
+            Body::from("event"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    // Before the proxy lands, every method on the resource answers 404 for
+    // both stream forms, so `/{b}/{s}/keyed-state` is never read, written or
+    // created as the affinity stream `keyed-state` (C8, U5).
+    for uri in [
+        "/benchcmp/session/keyed-state",
+        "/benchcmp/run-42/session/keyed-state",
+    ] {
+        for method in ["GET", "HEAD", "PUT", "POST", "DELETE"] {
+            let response = send(&app, method, uri, &[], Body::empty()).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        }
+    }
+    let response = http_put(
+        &app,
+        "/benchcmp/session/keyed-state",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("not a stream"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = http_get(&app, "/benchcmp/session").await;
+    assert_eq!(&body_bytes(response).await[..], b"event");
+}
+
+#[tokio::test]
 async fn group_append_transaction_is_atomic_over_http() {
     let app = test_router();
     for stream in ["journal", "queue"] {

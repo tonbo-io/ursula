@@ -130,6 +130,7 @@ pub(crate) fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, Snaps
                 .map(bucket_quota_from_proto)
                 .collect(),
             feature_level: header.feature_level,
+            last_created_at_ms: header.last_created_at_ms,
         },
         stream_append_counts,
     })
@@ -203,6 +204,7 @@ impl GroupSnapshotFrameIter {
             bucket_usage,
             bucket_quotas,
             feature_level,
+            last_created_at_ms,
         } = stream_snapshot;
         Self {
             header: Some(proto::SnapshotHeaderV1 {
@@ -228,6 +230,7 @@ impl GroupSnapshotFrameIter {
                     .collect(),
                 committed_write_unit_bytes: Some(ursula_stream::COMMITTED_WRITE_UNIT_BYTES),
                 feature_level,
+                last_created_at_ms,
             }),
             streams: streams.into_iter(),
             append_counts: stream_append_counts.into_iter(),
@@ -657,6 +660,7 @@ fn cold_gc_to_proto(entry: ColdGcEntry) -> proto::ColdGcEntryV1 {
         seq: entry.seq,
         bucket_id: entry.bucket_id,
         not_before_ms: entry.not_before_ms,
+        cold_generation: entry.cold_generation,
         target: Some(match entry.target {
             ColdGcTarget::Stream(stream_id) => {
                 proto::cold_gc_entry_v1::Target::Stream(stream_id.into())
@@ -673,6 +677,7 @@ fn cold_gc_from_proto(entry: proto::ColdGcEntryV1) -> Result<ColdGcEntry, Snapsh
         seq: entry.seq,
         bucket_id: entry.bucket_id,
         not_before_ms: entry.not_before_ms,
+        cold_generation: entry.cold_generation,
         target: match required(entry.target, "snapshot cold gc target")? {
             proto::cold_gc_entry_v1::Target::Stream(stream_id) => {
                 ColdGcTarget::Stream(stream_id.into())
@@ -715,7 +720,22 @@ mod tests {
                 buckets: vec!["bucket".to_owned()],
                 erased_buckets: vec!["erased-bucket".to_owned()],
                 streams: Vec::new(),
-                pending_cold_gc: Vec::new(),
+                pending_cold_gc: vec![
+                    ColdGcEntry {
+                        seq: 7,
+                        bucket_id: "bucket".to_owned(),
+                        not_before_ms: 0,
+                        target: ColdGcTarget::Stream(BucketStreamId::new("bucket", "legacy")),
+                        cold_generation: None,
+                    },
+                    ColdGcEntry {
+                        seq: 8,
+                        bucket_id: "bucket".to_owned(),
+                        not_before_ms: 0,
+                        target: ColdGcTarget::Stream(BucketStreamId::new("bucket", "scoped")),
+                        cold_generation: Some(1_234),
+                    },
+                ],
                 next_cold_gc_seq: 9,
                 shared_cold_object_owners: vec![SharedColdObjectOwnersSnapshot {
                     s3_path: "_packs/legacy.bin".to_owned(),
@@ -739,6 +759,7 @@ mod tests {
                     },
                 }],
                 feature_level: ursula_stream::MAX_SUPPORTED_FEATURE_LEVEL,
+                last_created_at_ms: 1_234,
             },
             stream_append_counts: vec![StreamAppendCount {
                 stream_id: BucketStreamId {
@@ -780,6 +801,7 @@ mod tests {
                     bucket_quotas: Vec::new(),
                     committed_write_unit_bytes: None,
                     feature_level: 0,
+                    last_created_at_ms: 0,
                 },
             )),
         })
@@ -808,6 +830,7 @@ mod tests {
             bucket_quotas: Vec::new(),
             committed_write_unit_bytes: Some(4096),
             feature_level: 0,
+            last_created_at_ms: 0,
         };
         let bytes = [
             encode_frame(proto::SnapshotFrameV1 {
@@ -843,6 +866,7 @@ mod tests {
             bucket_quotas: Vec::new(),
             committed_write_unit_bytes: None,
             feature_level,
+            last_created_at_ms: 0,
         };
         [
             encode_frame(proto::SnapshotFrameV1 {
@@ -899,6 +923,7 @@ mod tests {
 
         let decoded = decode_group_snapshot(&bytes).expect("decode legacy snapshot");
         assert_eq!(decoded.stream_snapshot.feature_level, 0);
+        assert_eq!(decoded.stream_snapshot.last_created_at_ms, 0);
         assert_eq!(decoded.stream_snapshot.buckets, vec!["bucket".to_owned()]);
         assert_eq!(decoded.group_commit_index, 5);
     }

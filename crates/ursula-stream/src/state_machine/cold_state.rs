@@ -8,6 +8,10 @@ pub(super) struct StreamColdState {
     cold_chunks: Vec<ColdChunkRef>,
     external_segments: Vec<ObjectPayloadRef>,
     cold_frontier: u64,
+    /// Cold-index page generation of this stream incarnation (F14g). Zero
+    /// for streams created below feature level 1, whose pages and chunk names
+    /// carry no incarnation; otherwise the stream's unique `created_at_ms`.
+    cold_generation: u64,
 }
 
 impl StreamColdState {
@@ -20,7 +24,25 @@ impl StreamColdState {
     }
 
     pub(super) fn cold_generation(&self) -> u64 {
-        0
+        self.cold_generation
+    }
+
+    /// Cold state of a new incarnation whose objects are scoped to
+    /// `cold_generation` (F14g step 2).
+    pub(super) fn with_generation(cold_generation: u64) -> Self {
+        Self {
+            cold_generation,
+            ..Self::default()
+        }
+    }
+
+    /// Keeps an external payload as a direct state reference instead of a
+    /// cold-index page entry. A create's initial payload is staged before
+    /// apply assigns the incarnation, so no page generation exists for it
+    /// yet (F14g step 2).
+    pub(super) fn push_direct_external_segment(&mut self, object: ObjectPayloadRef) {
+        self.cold_frontier = self.cold_frontier.max(object.end_offset);
+        self.external_segments.push(object);
     }
 
     pub(super) fn push_cold_chunk(&mut self, chunk: ColdChunkRef) {
@@ -37,7 +59,7 @@ impl StreamColdState {
 
     pub(super) fn restore(
         cold_frontier_offset: u64,
-        _cold_index_generation: u64,
+        cold_index_generation: u64,
         cold_chunks: Vec<ColdChunkRef>,
         external_segments: Vec<ObjectPayloadRef>,
     ) -> Self {
@@ -45,6 +67,7 @@ impl StreamColdState {
             cold_chunks,
             external_segments,
             cold_frontier: cold_frontier_offset,
+            cold_generation: cold_index_generation,
         }
     }
 

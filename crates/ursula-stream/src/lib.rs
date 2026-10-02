@@ -36,6 +36,7 @@ pub use model::COLD_INDEX_PAGE_SPAN_BYTES;
 pub use model::ColdChunkRef;
 pub use model::ColdFlushCandidate;
 pub use model::ColdGcEntry;
+pub use model::ColdGcPlanEntry;
 pub use model::ColdGcTarget;
 pub use model::ExternalPayloadRef;
 pub use model::HotPayloadSegment;

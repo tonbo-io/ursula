@@ -11,7 +11,7 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::BucketUsageSnapshot;
 use ursula_stream::ColdFlushCandidate;
-use ursula_stream::ColdGcEntry;
+use ursula_stream::ColdGcPlanEntry;
 use ursula_stream::StreamCommand;
 use ursula_stream::StreamErrorCode;
 use ursula_stream::StreamErrorContext;
@@ -128,7 +128,7 @@ pub type GroupAckColdGcFuture<'a> =
 pub type GroupPurgeBucketFuture<'a> =
     Pin<Box<dyn Future<Output = Result<PurgeBucketResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupPlanColdGcFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Vec<ColdGcEntry>, GroupEngineError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<Vec<ColdGcPlanEntry>, GroupEngineError>> + Send + 'a>>;
 pub type GroupImportGroupStateFuture<'a> = Pin<
     Box<
         dyn Future<Output = Result<crate::request::ImportGroupStateResponse, GroupEngineError>>

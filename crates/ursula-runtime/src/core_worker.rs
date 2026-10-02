@@ -8,7 +8,7 @@ use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::ColdFlushCandidate;
-use ursula_stream::ColdGcEntry;
+use ursula_stream::ColdGcPlanEntry;
 
 use crate::admission::RaftUncommittedAdmission;
 use crate::admission::SharedRaftUncommittedBytes;
@@ -996,7 +996,7 @@ impl CoreWorker {
         group: &mut Box<dyn GroupEngine>,
         max: usize,
         placement: ShardPlacement,
-    ) -> Result<Vec<ColdGcEntry>, RuntimeError> {
+    ) -> Result<Vec<ColdGcPlanEntry>, RuntimeError> {
         // GC is leader-side side-effecting work: only the local leader reclaims
         // and acks, mirroring the cold-flush planner's leadership gate.
         if !group.accepts_local_writes() {

@@ -1,4 +1,6 @@
+use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::io;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -17,19 +19,25 @@ use ursula_shard::ShardPlacement;
 use ursula_shard::StaticShardMap;
 use ursula_stream::ColdChunkRef;
 use ursula_stream::ColdFlushCandidate;
-use ursula_stream::ColdGcEntry;
+use ursula_stream::ColdGcPlanEntry;
 use ursula_stream::ColdGcTarget;
 
 use crate::admission::RaftUncommittedAdmission;
 use crate::admission::RaftUncommittedBytesTracker;
+use crate::cold_index::ColdIndexPageKey;
+use crate::cold_index::ColdIndexPageStore;
 use crate::cold_index::ColdStoreColdIndexPageStore;
-use crate::cold_index::cold_index_prefix;
+use crate::cold_index::cold_index_generation_dir;
 use crate::cold_index::load_cold_chunks_from_pages;
+use crate::cold_index::parse_cold_index_page_file_name;
 use crate::cold_index::select_cold_chunk_compaction;
 use crate::cold_store::ColdStoreHandle;
 use crate::cold_store::ColdStoreInfo;
-use crate::cold_store::cold_chunk_prefix;
-use crate::cold_store::new_cold_chunk_path;
+use crate::cold_store::cold_chunk_dir;
+use crate::cold_store::cold_external_dir;
+use crate::cold_store::is_cold_chunk_file_name;
+use crate::cold_store::is_external_payload_file_name;
+use crate::cold_store::new_cold_chunk_path_in_generation;
 use crate::cold_store::new_cold_pack_path;
 use crate::command::GroupSnapshot;
 use crate::core_worker::CoreCommand;
@@ -369,8 +377,9 @@ impl ShardRuntime {
                 message: "cold backend must be configured before flushing cold chunks".to_owned(),
             });
         };
-        let path = new_cold_chunk_path(
+        let path = new_cold_chunk_path_in_generation(
             &candidate.stream_id,
+            candidate.cold_generation,
             candidate.start_offset,
             candidate.end_offset,
         );
@@ -824,18 +833,19 @@ impl ShardRuntime {
                 .map_err(|err| RuntimeError::ColdStoreIo {
                     message: err.to_string(),
                 })?;
-        let mut pages_by_stream: HashMap<BucketStreamId, Vec<_>> = HashMap::new();
+        // Pages are grouped per stream incarnation (F14g). The engine
+        // republishes into the live incarnation's generation, so inputs from
+        // a deleted incarnation fail the page match and are skipped.
+        let mut pages_by_stream: HashMap<(BucketStreamId, u64), Vec<_>> = HashMap::new();
         for page in pages {
-            if page.generation == 0 {
-                pages_by_stream
-                    .entry(page.stream_id.clone())
-                    .or_default()
-                    .push(page);
-            }
+            pages_by_stream
+                .entry((page.stream_id.clone(), page.generation))
+                .or_default()
+                .push(page);
         }
         let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
         let mut compacted = 0;
-        for (stream_id, stream_pages) in pages_by_stream {
+        for ((stream_id, generation), stream_pages) in pages_by_stream {
             if compacted >= max_streams {
                 break;
             }
@@ -887,7 +897,12 @@ impl ShardRuntime {
             let last = old_chunks
                 .last()
                 .expect("candidate contains at least two chunks");
-            let path = new_cold_chunk_path(&stream_id, first.start_offset, last.end_offset);
+            let path = new_cold_chunk_path_in_generation(
+                &stream_id,
+                generation,
+                first.start_offset,
+                last.end_offset,
+            );
             let object_size = cold_store
                 .write_chunk(&path, &payload)
                 .await
@@ -957,7 +972,7 @@ impl ShardRuntime {
                 let stream_id = stream.metadata.stream_id;
                 for chunk in stream.cold_chunks {
                     if is_legacy_cross_bucket_pack(&stream_id, &chunk) {
-                        candidates.push((stream_id.clone(), chunk));
+                        candidates.push((stream_id.clone(), stream.cold_index_generation, chunk));
                     }
                 }
             }
@@ -968,12 +983,12 @@ impl ShardRuntime {
                 .cmp(&right.0.bucket_id)
                 .then_with(|| left.0.affinity_key.cmp(&right.0.affinity_key))
                 .then_with(|| left.0.stream_id.cmp(&right.0.stream_id))
-                .then_with(|| left.1.start_offset.cmp(&right.1.start_offset))
+                .then_with(|| left.2.start_offset.cmp(&right.2.start_offset))
         });
 
         let observed_chunks = candidates.len();
         let mut migrated_chunks = 0usize;
-        for (stream_id, chunk) in candidates.into_iter().take(max_chunks) {
+        for (stream_id, generation, chunk) in candidates.into_iter().take(max_chunks) {
             let logical_bytes = chunk.end_offset.saturating_sub(chunk.start_offset);
             let len = usize::try_from(logical_bytes).map_err(|_| RuntimeError::ColdStoreIo {
                 message: "legacy shared chunk exceeds addressable memory".to_owned(),
@@ -984,7 +999,12 @@ impl ShardRuntime {
                 .map_err(|err| RuntimeError::ColdStoreIo {
                     message: err.to_string(),
                 })?;
-            let path = new_cold_chunk_path(&stream_id, chunk.start_offset, chunk.end_offset);
+            let path = new_cold_chunk_path_in_generation(
+                &stream_id,
+                generation,
+                chunk.start_offset,
+                chunk.end_offset,
+            );
             let object_size = cold_store
                 .write_chunk(&path, &payload)
                 .await
@@ -1040,24 +1060,29 @@ impl ShardRuntime {
         let Some(cold_store) = self.cold_store.as_ref() else {
             return Ok(0);
         };
-        let entries = self.plan_cold_gc(raft_group_id, max_entries).await?;
-        if entries.is_empty() {
+        let planned = self.plan_cold_gc(raft_group_id, max_entries).await?;
+        if planned.is_empty() {
             return Ok(0);
         }
         let mut acked_seq = None;
         let mut reclaimed = 0usize;
         // Entries are FIFO by seq; stop at the first failure so the ack never
         // skips past an object that is still present in cold storage.
-        for entry in entries {
+        for planned_entry in planned {
+            let entry = &planned_entry.entry;
             if entry.not_before_ms > unix_time_ms() {
                 break;
             }
             let result = match &entry.target {
                 ColdGcTarget::Stream(stream_id) => {
-                    match cold_store.remove_all(&cold_chunk_prefix(stream_id)).await {
-                        Ok(()) => cold_store.remove_all(&cold_index_prefix(stream_id)).await,
-                        Err(err) => Err(err),
-                    }
+                    self.reclaim_stream_incarnation(
+                        cold_store,
+                        raft_group_id,
+                        max_entries,
+                        &planned_entry,
+                        stream_id,
+                    )
+                    .await
                 }
                 ColdGcTarget::Paths(paths) => {
                     let mut outcome = Ok(());
@@ -1092,6 +1117,104 @@ impl ShardRuntime {
                 .record_cold_gc_reclaimed(u64::try_from(reclaimed).expect("reclaimed fits u64"));
         }
         Ok(reclaimed)
+    }
+
+    /// Reclaims the cold objects of one removed stream incarnation (F14a,
+    /// F14g). The sweep deletes only object names Ursula writes for that
+    /// stream, one directory level at a time, so it never reaches another
+    /// stream's namespace, such as an affinity stream under a two-segment
+    /// stream's name. It never deletes objects of the generation a live
+    /// stream of the same name uses, and checks that again before deleting
+    /// pages, which are the last objects removed.
+    ///
+    /// - Legacy entries (no generation, enqueued below level 1) delete
+    ///   legacy-format chunk names directly under `{stream}/chunks/` and
+    ///   generation-0 pages, and are acknowledged without deleting anything
+    ///   while a stream with the name exists again (step 1).
+    /// - Entries naming generation `g` (level 1) delete the external
+    ///   payloads that generation's pages reference inside
+    ///   `{stream}/external/` (F14a), the chunks of that generation (legacy
+    ///   names for `g = 0`, `{stream}/chunks/{g:016x}/` otherwise), and its
+    ///   pages.
+    async fn reclaim_stream_incarnation(
+        &self,
+        cold_store: &ColdStoreHandle,
+        raft_group_id: RaftGroupId,
+        max_entries: usize,
+        planned: &ColdGcPlanEntry,
+        stream_id: &BucketStreamId,
+    ) -> io::Result<()> {
+        let generation = planned.entry.cold_generation.unwrap_or(0);
+        if stream_gc_blocked_by_live_stream(
+            planned.entry.cold_generation,
+            planned.live_cold_generation,
+        ) {
+            tracing::debug!(
+                stream = %stream_id,
+                seq = planned.entry.seq,
+                "stream gc entry acknowledged without deletion: the name is live again"
+            );
+            return Ok(());
+        }
+
+        if planned.entry.cold_generation.is_some() {
+            let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+            let external_dir = cold_external_dir(stream_id);
+            let mut referenced = BTreeSet::new();
+            for page_id in list_cold_index_page_ids(cold_store, stream_id, generation).await? {
+                let key = ColdIndexPageKey {
+                    stream_id: stream_id.clone(),
+                    generation,
+                    page_id,
+                };
+                let Some(page) = store.get_page(&key).await? else {
+                    continue;
+                };
+                referenced.extend(
+                    page.external_segments
+                        .iter()
+                        .filter(|object| {
+                            object
+                                .s3_path
+                                .strip_prefix(&external_dir)
+                                .is_some_and(is_external_payload_file_name)
+                        })
+                        .map(|object| object.s3_path.clone()),
+                );
+            }
+            for path in referenced {
+                cold_store.delete_chunk(&path).await?;
+            }
+        }
+
+        let chunk_dir = cold_chunk_dir(stream_id, generation);
+        for name in cold_store.list_file_names(&chunk_dir).await? {
+            if is_cold_chunk_file_name(&name) {
+                cold_store
+                    .delete_chunk(&format!("{chunk_dir}{name}"))
+                    .await?;
+            }
+        }
+
+        // The pages are the discovery surface for referenced objects, so
+        // they go last, after checking the name once more.
+        let live = self
+            .plan_cold_gc(raft_group_id, max_entries)
+            .await
+            .map_err(|err| io::Error::other(err.to_string()))?
+            .into_iter()
+            .find(|candidate| candidate.entry.seq == planned.entry.seq)
+            .and_then(|candidate| candidate.live_cold_generation);
+        if stream_gc_blocked_by_live_stream(planned.entry.cold_generation, live) {
+            return Ok(());
+        }
+        let page_dir = cold_index_generation_dir(stream_id, generation);
+        for page_id in list_cold_index_page_ids(cold_store, stream_id, generation).await? {
+            cold_store
+                .delete_chunk(&format!("{page_dir}{page_id:020}.idx"))
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn run_cold_gc_all_groups_once(
@@ -1401,6 +1524,36 @@ impl ShardRuntime {
             .collect::<Vec<_>>();
         RuntimeMailboxSnapshot { depths, capacities }
     }
+}
+
+/// F14g: a stream GC entry deletes nothing while a live stream of the same
+/// name uses its objects. A legacy entry (no generation) shares names with
+/// any recreated stream, so it waits for none; an entry naming generation
+/// `g` only conflicts with a live incarnation in `g`, which C7 rules out.
+fn stream_gc_blocked_by_live_stream(
+    entry_generation: Option<u64>,
+    live_generation: Option<u64>,
+) -> bool {
+    match entry_generation {
+        None => live_generation.is_some(),
+        Some(generation) => live_generation == Some(generation),
+    }
+}
+
+/// Page ids present in one generation directory of a stream, ignoring any
+/// name Ursula does not write there.
+async fn list_cold_index_page_ids(
+    cold_store: &ColdStoreHandle,
+    stream_id: &BucketStreamId,
+    generation: u64,
+) -> io::Result<Vec<u64>> {
+    let dir = cold_index_generation_dir(stream_id, generation);
+    Ok(cold_store
+        .list_file_names(&dir)
+        .await?
+        .iter()
+        .filter_map(|name| parse_cold_index_page_file_name(name))
+        .collect())
 }
 
 #[cfg(not(madsim))]

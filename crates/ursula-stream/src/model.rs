@@ -185,12 +185,32 @@ pub struct ColdGcEntry {
     #[serde(default)]
     pub not_before_ms: u64,
     pub target: ColdGcTarget,
+    /// Cold generation of the removed incarnation for a
+    /// [`ColdGcTarget::Stream`] entry enqueued at feature level 1 or later
+    /// (F14g step 2): the worker deletes only that generation's cold-index
+    /// pages, the objects they reference, and chunk names scoped to it.
+    /// `None` marks a legacy entry, which deletes only legacy-format chunk
+    /// names and generation-0 pages and never runs while a stream of the
+    /// same name exists (F14g step 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_generation: Option<u64>,
+}
+
+/// A pending GC entry as planned for the leader's GC worker, with the cold
+/// generation of the live stream that currently holds the entry's name, if
+/// any. Not replicated: the worker uses it to avoid deleting a live
+/// incarnation's objects (F14g step 1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ColdGcPlanEntry {
+    pub entry: ColdGcEntry,
+    pub live_cold_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColdGcTarget {
-    /// Every cold object owned by a fully removed stream. The whole
-    /// `{stream}/chunks/` prefix can be reclaimed at once.
+    /// Every cold object owned by a fully removed stream incarnation. The
+    /// worker deletes only object names Ursula writes for that stream and
+    /// never recurses into another stream's namespace (F14g).
     Stream(BucketStreamId),
     /// Specific cold object paths dropped while the stream lives on (snapshot
     /// retention compaction).
@@ -208,6 +228,9 @@ pub struct HotPayloadSegment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColdFlushCandidate {
     pub stream_id: BucketStreamId,
+    /// Cold generation of the planned incarnation (F14g); the chunk name
+    /// and cold-index pages written for this candidate use it.
+    pub cold_generation: u64,
     pub start_offset: u64,
     pub end_offset: u64,
     pub payload: Vec<u8>,

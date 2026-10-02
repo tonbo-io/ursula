@@ -44,6 +44,20 @@ pub fn cold_index_prefix(stream_id: &BucketStreamId) -> String {
     format!("{stream_id}/cold-index/")
 }
 
+/// The directory holding one cold generation's pages of a stream (F14g).
+pub fn cold_index_generation_dir(stream_id: &BucketStreamId, generation: u64) -> String {
+    format!("{stream_id}/cold-index/{generation:020}/")
+}
+
+/// Parses a page file name inside a generation directory, `{page:020}.idx`.
+pub fn parse_cold_index_page_file_name(name: &str) -> Option<u64> {
+    let digits = name.strip_suffix(".idx")?;
+    if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColdIndexPage {
     pub start_offset: u64,
@@ -352,7 +366,18 @@ pub async fn write_cold_chunk_index_pages<S: ColdIndexPageStore + ?Sized>(
     stream_id: &BucketStreamId,
     chunk: &ColdChunkRef,
 ) -> io::Result<()> {
-    write_cold_chunk_index_pages_with_rollback(store, stream_id, chunk)
+    write_cold_chunk_index_pages_in_generation(store, stream_id, 0, chunk).await
+}
+
+/// [`write_cold_chunk_index_pages`] for the stream incarnation whose pages
+/// live under `generation` (F14g; 0 for streams created below level 1).
+pub async fn write_cold_chunk_index_pages_in_generation<S: ColdIndexPageStore + ?Sized>(
+    store: &S,
+    stream_id: &BucketStreamId,
+    generation: u64,
+    chunk: &ColdChunkRef,
+) -> io::Result<()> {
+    write_cold_chunk_index_pages_with_rollback_in_generation(store, stream_id, generation, chunk)
         .await
         .map(|_| ())
 }
@@ -360,6 +385,17 @@ pub async fn write_cold_chunk_index_pages<S: ColdIndexPageStore + ?Sized>(
 pub async fn write_cold_chunk_index_pages_with_rollback<S: ColdIndexPageStore + ?Sized>(
     store: &S,
     stream_id: &BucketStreamId,
+    chunk: &ColdChunkRef,
+) -> io::Result<Vec<ColdIndexPageRollback>> {
+    write_cold_chunk_index_pages_with_rollback_in_generation(store, stream_id, 0, chunk).await
+}
+
+pub async fn write_cold_chunk_index_pages_with_rollback_in_generation<
+    S: ColdIndexPageStore + ?Sized,
+>(
+    store: &S,
+    stream_id: &BucketStreamId,
+    generation: u64,
     chunk: &ColdChunkRef,
 ) -> io::Result<Vec<ColdIndexPageRollback>> {
     if chunk.end_offset <= chunk.start_offset {
@@ -371,7 +407,7 @@ pub async fn write_cold_chunk_index_pages_with_rollback<S: ColdIndexPageStore + 
     for page_id in first_page_id..=last_page_id {
         let key = ColdIndexPageKey {
             stream_id: stream_id.clone(),
-            generation: 0,
+            generation,
             page_id,
         };
         let page_start = page_id.saturating_mul(ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES);
@@ -438,6 +474,19 @@ pub async fn write_external_segment_index_pages<S: ColdIndexPageStore + ?Sized>(
     start_offset: u64,
     payload: &ExternalPayloadRef,
 ) -> io::Result<()> {
+    write_external_segment_index_pages_in_generation(store, stream_id, 0, start_offset, payload)
+        .await
+}
+
+/// [`write_external_segment_index_pages`] for the stream incarnation whose
+/// pages live under `generation` (F14g).
+pub async fn write_external_segment_index_pages_in_generation<S: ColdIndexPageStore + ?Sized>(
+    store: &S,
+    stream_id: &BucketStreamId,
+    generation: u64,
+    start_offset: u64,
+    payload: &ExternalPayloadRef,
+) -> io::Result<()> {
     let object = ObjectPayloadRef {
         start_offset,
         end_offset: start_offset.saturating_add(payload.payload_len),
@@ -445,12 +494,13 @@ pub async fn write_external_segment_index_pages<S: ColdIndexPageStore + ?Sized>(
         object_size: payload.object_size,
         object_offset: 0,
     };
-    write_object_index_pages(store, stream_id, object).await
+    write_object_index_pages(store, stream_id, generation, object).await
 }
 
 async fn write_object_index_pages<S: ColdIndexPageStore + ?Sized>(
     store: &S,
     stream_id: &BucketStreamId,
+    generation: u64,
     object: ObjectPayloadRef,
 ) -> io::Result<()> {
     if object.end_offset <= object.start_offset {
@@ -461,7 +511,7 @@ async fn write_object_index_pages<S: ColdIndexPageStore + ?Sized>(
     for page_id in first_page_id..=last_page_id {
         let key = ColdIndexPageKey {
             stream_id: stream_id.clone(),
-            generation: 0,
+            generation,
             page_id,
         };
         let page_start = page_id.saturating_mul(ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES);
@@ -817,6 +867,27 @@ pub async fn replace_cold_chunk_index_pages_with_rollback<S: ColdIndexPageStore 
     old_chunks: &[ColdChunkRef],
     replacement: &ColdChunkRef,
 ) -> io::Result<Option<Vec<ColdIndexPageRollback>>> {
+    replace_cold_chunk_index_pages_with_rollback_in_generation(
+        store,
+        stream_id,
+        0,
+        old_chunks,
+        replacement,
+    )
+    .await
+}
+
+/// [`replace_cold_chunk_index_pages_with_rollback`] for the stream
+/// incarnation whose pages live under `generation` (F14g).
+pub async fn replace_cold_chunk_index_pages_with_rollback_in_generation<
+    S: ColdIndexPageStore + ?Sized,
+>(
+    store: &S,
+    stream_id: &BucketStreamId,
+    generation: u64,
+    old_chunks: &[ColdChunkRef],
+    replacement: &ColdChunkRef,
+) -> io::Result<Option<Vec<ColdIndexPageRollback>>> {
     if old_chunks.len() < 2 || replacement.end_offset <= replacement.start_offset {
         return Ok(None);
     }
@@ -831,7 +902,7 @@ pub async fn replace_cold_chunk_index_pages_with_rollback<S: ColdIndexPageStore 
     for page_id in first_page_id..=last_page_id {
         let key = ColdIndexPageKey {
             stream_id: stream_id.clone(),
-            generation: 0,
+            generation,
             page_id,
         };
         let Some(mut page) = store.get_page(&key).await? else {

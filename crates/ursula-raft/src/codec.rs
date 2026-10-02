@@ -55,3 +55,60 @@ pub(crate) fn placement_from_parts(
 pub(crate) fn required<T>(value: Option<T>, field: &str) -> Result<T, GroupEngineError> {
     value.ok_or_else(|| GroupEngineError::Infra(GroupInfraError::proto_decode(field)))
 }
+
+#[cfg(test)]
+mod tests {
+    use ursula_runtime::HeadStreamResponse;
+    use ursula_runtime::StreamIntegritySnapshot;
+
+    use super::*;
+
+    fn head_response(created_at_ms: Option<u64>) -> HeadStreamResponse {
+        HeadStreamResponse {
+            placement: ShardPlacement {
+                core_id: CoreId(0),
+                shard_id: ShardId(1),
+                raft_group_id: RaftGroupId(2),
+            },
+            content_type: "application/json".to_owned(),
+            tail_offset: 9,
+            cold_hot_start_offset: 0,
+            closed: false,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            snapshot_offset: None,
+            snapshot_digest: None,
+            retained_offset: 0,
+            integrity: StreamIntegritySnapshot {
+                live_setsum: String::new(),
+                evicted_setsum: String::new(),
+                total_setsum: String::new(),
+                live_start_offset: 0,
+                tail_offset: 9,
+                live_records: 0,
+                evicted_records: 0,
+                total_records: 0,
+            },
+            record_range: None,
+            created_at_ms,
+        }
+    }
+
+    #[test]
+    fn forwarded_head_carries_created_at_ms_and_decodes_from_older_followers() {
+        let current = head_response(Some(1_234));
+        let decoded: HeadStreamResponse =
+            decode_wire(&encode_wire(&current), "head").expect("decode current head");
+        assert_eq!(decoded, current);
+
+        // A follower without the field forwards a map without it.
+        let mut legacy = serde_json::to_value(head_response(None)).expect("head to value");
+        legacy
+            .as_object_mut()
+            .expect("head object")
+            .remove("created_at_ms");
+        let decoded: HeadStreamResponse =
+            decode_wire(&encode_wire(&legacy), "legacy head").expect("decode legacy head");
+        assert_eq!(decoded, head_response(None));
+    }
+}

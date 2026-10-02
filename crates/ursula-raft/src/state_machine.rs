@@ -26,7 +26,7 @@ use ursula_runtime::AppendTransactionRequest;
 use ursula_runtime::BootstrapStreamRequest;
 use ursula_runtime::BootstrapStreamResponse;
 use ursula_runtime::ColdFlushCandidate;
-use ursula_runtime::ColdGcEntry;
+use ursula_runtime::ColdGcPlanEntry;
 use ursula_runtime::ColdHotBacklog;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::ColdWriteAdmission;
@@ -413,7 +413,7 @@ impl RaftGroupStateMachine {
         &mut self,
         max: usize,
         placement: ShardPlacement,
-    ) -> Result<Vec<ColdGcEntry>, GroupEngineError> {
+    ) -> Result<Vec<ColdGcPlanEntry>, GroupEngineError> {
         self.engine.plan_cold_gc(max, placement).await
     }
 

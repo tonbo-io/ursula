@@ -60,6 +60,7 @@ use axum::middleware::Next;
 use axum::middleware::{self};
 use axum::response::IntoResponse;
 use axum::response::Response;
+use axum::routing::any;
 use axum::routing::get;
 use axum::routing::post;
 use axum::routing::put;
@@ -1361,6 +1362,14 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         )
         .route("/{bucket}/{stream}/append-batch", post(append_batch))
         .route(
+            "/{bucket}/{stream}/keyed-state",
+            any(keyed_state_not_served),
+        )
+        .route(
+            "/{bucket}/{affinity}/{stream}/keyed-state",
+            any(keyed_state_not_served),
+        )
+        .route(
             "/{bucket}/{affinity}/$transaction",
             post(append_transaction),
         )
@@ -1410,6 +1419,18 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         ))
         .layer(response_compression)
         .with_state(state)
+}
+
+/// `{stream_url}/keyed-state` (keyed-streams P3). The name is reserved
+/// for routing at once (C8, U5), so these explicit routes keep it from ever
+/// matching the affinity stream route; until the keyed-state proxy lands,
+/// every method answers 404, which P3 also uses for unkeyed streams.
+async fn keyed_state_not_served() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        "keyed-state is not served for this stream",
+    )
+        .into_response()
 }
 
 pub(crate) fn should_externalize_payload(

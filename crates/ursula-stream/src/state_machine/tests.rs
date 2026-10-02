@@ -2326,6 +2326,7 @@ fn snapshot_restore_rejects_invalid_entries() {
             bucket_usage: Vec::new(),
             bucket_quotas: Vec::new(),
             feature_level: 0,
+            last_created_at_ms: 0,
         })
         .expect_err("duplicate bucket"),
         StreamSnapshotError::DuplicateBucket("benchcmp".to_owned())
@@ -2342,6 +2343,7 @@ fn snapshot_restore_rejects_invalid_entries() {
             bucket_usage: Vec::new(),
             bucket_quotas: Vec::new(),
             feature_level: 0,
+            last_created_at_ms: 0,
         })
     };
 
@@ -4209,6 +4211,216 @@ fn import_snapshot_never_lowers_the_feature_level() {
         StreamResponse::SnapshotImported { .. }
     ));
     assert_eq!(fresh.feature_level(), 1);
+}
+
+fn created_at_ms(machine: &StreamStateMachine, id: &str) -> u64 {
+    machine
+        .head(&stream(id))
+        .expect("stream exists")
+        .created_at_ms
+}
+
+fn flush_and_delete(machine: &mut StreamStateMachine, id: &str) {
+    assert!(matches!(
+        machine.apply(append_cmd(stream(id), b"cold", Append::default())),
+        StreamResponse::Appended { .. }
+    ));
+    assert!(matches!(
+        machine.apply(flush_cold_cmd(stream(id), 0, 4, "chunk", 4)),
+        StreamResponse::ColdFlushed { .. }
+    ));
+    assert_eq!(
+        machine.apply(delete_cmd(stream(id))),
+        StreamResponse::Deleted
+    );
+}
+
+#[test]
+fn c7_created_at_ms_is_unique_under_a_frozen_clock_only_from_level_one() {
+    // Level 0 keeps today's behavior: a delete and recreate at the same
+    // instant reuses the incarnation.
+    let mut legacy = machine();
+    create_stream(&mut legacy, "frozen");
+    assert_eq!(created_at_ms(&legacy, "frozen"), 0);
+    assert_eq!(
+        legacy.apply(delete_cmd(stream("frozen"))),
+        StreamResponse::Deleted
+    );
+    create_stream(&mut legacy, "frozen");
+    assert_eq!(created_at_ms(&legacy, "frozen"), 0);
+    assert_eq!(legacy.last_created_at_ms(), 0);
+
+    let mut machine = machine();
+    machine.apply(set_feature_level_cmd(1));
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        create_stream(&mut machine, "frozen");
+        seen.push(created_at_ms(&machine, "frozen"));
+        assert_eq!(
+            machine.apply(delete_cmd(stream("frozen"))),
+            StreamResponse::Deleted
+        );
+    }
+    create_stream(&mut machine, "other");
+    seen.push(created_at_ms(&machine, "other"));
+    assert_eq!(seen, vec![1, 2, 3, 4]);
+    assert_eq!(machine.last_created_at_ms(), 4);
+
+    // A later clock wins over the counter.
+    assert_eq!(
+        machine.apply(create_cmd(stream("later"), Create {
+            now_ms: 1_000,
+            ..Create::default()
+        })),
+        created(stream("later"), 0)
+    );
+    assert_eq!(created_at_ms(&machine, "later"), 1_000);
+    assert_eq!(machine.last_created_at_ms(), 1_000);
+}
+
+#[test]
+fn c7_raise_starts_after_every_live_incarnation() {
+    let mut machine = machine();
+    assert_eq!(
+        machine.apply(create_cmd(stream("old"), Create {
+            now_ms: 500,
+            ..Create::default()
+        })),
+        created(stream("old"), 0)
+    );
+    machine.apply(set_feature_level_cmd(1));
+    assert_eq!(machine.last_created_at_ms(), 500);
+    create_stream(&mut machine, "new");
+    assert_eq!(created_at_ms(&machine, "new"), 501);
+}
+
+#[test]
+fn c7_last_created_at_ms_survives_snapshot_round_trip_and_legacy_decode() {
+    let mut machine = machine();
+    machine.apply(set_feature_level_cmd(1));
+    create_stream(&mut machine, "a");
+    assert_eq!(
+        machine.apply(delete_cmd(stream("a"))),
+        StreamResponse::Deleted
+    );
+    let snapshot = machine.snapshot();
+    assert_eq!(snapshot.last_created_at_ms, 1);
+    let mut restored = StreamStateMachine::restore(snapshot).expect("restore snapshot");
+    assert_eq!(restored.last_created_at_ms(), 1);
+    create_stream(&mut restored, "a");
+    assert_eq!(created_at_ms(&restored, "a"), 2);
+
+    // A snapshot without the field restores below every live incarnation's
+    // creation time only at level 0; at level 1 it is normalized upwards.
+    let mut value = serde_json::to_value(restored.snapshot()).expect("encode snapshot");
+    value
+        .as_object_mut()
+        .expect("snapshot object")
+        .remove("last_created_at_ms");
+    let legacy: StreamSnapshot = serde_json::from_value(value).expect("decode legacy snapshot");
+    assert_eq!(legacy.last_created_at_ms, 0);
+    let mut restored = StreamStateMachine::restore(legacy).expect("restore legacy snapshot");
+    assert_eq!(restored.last_created_at_ms(), 2);
+    create_stream(&mut restored, "b");
+    assert_eq!(created_at_ms(&restored, "b"), 3);
+}
+
+#[test]
+fn c8_keyed_state_affinity_stream_is_reserved_on_apply_only_from_level_one() {
+    let keyed_state = BucketStreamId::with_affinity("benchcmp", "session", "keyed-state");
+    let mut legacy = machine();
+    assert_eq!(
+        legacy.apply(create_cmd(keyed_state.clone(), Create::default())),
+        created(keyed_state.clone(), 0)
+    );
+
+    let mut machine = machine();
+    machine.apply(set_feature_level_cmd(1));
+    assert_error_code(
+        machine.apply(create_cmd(keyed_state, Create::default())),
+        StreamErrorCode::InvalidStreamId,
+    );
+    // The two-segment stream named `keyed-state` stays valid.
+    assert_eq!(
+        machine.apply(create_cmd(stream("keyed-state"), Create::default())),
+        created(stream("keyed-state"), 0)
+    );
+}
+
+#[test]
+fn f14g_stream_gc_entries_name_the_incarnation_only_from_level_one() {
+    let mut legacy = machine();
+    create_stream(&mut legacy, "gc");
+    flush_and_delete(&mut legacy, "gc");
+    let entries = legacy.pending_cold_gc_batch(8);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].target, ColdGcTarget::Stream(stream("gc")));
+    assert_eq!(entries[0].cold_generation, None);
+
+    let mut machine = machine();
+    machine.apply(set_feature_level_cmd(1));
+    create_stream(&mut machine, "gc");
+    let first = created_at_ms(&machine, "gc");
+    assert_eq!(machine.cold_index_generation(&stream("gc")), Some(first));
+    flush_and_delete(&mut machine, "gc");
+    create_stream(&mut machine, "gc");
+    let second = created_at_ms(&machine, "gc");
+    assert_ne!(first, second);
+
+    let planned = machine.plan_cold_gc_batch(8);
+    assert_eq!(planned.len(), 1);
+    assert_eq!(planned[0].entry.target, ColdGcTarget::Stream(stream("gc")));
+    assert_eq!(planned[0].entry.cold_generation, Some(first));
+    assert_eq!(planned[0].live_cold_generation, Some(second));
+
+    // Generations and GC entries survive a snapshot round trip.
+    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
+    assert_eq!(restored.cold_index_generation(&stream("gc")), Some(second));
+    assert_eq!(restored.plan_cold_gc_batch(8), planned);
+}
+
+#[test]
+fn f14g_external_create_at_level_one_keeps_its_payload_in_state_for_gc() {
+    let mut machine = machine();
+    machine.apply(set_feature_level_cmd(1));
+    let external = ExternalPayloadRef {
+        s3_path: "benchcmp/ext/external/initial.bin".to_owned(),
+        payload_len: 4,
+        object_size: 4,
+    };
+    assert!(matches!(
+        machine.apply(StreamCommand::CreateExternal {
+            stream_id: stream("ext"),
+            content_type: OCTET.to_owned(),
+            initial_payload: external.clone(),
+            record_ends: Vec::new(),
+            close_after: false,
+            stream_seq: None,
+            producer: None,
+            stream_ttl_seconds: None,
+            stream_expires_at_ms: None,
+            attrs: None,
+            now_ms: 0,
+        }),
+        StreamResponse::Created { .. }
+    ));
+    let plan = machine
+        .read_plan(&stream("ext"), 0, 4)
+        .expect("read plan for external create");
+    assert!(matches!(
+        plan.segments.as_slice(),
+        [StreamReadSegment::Object(segment)] if segment.object.s3_path == external.s3_path
+    ));
+    assert_eq!(
+        machine.apply(delete_cmd(stream("ext"))),
+        StreamResponse::Deleted
+    );
+    let entries = machine.pending_cold_gc_batch(8);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries[1].target,
+        ColdGcTarget::Paths(vec![external.s3_path.clone()])
+    );
 }
 
 #[test]

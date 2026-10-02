@@ -1647,6 +1647,7 @@ async fn install_group_snapshot_rejects_mismatched_placement_before_routing() {
             bucket_usage: Vec::new(),
             bucket_quotas: Vec::new(),
             feature_level: 0,
+            last_created_at_ms: 0,
         },
         stream_append_counts: Vec::new(),
     };
@@ -2503,7 +2504,7 @@ async fn cold_gc_worker_physically_reclaims_deleted_stream_chunks() {
     let chunk = ColdChunkRef {
         start_offset: 0,
         end_offset: 4,
-        s3_path: "benchcmp/cold-gc/chunks/000000.bin".to_owned(),
+        s3_path: new_cold_chunk_path(&stream, 0, 4),
         object_size: 4,
         ..Default::default()
     };
@@ -2569,7 +2570,7 @@ async fn purge_report_proves_cold_gc_queue_is_empty_only_after_reclamation() {
     let chunk = ColdChunkRef {
         start_offset: 0,
         end_offset: 4,
-        s3_path: "offboard-tenant/cold-payload/chunks/000000.bin".to_owned(),
+        s3_path: new_cold_chunk_path(&stream, 0, 4),
         object_size: 4,
         ..Default::default()
     };
@@ -4196,6 +4197,7 @@ impl GroupEngine for BlockingReadEngine {
                     bucket_usage: Vec::new(),
                     bucket_quotas: Vec::new(),
                     feature_level: 0,
+                    last_created_at_ms: 0,
                 },
                 stream_append_counts: Vec::new(),
             })
@@ -4260,6 +4262,7 @@ impl GroupEngine for RecordingEngine {
                 retained_offset: 0,
                 integrity: empty_integrity(),
                 record_range: None,
+                created_at_ms: None,
             })
         })
     }
@@ -4433,6 +4436,7 @@ impl GroupEngine for RecordingEngine {
                     bucket_usage: Vec::new(),
                     bucket_quotas: Vec::new(),
                     feature_level: 0,
+                    last_created_at_ms: 0,
                 },
                 stream_append_counts: Vec::new(),
             })

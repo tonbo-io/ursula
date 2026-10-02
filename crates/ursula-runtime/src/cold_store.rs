@@ -640,6 +640,35 @@ impl ColdStore {
         Ok(())
     }
 
+    /// Lists the file names directly below the directory `dir` (which ends
+    /// in `/`), without recursing into subdirectories. Stream GC uses it so a
+    /// sweep never reaches another stream's namespace (F14g).
+    pub async fn list_file_names(&self, dir: &str) -> io::Result<Vec<String>> {
+        let mut lister = self
+            .operator
+            .lister_with(dir)
+            .await
+            .map_err(|err| cold_store_io_error(dir, err))?;
+        let mut names = Vec::new();
+        while let Some(entry) = lister
+            .try_next()
+            .await
+            .map_err(|err| cold_store_io_error(dir, err))?
+        {
+            if entry.metadata().mode() != EntryMode::FILE {
+                continue;
+            }
+            let Some(name) = entry.path().strip_prefix(dir) else {
+                continue;
+            };
+            if !name.is_empty() && !name.contains('/') {
+                names.push(name.to_owned());
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
     /// Proves that the object store has no file below `path`. Tenant purge
     /// uses this after recursive deletion; a successful delete request alone
     /// is not physical-absence evidence.
@@ -1318,11 +1347,65 @@ pub fn new_cold_chunk_path(
     start_offset: u64,
     end_offset: u64,
 ) -> String {
+    new_cold_chunk_path_in_generation(stream_id, 0, start_offset, end_offset)
+}
+
+/// Names a new exclusive chunk of the stream incarnation whose cold
+/// generation is `generation` (F14g). Generation 0 keeps the legacy name
+/// directly under `{stream}/chunks/`; any other generation adds a
+/// `{generation:016x}/` component, so stream GC can delete one incarnation's
+/// chunks without touching another's.
+pub fn new_cold_chunk_path_in_generation(
+    stream_id: &BucketStreamId,
+    generation: u64,
+    start_offset: u64,
+    end_offset: u64,
+) -> String {
     let unix_nanos = cold_object_unix_nanos();
     let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!(
-        "{stream_id}/chunks/{start_offset:016x}-{end_offset:016x}-{unix_nanos:032x}-{sequence:016x}.bin"
+        "{}{start_offset:016x}-{end_offset:016x}-{unix_nanos:032x}-{sequence:016x}.bin",
+        cold_chunk_dir(stream_id, generation)
     )
+}
+
+/// The directory holding the exclusive chunks of one stream incarnation
+/// (F14g): `{stream}/chunks/` for generation 0, otherwise
+/// `{stream}/chunks/{generation:016x}/`.
+pub fn cold_chunk_dir(stream_id: &BucketStreamId, generation: u64) -> String {
+    if generation == 0 {
+        cold_chunk_prefix(stream_id)
+    } else {
+        format!("{stream_id}/chunks/{generation:016x}/")
+    }
+}
+
+/// The directory holding a stream's staged external payloads.
+pub fn cold_external_dir(stream_id: &BucketStreamId) -> String {
+    format!("{stream_id}/external/")
+}
+
+/// Whether `name` (a file name without directory) has the form Ursula uses
+/// for exclusive chunks, `{start:016x}-{end:016x}-{nanos:032x}-{seq:016x}.bin`.
+pub fn is_cold_chunk_file_name(name: &str) -> bool {
+    hex_fields_with_suffix(name, ".bin", &[16, 16, 32, 16])
+}
+
+/// Whether `name` has the form Ursula uses for staged external payloads,
+/// `{nanos:032x}-{seq:016x}.bin`.
+pub fn is_external_payload_file_name(name: &str) -> bool {
+    hex_fields_with_suffix(name, ".bin", &[32, 16])
+}
+
+fn hex_fields_with_suffix(name: &str, suffix: &str, widths: &[usize]) -> bool {
+    let Some(stem) = name.strip_suffix(suffix) else {
+        return false;
+    };
+    let fields = stem.split('-').collect::<Vec<_>>();
+    fields.len() == widths.len()
+        && fields.iter().zip(widths).all(|(field, width)| {
+            field.len() == *width && field.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 pub fn new_cold_pack_path(bucket_id: &str, raft_group_id: u32) -> String {
@@ -1337,9 +1420,10 @@ pub fn cold_bucket_prefix(bucket_id: &str) -> String {
     format!("{bucket_id}/")
 }
 
-/// The prefix under which all of a stream's cold chunks live. Cold objects are
-/// stream-exclusive, so removing this prefix reclaims every chunk for a fully
-/// deleted stream in one sweep. Mirrors the layout of [`new_cold_chunk_path`].
+/// The directory of a stream's legacy (generation-0) exclusive chunks.
+/// Mirrors the layout of [`new_cold_chunk_path`]. Never remove it
+/// recursively: an affinity stream named `chunks` under this stream's name
+/// lives below it (D4); stream GC lists it one level at a time instead.
 pub fn cold_chunk_prefix(stream_id: &BucketStreamId) -> String {
     format!("{stream_id}/chunks/")
 }
