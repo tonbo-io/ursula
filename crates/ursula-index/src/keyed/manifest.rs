@@ -136,9 +136,14 @@ fn invalid(message: impl Into<String>) -> IndexError {
 impl KeyedManifest {
     /// `state(0)` of a source: what a missing namespace means.
     pub fn empty(source: KeyedSource) -> Self {
+        Self::empty_at(source, KEYED_PROJECTION_FORMAT)
+    }
+
+    /// `state(0)` of a source in a namespace of projection format `format`.
+    pub fn empty_at(source: KeyedSource, format: u32) -> Self {
         Self {
             version: KEYED_MANIFEST_VERSION,
-            format: KEYED_PROJECTION_FORMAT,
+            format,
             generation: 0,
             source,
             through_record: 0,
@@ -154,11 +159,8 @@ impl KeyedManifest {
         if self.version != KEYED_MANIFEST_VERSION {
             return Err(IndexError::ManifestVersion(self.version));
         }
-        if self.format != KEYED_PROJECTION_FORMAT {
-            return Err(invalid(format!(
-                "unknown projection format {}",
-                self.format
-            )));
+        if self.format == 0 {
+            return Err(invalid("projection format 0 does not exist"));
         }
         if (self.through_record == 0) != self.through_digest.is_none() {
             return Err(invalid("through_digest must be present exactly when D > 0"));
@@ -345,18 +347,32 @@ pub fn namespace_prefix(source: &KeyedSource, format: u32) -> String {
 pub struct KeyedNamespace {
     store: ObjectStore,
     source: KeyedSource,
+    format: u32,
     prefix: String,
 }
 
 impl KeyedNamespace {
     /// The namespace of `source` at the current projection format.
     pub fn new(store: ObjectStore, source: KeyedSource) -> Self {
-        let prefix = namespace_prefix(&source, KEYED_PROJECTION_FORMAT);
+        Self::with_format(store, source, KEYED_PROJECTION_FORMAT)
+    }
+
+    /// The namespace of `source` at projection format `format`: a separate
+    /// `v{format}/` prefix, so a blue/green rebuild at another format never
+    /// touches the namespace being served.
+    pub fn with_format(store: ObjectStore, source: KeyedSource, format: u32) -> Self {
+        let prefix = namespace_prefix(&source, format);
         Self {
             store,
             source,
+            format,
             prefix,
         }
+    }
+
+    /// The projection format of this namespace.
+    pub fn format(&self) -> u32 {
+        self.format
     }
 
     /// The namespace's key prefix, ending in `/`.
@@ -438,6 +454,12 @@ impl KeyedNamespace {
         if manifest.source != self.source {
             return Err(invalid("namespace manifest names another source"));
         }
+        if manifest.format != self.format {
+            return Err(invalid(format!(
+                "namespace at projection format {} holds a format {} manifest",
+                self.format, manifest.format
+            )));
+        }
         Ok(Some(PublishedKeyedManifest {
             pointer_etag: current.etag,
             manifest_key: pointer.manifest,
@@ -459,6 +481,12 @@ impl KeyedNamespace {
             .ok_or_else(|| invalid("generation overflowed"))?;
         if manifest.source != self.source {
             return Err(invalid("manifest names another source"));
+        }
+        if manifest.format != self.format {
+            return Err(invalid(format!(
+                "a format {} manifest cannot be published at projection format {}",
+                manifest.format, self.format
+            )));
         }
         manifest.validate()?;
         let (key, bytes, pointer) = manifest.encode()?;
@@ -652,6 +680,40 @@ mod tests {
                 .after_compaction(&[b], &merged, true, 3)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// A blue/green rebuild at another projection format writes a separate
+    /// `v{fmt}/` namespace and never reads or overwrites the served one.
+    #[tokio::test]
+    async fn projection_formats_are_separate_namespaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ObjectStore::from(FsObjectStore::new(dir.path()).unwrap());
+        let blue = KeyedNamespace::new(store.clone(), source());
+        let green = KeyedNamespace::with_format(store.clone(), source(), 2);
+        assert_eq!(green.format(), 2);
+        assert!(green.prefix().ends_with("/v2/"), "{}", green.prefix());
+        assert_ne!(blue.prefix(), green.prefix());
+
+        let (first_run, part) = run(0, 2, 1);
+        blue.put_part(&part).await.unwrap();
+        let first = KeyedManifest::empty(source())
+            .after_ingest(Some(first_run), 2, record_digest(b"r1"), 10)
+            .unwrap();
+        assert!(matches!(
+            blue.publish(None, &first).await.unwrap(),
+            PublishOutcome::Published(_)
+        ));
+        // The green namespace is still `state(0)`, and refuses a blue manifest.
+        assert!(green.load().await.unwrap().is_none());
+        green.publish(None, &first).await.unwrap_err();
+        let green_first = KeyedManifest::empty_at(source(), 2);
+        assert_eq!(green_first.format, 2);
+        green_first.validate().unwrap();
+        KeyedManifest::empty_at(source(), 0).validate().unwrap_err();
+        assert_eq!(
+            blue.load().await.unwrap().unwrap().manifest.through_record,
+            2
         );
     }
 

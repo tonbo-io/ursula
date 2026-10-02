@@ -55,6 +55,7 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::fold::RangeQuery;
+use super::manifest::KEYED_PROJECTION_FORMAT;
 use super::manifest::KeyedManifest;
 use super::manifest::KeyedNamespace;
 use super::manifest::KeyedPartMeta;
@@ -120,6 +121,10 @@ pub struct KeyedEngineConfig {
     pub part_options: PartOptions,
     /// Size-tiered compaction policy.
     pub policy: CompactionPolicy,
+    /// Projection format of the namespaces this pod reads and writes
+    /// (`v{fmt}/`). A pod at another format builds its own namespaces from
+    /// record 0 next to the served ones: the blue/green rebuild (§6.1 U20).
+    pub projection_format: u32,
 }
 
 impl Default for KeyedEngineConfig {
@@ -137,6 +142,7 @@ impl Default for KeyedEngineConfig {
             drain_hold: Duration::from_secs(600),
             part_options: PartOptions::default(),
             policy: CompactionPolicy::default(),
+            projection_format: KEYED_PROJECTION_FORMAT,
         }
     }
 }
@@ -624,7 +630,11 @@ impl Inner {
             namespace.touch();
             return Ok(Arc::clone(namespace));
         }
-        let namespace = KeyedNamespace::new(self.store.clone(), source.clone());
+        let namespace = KeyedNamespace::with_format(
+            self.store.clone(),
+            source.clone(),
+            self.config.projection_format,
+        );
         let mut store = namespace.opener();
         if let Some(cache) = &self.cache {
             store = store.with_cache(cache)?;
@@ -1103,7 +1113,8 @@ impl Inner {
             cursor = page.next_record;
         }
         namespace.backlog.store(truncated, Ordering::SeqCst);
-        let empty_base = || KeyedManifest::empty(namespace.source.clone());
+        let empty_base =
+            || KeyedManifest::empty_at(namespace.source.clone(), namespace.namespace.format());
         let mut manifest = if rebuild {
             empty_base()
         } else {
