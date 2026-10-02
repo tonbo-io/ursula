@@ -222,6 +222,7 @@ pub use ursula_stream::BucketStreamListing;
 pub use ursula_stream::COMMITTED_WRITE_UNIT_BYTES;
 pub use ursula_stream::ColdChunkRef;
 pub use ursula_stream::ColdFlushCandidate;
+pub use ursula_stream::ColdFlushPressure;
 pub use ursula_stream::ColdGcEntry;
 pub use ursula_stream::ColdGcPlanEntry;
 pub use ursula_stream::ColdGcTarget;

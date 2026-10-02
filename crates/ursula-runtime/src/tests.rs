@@ -801,6 +801,59 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
     assert!(entry.external_segments.is_empty());
 }
 
+/// bounded-stream-state F11: bootstrap plans one read window for all hot
+/// updates instead of one plan per message (O(hot records²) before).
+#[tokio::test]
+async fn bootstrap_issues_one_read_plan_for_all_updates() {
+    let placement = placement();
+    let stream = BucketStreamId::new("benchcmp", "bootstrap-one-plan");
+    let mut engine = InMemoryGroupEngine::default();
+    engine
+        .create_stream(
+            CreateStreamRequest::new(stream.clone(), DEFAULT_CONTENT_TYPE),
+            placement,
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("create stream");
+    let payloads = (0..64)
+        .map(|index| format!("message-{index}").into_bytes())
+        .collect::<Vec<_>>();
+    for payload in &payloads {
+        engine
+            .append(
+                AppendRequest::from_bytes(stream.clone(), payload.clone()),
+                placement,
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("append");
+    }
+
+    let plans_before = engine.bootstrap_read_plans;
+    let bootstrap = engine
+        .bootstrap_stream(
+            BootstrapStreamRequest {
+                stream_id: stream.clone(),
+                now_ms: 0,
+            },
+            placement,
+        )
+        .await
+        .expect("bootstrap");
+    assert_eq!(engine.bootstrap_read_plans - plans_before, 1);
+    assert!(bootstrap.up_to_date);
+    assert_eq!(bootstrap.updates.len(), payloads.len());
+    let mut offset = 0u64;
+    for (update, payload) in bootstrap.updates.iter().zip(&payloads) {
+        assert_eq!(&update.payload, payload);
+        assert_eq!(update.start_offset, offset);
+        offset += u64::try_from(payload.len()).expect("len fits u64");
+        assert_eq!(update.next_offset, offset);
+    }
+    assert_eq!(bootstrap.next_offset, offset);
+}
+
 #[tokio::test]
 async fn bootstrap_returns_honest_partial_when_updates_after_snapshot_are_cold() {
     let placement = placement();
@@ -2086,6 +2139,7 @@ async fn flush_cold_group_batch_once_publishes_multiple_chunks() {
                 min_hot_bytes: 1,
                 max_flush_bytes: 1,
                 max_batch_bytes: 4,
+                pressure: None,
             },
             4,
         )
@@ -2171,6 +2225,7 @@ async fn packed_cold_object_survives_until_last_stream_is_deleted() {
                 min_hot_bytes: 4,
                 max_flush_bytes: 4,
                 max_batch_bytes: 8,
+                pressure: None,
             },
             8,
         )
@@ -2254,6 +2309,7 @@ async fn cold_packs_are_bucket_scoped_erasure_domains_within_one_raft_group() {
                 min_hot_bytes: 4,
                 max_flush_bytes: 4,
                 max_batch_bytes: 16,
+                pressure: None,
             },
             16,
         )
@@ -2312,6 +2368,85 @@ async fn cold_packs_are_bucket_scoped_erasure_domains_within_one_raft_group() {
             .expect("other bucket pack remains readable"),
         b"cccc"
     );
+}
+
+async fn node_hot_bytes(runtime: &ShardRuntime, group_count: u32) -> u64 {
+    let mut total = 0u64;
+    for group_id in 0..group_count {
+        let snapshot = runtime
+            .snapshot_group(RaftGroupId(group_id))
+            .await
+            .expect("snapshot group");
+        total += snapshot
+            .stream_snapshot
+            .streams
+            .iter()
+            .map(|entry| u64::try_from(entry.payload.len()).expect("len fits u64"))
+            .sum::<u64>();
+    }
+    total
+}
+
+/// bounded-stream-state F10: node pressure with many small groups (each far
+/// below flush_size) brings node hot bytes under three quarters of the
+/// watermark by draining the largest streams, instead of being a no-op for
+/// small groups or flushing every stream that holds a byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn node_pressure_drains_small_groups_below_the_watermark() {
+    const GROUPS: u32 = 8;
+    const FLUSH_SIZE: usize = 8 * 1024;
+    const WATERMARK: u64 = 10 * 1024;
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(RuntimeConfig::new(2, GROUPS as usize), cold_store);
+    for group_id in 0..GROUPS {
+        for (index, len) in [256usize, 512, 768].into_iter().enumerate() {
+            let stream = stream_on_group(
+                &runtime,
+                RaftGroupId(group_id),
+                &format!("pressure-{index}"),
+            );
+            create_stream(&runtime, &stream).await;
+            append_bytes(&runtime, &stream, &vec![b'p'; len]).await;
+        }
+    }
+    let before = node_hot_bytes(&runtime, GROUPS).await;
+    assert_eq!(before, u64::from(GROUPS) * 1536);
+    assert!(before >= WATERMARK);
+
+    // Without pressure, groups far below flush_size plan nothing.
+    let request = PlanGroupColdFlushRequest {
+        min_hot_bytes: FLUSH_SIZE,
+        max_flush_bytes: FLUSH_SIZE,
+        max_batch_bytes: FLUSH_SIZE,
+        pressure: None,
+    };
+    assert_eq!(
+        runtime
+            .flush_cold_all_groups_once_bounded(request.clone(), 1)
+            .await
+            .expect("flush pass"),
+        0
+    );
+
+    let target = WATERMARK / 4 * 3;
+    let flushed = runtime
+        .flush_cold_all_groups_once_bounded(
+            PlanGroupColdFlushRequest {
+                pressure: Some(ColdFlushPressure {
+                    node_hot_bytes: before,
+                    node_target_bytes: target,
+                }),
+                ..request
+            },
+            1,
+        )
+        .await
+        .expect("pressure pass");
+    let after = node_hot_bytes(&runtime, GROUPS).await;
+    assert!(after <= target, "node hot {after} above target {target}");
+    // Largest first: each group flushed only its largest stream.
+    assert_eq!(flushed, usize::try_from(GROUPS).expect("fits"));
+    assert_eq!(after, u64::from(GROUPS) * 768);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2465,6 +2600,7 @@ async fn all_stale_packed_candidates_reclaim_unpublished_object() {
                 min_hot_bytes: 4,
                 max_flush_bytes: 4,
                 max_batch_bytes: 8,
+                pressure: None,
             },
             8,
         )
@@ -2703,6 +2839,7 @@ async fn stale_cold_flush_batch_after_delete_recreate_is_classified_for_cleanup(
                 min_hot_bytes: 18,
                 max_flush_bytes: 18,
                 max_batch_bytes: 18,
+                pressure: None,
             },
             1,
         )
@@ -3034,6 +3171,7 @@ async fn flush_cold_group_once_selects_stream_inside_owner_group() {
             min_hot_bytes: 4,
             max_flush_bytes: 4,
             max_batch_bytes: 4,
+            pressure: None,
         })
         .await
         .expect("flush group")
@@ -3064,6 +3202,7 @@ async fn flush_cold_all_groups_once_bounded_flushes_multiple_groups() {
                 min_hot_bytes: 4,
                 max_flush_bytes: 4,
                 max_batch_bytes: 8,
+                pressure: None,
             },
             2,
         )
@@ -3120,6 +3259,7 @@ async fn repeated_cold_flush_keeps_hot_bytes_bounded_while_writes_continue() {
                     min_hot_bytes: 4,
                     max_flush_bytes: 4,
                     max_batch_bytes: 4,
+                    pressure: None,
                 },
                 streams.len(),
             )
@@ -3543,6 +3683,7 @@ async fn background_cold_flush_skips_groups_that_cannot_accept_local_writes() {
                 min_hot_bytes: 1,
                 max_flush_bytes: 1,
                 max_batch_bytes: 4,
+                pressure: None,
             },
             4,
         )

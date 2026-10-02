@@ -26,38 +26,44 @@ impl HotBuffer {
         }
         let end_offset = start_offset
             .saturating_add(u64::try_from(payload.len()).expect("payload len fits u64"));
+        let bytes = payload.len();
         let mut chunks = VecDeque::new();
         chunks.push_back(HotChunk {
             start_offset,
             end_offset,
             bytes: payload,
         });
-        let payload_len = chunks.iter().map(|chunk| chunk.bytes.len()).sum();
         Self {
             chunks,
-            payload_len,
+            payload_len: bytes,
         }
     }
 
     pub(super) fn from_snapshot(payload: Vec<u8>, segments: &[HotPayloadSegment]) -> Self {
         let mut chunks = VecDeque::with_capacity(segments.len());
+        let mut bytes = 0usize;
         for segment in segments {
+            let chunk = payload[segment.payload_start..segment.payload_end].to_vec();
+            bytes = bytes.saturating_add(chunk.len());
             chunks.push_back(HotChunk {
                 start_offset: segment.start_offset,
                 end_offset: segment.end_offset,
-                bytes: payload[segment.payload_start..segment.payload_end].to_vec(),
+                bytes: chunk,
             });
         }
-        let payload_len = chunks.iter().map(|chunk| chunk.bytes.len()).sum();
         Self {
             chunks,
-            payload_len,
+            payload_len: bytes,
         }
     }
 
     /// Hot payload bytes held, in O(1).
     pub(super) fn len(&self) -> usize {
         self.payload_len
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
     }
 
     pub(super) fn hot_start_offset(&self) -> u64 {
@@ -157,17 +163,6 @@ impl HotBuffer {
         }
         let end_offset = from_offset + u64::try_from(payload.len()).expect("payload len fits u64");
         Some((from_offset, end_offset, payload))
-    }
-
-    pub(super) fn remaining_len_from(&self, from_offset: u64) -> usize {
-        self.chunks
-            .iter()
-            .filter(|chunk| chunk.end_offset > from_offset)
-            .map(|chunk| {
-                let start = chunk.start_offset.max(from_offset);
-                usize::try_from(chunk.end_offset - start).expect("remaining len fits usize")
-            })
-            .sum()
     }
 
     pub(super) fn read_segments(

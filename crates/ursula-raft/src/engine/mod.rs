@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod compact_tests;
 mod factory;
 
 use std::collections::BTreeMap;
@@ -1682,19 +1684,35 @@ impl GroupEngine for RaftGroupEngine {
                     .local_cold_index_generation(Some(request.stream_id.clone()))
                     .await?;
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-                let Some(rollback) = replace_cold_chunk_index_pages_with_rollback_in_generation(
-                    &store,
-                    &request.stream_id,
-                    generation,
-                    &request.old_chunks,
-                    &request.replacement,
-                )
-                .await
-                .map_err(|err| GroupEngineError::new(err.to_string()))?
-                else {
-                    return Err(GroupEngineError::new(
-                        "cold compaction input no longer matches the cold index",
-                    ));
+                // Shared pack slices live only in replicated state, never in
+                // cold-index pages, so an all-shared input has nothing to
+                // replace: index the replacement as a fresh entry instead.
+                let rollback = if request.old_chunks.iter().all(|chunk| chunk.shared_object) {
+                    write_cold_chunk_index_pages_with_rollback_in_generation(
+                        &store,
+                        &request.stream_id,
+                        generation,
+                        &request.replacement,
+                    )
+                    .await
+                    .map_err(|err| GroupEngineError::new(err.to_string()))?
+                } else {
+                    let Some(rollback) =
+                        replace_cold_chunk_index_pages_with_rollback_in_generation(
+                            &store,
+                            &request.stream_id,
+                            generation,
+                            &request.old_chunks,
+                            &request.replacement,
+                        )
+                        .await
+                        .map_err(|err| GroupEngineError::new(err.to_string()))?
+                    else {
+                        return Err(GroupEngineError::new(
+                            "cold compaction input no longer matches the cold index",
+                        ));
+                    };
+                    rollback
                 };
                 index_rollback = Some((store, rollback));
             }

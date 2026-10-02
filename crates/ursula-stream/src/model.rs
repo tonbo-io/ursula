@@ -295,6 +295,10 @@ pub struct StreamVisibleSnapshot {
     pub digest: String,
 }
 
+/// Default cap on the update bytes one `/bootstrap` response carries
+/// (bounded-stream-state F11, the 8 MiB server read cap).
+pub const BOOTSTRAP_MAX_UPDATE_BYTES: u64 = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamBootstrapPlan {
     pub snapshot: Option<StreamVisibleSnapshot>,

@@ -392,7 +392,7 @@ In both cases the update parts MUST be the retained messages starting exactly at
 
 A server MAY choose the partial form for any reason, for example because some messages after `S` are held only in a storage tier that does not keep per-message boundaries in memory. Serving `/bootstrap` never requires a server to read such a tier. A client MUST NOT treat `Stream-Up-To-Date: false` as an error.
 
-> **Note (informative).** Ursula returns the complete form when every message in `[S, tail)` is above the stream's cold frontier, and otherwise the partial form with `P = S` (the snapshot part only). It never reads cold storage while serving `/bootstrap`.
+> **Note (informative).** Ursula returns the complete form when every message in `[S, tail)` is above the stream's cold frontier, and otherwise the partial form with `P = S` (the snapshot part only). It never reads cold storage while serving `/bootstrap`. It also caps the update parts of one response at 8 MiB: when the updates exceed the cap it returns the partial form with `P` at the last message boundary that keeps the parts within the cap, and always includes at least one message, even when that message alone exceeds the cap.
 
 **Response Body:**
 

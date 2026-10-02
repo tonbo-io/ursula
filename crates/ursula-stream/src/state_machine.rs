@@ -6,7 +6,8 @@
 //! - [`query`]: read paths — heads, accessors, read plans, snapshots, bootstrap.
 //! - [`append`]: append paths and idempotent producer bookkeeping.
 //! - [`lifecycle`]: bucket/stream create, close, delete, attrs, and TTL expiry.
-//! - [`cold`]: cold-tier flush planning, GC, retention compaction, snapshot publishing.
+//! - [`cold`]: cold-tier flush candidates, GC, retention compaction, snapshot publishing.
+//! - [`flush_planner`]: leader-side flush passes over a derived hot-stream index.
 //! - [`persist`]: snapshot / restore / integrity serialization.
 //! - [`hot_buffer`], [`cold_state`], [`ttl`]: internal per-stream data structures.
 //!
@@ -35,6 +36,7 @@ use crate::command::StreamCommand;
 use crate::integrity::StreamIntegrity;
 use crate::model::AppendExternalInput;
 use crate::model::AppendStreamInput;
+use crate::model::BOOTSTRAP_MAX_UPDATE_BYTES;
 use crate::model::BucketQuota;
 use crate::model::BucketQuotaSnapshot;
 use crate::model::BucketStreamListing;
@@ -84,7 +86,13 @@ mod append;
 mod cold;
 mod cold_gc;
 mod cold_state;
+mod flush_planner;
 mod hot_buffer;
+
+pub use self::flush_planner::ColdFlushPass;
+pub use self::flush_planner::ColdFlushPassRequest;
+pub use self::flush_planner::ColdFlushPlanStats;
+pub use self::flush_planner::ColdFlushPressure;
 mod lifecycle;
 mod persist;
 mod query;
@@ -129,6 +137,10 @@ pub struct StreamStateMachine {
     /// Per-bucket data-plane quota backstops enforced against this group's
     /// local counters; see [`BucketQuota`] for the enforcement semantics.
     bucket_quotas: HashMap<String, BucketQuota>,
+    /// Derived flush-planner state (bounded-stream-state F10): the streams
+    /// that hold hot bytes and the leader-local rotation cursor. Neither is
+    /// replicated nor part of snapshots; restore rebuilds the index.
+    flush_planner: flush_planner::FlushPlannerState,
     /// Replicated group feature level (C0). Raised only by
     /// [`StreamCommand::SetFeatureLevel`], never lowered; gated apply-time
     /// behavior checks it through [`StreamStateMachine::require_feature_level`].
@@ -231,9 +243,27 @@ impl StreamStateMachine {
 
     fn insert_stream_slot(&mut self, slot: StreamSlot) -> Option<StreamKey> {
         let hot_payload_bytes = u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64");
+        let stream_id = (!slot.hot_buffer.is_empty()).then(|| slot.metadata.stream_id.clone());
         let key = self.registry.insert(slot)?;
         self.hot_payload_bytes = self.hot_payload_bytes.saturating_add(hot_payload_bytes);
+        if let Some(stream_id) = stream_id {
+            self.flush_planner.mark_hot(&stream_id);
+        }
         Some(key)
+    }
+
+    /// Re-derives one stream's membership in the flush planner's hot index
+    /// after its hot buffer changed.
+    fn sync_hot_index(&mut self, stream_id: &BucketStreamId) {
+        let hot = self
+            .registry
+            .slot(stream_id)
+            .is_some_and(|slot| !slot.hot_buffer.is_empty());
+        if hot {
+            self.flush_planner.mark_hot(stream_id);
+        } else {
+            self.flush_planner.unmark_hot(stream_id);
+        }
     }
 
     fn add_hot_payload_bytes(&mut self, bytes: u64) {

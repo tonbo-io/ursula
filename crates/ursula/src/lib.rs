@@ -2698,7 +2698,10 @@ pub(crate) async fn create_stream_by_id(
         return *response;
     }
     request.close_after = stream_closed(&request_headers);
-    request.stream_seq = stream_seq(&request_headers);
+    request.stream_seq = match stream_seq(&request_headers) {
+        Ok(stream_seq) => stream_seq,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
     request.stream_ttl_seconds = stream_ttl_seconds;
     request.stream_expires_at_ms = stream_expires_at_ms;
     request.attrs = attrs;
@@ -2790,11 +2793,15 @@ pub(crate) async fn append_stream_by_id(
             Ok(producer) => producer,
             Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
         };
+        let stream_seq = match stream_seq(&headers) {
+            Ok(stream_seq) => stream_seq,
+            Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        };
         return match state
             .runtime
             .close_stream(CloseStreamRequest {
                 stream_id,
-                stream_seq: stream_seq(&headers),
+                stream_seq,
                 producer: producer.clone(),
                 now_ms: state.unix_time_ms(),
             })
@@ -2834,7 +2841,10 @@ pub(crate) async fn append_stream_by_id(
     let mut request = AppendRequest::from_bytes(stream_id, payload);
     request.content_type = content_type;
     request.close_after = close_after;
-    request.stream_seq = stream_seq(&headers);
+    request.stream_seq = match stream_seq(&headers) {
+        Ok(stream_seq) => stream_seq,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
     request.now_ms = state.unix_time_ms();
     let producer = match producer_request(&headers) {
         Ok(producer) => producer,
@@ -2999,6 +3009,9 @@ pub(crate) async fn append_transaction(
     let mut operations = Vec::with_capacity(transaction.operations.len());
     let mut keyed = false;
     for operation in transaction.operations {
+        if let Err(message) = check_transaction_operation_identifiers(&operation) {
+            return (StatusCode::BAD_REQUEST, message).into_response();
+        }
         // U10: op content types are normalized like the Content-Type header,
         // so apply compares them to the stream's stored (normalized) type.
         let content_type = normalize_content_type(&operation.content_type);
@@ -4402,12 +4415,43 @@ pub(crate) fn stream_closed(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
-pub(crate) fn stream_seq(headers: &HeaderMap) -> Option<String> {
-    headers
+/// Maximum length in bytes of a `Producer-Id` or `Stream-Seq` value on every
+/// HTTP write path, `$transaction` JSON included (bounded-stream-state F3).
+/// Both values are kept in replicated per-stream state, so their length must
+/// be bounded at the edge.
+pub(crate) const WRITE_IDENTIFIER_MAX_BYTES: usize = 256;
+
+fn check_write_identifier_len(name: &str, value: &str) -> Result<(), String> {
+    if value.len() > WRITE_IDENTIFIER_MAX_BYTES {
+        return Err(format!(
+            "{name} must be at most {WRITE_IDENTIFIER_MAX_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn stream_seq(headers: &HeaderMap) -> Result<Option<String>, String> {
+    let Some(value) = headers
         .get(HEADER_STREAM_SEQ)
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+    check_write_identifier_len(HEADER_STREAM_SEQ, value)?;
+    Ok(Some(value.to_owned()))
+}
+
+fn check_transaction_operation_identifiers(
+    operation: &AppendTransactionHttpOperation,
+) -> Result<(), String> {
+    if let Some(stream_seq) = operation.stream_seq.as_deref() {
+        check_write_identifier_len("stream_seq", stream_seq)?;
+    }
+    if let Some(producer) = operation.producer.as_ref() {
+        check_write_identifier_len("producer_id", &producer.producer_id)?;
+    }
+    Ok(())
 }
 
 fn stream_record_match(headers: &HeaderMap) -> Result<Option<u64>, BoxResponse> {
@@ -4442,6 +4486,7 @@ pub(crate) fn producer_request(headers: &HeaderMap) -> Result<Option<ProducerReq
     if producer_id.trim().is_empty() {
         return Err("producer-id must not be empty".to_owned());
     }
+    check_write_identifier_len(HEADER_PRODUCER_ID, producer_id)?;
     Ok(Some(ProducerRequest {
         producer_id: producer_id.to_owned(),
         producer_epoch: parse_producer_integer(

@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::sync::Arc;
 
 use bytes::Buf;
 use bytes::Bytes;
@@ -37,11 +38,25 @@ fn placement_to_proto(placement: ShardPlacement) -> proto::ShardPlacementV1 {
     }
 }
 
-pub(crate) fn group_snapshot_frames(snapshot: GroupSnapshot) -> SnapshotBytesIterator {
+pub(crate) fn group_snapshot_frames(snapshot: Arc<GroupSnapshot>) -> SnapshotBytesIterator {
     Box::new(GroupSnapshotFrameIter::new(snapshot))
 }
 
+#[cfg(test)]
+thread_local! {
+    static DECODE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of [`decode_group_snapshot`] calls on the current thread, so tests
+/// can assert that an install decodes a snapshot exactly once.
+#[cfg(test)]
+pub(crate) fn decode_calls_on_this_thread() -> usize {
+    DECODE_CALLS.with(std::cell::Cell::get)
+}
+
 pub(crate) fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStoreError> {
+    #[cfg(test)]
+    DECODE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut cursor = Cursor::new(bytes);
     let mut header = None;
     let mut streams = Vec::new();
@@ -178,64 +193,62 @@ fn bucket_usage_to_proto(value: ursula_stream::BucketUsageSnapshot) -> proto::Bu
     }
 }
 
+/// Encodes a group snapshot frame by frame without copying the whole group
+/// first (bounded-stream-state F12c). The iterator shares the builder's
+/// snapshot through an `Arc`, so a fallback re-encode does not deep-clone it;
+/// only the entry being encoded is copied, one frame at a time.
 struct GroupSnapshotFrameIter {
-    header: Option<proto::SnapshotHeaderV1>,
-    streams: std::vec::IntoIter<StreamSnapshotEntry>,
-    append_counts: std::vec::IntoIter<StreamAppendCount>,
-    cold_gc: std::vec::IntoIter<ColdGcEntry>,
+    snapshot: Arc<GroupSnapshot>,
+    header: bool,
+    next_stream: usize,
+    next_append_count: usize,
+    next_cold_gc: usize,
     footer: bool,
 }
 
 impl GroupSnapshotFrameIter {
-    fn new(snapshot: GroupSnapshot) -> Self {
-        let GroupSnapshot {
-            placement,
-            group_commit_index,
-            stream_snapshot,
-            stream_append_counts,
-        } = snapshot;
-        let StreamSnapshot {
-            buckets,
-            erased_buckets,
-            streams,
-            pending_cold_gc,
-            next_cold_gc_seq,
-            shared_cold_object_owners,
-            bucket_usage,
-            bucket_quotas,
-            feature_level,
-            last_created_at_ms,
-        } = stream_snapshot;
+    fn new(snapshot: Arc<GroupSnapshot>) -> Self {
         Self {
-            header: Some(proto::SnapshotHeaderV1 {
-                placement: Some(placement_to_proto(placement)),
-                group_commit_index,
-                buckets,
-                erased_buckets,
-                next_cold_gc_seq,
-                shared_cold_object_owners: shared_cold_object_owners
-                    .into_iter()
-                    .map(|record| proto::SharedColdObjectOwnersV1 {
-                        s3_path: record.s3_path,
-                        bucket_ids: record.bucket_ids,
-                    })
-                    .collect(),
-                bucket_usage: bucket_usage
-                    .into_iter()
-                    .map(bucket_usage_to_proto)
-                    .collect(),
-                bucket_quotas: bucket_quotas
-                    .into_iter()
-                    .map(bucket_quota_to_proto)
-                    .collect(),
-                committed_write_unit_bytes: Some(ursula_stream::COMMITTED_WRITE_UNIT_BYTES),
-                feature_level,
-                last_created_at_ms,
-            }),
-            streams: streams.into_iter(),
-            append_counts: stream_append_counts.into_iter(),
-            cold_gc: pending_cold_gc.into_iter(),
+            snapshot,
+            header: true,
+            next_stream: 0,
+            next_append_count: 0,
+            next_cold_gc: 0,
             footer: true,
+        }
+    }
+
+    fn header_frame(snapshot: &GroupSnapshot) -> proto::SnapshotHeaderV1 {
+        let stream_snapshot = &snapshot.stream_snapshot;
+        proto::SnapshotHeaderV1 {
+            placement: Some(placement_to_proto(snapshot.placement)),
+            group_commit_index: snapshot.group_commit_index,
+            buckets: stream_snapshot.buckets.clone(),
+            erased_buckets: stream_snapshot.erased_buckets.clone(),
+            next_cold_gc_seq: stream_snapshot.next_cold_gc_seq,
+            shared_cold_object_owners: stream_snapshot
+                .shared_cold_object_owners
+                .iter()
+                .map(|record| proto::SharedColdObjectOwnersV1 {
+                    s3_path: record.s3_path.clone(),
+                    bucket_ids: record.bucket_ids.clone(),
+                })
+                .collect(),
+            bucket_usage: stream_snapshot
+                .bucket_usage
+                .iter()
+                .cloned()
+                .map(bucket_usage_to_proto)
+                .collect(),
+            bucket_quotas: stream_snapshot
+                .bucket_quotas
+                .iter()
+                .cloned()
+                .map(bucket_quota_to_proto)
+                .collect(),
+            committed_write_unit_bytes: Some(ursula_stream::COMMITTED_WRITE_UNIT_BYTES),
+            feature_level: stream_snapshot.feature_level,
+            last_created_at_ms: stream_snapshot.last_created_at_ms,
         }
     }
 }
@@ -244,17 +257,29 @@ impl Iterator for GroupSnapshotFrameIter {
     type Item = Result<Bytes, SnapshotStoreError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let frame = if let Some(header) = self.header.take() {
-            proto::snapshot_frame_v1::Frame::Header(header)
-        } else if let Some(stream) = self.streams.next() {
-            match stream_to_proto(stream) {
+        let snapshot = &*self.snapshot;
+        let frame = if self.header {
+            self.header = false;
+            proto::snapshot_frame_v1::Frame::Header(Self::header_frame(snapshot))
+        } else if let Some(stream) = snapshot.stream_snapshot.streams.get(self.next_stream) {
+            self.next_stream += 1;
+            match stream_to_proto(stream.clone()) {
                 Ok(stream) => proto::snapshot_frame_v1::Frame::Stream(Box::new(stream)),
                 Err(err) => return Some(Err(err)),
             }
-        } else if let Some(append_count) = self.append_counts.next() {
-            proto::snapshot_frame_v1::Frame::AppendCount(append_count_to_proto(append_count))
-        } else if let Some(cold_gc) = self.cold_gc.next() {
-            proto::snapshot_frame_v1::Frame::ColdGc(cold_gc_to_proto(cold_gc))
+        } else if let Some(append_count) = snapshot.stream_append_counts.get(self.next_append_count)
+        {
+            self.next_append_count += 1;
+            proto::snapshot_frame_v1::Frame::AppendCount(append_count_to_proto(
+                append_count.clone(),
+            ))
+        } else if let Some(cold_gc) = snapshot
+            .stream_snapshot
+            .pending_cold_gc
+            .get(self.next_cold_gc)
+        {
+            self.next_cold_gc += 1;
+            proto::snapshot_frame_v1::Frame::ColdGc(cold_gc_to_proto(cold_gc.clone()))
         } else if self.footer {
             self.footer = false;
             proto::snapshot_frame_v1::Frame::Footer(proto::SnapshotFooterV1 {})
@@ -770,7 +795,7 @@ mod tests {
                 append_count: 3,
             }],
         };
-        let bytes = group_snapshot_frames(snapshot.clone())
+        let bytes = group_snapshot_frames(Arc::new(snapshot.clone()))
             .collect::<Result<Vec<_>, _>>()
             .expect("encode frames")
             .into_iter()
@@ -932,7 +957,7 @@ mod tests {
     fn feature_level_round_trips_through_the_header() {
         let decoded = decode_group_snapshot(&header_only_snapshot(1)).expect("decode level 1");
         assert_eq!(decoded.stream_snapshot.feature_level, 1);
-        let reencoded = group_snapshot_frames(decoded.clone())
+        let reencoded = group_snapshot_frames(Arc::new(decoded.clone()))
             .collect::<Result<Vec<_>, _>>()
             .expect("encode frames")
             .concat();
