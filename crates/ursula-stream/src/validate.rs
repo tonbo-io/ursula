@@ -1,5 +1,8 @@
 use ursula_shard::BucketStreamId;
-use ursula_shard::is_reserved_affinity_stream_id;
+use ursula_shard::KEYED_STATE_RESOURCE;
+use ursula_shard::is_baseline_reserved_affinity_stream_id;
+
+use crate::feature::FEATURE_LEVEL_KEYED_STREAMS;
 
 pub fn validate_bucket_id(bucket_id: &str) -> Result<(), String> {
     if !(4..=64).contains(&bucket_id.len()) {
@@ -16,7 +19,16 @@ pub fn validate_bucket_id(bucket_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn validate_stream_id(stream_id: &BucketStreamId) -> Result<(), String> {
+/// Apply-time reservation of affinity stream IDs (C8): the baseline
+/// subresource names at every level, plus `keyed-state` from feature level 1.
+pub fn is_reserved_affinity_stream_id_at_level(stream_id: &str, feature_level: u32) -> bool {
+    is_baseline_reserved_affinity_stream_id(stream_id)
+        || (feature_level >= FEATURE_LEVEL_KEYED_STREAMS && stream_id == KEYED_STATE_RESOURCE)
+}
+
+/// Validates a stream identity on apply. `feature_level` is the group's
+/// replicated level, which decides the reserved affinity names (C8).
+pub fn validate_stream_id(stream_id: &BucketStreamId, feature_level: u32) -> Result<(), String> {
     if let Some(affinity_key) = &stream_id.affinity_key {
         validate_path_segment("affinity_key", affinity_key)?;
     }
@@ -25,7 +37,9 @@ pub fn validate_stream_id(stream_id: &BucketStreamId) -> Result<(), String> {
     if local == "streams" {
         return Err("stream_id 'streams' is reserved".to_owned());
     }
-    if stream_id.affinity_key.is_some() && is_reserved_affinity_stream_id(local) {
+    if stream_id.affinity_key.is_some()
+        && is_reserved_affinity_stream_id_at_level(local, feature_level)
+    {
         return Err(format!(
             "stream_id '{local}' is reserved under an affinity path"
         ));
@@ -68,11 +82,11 @@ mod tests {
     #[test]
     fn affinity_identity_uses_the_existing_total_length_limit() {
         let valid = BucketStreamId::with_affinity("test", "run-42", "queue");
-        assert_eq!(validate_stream_id(&valid), Ok(()));
+        assert_eq!(validate_stream_id(&valid, 0), Ok(()));
 
         let too_long = BucketStreamId::with_affinity("test", "a".repeat(112), "queue");
         assert!(
-            validate_stream_id(&too_long)
+            validate_stream_id(&too_long, 0)
                 .expect_err("identity exceeds limit")
                 .contains("must not exceed 122 bytes")
         );
@@ -89,14 +103,36 @@ mod tests {
         ] {
             let stream_id = BucketStreamId::with_affinity("test", "run-42", stream);
             assert!(
-                validate_stream_id(&stream_id)
+                validate_stream_id(&stream_id, 0)
                     .expect_err("reserved stream")
                     .contains("reserved under an affinity path")
             );
         }
 
         assert_eq!(
-            validate_stream_id(&BucketStreamId::new("test", "snapshot")),
+            validate_stream_id(&BucketStreamId::new("test", "snapshot"), 0),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn keyed_state_is_reserved_under_an_affinity_path_only_from_level_one() {
+        let keyed_state = BucketStreamId::with_affinity("test", "run-42", "keyed-state");
+        assert_eq!(
+            validate_stream_id(&keyed_state, crate::FEATURE_LEVEL_BASELINE),
+            Ok(())
+        );
+        assert!(
+            validate_stream_id(&keyed_state, crate::FEATURE_LEVEL_KEYED_STREAMS)
+                .expect_err("reserved at level 1")
+                .contains("reserved under an affinity path")
+        );
+        // The two-segment form is the stream itself, never a subresource.
+        assert_eq!(
+            validate_stream_id(
+                &BucketStreamId::new("test", "keyed-state"),
+                crate::FEATURE_LEVEL_KEYED_STREAMS
+            ),
             Ok(())
         );
     }

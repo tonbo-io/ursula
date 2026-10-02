@@ -6,6 +6,7 @@ use bytes::Bytes;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::AppendStreamInput;
+use ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
 use ursula_stream::ProducerRequest;
 use ursula_stream::StreamCommand;
 use ursula_stream::StreamErrorCode;
@@ -56,10 +57,11 @@ use super::GroupUpdateStreamAttrsFuture;
 use super::GroupWriteResponse;
 use crate::cold_index::ColdIndexPageCache;
 use crate::cold_index::ColdStoreColdIndexPageStore;
-use crate::cold_index::replace_cold_chunk_index_pages_with_rollback;
+use crate::cold_index::replace_cold_chunk_index_pages_with_rollback_in_generation;
 use crate::cold_index::rollback_cold_index_pages;
-use crate::cold_index::write_cold_chunk_index_pages_with_rollback;
+use crate::cold_index::write_cold_chunk_index_pages_with_rollback_in_generation;
 use crate::cold_index::write_external_segment_index_pages;
+use crate::cold_index::write_external_segment_index_pages_in_generation;
 use crate::cold_store::ColdStoreHandle;
 use crate::cold_store::DEFAULT_CONTENT_TYPE;
 use crate::command::GroupSnapshot;
@@ -1078,6 +1080,7 @@ impl InMemoryGroupEngine {
         let closed = metadata.status == ursula_stream::StreamStatus::Closed;
         let stream_ttl_seconds = metadata.stream_ttl_seconds;
         let stream_expires_at_ms = metadata.stream_expires_at_ms;
+        let created_at_ms = metadata.created_at_ms;
         let _ = metadata;
         let snapshot = self
             .state_machine
@@ -1102,6 +1105,7 @@ impl InMemoryGroupEngine {
                 .state_machine
                 .record_range(&request.stream_id)
                 .map_err(|err| GroupEngineError::new(format!("record range: {err:?}")))?,
+            created_at_ms: Some(created_at_ms),
         })
     }
 
@@ -1307,6 +1311,12 @@ impl InMemoryGroupEngine {
         counts
     }
 
+    /// Cold-index generation of the live stream `stream_id` (F14g), which
+    /// pre-proposal cold-index page writes use.
+    pub fn cold_index_generation(&self, stream_id: &BucketStreamId) -> Option<u64> {
+        self.state_machine.cold_index_generation(stream_id)
+    }
+
     pub fn stream_tail_offset(&self, stream_id: &BucketStreamId) -> Option<u64> {
         self.state_machine
             .head(stream_id)
@@ -1377,7 +1387,12 @@ impl GroupEngine for InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> GroupCreateStreamFuture<'a> {
         Box::pin(async move {
-            if let Some(cold_store) = self.cold_store.as_ref() {
+            // From feature level 1 the state keeps the initial payload as a
+            // direct reference (F14g); the level never drops between this
+            // check and apply, so skipping the page is always safe.
+            if let Some(cold_store) = self.cold_store.as_ref()
+                && self.state_machine.feature_level() < FEATURE_LEVEL_KEYED_STREAMS
+            {
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
                 write_external_segment_index_pages(
                     &store,
@@ -1760,7 +1775,7 @@ impl GroupEngine for InMemoryGroupEngine {
         max: usize,
         _placement: ShardPlacement,
     ) -> GroupPlanColdGcFuture<'a> {
-        let entries = self.state_machine.pending_cold_gc_batch(max);
+        let entries = self.state_machine.plan_cold_gc_batch(max);
         Box::pin(async move { Ok(entries) })
     }
 
@@ -1849,10 +1864,15 @@ impl GroupEngine for InMemoryGroupEngine {
                             format!("stream '{}' does not exist", request.stream_id),
                         )
                     })?;
+                let generation = self
+                    .state_machine
+                    .cold_index_generation(&request.stream_id)
+                    .unwrap_or(0);
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-                write_external_segment_index_pages(
+                write_external_segment_index_pages_in_generation(
                     &store,
                     &request.stream_id,
+                    generation,
                     start_offset,
                     &request.payload,
                 )
@@ -1902,10 +1922,15 @@ impl GroupEngine for InMemoryGroupEngine {
             if !request.chunk.shared_object
                 && let Some(cold_store) = self.cold_store.as_ref()
             {
+                let generation = self
+                    .state_machine
+                    .cold_index_generation(&request.stream_id)
+                    .unwrap_or(0);
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-                let rollback = write_cold_chunk_index_pages_with_rollback(
+                let rollback = write_cold_chunk_index_pages_with_rollback_in_generation(
                     &store,
                     &request.stream_id,
+                    generation,
                     &request.chunk,
                 )
                 .await
@@ -1949,24 +1974,31 @@ impl GroupEngine for InMemoryGroupEngine {
         Box::pin(async move {
             let mut index_rollback = None;
             if let Some(cold_store) = self.cold_store.as_ref() {
+                let generation = self
+                    .state_machine
+                    .cold_index_generation(&request.stream_id)
+                    .unwrap_or(0);
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
                 let rollback = if request.old_chunks.iter().all(|chunk| chunk.shared_object) {
-                    write_cold_chunk_index_pages_with_rollback(
+                    write_cold_chunk_index_pages_with_rollback_in_generation(
                         &store,
                         &request.stream_id,
+                        generation,
                         &request.replacement,
                     )
                     .await
                     .map_err(|err| GroupEngineError::new(err.to_string()))?
                 } else {
-                    let Some(rollback) = replace_cold_chunk_index_pages_with_rollback(
-                        &store,
-                        &request.stream_id,
-                        &request.old_chunks,
-                        &request.replacement,
-                    )
-                    .await
-                    .map_err(|err| GroupEngineError::new(err.to_string()))?
+                    let Some(rollback) =
+                        replace_cold_chunk_index_pages_with_rollback_in_generation(
+                            &store,
+                            &request.stream_id,
+                            generation,
+                            &request.old_chunks,
+                            &request.replacement,
+                        )
+                        .await
+                        .map_err(|err| GroupEngineError::new(err.to_string()))?
                     else {
                         return Err(GroupEngineError::new(
                             "cold compaction input no longer matches the cold index",

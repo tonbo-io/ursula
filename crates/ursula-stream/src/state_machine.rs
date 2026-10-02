@@ -43,6 +43,7 @@ use crate::model::COLD_INDEX_PAGE_SPAN_BYTES;
 use crate::model::ColdChunkRef;
 use crate::model::ColdFlushCandidate;
 use crate::model::ColdGcEntry;
+use crate::model::ColdGcPlanEntry;
 use crate::model::ColdGcTarget;
 use crate::model::ExternalPayloadRef;
 use crate::model::HotPayloadSegment;
@@ -131,6 +132,11 @@ pub struct StreamStateMachine {
     /// [`StreamCommand::SetFeatureLevel`], never lowered; gated apply-time
     /// behavior checks it through [`StreamStateMachine::require_feature_level`].
     feature_level: u32,
+    /// Largest stream `created_at_ms` this group assigned (C7, F14a/F14g).
+    /// Maintained only at feature level 1 or later, where every create
+    /// assigns `max(now_ms, last_created_at_ms + 1)`, so stream incarnations
+    /// are unique per group even under a frozen or skewed clock.
+    last_created_at_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -396,6 +402,55 @@ impl StreamStateMachine {
         self.feature_level
     }
 
+    /// Largest `created_at_ms` assigned by this group at feature level 1 or
+    /// later (C7).
+    pub fn last_created_at_ms(&self) -> u64 {
+        self.last_created_at_ms
+    }
+
+    fn max_live_created_at_ms(&self, floor: u64) -> u64 {
+        self.registry
+            .slots()
+            .map(|slot| slot.metadata.created_at_ms)
+            .fold(floor, u64::max)
+    }
+
+    /// The `created_at_ms` of a new stream incarnation (C7). At feature
+    /// level 1 or later it is `max(now_ms, last_created_at_ms + 1)`, unique
+    /// and strictly increasing per group; below it the command's `now_ms` is
+    /// used unchanged, as every earlier release does. The create records it
+    /// with [`Self::record_created_at_ms`] once the stream is inserted.
+    fn next_created_at_ms(&self, now_ms: u64) -> u64 {
+        if self.incarnation_scoped_cold_objects() {
+            now_ms.max(self.last_created_at_ms.saturating_add(1))
+        } else {
+            now_ms
+        }
+    }
+
+    fn record_created_at_ms(&mut self, created_at_ms: u64) {
+        if self.incarnation_scoped_cold_objects() {
+            self.last_created_at_ms = self.last_created_at_ms.max(created_at_ms);
+        }
+    }
+
+    /// Cold state for a new incarnation created at `created_at_ms`: scoped
+    /// to its incarnation at feature level 1 or later (F14g step 2),
+    /// generation 0 below it.
+    fn new_incarnation_cold_state(&self, created_at_ms: u64) -> StreamColdState {
+        if self.incarnation_scoped_cold_objects() {
+            StreamColdState::with_generation(created_at_ms)
+        } else {
+            StreamColdState::default()
+        }
+    }
+
+    /// Whether objects of new incarnations are scoped to their incarnation
+    /// (F14g step 2, feature level 1).
+    fn incarnation_scoped_cold_objects(&self) -> bool {
+        self.feature_level >= crate::feature::FEATURE_LEVEL_KEYED_STREAMS
+    }
+
     /// Apply-time feature gate (C0). Gated commands call this before any
     /// mutation; below `required` the command fails deterministically on
     /// every replica with [`StreamErrorCode::FeatureNotEnabled`], whose
@@ -415,6 +470,13 @@ impl StreamStateMachine {
     fn set_feature_level(&mut self, level: u32) -> StreamResponse {
         let previous_level = self.feature_level;
         self.feature_level = previous_level.max(level);
+        if previous_level < crate::feature::FEATURE_LEVEL_KEYED_STREAMS
+            && self.feature_level >= crate::feature::FEATURE_LEVEL_KEYED_STREAMS
+        {
+            // C7 starts at the raise from the live streams' creation times,
+            // so the first unique incarnation follows every existing one.
+            self.last_created_at_ms = self.max_live_created_at_ms(self.last_created_at_ms);
+        }
         StreamResponse::FeatureLevelSet {
             level: self.feature_level,
             previous_level,

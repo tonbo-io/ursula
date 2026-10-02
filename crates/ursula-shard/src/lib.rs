@@ -29,9 +29,24 @@ pub struct ShardId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct RaftGroupId(pub u32);
 
-/// Returns whether a local stream ID collides with a two-segment stream
-/// subresource when used in the three-segment path-affinity form.
+/// Name of the keyed-state read resource, `{stream_url}/keyed-state`
+/// (keyed-streams P3).
+pub const KEYED_STATE_RESOURCE: &str = "keyed-state";
+
+/// HTTP and routing predicate: returns whether a local stream ID collides
+/// with a two-segment stream subresource when used in the three-segment
+/// path-affinity form. Node and gateway routing use it, so `keyed-state`
+/// is reserved here at once (keyed-streams U5); replicated apply uses
+/// [`is_baseline_reserved_affinity_stream_id`] plus the group's feature level
+/// instead (C8).
 pub fn is_reserved_affinity_stream_id(stream_id: &str) -> bool {
+    is_baseline_reserved_affinity_stream_id(stream_id) || stream_id == KEYED_STATE_RESOURCE
+}
+
+/// Apply-time predicate at feature level 0: the subresource names every
+/// release reserves under an affinity path. Changing this list changes
+/// replicated apply, so additions go through a feature level instead.
+pub fn is_baseline_reserved_affinity_stream_id(stream_id: &str) -> bool {
     matches!(
         stream_id,
         "$transaction" | "append-batch" | "attrs" | "bootstrap" | "retention" | "snapshot"
@@ -203,6 +218,26 @@ fn fnv1a64_routing_key(stream_id: &BucketStreamId) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routing_reserves_keyed_state_while_the_baseline_apply_list_does_not() {
+        assert!(is_reserved_affinity_stream_id(KEYED_STATE_RESOURCE));
+        assert!(!is_baseline_reserved_affinity_stream_id(
+            KEYED_STATE_RESOURCE
+        ));
+        for name in [
+            "$transaction",
+            "append-batch",
+            "attrs",
+            "bootstrap",
+            "retention",
+            "snapshot",
+        ] {
+            assert!(is_reserved_affinity_stream_id(name));
+            assert!(is_baseline_reserved_affinity_stream_id(name));
+        }
+        assert!(!is_reserved_affinity_stream_id("journal"));
+    }
 
     #[test]
     fn rejects_empty_dimensions() {

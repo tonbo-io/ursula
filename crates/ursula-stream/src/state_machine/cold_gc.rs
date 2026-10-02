@@ -30,6 +30,22 @@ impl ColdGcQueue {
         self.enqueue_after(bucket_id, target, 0);
     }
 
+    /// Append the removal of one stream incarnation. `cold_generation` is
+    /// `Some` only for entries enqueued at feature level 1 or later (F14g).
+    pub(super) fn enqueue_stream(
+        &mut self,
+        bucket_id: String,
+        stream_id: ursula_shard::BucketStreamId,
+        cold_generation: Option<u64>,
+    ) {
+        self.push(
+            bucket_id,
+            ColdGcTarget::Stream(stream_id),
+            0,
+            cold_generation,
+        );
+    }
+
     /// Append a reclamation target that must remain readable until the given
     /// wall-clock timestamp. Cold-object compaction uses this grace period so
     /// a lagging replica can apply the replacement and invalidate its cached
@@ -40,6 +56,16 @@ impl ColdGcQueue {
         target: ColdGcTarget,
         not_before_ms: u64,
     ) {
+        self.push(bucket_id, target, not_before_ms, None);
+    }
+
+    fn push(
+        &mut self,
+        bucket_id: String,
+        target: ColdGcTarget,
+        not_before_ms: u64,
+        cold_generation: Option<u64>,
+    ) {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         self.pending.push_back(ColdGcEntry {
@@ -47,6 +73,7 @@ impl ColdGcQueue {
             bucket_id,
             not_before_ms,
             target,
+            cold_generation,
         });
     }
 
@@ -104,6 +131,7 @@ mod tests {
                 bucket_id: String::new(),
                 not_before_ms: 0,
                 target: ColdGcTarget::Paths(vec!["_packs/legacy.bin".to_owned()]),
+                cold_generation: None,
             }],
             8,
         );

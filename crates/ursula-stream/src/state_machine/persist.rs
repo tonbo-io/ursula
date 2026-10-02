@@ -108,6 +108,7 @@ impl StreamStateMachine {
             bucket_usage: self.bucket_usage_report(),
             bucket_quotas: self.bucket_quota_report(),
             feature_level: self.feature_level,
+            last_created_at_ms: self.last_created_at_ms,
         }
     }
 
@@ -135,6 +136,7 @@ impl StreamStateMachine {
                 // The feature level is never lowered, not even by importing
                 // a backup taken at a lower level.
                 restored.feature_level = restored.feature_level.max(self.feature_level);
+                restored.normalize_last_created_at_ms();
                 *self = restored;
                 StreamResponse::SnapshotImported { buckets, streams }
             }
@@ -142,6 +144,16 @@ impl StreamStateMachine {
                 StreamErrorCode::ImportInvalid,
                 format!("snapshot import failed validation: {error}"),
             ),
+        }
+    }
+
+    /// Keeps C7's invariant after a restore or import: at feature level 1 or
+    /// later, `last_created_at_ms` is at least every live stream's
+    /// `created_at_ms`, so the next create is unique even when the snapshot
+    /// predates the field or comes from a lower-level backup.
+    fn normalize_last_created_at_ms(&mut self) {
+        if self.incarnation_scoped_cold_objects() {
+            self.last_created_at_ms = self.max_live_created_at_ms(self.last_created_at_ms);
         }
     }
 
@@ -154,6 +166,7 @@ impl StreamStateMachine {
         }
         let mut machine = Self {
             feature_level: snapshot.feature_level,
+            last_created_at_ms: snapshot.last_created_at_ms,
             ..Self::default()
         };
         for bucket_id in &snapshot.buckets {
@@ -302,6 +315,7 @@ impl StreamStateMachine {
 
         machine.cold_gc =
             ColdGcQueue::from_parts(snapshot.pending_cold_gc, snapshot.next_cold_gc_seq);
+        machine.normalize_last_created_at_ms();
 
         // Usage restore: gauges are recomputed from the restored slots so a
         // snapshot can never carry gauge drift forward; only the monotonic

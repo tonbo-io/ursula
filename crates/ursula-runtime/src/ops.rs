@@ -284,7 +284,7 @@ macro_rules! runtime_operations {
             }
             op PlanColdGc {
                 fields { max: usize }
-                reply { response_tx: Vec<ColdGcEntry> }
+                reply { response_tx: Vec<ColdGcPlanEntry> }
                 guard { none }
                 handle { call plan_cold_gc(engine, max, placement) }
                 client { group fn plan_cold_gc }

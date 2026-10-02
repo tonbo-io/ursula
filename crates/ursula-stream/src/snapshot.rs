@@ -42,6 +42,10 @@ pub struct StreamSnapshot {
     /// which decode as level 0.
     #[serde(default)]
     pub feature_level: u32,
+    /// Largest `created_at_ms` assigned at feature level 1 or later (C7,
+    /// F14g). Absent in legacy snapshots, which decode as 0.
+    #[serde(default)]
+    pub last_created_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

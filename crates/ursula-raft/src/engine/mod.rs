@@ -91,10 +91,11 @@ use ursula_runtime::StreamErrorCode;
 use ursula_runtime::TouchStreamAccessResponse;
 use ursula_runtime::UpdateStreamAttrsRequest;
 use ursula_runtime::default_snapshot_store;
-use ursula_runtime::replace_cold_chunk_index_pages_with_rollback;
+use ursula_runtime::replace_cold_chunk_index_pages_with_rollback_in_generation;
 use ursula_runtime::rollback_cold_index_pages;
-use ursula_runtime::write_cold_chunk_index_pages;
+use ursula_runtime::write_cold_chunk_index_pages_in_generation;
 use ursula_runtime::write_external_segment_index_pages;
+use ursula_runtime::write_external_segment_index_pages_in_generation;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::StreamCommand;
@@ -534,6 +535,27 @@ impl RaftGroupEngine {
             .map_err(|err| GroupEngineError::new(format!("OpenRaft state-machine access: {err}")))
     }
 
+    /// The local applied feature level and, for `stream_id`, the live
+    /// stream's cold-index generation (F14g; 0 when absent). Pre-proposal
+    /// cold-index page writes use them; both are monotone with respect to
+    /// what apply later sees for the same incarnation.
+    pub(crate) async fn local_cold_index_generation(
+        &self,
+        stream_id: Option<BucketStreamId>,
+    ) -> Result<(u32, u64), GroupEngineError> {
+        self.with_state_machine(move |state_machine| {
+            Box::pin(async move {
+                let engine = &state_machine.engine;
+                let generation = stream_id
+                    .as_ref()
+                    .and_then(|stream_id| engine.cold_index_generation(stream_id))
+                    .unwrap_or(0);
+                (engine.feature_level(), generation)
+            })
+        })
+        .await
+    }
+
     pub(crate) async fn access_requires_write(
         &self,
         stream_id: BucketStreamId,
@@ -673,7 +695,13 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupCreateStreamFuture<'a> {
         Box::pin(async move {
-            if let Some(cold_store) = self.cold_store.as_ref() {
+            // From feature level 1 the state keeps the initial payload as a
+            // direct reference (F14g). The local level never exceeds the
+            // level at apply, so skipping the page is always safe.
+            if let Some(cold_store) = self.cold_store.as_ref()
+                && self.local_cold_index_generation(None).await?.0
+                    < ursula_runtime::FEATURE_LEVEL_KEYED_STREAMS
+            {
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
                 write_external_segment_index_pages(
                     &store,
@@ -1280,12 +1308,15 @@ impl GroupEngine for RaftGroupEngine {
                 .await?;
             if let Some(cold_store) = self.cold_store.as_ref() {
                 let stream_id = request.stream_id.clone();
-                let start_offset = self
+                let (start_offset, generation) = self
                     .with_state_machine(move |state_machine| {
                         Box::pin(async move {
-                            state_machine
-                                .engine
+                            let engine = &state_machine.engine;
+                            engine
                                 .stream_tail_offset(&stream_id)
+                                .map(|tail| {
+                                    (tail, engine.cold_index_generation(&stream_id).unwrap_or(0))
+                                })
                                 .ok_or_else(|| {
                                     GroupEngineError::stream(
                                         StreamErrorCode::StreamNotFound,
@@ -1296,9 +1327,10 @@ impl GroupEngine for RaftGroupEngine {
                     })
                     .await??;
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-                write_external_segment_index_pages(
+                write_external_segment_index_pages_in_generation(
                     &store,
                     &request.stream_id,
+                    generation,
                     start_offset,
                     &request.payload,
                 )
@@ -1502,10 +1534,18 @@ impl GroupEngine for RaftGroupEngine {
             if !request.chunk.shared_object
                 && let Some(cold_store) = self.cold_store.as_ref()
             {
+                let (_, generation) = self
+                    .local_cold_index_generation(Some(request.stream_id.clone()))
+                    .await?;
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-                write_cold_chunk_index_pages(&store, &request.stream_id, &request.chunk)
-                    .await
-                    .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                write_cold_chunk_index_pages_in_generation(
+                    &store,
+                    &request.stream_id,
+                    generation,
+                    &request.chunk,
+                )
+                .await
+                .map_err(|err| GroupEngineError::new(err.to_string()))?;
             }
             match self.write(GroupWriteCommand::from(request)).await? {
                 GroupWriteResponse::FlushCold(response) => Ok(response),
@@ -1526,10 +1566,14 @@ impl GroupEngine for RaftGroupEngine {
                 .await?;
             let mut index_rollback = None;
             if let Some(cold_store) = self.cold_store.as_ref() {
+                let (_, generation) = self
+                    .local_cold_index_generation(Some(request.stream_id.clone()))
+                    .await?;
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-                let Some(rollback) = replace_cold_chunk_index_pages_with_rollback(
+                let Some(rollback) = replace_cold_chunk_index_pages_with_rollback_in_generation(
                     &store,
                     &request.stream_id,
+                    generation,
                     &request.old_chunks,
                     &request.replacement,
                 )

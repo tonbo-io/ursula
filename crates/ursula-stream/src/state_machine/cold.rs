@@ -4,6 +4,7 @@ use super::BucketStreamId;
 use super::ColdChunkRef;
 use super::ColdFlushCandidate;
 use super::ColdGcEntry;
+use super::ColdGcPlanEntry;
 use super::ColdGcTarget;
 use super::HashMap;
 use super::StreamErrorCode;
@@ -51,6 +52,7 @@ impl StreamStateMachine {
         let payload_digest = blake3::hash(&payload).to_hex().to_string();
         Ok(Some(ColdFlushCandidate {
             stream_id: stream_id.clone(),
+            cold_generation: slot.cold.cold_generation(),
             start_offset,
             end_offset,
             payload,
@@ -651,6 +653,34 @@ impl StreamStateMachine {
     /// to reclaim. Read-only; draining is confirmed by a replicated `AckColdGc`.
     pub fn pending_cold_gc_batch(&self, max: usize) -> Vec<ColdGcEntry> {
         self.cold_gc.batch(max)
+    }
+
+    /// [`Self::pending_cold_gc_batch`] annotated for the GC worker with the
+    /// cold generation of the live stream that now holds each stream entry's
+    /// name (F14g step 1). Read-only and leader-local.
+    pub fn plan_cold_gc_batch(&self, max: usize) -> Vec<ColdGcPlanEntry> {
+        self.cold_gc
+            .batch(max)
+            .into_iter()
+            .map(|entry| {
+                let live_cold_generation = match &entry.target {
+                    ColdGcTarget::Stream(stream_id) => self.cold_index_generation(stream_id),
+                    ColdGcTarget::Paths(_) => None,
+                };
+                ColdGcPlanEntry {
+                    entry,
+                    live_cold_generation,
+                }
+            })
+            .collect()
+    }
+
+    /// Cold-index page generation of the live stream `stream_id` (F14g):
+    /// 0 for streams created below feature level 1, otherwise the stream's
+    /// unique incarnation. Engines write the stream's pages under it.
+    pub fn cold_index_generation(&self, stream_id: &BucketStreamId) -> Option<u64> {
+        self.stream_slot(stream_id)
+            .map(|slot| slot.cold.cold_generation())
     }
 
     pub fn pending_cold_gc_len(&self) -> usize {

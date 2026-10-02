@@ -8,7 +8,7 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::ColdFlushCandidate;
-use ursula_stream::ColdGcEntry;
+use ursula_stream::ColdGcPlanEntry;
 
 use crate::admission::UncommittedBytesGuard;
 use crate::command::GroupSnapshot;

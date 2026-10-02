@@ -14,7 +14,6 @@ use super::ProducerReceipt;
 use super::ProducerRequest;
 use super::ProducerState;
 use super::StreamAttrs;
-use super::StreamColdState;
 use super::StreamErrorCode;
 use super::StreamErrorContext;
 use super::StreamIntegrity;
@@ -208,6 +207,7 @@ impl StreamStateMachine {
             return response;
         }
 
+        let created_at_ms = self.next_created_at_ms(input.now_ms);
         let metadata = StreamMetadata {
             stream_id: input.stream_id.clone(),
             content_type: input.content_type,
@@ -216,7 +216,7 @@ impl StreamStateMachine {
             last_stream_seq: input.stream_seq,
             stream_ttl_seconds: input.stream_ttl_seconds,
             stream_expires_at_ms: input.stream_expires_at_ms,
-            created_at_ms: input.now_ms,
+            created_at_ms,
             last_ttl_touch_at_ms: input.now_ms,
         };
         let hot_buffer = HotBuffer::from_payload(0, input.initial_payload);
@@ -256,7 +256,7 @@ impl StreamStateMachine {
             metadata,
             attrs,
             hot_buffer,
-            cold: StreamColdState::default(),
+            cold: self.new_incarnation_cold_state(created_at_ms),
             message_records,
             record_index,
             integrity,
@@ -273,6 +273,7 @@ impl StreamStateMachine {
                 ),
             );
         }
+        self.record_created_at_ms(created_at_ms);
         self.usage_on_stream_created(
             &stream_id.bucket_id,
             initial_len,
@@ -370,6 +371,7 @@ impl StreamStateMachine {
         if let Err(response) = self.check_create_quota(&input.stream_id.bucket_id, initial_len) {
             return response;
         }
+        let created_at_ms = self.next_created_at_ms(input.now_ms);
         let metadata = StreamMetadata {
             stream_id: input.stream_id.clone(),
             content_type: input.content_type,
@@ -378,7 +380,7 @@ impl StreamStateMachine {
             last_stream_seq: input.stream_seq,
             stream_ttl_seconds: input.stream_ttl_seconds,
             stream_expires_at_ms: input.stream_expires_at_ms,
-            created_at_ms: input.now_ms,
+            created_at_ms,
             last_ttl_touch_at_ms: input.now_ms,
         };
         let object = ObjectPayloadRef {
@@ -388,8 +390,14 @@ impl StreamStateMachine {
             object_size: input.initial_payload.object_size,
             object_offset: 0,
         };
-        let mut cold = StreamColdState::default();
-        cold.push_external_segment(object.clone());
+        let mut cold = self.new_incarnation_cold_state(created_at_ms);
+        if self.incarnation_scoped_cold_objects() {
+            // The payload was staged before apply chose the incarnation, so
+            // no page of this generation can reference it; keep it in state.
+            cold.push_direct_external_segment(object.clone());
+        } else {
+            cold.push_external_segment(object.clone());
+        }
         let mut integrity = StreamIntegrity::default();
         if initial_len > 0 {
             integrity.append_external(
@@ -448,6 +456,7 @@ impl StreamStateMachine {
                 ),
             );
         }
+        self.record_created_at_ms(created_at_ms);
         self.usage_on_stream_created(
             &stream_id.bucket_id,
             initial_len,
@@ -618,10 +627,31 @@ impl StreamStateMachine {
         // Enqueue the whole prefix for the background GC worker to reclaim;
         // A prefix sweep is safe and keeps the queue O(streams), not O(chunks).
         if slot.cold.has_cold_objects() {
-            self.cold_gc.enqueue(
+            // At feature level 1 the entry names the removed incarnation's
+            // generation, so the worker deletes only that incarnation's
+            // objects, its external payloads included (F14a, F14g step 2).
+            let cold_generation = self
+                .incarnation_scoped_cold_objects()
+                .then(|| slot.cold.cold_generation());
+            self.cold_gc.enqueue_stream(
                 stream_id.bucket_id.clone(),
-                ColdGcTarget::Stream(stream_id.clone()),
+                stream_id.clone(),
+                cold_generation,
             );
+            if cold_generation.is_some() {
+                let direct_external_paths = slot
+                    .cold
+                    .external_segments()
+                    .iter()
+                    .map(|object| object.s3_path.clone())
+                    .collect::<Vec<_>>();
+                if !direct_external_paths.is_empty() {
+                    self.cold_gc.enqueue(
+                        stream_id.bucket_id.clone(),
+                        ColdGcTarget::Paths(direct_external_paths),
+                    );
+                }
+            }
         }
         self.release_shared_cold_objects(&stream_id.bucket_id, shared_paths, 0);
         true
@@ -637,7 +667,7 @@ impl StreamStateMachine {
                 message,
             ));
         }
-        if let Err(message) = validate_stream_id(stream_id) {
+        if let Err(message) = validate_stream_id(stream_id, self.feature_level) {
             return Err(StreamResponse::error(
                 StreamErrorCode::InvalidStreamId,
                 message,

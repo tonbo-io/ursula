@@ -14,10 +14,12 @@
 //!
 //! - [`FEATURE_LEVEL_BASELINE`] (0): behavior of every release before C0.
 //!   Snapshots and groups without a recorded level are at 0.
-//! - [`FEATURE_LEVEL_KEYED_STREAMS`] (1): keyed-streams milestone M1 —
-//!   C7 unique stream incarnation (`created_at_ms` strictly increases per
-//!   group), C8 apply-time reservation of the `keyed-state` stream name, and
-//!   creation of `application/json; profile=keyed-batch-v1` streams.
+//! - [`FEATURE_LEVEL_KEYED_STREAMS`] (1): keyed-streams milestone M1 and
+//!   bounded-state Lb1 — C7 unique stream incarnation (`created_at_ms`
+//!   strictly increases per group), C8 apply-time reservation of the
+//!   `keyed-state` stream name, F14a/F14g incarnation-scoped cold objects and
+//!   stream GC, and creation of `application/json; profile=keyed-batch-v1`
+//!   streams.
 //!
 //! Later core-track changes (C1, C3, C4, C6, U22) take the next levels in
 //! release order.
