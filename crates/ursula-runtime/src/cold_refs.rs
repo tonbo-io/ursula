@@ -5,7 +5,10 @@
 //!   is the state query [`ursula_stream::StreamStateMachine::shared_ref_candidates`];
 //! - the orphan sweep (F14h, §5.15), which deletes cold objects that
 //!   ambiguous publishes left behind once they are older than a grace period
-//!   and nothing references them.
+//!   and nothing references them;
+//! - the external-locator offload (F5, §5.6, feature level 3), which writes
+//!   cold-index page entries for committed state-held external refs and then
+//!   removes them from state with `OffloadColdRefs`.
 //!
 //! The drivers themselves are `ShardRuntime` methods; the group engine only
 //! answers the read-only planning queries below in its group actor.
@@ -163,9 +166,106 @@ pub fn cold_object_written_unix_ms(file_name: &str) -> Option<u64> {
     u64::try_from(nanos / 1_000_000).ok()
 }
 
+/// One leader-side external-locator offload pass over a group (F5): the
+/// engine offloads every stream holding more than `max_staged_refs` state
+/// external refs, or one written at least `min_age_ms` before `now_ms`, at
+/// most `max_streams` streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OffloadColdRefsRequest {
+    pub now_ms: u64,
+    pub min_age_ms: u64,
+    pub max_staged_refs: usize,
+    pub max_streams: usize,
+}
+
+impl OffloadColdRefsRequest {
+    /// The design's triggers (T_ext = 16 refs, or a ref older than 10 s).
+    pub fn new(now_ms: u64, max_streams: usize) -> Self {
+        Self {
+            now_ms,
+            min_age_ms: ursula_stream::STAGED_EXTERNAL_REF_MAX_AGE_MS,
+            max_staged_refs: ursula_stream::MAX_STAGED_EXTERNAL_REFS,
+            max_streams,
+        }
+    }
+
+    /// Whether `object` is due for offload: written at least `min_age_ms`
+    /// ago, or of unknown age (a name Ursula did not time-stamp, or the
+    /// simulator's zero clock). Offloading a committed ref early is always
+    /// safe; it only costs a page write sooner.
+    pub fn is_due(&self, object: &ursula_stream::ObjectPayloadRef) -> bool {
+        let file_name = object
+            .s3_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(object.s3_path.as_str());
+        cold_object_written_unix_ms(file_name)
+            .is_none_or(|written_ms| self.now_ms.saturating_sub(written_ms) >= self.min_age_ms)
+    }
+}
+
+/// Outcome of one external-locator offload pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OffloadColdRefsResponse {
+    /// Streams whose `OffloadColdRefs` committed.
+    pub streams: u64,
+    /// Refs removed from state.
+    pub refs_offloaded: u64,
+    /// Page entries the proven writes clipped (F19).
+    pub page_entries_clipped: u64,
+    /// Streams whose `OffloadColdRefs` was definitely rejected (deleted in
+    /// between, for example). Their page entries stay: the refs were
+    /// committed, so the entries are correct.
+    pub rejected: u64,
+}
+
+impl OffloadColdRefsResponse {
+    pub fn add(&mut self, other: &Self) {
+        self.streams = self.streams.saturating_add(other.streams);
+        self.refs_offloaded = self.refs_offloaded.saturating_add(other.refs_offloaded);
+        self.page_entries_clipped = self
+            .page_entries_clipped
+            .saturating_add(other.page_entries_clipped);
+        self.rejected = self.rejected.saturating_add(other.rejected);
+    }
+}
+
+/// Result of one replicated `OffloadColdRefs` command.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OffloadStreamColdRefsResponse {
+    pub placement: ursula_shard::ShardPlacement,
+    /// Listed refs that were still in state and were removed.
+    pub removed: u64,
+    /// State-held external refs the stream keeps.
+    pub remaining: u64,
+    pub group_commit_index: u64,
+}
+
 #[cfg(test)]
 mod tests {
+    use super::OffloadColdRefsRequest;
     use super::cold_object_written_unix_ms;
+
+    #[test]
+    fn offload_is_due_by_name_age_or_unknown_age() {
+        let request = OffloadColdRefsRequest::new(1_700_000_020_000, 8);
+        let object = |name: String| ursula_stream::ObjectPayloadRef {
+            start_offset: 0,
+            end_offset: 1,
+            s3_path: format!("b/s/external/{name}"),
+            object_size: 1,
+            object_offset: 0,
+        };
+        let named =
+            |written_ms: u128| object(format!("{:032x}-{:016x}.bin", written_ms * 1_000_000, 1));
+        assert!(
+            request.is_due(&named(1_700_000_010_000)),
+            "exactly 10 s old"
+        );
+        assert!(!request.is_due(&named(1_700_000_015_000)), "5 s old");
+        assert!(request.is_due(&object("initial.bin".to_owned())));
+        assert!(request.is_due(&named(0)), "simulator zero clock");
+    }
 
     #[test]
     fn written_time_comes_from_ursula_object_names_only() {

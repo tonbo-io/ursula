@@ -118,6 +118,13 @@ pub type GroupTidyStreamFuture<'a> = Pin<
             + 'a,
     >,
 >;
+pub type GroupOffloadColdRefsFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<crate::cold_refs::OffloadColdRefsResponse, GroupEngineError>>
+            + Send
+            + 'a,
+    >,
+>;
 pub type GroupTidyStreamsFuture<'a> = Pin<
     Box<
         dyn Future<Output = Result<crate::request::TidyStreamsResponse, GroupEngineError>>
@@ -239,6 +246,7 @@ pub enum GroupWriteResponse {
     SetFeatureLevel(SetFeatureLevelResponse),
     TidyStream(crate::request::TidyStreamResponse),
     DeferColdGc(DeferColdGcResponse),
+    OffloadColdRefs(crate::cold_refs::OffloadStreamColdRefsResponse),
 }
 
 pub trait GroupEngine: Send + 'static {
@@ -444,6 +452,19 @@ pub trait GroupEngine: Send + 'static {
         _placement: ShardPlacement,
     ) -> GroupTidyStreamsFuture<'a> {
         Box::pin(async move { Ok(crate::request::TidyStreamsResponse::default()) })
+    }
+
+    /// One leader-side external-locator offload pass (bounded-state F5,
+    /// feature level 3): for each stream whose state-held external refs are
+    /// due, writes their cold-index page entries (clipping overlapping
+    /// entries) and then proposes `OffloadColdRefs`. A follower, a group below
+    /// level 3, or an engine without a cold store offloads nothing.
+    fn offload_cold_refs<'a>(
+        &'a mut self,
+        _request: crate::cold_refs::OffloadColdRefsRequest,
+        _placement: ShardPlacement,
+    ) -> GroupOffloadColdRefsFuture<'a> {
+        Box::pin(async move { Ok(crate::cold_refs::OffloadColdRefsResponse::default()) })
     }
 
     /// Replicated `SetFeatureLevel` write (C0); see
@@ -1071,6 +1092,9 @@ pub trait GroupEngine: Send + 'static {
                 StreamCommand::CreateBucket { .. } | StreamCommand::DeleteBucket { .. } => Err(
                     GroupEngineError::new("bucket commands are not valid group writes"),
                 ),
+                StreamCommand::OffloadColdRefs { .. } => Err(GroupEngineError::new(
+                    "OffloadColdRefs is proposed only by the leader's offload pass",
+                )),
             }
         })
     }

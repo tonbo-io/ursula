@@ -333,6 +333,8 @@ Pi's C6 fixes the locator by keeping the `ObjectPayloadRef` in state at apply, a
 
 **Bound.** At most T_ext plus in-flight refs per stream.
 
+**Implementation note.** Lb3 is feature level 3 (`FEATURE_LEVEL_EXTERNAL_LOCATORS`). The offload runs as its own leader-side worker every 2 s whenever a cold store is configured, rather than inside F2's driver loop, because that loop only runs when `compaction_enabled` is set and the offload bounds replicated state. A ref's age comes from the write time in its object name; a name without one counts as due. The cleanup rule also deletes the staged object of a create that answers already-exists. The orphan sweep (F14h) reads state refs before pages, and the offload writes pages before it removes refs, so a ref moving from state to pages is always seen in one of them.
+
 **Codec and gating.** No new codec field; `external_segments` is field 9 already. The apply change and the new `OffloadColdRefs` command are gated at Lb3. Lb3 may trail the other levels: until it ships, deployments that cannot afford the staging path keep `external_payload_min_size` above the 32 MiB body cap, as Pi does.
 
 **Cost.** +500 production LoC, +600 test LoC. Medium-high risk, since this is the data path for large appends; madsim ambiguous-commit seeds mitigate it (§7.4).

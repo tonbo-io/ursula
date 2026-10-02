@@ -185,6 +185,47 @@ pub fn spawn_cold_index_repair_worker(runtime: &ShardRuntime) {
     });
 }
 
+/// Pause between external-locator offload passes. Well below the 10 s age
+/// trigger, so a staged ref rarely waits much longer than that.
+const COLD_REF_OFFLOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Streams per group one offload pass moves into pages.
+const COLD_REF_OFFLOAD_MAX_STREAMS_PER_GROUP: usize = 64;
+
+/// Start the leader-side external-locator offload (bounded-stream-state F5,
+/// feature level 3). Every interval each group the node leads writes the
+/// cold-index page entries of its due state-held external refs (more than
+/// T_ext = 16 on a stream, or one older than 10 s) and removes them from
+/// state with `OffloadColdRefs`, which keeps at most T_ext plus in-flight
+/// refs per stream. Below level 3 no stream holds staged refs and a pass
+/// does nothing. It bounds replicated state, so it is not behind a config
+/// switch.
+pub fn spawn_cold_ref_offload_worker(runtime: &ShardRuntime) {
+    if !runtime.has_cold_store() {
+        return;
+    }
+    let runtime = runtime.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(COLD_REF_OFFLOAD_INTERVAL).await;
+            let report = runtime
+                .offload_cold_refs_all_groups_once(
+                    COLD_REF_OFFLOAD_MAX_STREAMS_PER_GROUP,
+                    crate::runtime::unix_time_ms(),
+                )
+                .await;
+            if report.streams > 0 || report.rejected > 0 {
+                tracing::debug!(
+                    streams = report.streams,
+                    refs_offloaded = report.refs_offloaded,
+                    page_entries_clipped = report.page_entries_clipped,
+                    rejected = report.rejected,
+                    "external-locator offload pass completed"
+                );
+            }
+        }
+    });
+}
+
 /// Pause between cold orphan-sweep steps.
 const COLD_ORPHAN_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 /// Streams per group whose prefixes one orphan-sweep step lists.

@@ -82,6 +82,10 @@ pub fn pr_suite() -> Result<Vec<Job>> {
             "w3_r5000",
             Workload::W3(parse::<W3Args>("--appends=100 --recs-per-append=5000")?),
         ),
+        job(
+            "w3_lb3_r1",
+            Workload::W3(parse::<W3Args>("--appends=1000 --external-locators")?),
+        ),
         job("w4_p1", Workload::W4(parse::<W4Args>("--appends=100000")?)),
         job(
             "w4_p10000",
@@ -212,6 +216,10 @@ pub fn nightly_suite() -> Result<Vec<Job>> {
         job("l2_legacy", Workload::L2(parse::<L2Args>("--mode=legacy")?)),
         job("planner", Workload::Planner(parse::<PlannerArgs>("")?)),
         job("w3_r1", Workload::W3(parse::<W3Args>("--appends=100000")?)),
+        job(
+            "w3_lb3_r1",
+            Workload::W3(parse::<W3Args>("--appends=100000 --external-locators")?),
+        ),
         job(
             "w3_r5000",
             Workload::W3(parse::<W3Args>("--appends=1000 --recs-per-append=5000")?),

@@ -6,9 +6,10 @@
 //! - [`cold_index`]: cold-index pages (binary format, stores, cache), their
 //!   writes with the clip rule and rollback, and leader-side page repair.
 //! - [`cold_refs`]: value types of the shared pack-reference compaction driver
-//!   (F2) and the cold orphan sweep (F14h), and object-name age parsing.
-//! - [`cold_worker`]: background flush, compaction, GC, page-repair and
-//!   orphan-sweep loops.
+//!   (F2), the cold orphan sweep (F14h) and the external-locator offload
+//!   (F5), and object-name age parsing.
+//! - [`cold_worker`]: background flush, compaction, GC, page-repair,
+//!   orphan-sweep and external-locator offload loops.
 //! - [`request`]: HTTP/gRPC request and response value types for each engine op.
 //! - [`command`]: the replicated [`GroupWriteCommand`] envelope around the
 //!   canonical [`ursula_stream::StreamCommand`], plus `From` conversions from
@@ -73,10 +74,14 @@ pub use cold_index::write_cold_chunk_index_pages_with_rollback;
 pub use cold_index::write_cold_chunk_index_pages_with_rollback_in_generation;
 pub use cold_index::write_external_segment_index_pages;
 pub use cold_index::write_external_segment_index_pages_in_generation;
+pub use cold_index::write_proven_external_index_pages;
 pub use cold_refs::ColdOrphanSweepPlan;
 pub use cold_refs::ColdOrphanSweepReport;
 pub use cold_refs::ColdOrphanSweepRequest;
 pub use cold_refs::ColdOrphanSweepStream;
+pub use cold_refs::OffloadColdRefsRequest;
+pub use cold_refs::OffloadColdRefsResponse;
+pub use cold_refs::OffloadStreamColdRefsResponse;
 pub use cold_refs::SharedRefCompactionConfig;
 pub use cold_refs::SharedRefCompactionReport;
 pub use cold_refs::cold_object_written_unix_ms;
@@ -102,6 +107,7 @@ pub use cold_worker::spawn_cold_flush_worker_if_configured;
 pub use cold_worker::spawn_cold_gc_worker_if_configured;
 pub use cold_worker::spawn_cold_index_repair_worker;
 pub use cold_worker::spawn_cold_orphan_sweep_worker;
+pub use cold_worker::spawn_cold_ref_offload_worker;
 pub use command::GroupSnapshot;
 pub use command::GroupWriteCommand;
 pub use engine::GroupAckColdGcFuture;
@@ -133,6 +139,7 @@ pub use engine::GroupInfraError;
 pub use engine::GroupInstallSnapshotFuture;
 pub use engine::GroupLeaderHint;
 pub use engine::GroupListBucketStreamsFuture;
+pub use engine::GroupOffloadColdRefsFuture;
 pub use engine::GroupPlanColdFlushFuture;
 pub use engine::GroupPlanColdGcFuture;
 pub use engine::GroupPlanColdOrphanSweepFuture;
@@ -263,6 +270,7 @@ pub use ursula_stream::ColdGcPlanEntry;
 pub use ursula_stream::ColdGcTarget;
 pub use ursula_stream::ExternalPayloadRef;
 pub use ursula_stream::FEATURE_LEVEL_BASELINE;
+pub use ursula_stream::FEATURE_LEVEL_EXTERNAL_LOCATORS;
 pub use ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
 pub use ursula_stream::FEATURE_LEVEL_SPARSE_MARKS;
 pub use ursula_stream::MARK_BLOCK_BYTES;
@@ -294,3 +302,6 @@ mod cold_correctness_tests;
 
 #[cfg(test)]
 mod cold_drivers_tests;
+
+#[cfg(test)]
+mod external_locators_tests;

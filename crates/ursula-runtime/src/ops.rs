@@ -352,6 +352,13 @@ macro_rules! runtime_operations {
                 handle { call set_feature_level(engine, metrics, request, placement) }
                 client { pub group fn set_feature_level }
             }
+            op OffloadColdRefs {
+                fields { request: crate::cold_refs::OffloadColdRefsRequest }
+                reply { response_tx: crate::cold_refs::OffloadColdRefsResponse }
+                guard { none }
+                handle { call offload_cold_refs(engine, metrics, request, placement) }
+                client { pub group fn offload_cold_refs }
+            }
             op TidyStreams {
                 fields { request: TidyStreamsRequest }
                 reply { response_tx: TidyStreamsResponse }

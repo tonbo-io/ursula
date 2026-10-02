@@ -37,7 +37,15 @@
 //!   Operators raise it only after every group completed a cold-index
 //!   page-repair cycle (F19).
 //!
-//! Later core-track changes (C3, C4, C6, U22) take the next levels in
+//! - [`FEATURE_LEVEL_EXTERNAL_LOCATORS`] (3): bounded-state Lb3 (F5, Pi C6) —
+//!   external payload locators are committed first and indexed after: an
+//!   `AppendExternal` keeps its `ObjectPayloadRef` in replicated state at
+//!   apply, the engine writes no cold-index page entry before proposing, and
+//!   the leader's offload pass writes page entries for committed refs and
+//!   then removes them from state with `OffloadColdRefs`. Raised, like
+//!   level 2, only after a completed cold-index page-repair cycle.
+//!
+//! Later core-track changes (C1, C3, C4, U22) take the remaining levels in
 //! release order.
 //!
 //! No downgrade: once a group's level is raised, a binary whose
@@ -58,10 +66,14 @@ pub const FEATURE_LEVEL_KEYED_STREAMS: u32 = 1;
 /// Bounded-state Lb2: F1 sparse cold record marks.
 pub const FEATURE_LEVEL_SPARSE_MARKS: u32 = 2;
 
-/// Highest group feature level this binary can apply.
-pub const MAX_SUPPORTED_FEATURE_LEVEL: u32 = FEATURE_LEVEL_SPARSE_MARKS;
+/// Bounded-state Lb3 (F5): external payload locators committed in state and
+/// offloaded to cold-index pages by `OffloadColdRefs`.
+pub const FEATURE_LEVEL_EXTERNAL_LOCATORS: u32 = 3;
 
-const _: () = assert!(MAX_SUPPORTED_FEATURE_LEVEL >= FEATURE_LEVEL_SPARSE_MARKS);
+/// Highest group feature level this binary can apply.
+pub const MAX_SUPPORTED_FEATURE_LEVEL: u32 = FEATURE_LEVEL_EXTERNAL_LOCATORS;
+
+const _: () = assert!(MAX_SUPPORTED_FEATURE_LEVEL >= FEATURE_LEVEL_EXTERNAL_LOCATORS);
 
 /// Pure form of the apply-time gate: `Ok` when a group at `current` may run
 /// an operation that needs `required`, otherwise the plain-text reason that

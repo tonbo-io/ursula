@@ -1554,6 +1554,13 @@ pub(crate) async fn cleanup_external_payload(state: &HttpState, s3_path: &str, e
         );
         return;
     }
+    delete_unreferenced_staged_payload(state, s3_path).await;
+}
+
+/// Deletes a staged external object that no committed command references:
+/// one whose write was definitely rejected, or whose write was answered
+/// without applying it (a deduplicated append, a create of a live stream).
+pub(crate) async fn delete_unreferenced_staged_payload(state: &HttpState, s3_path: &str) {
     let Some(cold_store) = state.runtime.cold_store() else {
         return;
     };
@@ -1561,7 +1568,7 @@ pub(crate) async fn cleanup_external_payload(state: &HttpState, s3_path: &str, e
         tracing::warn!(
             path = %s3_path,
             error = %cleanup_err,
-            "failed to remove a rejected staged external payload"
+            "failed to remove an unreferenced staged external payload"
         );
     }
 }
@@ -2922,15 +2929,22 @@ pub(crate) async fn create_stream_external_by_id(
         CreateStreamExternalRequest::from_create_request(request, external_payload, record_ends);
 
     match state.runtime.create_stream_external(external_request).await {
-        Ok(response) => create_stream_http_response(CreateStreamHttpResponseInput {
-            response,
-            stream_id: &stream_id,
-            content_type: &content_type,
-            stream_ttl_seconds,
-            stream_expires_at_ms,
-            producer: producer.as_ref(),
-            keyed_state_served: state.serves_keyed_state(),
-        }),
+        Ok(response) => {
+            if response.already_exists {
+                // The live stream was not replaced; its initial payload is
+                // another object (F5 cleanup rule).
+                delete_unreferenced_staged_payload(&state, &external_path).await;
+            }
+            create_stream_http_response(CreateStreamHttpResponseInput {
+                response,
+                stream_id: &stream_id,
+                content_type: &content_type,
+                stream_ttl_seconds,
+                stream_expires_at_ms,
+                producer: producer.as_ref(),
+                keyed_state_served: state.serves_keyed_state(),
+            })
+        }
         Err(err) => {
             cleanup_external_payload(&state, &external_path, &err).await;
             runtime_error_or_leader_redirect_async(&state, err, &request_target).await
@@ -3058,7 +3072,14 @@ pub(crate) async fn append_stream_external_by_id(
     let external_request =
         AppendExternalRequest::from_append_request(request, external_payload, record_ends);
     match state.runtime.append_external(external_request).await {
-        Ok(response) => append_http_response(response),
+        Ok(response) => {
+            if response.deduplicated {
+                // The original append committed with its own object; this
+                // retry's object is referenced by nothing (F5 cleanup rule).
+                delete_unreferenced_staged_payload(&state, &external_path).await;
+            }
+            append_http_response(response)
+        }
         Err(err) => {
             cleanup_external_payload(&state, &external_path, &err).await;
             runtime_error_or_leader_redirect_async(&state, err, &request_target).await

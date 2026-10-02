@@ -13,7 +13,9 @@
 //!   plus [`GroupStateGauges`], the per-group bounded-state gauges
 //!   (`docs/architecture/bounded-stream-state.md` §7.5), and the leader-side
 //!   cold-reference queries: shared-ref compaction discovery
-//!   ([`SharedRefCandidate`], F2) and orphan-sweep references (F14h).
+//!   ([`SharedRefCandidate`], F2), orphan-sweep references (F14h) and
+//!   staged external-ref offload discovery ([`StagedExternalRefCandidate`],
+//!   F5).
 //! - [`validate`]: bucket/stream id validation used by HTTP and Raft entry points.
 
 mod command;
@@ -28,6 +30,7 @@ mod validate;
 
 pub use command::StreamCommand;
 pub use feature::FEATURE_LEVEL_BASELINE;
+pub use feature::FEATURE_LEVEL_EXTERNAL_LOCATORS;
 pub use feature::FEATURE_LEVEL_KEYED_STREAMS;
 pub use feature::FEATURE_LEVEL_SPARSE_MARKS;
 pub use feature::MAX_SUPPORTED_FEATURE_LEVEL;
@@ -103,11 +106,14 @@ pub use state_machine::GroupStateGauges;
 pub use state_machine::RecordPlanError;
 pub use state_machine::RecordReadAnchor;
 pub use state_machine::RecordReadRequest;
+pub use state_machine::MAX_STAGED_EXTERNAL_REFS;
 pub use state_machine::SHARED_REF_COMPACTION_THRESHOLD;
 pub use state_machine::SHARED_REF_IDLE_MS;
+pub use state_machine::STAGED_EXTERNAL_REF_MAX_AGE_MS;
 pub use state_machine::SharedRefCandidate;
 pub use state_machine::SharedRefCompactionRequest;
 pub use state_machine::SharedRefIdleTracker;
+pub use state_machine::StagedExternalRefCandidate;
 pub use state_machine::StreamStateMachine;
 pub use state_machine::is_legacy_cross_bucket_pack;
 pub use state_machine::plan_shared_ref_run;

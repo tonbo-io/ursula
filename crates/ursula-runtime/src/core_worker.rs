@@ -1283,6 +1283,31 @@ impl CoreWorker {
         response
     }
 
+    /// One F5 external-locator offload pass (feature level 3). Offloading
+    /// writes cold-index pages and proposes, so only the local leader runs
+    /// it; a follower reports an empty pass.
+    pub(crate) async fn offload_cold_refs(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        request: crate::cold_refs::OffloadColdRefsRequest,
+        placement: ShardPlacement,
+    ) -> Result<crate::cold_refs::OffloadColdRefsResponse, RuntimeError> {
+        if !group.accepts_local_writes() {
+            return Ok(crate::cold_refs::OffloadColdRefsResponse::default());
+        }
+        let started_at = Instant::now();
+        let response = group
+            .offload_cold_refs(request, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err));
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(started_at),
+        );
+        response
+    }
+
     pub(crate) async fn tidy_streams(
         group: &mut Box<dyn GroupEngine>,
         metrics: Arc<RuntimeMetricsInner>,

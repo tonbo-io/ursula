@@ -5,11 +5,17 @@
 //! retention every N external appends, keeping the last `--retain-keep` records.
 //! Runs at feature level 2: external appends collapse message records below
 //! the seal point (F4a, level 1) and seal their records into sparse marks
-//! (F1).
+//! (F1). `--external-locators` runs at feature level 3 instead (F5): each
+//! external append keeps its locator in state, and the workload models the
+//! leader's offload pass after every append, offloading a stream's staged refs
+//! once it holds more than T_ext = 16 or one is 10 s old.
+
+use std::collections::HashMap;
 
 use anyhow::Result;
 use clap::Args;
 use serde_json::json;
+use ursula_stream::StreamCommand;
 use ursula_stream::StreamStateMachine;
 
 use crate::formula;
@@ -44,6 +50,9 @@ pub struct W3Args {
     pub checkpoints: Vec<u64>,
     #[arg(long)]
     pub zstd: bool,
+    /// Run at feature level 3 (F5) and model the offload pass.
+    #[arg(long)]
+    pub external_locators: bool,
     #[arg(long)]
     pub name: Option<String>,
 }
@@ -51,7 +60,9 @@ pub struct W3Args {
 pub fn default_name(args: &W3Args) -> String {
     let recs = args.recs_per_append;
     args.name.clone().unwrap_or_else(|| {
-        if args.retain_every > 0 {
+        if args.external_locators {
+            format!("w3_lb3_external_r{recs}")
+        } else if args.retain_every > 0 {
             format!("w6_w3_retention_r{recs}")
         } else if args.inline_every > 0 {
             format!("w3_external_r{recs}_inline{}", args.inline_every)
@@ -83,7 +94,15 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
     let mut rng = payload::Rng::new(5);
     let base = Baseline::now();
     let mut m = StreamStateMachine::new();
-    smx::raise_feature_level(&mut m, ursula_stream::FEATURE_LEVEL_SPARSE_MARKS)?;
+    let level = if args.external_locators {
+        ursula_stream::FEATURE_LEVEL_EXTERNAL_LOCATORS
+    } else {
+        ursula_stream::FEATURE_LEVEL_SPARSE_MARKS
+    };
+    smx::raise_feature_level(&mut m, level)?;
+    let mut staged_at: HashMap<String, u64> = HashMap::new();
+    let mut max_staged = 0_u64;
+    let mut offloads = 0_u64;
     smx::create_bucket(&mut m, "bkt1")?;
     let id = smx::sid("bkt1", "h0001", "log");
     smx::create_stream(&mut m, &id, None, None, smx::T0)?;
@@ -102,6 +121,13 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
                 smx::append_external(&mut m, &id, payload_bytes, ends.clone(), now),
                 "append external",
             )?;
+            if args.external_locators {
+                for object in m.external_segments(&id) {
+                    staged_at.entry(object.s3_path.clone()).or_insert(now);
+                }
+                max_staged = max_staged.max(m.external_segments(&id).len() as u64);
+                offloads += offload_pass(&mut m, &mut staged_at, now)?;
+            }
             n += 1;
             records += recs;
             if args.inline_every > 0 && n.is_multiple_of(args.inline_every) {
@@ -141,6 +167,8 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
             "records": records,
             "logical_bytes": m.head(&id).map(|h| h.tail_offset),
             "external_segments_in_state": m.external_segments(&id).len(),
+            "max_staged_external_refs": max_staged,
+            "offloads": offloads,
             "cold_refs_in_state": m.cold_chunks(&id).len(),
             "hot_bytes": m.hot_payload_len(&id).unwrap_or(0),
             "flush": stats,
@@ -162,7 +190,51 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
             );
             outcome.metric_u64("dense_entries", measured.gauges.dense_record_entries);
             outcome.metric_u64("staged_external_refs", measured.gauges.staged_external_refs);
+            if args.external_locators {
+                outcome.metric_u64("max_staged_external_refs", max_staged);
+                outcome.check(
+                    "f5_max_staged_external_refs",
+                    "staged external refs per stream stay <= 16 at every append (F5)",
+                    max_staged as f64,
+                    ursula_stream::MAX_STAGED_EXTERNAL_REFS as f64,
+                );
+            }
         }
     }
     Ok(outcome)
+}
+
+/// The leader's offload pass (F5), applied as the engines do after writing
+/// the refs' page entries: every stream holding more than T_ext staged refs,
+/// or one staged at least 10 s (simulated) ago, proposes `OffloadColdRefs`
+/// for all of its refs. Returns the commands applied.
+fn offload_pass(
+    m: &mut StreamStateMachine,
+    staged_at: &mut HashMap<String, u64>,
+    now_ms: u64,
+) -> Result<u64> {
+    let candidates = m.staged_external_ref_candidates(
+        ursula_stream::MAX_STAGED_EXTERNAL_REFS,
+        &|object| {
+            staged_at.get(&object.s3_path).is_none_or(|at| {
+                now_ms.saturating_sub(*at) >= ursula_stream::STAGED_EXTERNAL_REF_MAX_AGE_MS
+            })
+        },
+        64,
+    );
+    let mut applied = 0;
+    for candidate in candidates {
+        for object in &candidate.refs {
+            staged_at.remove(&object.s3_path);
+        }
+        smx::ok(
+            m.apply(StreamCommand::OffloadColdRefs {
+                stream_id: candidate.stream_id,
+                refs: candidate.refs,
+            }),
+            "offload cold refs",
+        )?;
+        applied += 1;
+    }
+    Ok(applied)
 }
