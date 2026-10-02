@@ -405,7 +405,13 @@ mod tests {
         }
 
         proptest! {
-            #![proptest_config(ProptestConfig::with_cases(4096))]
+            // 4096 cases by default; PROPTEST_CASES overrides (M0b ran 10^6).
+            #![proptest_config(ProptestConfig::with_cases(
+                std::env::var("PROPTEST_CASES")
+                    .ok()
+                    .and_then(|cases| cases.parse().ok())
+                    .unwrap_or(4096)
+            ))]
 
             #[test]
             fn stored_is_the_minified_writer_text(value in json(), pieces in whitespace()) {
