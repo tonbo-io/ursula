@@ -6,6 +6,7 @@ use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::AppendStreamInput;
 use ursula_stream::ColdFlushPassRequest;
+use ursula_stream::FEATURE_LEVEL_EXTERNAL_LOCATORS;
 use ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
 use ursula_stream::ObjectPayloadRef;
 use ursula_stream::ProducerRequest;
@@ -307,8 +308,11 @@ impl InMemoryGroupEngine {
             command => {
                 let stream_id = command_stream_id(&command);
                 let command_producer = command_producer(&command);
+                // Pages a compaction or an F5 offload rewrote (and possibly
+                // clipped) on the leader; every replica drops its cached copies.
                 let compacted_stream_id = match &command {
-                    StreamCommand::CompactCold { stream_id, .. } => Some(stream_id.clone()),
+                    StreamCommand::CompactCold { stream_id, .. }
+                    | StreamCommand::OffloadColdRefs { stream_id, .. } => Some(stream_id.clone()),
                     _ => None,
                 };
                 // Pages an exclusive cold flush rewrote (and possibly clipped)
@@ -724,6 +728,18 @@ impl InMemoryGroupEngine {
                     removed,
                     group_commit_index: self.commit_index,
                 }))
+            }
+            StreamResponse::ColdRefsOffloaded { removed, remaining } => {
+                require_response_stream_id(stream_id, "cold refs offloaded")?;
+                self.commit_index += 1;
+                Ok(GroupWriteResponse::OffloadColdRefs(
+                    crate::cold_refs::OffloadStreamColdRefsResponse {
+                        placement,
+                        removed,
+                        remaining,
+                        group_commit_index: self.commit_index,
+                    },
+                ))
             }
             StreamResponse::ColdGcDeferred { new_seq } => {
                 self.commit_index += 1;
@@ -1530,6 +1546,27 @@ impl InMemoryGroupEngine {
             .shared_ref_candidates(request, &mut self.shared_ref_idle)
     }
 
+    /// F5 offload discovery on this replica: streams whose state-held
+    /// external refs `request` makes due (empty below feature level 3).
+    pub fn staged_external_ref_candidates(
+        &self,
+        request: &crate::cold_refs::OffloadColdRefsRequest,
+    ) -> Vec<ursula_stream::StagedExternalRefCandidate> {
+        self.state_machine.staged_external_ref_candidates(
+            request.max_staged_refs,
+            &|object| request.is_due(object),
+            request.max_streams.max(1),
+        )
+    }
+
+    /// Whether external appends keep their locator in replicated state at
+    /// this replica's applied level (F5, feature level 3). Levels only rise,
+    /// so a proposal applied later sees at least this level: when this holds
+    /// the engine must not write a page entry before proposing.
+    pub fn external_locators_in_state(&self) -> bool {
+        self.state_machine.feature_level() >= FEATURE_LEVEL_EXTERNAL_LOCATORS
+    }
+
     /// What applied state references for one orphan-sweep step (F14h): the
     /// group's pack directories at the start of a cycle, the group-wide
     /// referenced paths, and up to `max_streams` live streams after the
@@ -1851,6 +1888,60 @@ impl GroupEngine for InMemoryGroupEngine {
                     "unexpected tidy stream write response: {other:?}"
                 ))),
             }
+        })
+    }
+
+    fn offload_cold_refs<'a>(
+        &'a mut self,
+        request: crate::cold_refs::OffloadColdRefsRequest,
+        placement: ShardPlacement,
+    ) -> super::GroupOffloadColdRefsFuture<'a> {
+        Box::pin(async move {
+            let mut report = crate::cold_refs::OffloadColdRefsResponse::default();
+            let Some(cold_store) = self.cold_store.clone() else {
+                return Ok(report);
+            };
+            let store = ColdStoreColdIndexPageStore::new(cold_store);
+            for candidate in self.staged_external_ref_candidates(&request) {
+                // Index after commit: every ref is committed, so its entries
+                // are correct whatever happens to the proposal below.
+                for object in &candidate.refs {
+                    let clipped = crate::cold_index::write_proven_external_index_pages(
+                        &store,
+                        &candidate.stream_id,
+                        candidate.cold_generation,
+                        object,
+                    )
+                    .await
+                    .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                    report.page_entries_clipped =
+                        report.page_entries_clipped.saturating_add(clipped);
+                }
+                if let Some(cache) = self.cold_index_cache.as_ref() {
+                    cache.invalidate_stream(&candidate.stream_id);
+                }
+                let command = GroupWriteCommand::from(StreamCommand::OffloadColdRefs {
+                    stream_id: candidate.stream_id,
+                    refs: candidate.refs,
+                });
+                match self.apply_committed_write(command, placement) {
+                    Ok(GroupWriteResponse::OffloadColdRefs(response)) => {
+                        report.streams = report.streams.saturating_add(1);
+                        report.refs_offloaded =
+                            report.refs_offloaded.saturating_add(response.removed);
+                    }
+                    Ok(other) => {
+                        return Err(GroupEngineError::new(format!(
+                            "unexpected offload cold refs write response: {other:?}"
+                        )));
+                    }
+                    Err(err) if err.code().is_some() => {
+                        report.rejected = report.rejected.saturating_add(1);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok(report)
         })
     }
 
@@ -2285,7 +2376,15 @@ impl GroupEngine for InMemoryGroupEngine {
     ) -> GroupAppendFuture<'a> {
         Box::pin(async move {
             self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
-            if let Some(cold_store) = self.cold_store.as_ref() {
+            // F5 (level 3): commit first, index after. Apply keeps the
+            // locator in state; the offload pass writes the page entry once
+            // the append committed. Below level 3 the page entry written
+            // here, before proposing, is the only locator.
+            if let Some(cold_store) = self
+                .cold_store
+                .as_ref()
+                .filter(|_| !self.external_locators_in_state())
+            {
                 let start_offset = self
                     .state_machine
                     .head(&request.stream_id)
@@ -2618,7 +2717,8 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::CompactCold { stream_id, .. }
         | StreamCommand::Close { stream_id, .. }
         | StreamCommand::DeleteStream { stream_id }
-        | StreamCommand::TidyStream { stream_id, .. } => Some(stream_id.clone()),
+        | StreamCommand::TidyStream { stream_id, .. }
+        | StreamCommand::OffloadColdRefs { stream_id, .. } => Some(stream_id.clone()),
     }
 }
 

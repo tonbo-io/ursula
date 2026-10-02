@@ -843,6 +843,35 @@ impl ShardRuntime {
         responses
     }
 
+    /// One leader-side external-locator offload pass (bounded-state F5) in
+    /// every group this node leads: each offloads up to
+    /// `max_streams_per_group` streams whose state-held external refs are
+    /// due. A failing group is logged and skipped, so it cannot stall the
+    /// others. Groups below feature level 3 hold no staged refs.
+    pub async fn offload_cold_refs_all_groups_once(
+        &self,
+        max_streams_per_group: usize,
+        now_ms: u64,
+    ) -> crate::cold_refs::OffloadColdRefsResponse {
+        let mut report = crate::cold_refs::OffloadColdRefsResponse::default();
+        if self.cold_store.is_none() {
+            return report;
+        }
+        for group_id in 0..self.shard_map.raft_group_count() {
+            let request =
+                crate::cold_refs::OffloadColdRefsRequest::new(now_ms, max_streams_per_group);
+            match self.offload_cold_refs(RaftGroupId(group_id), request).await {
+                Ok(step) => report.add(&step),
+                Err(err) => tracing::warn!(
+                    raft_group_id = group_id,
+                    error = %err,
+                    "external-locator offload pass failed; continuing with remaining groups"
+                ),
+            }
+        }
+        report
+    }
+
     /// One leader-side `TidyStream` pass over every Raft group
     /// (bounded-state F0): each group this node leads proposes `TidyStream`
     /// for at most `max_streams_per_group` streams with normalization debt.

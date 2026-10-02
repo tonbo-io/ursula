@@ -2,6 +2,8 @@
 mod cold_drivers_tests;
 #[cfg(test)]
 mod compact_tests;
+#[cfg(test)]
+mod external_locators_tests;
 mod factory;
 
 use std::collections::BTreeMap;
@@ -1115,6 +1117,76 @@ impl GroupEngine for RaftGroupEngine {
         })
     }
 
+    fn offload_cold_refs<'a>(
+        &'a mut self,
+        request: ursula_runtime::OffloadColdRefsRequest,
+        _placement: ShardPlacement,
+    ) -> ursula_runtime::GroupOffloadColdRefsFuture<'a> {
+        Box::pin(async move {
+            let mut report = ursula_runtime::OffloadColdRefsResponse::default();
+            // Leader-side driver: followers write no pages and propose nothing.
+            let Some(cold_store) = self.cold_store.clone() else {
+                return Ok(report);
+            };
+            if !self.raft.is_leader() {
+                return Ok(report);
+            }
+            let candidates = self
+                .with_state_machine(move |state_machine| {
+                    Box::pin(async move {
+                        state_machine
+                            .engine
+                            .staged_external_ref_candidates(&request)
+                    })
+                })
+                .await?;
+            let store = ColdStoreColdIndexPageStore::new(cold_store);
+            for candidate in candidates {
+                // Index after commit: every ref is committed, so its entries
+                // are correct whatever happens to the proposal below, and a
+                // retried pass rewrites them unchanged.
+                for object in &candidate.refs {
+                    let clipped = ursula_runtime::write_proven_external_index_pages(
+                        &store,
+                        &candidate.stream_id,
+                        candidate.cold_generation,
+                        object,
+                    )
+                    .await
+                    .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                    report.page_entries_clipped =
+                        report.page_entries_clipped.saturating_add(clipped);
+                }
+                if let Some(cache) = self.cold_index_cache.as_ref() {
+                    cache.invalidate_stream(&candidate.stream_id);
+                }
+                let command = GroupWriteCommand::from(StreamCommand::OffloadColdRefs {
+                    stream_id: candidate.stream_id,
+                    refs: candidate.refs,
+                });
+                match self.write(command).await {
+                    Ok(GroupWriteResponse::OffloadColdRefs(response)) => {
+                        report.streams = report.streams.saturating_add(1);
+                        report.refs_offloaded =
+                            report.refs_offloaded.saturating_add(response.removed);
+                    }
+                    Ok(other) => {
+                        return Err(GroupEngineError::new(format!(
+                            "unexpected offload cold refs write response: {other:?}"
+                        )));
+                    }
+                    Err(err) if err.code().is_some() => {
+                        report.rejected = report.rejected.saturating_add(1);
+                    }
+                    // Ambiguous (lost leadership, transport): the refs stay
+                    // in state until a later pass; the pages are correct.
+                    Err(err) => return Err(err),
+                }
+            }
+            Ok(report)
+        })
+    }
+
     fn tidy_streams<'a>(
         &'a mut self,
         request: TidyStreamsRequest,
@@ -1535,7 +1607,17 @@ impl GroupEngine for RaftGroupEngine {
             }
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
-            if let Some(cold_store) = self.cold_store.as_ref() {
+            // F5 (level 3): commit first, index after. Apply keeps the locator
+            // in state and the offload pass writes the page entry once the
+            // append committed. The leader's applied level never exceeds the
+            // level at apply, so skipping the write here is always safe.
+            // Below level 3 the page entry written here is the only locator.
+            let locators_in_state = self
+                .with_state_machine(move |state_machine| {
+                    Box::pin(async move { state_machine.engine.external_locators_in_state() })
+                })
+                .await?;
+            if let Some(cold_store) = self.cold_store.as_ref().filter(|_| !locators_in_state) {
                 let stream_id = request.stream_id.clone();
                 let (start_offset, generation) = self
                     .with_state_machine(move |state_machine| {

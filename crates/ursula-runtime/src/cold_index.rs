@@ -562,6 +562,71 @@ pub async fn write_external_segment_index_pages_in_generation<S: ColdIndexPageSt
     write_object_index_pages(store, stream_id, generation, object).await
 }
 
+/// Bounded-state F5 offload: writes the page entries of a *committed*
+/// state-held external ref under `generation`. State proves its bytes, so the
+/// same read-modify-write clips every other entry overlapping it, chunk or
+/// external, as F19's clip rule does for flushes. Idempotent: rewriting the
+/// same ref leaves the pages unchanged. Returns the entries clipped.
+pub async fn write_proven_external_index_pages<S: ColdIndexPageStore + ?Sized>(
+    store: &S,
+    stream_id: &BucketStreamId,
+    generation: u64,
+    object: &ObjectPayloadRef,
+) -> io::Result<u64> {
+    if object.end_offset <= object.start_offset {
+        return Ok(0);
+    }
+    let first_page_id = object.start_offset / ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
+    let last_page_id = (object.end_offset - 1) / ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES;
+    let mut clipped = 0_u64;
+    for page_id in first_page_id..=last_page_id {
+        let key = ColdIndexPageKey {
+            stream_id: stream_id.clone(),
+            generation,
+            page_id,
+        };
+        let page_start = page_id.saturating_mul(ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES);
+        let page_end = page_start.saturating_add(ursula_stream::COLD_INDEX_PAGE_SPAN_BYTES);
+        let previous = store.get_page(&key).await?;
+        let mut page = previous.clone().unwrap_or_else(|| ColdIndexPage {
+            start_offset: page_start,
+            end_offset: page_end,
+            cold_chunks: Vec::new(),
+            external_segments: Vec::new(),
+        });
+        let overlaps = |start: u64, end: u64| {
+            ranges_overlap(start, end, object.start_offset, object.end_offset)
+        };
+        let before = page
+            .cold_chunks
+            .len()
+            .saturating_add(page.external_segments.len());
+        page.cold_chunks
+            .retain(|chunk| !overlaps(chunk.start_offset, chunk.end_offset));
+        page.external_segments.retain(|existing| {
+            existing == object || !overlaps(existing.start_offset, existing.end_offset)
+        });
+        let kept = page
+            .cold_chunks
+            .len()
+            .saturating_add(page.external_segments.len());
+        clipped = clipped.saturating_add(u64::try_from(before.saturating_sub(kept)).unwrap_or(0));
+        if !page
+            .external_segments
+            .iter()
+            .any(|existing| existing == object)
+        {
+            page.external_segments.push(object.clone());
+            page.external_segments
+                .sort_by_key(|existing| existing.start_offset);
+        }
+        if previous.as_ref() != Some(&page) {
+            store.put_page(&key, &page).await?;
+        }
+    }
+    Ok(clipped)
+}
+
 async fn write_object_index_pages<S: ColdIndexPageStore + ?Sized>(
     store: &S,
     stream_id: &BucketStreamId,
