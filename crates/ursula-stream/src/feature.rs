@@ -22,7 +22,11 @@
 //!   streams, F3 producer-state bounds (a 1,024-item receipt window beyond
 //!   each producer's newest receipt, duplicates beyond it deduplicated
 //!   without ranges, 7-day idle-producer expiry), F4a message-record
-//!   collapse at every cold transition, and `TidyStream`.
+//!   collapse at every cold transition, `TidyStream`, F18 step 2 cold
+//!   coverage derived from the hot buffer (the scalar cold frontier is no
+//!   longer read; snapshot field 6 carries the seal point), F14b
+//!   `DeferColdGc`, F14i retention grace for dropped pack slices, the
+//!   `FlushCold` incarnation check, and F12a MessagePack snapshot envelopes.
 //!
 //! Later core-track changes (C1, C3, C4, C6, U22) take the next levels in
 //! release order.

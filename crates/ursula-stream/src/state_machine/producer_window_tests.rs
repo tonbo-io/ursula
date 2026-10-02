@@ -825,6 +825,7 @@ fn bootstrap_is_partial_when_the_cold_frontier_regressed_below_the_seal_point() 
     assert!(matches!(
         machine.apply(StreamCommand::FlushCold {
             stream_id: stream_id.clone(),
+            cold_generation: None,
             chunk: ColdChunkRef {
                 start_offset: 0,
                 end_offset: 10,

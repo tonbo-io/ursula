@@ -116,6 +116,7 @@ pub use engine::GroupCloseStreamFuture;
 pub use engine::GroupColdHotBacklogFuture;
 pub use engine::GroupCompactColdFuture;
 pub use engine::GroupCreateStreamFuture;
+pub use engine::GroupDeferColdGcFuture;
 pub use engine::GroupDeleteSnapshotFuture;
 pub use engine::GroupDeleteStreamFuture;
 pub use engine::GroupEngine;
@@ -187,6 +188,7 @@ pub use request::CompactColdResponse;
 pub use request::CreateStreamExternalRequest;
 pub use request::CreateStreamRequest;
 pub use request::CreateStreamResponse;
+pub use request::DeferColdGcResponse;
 pub use request::DeleteSnapshotRequest;
 pub use request::DeleteStreamRequest;
 pub use request::DeleteStreamResponse;
@@ -234,6 +236,7 @@ pub use snapshot_store::S3SnapshotStore;
 pub use snapshot_store::SharedSnapshotStore;
 pub use snapshot_store::SnapshotBytesIterator;
 pub use snapshot_store::SnapshotCompression;
+pub use snapshot_store::SnapshotEnvelope;
 pub use snapshot_store::SnapshotKey;
 pub use snapshot_store::SnapshotLocation;
 pub use snapshot_store::SnapshotPointer;
@@ -272,6 +275,8 @@ pub use ursula_stream::validate_bucket_id;
 mod incarnation_gc_tests;
 #[cfg(test)]
 mod keyed_lifecycle_tests;
+#[cfg(all(test, not(madsim)))]
+mod lb1_cold_tests;
 #[cfg(test)]
 mod producer_window_tests;
 #[cfg(test)]

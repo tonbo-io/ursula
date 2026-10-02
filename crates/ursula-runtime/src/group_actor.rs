@@ -44,6 +44,7 @@ use crate::request::CompactColdResponse;
 use crate::request::CreateStreamExternalRequest;
 use crate::request::CreateStreamRequest;
 use crate::request::CreateStreamResponse;
+use crate::request::DeferColdGcResponse;
 use crate::request::DeleteSnapshotRequest;
 use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;

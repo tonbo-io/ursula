@@ -296,6 +296,7 @@ mod tests {
         for candidate in candidates {
             let len = candidate.payload.len() as u64;
             let response = m.apply(StreamCommand::FlushCold {
+                cold_generation: None,
                 stream_id: candidate.stream_id.clone(),
                 chunk: ColdChunkRef {
                     start_offset: candidate.start_offset,

@@ -43,6 +43,7 @@ use crate::request::CompactColdResponse;
 use crate::request::CreateStreamExternalRequest;
 use crate::request::CreateStreamRequest;
 use crate::request::CreateStreamResponse;
+use crate::request::DeferColdGcResponse;
 use crate::request::DeleteSnapshotRequest;
 use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
@@ -153,6 +154,8 @@ pub type GroupDeleteStreamFuture<'a> =
     Pin<Box<dyn Future<Output = Result<DeleteStreamResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupAckColdGcFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AckColdGcResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupDeferColdGcFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<DeferColdGcResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupPurgeBucketFuture<'a> =
     Pin<Box<dyn Future<Output = Result<PurgeBucketResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupPlanColdGcFuture<'a> =
@@ -235,6 +238,7 @@ pub enum GroupWriteResponse {
     // stable across mixed-version clusters.
     SetFeatureLevel(SetFeatureLevelResponse),
     TidyStream(crate::request::TidyStreamResponse),
+    DeferColdGc(DeferColdGcResponse),
 }
 
 pub trait GroupEngine: Send + 'static {
@@ -537,6 +541,18 @@ pub trait GroupEngine: Send + 'static {
         _placement: ShardPlacement,
     ) -> GroupAckColdGcFuture<'a> {
         Box::pin(async { Err(GroupEngineError::new("cold GC ack is not supported")) })
+    }
+
+    /// Replicated `DeferColdGc` (bounded-state F14b, feature level 1): moves
+    /// the failing cold-GC entry `seq` to the tail of the queue, due no
+    /// earlier than `not_before_ms`. Default unsupported.
+    fn defer_cold_gc<'a>(
+        &'a mut self,
+        _seq: u64,
+        _not_before_ms: u64,
+        _placement: ShardPlacement,
+    ) -> GroupDeferColdGcFuture<'a> {
+        Box::pin(async { Err(GroupEngineError::new("cold GC deferral is not supported")) })
     }
 
     /// Replicated tenant offboarding: removes every stream in the bucket, the
@@ -960,8 +976,19 @@ pub trait GroupEngine: Send + 'static {
                     )
                     .await
                     .map(GroupWriteResponse::UpdateStreamAttrs),
-                StreamCommand::FlushCold { stream_id, chunk } => self
-                    .flush_cold(FlushColdRequest { stream_id, chunk }, placement)
+                StreamCommand::FlushCold {
+                    stream_id,
+                    chunk,
+                    cold_generation,
+                } => self
+                    .flush_cold(
+                        FlushColdRequest {
+                            stream_id,
+                            chunk,
+                            cold_generation,
+                        },
+                        placement,
+                    )
                     .await
                     .map(GroupWriteResponse::FlushCold),
                 StreamCommand::CompactCold {
@@ -1006,6 +1033,10 @@ pub trait GroupEngine: Send + 'static {
                     .ack_cold_gc(up_to_seq, placement)
                     .await
                     .map(GroupWriteResponse::AckColdGc),
+                StreamCommand::DeferColdGc { seq, not_before_ms } => self
+                    .defer_cold_gc(seq, not_before_ms, placement)
+                    .await
+                    .map(GroupWriteResponse::DeferColdGc),
                 StreamCommand::PurgeBucket { bucket_id } => self
                     .purge_bucket(bucket_id, placement)
                     .await

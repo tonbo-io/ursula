@@ -56,6 +56,7 @@ use ursula_runtime::GroupCloseStreamFuture;
 use ursula_runtime::GroupColdHotBacklogFuture;
 use ursula_runtime::GroupCompactColdFuture;
 use ursula_runtime::GroupCreateStreamFuture;
+use ursula_runtime::GroupDeferColdGcFuture;
 use ursula_runtime::GroupDeleteSnapshotFuture;
 use ursula_runtime::GroupDeleteStreamFuture;
 use ursula_runtime::GroupEngine;
@@ -388,6 +389,10 @@ impl RaftGroupEngine {
             .restore_persisted_snapshot()
             .await
             .map_err(|err| GroupEngineError::new(format!("restore OpenRaft snapshot: {err}")))?;
+        // One page cache per group, shared by the read path and the state
+        // machine: invalidations on apply (FlushCold, CompactCold, snapshot
+        // install) then reach reads on every replica, followers included.
+        let cold_index_cache = state_machine.engine.cold_index_cache();
         let raft = Raft::<UrsulaRaftTypeConfig, RaftGroupStateMachine>::new(
             node_id,
             config,
@@ -397,13 +402,6 @@ impl RaftGroupEngine {
         )
         .await
         .map_err(|err| GroupEngineError::new(format!("create OpenRaft group: {err}")))?;
-
-        let cold_index_cache = cold_store.as_ref().map(|cold_store| {
-            Arc::new(ColdIndexPageCache::new(
-                Arc::new(ColdStoreColdIndexPageStore::new(cold_store.clone())),
-                1024,
-            ))
-        });
 
         Ok(Self {
             raft,
@@ -1410,6 +1408,28 @@ impl GroupEngine for RaftGroupEngine {
                 GroupWriteResponse::AckColdGc(response) => Ok(response),
                 other => Err(GroupEngineError::new(format!(
                     "unexpected ack cold gc write response: {other:?}"
+                ))),
+            }
+        })
+    }
+
+    fn defer_cold_gc<'a>(
+        &'a mut self,
+        seq: u64,
+        not_before_ms: u64,
+        _placement: ShardPlacement,
+    ) -> GroupDeferColdGcFuture<'a> {
+        Box::pin(async move {
+            match self
+                .write(GroupWriteCommand::Stream(StreamCommand::DeferColdGc {
+                    seq,
+                    not_before_ms,
+                }))
+                .await?
+            {
+                GroupWriteResponse::DeferColdGc(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected defer cold gc write response: {other:?}"
                 ))),
             }
         })

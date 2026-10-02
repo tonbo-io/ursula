@@ -16,8 +16,8 @@
 
 mod bootstrap;
 pub mod json_text;
-pub mod keyed_state;
 mod keyed_lifecycle;
+pub mod keyed_state;
 mod otel_metrics;
 pub mod server;
 mod http_time {
@@ -4754,5 +4754,6 @@ mod keyed_indexer_tests;
 mod staging_cleanup_tests;
 
 #[cfg(test)]
-mod keyed_state_tests;
 mod keyed_lifecycle_tests;
+#[cfg(test)]
+mod keyed_state_tests;

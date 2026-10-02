@@ -647,6 +647,10 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 placement,
                 metrics: None,
                 cold_store: self.cold_store.clone(),
+                // A request-scoped cache: forwarded reads load pages fresh, so
+                // they never serve entries a leader-side clip or repair
+                // removed (bounded-state F19 follow-up). Sharing the group's
+                // cache is F13's remaining step.
                 cold_index_cache: self.cold_store.as_ref().map(|cold_store| {
                     Arc::new(ColdIndexPageCache::new(
                         Arc::new(ColdStoreColdIndexPageStore::new(cold_store.clone())),

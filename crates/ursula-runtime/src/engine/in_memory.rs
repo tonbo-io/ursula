@@ -33,6 +33,7 @@ use super::GroupCloseStreamFuture;
 use super::GroupColdHotBacklogFuture;
 use super::GroupCompactColdFuture;
 use super::GroupCreateStreamFuture;
+use super::GroupDeferColdGcFuture;
 use super::GroupDeleteSnapshotFuture;
 use super::GroupDeleteStreamFuture;
 use super::GroupEngine;
@@ -108,6 +109,7 @@ use crate::request::CompactColdResponse;
 use crate::request::CreateStreamExternalRequest;
 use crate::request::CreateStreamRequest;
 use crate::request::CreateStreamResponse;
+use crate::request::DeferColdGcResponse;
 use crate::request::DeleteSnapshotRequest;
 use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
@@ -174,6 +176,14 @@ impl InMemoryGroupEngine {
 
     pub fn cold_store(&self) -> Option<ColdStoreHandle> {
         self.cold_store.clone()
+    }
+
+    /// The cold-index page cache this engine invalidates when replicated
+    /// cold commands apply. Read paths outside the engine (the Raft group
+    /// handle) share it, so apply-time invalidation reaches their reads on
+    /// every replica.
+    pub fn cold_index_cache(&self) -> Option<Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>> {
+        self.cold_index_cache.clone()
     }
 
     pub(crate) fn set_cold_store(&mut self, cold_store: Option<ColdStoreHandle>) {
@@ -301,6 +311,16 @@ impl InMemoryGroupEngine {
                     StreamCommand::CompactCold { stream_id, .. } => Some(stream_id.clone()),
                     _ => None,
                 };
+                // Pages an exclusive cold flush rewrote (and possibly clipped)
+                // on the leader; every replica drops its cached copies.
+                let flushed_range = match &command {
+                    StreamCommand::FlushCold {
+                        stream_id, chunk, ..
+                    } if !chunk.shared_object => {
+                        Some((stream_id.clone(), chunk.start_offset, chunk.end_offset))
+                    }
+                    _ => None,
+                };
                 if let StreamCommand::CreateStream { stream_id, .. }
                 | StreamCommand::CreateExternal { stream_id, .. } = &command
                 {
@@ -318,6 +338,13 @@ impl InMemoryGroupEngine {
                         (self.cold_index_cache.as_ref(), compacted_stream_id.as_ref())
                 {
                     cache.invalidate_stream(stream_id);
+                }
+                if response.is_ok()
+                    && let (Some(cache), Some((stream_id, start_offset, end_offset))) =
+                        (self.cold_index_cache.as_ref(), flushed_range.as_ref())
+                    && let Some(generation) = self.state_machine.cold_index_generation(stream_id)
+                {
+                    cache.invalidate_range(stream_id, generation, *start_offset, *end_offset);
                 }
                 response
             }
@@ -695,6 +722,14 @@ impl InMemoryGroupEngine {
                 Ok(GroupWriteResponse::AckColdGc(AckColdGcResponse {
                     placement,
                     removed,
+                    group_commit_index: self.commit_index,
+                }))
+            }
+            StreamResponse::ColdGcDeferred { new_seq } => {
+                self.commit_index += 1;
+                Ok(GroupWriteResponse::DeferColdGc(DeferColdGcResponse {
+                    placement,
+                    new_seq,
                     group_commit_index: self.commit_index,
                 }))
             }
@@ -1465,6 +1500,10 @@ impl InMemoryGroupEngine {
     pub fn check_cold_flush(&self, request: &FlushColdRequest) -> Result<(), GroupEngineError> {
         self.state_machine
             .check_cold_flush(&request.stream_id, &request.chunk)
+            .and_then(|()| {
+                self.state_machine
+                    .check_cold_flush_generation(&request.stream_id, request.cold_generation)
+            })
             .map_err(stream_response_error)
     }
 
@@ -1634,6 +1673,11 @@ impl InMemoryGroupEngine {
 
         self.commit_index = group_commit_index;
         self.state_machine = state_machine;
+        // The installed state may follow page rewrites (clips, compaction)
+        // this replica never applied; cached pages could predate them.
+        if let Some(cache) = self.cold_index_cache.as_ref() {
+            cache.clear();
+        }
         Ok(())
     }
 }
@@ -2102,6 +2146,25 @@ impl GroupEngine for InMemoryGroupEngine {
         })
     }
 
+    fn defer_cold_gc<'a>(
+        &'a mut self,
+        seq: u64,
+        not_before_ms: u64,
+        placement: ShardPlacement,
+    ) -> GroupDeferColdGcFuture<'a> {
+        Box::pin(async move {
+            match self.apply_committed_write(
+                GroupWriteCommand::Stream(StreamCommand::DeferColdGc { seq, not_before_ms }),
+                placement,
+            )? {
+                GroupWriteResponse::DeferColdGc(response) => Ok(response),
+                other => Err(GroupEngineError::new(format!(
+                    "unexpected defer cold gc write response: {other:?}"
+                ))),
+            }
+        })
+    }
+
     fn plan_cold_gc<'a>(
         &'a mut self,
         max: usize,
@@ -2538,6 +2601,7 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::DeleteBucket { .. }
         | StreamCommand::PurgeBucket { .. }
         | StreamCommand::AckColdGc { .. }
+        | StreamCommand::DeferColdGc { .. }
         | StreamCommand::ImportSnapshot { .. }
         | StreamCommand::SetBucketQuota { .. }
         | StreamCommand::SetFeatureLevel { .. } => None,

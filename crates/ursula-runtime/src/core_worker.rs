@@ -54,6 +54,7 @@ use crate::request::CompactColdResponse;
 use crate::request::CreateStreamExternalRequest;
 use crate::request::CreateStreamRequest;
 use crate::request::CreateStreamResponse;
+use crate::request::DeferColdGcResponse;
 use crate::request::DeleteSnapshotRequest;
 use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
@@ -1070,6 +1071,18 @@ impl CoreWorker {
     ) -> Result<AckColdGcResponse, RuntimeError> {
         group
             .ack_cold_gc(up_to_seq, placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err))
+    }
+
+    pub(crate) async fn defer_cold_gc(
+        group: &mut Box<dyn GroupEngine>,
+        seq: u64,
+        not_before_ms: u64,
+        placement: ShardPlacement,
+    ) -> Result<DeferColdGcResponse, RuntimeError> {
+        group
+            .defer_cold_gc(seq, not_before_ms, placement)
             .await
             .map_err(|err| RuntimeError::group_engine(placement, err))
     }

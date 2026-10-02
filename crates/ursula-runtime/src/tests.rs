@@ -406,6 +406,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
     let flushed = engine
         .apply_committed_write(
             GroupWriteCommand::Stream(StreamCommand::FlushCold {
+                cold_generation: None,
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -487,6 +488,7 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
     engine
         .flush_cold(
             FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -620,6 +622,7 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
     engine
         .flush_cold(
             FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -637,6 +640,7 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
     let stale_flush = engine
         .flush_cold(
             FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -893,6 +897,7 @@ async fn bootstrap_returns_honest_partial_when_updates_after_snapshot_are_cold()
     engine
         .flush_cold(
             FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -2057,6 +2062,7 @@ async fn flush_cold_publishes_chunk_metadata_on_owner_group() {
 
     let flushed = runtime
         .flush_cold(FlushColdRequest {
+            cold_generation: None,
             stream_id: stream.clone(),
             chunk: ColdChunkRef {
                 start_offset: 0,
@@ -2483,6 +2489,7 @@ async fn legacy_cross_bucket_pack_is_rewritten_before_bucket_erasure_proof() {
         };
         runtime
             .flush_cold(FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream.clone(),
                 chunk,
             })
@@ -2664,6 +2671,7 @@ async fn cold_gc_worker_physically_reclaims_deleted_stream_chunks() {
         .expect("write cold chunk");
     runtime
         .flush_cold(FlushColdRequest {
+            cold_generation: None,
             stream_id: stream.clone(),
             chunk: chunk.clone(),
         })
@@ -2730,6 +2738,7 @@ async fn purge_report_proves_cold_gc_queue_is_empty_only_after_reclamation() {
         .expect("write cold chunk");
     runtime
         .flush_cold(FlushColdRequest {
+            cold_generation: None,
             stream_id: stream,
             chunk: chunk.clone(),
         })
@@ -2782,6 +2791,7 @@ async fn cold_compaction_preserves_reads_and_reclaims_inputs_after_grace() {
             .expect("write input chunk");
         runtime
             .flush_cold(FlushColdRequest {
+                cold_generation: None,
                 stream_id: stream.clone(),
                 chunk,
             })

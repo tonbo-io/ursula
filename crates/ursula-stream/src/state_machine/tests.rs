@@ -353,6 +353,7 @@ fn flush_cold_cmd(
     object_size: u64,
 ) -> StreamCommand {
     StreamCommand::FlushCold {
+        cold_generation: None,
         stream_id,
         chunk: ColdChunkRef {
             start_offset,
@@ -1624,6 +1625,7 @@ fn shared_cold_object_is_reclaimed_after_last_stream_reference() {
         machine.apply(append_cmd(stream(id), b"abcd", Append::default()));
         assert!(matches!(
             machine.apply(StreamCommand::FlushCold {
+                cold_generation: None,
                 stream_id: stream(id),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -1699,6 +1701,7 @@ fn compact_cold_enqueues_inputs_with_gc_grace() {
     };
     assert!(matches!(
         machine.apply(StreamCommand::FlushCold {
+            cold_generation: None,
             stream_id: stream("compact"),
             chunk: first.clone(),
         }),
@@ -1706,6 +1709,7 @@ fn compact_cold_enqueues_inputs_with_gc_grace() {
     ));
     assert!(matches!(
         machine.apply(StreamCommand::FlushCold {
+            cold_generation: None,
             stream_id: stream("compact"),
             chunk: second.clone(),
         }),
@@ -5086,6 +5090,7 @@ fn flush_shared_slice(
         machine.apply(StreamCommand::FlushCold {
             stream_id: stream(id),
             chunk: chunk.clone(),
+            cold_generation: None,
         }),
         StreamResponse::ColdFlushed { .. }
     ));

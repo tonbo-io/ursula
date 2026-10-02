@@ -159,6 +159,7 @@ async fn cold_path_publish(
     let flushed = setup.engines[setup.leader_index]
         .flush_cold(
             FlushColdRequest {
+                cold_generation: None,
                 stream_id: config.stream.clone(),
                 chunk: ursula_runtime::ColdChunkRef {
                     start_offset: setup.candidate.start_offset,
@@ -498,6 +499,7 @@ pub(super) async fn run_cold_write_delay_inner(
     let flushed = setup.engines[setup.leader_index]
         .flush_cold(
             FlushColdRequest {
+                cold_generation: None,
                 stream_id: config.stream.clone(),
                 chunk: ursula_runtime::ColdChunkRef {
                     start_offset: setup.candidate.start_offset,

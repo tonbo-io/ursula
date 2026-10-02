@@ -105,6 +105,13 @@ pub enum StreamCommand {
     FlushCold {
         stream_id: BucketStreamId,
         chunk: ColdChunkRef,
+        /// Cold generation of the incarnation the chunk was planned from
+        /// (F14g). From feature level 1 apply rejects the flush as stale when
+        /// it differs from the live stream's, so a flush racing a delete and
+        /// recreate cannot publish one incarnation's chunk into another.
+        /// `None` (proposers before this field) skips the check.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cold_generation: Option<u64>,
     },
     /// Replaces a contiguous run of immutable cold chunks with one equivalent
     /// object. The external cold-index page update is completed before this
@@ -137,6 +144,15 @@ pub enum StreamCommand {
     /// replicated queue. Idempotent under replay.
     AckColdGc {
         up_to_seq: u64,
+    },
+    /// Bounded-state F14b (feature level 1): moves the pending cold-GC entry
+    /// `seq`, whose reclamation failed, to the tail of the queue under a new
+    /// sequence number, due no earlier than `not_before_ms`, so one failing
+    /// entry no longer blocks every entry behind it. An absent `seq` is a
+    /// no-op success, which keeps replays idempotent.
+    DeferColdGc {
+        seq: u64,
+        not_before_ms: u64,
     },
     /// Replaces this group's entire state with a backup snapshot.
     ///
@@ -229,7 +245,9 @@ impl fmt::Display for StreamCommand {
             Self::UpdateStreamAttrs { stream_id, .. } => {
                 write!(f, "update_stream_attrs:{stream_id}")
             }
-            Self::FlushCold { stream_id, chunk } => write!(
+            Self::FlushCold {
+                stream_id, chunk, ..
+            } => write!(
                 f,
                 "flush_cold:{stream_id}:{}..{}",
                 chunk.start_offset, chunk.end_offset
@@ -250,6 +268,7 @@ impl fmt::Display for StreamCommand {
             Self::DeleteStream { stream_id } => write!(f, "delete_stream:{stream_id}"),
             Self::PurgeBucket { bucket_id } => write!(f, "purge_bucket:{bucket_id}"),
             Self::AckColdGc { up_to_seq } => write!(f, "ack_cold_gc:up_to_seq={up_to_seq}"),
+            Self::DeferColdGc { seq, .. } => write!(f, "defer_cold_gc:seq={seq}"),
             Self::ImportSnapshot { snapshot } => write!(
                 f,
                 "import_snapshot:buckets={}:streams={}",
