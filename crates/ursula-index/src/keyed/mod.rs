@@ -18,9 +18,12 @@
 //!   compaction policy (§9.6).
 //! - [`manifest`]: manifest v6, the namespace layout, and publication by
 //!   CAS on `CURRENT` (U15).
-//! - [`source`]: the source-log client: P7 pages, incarnation checks (U18).
+//! - [`source`]: the [`SourceClient`] trait of the source log and its HTTP
+//!   client: P7 pages, incarnation checks (U18, U21).
 //! - [`engine`]: on-demand ingest with the continuity check, publication,
-//!   compaction, delta GC and drain (U16).
+//!   compaction, delta GC, the orphan sweep and drain (U16, U20 sweep); its
+//!   source, object store and clock are injectable, so it runs under the
+//!   deterministic simulator (U21).
 //! - [`http`]: the internal `/v1/keyed` API (U17).
 //!
 //! Engine data flow: a [`RunBuilder`] folds `(record, batch)` pairs into a
@@ -92,5 +95,9 @@ pub use run::CompactionPolicy;
 pub use run::RunBuilder;
 pub use run::compact;
 pub use run::plan_compaction;
+pub use source::IncarnationState;
 pub use source::KeyedSourceClient;
+pub use source::SourceClient;
 pub use source::SourceError;
+pub use source::SourcePage;
+pub use source::read_response;

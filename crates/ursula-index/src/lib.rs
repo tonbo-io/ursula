@@ -5,6 +5,8 @@
 //! - [`cache`]: disposable local caches for whole parts and verified Parquet
 //!   page ranges.
 //! - [`catalog`]: dynamic index registrations shared by a worker pool.
+//! - [`clock`]: the injectable wall clock of the keyed engine and the
+//!   in-memory store (simulation, design U21).
 //! - [`index`]: the S3-authoritative ingest/flush/query/compact/GC engine.
 //! - [`keyed`]: the `keyed-batch-v1` record format (validator and parser),
 //!   the reference fold of keyed state, and the keyed projection engine's
@@ -12,19 +14,26 @@
 //!   and the keyed engine service (ingest, publish, compaction, GC, the
 //!   internal `/v1/keyed` API).
 //! - [`manifest`]: the conditionally published manifest state model.
+//! - [`memory_store`]: the in-memory conditional object store with
+//!   deterministic fault hooks (latency, failures, CAS conflicts, ambiguous
+//!   writes) for the indexer simulation.
 //! - [`object_store`]: conditional object operations for S3 and local tests.
 //! - [`part`]: immutable sorted Parquet parts.
+//! - `rt` (private): the task and timer seam, madsim under `cfg(madsim)`.
 //! - [`service`]: command arguments and the long-running indexer service entrypoint.
 //! - [`source`]: HTTP client for the upstream record stream.
 //! - [`store`]: shared event, query, status, configuration, and error types.
 
 mod cache;
 mod catalog;
+pub mod clock;
 mod index;
 pub mod keyed;
 mod manifest;
+pub mod memory_store;
 mod object_store;
 mod part;
+mod rt;
 pub mod service;
 mod source;
 mod store;
@@ -37,6 +46,7 @@ pub use index::EventIndex;
 pub use manifest::CompletedRecordRange;
 pub use manifest::GarbageCollectionReport;
 pub use manifest::RecordSegmentLease;
+pub use memory_store::MemoryObjectStore;
 pub use object_store::FsObjectStore;
 pub use object_store::ObjectStore;
 pub use object_store::S3ObjectStore;

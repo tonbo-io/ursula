@@ -42,12 +42,15 @@ pub(crate) struct ObjectInfo {
 }
 
 /// A conditional-write object backend. Opaque outside this crate: construct
-/// one via [`From`] on [`FsObjectStore`] or [`S3ObjectStore`] and hand it to
-/// [`crate::EventIndex::open`] or [`crate::IndexCatalog::new`].
+/// one via [`From`] on [`FsObjectStore`], [`S3ObjectStore`] or
+/// [`crate::MemoryObjectStore`] and hand it to [`crate::EventIndex::open`],
+/// [`crate::IndexCatalog::new`] or [`crate::keyed::KeyedEngine::new`].
 #[derive(Clone)]
 pub enum ObjectStore {
     Fs(FsObjectStore),
     S3(S3ObjectStore),
+    /// In-memory, with deterministic fault hooks (simulation and tests).
+    Memory(crate::MemoryObjectStore),
 }
 
 impl ObjectStore {
@@ -55,6 +58,7 @@ impl ObjectStore {
         match self {
             Self::Fs(store) => store.get(key),
             Self::S3(store) => store.get(key).await,
+            Self::Memory(store) => store.get(key).await,
         }
     }
 
@@ -66,6 +70,7 @@ impl ObjectStore {
         match self {
             Self::Fs(store) => store.get_range(key, range),
             Self::S3(store) => store.get_range(key, range).await,
+            Self::Memory(store) => store.get_range(key, range).await,
         }
     }
 
@@ -77,6 +82,7 @@ impl ObjectStore {
         match self {
             Self::Fs(store) => store.put_if_absent(key, bytes),
             Self::S3(store) => store.put_if_absent(key, bytes).await,
+            Self::Memory(store) => store.put_if_absent(key, bytes).await,
         }
     }
 
@@ -89,6 +95,7 @@ impl ObjectStore {
         match self {
             Self::Fs(store) => store.compare_and_swap(key, expected_etag, bytes),
             Self::S3(store) => store.compare_and_swap(key, expected_etag, bytes).await,
+            Self::Memory(store) => store.compare_and_swap(key, expected_etag, bytes).await,
         }
     }
 
@@ -96,6 +103,7 @@ impl ObjectStore {
         match self {
             Self::Fs(store) => store.list(prefix),
             Self::S3(store) => store.list(prefix).await,
+            Self::Memory(store) => store.list(prefix).await,
         }
     }
 
@@ -103,6 +111,7 @@ impl ObjectStore {
         match self {
             Self::Fs(store) => store.delete(key),
             Self::S3(store) => store.delete(key).await,
+            Self::Memory(store) => store.delete(key).await,
         }
     }
 

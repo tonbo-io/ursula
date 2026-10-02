@@ -1,18 +1,25 @@
-//! Source client of the keyed engine (design §6.1 U18).
+//! Source client of the keyed engine (design §6.1 U18, U21).
 //!
-//! Reads a keyed stream's log from an Ursula node or gateway in P7 pages:
-//! record-aware reads in the default view (`application/x-ndjson`, one stored
-//! message per line) bounded by `max_bytes`. Reads use the node's default
-//! (local) consistency, so a rebuild may be served by followers; decisions
-//! that retire a namespace confirm with a leader read. One HTTP client is
-//! shared by every namespace.
+//! The engine reads a keyed stream's log through the [`SourceClient`]
+//! trait. [`KeyedSourceClient`] is the HTTP implementation: it reads from an
+//! Ursula node or gateway in P7 pages, record-aware reads in the default
+//! view (`application/x-ndjson`, one stored message per line) bounded by
+//! `max_bytes`. Reads use the node's default (local) consistency, so a
+//! rebuild may be served by followers; decisions that retire a namespace
+//! confirm with a leader read. One HTTP client is shared by every namespace.
+//! The simulator implements the trait over an in-process node and reuses
+//! [`read_response`] to interpret its answers exactly as the HTTP client
+//! does.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
 use reqwest::StatusCode;
 use reqwest::Url;
+use reqwest::header::HeaderMap;
 use serde::Deserialize;
 
 use super::batch::KEYED_BATCH_PROFILE;
@@ -69,6 +76,118 @@ pub enum IncarnationState {
     Gone,
 }
 
+/// The source log of keyed namespaces, as the engine reads it.
+pub trait SourceClient: Send + Sync {
+    /// Reads one page of records from `record`: at most `max_bytes` of
+    /// stored bytes (at least one record when one exists), and at most
+    /// `max_records` records when given. `leader` asks for a leader read.
+    fn read<'a>(
+        &'a self,
+        bucket: &'a str,
+        key: &'a str,
+        record: u64,
+        max_bytes: u64,
+        max_records: Option<u64>,
+        leader: bool,
+    ) -> BoxFuture<'a, Result<SourcePage, SourceError>>;
+
+    /// Whether incarnation `incarnation` of the stream still exists.
+    /// Inconclusive answers count as present.
+    fn incarnation<'a>(
+        &'a self,
+        bucket: &'a str,
+        key: &'a str,
+        incarnation: u64,
+    ) -> BoxFuture<'a, Result<IncarnationState, SourceError>>;
+}
+
+impl<T: SourceClient + ?Sized> SourceClient for Arc<T> {
+    fn read<'a>(
+        &'a self,
+        bucket: &'a str,
+        key: &'a str,
+        record: u64,
+        max_bytes: u64,
+        max_records: Option<u64>,
+        leader: bool,
+    ) -> BoxFuture<'a, Result<SourcePage, SourceError>> {
+        (**self).read(bucket, key, record, max_bytes, max_records, leader)
+    }
+
+    fn incarnation<'a>(
+        &'a self,
+        bucket: &'a str,
+        key: &'a str,
+        incarnation: u64,
+    ) -> BoxFuture<'a, Result<IncarnationState, SourceError>> {
+        (**self).incarnation(bucket, key, incarnation)
+    }
+}
+
+/// Interprets a node's answer to a record read from `record` (the request
+/// carried `max_bytes`): the status mapping and page checks of
+/// [`KeyedSourceClient`], for other transports.
+pub fn read_response(
+    record: u64,
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &str,
+) -> Result<SourcePage, SourceError> {
+    read_status(record, false, status, headers)?;
+    read_page(record, headers, body)
+}
+
+/// Maps a record read's status to its error, if any.
+fn read_status(
+    record: u64,
+    fallback: bool,
+    status: StatusCode,
+    headers: &HeaderMap,
+) -> Result<(), SourceError> {
+    match status {
+        StatusCode::NOT_FOUND => Err(SourceError::NotFound),
+        StatusCode::GONE => Err(SourceError::Retained {
+            first_record: header_u64(headers, "stream-record-first")
+                .unwrap_or(record.saturating_add(1)),
+        }),
+        // A beyond-tail read names the tail; any other 400 on a
+        // well-formed request is a node that rejects `max_bytes`.
+        StatusCode::BAD_REQUEST => Err(match header_u64(headers, "stream-record-next") {
+            Some(next_record) => SourceError::BeyondTail { next_record },
+            None if !fallback => SourceError::Transient(MAX_BYTES_REJECTED.to_owned()),
+            None => transient("source rejected a record read with 400"),
+        }),
+        status if !status.is_success() => Err(transient(format!("source returned HTTP {status}"))),
+        _ if !advertises(headers, KEYED_BATCH_PROFILE) => Err(SourceError::NotKeyed),
+        _ => Ok(()),
+    }
+}
+
+/// Splits a successful record read's body into its records and checks them
+/// against the response's record coordinates.
+fn read_page(record: u64, headers: &HeaderMap, body: &str) -> Result<SourcePage, SourceError> {
+    let start_record = header_u64(headers, "stream-record-start")
+        .ok_or_else(|| transient("source read omitted Stream-Record-Start"))?;
+    let next_record = header_u64(headers, "stream-record-next")
+        .ok_or_else(|| transient("source read omitted Stream-Record-Next"))?;
+    let records: Vec<String> = body
+        .split('\n')
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let count = u64::try_from(records.len()).unwrap_or(u64::MAX);
+    if start_record != record || start_record.checked_add(count) != Some(next_record) {
+        return Err(transient(
+            "source page does not match its record coordinates",
+        ));
+    }
+    Ok(SourcePage {
+        start_record,
+        next_record,
+        records,
+    })
+}
+
 /// HTTP client of the source log.
 #[derive(Clone, Debug)]
 pub struct KeyedSourceClient {
@@ -94,14 +213,14 @@ fn transient(error: impl std::fmt::Display) -> SourceError {
     SourceError::Transient(error.to_string())
 }
 
-fn header_u64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
+fn header_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
     headers
         .get(name)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse().ok())
 }
 
-fn advertises(headers: &reqwest::header::HeaderMap, token: &str) -> bool {
+fn advertises(headers: &HeaderMap, token: &str) -> bool {
     headers
         .get_all("stream-extensions")
         .iter()
@@ -209,54 +328,10 @@ impl KeyedSourceClient {
             }
         }
         let response = self.client.get(url).send().await.map_err(transient)?;
-        let status = response.status();
+        read_status(record, fallback, response.status(), response.headers())?;
         let headers = response.headers().clone();
-        match status {
-            StatusCode::NOT_FOUND => return Err(SourceError::NotFound),
-            StatusCode::GONE => {
-                return Err(SourceError::Retained {
-                    first_record: header_u64(&headers, "stream-record-first")
-                        .unwrap_or(record.saturating_add(1)),
-                });
-            }
-            StatusCode::BAD_REQUEST => {
-                // A beyond-tail read names the tail; any other 400 on a
-                // well-formed request is a node that rejects `max_bytes`.
-                return Err(match header_u64(&headers, "stream-record-next") {
-                    Some(next_record) => SourceError::BeyondTail { next_record },
-                    None if !fallback => SourceError::Transient(MAX_BYTES_REJECTED.to_owned()),
-                    None => transient("source rejected a record read with 400"),
-                });
-            }
-            status if !status.is_success() => {
-                return Err(transient(format!("source returned HTTP {status}")));
-            }
-            _ => {}
-        }
-        if !advertises(&headers, KEYED_BATCH_PROFILE) {
-            return Err(SourceError::NotKeyed);
-        }
-        let start_record = header_u64(&headers, "stream-record-start")
-            .ok_or_else(|| transient("source read omitted Stream-Record-Start"))?;
-        let next_record = header_u64(&headers, "stream-record-next")
-            .ok_or_else(|| transient("source read omitted Stream-Record-Next"))?;
         let body = response.text().await.map_err(transient)?;
-        let records: Vec<String> = body
-            .split('\n')
-            .filter(|line| !line.is_empty())
-            .map(str::to_owned)
-            .collect();
-        let count = u64::try_from(records.len()).unwrap_or(u64::MAX);
-        if start_record != record || start_record.checked_add(count) != Some(next_record) {
-            return Err(transient(
-                "source page does not match its record coordinates",
-            ));
-        }
-        Ok(SourcePage {
-            start_record,
-            next_record,
-            records,
-        })
+        read_page(record, &headers, &body)
     }
 
     /// Whether incarnation `incarnation` of the stream still exists: a HEAD
@@ -308,3 +383,26 @@ impl KeyedSourceClient {
 }
 
 const MAX_BYTES_REJECTED: &str = "source rejected max_bytes on a record read";
+
+impl SourceClient for KeyedSourceClient {
+    fn read<'a>(
+        &'a self,
+        bucket: &'a str,
+        key: &'a str,
+        record: u64,
+        max_bytes: u64,
+        max_records: Option<u64>,
+        leader: bool,
+    ) -> BoxFuture<'a, Result<SourcePage, SourceError>> {
+        KeyedSourceClient::read(self, bucket, key, record, max_bytes, max_records, leader).boxed()
+    }
+
+    fn incarnation<'a>(
+        &'a self,
+        bucket: &'a str,
+        key: &'a str,
+        incarnation: u64,
+    ) -> BoxFuture<'a, Result<IncarnationState, SourceError>> {
+        KeyedSourceClient::incarnation(self, bucket, key, incarnation).boxed()
+    }
+}
