@@ -339,6 +339,27 @@ pub struct BucketUsageSnapshot {
     pub usage: BucketUsage,
 }
 
+/// One stream in a bucket listing (`extensions.md` §1.4). `stream_id` is the
+/// bucket-local path: the plain stream ID, or `{affinity_key}/{stream_id}`
+/// for a stream addressed through path affinity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketStreamListing {
+    pub stream_id: String,
+    pub status: StreamStatus,
+    pub content_type: String,
+    pub tail_offset: u64,
+    pub created_at_ms: u64,
+}
+
+/// Returns the bucket-local path of a stream: what follows `/{bucket_id}/` in
+/// its URL.
+pub fn bucket_local_stream_path(stream_id: &BucketStreamId) -> String {
+    match &stream_id.affinity_key {
+        Some(affinity_key) => format!("{affinity_key}/{}", stream_id.stream_id),
+        None => stream_id.stream_id.clone(),
+    }
+}
+
 /// Per-bucket data-plane quota stored in replicated state. `None` means
 /// unlimited. Every Raft group stores the same record and enforces it
 /// against its own local [`BucketUsage`], so the cluster-wide bound is

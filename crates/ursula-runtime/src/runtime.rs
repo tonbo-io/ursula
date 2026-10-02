@@ -86,6 +86,8 @@ use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
 use crate::request::ImportGroupStateRequest;
 use crate::request::ImportGroupStateResponse;
+use crate::request::ListBucketStreamsRequest;
+use crate::request::ListBucketStreamsResponse;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -675,6 +677,48 @@ impl ShardRuntime {
             .collect::<Vec<_>>();
         report.sort_by(|left, right| left.bucket_id.cmp(&right.bucket_id));
         Ok(report)
+    }
+
+    /// Lists a bucket's streams (`extensions.md` §1.4) by asking every Raft
+    /// group for its first `limit + 1` eligible streams and merging them by
+    /// bucket-local stream path. Each group answers from local replica state,
+    /// so a just-created stream may lag on a follower. Returns `None` when no
+    /// group knows the bucket.
+    pub async fn list_bucket_streams_all_groups(
+        &self,
+        bucket_id: &str,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+        now_ms: u64,
+    ) -> Result<Option<ListBucketStreamsResponse>, RuntimeError> {
+        let request = ListBucketStreamsRequest {
+            bucket_id: bucket_id.to_owned(),
+            prefix: prefix.to_owned(),
+            after: after.map(str::to_owned),
+            limit: limit.saturating_add(1),
+            now_ms,
+        };
+        let group_count = self.shard_map.raft_group_count();
+        let mut bucket_known = false;
+        let mut streams = Vec::new();
+        for group_id in 0..group_count {
+            if let Some(group_streams) = self
+                .list_bucket_streams(RaftGroupId(group_id), request.clone())
+                .await?
+            {
+                bucket_known = true;
+                streams.extend(group_streams);
+            }
+        }
+        if !bucket_known {
+            return Ok(None);
+        }
+        streams.sort_by(|left, right| left.stream_id.cmp(&right.stream_id));
+        streams.dedup_by(|right, left| right.stream_id == left.stream_id);
+        let has_more = streams.len() > limit;
+        streams.truncate(limit);
+        Ok(Some(ListBucketStreamsResponse { streams, has_more }))
     }
 
     /// Replicates one bucket's quota record to every Raft group so each

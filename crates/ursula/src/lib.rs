@@ -1330,6 +1330,7 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         .route("/__ursula/quota/{bucket}", put(set_bucket_quota))
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .route("/{bucket}", put(create_bucket))
+        .route("/{bucket}/streams", get(list_bucket_streams))
         .route(
             "/{bucket}/{stream}/snapshot",
             get(read_latest_snapshot).put(publish_snapshot_at_record),
@@ -1646,6 +1647,80 @@ const LEGACY_SHARED_MIGRATION_MAX_CHUNKS: usize = 32;
 
 pub(crate) async fn create_bucket(Path(_bucket): Path<String>) -> Response {
     StatusCode::CREATED.into_response()
+}
+
+/// Default and maximum page size of the bucket listing (`extensions.md` §1.4).
+const BUCKET_LISTING_MAX_LIMIT: usize = 1000;
+
+/// `GET /{bucket}/streams?prefix=&after=&limit=` (`extensions.md` §1.4): the
+/// bucket's streams merged across every Raft group, sorted by bucket-local
+/// stream path. Groups answer from local replica state, so the listing may
+/// briefly lag a just-committed create or delete. `last_write_at_ms` is
+/// omitted because Ursula does not track it.
+pub(crate) async fn list_bucket_streams(
+    State(state): State<HttpState>,
+    Path(bucket): Path<String>,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
+    if let Err(message) = ursula_runtime::validate_bucket_id(&bucket) {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
+    let query = match parse_query(raw_query.as_deref()) {
+        Ok(query) => query,
+        Err(response) => return *response,
+    };
+    let limit = match query.get("limit") {
+        None => BUCKET_LISTING_MAX_LIMIT,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(limit) if (1..=BUCKET_LISTING_MAX_LIMIT).contains(&limit) => limit,
+            _ => {
+                return (StatusCode::BAD_REQUEST, "limit must be in 1..=1000").into_response();
+            }
+        },
+    };
+    let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
+    let after = query.get("after").map(String::as_str);
+    let listing = match state
+        .runtime
+        .list_bucket_streams_all_groups(&bucket, prefix, after, limit, state.unix_time_ms())
+        .await
+    {
+        Ok(Some(listing)) => listing,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                format!("bucket '{bucket}' does not exist"),
+            )
+                .into_response();
+        }
+        Err(err) => return runtime_error_response(err),
+    };
+    let next_cursor = listing
+        .has_more
+        .then(|| listing.streams.last().map(|entry| entry.stream_id.clone()))
+        .flatten();
+    let streams = listing
+        .streams
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "stream_id": entry.stream_id,
+                "status": entry.status,
+                "content_type": entry.content_type,
+                "tail_offset": entry.tail_offset,
+                "created_at_ms": entry.created_at_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    axum::Json(serde_json::json!({
+        "bucket_id": bucket,
+        "prefix": prefix,
+        "stream_count": streams.len(),
+        "streams": streams,
+        "next_cursor": next_cursor,
+        "has_more": listing.has_more,
+    }))
+    .into_response()
 }
 
 /// Versioned, self-described per-bucket usage summed across this node's Raft
@@ -3344,13 +3419,6 @@ pub(crate) async fn read_stream_by_id(
         )
             .into_response();
     }
-    if record_aware && query.contains_key("max_bytes") {
-        return (
-            StatusCode::BAD_REQUEST,
-            "record-aware reads do not support max_bytes",
-        )
-            .into_response();
-    }
     if live_mode.is_some() && !query.contains_key("offset") && !record_aware {
         return (
             StatusCode::BAD_REQUEST,
@@ -3398,10 +3466,19 @@ pub(crate) async fn read_stream_by_id(
             Err(response) => return *response,
         }
     };
-    let max_len = query
-        .get("max_bytes")
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(usize::MAX);
+    // On a record-aware read `max_bytes` bounds complete records (P7,
+    // extensions.md §6.6) and must be a positive integer; offset reads keep
+    // the base protocol's lenient parsing.
+    let max_len = match query.get("max_bytes") {
+        Some(raw) if record_aware => match raw.parse::<usize>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                return (StatusCode::BAD_REQUEST, "max_bytes must be positive").into_response();
+            }
+        },
+        Some(raw) => raw.parse::<usize>().unwrap_or(usize::MAX),
+        None => usize::MAX,
+    };
 
     match live_mode {
         Some("sse") => {
@@ -4043,7 +4120,9 @@ pub(crate) async fn sse_stream(
         .http_metrics
         .sse_streams_opened
         .fetch_add(1, Ordering::Relaxed);
-    let sse_max_len = if encode_base64 {
+    // Record-aware reads always return whole records, so only offset reads
+    // need room for one complete UTF-8 code point.
+    let sse_max_len = if encode_base64 || record.is_some() {
         max_len.max(1)
     } else {
         max_len.max(4)

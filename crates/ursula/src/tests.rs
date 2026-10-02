@@ -8186,3 +8186,495 @@ async fn keyed_batch_v1_message_vectors_through_http() {
         committed.to_string()
     );
 }
+
+// --- P7: byte-bounded record-aware reads (extensions.md §6.6) ---
+
+/// Record sizes in stored bytes, LF included: 8, 8, 49, 8.
+const P7_RECORDS: [&str; 4] = [
+    r#"{"a":1}"#,
+    r#"{"a":2}"#,
+    r#"{"b":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}"#,
+    r#"{"a":4}"#,
+];
+
+async fn p7_stream(app: &Router, uri: &str, close: bool) {
+    let response = http_put(
+        app,
+        uri,
+        &[(CONTENT_TYPE.as_str(), "application/json")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    post_messages(app, uri, "application/json", &P7_RECORDS).await;
+    if close {
+        let response = http_post(
+            app,
+            uri,
+            &[
+                (CONTENT_TYPE.as_str(), "application/json"),
+                (HEADER_STREAM_CLOSED, "true"),
+            ],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+}
+
+/// Reads `uri` and returns (status, record start, record next, next offset, body).
+async fn p7_read(app: &Router, uri: &str) -> (StatusCode, String, String, String, String) {
+    let response = http_get(app, uri).await;
+    let status = response.status();
+    if status != StatusCode::OK {
+        let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+        return (status, String::new(), String::new(), String::new(), body);
+    }
+    let start = header_str(&response, HEADER_STREAM_RECORD_START).to_owned();
+    let next = header_str(&response, HEADER_STREAM_RECORD_NEXT).to_owned();
+    let next_offset = header_str(&response, HEADER_STREAM_NEXT_OFFSET).to_owned();
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).expect("utf8");
+    (status, start, next, next_offset, body)
+}
+
+fn p7_lines(range: std::ops::Range<usize>) -> String {
+    P7_RECORDS[range]
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect()
+}
+
+#[tokio::test]
+async fn record_read_max_bytes_returns_longest_complete_record_run() {
+    let app = test_router();
+    let uri = "/benchcmp/p7-records";
+    p7_stream(&app, uri, false).await;
+
+    // Exactly two small records fit (8 + 8 bytes, LF included).
+    let (status, start, next, next_offset, body) =
+        p7_read(&app, &format!("{uri}?record=0&max_bytes=16")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!((start.as_str(), next.as_str()), ("0", "2"));
+    assert_eq!(body, p7_lines(0..2));
+    let (_, _, _, by_count_offset, _) =
+        p7_read(&app, &format!("{uri}?record=0&max_records=2")).await;
+    assert_eq!(next_offset, by_count_offset);
+
+    // One byte short of the second record's LF: only the first record.
+    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=0&max_bytes=15")).await;
+    assert_eq!(next, "1");
+    assert_eq!(body, p7_lines(0..1));
+
+    // A budget smaller than the first record still returns that record.
+    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=0&max_bytes=1")).await;
+    assert_eq!(next, "1");
+    assert_eq!(body, p7_lines(0..1));
+
+    // A single record larger than max_bytes is returned whole and alone.
+    let (_, start, next, _, body) = p7_read(&app, &format!("{uri}?record=2&max_bytes=10")).await;
+    assert_eq!((start.as_str(), next.as_str()), ("2", "3"));
+    assert_eq!(body, p7_lines(2..3));
+
+    // The large record stops the run that precedes it.
+    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=1&max_bytes=56")).await;
+    assert_eq!(next, "2");
+    assert_eq!(body, p7_lines(1..2));
+    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=1&max_bytes=57")).await;
+    assert_eq!(next, "3");
+    assert_eq!(body, p7_lines(1..3));
+
+    // A budget beyond the tail returns everything.
+    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=0&max_bytes=100000")).await;
+    assert_eq!(next, "4");
+    assert_eq!(body, p7_lines(0..4));
+
+    // tail_records composes with max_bytes.
+    let (_, start, next, _, body) =
+        p7_read(&app, &format!("{uri}?tail_records=2&max_bytes=49")).await;
+    assert_eq!((start.as_str(), next.as_str()), ("2", "3"));
+    assert_eq!(body, p7_lines(2..3));
+
+    // At the tail the read is an empty up-to-date read.
+    let (status, start, next, _, body) =
+        p7_read(&app, &format!("{uri}?record=4&max_bytes=8")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!((start.as_str(), next.as_str()), ("4", "4"));
+    assert!(body.is_empty());
+}
+
+#[tokio::test]
+async fn record_read_max_bytes_combines_with_max_records() {
+    let app = test_router();
+    let uri = "/benchcmp/p7-both";
+    p7_stream(&app, uri, false).await;
+
+    // max_records is the tighter limit.
+    let (status, _, next, _, body) = p7_read(
+        &app,
+        &format!("{uri}?record=0&max_bytes=1000&max_records=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(next, "1");
+    assert_eq!(body, p7_lines(0..1));
+
+    // max_bytes is the tighter limit.
+    let (_, _, next, _, body) =
+        p7_read(&app, &format!("{uri}?record=0&max_bytes=20&max_records=3")).await;
+    assert_eq!(next, "2");
+    assert_eq!(body, p7_lines(0..2));
+
+    // Both allow everything up to max_records.
+    let (_, _, next, _, body) = p7_read(
+        &app,
+        &format!("{uri}?record=0&max_bytes=1000&max_records=3"),
+    )
+    .await;
+    assert_eq!(next, "3");
+    assert_eq!(body, p7_lines(0..3));
+}
+
+#[tokio::test]
+async fn record_read_max_bytes_envelope_counts_stored_bytes_only() {
+    let app = test_router();
+    let uri = "/benchcmp/p7-envelope";
+    p7_stream(&app, uri, false).await;
+
+    // Envelope framing does not count: 16 stored bytes still yield two records.
+    let response = http_get(
+        &app,
+        &format!("{uri}?record=0&max_bytes=16&record_view=envelope"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header_str(&response, CONTENT_TYPE),
+        "application/vnd.durable-stream-records+ndjson"
+    );
+    assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "2");
+    let body = body_bytes(response).await;
+    assert_eq!(
+        &body[..],
+        b"{\"record\":0,\"value\":{\"a\":1}}\n{\"record\":1,\"value\":{\"a\":2}}\n"
+    );
+}
+
+#[tokio::test]
+async fn record_read_max_bytes_pages_continue_without_gaps() {
+    let app = test_router();
+    let uri = "/benchcmp/p7-pages";
+    p7_stream(&app, uri, false).await;
+    let (_, _, _, _, full) = p7_read(&app, &format!("{uri}?record=0")).await;
+
+    for max_bytes in [1_usize, 8, 9, 16, 20, 49, 57, 64] {
+        let mut record = 0_u64;
+        let mut pages = String::new();
+        let mut page_count = 0;
+        while record < 4 {
+            let (status, start, next, _, body) = p7_read(
+                &app,
+                &format!("{uri}?record={record}&max_bytes={max_bytes}"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(start, record.to_string());
+            let next: u64 = next.parse().expect("record next");
+            assert!(next > record, "max_bytes={max_bytes} made no progress");
+            let page_records = usize::try_from(next - record).expect("count");
+            assert!(
+                page_records == 1 || body.len() <= max_bytes,
+                "{max_bytes}: {body}"
+            );
+            pages.push_str(&body);
+            record = next;
+            page_count += 1;
+        }
+        assert_eq!(pages, full, "max_bytes={max_bytes}");
+        assert!(page_count <= 4);
+    }
+}
+
+#[tokio::test]
+async fn record_read_max_bytes_rejects_non_positive_values() {
+    let app = test_router();
+    let uri = "/benchcmp/p7-invalid";
+    p7_stream(&app, uri, false).await;
+    for raw in ["0", "-1", "abc", ""] {
+        let response = http_get(&app, &format!("{uri}?record=0&max_bytes={raw}")).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "max_bytes={raw}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn record_read_max_bytes_applies_to_long_poll_and_sse() {
+    let app = test_router();
+    let uri = "/benchcmp/p7-live";
+    p7_stream(&app, uri, true).await;
+
+    let (status, _, next, _, body) = p7_read(
+        &app,
+        &format!("{uri}?record=0&max_bytes=16&live=long-poll&timeout_ms=10"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(next, "2");
+    assert_eq!(body, p7_lines(0..2));
+
+    let response = http_get(&app, &format!("{uri}?record=0&max_bytes=16&live=sse")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    let body = std::str::from_utf8(&body).expect("utf8 sse body");
+    let next_records: Vec<&str> = body
+        .match_indices("\"streamNextRecord\":")
+        .map(|(index, key)| {
+            let rest = &body[index + key.len()..];
+            let end = rest.find(|ch: char| !ch.is_ascii_digit()).expect("digits");
+            &rest[..end]
+        })
+        .collect();
+    assert_eq!(next_records, vec!["2", "3", "4"], "{body}");
+}
+
+#[tokio::test]
+async fn record_read_max_bytes_cuts_cold_windows() {
+    let app = cold_test_router();
+    let uri = "/benchcmp/p7-cold";
+    p7_stream(&app, uri, false).await;
+    flush_cold(&app, uri, 1024).await;
+
+    let (status, _, next, _, body) = p7_read(&app, &format!("{uri}?record=0&max_bytes=16")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(next, "2");
+    assert_eq!(body, p7_lines(0..2));
+    let (_, _, next, _, body) = p7_read(&app, &format!("{uri}?record=2&max_bytes=1")).await;
+    assert_eq!(next, "3");
+    assert_eq!(body, p7_lines(2..3));
+}
+
+// --- U9: bucket stream listing (extensions.md §1.4) ---
+
+async fn list_streams(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let response = http_get(app, uri).await;
+    let status = response.status();
+    let body = body_bytes(response).await;
+    let value = serde_json::from_slice(&body)
+        .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(&body).into()));
+    (status, value)
+}
+
+fn listed_ids(listing: &serde_json::Value) -> Vec<String> {
+    listing["streams"]
+        .as_array()
+        .expect("streams array")
+        .iter()
+        .map(|entry| entry["stream_id"].as_str().expect("stream_id").to_owned())
+        .collect()
+}
+
+async fn create_listing_streams(app: &Router, bucket: &str, ids: &[&str]) {
+    for id in ids {
+        let response = http_put(
+            app,
+            &format!("/{bucket}/{id}"),
+            &[(CONTENT_TYPE.as_str(), "text/plain")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED, "{id}");
+    }
+}
+
+#[tokio::test]
+async fn bucket_listing_merges_streams_across_groups() {
+    let app = test_router();
+    let ids: Vec<String> = (0..24).map(|index| format!("s-{index:02}")).collect();
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    create_listing_streams(&app, "catalog", &id_refs).await;
+    let runtime_groups: std::collections::HashSet<u32> = {
+        let shard_map = ursula_shard::StaticShardMap::new(2, 8).expect("shard map");
+        ids.iter()
+            .map(|id| {
+                shard_map
+                    .locate(&BucketStreamId::new("catalog", id.as_str()))
+                    .raft_group_id
+                    .0
+            })
+            .collect()
+    };
+    assert!(runtime_groups.len() > 1, "streams must span several groups");
+
+    let response = http_post(
+        &app,
+        "/catalog/s-03",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::from("hello"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let (status, listing) = list_streams(&app, "/catalog/streams").await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(listing["bucket_id"], "catalog");
+    assert_eq!(listing["stream_count"], 24);
+    assert_eq!(listing["has_more"], false);
+    assert!(listing["next_cursor"].is_null());
+    assert_eq!(listed_ids(&listing), ids);
+    let entry = &listing["streams"][3];
+    assert_eq!(entry["stream_id"], "s-03");
+    assert_eq!(entry["status"], "Open");
+    assert_eq!(entry["content_type"], "text/plain");
+    assert_eq!(entry["tail_offset"], 5);
+    assert!(entry["created_at_ms"].as_u64().is_some());
+    assert!(entry.get("last_write_at_ms").is_none());
+}
+
+#[tokio::test]
+async fn bucket_listing_filters_by_prefix_and_pages_by_cursor() {
+    let app = test_router();
+    create_listing_streams(&app, "catalog", &[
+        "user-3", "user-1", "admin", "user-2", "user-10", "zeta",
+    ])
+    .await;
+    let response = http_put(
+        &app,
+        "/catalog/user-run/journal",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let response = http_post(
+        &app,
+        "/catalog/user-2",
+        &[
+            (CONTENT_TYPE.as_str(), "text/plain"),
+            (HEADER_STREAM_CLOSED, "true"),
+        ],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let (status, listing) = list_streams(&app, "/catalog/streams?prefix=user-").await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(listing["prefix"], "user-");
+    assert_eq!(listed_ids(&listing), vec![
+        "user-1",
+        "user-10",
+        "user-2",
+        "user-3",
+        "user-run/journal"
+    ]);
+    assert_eq!(listing["streams"][2]["status"], "Closed");
+
+    let mut cursor: Option<String> = None;
+    let mut pages = Vec::new();
+    loop {
+        let uri = match &cursor {
+            Some(after) => format!("/catalog/streams?prefix=user-&limit=2&after={after}"),
+            None => "/catalog/streams?prefix=user-&limit=2".to_owned(),
+        };
+        let (status, listing) = list_streams(&app, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{listing}");
+        let page = listed_ids(&listing);
+        assert!(page.len() <= 2);
+        pages.push(page.clone());
+        if listing["has_more"] == true {
+            assert_eq!(
+                listing["next_cursor"],
+                page.last().expect("non-empty page").as_str()
+            );
+            cursor = Some(
+                url::form_urlencoded::byte_serialize(page.last().expect("page").as_bytes())
+                    .collect(),
+            );
+        } else {
+            assert!(listing["next_cursor"].is_null());
+            break;
+        }
+    }
+    assert_eq!(pages, vec![
+        vec!["user-1".to_owned(), "user-10".to_owned()],
+        vec!["user-2".to_owned(), "user-3".to_owned()],
+        vec!["user-run/journal".to_owned()],
+    ]);
+
+    let (status, listing) = list_streams(&app, "/catalog/streams?after=user-3").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed_ids(&listing), vec!["user-run/journal", "zeta"]);
+    let (status, listing) = list_streams(&app, "/catalog/streams?prefix=nobody").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listing["stream_count"], 0);
+    assert_eq!(listing["has_more"], false);
+}
+
+#[tokio::test]
+async fn bucket_listing_of_empty_and_unknown_buckets() {
+    let app = test_router();
+    create_listing_streams(&app, "emptied", &["only"]).await;
+    let response = http_delete(&app, "/emptied/only").await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (status, listing) = list_streams(&app, "/emptied/streams").await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(listing["stream_count"], 0);
+    assert_eq!(listing["streams"], serde_json::json!([]));
+    assert_eq!(listing["has_more"], false);
+
+    let (status, _) = list_streams(&app, "/missing-bucket/streams").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn bucket_listing_rejects_invalid_parameters() {
+    let app = test_router();
+    create_listing_streams(&app, "catalog", &["a-stream"]).await;
+    for uri in [
+        "/catalog/streams?limit=0",
+        "/catalog/streams?limit=1001",
+        "/catalog/streams?limit=abc",
+        "/catalog/streams?limit=",
+        "/BAD/streams",
+        "/abc/streams",
+    ] {
+        let (status, body) = list_streams(&app, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+    }
+    let (status, listing) = list_streams(&app, "/catalog/streams?limit=1000").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed_ids(&listing), vec!["a-stream"]);
+
+    // `streams` stays reserved: the name cannot be created as a stream.
+    let response = http_put(
+        &app,
+        "/catalog/streams",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
+    assert!(response.status().is_client_error(), "{}", response.status());
+}
+
+#[tokio::test]
+async fn bucket_listing_on_raft_engine() {
+    let app = router(
+        spawn_runtime(
+            &test_config(1, 2),
+            Persistence::Raft { log_dir: None },
+            Topology::SingleNode {
+                raft_group_count: 2,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    );
+    create_listing_streams(&app, "catalog", &["b", "a", "c"]).await;
+    let (status, listing) = list_streams(&app, "/catalog/streams?limit=2").await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(listed_ids(&listing), vec!["a", "b"]);
+    assert_eq!(listing["has_more"], true);
+    assert_eq!(listing["next_cursor"], "b");
+}

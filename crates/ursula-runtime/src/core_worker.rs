@@ -62,6 +62,7 @@ use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
 use crate::request::ImportGroupStateRequest;
 use crate::request::ImportGroupStateResponse;
+use crate::request::ListBucketStreamsRequest;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -1084,6 +1085,25 @@ impl CoreWorker {
         let exec_started_at = Instant::now();
         let response = group
             .bucket_usage(placement)
+            .await
+            .map_err(|err| RuntimeError::group_engine(placement, err));
+        metrics.record_group_engine_exec(
+            placement.core_id,
+            placement.raft_group_id,
+            elapsed_ns(exec_started_at),
+        );
+        response
+    }
+
+    pub(crate) async fn list_bucket_streams(
+        group: &mut Box<dyn GroupEngine>,
+        metrics: Arc<RuntimeMetricsInner>,
+        request: ListBucketStreamsRequest,
+        placement: ShardPlacement,
+    ) -> Result<Option<Vec<ursula_stream::BucketStreamListing>>, RuntimeError> {
+        let exec_started_at = Instant::now();
+        let response = group
+            .list_bucket_streams(request, placement)
             .await
             .map_err(|err| RuntimeError::group_engine(placement, err));
         metrics.record_group_engine_exec(

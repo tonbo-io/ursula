@@ -52,6 +52,7 @@ use crate::request::GroupReadStreamParts;
 use crate::request::HeadStreamRequest;
 use crate::request::HeadStreamResponse;
 use crate::request::ImportGroupStateRequest;
+use crate::request::ListBucketStreamsRequest;
 use crate::request::PlanColdFlushRequest;
 use crate::request::PlanGroupColdFlushRequest;
 use crate::request::PublishSnapshotRequest;
@@ -107,6 +108,14 @@ pub type GroupSetBucketQuotaFuture<'a> =
     Pin<Box<dyn Future<Output = Result<SetBucketQuotaResponse, GroupEngineError>> + Send + 'a>>;
 pub type GroupSetFeatureLevelFuture<'a> =
     Pin<Box<dyn Future<Output = Result<SetFeatureLevelResponse, GroupEngineError>> + Send + 'a>>;
+pub type GroupListBucketStreamsFuture<'a> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<Option<Vec<ursula_stream::BucketStreamListing>>, GroupEngineError>,
+            > + Send
+            + 'a,
+    >,
+>;
 pub type GroupFeatureLevelFuture<'a> =
     Pin<Box<dyn Future<Output = Result<u32, GroupEngineError>> + Send + 'a>>;
 pub type GroupReadSnapshotFuture<'a> =
@@ -314,6 +323,26 @@ pub trait GroupEngine: Send + 'static {
             Err(GroupEngineError::new(format!(
                 "bucket quotas are not supported for bucket '{}'",
                 request.bucket_id
+            )))
+        })
+    }
+
+    /// This group's share of a bucket listing (`extensions.md` §1.4), or
+    /// `None` when the group does not know the bucket. Like
+    /// [`GroupEngine::bucket_usage`] it is served from local replica state,
+    /// leader or follower: the listing is a catalog that tolerates
+    /// replication lag, and requiring leadership would fail it whenever any
+    /// group is led elsewhere. Default unsupported, so an engine that cannot
+    /// list never reports a bucket as empty.
+    fn list_bucket_streams<'a>(
+        &'a mut self,
+        request: ListBucketStreamsRequest,
+        placement: ShardPlacement,
+    ) -> GroupListBucketStreamsFuture<'a> {
+        Box::pin(async move {
+            Err(GroupEngineError::new(format!(
+                "bucket listing is not supported for bucket '{}' in group {}",
+                request.bucket_id, placement.raft_group_id.0
             )))
         })
     }
