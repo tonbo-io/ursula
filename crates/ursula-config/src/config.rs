@@ -692,7 +692,8 @@ pub struct KeyedStateConfig {
     pub upstream_connect_timeout: HumanDuration,
     /// How long a keyed-state request waits for one pod's response headers,
     /// beyond the read's own `timeout_ms`, before it fails over to the next
-    /// pod. The last pod tried gets the rest of the request's budget.
+    /// pod. A pod that sent its headers then gets as long again for its
+    /// body. The last pod tried gets the rest of the request's budget.
     pub failover_header_timeout: HumanDuration,
     /// How long a pod that failed (connection error, header timeout, 502,
     /// 503, 504) stays out of the failover order before the node probes its

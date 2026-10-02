@@ -7,8 +7,12 @@
 //! while it is healthy.
 //!
 //! An attempt fails on a connection error, on no response headers within
-//! the read's wait plus `failover_header_timeout`, on a body that breaks off,
-//! or on a 502/503/504 answer. The request then moves on to the next pod
+//! the read's wait plus `failover_header_timeout`, on a body that breaks off
+//! or does not finish within another `failover_header_timeout`, or on a
+//! 502/503/504 answer (a non-final attempt fails over right after such
+//! headers, without reading the body). Only the last pod tried gets the rest
+//! of the budget, so a pod that stalls after its headers cannot use up the
+//! time of the pods after it. The request then moves on to the next pod
 //! within its own budget (the read's remaining `timeout_ms` is passed on),
 //! and the failed pod is marked unhealthy for `unhealthy_backoff`. Healthy
 //! pods are tried first, in order, then unhealthy ones in order, so a
@@ -290,15 +294,25 @@ impl KeyedStateUpstream {
                 tracing::warn!(pod = %pod.base, "keyed-state upstream URL cannot carry a path");
                 continue;
             };
-            let header_timeout = if attempt + 1 == order.len() {
-                remaining
+            let final_attempt = attempt + 1 == order.len();
+            let (header_timeout, total_timeout) = if final_attempt {
+                (remaining, remaining)
             } else {
-                Duration::from_millis(attempt_wait_ms.unwrap_or_default())
+                let header_timeout = Duration::from_millis(attempt_wait_ms.unwrap_or_default())
                     .saturating_add(self.options.header_timeout)
-                    .min(remaining)
+                    .min(remaining);
+                // Headers plus a body allowance: a pod that stalls after
+                // its headers leaves the rest of the budget to later pods.
+                let total_timeout = header_timeout
+                    .saturating_add(self.options.header_timeout)
+                    .min(remaining);
+                (header_timeout, total_timeout)
             };
             pod.requests.fetch_add(1, Ordering::Relaxed);
-            match self.attempt(url, header_timeout, remaining).await {
+            match self
+                .attempt(url, header_timeout, total_timeout, !final_attempt)
+                .await
+            {
                 Ok(answer) if is_failover_status(answer.status) => {
                     self.mark_unhealthy(index, answer.status.as_str());
                     last_answer = Some(answer);
@@ -316,12 +330,18 @@ impl KeyedStateUpstream {
         last_answer
     }
 
+    /// One request to one pod: headers within `header_timeout`, the whole
+    /// answer within `total_timeout`. With `skip_failover_body`, a
+    /// 502/503/504 answer returns right after its headers with an empty body
+    /// (the request fails over; a slow error body must not delay it).
     async fn attempt(
         &self,
         url: url::Url,
         header_timeout: Duration,
         total_timeout: Duration,
+        skip_failover_body: bool,
     ) -> Result<UpstreamAnswer, String> {
+        let started = Instant::now();
         let send = self.client.get(url).timeout(total_timeout).send();
         let response = match tokio::time::timeout(header_timeout, send).await {
             Err(_) => return Err("no response headers in time".to_owned()),
@@ -330,10 +350,19 @@ impl KeyedStateUpstream {
         };
         let status = response.status();
         let headers = response.headers().clone();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|err| format!("response body failed: {err}"))?;
+        if skip_failover_body && is_failover_status(status) {
+            return Ok(UpstreamAnswer {
+                status,
+                headers,
+                body: Bytes::new(),
+            });
+        }
+        let body_timeout = total_timeout.saturating_sub(started.elapsed());
+        let body = match tokio::time::timeout(body_timeout, response.bytes()).await {
+            Err(_) => return Err("response body not complete in time".to_owned()),
+            Ok(Err(err)) => return Err(format!("response body failed: {err}")),
+            Ok(Ok(body)) => body,
+        };
         Ok(UpstreamAnswer {
             status,
             headers,

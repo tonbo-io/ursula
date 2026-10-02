@@ -764,3 +764,84 @@ async fn a_hung_primary_fails_over_after_the_header_timeout() {
     assert_eq!(standby.take_reads(), 1);
     assert_eq!(upstream_metrics(&app).await["pods"][0]["healthy"], false);
 }
+
+/// A pod that accepts connections and answers every request with `head`
+/// (status line and headers), then never sends the body it announced.
+async fn stalling_pod(head: &'static str) -> String {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let _ = socket.write_all(head.as_bytes()).await;
+                // Hold the connection open with the body unsent.
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                drop(socket);
+            });
+        }
+    });
+    url
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_primary_that_stalls_after_its_headers_fails_over_within_the_request() {
+    let primary = stalling_pod(
+        "HTTP/1.1 200 OK\r\nstream-keyed-through: 1\r\ncontent-length: 100\r\n\r\n",
+    )
+    .await;
+    let standby = StubIndexer::spawn().await;
+    standby.reply(StubReply::rows(1, ""));
+    let upstream = KeyedStateUpstream::with_pods([primary, standby.url.clone()], FAST_FAILOVER)
+        .expect("upstream");
+    let (app, _) = app_with(Some(upstream)).await;
+    create(&app, "/bkt1/keyed", KEYED_CT, 1).await;
+    let started = std::time::Instant::now();
+    let response = get(&app, "/bkt1/keyed/keyed-state?key=AQ").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header(&response, HEADER_STREAM_KEYED_THROUGH), Some("1"));
+    // Headers plus the body allowance (2 × 500 ms), not the 30 s budget.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(standby.take_reads(), 1);
+    assert_eq!(upstream_metrics(&app).await["pods"][0]["healthy"], false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_503_with_a_slow_body_fails_over_right_after_its_headers() {
+    let primary = stalling_pod(
+        "HTTP/1.1 503 Service Unavailable\r\nretry-after: 3\r\ncontent-length: 100\r\n\r\n",
+    )
+    .await;
+    let standby = StubIndexer::spawn().await;
+    standby.reply(StubReply::rows(1, ""));
+    let options = crate::keyed_state::FailoverOptions {
+        header_timeout: std::time::Duration::from_secs(2),
+        ..FAST_FAILOVER
+    };
+    let upstream =
+        KeyedStateUpstream::with_pods([primary, standby.url.clone()], options).expect("upstream");
+    let (app, _) = app_with(Some(upstream)).await;
+    create(&app, "/bkt1/keyed", KEYED_CT, 1).await;
+    let started = std::time::Instant::now();
+    let response = get(&app, "/bkt1/keyed/keyed-state?key=AQ").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    // Reading the body would hold the request for the 2 s header deadline
+    // plus the 2 s body allowance.
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1_500),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(standby.take_reads(), 1);
+    assert_eq!(upstream_metrics(&app).await["pods"][0]["healthy"], false);
+}
