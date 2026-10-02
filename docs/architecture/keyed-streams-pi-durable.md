@@ -1,10 +1,10 @@
 # Keyed Streams: Pi Durable on Ursula
 
-Status: Draft — protocol alignment pending
+Status: Accepted 2026-10-02 (Q0–Q5 confirmed; Q6–Q8 take the recommendations; `/bootstrap` fix uses the honest-partial form). Implementation in progress on `agent/keyed-streams`.
 
-Scope: make Ursula the single storage backend for Pi Durable. This document defines a writer-declared keyed record format, a keyed-state read resource served from a rebuildable projection, JSON message text fidelity, byte-bounded record reads, the Ursula-core changes that let a log stay untrimmed with bounded replicated memory, and the TypeScript owner that implements Pi's 17-method `Storage` contract on top of them.
+Scope: make Ursula the single storage backend for Pi Durable. This document defines a writer-declared keyed record format, a keyed-state read resource served from a rebuildable projection, JSON message text fidelity, byte-bounded record reads, and the TypeScript owner that implements Pi's 17-method `Storage` contract on top of them. The Ursula-core work that lets a log stay untrimmed with bounded replicated memory is general and lives in `docs/architecture/bounded-stream-state.md`; §6.2 summarizes what Pi needs from it.
 
-Related: `docs/web/public/docs/specs/extensions.md` §1.4 (bucket stream listing), §1.7 (path affinity), §2 (snapshots), §6 (JSON record coordinates); `docs/architecture/json-record-coordinates-validation.md` (external index boundary); `docs/architecture/raft-wal-production.md`; `docs/architecture/deterministic-simulation-testing.md`; Ursula #84/#85 (record coordinates), #86 (event time), #87 (append sessions); Durable Streams #404 (server-side compaction of State Protocol streams), #405 (write fencing), #281 (JSON validation envelope), #110 (RFC 9457 errors); Pi Durable `packages/durable/docs/spec.md` and `src/testing/storage-conformance.ts`.
+Related: `docs/web/src/content/docs/pages/specs/extensions.mdx` §1.4 (bucket stream listing), §1.7 (path affinity), §2 (snapshots), §6 (JSON record coordinates); `docs/architecture/bounded-stream-state.md` (the never-trim core, C0 to C7); `docs/architecture/json-record-coordinates-validation.md` (external index boundary); `docs/architecture/raft-wal-production.md`; `docs/architecture/deterministic-simulation-testing.md`; Ursula #84/#85 (record coordinates), #86 (event time), #87 (append sessions); Durable Streams #404 (server-side compaction of State Protocol streams), #405 (write fencing), #281 (JSON validation envelope), #110 (RFC 9457 errors); Pi Durable `packages/durable/docs/spec.md` and `src/testing/storage-conformance.ts`.
 
 Conventions: Ursula paths are relative to the repository root. Pi paths are prefixed `pi:` and are relative to the Pi monorepo. Figures marked *measured* come from the probes in §11.9; all other figures are priors that M0 replaces with measurements.
 
@@ -16,12 +16,12 @@ Conventions: Ursula paths are relative to the repository root. Pi paths are pref
 4. The keyed engine is ursula-index generalized in place: covering rows, LWW versions, point and range tombstones, and size-tiered compaction. Ingestion runs on demand, triggered by reads that carry `min_through_record`. Idle harnesses cost zero S3 requests.
 5. `GET {stream}/keyed-state` returns exactly one `state(D)` per response. The stream's node serves it as a thin proxy to an internal indexer endpoint, passing the stream's incarnation and tail. There is no gateway pool, no HEAD, and no time travel.
 6. JSON writes keep the writer's text: Ursula validates it and strips insignificant whitespace, and never reorders members or rewrites literals. Record-aware reads accept `max_bytes`.
-7. Never-trim is paid for in Ursula core rather than worked around: sparse cold record marks (16 B per MiB of cold log instead of 8 B per record), pack-reference compaction through the existing `CompactCold`, capped producer receipts, and the correct fix for the ≥1 MiB external-staging defects. One replicated group feature level gates every replicated-core change.
+7. Never-trim is paid for in Ursula core rather than worked around, by the general bounded-state workstream (`docs/architecture/bounded-stream-state.md`): per-stream replicated state stays at about 32 KiB plus 8 B per unflushed record plus 16 B per MiB of cold log, with no retention. Its main parts are sparse cold record marks, pack-reference compaction through the existing `CompactCold`, and bounded producer receipts. It also fixes cold-path defects a never-trim stream would hit, among them data made unreadable by a ≥1 MiB append and stale external page entries. Replicated group feature levels gate every replicated-core change, Pi's included.
 8. Fencing uses only `Stream-Record-Match`: claim on open (epoch = claim ordinal, plus a random nonce), fixed bytes per attempt, and read-back on ambiguity. Open runs its preflight first and claims last, in a host-chosen mode: `fence` or `fail-if-active`.
 9. The owner keeps an overlay of unflushed records `[E, tail)` and a cache of key ranges holding materialized `state(tail)`. Remote pages merge by replaying the overlay over them. Rows keyed by IDs minted in the current session are complete by construction. After warm-up, every read on Pi's Session line is local.
 10. Failure policy: transient failures on the Session line retry until a deadline, then poison the storage; the background flush loop retries indefinitely and never poisons on a transient failure. `StorageRejected` is used only for deterministic outcomes where nothing became durable. Once any attempt of a commit is ambiguous, every later outcome for that commit is resolved by reading back record N.
 11. Four protocol items need alignment (P1, P2, P3, P7), written as one new `extensions.md` section plus two general amendments. Everything else is internal.
-12. Milestones: M0 covers alignment plus four risk spikes. M1 is a full-resident owner passing Pi conformance against a real node. M2 adds the engine and keyed-state, M3 the bounded owner, M4 hardening. The Ursula-core track runs in parallel and must land before production.
+12. Milestones: M0 covers alignment plus four risk spikes. M1 is a full-resident owner passing Pi conformance against a real node. M2 adds the engine and keyed-state, M3 the bounded owner, M4 hardening. The bounded-state workstream (B0–B7) starts now, runs in parallel, and must reach B4 before Pi production.
 
 The decisions needed from you are in §13: eight items, each with a recommendation.
 
@@ -80,8 +80,6 @@ Principles (binding): no force-fit, and adjust an existing Ursula abstraction be
   S3: {bucket}/{stream}/chunks|cold-index|external/…, {bucket}/_packs/…   (log; nodes)
       .keyed/{bucket}/{key}/{incarnation}/v{fmt}/…                        (projection; indexer)
 ```
-
-
 
 ### 3.3 Write path
 
@@ -178,7 +176,7 @@ A fenced owner learns of the takeover on its next commit (412, then read-back sh
 - **Naming.** `/{bucket}/{harness_id}` (two-segment form). This replaces the brief's affinity key per harness: an affinity key only co-locates several streams in one Raft group (`extensions.md` §1.7), and a harness is one stream, so the key would add a path segment and buy nothing. `harness_id` is chosen by the host, unique, and never reused. The recommended shape is `{scope}-{rev_ms13}-{ulid}`: `scope` is a short hash of the host's grouping key (for example the cwd), and `rev_ms13 = 9999999999999 − created_ms`, so a prefix listing returns one scope newest-first. The ID fits the 122-byte limit (`extensions.md` §1.1).
 - **Catalog.** Implement the specified but unimplemented bucket listing, `GET /{bucket}/streams?prefix=…&after=…&limit=…` (`extensions.md` §1.4; there is no route today, `crates/ursula/src/lib.rs:1323-1400`). Session metadata lives in stream attrs (`title`, `metadata`, at most 16 KiB): `{"title":…,"metadata":{"pi_durable":1,"cwd":…,"created_at_ms":…}}`. The owner writes attrs at create time and when the title changes.
 - **Abandonment.** Hosts may set a sliding `Stream-TTL` at create (`crates/ursula-stream/src/state_machine.rs:734-750`). Appends and log reads renew it (`crates/ursula-runtime/src/engine/in_memory.rs:952`), including the one ingestion that catches the projection up after the last append. Keyed-state requests themselves do not, so reads of an abandoned, caught-up harness never renew it. The default is no TTL, because sessions are user data.
-- **Delete.** `DELETE {stream}` enqueues the existing cold GC sweep (`crates/ursula-runtime/src/runtime.rs:1016-1019`). U22 extends it to the stream's external payloads and, for a keyed stream, to the deleted incarnation's namespace prefix `.keyed/{bucket}/{key}/{c:016x}/`, which delete apply enqueues as a GC path. A recreated stream's new incarnation is never swept.
+- **Delete.** `DELETE {stream}` enqueues the stream's cold GC sweep (`crates/ursula-runtime/src/runtime.rs:1016-1019`), which the bounded-state workstream scopes to the deleted incarnation and extends to its external payloads (C7, F14a). For a keyed stream, delete apply also enqueues the deleted incarnation's namespace prefix `.keyed/{bucket}/{key}/{c:016x}/` as a GC path (U22). A recreated stream's new incarnation is never swept.
 - **Purge.** `DELETE /__ursula/purge/{bucket}` keeps its existing tombstone step. It then sends `drain(bucket)` to every indexer pod. Each pod blocks new work for the bucket, waits for its in-flight operations and acknowledges; the purge proceeds only when every pod has acknowledged. After the tombstone, nodes answer 404 for the bucket's streams, so no new work arrives. Finally the purge erases both `{bucket}/` and `.keyed/{bucket}/` and proves both empty (U23, extending `crates/ursula-runtime/src/runtime.rs:602-633`). `.keyed/` is a top-level prefix: a bucket ID cannot contain `.`, so no bucket's erasure domain can collide with it, and lifecycle and IAM rules can target it by prefix.
 - **Disaster recovery.** The projection is a cache. Restore the log with the standard Ursula DR procedure (RPO = export time). Namespaces that are now ahead of, or divergent from, their restored source fail the continuity check and rebuild (§5.5); keyed-state answers 503 for them until the rebuild catches up. Owners poison at the commit deadline and reopen. `.keyed/` does not need to be in backups.
 - **Usage.** No system process advances retention, so log bytes stay in the bucket's retained-bytes gauge and quota. Projection live bytes are exported per bucket as a separate usage metric.
@@ -509,7 +507,7 @@ Production LoC; tests are listed separately below.
 | U1 | `ursula/src/render.rs:725-753` | P1: `RawValue` validation, flattening, lexical minify with per-message depth counting; a minify loop that skips string contents quickly | +110 / −25 | medium (all JSON writes) | M0b → M1 |
 | U2 | `ursula/src/render.rs:498-527` | envelope view splices stored bytes (once P1 stores lone surrogates, re-parsing into `serde_json::Value` would turn the envelope into a 500) | +20 / −15 | low | M1 |
 | U3 | `ursula-index/src/keyed/batch.rs` (new) | `keyed-batch-v1` validator and parser (serde + `&RawValue`, raw-key check, canonical base64url), shared by node and indexer; `ursula` already depends on `ursula-index` (`crates/ursula/Cargo.toml:56`) | +220 | low (fuzzed) | M1 |
-| U4 | `ursula/src/lib.rs:2421, 2552, 2642, 2721` | keyed streams validate at all four write paths; token advertisement; keyed creates refused below the feature level | +120 | low | M1 |
+| U4 | `ursula/src/lib.rs:2421, 2552, 2642, 2721` | keyed streams validate at all four write paths; token advertisement; keyed creates refused below `Lk` (§6.2) | +120 | low | M1 |
 | U5 | `ursula-shard/src/lib.rs` | split `is_reserved_affinity_stream_id`, which today serves the apply-time validator, node routing and gateway routing alike (`ursula-stream/src/validate.rs:28`, `ursula/src/lib.rs:1108`, `ursula-gateway/src/lib.rs:677, 880`): the routing and HTTP predicate reserves `keyed-state` from M1, and the apply-time one only from C8's level; move `normalize_content_type` and `profile_of` here so node, gateway and indexer share them | +50 | low | M1 |
 | U6 | `ursula/src/lib.rs:3101-3107`, `ursula-runtime/src/engine/in_memory.rs:1003-1022` | P7: `max_bytes` on record reads | +60 | low | M2 |
 | U7 | `ursula/src/lib.rs` (new handler), `ursula-runtime/src/request.rs:117-131` | keyed-state proxy: routes, parameter validation, stream metadata (incarnation, tail), forwarding to `/v1/keyed`, status mapping, tokens, gzip; an explicit 405 for `HEAD` and other methods (axum's `get()` would answer `HEAD` by running the GET handler, wait included); `HeadStreamResponse.created_at_ms` | +350 | medium | M2 |
@@ -527,11 +525,11 @@ Production LoC; tests are listed separately below.
 | U19 | `ursula-index/src/cache.rs:394-465` | parameterize the cache validator | +20 / −10 | low | M2 |
 | U20 | `ursula-index` CLI | `keyed-state verify` (sampled rebuild, row-by-row compare at equal `D`), `rebuild` (followers, rate-limited, parallel by record range, blue/green), `sweep` (one namespace LIST; deletes unreferenced objects older than the GC grace period), `dump` | +320 | low | M3 |
 | U21 | `ursula-sim`, `ursula-index` | indexer DST: `SourceClient` trait, injectable GC clock (always the epoch under madsim today) | test infra +900 | medium | M4 |
-| U22 | `ursula-runtime/src/runtime.rs:1016-1019`, `ursula-stream/src/state_machine/lifecycle.rs:596-603` | stream-delete sweep also removes the stream's external payloads (today every ≥1 MiB payload leaks on delete). Delete apply of a keyed stream also enqueues its incarnation's prefix `.keyed/{bucket}/{key}/{c:016x}/` as a GC path (gated), which the worker removes as a prefix. Each `{stream}/…/` sweep deletes only names matching what Ursula writes there (`external/{32 hex}-{16 hex}.bin`, and likewise for `chunks/` and `cold-index/`), so a two-segment stream's sweep never reaches an affinity stream under the same name; today's recursive `chunks/` and `cold-index/` sweeps do | +60 | low | M2 |
+| U22 | `ursula-stream/src/state_machine/lifecycle.rs:596-603` | delete apply of a keyed stream enqueues its incarnation's prefix `.keyed/{bucket}/{key}/{c:016x}/` as a GC path (gated), which the worker removes as a prefix. The general parts, removing the stream's external payloads and sweeping only the deleted incarnation's names so that a two-segment stream's sweep never reaches an affinity stream under the same name, are bounded-state F14a and F14g (C7) | +30 | low | M2 |
 | U23 | `ursula-runtime/src/runtime.rs:602-633`, `ursulactl` | purge: `drain(bucket)` to every indexer pod, acknowledged by each, then erase and prove `.keyed/{bucket}/` | +70 | low | M2 |
-| U24 | all | metrics: per-group record marks, dense entries, pack refs, external refs, feature level, and S3 requests by class for packs and C2; per-namespace S3 requests by class, live bytes per bucket, `N − D` lag, CAS conflicts, run count, GC backlog; owner counters (§7.6) | +200 | low | M2–M3 |
+| U24 | all | metrics: S3 requests by class for packs and C2 per group; per-namespace S3 requests by class, live bytes per bucket, `N − D` lag, CAS conflicts, run count, GC backlog; owner counters (§7.6). The per-group state gauges (record marks, dense entries, pack and external refs, feature level) come from bounded-state B0 | +150 | low | M2–M3 |
 
-The Ursula-core track (§6.2) adds C0–C8, about +1,205 LoC. Rust totals are about +5,550 / −120 production LoC, about +3,800 test LoC, plus about 900 LoC of DST infrastructure.
+Pi-specific Rust (U1–U24 and C8; C9 is optional, +60) totals about +4,300 / −120 production LoC and about +2,800 test LoC, plus about 900 LoC of DST infrastructure. The never-trim core (§6.2) is general Ursula work, costed in the bounded-state document at about +5,800 / −400 production LoC and +6,500 test LoC.
 
 TypeScript package:
 
@@ -547,56 +545,40 @@ TypeScript package:
 
 Converging the event-time index onto the keyed engine (about −1,200 / +350) is a deliberate Ursula follow-up, not on Pi's path. Two engines coexist until then. Because keyed logs are never trimmed, such later server-side extractors (that index, or a #404 export view) can backfill from full history.
 
-### 6.2 Never-trim core track
+### 6.2 Never-trim core
 
-These are general Ursula fixes for every long-lived JSON stream, not Pi workarounds. They run in parallel with M1–M3 and must land before production.
+Never-trim needs bounded replicated state, and that is general Ursula work: `docs/architecture/bounded-stream-state.md` (the bounded-state document) specifies it, and its workstream B0–B7 delivers it. Every stream stays within about 32 KiB + 8 B per unflushed record + 16 B per MiB of cold log, with no retention, and the workstream fixes the cold-path defects a never-trim stream would hit. The IDs this document uses map onto it:
 
-- **C0, group feature level.**
-  - A replicated `u32` in group state and a `SetFeatureLevel` command. `ursulactl cluster enable-feature` proposes a level only after every voter and learner reports a binary that supports it.
-  - Each release that adds apply-time behavior defines the next level, and its changes activate only at that level. Binaries from different milestones therefore never apply a command differently. Level 1 is M1's (C7, C8); the core track and M2's U22 enqueue get the next levels in release order. Keyed creates are refused at the HTTP layer below level 1.
-  - +150 LoC, medium risk, M1.
-- **C1, sparse cold record marks.** Replaces `StreamRecordIndex {first_record, record_offsets}` (`crates/ursula-stream/src/record_index.rs:6-10`) with `{first_record, cold_marks: [(record, offset)], dense_first_record, dense_offsets}`.
-  - **Sealing.** At `FlushCold` and `AppendExternal` apply, records wholly below the cold frontier leave the dense vector. One mark is kept at the first record that starts in each 2^20-aligned logical block, and capacity is shrunk when it exceeds twice the length (`record_index.rs:209-229` never shrinks today).
-  - **Lookup.** `offset_for(r)` returns `Exact` for dense records and `Bracket(mark_le(r))` for cold ones.
-  - **Read plan.** The single plan function both engines share (`crates/ursula-runtime/src/engine/in_memory.rs:976-1031`, called from `crates/ursula-raft/src/engine/mod.rs:814`) turns a bracket into a window that starts at the mark. After materialization, the response skips and takes records by counting LF with `memchr`. This is exact because stored record boundaries are exactly the LF positions (`record_index.rs:46-65`), and P1 minification keeps LF out of records.
-  - **Retention.** `AdvanceRetention` gains `#[serde(default)] retained_record: Option<u64>`, resolved by the HTTP layer.
-  - **Append acknowledgements.** Today every append response recomputes its record range from offsets (`record_range_for_append` → `record_for_offset`, `crates/ursula-stream/src/state_machine/query.rs:57-91`, called at `crates/ursula-runtime/src/engine/in_memory.rs:450-453, 908-911`), a binary search over the dense vector. Once `AppendExternal` apply seals its own record, that search fails for a committed append, and before C6 the HTTP layer would then delete its staged object (`crates/ursula/src/lib.rs:2581-2600`). `StreamResponse::Appended` therefore carries the range that apply already computes (`append.rs:492-494`), and producer duplicates take theirs from the matching receipt's items (`receipts[*].items`, not only `last_items`).
-  - **Unchanged.** `record_match`, HEAD and transactions use only the tail and dense offsets.
-  - **Snapshot codec.** New fields `cold_mark_records = 17`, `cold_mark_offsets = 18`, `dense_first_record = 19`. Old snapshots decode as all-dense. Idle legacy streams are sealed by a one-shot `SealRecordIndex` sweep, a gated command.
-  - **Cost.** 16 B per MiB of cold log; *measured*: 200k records over 124 MiB need 2,000 B instead of 1,600,000 B. A random cold read by record over-reads less than 1 MiB before its start record, adding one block GET about half the time plus about 50 µs of CPU. Past its end, the window runs to the next mark, which a large record can push far out, so record reads bound it with `max_bytes` (P7); the owner and indexer always do.
-  - +480 / +500 test LoC, medium risk.
-- **C2, pack-reference compaction through `CompactCold`.**
-  - (a) Mirror the in-memory engine's all-shared branch (`crates/ursula-runtime/src/engine/in_memory.rs:1898-1921`) in the Raft engine's `compact_cold` (`crates/ursula-raft/src/engine/mod.rs:1477-1503`), which rejects shared inputs today. This also fixes `migrate_legacy_shared_cold_once` on Raft clusters (`crates/ursula-runtime/src/runtime.rs:905-990` passes one shared chunk).
-  - (b) Generalize that driver. Candidates are streams with at least 64 shared refs, or idle for at least 1 h with any. The driver groups contiguous refs into runs of at most 16 MiB, writes one exclusive chunk, and issues `CompactCold`; existing refcounted pack GC applies the grace period. Candidates are discovered through a state query, not group snapshots.
-  - (c) Enable cold compaction for keyed clusters (`crates/ursula-config/src/config.rs:370` defaults it off), discovering candidates from recently flushed streams instead of listing every page every 30 s.
-  - +175 / +200 test LoC, low risk, no state-machine or codec change.
-- **C3, receipt cap.** Keep the last 1,024 receipts per producer. Older retries get the existing 409 ("older than the retained receipt window", `crates/ursula-stream/src/state_machine/append.rs:933-946`). Receipts grow without bound today (`append.rs:1005`). Gated. Pi uses no producer headers, so it has 0 receipts. +30 LoC.
-- **C4, `message_records` collapse at `AppendExternal` apply.** Today `message_records` (16 B per record) collapse only on `FlushCold` or retention (`crates/ursula-stream/src/state_machine/cold.rs:510-514, 699`, through `compact_message_records_before`, `cold.rs:717-751`). Gated. +20 LoC.
-- **C5, `hot_payload_len` counter.** `HotBuffer::len` sums every hot chunk on each append response (`crates/ursula-stream/src/state_machine/hot_buffer.rs:47-48`, `query.rs:153-160`). A running counter replaces it; replicated semantics are unchanged. +20 LoC.
-- **C6, the ≥1 MiB external-staging defects (correct fix, mandatory).**
-  - **The defects.** Replicated state never holds an external payload's path: `push_external_segment` only advances the frontier (`crates/ursula-stream/src/state_machine/cold_state.rs:33-36`). The pre-proposal cold-index page is therefore the only locator, and it is never rolled back (`crates/ursula-raft/src/engine/mod.rs:1223-1270`, `crates/ursula-runtime/src/cold_index.rs:435-487`). Cleanup deletes the staged object on any runtime error, including errors after proposal (`crates/ursula/src/lib.rs:2581-2600`). A stale entry also supplies bytes for later ordinary chunks, because `objects_for_read` merges by start offset (`cold_index.rs:880-895`).
-  - **The fix.**
-    1. At apply, push the `ObjectPayloadRef` into `StreamColdState.external_segments`. The field already exists in the snapshot proto and codec, and `read_plan_at` already serves state refs as direct object segments (`query.rs:266-334`).
-    2. Delete the pre-proposal index write. Reads already exclude state-ref ranges from cold-index lookups (`query.rs:266-334`), so appends made after C6 need no read change. Stale page entries left by pre-C6 rejected appends remain: a one-shot repair pass drops page external entries that overlap a chunk entry, which a legitimate external segment never does. Two overlapping page-only external entries cannot be told apart and remain a documented hazard for pre-C6 data. Pi's keyed streams have neither, because they stay inline until C6.
-    3. Never delete a staged object once it may have been proposed; this applies to the create-external path too. The staging node deletes such an object only after a grace period, and only if neither the stream's state refs nor any of its cold-index page entries reference it; payloads written before C6 are referenced only by pages. Objects orphaned by a node crash are reclaimed when the stream is deleted (U22).
-  - **Cost and interim.** Gated. About 120 B of replicated state per ≥1 MiB append, until offloaded into cold-index pages (a follow-up). Until C6 lands, Pi clusters keep `external_payload_min_size` above the 32 MiB body cap and the per-group admission caps at 64 MiB or more (§3.3). +280 / +300 test LoC, medium-high risk.
-- **C7, unique incarnation.** `created_at_ms := max(now_ms, group.last_created_at_ms + 1)` at create apply (`crates/ursula-stream/src/state_machine/lifecycle.rs:201, 360`). One `u64` per group. Gated. +30 LoC, M1.
-- **C8, apply-time reservation of `keyed-state`.** `crates/ursula-stream/src/validate.rs:28` runs on apply for every stream command, so the reservation is gated: `validate_stream_id` receives the group feature level, and only its apply-time predicate (split out in U5) adds `keyed-state` at level 1. The HTTP layer rejects the name at once (U5). +20 LoC, M1.
+| ID | Bounded-state item | Level | Milestone |
+|---|---|---|---|
+| C0 | F0: group feature levels, `SetFeatureLevel`, a level frame in snapshots that older binaries refuse, `TidyStream` | plumbing; `TidyStream` at Lb1 | B1; B3 |
+| C1 | F1: sparse cold record marks; retention into cold history lands on the mark at or below its target | Lb2 | B1 (ungated parts), B4 |
+| C2 | F2: pack-reference compaction through `CompactCold`: the Raft engine's all-shared branch, then a driver | none | B1, B2 |
+| C3 | F3: a receipt window of 1,024 items per stream plus each producer's newest acknowledgement; idle expiry; caps | Lb1 | B3 |
+| C4 | F4a: message-record collapse at every cold transition | Lb1 | B3 |
+| C5 | F6a: `hot_payload_len` counter | none | B1 |
+| C6 | F5 with F19: external locators committed in state and offloaded to cold-index pages; a clip rule and a repair for stale page entries | Lb3; F19 none | B1, B5 |
+| C7 | F14g: unique incarnations, `created_at_ms := max(now_ms, group.last_created_at_ms + 1)`, and incarnation-scoped cold objects and GC | Lb1 | B3 |
+
+What this means for Pi:
+
+- **Prerequisite.** Pi production requires bounded-state B4 (sparse marks, Lb2), which comes after B1's defect fixes and B2's pack driver. B5 (C6) is required before Pi lowers `external_payload_min_size`; B6 (byte-based snapshot cadence, compact hot window) is recommended.
+- **Interim.** Until C6 ships, Pi clusters keep `external_payload_min_size` above the 32 MiB body cap and the per-group admission caps at 64 MiB or more (§3.3). Every commit rides Raft inline, so the staging defects are unreachable, including the cold-frontier regression that a ≥1 MiB append after hot bytes triggers today (bounded-state D1).
+- **Behavior Pi relies on.** Pi sends no producer headers, so it holds no receipts; it never advances retention, so retention landing on a mark does not affect it; and it does not use `/bootstrap`.
+- **Reads.** *Measured*: 200k sealed records over 124 MiB need 2,000 B of marks instead of 1,600,000 B of dense offsets. A cold read by record over-reads less than 1 MiB before its start record, adding one block GET about half the time plus about 50 µs of CPU. Past its end, the window runs to the next anchor, which a large record can push far out, so the owner and the indexer bound every record read with `max_bytes` (P7).
+- **Levels.** Levels follow release order across both documents. The keyed level `Lk` is the first level that carries C8; keyed creates are refused below it. C7 and U22's GC-path enqueue ride the first level released after they are ready, so numbers are assigned at release.
+
+Pi-only core items:
+
+- **C8, apply-time reservation of `keyed-state`.** `crates/ursula-stream/src/validate.rs:28` runs on apply for every stream command, so the reservation is gated: `validate_stream_id` receives the group feature level, and only its apply-time predicate (split out in U5) adds `keyed-state` at `Lk`. The HTTP layer rejects the name at once (U5). +20 LoC, M1.
 - **C9, optional: `record_match` fast-fail.** A check before `stage_external_payload` and before any index write, with apply still authoritative. +60 LoC, M4, latency lever 1.
-
-Follow-ups, not required for Pi:
-
-- offload C6's external refs into cold-index pages once a stream holds more than 64;
-- leader-side reclamation of exclusive chunks and external payloads below a retained offset. Today retention never deletes them, because they are tracked only in cold-index pages, never in replicated state;
-- mark thinning to 8 MiB for compacted history;
-- marks in cold-index page v3 (about 128 B/GB) if 16 B/MiB ever matters.
 
 ### 6.3 Rolling-upgrade gate
 
-- **Raising the level.** P1 and P2 run in the HTTP layer of whichever node receives the write. Followers forward commands they have already built, and the leader does not re-validate (`crates/ursula-raft/src/engine/mod.rs:1230-1236`). An old binary would therefore silently re-normalize keyed records (*measured*: sorted members, `1.50e3` becomes `1500.0`, `\ud800` is rejected), producing false `FencedError`s and LocalStore/projection divergence. So keyed streams may be created only at group feature level ≥ 1. The level is raised after every node runs the new binary, and never lowered.
+- **Raising the level.** P1 and P2 run in the HTTP layer of whichever node receives the write. Followers forward commands they have already built, and the leader does not re-validate (`crates/ursula-raft/src/engine/mod.rs:1230-1236`). An old binary would therefore silently re-normalize keyed records (*measured*: sorted members, `1.50e3` becomes `1500.0`, `\ud800` is rejected), producing false `FencedError`s and LocalStore/projection divergence. So keyed streams may be created only at level `Lk` or above (§6.2). The level is raised after every node runs the new binary, and never lowered.
 - **Owner check.** The owner requires `keyed-batch-v1` in the create response and in HEAD before its first commit. An old node never advertises it.
 - **Indexer check.** The indexer rejects sources whose metadata lacks the token.
-- **No downgrade.** Once a level is raised, a binary that cannot decode that level's snapshot fields and commands (C1, C7, `SetFeatureLevel`) must not run. Release notes state this. New binaries record the level they wrote and refuse snapshots from a higher level.
+- **No downgrade.** Once a level is raised, binaries below it must not run. Snapshots at a raised level carry a level frame that binaries without C0 refuse, and newer binaries refuse levels above their maximum (bounded-state F0). Release notes state this.
 - **Projection format.** Format changes ship readers before writers. Namespaces are versioned, so no binary reads a format newer than it understands.
 - **Exit drill (M4).** A rolling restart under live keyed traffic, with zero poison and byte-identical records.
 
@@ -604,16 +586,11 @@ Follow-ups, not required for Pi:
 
 The state machine, snapshot codec or command set changes for:
 
-- C0: feature level field and `SetFeatureLevel` command;
-- C1: record-index structure, three codec fields, `AdvanceRetention.retained_record`, `SealRecordIndex`;
-- C3: receipt eviction at apply;
-- C4: collapse at apply;
-- C6: external refs kept in state at apply;
-- C7: group `last_created_at_ms`;
-- C8: apply-time reservation;
+- C0, C1, C3, C4, C6 and C7: the bounded-state levels Lb1 to Lb3, each change listed with its gate in the bounded-state document (§5.20);
+- C8: apply-time reservation, at `Lk`;
 - U22: delete apply of a keyed stream enqueues its projection prefix as a GC path (an existing `ColdGcTarget::Paths` entry, so no codec change).
 
-All of them are gated by C0. C1 also changes `StreamResponse::Appended`, which is apply output, not replicated state. C2 changes the Raft engine's `compact_cold`, but neither the state machine nor the codec. P1, P2 and P7 are HTTP-layer and read-path changes. Fencing needs no core change.
+All of them are gated by C0. C1 also changes `StreamResponse::Appended`, which is apply output, not replicated state. C2 and C5 change no replicated state. P1, P2 and P7 are HTTP-layer and read-path changes. Fencing needs no core change.
 
 ### 6.5 Not changed
 
@@ -623,7 +600,7 @@ All of them are gated by C0. C1 also changes `StreamResponse::Appended`, which i
 - Generic snapshot and retention semantics: keyed streams get no special rules.
 - The authorization model: still per bucket.
 - No ReadIndex: writes linearize through `record_match`, and every read names an explicit ordinal.
-- The `/bootstrap` bugs (it drops cold updates when the snapshot offset is beyond the retained offset, and returns the whole cold suffix as one part). Pi does not use bootstrap; they are tracked separately.
+- `/bootstrap`: keyed streams get no special rules, and Pi does not use it. Its generic defects (updates dropped after a checkpoint, one part for the whole cold suffix) are fixed for every stream by bounded-state F11.
 
 ## 7. Owner (TypeScript) design
 
@@ -758,7 +735,7 @@ Model:
 | I26 | `e/` value `seq` = commitSeq; the `e/` and `e.h/` values of an entry are byte-identical | model test |
 | I27 | The Rust indexer fold, the TypeScript overlay fold and the reference model produce identical `key → (record, value)` maps on any log prefix | applier conformance property test |
 | I28 | Sparse marks resolve every retained record to the boundary the dense index would | differential vs `crates/ursula-stream/tests/record_coordinates_reference.rs`; DST cold paths |
-| I29 | Per-stream replicated state is O(1) + 16 B/MiB of cold log + at most 64 pack refs (+120 B per external ref until offload) | soak gauges (U24) |
+| I29 | Per-stream replicated state stays within bounded-state I1: about 32 KiB + 8 B per unflushed record + 16 B/MiB of cold log, with at most 64 pack refs and 16 staged external refs | bounded-state soak gauges and DST invariant 9 |
 
 ## 9. Performance and cost model
 
@@ -830,7 +807,7 @@ Worst-case read amplification: an anonymous `public_read` reader that sends a ne
 - **Replicated memory per replica, idle harness.** About 1 KB plus 16 B/MiB, because the idle pack trigger compacts the refs away.
 - **At scale.** 10,000 harnesses with 1 GB of history each need about 160 MB of marks per replica. Today's dense index would need about 28 MB per such harness (8 B per record at about 300 B per record).
 - **Independence from the indexer.** None of this depends on the indexer being alive.
-- **Group snapshots.** Snapshots every 5,000 entries (`crates/ursula-config/src/config.rs:205`) are dominated by hot payload, which the group hot cap bounds, not by per-stream state.
+- **Group snapshots.** Snapshots every 5,000 entries (`crates/ursula-config/src/config.rs:205`) are dominated by hot payload, which the group hot cap bounds, not by per-stream state. Bounded-state F12e makes the cadence byte-based, so snapshot I/O stays near half the appended bytes.
 - **Rebuild.** Reading the log through followers at about 100 MiB/s per pod, a 2 GB history reads in about 20 s, and about 20 min per pod per heavy harness-year. Rebuilds parallelize by record range.
 
 ### 9.6 Compaction write amplification
@@ -877,8 +854,8 @@ Every exit criterion uses metrics that exist today or are added in the same mile
   - `ursula-bench` gains `--content-type json --record-match`.
   - Exit: mean L ≤ 5 ms, p50 ≤ 4, p99 ≤ 20, p999 ≤ 60; N=1 submit→provider ≤ 4·L̄ + 5 ms; N=16 ≥ 130 commits/s and submit→provider ≤ 100 ms. A miss triggers §13 Q6. Results are recorded in the repo.
 - **M0d, staging defects.**
-  - Scope: failing tests for (i) a post-proposal error deleting the staged object and (ii) a 412-rejected ≥1 MiB append whose stale page entry corrupts later cold reads.
-  - Exit: the tests are committed and C6's design is agreed with the maintainers.
+  - Scope: failing tests for (i) a post-proposal error deleting the staged object and (ii) a 412-rejected ≥1 MiB append whose stale page entry corrupts later cold reads. Bounded-state B0 already commits (ii) among its reproductions; (i) joins them.
+  - Exit: the tests are committed and the bounded-state design for them (C6: F5 and F19) is agreed with the maintainers.
 - **M0e, owner merge.**
   - Scope: the TypeScript overlay/cache (§7.2–§7.3) against a ~200 LoC fake projection that folds the log to a random lagging `D` and truncates pages at random, under a deterministic scheduler that can complete a flush-wait or eviction between any two awaits.
   - Exit: 10^5 cases with `cache|R = state(tail)|R` and zero divergence from a MemoryStorage oracle.
@@ -886,7 +863,7 @@ Every exit criterion uses metrics that exist today or are added in the same mile
 ### M1 — Log and Pi layer, full-resident owner (about 3 weeks)
 
 - **Scope.**
-  - Ursula: U1–U5, U8 (listing), U9–U11, C0, C7 and C8 on main.
+  - Ursula: U1–U5, U8 (listing), U9–U11 and C8 on main, on bounded-state B1's level plumbing (C0).
   - TypeScript: tuple layer, families, Pi layer, log client, claims and fencing in both modes, the §3.3 outcome policy, close.
   - LocalStore without eviction: `E = 0`, with a full replay from record 0 in `max_records` pages until P7.
 - **Exit.**
@@ -894,7 +871,7 @@ Every exit criterion uses metrics that exist today or are added in the same mile
   - Backend tests cover what the 23 cases miss: in-batch duplicate IDs; singleton vs key `""` at one address; requestId remaps within and across batches; terminal→pending rewrites; conversation and kind moves; >1 KiB strings.
   - Fencing, ambiguity, takeover, dual-owner and busy-zombie tests pass, including ≥1 MiB commits (inline under the interim threshold).
   - Bucket listing tests pass.
-  - Keyed creates are refused below feature level 1.
+  - Keyed creates are refused below `Lk`.
 - **Validation.** CI; the fault proxy (§11.7); P2 negative vectors on all four write paths.
 
 ### M2 — Keyed engine, keyed-state, P7 (about 4 weeks)
@@ -904,7 +881,7 @@ Every exit criterion uses metrics that exist today or are added in the same mile
   - Engine model test: ≥ 10^5 random workloads match the oracle at every `D`, with flush, compaction, GC and reads interleaved, including tombstone-only parts.
   - Crash injection between part, manifest and CAS, mid-compaction and mid-GC leaves state unchanged. A lost CAS leaves no orphans after the grace period; a crash leaves at most one publish's or one compaction budget's worth, which stream deletion reclaims.
   - A two-pod CAS race stays consistent.
-  - Continuity checks: same-path recreate with a frozen clock; a restored source.
+  - Continuity checks: same-path recreate with a frozen clock (needs C7, from bounded-state Lb1 or carried on `Lk`); a restored source.
   - Logs written in M1 ingest from record 0.
   - P3 and P7 vectors pass at the real HTTP boundary.
   - Compaction is ≤ 6× flushed bytes for profiles (a) and (d) at 2 GB.
@@ -923,14 +900,14 @@ Every exit criterion uses metrics that exist today or are added in the same mile
   - `verify` equals `CURRENT`.
 - **Validation.** §11.1–§11.2 and the §11.10 benchmarks.
 
-### Ursula-core track (parallel with M1–M3, about 5 weeks; required before production)
+### Bounded-state workstream (B0–B7, starts now, parallel with M0–M4; required before production)
 
-- **Scope.** C1–C6.
-- **Exit.**
-  - Sparse marks pass differential tests against the record-coordinates reference, DST cold-path seeds, snapshot round-trips and the mixed-version gate test. An inline append followed by a ≥1 MiB external append acknowledges the right `Stream-Record-Start` and `Stream-Record-Next`.
-  - Pack compaction: the Raft engine passes shared→exclusive `CompactCold`, and a hot-group soak keeps refs ≤ 64 per stream.
-  - C6: M0d's tests pass, no code path deletes a possibly-proposed object, and the repair pass removes M0d's stale page entry.
-  - Receipts stay ≤ 1,024 per producer.
+- **Scope.** The bounded-state document's milestones (§8 there): B0 harness; B1 correctness defects and ungated fixes, with the level plumbing; B2 pack-reference driver and orphan sweep; B3 level Lb1 (C3, C4, C7); B4 level Lb2 (C1); B5 level Lb3 (C6); B6 hot window and byte-based snapshot cadence; B7 hardening. About 11 weeks to B4, which Pi production requires.
+- **Exit criteria Pi depends on.**
+  - B1: the cold-path defects (bounded-state D1 to D4) are fixed or contained, with their reproductions in CI, M0d's tests among them; the level plumbing is available for `Lk`.
+  - B2: W2-shaped workloads keep at most 64 pack refs per stream, and packs are GC'd after compaction.
+  - B3: incarnations are unique (C7), and delete and recreate never loses the new incarnation's objects.
+  - B4: sparse marks pass RC-1 to RC-21 and DST invariants 9 to 12; W1 at 3M records holds at most ⌈cold MiB⌉ + 2 marks and exactly its unflushed records as dense entries; an EKS rolling upgrade and raise under live traffic shows zero acknowledged-data divergence.
 
 ### M4 — Production hardening (about 3 weeks)
 
@@ -981,12 +958,7 @@ Items are cited elsewhere as §11.n.
    - Both open modes run against idle, busy and crashed owners; a claim still ambiguous at the 5 s deadline yields `ClaimTimeout`.
    - Gateway responses the owner must survive: a live-read 429 without `Retry-After` during parallel preloads, 401 after credential expiry, and a lagging node's 400 on a flush-wait.
    - On the indexer, crashes are injected between part, manifest and CAS, mid-compaction and mid-GC.
-8. **Ursula-core tests.**
-   - Sparse marks: differential against `crates/ursula-stream/tests/record_coordinates_reference.rs`, plus record ranges acknowledged for appends that seal their own record.
-   - `CompactCold` with shared inputs on the Raft engine.
-   - C6 regression tests from M0d, and a staged-object sweeper test with pre-C6 payloads referenced only by pages.
-   - Stream deletion next to affinity streams named `chunks`, `cold-index` and `external`, and under the same name.
-   - Snapshot codec round-trip and mixed-version gate tests.
+8. **Ursula-core tests.** The bounded-state document's RC-1 to RC-21 suite, DST invariants 9 to 12 and measurement gates (its §6 and §7) cover C0 to C7, including the M0d regressions and the reproductions of its defects D1 to D4. Pi adds keyed cases on top: deletion of a keyed stream next to affinity streams named `chunks`, `cold-index` and `external`, and under the same name (U22 with C7); the keyed level `Lk` in the mixed-version gate test.
 9. **Probes behind *measured* figures.** These are reproduced in the repository during M0:
    - the Pi harness instrumented through a Storage proxy (commit cadence, sizes, critical path);
    - the `serde_json` probes (`RawValue` fidelity, the depth limit, base64 canonicality);
@@ -1052,8 +1024,8 @@ Items are cited elsewhere as §11.n.
 ## 13. Decisions needed
 
 **Q1. Never trim keyed logs.**
-- (a) Never trim: the log is the source of truth and the projection a rebuildable cache. Cost: S3 for the full log (§9.5, ≈ $0.0008 per month per streaming hour at most) and the core track (≈ +1,200 LoC, all general Ursula improvements). Every engine bug is then repairable by rebuild.
-- (b) Trim with a first-class retention-hold primitive (≈ +180 LoC, gated), a time-based window at least as long as the verify cadence, a restore procedure, and no trimming before indexer DST. Choose (b) only if O(1) footprint per idle harness is required.
+- (a) Never trim: the log is the source of truth and the projection a rebuildable cache. Cost: S3 for the full log (§9.5, ≈ $0.0008 per month per streaming hour at most) and the bounded-state workstream through B4 (§6.2), which is general Ursula work that every long-lived stream needs. Every engine bug is then repairable by rebuild.
+- (b) Trim with a first-class retention-hold primitive (≈ +180 LoC, gated), a time-based window at least as long as the verify cadence, a restore procedure, and no trimming before indexer DST. Most of the bounded-state work is still needed, because retention bounds neither the TTL heap, producer state, capacity slack nor the cold-path defects. Choose (b) only if O(1) footprint per idle harness is required.
 - **Recommendation: (a).**
 
 **Q2. P1 as the default for all `application/json` streams.**
