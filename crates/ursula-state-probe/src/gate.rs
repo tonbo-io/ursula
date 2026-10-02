@@ -26,6 +26,7 @@ use serde::Serialize;
 
 use crate::out::Outcome;
 use crate::workloads::Workload;
+use crate::workloads::cadence::CadenceArgs;
 use crate::workloads::l2::L2Args;
 use crate::workloads::planner::PlannerArgs;
 use crate::workloads::w1::W1Args;
@@ -132,6 +133,18 @@ pub fn pr_suite() -> Result<Vec<Job>> {
             Workload::L2(parse::<L2Args>("--mode=compact")?),
         ),
         job("l2_legacy", Workload::L2(parse::<L2Args>("--mode=legacy")?)),
+        job(
+            "cadence_w1",
+            Workload::Cadence(parse::<CadenceArgs>(
+                "--groups=1 --node-groups=128 --appends=300000 --name=cadence_w1",
+            )?),
+        ),
+        job(
+            "cadence_g128",
+            Workload::Cadence(parse::<CadenceArgs>(
+                "--groups=128 --streams-per-group=4 --appends=1000000 --budget-mib=128 --flush-kib=256 --name=cadence_g128",
+            )?),
+        ),
     ])
 }
 
@@ -231,6 +244,18 @@ pub fn nightly_suite() -> Result<Vec<Job>> {
         job(
             "w5_ttl_heap",
             Workload::W5(parse::<W5Args>("--mode=ttl-heap --appends=1000000")?),
+        ),
+        job(
+            "cadence_w1",
+            Workload::Cadence(parse::<CadenceArgs>(
+                "--groups=1 --node-groups=128 --appends=3000000 --name=cadence_w1",
+            )?),
+        ),
+        job(
+            "cadence_g128",
+            Workload::Cadence(parse::<CadenceArgs>(
+                "--groups=128 --streams-per-group=4 --appends=20000000 --flush-kib=1024 --name=cadence_g128",
+            )?),
         ),
         job(
             "w5_purge",

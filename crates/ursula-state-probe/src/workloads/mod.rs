@@ -3,6 +3,7 @@
 //! engines (L2). Each returns an [`crate::out::Outcome`] for the gate and
 //! writes one JSONL row per checkpoint.
 
+pub mod cadence;
 pub mod l2;
 pub mod planner;
 pub mod w1;
@@ -22,6 +23,7 @@ use crate::out::Sink;
 #[derive(Debug, Clone)]
 pub enum Workload {
     W1(w1::W1Args),
+    Cadence(cadence::CadenceArgs),
     W2(w2::W2Args),
     W3(w3::W3Args),
     W4(w4::W4Args),
@@ -35,6 +37,7 @@ impl Workload {
     pub fn name(&self) -> String {
         match self {
             Workload::W1(args) => w1::default_name(args),
+            Workload::Cadence(args) => cadence::default_name(args),
             Workload::W2(args) => w2::default_name(args),
             Workload::W3(args) => w3::default_name(args),
             Workload::W4(args) => w4::default_name(args),
@@ -52,6 +55,7 @@ impl Workload {
         let mut sink = Sink::new(out_dir, &self.name(), echo)?;
         match self {
             Workload::W1(args) => w1::run(args, &mut sink),
+            Workload::Cadence(args) => cadence::run(args, &mut sink),
             Workload::W2(args) => w2::run(args, &mut sink),
             Workload::W3(args) => w3::run(args, &mut sink),
             Workload::W4(args) => w4::run(args, &mut sink),

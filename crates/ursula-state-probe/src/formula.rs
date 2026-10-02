@@ -18,6 +18,10 @@ pub const MAX_SHARED_REFS: u64 = 64;
 pub const MAX_STAGED_EXTERNAL: u64 = 16;
 /// Hot overhead per unflushed record with F6b (bytes).
 pub const HOT_OVERHEAD_PER_RECORD: f64 = 24.0;
+/// Payload bytes per hot block (F6b).
+pub const HOT_BLOCK_BYTES: u64 = 64 * 1024;
+/// Header bytes allowed per hot block (F6b).
+pub const HOT_BLOCK_HEADER_ALLOWANCE: u64 = 64;
 /// Snapshot bytes of mark fields per cold MiB (F1).
 pub const MARK_SNAPSHOT_BYTES_PER_COLD_MIB: u64 = 32;
 
@@ -99,15 +103,26 @@ pub fn per_stream_checks(outcome: &mut Outcome, m: &Measured, shared_refs_interv
     );
     let unflushed: u64 = m.snap.streams.iter().map(|s| s.unflushed_records).sum();
     if unflushed > 0 {
-        // Hot overhead per unflushed record: chunk headers + message records
-        // (16 B) + dense offsets (8 B) for records above the seal point.
+        // Hot overhead per unflushed record: hot-buffer headers + message
+        // records (16 B) + dense offsets (8 B) for records above the seal
+        // point. With F6b the hot buffer holds one header per block of up to
+        // 64 KiB, which is per payload byte rather than per record: the
+        // bound allows one header per started block of each stream's hot
+        // bytes, so per-append headers would still fail it.
         let hot_message_records = m.snap.message_records_count.min(unflushed);
         let overhead = g.hot_overhead_bytes + 16 * hot_message_records + 8 * unflushed;
+        let block_allowance: u64 = m
+            .snap
+            .streams
+            .iter()
+            .filter(|s| s.hot_bytes > 0)
+            .map(|s| HOT_BLOCK_HEADER_ALLOWANCE * (s.hot_bytes.div_ceil(HOT_BLOCK_BYTES) + 1))
+            .sum();
         outcome.check(
             "f6_hot_overhead_per_unflushed_record",
-            "hot overhead per unflushed record <= 24 B (F6b)",
+            "hot overhead per unflushed record <= 24 B plus one header per 64 KiB hot block (F6b)",
             overhead as f64 / unflushed as f64,
-            HOT_OVERHEAD_PER_RECORD,
+            HOT_OVERHEAD_PER_RECORD + block_allowance as f64 / unflushed as f64,
         );
     }
 }
