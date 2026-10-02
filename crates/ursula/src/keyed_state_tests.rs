@@ -779,8 +779,8 @@ async fn stalling_pod(head: &'static str) -> String {
         while let Ok((mut socket, _)) = listener.accept().await {
             tokio::spawn(async move {
                 let mut request = [0_u8; 4096];
-                let _ = socket.read(&mut request).await;
-                let _ = socket.write_all(head.as_bytes()).await;
+                let _read = socket.read(&mut request).await;
+                let _written = socket.write_all(head.as_bytes()).await;
                 // Hold the connection open with the body unsent.
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                 drop(socket);

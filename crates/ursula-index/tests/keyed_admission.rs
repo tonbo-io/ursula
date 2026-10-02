@@ -534,7 +534,7 @@ async fn a_blocking_encode_past_the_deadline_keeps_its_slot_and_budget() {
         .await
         .unwrap()
         .expect("the encode starts");
-    let _ = reader.await.unwrap();
+    let _outcome = reader.await.unwrap();
 
     // Past the deadline the ingest future is gone, but the encode still
     // runs and holds what it was admitted with.
