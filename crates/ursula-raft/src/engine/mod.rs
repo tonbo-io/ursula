@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod compact_tests;
 mod factory;
 
 use std::collections::BTreeMap;
@@ -94,6 +96,7 @@ use ursula_runtime::default_snapshot_store;
 use ursula_runtime::replace_cold_chunk_index_pages_with_rollback;
 use ursula_runtime::rollback_cold_index_pages;
 use ursula_runtime::write_cold_chunk_index_pages;
+use ursula_runtime::write_cold_chunk_index_pages_with_rollback;
 use ursula_runtime::write_external_segment_index_pages;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
@@ -1527,18 +1530,32 @@ impl GroupEngine for RaftGroupEngine {
             let mut index_rollback = None;
             if let Some(cold_store) = self.cold_store.as_ref() {
                 let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
-                let Some(rollback) = replace_cold_chunk_index_pages_with_rollback(
-                    &store,
-                    &request.stream_id,
-                    &request.old_chunks,
-                    &request.replacement,
-                )
-                .await
-                .map_err(|err| GroupEngineError::new(err.to_string()))?
-                else {
-                    return Err(GroupEngineError::new(
-                        "cold compaction input no longer matches the cold index",
-                    ));
+                // Shared pack slices live only in replicated state, never in
+                // cold-index pages, so an all-shared input has nothing to
+                // replace: index the replacement as a fresh entry instead.
+                let rollback = if request.old_chunks.iter().all(|chunk| chunk.shared_object) {
+                    write_cold_chunk_index_pages_with_rollback(
+                        &store,
+                        &request.stream_id,
+                        &request.replacement,
+                    )
+                    .await
+                    .map_err(|err| GroupEngineError::new(err.to_string()))?
+                } else {
+                    let Some(rollback) = replace_cold_chunk_index_pages_with_rollback(
+                        &store,
+                        &request.stream_id,
+                        &request.old_chunks,
+                        &request.replacement,
+                    )
+                    .await
+                    .map_err(|err| GroupEngineError::new(err.to_string()))?
+                    else {
+                        return Err(GroupEngineError::new(
+                            "cold compaction input no longer matches the cold index",
+                        ));
+                    };
+                    rollback
                 };
                 index_rollback = Some((store, rollback));
             }

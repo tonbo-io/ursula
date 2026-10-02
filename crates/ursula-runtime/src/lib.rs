@@ -51,6 +51,7 @@ pub use cold_index::replace_cold_chunk_index_pages_with_rollback;
 pub use cold_index::rollback_cold_index_pages;
 pub use cold_index::select_cold_chunk_compaction;
 pub use cold_index::write_cold_chunk_index_pages;
+pub use cold_index::write_cold_chunk_index_pages_with_rollback;
 pub use cold_index::write_external_segment_index_pages;
 pub use cold_store::ColdReadCacheParams;
 pub use cold_store::ColdStore;
