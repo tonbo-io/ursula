@@ -80,6 +80,7 @@ pub use snapshot::StreamSnapshot;
 pub use snapshot::StreamSnapshotEntry;
 pub use snapshot::StreamSnapshotError;
 pub use state_machine::COMMITTED_WRITE_UNIT_BYTES;
+pub use state_machine::ColdFlushHotAge;
 pub use state_machine::ColdFlushPass;
 pub use state_machine::ColdFlushPassRequest;
 pub use state_machine::ColdFlushPlanStats;

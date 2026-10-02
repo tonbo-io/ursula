@@ -2003,6 +2003,7 @@ fn planner_request(
         max_batch_bytes,
         max_candidates,
         pressure: None,
+        max_hot_age: None,
     }
 }
 
@@ -5262,4 +5263,57 @@ fn shared_ref_candidates_legacy_filter_selects_only_legacy_pack_slices() {
         &stream("legacy"),
         &legacy.run[0]
     ));
+}
+
+/// bounded-stream-state F10 maximum hot age: in a group below its flush
+/// threshold, a stream's small hot tail is flushed whole once it has been
+/// hot for `flush_max_hot_age`; younger tails stay hot.
+#[test]
+fn flush_planner_flushes_tails_older_than_the_max_hot_age() {
+    const AGE_MS: u64 = 300_000;
+    let mut machine = machine();
+    for name in ["old", "young"] {
+        create_stream(&mut machine, name);
+    }
+    append_all(&mut machine, "old", &[b"abcd", b"efgh"]);
+    let aged_request = |now_ms: u64| {
+        let mut request = planner_request(1 << 20, 1 << 20, 1 << 20, usize::MAX);
+        request.max_hot_age = Some(ColdFlushHotAge {
+            now_ms,
+            max_age_ms: AGE_MS,
+        });
+        request
+    };
+    // Without the age the group (8 B) is far below its 1 MiB threshold.
+    let pass = machine
+        .plan_cold_flush_pass(planner_request(1 << 20, 1 << 20, 1 << 20, usize::MAX))
+        .expect("plan pass");
+    assert!(pass.candidates.is_empty());
+    let pass = machine
+        .plan_cold_flush_pass(aged_request(1_000))
+        .expect("plan pass");
+    assert!(pass.candidates.is_empty(), "nothing is old yet");
+    append_all(&mut machine, "young", &[b"ij"]);
+    let pass = machine
+        .plan_cold_flush_pass(aged_request(1_000 + AGE_MS / 2))
+        .expect("plan pass");
+    assert!(pass.candidates.is_empty());
+
+    let pass = machine
+        .plan_cold_flush_pass(aged_request(1_000 + AGE_MS))
+        .expect("plan pass");
+    assert_eq!(pass.candidates.len(), 1);
+    let candidate = &pass.candidates[0];
+    assert_eq!(candidate.stream_id, stream("old"));
+    assert_eq!((candidate.start_offset, candidate.end_offset), (0, 8));
+    apply_flush_pass(&mut machine, &pass, 0);
+    assert_eq!(machine.hot_payload_len(&stream("old")).expect("hot"), 0);
+    assert_eq!(machine.hot_payload_len(&stream("young")).expect("hot"), 2);
+
+    // `young` was first seen hot at AGE/2 + 1s and ages out on its own clock.
+    let pass = machine
+        .plan_cold_flush_pass(aged_request(1_000 + AGE_MS / 2 + AGE_MS))
+        .expect("plan pass");
+    assert_eq!(pass.candidates.len(), 1);
+    assert_eq!(pass.candidates[0].stream_id, stream("young"));
 }

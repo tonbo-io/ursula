@@ -77,6 +77,7 @@ async fn pack_flush(runtime: &ShardRuntime) -> usize {
                 max_flush_bytes: 1 << 20,
                 max_batch_bytes: 1 << 20,
                 pressure: None,
+                max_hot_age: None,
             },
             64,
         )

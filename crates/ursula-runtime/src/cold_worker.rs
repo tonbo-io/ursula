@@ -88,6 +88,7 @@ pub fn spawn_cold_flush_worker_if_configured(
     let max_flush_bytes = usize::try_from(config.flush_max_size().as_bytes())
         .expect("config validation ensures flush sizes fit usize");
     let pressure_hot_bytes = config.flush_pressure_hot_size.as_bytes();
+    let max_hot_age = Some(config.flush_max_hot_age.as_duration()).filter(|age| !age.is_zero());
     let max_concurrency = config.flush_max_concurrency.max(1);
     let runtime = runtime.clone();
     tokio::spawn(async move {
@@ -103,6 +104,7 @@ pub fn spawn_cold_flush_worker_if_configured(
                         max_flush_bytes,
                         max_batch_bytes: max_flush_bytes,
                         pressure,
+                        max_hot_age,
                     },
                     max_concurrency,
                 )

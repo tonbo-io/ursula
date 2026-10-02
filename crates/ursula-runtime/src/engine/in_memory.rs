@@ -2509,6 +2509,12 @@ impl GroupEngine for InMemoryGroupEngine {
                     max_batch_bytes: request.max_batch_bytes,
                     max_candidates,
                     pressure: request.pressure,
+                    max_hot_age: request
+                        .max_hot_age
+                        .map(|age| ursula_stream::ColdFlushHotAge {
+                            now_ms: crate::runtime::unix_time_ms(),
+                            max_age_ms: u64::try_from(age.as_millis()).unwrap_or(u64::MAX),
+                        }),
                 })
                 .map(|pass| pass.candidates)
                 .map_err(stream_response_error)

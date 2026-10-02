@@ -166,6 +166,7 @@ fn flush_request(min_hot: usize, max_flush: usize) -> PlanGroupColdFlushRequest 
         max_flush_bytes: max_flush,
         max_batch_bytes: max_flush,
         pressure: None,
+        max_hot_age: None,
     }
 }
 

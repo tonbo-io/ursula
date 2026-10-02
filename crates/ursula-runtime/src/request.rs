@@ -629,6 +629,10 @@ pub struct PlanGroupColdFlushRequest {
     /// its proportional share of the node's excess hot bytes
     /// (bounded-stream-state F10).
     pub pressure: Option<ColdFlushPressure>,
+    /// Maximum hot age (`flush_max_hot_age`, bounded-stream-state F10): a
+    /// stream's hot tail older than this is flushed whole, even below the
+    /// group threshold. `None` disables it.
+    pub max_hot_age: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

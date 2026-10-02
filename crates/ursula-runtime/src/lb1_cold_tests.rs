@@ -233,6 +233,7 @@ async fn flush_planned_before_delete_and_recreate_never_publishes_into_the_new_i
                 max_flush_bytes: 4,
                 max_batch_bytes: 4,
                 pressure: None,
+                max_hot_age: None,
             },
             1,
         )
@@ -315,6 +316,7 @@ async fn retain_past_last_pack_reference(level: u32) -> (Arc<ColdStore>, String)
                 max_flush_bytes: 4,
                 max_batch_bytes: 8,
                 pressure: None,
+                max_hot_age: None,
             },
             8,
         )

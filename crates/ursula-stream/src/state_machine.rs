@@ -101,6 +101,7 @@ pub use self::cold_refs::SharedRefCompactionRequest;
 pub use self::cold_refs::SharedRefIdleTracker;
 pub use self::cold_refs::is_legacy_cross_bucket_pack;
 pub use self::cold_refs::plan_shared_ref_run;
+pub use self::flush_planner::ColdFlushHotAge;
 pub use self::flush_planner::ColdFlushPass;
 pub use self::flush_planner::ColdFlushPassRequest;
 pub use self::flush_planner::ColdFlushPlanStats;

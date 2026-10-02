@@ -80,6 +80,7 @@ impl StreamStateMachine {
                 max_batch_bytes,
                 max_candidates,
                 pressure: None,
+                max_hot_age: None,
             },
             None,
         )?;
