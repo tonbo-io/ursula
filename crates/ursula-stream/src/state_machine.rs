@@ -86,11 +86,18 @@ use crate::validate::validate_stream_id;
 mod append;
 mod cold;
 mod cold_gc;
+mod cold_refs;
 mod cold_state;
 mod flush_planner;
 mod gauges;
 mod hot_buffer;
 
+pub use self::cold_refs::SHARED_REF_COMPACTION_THRESHOLD;
+pub use self::cold_refs::SHARED_REF_IDLE_MS;
+pub use self::cold_refs::SharedRefCandidate;
+pub use self::cold_refs::SharedRefCompactionRequest;
+pub use self::cold_refs::SharedRefIdleTracker;
+pub use self::cold_refs::plan_shared_ref_run;
 pub use self::flush_planner::ColdFlushPass;
 pub use self::flush_planner::ColdFlushPassRequest;
 pub use self::flush_planner::ColdFlushPlanStats;

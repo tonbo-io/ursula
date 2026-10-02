@@ -5,7 +5,10 @@
 //! - [`cold_store`]: opendal-backed cold tier handle and object path helpers.
 //! - [`cold_index`]: cold-index pages (binary format, stores, cache), their
 //!   writes with the clip rule and rollback, and leader-side page repair.
-//! - [`cold_worker`]: background flush, compaction, GC and page-repair loops.
+//! - [`cold_refs`]: value types of the shared pack-reference compaction driver
+//!   (F2) and the cold orphan sweep (F14h), and object-name age parsing.
+//! - [`cold_worker`]: background flush, compaction, GC, page-repair and
+//!   orphan-sweep loops.
 //! - [`request`]: HTTP/gRPC request and response value types for each engine op.
 //! - [`command`]: the replicated [`GroupWriteCommand`] envelope around the
 //!   canonical [`ursula_stream::StreamCommand`], plus `From` conversions from
@@ -23,6 +26,7 @@
 
 mod admission;
 pub mod cold_index;
+mod cold_refs;
 mod cold_store;
 pub mod cold_worker;
 mod command;
@@ -67,6 +71,13 @@ pub use cold_index::write_cold_chunk_index_pages_with_rollback;
 pub use cold_index::write_cold_chunk_index_pages_with_rollback_in_generation;
 pub use cold_index::write_external_segment_index_pages;
 pub use cold_index::write_external_segment_index_pages_in_generation;
+pub use cold_refs::ColdOrphanSweepPlan;
+pub use cold_refs::ColdOrphanSweepReport;
+pub use cold_refs::ColdOrphanSweepRequest;
+pub use cold_refs::ColdOrphanSweepStream;
+pub use cold_refs::SharedRefCompactionConfig;
+pub use cold_refs::SharedRefCompactionReport;
+pub use cold_refs::cold_object_written_unix_ms;
 pub use cold_store::ColdReadCacheParams;
 pub use cold_store::ColdStore;
 pub use cold_store::ColdStoreEvent;
@@ -79,13 +90,16 @@ pub use cold_store::ColdStoreOperation;
 pub use cold_store::cold_bucket_prefix;
 pub use cold_store::cold_chunk_dir;
 pub use cold_store::cold_external_dir;
+pub use cold_store::cold_pack_dir;
 pub use cold_store::new_cold_chunk_path;
 pub use cold_store::new_cold_chunk_path_in_generation;
+pub use cold_store::new_cold_pack_path;
 pub use cold_store::new_external_payload_path;
 pub use cold_worker::spawn_cold_compaction_worker_if_configured;
 pub use cold_worker::spawn_cold_flush_worker_if_configured;
 pub use cold_worker::spawn_cold_gc_worker_if_configured;
 pub use cold_worker::spawn_cold_index_repair_worker;
+pub use cold_worker::spawn_cold_orphan_sweep_worker;
 pub use command::GroupSnapshot;
 pub use command::GroupWriteCommand;
 pub use engine::GroupAckColdGcFuture;
@@ -118,7 +132,9 @@ pub use engine::GroupLeaderHint;
 pub use engine::GroupListBucketStreamsFuture;
 pub use engine::GroupPlanColdFlushFuture;
 pub use engine::GroupPlanColdGcFuture;
+pub use engine::GroupPlanColdOrphanSweepFuture;
 pub use engine::GroupPlanNextColdFlushBatchFuture;
+pub use engine::GroupPlanSharedRefCompactionFuture;
 pub use engine::GroupPublishSnapshotFuture;
 pub use engine::GroupPurgeBucketFuture;
 pub use engine::GroupReadSnapshotFuture;
@@ -139,6 +155,7 @@ pub use engine::GroupWriteResponse;
 pub use engine::in_memory::InMemoryGroupEngine;
 pub use engine::in_memory::InMemoryGroupEngineFactory;
 pub use engine::in_memory::next_repair_cursor;
+pub use engine::in_memory::repair_cold_index_response;
 pub use error::ErrorStatus;
 pub use error::RuntimeError;
 pub use metrics::RuntimeMailboxSnapshot;
@@ -198,6 +215,7 @@ pub use request::StreamAppendCount;
 pub use request::TouchStreamAccessResponse;
 pub use request::UpdateStreamAttrsRequest;
 pub use request::UpdateStreamAttrsResponse;
+pub use runtime::COLD_ORPHAN_SWEEP_GRACE_MS;
 pub use runtime::ColdIndexRepairStep;
 pub use runtime::PurgeBucketReport;
 pub use runtime::RuntimeConfig;
@@ -216,7 +234,10 @@ pub use snapshot_store::SnapshotReferenceConfig;
 pub use snapshot_store::SnapshotStore;
 pub use snapshot_store::SnapshotStoreError;
 pub use snapshot_store::SnapshotStoreFuture;
+pub use snapshot_store::decode_snapshot_envelope;
 pub use snapshot_store::default_snapshot_store;
+pub use snapshot_store::encode_binary_envelope;
+pub use snapshot_store::is_json_snapshot_envelope;
 pub use snapshot_store::snapshot_store_from_config;
 pub use ursula_config::config::ColdConfig;
 pub use ursula_stream::BucketStreamListing;
@@ -249,3 +270,6 @@ mod tests;
 
 #[cfg(test)]
 mod cold_correctness_tests;
+
+#[cfg(test)]
+mod cold_drivers_tests;

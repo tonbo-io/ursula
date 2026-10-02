@@ -708,6 +708,29 @@ impl ColdStore {
             .await
     }
 
+    /// [`Self::read_chunk_range`] that bypasses the read cache: background
+    /// rewrites such as F2 compaction read each slice once, and must not
+    /// evict the blocks that serve client reads.
+    pub async fn read_chunk_range_uncached(
+        &self,
+        chunk: &ColdChunkRef,
+        read_start_offset: u64,
+        len: usize,
+    ) -> io::Result<Vec<u8>> {
+        let object = ObjectPayloadRef::from(chunk);
+        self.read_object_range_inner(None, &object, read_start_offset, len, false)
+            .await
+    }
+
+    /// Size of the object at `path`.
+    pub async fn object_size(&self, path: &str) -> io::Result<u64> {
+        self.operator
+            .stat(path)
+            .await
+            .map(|metadata| metadata.content_length())
+            .map_err(|err| cold_store_io_error(path, err))
+    }
+
     pub async fn read_object_range_for_stream(
         &self,
         stream_id: &BucketStreamId,
@@ -715,7 +738,7 @@ impl ColdStore {
         read_start_offset: u64,
         len: usize,
     ) -> io::Result<Vec<u8>> {
-        self.read_object_range_inner(Some(stream_id), object, read_start_offset, len)
+        self.read_object_range_inner(Some(stream_id), object, read_start_offset, len, true)
             .await
     }
 
@@ -725,7 +748,7 @@ impl ColdStore {
         read_start_offset: u64,
         len: usize,
     ) -> io::Result<Vec<u8>> {
-        self.read_object_range_inner(None, object, read_start_offset, len)
+        self.read_object_range_inner(None, object, read_start_offset, len, true)
             .await
     }
 
@@ -746,6 +769,7 @@ impl ColdStore {
         object: &ObjectPayloadRef,
         read_start_offset: u64,
         len: usize,
+        use_cache: bool,
     ) -> io::Result<Vec<u8>> {
         if len == 0 {
             return Ok(Vec::new());
@@ -783,7 +807,8 @@ impl ColdStore {
                 ),
             ));
         }
-        let cached = self.read_cache.is_some();
+        let read_cache = self.read_cache.as_ref().filter(|_| use_cache);
+        let cached = read_cache.is_some();
         self.notify(ColdStoreEvent::ReadObjectRangeBegin {
             stream_id: stream_id.cloned(),
             path: object.s3_path.clone(),
@@ -806,7 +831,7 @@ impl ColdStore {
                 cached: Some(cached),
             })
             .await?;
-        let mut bytes = if let Some(cache) = &self.read_cache {
+        let mut bytes = if let Some(cache) = read_cache {
             let bytes = self
                 .read_object_range_cached(cache, object, object_start, object_end, len)
                 .await?;
@@ -1454,7 +1479,15 @@ fn hex_fields_with_suffix(name: &str, suffix: &str, widths: &[usize]) -> bool {
 pub fn new_cold_pack_path(bucket_id: &str, raft_group_id: u32) -> String {
     let unix_nanos = cold_object_unix_nanos();
     let sequence = COLD_CHUNK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("{bucket_id}/_packs/{raft_group_id:08x}/{unix_nanos:032x}-{sequence:016x}.bin")
+    format!(
+        "{}{unix_nanos:032x}-{sequence:016x}.bin",
+        cold_pack_dir(bucket_id, raft_group_id)
+    )
+}
+
+/// The directory holding one Raft group's packs for one bucket.
+pub fn cold_pack_dir(bucket_id: &str, raft_group_id: u32) -> String {
+    format!("{bucket_id}/_packs/{raft_group_id:08x}/")
 }
 
 /// The physical erasure domain for one tenant bucket. Every current chunk,

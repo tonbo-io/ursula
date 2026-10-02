@@ -150,6 +150,20 @@ pub type GroupRepairColdIndexFuture<'a> = Pin<
             + 'a,
     >,
 >;
+pub type GroupPlanSharedRefCompactionFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Vec<ursula_stream::SharedRefCandidate>, GroupEngineError>>
+            + Send
+            + 'a,
+    >,
+>;
+pub type GroupPlanColdOrphanSweepFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<crate::cold_refs::ColdOrphanSweepPlan, GroupEngineError>>
+            + Send
+            + 'a,
+    >,
+>;
 pub type GroupImportGroupStateFuture<'a> = Pin<
     Box<
         dyn Future<Output = Result<crate::request::ImportGroupStateResponse, GroupEngineError>>
@@ -514,6 +528,27 @@ pub trait GroupEngine: Send + 'static {
         _placement: ShardPlacement,
     ) -> GroupRepairColdIndexFuture<'a> {
         Box::pin(async { Ok(crate::cold_index::RepairColdIndexResponse::default()) })
+    }
+
+    /// Leader-local discovery for the shared pack-reference compaction
+    /// driver (bounded-state F2): the streams to compact next and the run of
+    /// shared refs to compact for each. Default finds none.
+    fn plan_shared_ref_compaction<'a>(
+        &'a mut self,
+        _request: ursula_stream::SharedRefCompactionRequest,
+        _placement: ShardPlacement,
+    ) -> GroupPlanSharedRefCompactionFuture<'a> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// What applied state references for one orphan-sweep step (bounded-state
+    /// F14h). Default reports a non-leader with nothing to sweep.
+    fn plan_cold_orphan_sweep<'a>(
+        &'a mut self,
+        _request: crate::cold_refs::ColdOrphanSweepRequest,
+        _placement: ShardPlacement,
+    ) -> GroupPlanColdOrphanSweepFuture<'a> {
+        Box::pin(async { Ok(crate::cold_refs::ColdOrphanSweepPlan::default()) })
     }
 
     fn append<'a>(

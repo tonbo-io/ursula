@@ -725,6 +725,17 @@ impl RuntimeMetricsInner {
         self.cold_gc_reclaimed.fetch_add_relaxed(entries);
     }
 
+    /// One delete attempt of the cold orphan sweep (F14h): `bytes` reclaimed
+    /// on success, or an error.
+    pub(crate) fn record_cold_orphan_cleanup(&self, bytes: u64, error: bool) {
+        self.cold_orphan_cleanup_attempts.fetch_add_relaxed(1);
+        if error {
+            self.cold_orphan_cleanup_errors.fetch_add_relaxed(1);
+        } else {
+            self.cold_orphan_bytes.fetch_add_relaxed(bytes);
+        }
+    }
+
     pub(crate) fn record_cold_flush_write_error(&self) {
         self.cold_flush_write_errors.fetch_add_relaxed(1);
     }

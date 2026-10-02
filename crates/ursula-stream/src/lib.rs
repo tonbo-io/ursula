@@ -10,7 +10,9 @@
 //! - [`snapshot`]: snapshot wire format and restoration errors.
 //! - [`state_machine`]: the deterministic [`StreamStateMachine`] that drives a Raft group,
 //!   plus [`GroupStateGauges`], the per-group bounded-state gauges
-//!   (`docs/architecture/bounded-stream-state.md` §7.5).
+//!   (`docs/architecture/bounded-stream-state.md` §7.5), and the leader-side
+//!   cold-reference queries: shared-ref compaction discovery
+//!   ([`SharedRefCandidate`], F2) and orphan-sweep references (F14h).
 //! - [`validate`]: bucket/stream id validation used by HTTP and Raft entry points.
 
 mod command;
@@ -83,6 +85,12 @@ pub use state_machine::ColdFlushPassRequest;
 pub use state_machine::ColdFlushPlanStats;
 pub use state_machine::ColdFlushPressure;
 pub use state_machine::GroupStateGauges;
+pub use state_machine::SHARED_REF_COMPACTION_THRESHOLD;
+pub use state_machine::SHARED_REF_IDLE_MS;
+pub use state_machine::SharedRefCandidate;
+pub use state_machine::SharedRefCompactionRequest;
+pub use state_machine::SharedRefIdleTracker;
 pub use state_machine::StreamStateMachine;
+pub use state_machine::plan_shared_ref_run;
 pub use validate::validate_bucket_id;
 pub use validate::validate_stream_id;

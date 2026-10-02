@@ -9,6 +9,9 @@ use ursula_stream::ColdFlushPassRequest;
 use ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
 use ursula_stream::ObjectPayloadRef;
 use ursula_stream::ProducerRequest;
+use ursula_stream::SharedRefCandidate;
+use ursula_stream::SharedRefCompactionRequest;
+use ursula_stream::SharedRefIdleTracker;
 use ursula_stream::StreamCommand;
 use ursula_stream::StreamErrorCode;
 use ursula_stream::StreamMessageRecord;
@@ -45,7 +48,9 @@ use super::GroupInstallSnapshotFuture;
 use super::GroupListBucketStreamsFuture;
 use super::GroupPlanColdFlushFuture;
 use super::GroupPlanColdGcFuture;
+use super::GroupPlanColdOrphanSweepFuture;
 use super::GroupPlanNextColdFlushBatchFuture;
+use super::GroupPlanSharedRefCompactionFuture;
 use super::GroupPublishSnapshotFuture;
 use super::GroupPurgeBucketFuture;
 use super::GroupReadSnapshotFuture;
@@ -61,6 +66,7 @@ use super::GroupUpdateStreamAttrsFuture;
 use super::GroupWriteResponse;
 use crate::cold_index::ColdIndexPageCache;
 use crate::cold_index::ColdIndexRepairInput;
+use crate::cold_index::ColdIndexRepairReport;
 use crate::cold_index::ColdStoreColdIndexPageStore;
 use crate::cold_index::RepairColdIndexRequest;
 use crate::cold_index::RepairColdIndexResponse;
@@ -71,8 +77,12 @@ use crate::cold_index::rollback_cold_index_pages;
 use crate::cold_index::write_cold_chunk_index_pages_with_rollback_in_generation;
 use crate::cold_index::write_external_segment_index_pages;
 use crate::cold_index::write_external_segment_index_pages_in_generation;
+use crate::cold_refs::ColdOrphanSweepPlan;
+use crate::cold_refs::ColdOrphanSweepRequest;
+use crate::cold_refs::ColdOrphanSweepStream;
 use crate::cold_store::ColdStoreHandle;
 use crate::cold_store::DEFAULT_CONTENT_TYPE;
+use crate::cold_store::cold_pack_dir;
 use crate::command::GroupSnapshot;
 use crate::command::GroupWriteCommand;
 use crate::request::AckColdGcResponse;
@@ -146,6 +156,9 @@ pub struct InMemoryGroupEngine {
     /// Read plans issued while serving `/bootstrap`; one per request
     /// (bounded-stream-state F11). Node-local and not replicated.
     pub(crate) bootstrap_read_plans: u64,
+    /// Leader-local tail tracker of the shared-ref compaction driver (F2).
+    /// Not replicated; a new leader starts it empty.
+    pub(crate) shared_ref_idle: SharedRefIdleTracker,
 }
 
 impl InMemoryGroupEngine {
@@ -1404,40 +1417,118 @@ impl InMemoryGroupEngine {
         self.state_machine
             .stream_ids_after(after, max_streams)
             .into_iter()
-            .filter_map(|stream_id| {
-                let metadata = self.state_machine.head(&stream_id)?;
-                let hot_ranges = self
-                    .state_machine
-                    .hot_segments(&stream_id)
-                    .iter()
-                    .map(|segment| (segment.start_offset, segment.end_offset))
-                    .collect();
-                let state_refs = self
-                    .state_machine
-                    .cold_chunks(&stream_id)
-                    .iter()
-                    .map(ObjectPayloadRef::from)
-                    .chain(
-                        self.state_machine
-                            .external_segments(&stream_id)
-                            .iter()
-                            .cloned(),
-                    )
-                    .collect();
-                Some(ColdIndexRepairInput {
-                    generation: self
-                        .state_machine
-                        .cold_index_generation(&stream_id)
-                        .unwrap_or(0),
-                    retained_offset: self.state_machine.retained_offset(&stream_id),
-                    tail_offset: metadata.tail_offset,
-                    created_at_ms: metadata.created_at_ms,
-                    hot_ranges,
-                    state_refs,
-                    stream_id,
-                })
-            })
+            .filter_map(|stream_id| self.cold_index_repair_input(stream_id))
             .collect()
+    }
+
+    /// F2 discovery on this replica, tracking idle tails leader-locally.
+    pub fn plan_shared_ref_compaction_candidates(
+        &mut self,
+        request: &SharedRefCompactionRequest,
+    ) -> Vec<SharedRefCandidate> {
+        self.state_machine
+            .shared_ref_candidates(request, &mut self.shared_ref_idle)
+    }
+
+    /// What applied state references for one orphan-sweep step (F14h): the
+    /// group's pack directories at the start of a cycle, the group-wide
+    /// referenced paths, and up to `max_streams` live streams after the
+    /// cursor with the paths their state references.
+    pub fn cold_orphan_sweep_plan(
+        &self,
+        request: &ColdOrphanSweepRequest,
+        raft_group_id: u32,
+    ) -> ColdOrphanSweepPlan {
+        let max_streams = request.max_streams.max(1);
+        let stream_ids = self
+            .state_machine
+            .stream_ids_after(request.after.as_ref(), max_streams);
+        let next_after = (stream_ids.len() >= max_streams)
+            .then(|| stream_ids.last().cloned())
+            .flatten();
+        let pack_dirs = if request.after.is_none() {
+            self.state_machine
+                .bucket_ids()
+                .into_iter()
+                .map(|bucket_id| cold_pack_dir(&bucket_id, raft_group_id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let streams = stream_ids
+            .into_iter()
+            .map(|stream_id| ColdOrphanSweepStream {
+                generation: self
+                    .state_machine
+                    .cold_index_generation(&stream_id)
+                    .unwrap_or(0),
+                referenced: self.state_machine.stream_referenced_cold_paths(&stream_id),
+                stream_id,
+            })
+            .collect();
+        ColdOrphanSweepPlan {
+            leader: true,
+            pack_dirs,
+            group_referenced: self.state_machine.group_referenced_cold_paths(),
+            streams,
+            next_after,
+        }
+    }
+
+    /// The repair inputs one [`RepairColdIndexRequest`] covers: the one
+    /// stream it names (F2 repairs a stream right before compacting it), or
+    /// the next cursor step.
+    pub fn cold_index_repair_inputs_for(
+        &self,
+        request: &RepairColdIndexRequest,
+    ) -> Vec<ColdIndexRepairInput> {
+        match &request.stream {
+            Some(stream_id) => self
+                .cold_index_repair_input(stream_id.clone())
+                .into_iter()
+                .collect(),
+            None => {
+                self.cold_index_repair_inputs(request.after.as_ref(), request.max_streams.max(1))
+            }
+        }
+    }
+
+    /// What applied state proves about one stream, for cold-index page repair.
+    pub fn cold_index_repair_input(
+        &self,
+        stream_id: BucketStreamId,
+    ) -> Option<ColdIndexRepairInput> {
+        let metadata = self.state_machine.head(&stream_id)?;
+        let hot_ranges = self
+            .state_machine
+            .hot_segments(&stream_id)
+            .iter()
+            .map(|segment| (segment.start_offset, segment.end_offset))
+            .collect();
+        let state_refs = self
+            .state_machine
+            .cold_chunks(&stream_id)
+            .iter()
+            .map(ObjectPayloadRef::from)
+            .chain(
+                self.state_machine
+                    .external_segments(&stream_id)
+                    .iter()
+                    .cloned(),
+            )
+            .collect();
+        Some(ColdIndexRepairInput {
+            generation: self
+                .state_machine
+                .cold_index_generation(&stream_id)
+                .unwrap_or(0),
+            retained_offset: self.state_machine.retained_offset(&stream_id),
+            tail_offset: metadata.tail_offset,
+            created_at_ms: metadata.created_at_ms,
+            hot_ranges,
+            state_refs,
+            stream_id,
+        })
     }
 
     /// Whether `stream_id` exists and has not expired at `now_ms`. A create
@@ -1922,6 +2013,24 @@ impl GroupEngine for InMemoryGroupEngine {
         Box::pin(async move { Ok(entries) })
     }
 
+    fn plan_shared_ref_compaction<'a>(
+        &'a mut self,
+        request: SharedRefCompactionRequest,
+        _placement: ShardPlacement,
+    ) -> GroupPlanSharedRefCompactionFuture<'a> {
+        let candidates = self.plan_shared_ref_compaction_candidates(&request);
+        Box::pin(async move { Ok(candidates) })
+    }
+
+    fn plan_cold_orphan_sweep<'a>(
+        &'a mut self,
+        request: ColdOrphanSweepRequest,
+        placement: ShardPlacement,
+    ) -> GroupPlanColdOrphanSweepFuture<'a> {
+        let plan = self.cold_orphan_sweep_plan(&request, placement.raft_group_id.0);
+        Box::pin(async move { Ok(plan) })
+    }
+
     fn repair_cold_index<'a>(
         &'a mut self,
         request: RepairColdIndexRequest,
@@ -1931,19 +2040,13 @@ impl GroupEngine for InMemoryGroupEngine {
             let Some(cold_store) = self.cold_store.as_ref() else {
                 return Ok(RepairColdIndexResponse::default());
             };
-            let max_streams = request.max_streams.max(1);
-            let inputs = self.cold_index_repair_inputs(request.after.as_ref(), max_streams);
+            let inputs = self.cold_index_repair_inputs_for(&request);
             let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
             let report =
                 repair_cold_index_streams(&store, self.cold_index_cache.as_deref(), &inputs)
                     .await
                     .map_err(|err| GroupEngineError::new(err.to_string()))?;
-            let next_after = next_repair_cursor(&inputs, max_streams);
-            Ok(RepairColdIndexResponse {
-                report,
-                cycle_completed: next_after.is_none(),
-                next_after,
-            })
+            Ok(repair_cold_index_response(&request, &inputs, report))
         })
     }
 
@@ -2384,6 +2487,28 @@ pub fn next_repair_cursor(
         return None;
     }
     inputs.last().map(|input| input.stream_id.clone())
+}
+
+/// The response to one repair step over `inputs`. A step that names one
+/// stream leaves the cursor alone and never completes a cycle.
+pub fn repair_cold_index_response(
+    request: &RepairColdIndexRequest,
+    inputs: &[ColdIndexRepairInput],
+    report: ColdIndexRepairReport,
+) -> RepairColdIndexResponse {
+    if request.stream.is_some() {
+        return RepairColdIndexResponse {
+            report,
+            next_after: None,
+            cycle_completed: false,
+        };
+    }
+    let next_after = next_repair_cursor(inputs, request.max_streams.max(1));
+    RepairColdIndexResponse {
+        report,
+        cycle_completed: next_after.is_none(),
+        next_after,
+    }
 }
 
 pub(crate) fn stream_response_error(response: StreamResponse) -> GroupEngineError {

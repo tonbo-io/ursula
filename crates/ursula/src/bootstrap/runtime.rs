@@ -17,6 +17,7 @@ use ursula_runtime::spawn_cold_compaction_worker_if_configured;
 use ursula_runtime::spawn_cold_flush_worker_if_configured;
 use ursula_runtime::spawn_cold_gc_worker_if_configured;
 use ursula_runtime::spawn_cold_index_repair_worker;
+use ursula_runtime::spawn_cold_orphan_sweep_worker;
 
 use crate::bootstrap::cold_health;
 use crate::bootstrap::commit_stall;
@@ -128,6 +129,7 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         spawn_cold_compaction_worker_if_configured(&spawned.runtime, &config.storage.cold);
         spawn_cold_gc_worker_if_configured(&spawned.runtime, &config.storage.cold);
         spawn_cold_index_repair_worker(&spawned.runtime);
+        spawn_cold_orphan_sweep_worker(&spawned.runtime);
     }
 
     if let Topology::StaticCluster { node_id, peers, .. } = &topology {
