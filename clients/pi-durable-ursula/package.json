@@ -16,7 +16,8 @@
     "test": "vitest --run",
     "test:e2e": "vitest --run --config vitest.e2e.config.ts",
     "typecheck": "tsc -p .",
-    "bench:e2e": "vitest --run --config vitest.perf.config.ts"
+    "bench:e2e": "vitest --run --config vitest.perf.config.ts",
+    "test:drills": "vitest --run --config vitest.drills.config.ts"
   },
   "dependencies": {
     "@earendil-works/chord": "1.0.0",

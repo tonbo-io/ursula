@@ -34,6 +34,8 @@ export interface HttpTransportOptions {
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_FALLBACK_PAGE_RECORDS = 1000;
+/** 307/308 hops followed per request (a leader change can redirect more than once). */
+const MAX_REDIRECTS = 10;
 const LF = 0x0a;
 
 /** `{baseUrl}/{bucket}/{stream}` with every path segment percent-encoded. */
@@ -121,15 +123,27 @@ class HttpClient {
 		const budget = this.timeoutMs + (init.waitMs ?? 0);
 		const signal = AbortSignal.timeout(budget);
 		try {
-			const response = await this.fetchFn(url, {
-				method,
-				headers,
-				signal,
-				redirect: "follow",
-				...(init.body === undefined ? {} : { body: init.body }),
-			});
-			const body = new Uint8Array(await response.arrayBuffer());
-			return { status: response.status, headers: lowercaseHeaders(response.headers), body };
+			// Redirects are followed here, not by fetch: a node answers a write that reached a
+			// follower with 307 to the stream's leader (design §3.3), and fetch cannot replay a
+			// byte body on a redirect. Each hop sends a fresh copy, so the caller's bytes stay intact.
+			let target = url;
+			for (let hop = 0; ; hop++) {
+				const response = await this.fetchFn(target, {
+					method,
+					headers,
+					signal,
+					redirect: "manual",
+					...(init.body === undefined ? {} : { body: init.body.slice() }),
+				});
+				const location = response.headers.get("location");
+				if ((response.status === 307 || response.status === 308) && location !== null && hop < MAX_REDIRECTS) {
+					await response.arrayBuffer();
+					target = new URL(location, target).toString();
+					continue;
+				}
+				const body = new Uint8Array(await response.arrayBuffer());
+				return { status: response.status, headers: lowercaseHeaders(response.headers), body };
+			}
 		} catch (error) {
 			if (signal.aborted) throw new TransportError("timeout", `${method} ${url}: no response within ${budget} ms`, { cause: error });
 			throw new TransportError("connection", `${method} ${url}: ${describeError(error)}`, { cause: error });

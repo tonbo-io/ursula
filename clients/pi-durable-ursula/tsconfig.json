@@ -18,5 +18,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["src", "test", "vitest.config.ts", "vitest.e2e.config.ts", "vitest.perf.config.ts"]
+  "include": ["src", "test", "vitest.config.ts", "vitest.e2e.config.ts", "vitest.perf.config.ts", "vitest.drills.config.ts"]
 }

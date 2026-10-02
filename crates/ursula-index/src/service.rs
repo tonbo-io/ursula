@@ -129,6 +129,11 @@ pub struct IndexerArgs {
     /// Keyed mode: maximum concurrent waiting keyed-state reads.
     #[arg(long, default_value_t = 10_000)]
     keyed_max_waiters: usize,
+    /// Keyed mode, drills only: the projection format (`v{fmt}/`) this pod
+    /// reads and writes. Another format rehearses the blue/green rebuild
+    /// (docs/architecture/keyed-streams-drills.md); the layout is the same.
+    #[arg(long, hide = true, default_value_t = crate::keyed::KEYED_PROJECTION_FORMAT)]
+    keyed_projection_format: u32,
 }
 
 /// Indexer maintenance commands.
@@ -682,8 +687,13 @@ async fn run_single(args: IndexerArgs, stream_url: Url) -> anyhow::Result<()> {
 
 /// Keyed mode: the keyed projection engine behind `/v1/keyed`.
 async fn run_keyed(args: IndexerArgs, source_url: Url) -> anyhow::Result<()> {
-    if args.keyed_gc_grace_seconds == 0 || args.keyed_max_waiters == 0 {
-        anyhow::bail!("--keyed-gc-grace-seconds and --keyed-max-waiters must be positive");
+    if args.keyed_gc_grace_seconds == 0
+        || args.keyed_max_waiters == 0
+        || args.keyed_projection_format == 0
+    {
+        anyhow::bail!(
+            "--keyed-gc-grace-seconds, --keyed-max-waiters and --keyed-projection-format must be positive"
+        );
     }
     let target = match StoreTarget::from_args(&args)? {
         StoreTarget::S3 {
@@ -707,6 +717,7 @@ async fn run_keyed(args: IndexerArgs, source_url: Url) -> anyhow::Result<()> {
         min_publish_interval: Duration::from_millis(args.keyed_min_publish_interval_ms),
         gc_grace: Duration::from_secs(args.keyed_gc_grace_seconds),
         max_waiters: args.keyed_max_waiters,
+        projection_format: args.keyed_projection_format,
         ..crate::keyed::KeyedEngineConfig::default()
     };
     let engine = crate::keyed::KeyedEngine::new(store, source, Some(cache), config);

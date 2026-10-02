@@ -71,6 +71,7 @@ use tokio::sync::Notify;
 use tokio::sync::watch;
 
 use super::fold::RangeQuery;
+use super::manifest::KEYED_PROJECTION_FORMAT;
 use super::manifest::KeyedManifest;
 use super::manifest::KeyedNamespace;
 use super::manifest::KeyedPartMeta;
@@ -150,6 +151,10 @@ pub struct KeyedEngineConfig {
     /// last checked longer ago than this, so another pod's or a previous
     /// process's publication is never served below (P3.6).
     pub current_revalidate: Duration,
+    /// Projection format of the namespaces this pod reads and writes
+    /// (`v{fmt}/`). A pod at another format builds its own namespaces from
+    /// record 0 next to the served ones: the blue/green rebuild (§6.1 U20).
+    pub projection_format: u32,
 }
 
 impl Default for KeyedEngineConfig {
@@ -168,6 +173,7 @@ impl Default for KeyedEngineConfig {
             part_options: PartOptions::default(),
             policy: CompactionPolicy::default(),
             current_revalidate: Duration::from_secs(1),
+            projection_format: KEYED_PROJECTION_FORMAT,
         }
     }
 }
@@ -770,9 +776,10 @@ impl Inner {
             return Ok(Arc::clone(namespace));
         }
         let requests = Arc::new(ObjectRequestCounters::default());
-        let namespace = KeyedNamespace::new(
+        let namespace = KeyedNamespace::with_format(
             self.store.clone().counted(Arc::clone(&requests)),
             source.clone(),
+            self.config.projection_format,
         );
         let mut store = namespace.opener();
         if let Some(cache) = &self.cache {
@@ -1314,7 +1321,8 @@ impl Inner {
             cursor = page.next_record;
         }
         namespace.backlog.store(truncated, Ordering::SeqCst);
-        let empty_base = || KeyedManifest::empty(namespace.source.clone());
+        let empty_base =
+            || KeyedManifest::empty_at(namespace.source.clone(), namespace.namespace.format());
         let mut manifest = if rebuild {
             empty_base()
         } else {

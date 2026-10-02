@@ -64,6 +64,34 @@ describe("HttpLogTransport", () => {
 		expect(text(post?.body ?? new Uint8Array())).toBe('{"o":0,"ops":[]}');
 	});
 
+	// Regression: a node answers an append that reached a follower with 307 to the stream's leader
+	// (design §3.3). Node's fetch cannot replay a Uint8Array body on a redirect (it fails with a
+	// detached ArrayBuffer), so every commit through a follower node failed as a connection error.
+	it("follows a 307 on append to the leader with the same body, leaving the caller's bytes intact", async () => {
+		const leader = await stub(() => ({ status: 204, headers: { "Stream-Record-Start": "3", "Stream-Record-Next": "4" } }));
+		const follower = await stub((r) => ({ status: 307, headers: { Location: `${leader.baseUrl}${r.path}` } }));
+		const log = new HttpLogTransport({ baseUrl: follower.baseUrl, stream: "bkt/h-1" });
+		const body = utf8('{"o":0,"ops":[]}');
+		const out = await log.append(body, 3);
+		expect(out.status).toBe(204);
+		expect(out.headers["stream-record-start"]).toBe("3");
+		expect(text(body)).toBe('{"o":0,"ops":[]}');
+		const [post] = leader.requests;
+		expect(post?.method).toBe("POST");
+		expect(post?.path).toBe("/bkt/h-1");
+		expect(post?.headers["stream-record-match"]).toBe("3");
+		expect(text(post?.body ?? new Uint8Array())).toBe('{"o":0,"ops":[]}');
+	});
+
+	it("stops following redirects after a bounded number of hops", async () => {
+		const loop: { s?: Stub } = {};
+		loop.s = await stub((r) => ({ status: 307, headers: { Location: `${loop.s?.baseUrl}${r.path}` } }));
+		const log = new HttpLogTransport({ baseUrl: loop.s.baseUrl, stream: "bkt/h-1" });
+		const out = await log.append(utf8("{}"), 0);
+		expect(out.status).toBe(307);
+		expect(loop.s.requests.length).toBeLessThanOrEqual(11);
+	});
+
 	it("returns error statuses as values with the plain-text message", async () => {
 		const s = await stub(() => ({ status: 412, headers: { "Stream-Record-Next": "9" }, body: "record match failed\n" }));
 		const log = new HttpLogTransport({ baseUrl: s.baseUrl, stream: "b/s" });

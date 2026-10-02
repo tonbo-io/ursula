@@ -1,0 +1,86 @@
+name: Keyed streams drills (nightly)
+
+# The keyed-streams M4 drills at the design's durations (docs/architecture/keyed-streams-drills.md):
+# 10-minute indexer and S3 outages, rolling upgrade from main's binary, purge, restore plus
+# continuity rebuild, blue/green projection format rebuild. The keyed-streams CI runs the same
+# drills with short knobs on every push.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      outage_seconds:
+        description: Indexer and S3 outage length
+        default: "600"
+      owners:
+        description: Live owners per drill
+        default: "16"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  drills:
+    name: M4 drills
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 150
+    env:
+      URSULA_S3_ENDPOINT: http://127.0.0.1:9000
+      URSULA_S3_ACCESS_KEY: minioadmin
+      URSULA_S3_SECRET_KEY: minioadmin
+      DRILL_OUTAGE_S: ${{ inputs.outage_seconds || '600' }}
+      DRILL_OWNERS: ${{ inputs.owners || '16' }}
+      DRILL_SETTLE_S: "30"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Start MinIO
+        run: scripts/ks_minio_ci.sh
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Cache main's ursula binary (e6d8d70)
+        uses: actions/cache@v4
+        with:
+          path: target/ks-old/e6d8d70
+          key: ks-old-ursula-e6d8d70-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build main's ursula binary (rolling-upgrade source)
+        run: scripts/ks_build_old_ursula.sh
+
+      - name: Build ursula
+        run: cargo build --release -p ursula --bin ursula
+
+      - name: Drills
+        run: |
+          cd clients/pi-durable-ursula
+          npm ci
+          URSULA_BIN="$GITHUB_WORKSPACE/target/release/ursula" \
+          URSULA_OLD_BIN="$GITHUB_WORKSPACE/target/ks-old/e6d8d70/ursula" \
+          DRILL_RESULTS_DIR="$RUNNER_TEMP/drill-results" \
+          npm run test:drills
+
+      - name: Upload drill results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: drill-results
+          path: ${{ runner.temp }}/drill-results
+          if-no-files-found: ignore

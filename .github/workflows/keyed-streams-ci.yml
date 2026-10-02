@@ -159,3 +159,107 @@ jobs:
           cd clients/pi-durable-ursula
           npm ci
           URSULA_BIN="$GITHUB_WORKSPACE/target/release/ursula" E2E_STATE_STORE=bounded npm run test:e2e
+
+  typescript-e2e-s3:
+    name: TypeScript owner e2e on S3 (single node, then 3 nodes + gateway)
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    env:
+      URSULA_S3_ENDPOINT: http://127.0.0.1:9000
+      URSULA_S3_ACCESS_KEY: minioadmin
+      URSULA_S3_SECRET_KEY: minioadmin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # MinIO as the S3 service: the node cold store and the keyed indexer's object store (one
+      # S3 bucket per stack, the indexer under the node cold root's `.keyed/`).
+      - name: Start MinIO
+        run: scripts/ks_minio_ci.sh
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Build ursula
+        run: cargo build --release -p ursula --bin ursula
+
+      # The whole e2e suite plus the S3 lifecycle checks (stream-delete GC and bucket purge remove
+      # the indexer's namespaces) on one S3-backed node.
+      - name: e2e on S3, single node
+        timeout-minutes: 15
+        run: |
+          cd clients/pi-durable-ursula
+          npm ci
+          E2E_S3=1 URSULA_BIN="$GITHUB_WORKSPACE/target/release/ursula" npm run test:e2e
+
+      # The same suite through the gateway of a 3-node cluster, plus keyed-state on followers, an
+      # owner on a follower node (307 to the leader) and a takeover across nodes.
+      - name: e2e on S3, 3 nodes + gateway
+        timeout-minutes: 15
+        run: |
+          cd clients/pi-durable-ursula
+          E2E_NODES=3 E2E_S3=1 URSULA_BIN="$GITHUB_WORKSPACE/target/release/ursula" npm run test:e2e
+
+  drills:
+    name: M4 drills (short knobs)
+    runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
+    env:
+      URSULA_S3_ENDPOINT: http://127.0.0.1:9000
+      URSULA_S3_ACCESS_KEY: minioadmin
+      URSULA_S3_SECRET_KEY: minioadmin
+      DRILL_OUTAGE_S: "30"
+      DRILL_SETTLE_S: "5"
+      DRILL_OWNERS: "4"
+      DRILL_COMMIT_DEADLINE_MS: "10000"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Start MinIO
+        run: scripts/ks_minio_ci.sh
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Cache main's ursula binary (e6d8d70)
+        uses: actions/cache@v4
+        with:
+          path: target/ks-old/e6d8d70
+          key: ks-old-ursula-e6d8d70-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Build main's ursula binary (rolling-upgrade source)
+        run: scripts/ks_build_old_ursula.sh
+
+      - name: Build ursula
+        run: cargo build --release -p ursula --bin ursula
+
+      - name: Drills
+        timeout-minutes: 45
+        run: |
+          cd clients/pi-durable-ursula
+          npm ci
+          URSULA_BIN="$GITHUB_WORKSPACE/target/release/ursula" \
+          URSULA_OLD_BIN="$GITHUB_WORKSPACE/target/ks-old/e6d8d70/ursula" \
+          DRILL_RESULTS_DIR="$RUNNER_TEMP/drill-results" \
+          npm run test:drills
+
+      - name: Upload drill results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: drill-results
+          path: ${{ runner.temp }}/drill-results
+          if-no-files-found: ignore
