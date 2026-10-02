@@ -131,9 +131,9 @@ mod serde_bytes_vec {
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
-        // Accept both `bytes` (efficient binary) and the JSON-array fallback
-        // that serde_json uses by default; we go through Vec<u8> directly.
-        Vec::<u8>::deserialize(de)
+        // Accept both a byte string (the F12a MessagePack envelope writes
+        // `bin`) and the JSON array of numbers that serde_json writes.
+        serde_bytes::ByteBuf::deserialize(de).map(serde_bytes::ByteBuf::into_vec)
     }
 }
 
@@ -146,13 +146,52 @@ pub struct SnapshotPointer {
 }
 
 impl SnapshotPointer {
+    /// The JSON envelope every binary writes today.
     pub fn encode(&self) -> Result<Vec<u8>, SnapshotStoreError> {
         serde_json::to_vec(self).map_err(|err| SnapshotStoreError::Serialize(err.to_string()))
     }
 
+    /// The binary envelope of bounded-stream-state F12a: a MessagePack map
+    /// with named fields and inline snapshot bytes as `bin`, which avoids
+    /// JSON's number-array amplification. Decoders accept it now; emission
+    /// starts at feature level Lb1, once every follower can decode it.
+    pub fn encode_binary(&self) -> Result<Vec<u8>, SnapshotStoreError> {
+        encode_binary_envelope(self)
+    }
+
+    /// Decodes either envelope: the legacy JSON form (accepted forever) or
+    /// the F12a MessagePack form.
     pub fn decode(bytes: &[u8]) -> Result<Self, SnapshotStoreError> {
+        decode_snapshot_envelope(bytes)
+    }
+}
+
+/// Whether `bytes` hold the legacy JSON envelope: a JSON object, possibly
+/// after whitespace. The F12a MessagePack envelope is a map, whose first
+/// byte (`0x80..=0x8f`, `0xde` or `0xdf`) is never `{` or JSON whitespace.
+pub fn is_json_snapshot_envelope(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .find(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+        .is_some_and(|byte| *byte == b'{')
+}
+
+/// Encodes `value` as the F12a binary snapshot envelope (MessagePack map
+/// with named fields).
+pub fn encode_binary_envelope<T: Serialize>(value: &T) -> Result<Vec<u8>, SnapshotStoreError> {
+    rmp_serde::to_vec_named(value).map_err(|err| SnapshotStoreError::Serialize(err.to_string()))
+}
+
+/// Decodes a snapshot envelope in either format (F12a decode support): the
+/// legacy JSON form, or the MessagePack form.
+pub fn decode_snapshot_envelope<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<T, SnapshotStoreError> {
+    if is_json_snapshot_envelope(bytes) {
         serde_json::from_slice(bytes)
             .map_err(|err| SnapshotStoreError::Deserialize(err.to_string()))
+    } else {
+        rmp_serde::from_slice(bytes).map_err(|err| SnapshotStoreError::Deserialize(err.to_string()))
     }
 }
 
@@ -1105,6 +1144,61 @@ mod tests {
             SnapshotLocation::Inline { bytes } => assert_eq!(bytes, vec![1, 2, 3, 4]),
             other => panic!("unexpected location: {other:?}"),
         }
+    }
+
+    /// F12a decode support: every location round-trips through the binary
+    /// envelope, inline bytes travel as one MessagePack `bin` instead of a
+    /// JSON number array, and the JSON form still decodes.
+    #[test]
+    fn pointer_decodes_the_binary_envelope_and_the_legacy_json() {
+        let pointers = [
+            SnapshotPointer {
+                snapshot_id: "group-0-1-100".into(),
+                location: SnapshotLocation::Inline {
+                    bytes: (0..=255).collect(),
+                },
+            },
+            SnapshotPointer {
+                snapshot_id: "group-7-2-500".into(),
+                location: SnapshotLocation::Local {
+                    path: PathBuf::from("/var/snap/group-7.snap"),
+                    size_bytes: 12345,
+                },
+            },
+            SnapshotPointer {
+                snapshot_id: "group-3-4-900".into(),
+                location: SnapshotLocation::S3 {
+                    key: "snapshots/group-3/abc.snap".into(),
+                    size_bytes: 77,
+                    stored_size_bytes: Some(40),
+                    compression: SnapshotCompression::Zstd,
+                    shared_object: true,
+                },
+            },
+        ];
+        for pointer in pointers {
+            let binary = pointer.encode_binary().unwrap();
+            assert!(!is_json_snapshot_envelope(&binary));
+            let json = pointer.encode().unwrap();
+            assert!(is_json_snapshot_envelope(&json));
+            for encoded in [binary, json] {
+                let back = SnapshotPointer::decode(&encoded).unwrap();
+                assert_eq!(back.snapshot_id, pointer.snapshot_id);
+                assert_eq!(back.location, pointer.location);
+            }
+        }
+        let inline = SnapshotPointer {
+            snapshot_id: "g".into(),
+            location: SnapshotLocation::Inline {
+                bytes: vec![200; 4096],
+            },
+        };
+        let binary = inline.encode_binary().unwrap().len();
+        let json = inline.encode().unwrap().len();
+        assert!(binary < 4096 + 64, "binary inline bytes are not amplified");
+        assert!(json > 3 * 4096, "JSON writes one number per byte");
+        assert!(SnapshotPointer::decode(b"\x00garbage").is_err());
+        assert!(SnapshotPointer::decode(b" \n{\"snapshot_id\":1}").is_err());
     }
 
     #[test]
