@@ -4977,3 +4977,144 @@ fn d1_read_plan_keeps_hot_bytes_between_cold_ranges() {
     assert_eq!(shape, vec![("cold", 0), ("hot", 0), ("cold", 7)]);
     StreamStateMachine::restore(machine.snapshot()).expect("restore with a hot gap");
 }
+
+/// Publishes one shared slice `[start, end)` of `pack` for `id`.
+fn flush_shared_slice(
+    machine: &mut StreamStateMachine,
+    id: &str,
+    start: u64,
+    end: u64,
+    pack: &str,
+) -> ColdChunkRef {
+    let chunk = ColdChunkRef {
+        start_offset: start,
+        end_offset: end,
+        s3_path: pack.to_owned(),
+        object_size: 1_024,
+        object_offset: 0,
+        shared_object: true,
+        payload_digest: String::new(),
+    };
+    assert!(matches!(
+        machine.apply(StreamCommand::FlushCold {
+            stream_id: stream(id),
+            chunk: chunk.clone(),
+        }),
+        StreamResponse::ColdFlushed { .. }
+    ));
+    chunk
+}
+
+/// F2 discovery: a stream qualifies at T shared refs, or with one shared
+/// ref once its tail has stayed put for the idle period; candidates come
+/// fewest-live-slices first, and compacting a stream's run releases the
+/// packs it was the last reference of.
+#[test]
+fn shared_ref_candidates_follow_threshold_idle_and_pack_occupancy() {
+    let mut machine = machine();
+    for id in ["busy", "idle", "quiet"] {
+        create_stream(&mut machine, id);
+    }
+    // `busy` holds 3 slices of three single-slice packs; `idle` and `quiet`
+    // share one pack with each other.
+    for index in 0..3_u64 {
+        machine.apply(append_cmd(stream("busy"), b"abcd", Append::default()));
+        flush_shared_slice(
+            &mut machine,
+            "busy",
+            index * 4,
+            index * 4 + 4,
+            &format!("benchcmp/_packs/00000000/busy-{index}.bin"),
+        );
+    }
+    for id in ["idle", "quiet"] {
+        machine.apply(append_cmd(stream(id), b"abcd", Append::default()));
+        flush_shared_slice(&mut machine, id, 0, 4, "benchcmp/_packs/00000000/two.bin");
+    }
+
+    let mut tracker = SharedRefIdleTracker::default();
+    let mut request = SharedRefCompactionRequest {
+        min_refs: 3,
+        idle_ms: 1_000,
+        now_ms: 10_000,
+        max_run_bytes: 8,
+        limit: 16,
+    };
+    let candidates = machine.shared_ref_candidates(&request, &mut tracker);
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|c| c.stream_id.stream_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["busy"],
+        "only the stream at the threshold qualifies before anyone is idle"
+    );
+    let busy = &candidates[0];
+    assert_eq!(busy.shared_refs, 3);
+    assert_eq!(busy.run_bytes(), 8, "the run stops at max_run_bytes");
+    assert_eq!(busy.min_pack_live_slices, 1);
+    assert_eq!(tracker.len(), 3);
+
+    // `quiet` keeps appending (hot bytes only), so only `idle` goes idle.
+    machine.apply(append_cmd(stream("quiet"), b"e", Append::default()));
+    request.now_ms = 11_500;
+    let candidates = machine.shared_ref_candidates(&request, &mut tracker);
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|c| (c.stream_id.stream_id.as_str(), c.min_pack_live_slices))
+            .collect::<Vec<_>>(),
+        vec![("busy", 1), ("idle", 2)],
+        "fewest live slices first"
+    );
+
+    // Compacting `busy`'s whole run releases its packs with the grace.
+    let run = plan_shared_ref_run(machine.cold_chunks(&stream("busy")), u64::MAX);
+    assert_eq!(run.len(), 3);
+    assert!(matches!(
+        machine.apply(StreamCommand::CompactCold {
+            stream_id: stream("busy"),
+            old_chunks: run,
+            replacement: ColdChunkRef {
+                start_offset: 0,
+                end_offset: 12,
+                s3_path: "benchcmp/busy/chunks/0-12.bin".to_owned(),
+                object_size: 12,
+                object_offset: 0,
+                shared_object: false,
+                payload_digest: String::new(),
+            },
+            gc_not_before_ms: 99_000,
+        }),
+        StreamResponse::ColdCompacted { .. }
+    ));
+    let referenced = machine.group_referenced_cold_paths();
+    for index in 0..3 {
+        assert!(
+            referenced.contains(&format!("benchcmp/_packs/00000000/busy-{index}.bin")),
+            "released packs stay referenced by their GC entry until it is acked"
+        );
+    }
+    assert!(referenced.contains("benchcmp/_packs/00000000/two.bin"));
+    assert!(
+        machine
+            .shared_ref_candidates(&request, &mut tracker)
+            .iter()
+            .all(|c| c.stream_id != stream("busy"))
+    );
+    assert_eq!(
+        tracker.len(),
+        2,
+        "streams without shared refs leave the tracker"
+    );
+    assert_eq!(machine.stream_referenced_cold_paths(&stream("idle")), vec![
+        "benchcmp/_packs/00000000/two.bin".to_owned()
+    ]);
+    assert_eq!(machine.bucket_ids(), vec!["benchcmp".to_owned()]);
+
+    let pending = machine.pending_cold_gc_batch(16);
+    let last = pending.last().expect("pack releases queued").seq;
+    machine.apply(StreamCommand::AckColdGc { up_to_seq: last });
+    let referenced = machine.group_referenced_cold_paths();
+    assert!(!referenced.contains("benchcmp/_packs/00000000/busy-0.bin"));
+}
