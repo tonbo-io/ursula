@@ -116,9 +116,27 @@ impl StreamStateMachine {
         }
     }
 
+    /// Keyed streams (`application/json; profile=keyed-batch-v1`) may be
+    /// created only at [`FEATURE_LEVEL_KEYED_STREAMS`]: below it an older
+    /// binary could re-normalize their records (design §6.3).
+    ///
+    /// [`FEATURE_LEVEL_KEYED_STREAMS`]: crate::FEATURE_LEVEL_KEYED_STREAMS
+    fn require_keyed_create_level(&self, content_type: &str) -> Result<(), StreamResponse> {
+        if !ursula_shard::is_keyed_batch_content_type(content_type) {
+            return Ok(());
+        }
+        self.require_feature_level(
+            crate::feature::FEATURE_LEVEL_KEYED_STREAMS,
+            "keyed stream create",
+        )
+    }
+
     pub(super) fn create_stream(&mut self, input: CreateStreamInput) -> StreamResponse {
         let attrs = normalize_stream_attrs(input.attrs.clone());
         if let Err(response) = self.validate_stream_scope(&input.stream_id) {
+            return response;
+        }
+        if let Err(response) = self.require_keyed_create_level(&input.content_type) {
             return response;
         }
         if let Err(response) = validate_stream_attrs(attrs.as_ref()) {
@@ -276,6 +294,9 @@ impl StreamStateMachine {
             return response;
         }
         if let Err(response) = self.validate_stream_scope(&input.stream_id) {
+            return response;
+        }
+        if let Err(response) = self.require_keyed_create_level(&input.content_type) {
             return response;
         }
         if let Err(response) = validate_stream_attrs(attrs.as_ref()) {
