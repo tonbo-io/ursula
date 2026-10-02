@@ -33,6 +33,11 @@ export interface StackOptions {
 	readonly gatewayBin?: string;
 	/** Start the keyed indexer (default true). */
 	readonly indexer?: boolean;
+	/**
+	 * Also start a standby indexer on the same object store: the nodes list `[primary, standby]` as
+	 * `keyed_state.indexer_urls` (active/standby failover order), each behind its own proxy.
+	 */
+	readonly standbyIndexer?: boolean;
 	/** `--keyed-min-publish-interval-ms` (default 100). */
 	readonly publishIntervalMs?: number;
 	/** Raft groups (default 4). */
@@ -104,6 +109,9 @@ export class Stack {
 	/** In front of the current indexer; nodes use it as `keyed_state_upstream` and drain URL. */
 	indexerProxy!: FaultProxy;
 	indexer: IndexerHandle | undefined;
+	/** In front of the standby indexer (`standbyIndexer`); second in the nodes' failover order. */
+	standbyProxy: FaultProxy | undefined;
+	standby: IndexerHandle | undefined;
 	s3: S3Server | undefined;
 	/** In front of S3 for every component. */
 	s3Proxy: FaultProxy | undefined;
@@ -162,6 +170,7 @@ export class Stack {
 			this.s3Proxy = await FaultProxy.start(Number(new URL(this.s3.endpoint).port));
 		}
 		this.indexerProxy = await FaultProxy.start(await freePort());
+		if (this.options.standbyIndexer === true) this.standbyProxy = await FaultProxy.start(await freePort());
 		for (let i = 1; i <= n; i++) {
 			const port = await freePort();
 			const adminPort = await freePort();
@@ -187,6 +196,7 @@ export class Stack {
 		}
 		await this.waitWritable();
 		if (this.options.indexer !== false) await this.startIndexer();
+		if (this.options.standbyIndexer === true) await this.restartStandby();
 		const level = this.options.featureLevel ?? 1;
 		if (level > 0) await this.raiseFeatureLevel(level);
 	}
@@ -241,7 +251,10 @@ export class Stack {
 		} else if ((this.options.coldExtra ?? []).length > 0) {
 			lines.push("", "[storage.cold]", ...(this.options.coldExtra ?? []));
 		}
-		if (!node.legacy) lines.push("", "[keyed_state]", `indexer_urls = ["${this.indexerProxy.url}"]`, 'drain_timeout = "10s"');
+		if (!node.legacy) {
+			const urls = [this.indexerProxy.url, ...(this.standbyProxy === undefined ? [] : [this.standbyProxy.url])];
+			lines.push("", "[keyed_state]", `indexer_urls = [${urls.map((url) => `"${url}"`).join(", ")}]`, 'drain_timeout = "10s"');
+		}
 		return `${lines.join("\n")}\n`;
 	}
 
@@ -384,6 +397,15 @@ export class Stack {
 		this.indexerProxy.retarget(handle.port, true);
 	}
 
+	/** Starts (or restarts, on the same port) the standby indexer behind `standbyProxy`. */
+	async restartStandby(): Promise<void> {
+		if (this.standbyProxy === undefined) throw new Error("stack runs without a standby indexer");
+		const port = this.standby?.port;
+		await this.standby?.proc.stop();
+		this.standby = await this.spawnIndexer({}, port);
+		this.standbyProxy.retarget(this.standby.port, true);
+	}
+
 	/**
 	 * Raises every group to `level` (C0): `POST /__ursula/feature-level` on every node until every
 	 * hosted replica reports at least `level` (groups led elsewhere answer `not_leader`).
@@ -437,6 +459,7 @@ export class Stack {
 		const parts = this.nodes.map((node) => `--- node${node.id}\n${node.proc?.logs() ?? ""}`);
 		if (this.gateway !== undefined) parts.push(`--- gateway\n${this.gateway.logs()}`);
 		if (this.indexer !== undefined) parts.push(`--- indexer\n${this.indexer.proc.logs()}`);
+		if (this.standby !== undefined) parts.push(`--- standby indexer\n${this.standby.proc.logs()}`);
 		return parts.join("\n");
 	}
 
@@ -446,8 +469,12 @@ export class Stack {
 		await bounded("stop gateway", this.gateway?.stop());
 		await bounded("stop nodes", Promise.all(this.nodes.map((node) => node.proc?.stop())));
 		await bounded("close indexer proxy", this.indexerProxy?.close());
+		await bounded("close standby proxy", this.standbyProxy?.close());
 		await bounded("close S3 proxy", this.s3Proxy?.close());
 		await bounded("stop S3", this.s3?.stop());
+		// Whatever a late step left running must not keep the runner alive.
+		const procs = [...this.extraProcs, this.gateway, ...this.nodes.map((node) => node.proc)];
+		for (const proc of procs) proc?.release();
 		if (process.env.KEEP_STACK !== "1" && this.options.dir === undefined) rmSync(this.dir, { recursive: true, force: true });
 	}
 }

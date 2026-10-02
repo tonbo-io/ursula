@@ -148,7 +148,7 @@ The first read of a cold offset triggers an S3 `GetObject` range read. It runs o
 
 ### `keyed-state` answers `404`, `503` or `500`
 
-- `404` on a stream you know is keyed: the node has no keyed-state indexer configured. Set `server.keyed_state_upstream` (or `--keyed-state-upstream`) on every node. `HEAD` then advertises `keyed-state-v1`.
+- `404` on a stream you know is keyed: the node has no keyed-state indexer configured. Set `keyed_state.indexer_urls` (primary first) or `server.keyed_state_upstream` (or `--keyed-state-upstream`) on every node. `HEAD` then advertises `keyed-state-v1`.
 - `503` with `Retry-After`: the indexer is unreachable, could not read the stream, or is rebuilding the projection (for example after a restore). Check the indexer's `/readyz` and its logs, then retry.
 - `204`: not an error. Keyed state had not reached `min_through_record` within `timeout_ms`; retry the same request.
 - `500` naming a record: keyed state cannot advance past that record, usually because retention removed records the projection still needed. Keyed streams must not be trimmed; see [Keyed streams](/docs/concepts/keyed-streams#retention).

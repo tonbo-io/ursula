@@ -8,7 +8,9 @@
 //! record tail `N` as `source_next`. The indexer owns `state(D)`, waiting,
 //! and the 200/204/500/503 answers; the node maps them, adds
 //! `Stream-Extensions: keyed-state-v1` and `Cache-Control: no-store`, and
-//! lets the client router's compression layer gzip the rows.
+//! lets the client router's compression layer gzip the rows. The read goes
+//! to the first healthy indexer pod of the configured failover order
+//! ([`crate::keyed_upstream`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,6 +39,7 @@ use crate::HttpState;
 use crate::MAX_LONG_POLL_TIMEOUT_MS;
 use crate::StreamPath;
 use crate::insert_extension_token;
+use crate::keyed_upstream::UpstreamAnswer;
 use crate::render::insert_cache_control;
 use crate::render::insert_content_type;
 use crate::render::insert_default_response_headers;
@@ -58,88 +61,61 @@ const MAX_LIMIT: u64 = 1_000;
 const UPSTREAM_BASE_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_AFTER_SECS: &str = "1";
 
-/// The configured keyed-state upstream: the indexer (or a load balancer in
-/// front of its pods) that serves `/v1/keyed`.
-#[derive(Clone, Debug)]
-pub struct KeyedStateUpstream {
-    base: url::Url,
-    client: reqwest::Client,
-}
+pub use crate::keyed_upstream::FailoverOptions;
+pub use crate::keyed_upstream::KeyedStateUpstream;
 
-impl KeyedStateUpstream {
-    /// Accepts an absolute `http` or `https` base URL; a path prefix is kept.
-    pub fn new(base_url: &str) -> Result<Self, String> {
-        let base = url::Url::parse(base_url)
-            .map_err(|err| format!("invalid keyed-state upstream {base_url:?}: {err}"))?;
-        if !matches!(base.scheme(), "http" | "https") || base.cannot_be_a_base() {
-            return Err(format!(
-                "keyed-state upstream {base_url:?} must be an http or https base URL"
-            ));
-        }
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|err| format!("build keyed-state upstream client: {err}"))?;
-        Ok(Self { base, client })
-    }
-
-    /// The configured base URL.
-    pub fn base(&self) -> &url::Url {
-        &self.base
-    }
-
-    /// `{base}/v1/keyed/{bucket}/{key}?…`, with `{key}` the stream's local
-    /// name (`stream` or `affinity/stream`) as one percent-encoded segment.
-    fn request_url(
-        &self,
-        stream_id: &BucketStreamId,
-        incarnation: u64,
-        source_next: u64,
-        params: &KeyedStateParams,
-    ) -> Result<url::Url, ()> {
-        let local_name = match &stream_id.affinity_key {
-            Some(affinity) => format!("{affinity}/{}", stream_id.stream_id),
-            None => stream_id.stream_id.clone(),
-        };
-        let mut url = self.base.clone();
-        url.path_segments_mut()?.pop_if_empty().extend([
-            "v1",
-            "keyed",
-            &stream_id.bucket_id,
-            &local_name,
-        ]);
-        url.set_query(None);
-        {
-            let mut query = url.query_pairs_mut();
-            query.append_pair("incarnation", &incarnation.to_string());
-            query.append_pair("source_next", &source_next.to_string());
-            match &params.selection {
-                Selection::Point(key) => {
-                    query.append_pair("key", key);
-                }
-                Selection::Range { lower, end, limit } => {
-                    match lower {
-                        Some(Lower::Start(key)) => {
-                            query.append_pair("start", key);
-                        }
-                        Some(Lower::After(key)) => {
-                            query.append_pair("after", key);
-                        }
-                        None => {}
-                    }
-                    if let Some(end) = end {
-                        query.append_pair("end", end);
-                    }
-                    query.append_pair("limit", &limit.to_string());
-                }
+/// `{base}/v1/keyed/{bucket}/{key}?…`, with `{key}` the stream's local name
+/// (`stream` or `affinity/stream`) as one percent-encoded segment. `None`
+/// when the base cannot carry a path.
+fn request_url(
+    base: &url::Url,
+    stream_id: &BucketStreamId,
+    incarnation: u64,
+    source_next: u64,
+    params: &KeyedStateParams,
+) -> Option<url::Url> {
+    let local_name = match &stream_id.affinity_key {
+        Some(affinity) => format!("{affinity}/{}", stream_id.stream_id),
+        None => stream_id.stream_id.clone(),
+    };
+    let mut url = base.clone();
+    url.path_segments_mut().ok()?.pop_if_empty().extend([
+        "v1",
+        "keyed",
+        &stream_id.bucket_id,
+        &local_name,
+    ]);
+    url.set_query(None);
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("incarnation", &incarnation.to_string());
+        query.append_pair("source_next", &source_next.to_string());
+        match &params.selection {
+            Selection::Point(key) => {
+                query.append_pair("key", key);
             }
-            if let Some(wait) = params.wait {
-                query.append_pair("min_through_record", &wait.min_through_record.to_string());
-                query.append_pair("timeout_ms", &wait.timeout_ms.to_string());
+            Selection::Range { lower, end, limit } => {
+                match lower {
+                    Some(Lower::Start(key)) => {
+                        query.append_pair("start", key);
+                    }
+                    Some(Lower::After(key)) => {
+                        query.append_pair("after", key);
+                    }
+                    None => {}
+                }
+                if let Some(end) = end {
+                    query.append_pair("end", end);
+                }
+                query.append_pair("limit", &limit.to_string());
             }
         }
-        Ok(url)
+        if let Some(wait) = params.wait {
+            query.append_pair("min_through_record", &wait.min_through_record.to_string());
+            query.append_pair("timeout_ms", &wait.timeout_ms.to_string());
+        }
     }
+    Some(url)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -395,47 +371,38 @@ async fn forward(
     source_next: u64,
     params: &KeyedStateParams,
 ) -> Response {
-    let Ok(url) = upstream.request_url(stream_id, incarnation, source_next, params) else {
-        return unavailable("keyed-state upstream URL cannot carry a path");
+    let answer = upstream
+        .get(
+            params.wait.map(|wait| wait.timeout_ms),
+            UPSTREAM_BASE_TIMEOUT,
+            |base, wait_ms| {
+                let mut params = params.clone();
+                if let (Some(wait), Some(timeout_ms)) = (params.wait.as_mut(), wait_ms) {
+                    wait.timeout_ms = timeout_ms;
+                }
+                request_url(base, stream_id, incarnation, source_next, &params)
+            },
+        )
+        .await;
+    let Some(UpstreamAnswer {
+        status,
+        headers: upstream_headers,
+        body,
+    }) = answer
+    else {
+        tracing::warn!(
+            bucket = %stream_id.bucket_id,
+            stream = %stream_id.stream_id,
+            "no keyed-state indexer pod answered"
+        );
+        return unavailable("keyed-state upstream is unavailable");
     };
-    let timeout = UPSTREAM_BASE_TIMEOUT.saturating_add(Duration::from_millis(
-        params.wait.map(|wait| wait.timeout_ms).unwrap_or_default(),
-    ));
-    let upstream_response = match upstream.client.get(url).timeout(timeout).send().await {
-        Ok(response) => response,
-        Err(err) => {
-            tracing::warn!(
-                bucket = %stream_id.bucket_id,
-                stream = %stream_id.stream_id,
-                error = %err,
-                "keyed-state upstream request failed"
-            );
-            return unavailable("keyed-state upstream is unavailable");
-        }
-    };
-    let status = upstream_response.status();
-    let through = upstream_response
-        .headers()
+    let through = upstream_headers
         .get(HEADER_STREAM_KEYED_THROUGH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
-    let after = upstream_response
-        .headers()
-        .get(HEADER_STREAM_KEYED_AFTER)
-        .cloned();
-    let retry_after = upstream_response.headers().get(RETRY_AFTER).cloned();
-    let body = match upstream_response.bytes().await {
-        Ok(body) => body,
-        Err(err) => {
-            tracing::warn!(
-                bucket = %stream_id.bucket_id,
-                stream = %stream_id.stream_id,
-                error = %err,
-                "keyed-state upstream body failed"
-            );
-            return unavailable("keyed-state upstream is unavailable");
-        }
-    };
+    let after = upstream_headers.get(HEADER_STREAM_KEYED_AFTER).cloned();
+    let retry_after = upstream_headers.get(RETRY_AFTER).cloned();
     let mut headers = keyed_headers();
     match status.as_u16() {
         200 | 204 => {
@@ -594,22 +561,20 @@ mod tests {
 
     #[test]
     fn request_url_encodes_the_local_name_as_one_segment() {
-        let upstream = KeyedStateUpstream::new("http://indexer:9000/prefix/").expect("upstream");
+        let base = url::Url::parse("http://indexer:9000/prefix/").expect("base");
         let params =
             parse_params(Some("start=AQ&min_through_record=4&timeout_ms=99999")).expect("params");
-        let url = upstream
-            .request_url(
-                &BucketStreamId::with_affinity("b", "run 1", "a%b"),
-                7,
-                9,
-                &params,
-            )
-            .expect("url");
+        let url = request_url(
+            &base,
+            &BucketStreamId::with_affinity("b", "run 1", "a%b"),
+            7,
+            9,
+            &params,
+        )
+        .expect("url");
         assert_eq!(
             url.as_str(),
             "http://indexer:9000/prefix/v1/keyed/b/run%201%2Fa%25b?incarnation=7&source_next=9&start=AQ&limit=100&min_through_record=4&timeout_ms=60000"
         );
-        assert!(KeyedStateUpstream::new("ftp://indexer").is_err());
-        assert!(KeyedStateUpstream::new("not a url").is_err());
     }
 }

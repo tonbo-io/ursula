@@ -139,6 +139,7 @@ async fn fixture(bucket: &str, indexer_urls: Vec<String>) -> Fixture {
     let config = ursula_config::KeyedStateConfig {
         indexer_urls,
         drain_timeout: ursula_config::HumanDuration::sec(5),
+        ..Default::default()
     };
     let state = HttpState::new(runtime).with_keyed_state_config(&config);
     Fixture {

@@ -72,6 +72,17 @@ export class Proc {
 		this.child.kill("SIGKILL");
 		await exited;
 	}
+
+	/**
+	 * Teardown backstop: SIGKILL the process if it still runs, and detach its pipes and handle so
+	 * nothing it holds can keep the test runner's event loop alive.
+	 */
+	release(): void {
+		if (this.running) this.child.kill("SIGKILL");
+		this.child.stdout?.destroy();
+		this.child.stderr?.destroy();
+		this.child.unref();
+	}
 }
 
 /** Polls `url` until it answers 2xx, failing early if `proc` exits. */

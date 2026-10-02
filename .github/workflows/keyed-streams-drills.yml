@@ -1,6 +1,6 @@
-name: Keyed streams drills (nightly)
+name: Keyed fault drills (nightly)
 
-# The keyed-streams M4 drills at the design's durations (docs/architecture/keyed-streams-drills.md):
+# The keyed-streams fault drills at the design's durations (docs/architecture/keyed-streams-drills.md):
 # 10-minute indexer and S3 outages, rolling upgrade from main's binary, purge, restore plus
 # continuity rebuild, blue/green projection format rebuild. The keyed-streams CI runs the same
 # drills with short knobs on every push.
@@ -28,8 +28,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  drills:
-    name: M4 drills
+  fault-drills:
+    name: Keyed fault drills (nightly)
     runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 150
     env:

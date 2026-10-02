@@ -7,6 +7,8 @@
 //!   minification of `application/json` write bodies.
 //! - [`keyed_state`]: `{stream_url}/keyed-state` (keyed-streams P3): parameter
 //!   validation, stream resolution and forwarding to the indexer's `/v1/keyed`.
+//! - `keyed_upstream`: active/standby failover over the keyed-state indexer
+//!   pods (ordered list, health backoff, `/readyz` prober, failover metrics).
 //! - `keyed_lifecycle`: keyed-state lifecycle on the node: the bucket-purge
 //!   drain fan-out to keyed-state indexers (U23) and keyed-state request
 //!   counters (U24).
@@ -22,6 +24,7 @@ mod bucket_listing;
 pub mod json_text;
 mod keyed_lifecycle;
 pub mod keyed_state;
+mod keyed_upstream;
 mod otel_metrics;
 pub mod server;
 mod http_time {
@@ -368,7 +371,8 @@ pub struct HttpState {
     /// (e.g. ursulactl auto-enabling empty-log rejoin only for `memory`).
     wal_backend: &'static str,
     wal_disk: WalDiskMonitor,
-    /// Indexer serving `/v1/keyed`; `None` means keyed state is not served
+    /// Indexer pods serving `/v1/keyed`, in failover order; `None` means
+    /// keyed state is not served
     /// (`{stream_url}/keyed-state` answers 404 and nothing advertises
     /// `keyed-state-v1`).
     keyed_state_upstream: Option<Arc<keyed_state::KeyedStateUpstream>>,
@@ -497,8 +501,8 @@ impl HttpState {
         self
     }
 
-    /// Serve `{stream_url}/keyed-state` through this indexer base URL
-    /// (keyed-streams P3, U7).
+    /// Serve `{stream_url}/keyed-state` through these indexer pods
+    /// (keyed-streams P3, U7), first healthy pod first.
     pub fn with_keyed_state_upstream(mut self, upstream: keyed_state::KeyedStateUpstream) -> Self {
         self.keyed_state_upstream = Some(Arc::new(upstream));
         self
@@ -2146,6 +2150,14 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         object.insert(
             "keyed_state_requests".to_owned(),
             serde_json::to_value(state.keyed_state_metrics.snapshot())
+                .unwrap_or(serde_json::Value::Null),
+        );
+        object.insert(
+            "keyed_state_upstream".to_owned(),
+            state
+                .keyed_state_upstream
+                .as_ref()
+                .and_then(|upstream| serde_json::to_value(upstream.snapshot()).ok())
                 .unwrap_or(serde_json::Value::Null),
         );
         object.insert("process_rss_bytes".to_owned(), serde_json::json!(rss));

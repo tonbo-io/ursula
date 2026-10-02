@@ -80,9 +80,13 @@ export default async function setup(project: TestProject): Promise<() => Promise
 	project.provide("controlUrl", `http://127.0.0.1:${controlPort}`);
 	project.provide("stackInfo", JSON.stringify(info));
 	return async () => {
+		const started = Date.now();
+		console.error("[e2e] global teardown: stopping the stack");
 		const closed = new Promise<void>((resolve) => control.close(() => resolve()));
 		control.closeAllConnections();
-		await closed;
+		// Bounded: an in-flight control request must not hold the teardown.
+		await Promise.race([closed, new Promise((resolve) => setTimeout(resolve, 5_000).unref())]);
 		await stack.stop();
+		console.error(`[e2e] global teardown done in ${Date.now() - started} ms`);
 	};
 }

@@ -11,8 +11,8 @@ Design references: `keyed-streams-pi-durable.md` §3.8 (lifecycle, purge, disast
 | e2e suite, single node, filesystem indexer (existing) | CI `typescript-e2e` | `npm run test:e2e` |
 | e2e suite on S3, single node, plus the S3 lifecycle checks | CI `typescript-e2e-s3` | `E2E_S3=1 npm run test:e2e` |
 | e2e suite on S3 through the gateway of 3 nodes, plus the cluster checks | CI `typescript-e2e-s3` | `E2E_NODES=3 E2E_S3=1 npm run test:e2e` |
-| six drills, short knobs (30 s outages, 4 owners) | CI `drills` | `DRILL_OUTAGE_S=30 DRILL_SETTLE_S=5 DRILL_OWNERS=4 DRILL_COMMIT_DEADLINE_MS=10000 npm run test:drills` |
-| six drills, design durations (600 s outages, 16 owners) | nightly `keyed-streams-drills.yml`, or locally | `npm run test:drills` (defaults), nightly uses `DRILL_OWNERS=16 DRILL_SETTLE_S=30` |
+| the drills, short knobs (30 s outages, 4 owners) | CI job `Keyed fault drills (short)` (`fault-drills`) | `DRILL_OUTAGE_S=30 DRILL_SETTLE_S=5 DRILL_OWNERS=4 DRILL_COMMIT_DEADLINE_MS=10000 npm run test:drills` |
+| the drills, design durations (600 s outages, 16 owners) | nightly `keyed-streams-drills.yml` (`Keyed fault drills (nightly)`), or locally | `npm run test:drills` (defaults), nightly uses `DRILL_OWNERS=16 DRILL_SETTLE_S=30` |
 
 All commands run in `clients/pi-durable-ursula` with `URSULA_BIN` set to the release binary. The rolling-upgrade drill also needs `URSULA_OLD_BIN`, main's binary at `e6d8d70`, which `scripts/ks_build_old_ursula.sh` builds with `git archive` (CI caches it). S3 is MinIO: `URSULA_S3_ENDPOINT` names an external one (CI starts it with `scripts/ks_minio_ci.sh`); otherwise each stack spawns `minio` from `PATH` or `MINIO_BIN`. Each stack creates its own S3 bucket. Each drill appends its measurements to `drill-results/results.jsonl` (or `$DRILL_RESULTS_DIR`), which CI uploads as an artifact.
 
@@ -143,6 +143,10 @@ Expected: zero poison and zero faulted; E catches up on green after the cutover;
 | streams with identical blue and green rows | 4 / 4 | 16 / 16 |
 | formats side by side; after stream delete | v1, v2; none | v1, v2; none |
 | verified records, mismatches | 376, 0 | 5,301, 0 |
+
+### 4.7 Indexer active/standby failover (`indexer-failover.drill.ts`)
+
+One node lists two indexers, each behind its own fault proxy, in `keyed_state.indexer_urls` (primary first); both share the object store. Four bounded owners commit while the primary is SIGKILLed, and a poller reads every owner's keyed state without `min_through_record`. Expected and checked: the node's `keyed_state_upstream` metrics switch `active_pod` to the standby, the standby's request count rises, every owner's E keeps reaching its tail, zero poison or faulted tasks, no served `Stream-Keyed-Through` ever decreases, and every acknowledged commit is stored byte-for-byte. After the primary restarts on its port, the node's `/readyz` prober marks it healthy, `active_pod` returns to 0 and no further read goes to the standby. It does not depend on the outage knobs and takes about ten seconds.
 
 ## 5. Choices and gaps
 
