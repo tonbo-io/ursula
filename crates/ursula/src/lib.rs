@@ -3023,7 +3023,7 @@ pub(crate) async fn append_stream_by_id(
         return match state
             .runtime
             .close_stream(CloseStreamRequest {
-                stream_id,
+                stream_id: stream_id.clone(),
                 stream_seq,
                 producer: producer.clone(),
                 now_ms: state.unix_time_ms(),
@@ -3033,6 +3033,18 @@ pub(crate) async fn append_stream_by_id(
             Ok(response) => {
                 let mut headers = HeaderMap::new();
                 insert_default_response_headers(&mut headers);
+                // RT4 (§9.1.5): a close-only POST carries no content type, so
+                // learn whether the stream is keyed from its head.
+                if let Ok(head) = state
+                    .runtime
+                    .head_stream(HeadStreamRequest {
+                        stream_id,
+                        now_ms: state.unix_time_ms(),
+                    })
+                    .await
+                {
+                    insert_keyed_extension_for(&mut headers, &head.content_type);
+                }
                 insert_offset(&mut headers, response.next_offset);
                 insert_producer_ack(&mut headers, producer.as_ref());
                 if let Some(record_range) = response.record_range {
@@ -3259,9 +3271,6 @@ pub(crate) async fn append_transaction(
             Ok(payload) => payload,
             Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
         };
-        if let Err(response) = validate_keyed_write(&content_type, &payload, None) {
-            return *response;
-        }
         keyed |= ursula_shard::is_keyed_batch_content_type(&content_type);
         operations.push(AppendRequest {
             stream_id: BucketStreamId::with_affinity(
@@ -3277,6 +3286,15 @@ pub(crate) async fn append_transaction(
             now_ms,
             record_match: operation.record_match,
         });
+    }
+    // RT5 (§9.1.3): every op is decoded and normalized (400) before any op's
+    // keyed grammar is validated (422), as append-batch does.
+    for operation in &operations {
+        if let Err(response) =
+            validate_keyed_write(&operation.content_type, &operation.payload, None)
+        {
+            return *response;
+        }
     }
     let response = match state
         .runtime

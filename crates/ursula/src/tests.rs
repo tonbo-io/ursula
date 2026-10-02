@@ -8034,6 +8034,34 @@ async fn keyed_create_is_refused_below_feature_level_1_and_allowed_after_raising
     assert_keyed_advertised(&response);
 }
 
+/// RT4: a close-only POST (empty body, no content type) to a keyed stream
+/// advertises `keyed-batch-v1` like every other successful write (§9.1.5);
+/// one to a plain stream does not.
+#[tokio::test]
+async fn keyed_close_only_post_advertises_keyed_batch() {
+    let app = keyed_router_at_level_1().await;
+    for (uri, content_type, keyed) in [
+        ("/benchcmp/keyed-close-only", KEYED_CT, true),
+        ("/benchcmp/plain-close-only", "application/json", false),
+    ] {
+        let response = http_put(
+            &app,
+            uri,
+            &[(CONTENT_TYPE.as_str(), content_type)],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let response = http_post(&app, uri, &[(HEADER_STREAM_CLOSED, "true")], Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        if keyed {
+            assert_keyed_advertised(&response);
+        } else {
+            assert_keyed_not_advertised(&response);
+        }
+    }
+}
+
 #[tokio::test]
 async fn keyed_create_body_is_validated_before_the_feature_gate() {
     let app = test_router();
@@ -8314,6 +8342,15 @@ async fn keyed_transaction_ops_are_validated_and_advertised() {
         let response = http_head(&app, &format!("/benchcmp/txn-keyed/{stream}")).await;
         assert_eq!(header_str(&response, HEADER_STREAM_RECORD_NEXT), "0");
     }
+
+    // RT5 (§9.1.3): invalid JSON in a later op is 400 even when an earlier
+    // op is valid JSON with invalid keyed grammar (422).
+    let response = post_transaction(&app, txn, vec![
+        transaction_op("keyed", KEYED_CT, r#"{"ops":[["q","AQ"]]}"#),
+        transaction_op("plain", "application/json", r#"{"a":"#),
+    ])
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
     // Plain-only transactions do not advertise keyed-batch-v1.
     let response = post_transaction(&app, txn, vec![transaction_op(
