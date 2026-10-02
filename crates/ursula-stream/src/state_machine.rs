@@ -13,6 +13,9 @@
 //!   `TidyStream` (feature level 1).
 //! - [`marks`]: F1 sparse cold record marks — sealing at cold transitions and
 //!   record lookups (feature level 2).
+//! - [`boundaries`]: F4b message boundaries without message records — dense
+//!   record offsets or hot append starts, and the legacy conversion (feature
+//!   level 4).
 //! - [`external_locators`]: F5 state-held external payload locators and
 //!   `OffloadColdRefs` (feature level 3), plus the offload pass's query.
 //! - [`hot_buffer`], [`cold_state`], [`ttl`]: internal per-stream data structures.
@@ -93,6 +96,7 @@ use crate::validate::validate_bucket_id;
 use crate::validate::validate_stream_id;
 
 mod append;
+mod boundaries;
 mod cold;
 mod cold_gc;
 mod cold_refs;
@@ -139,22 +143,34 @@ pub const COMMITTED_WRITE_UNIT_BYTES: u64 = 10 * 1024;
 /// record (F6c), so a window of tiny records is charged for its real memory.
 pub const HOT_RECORD_OVERHEAD_BYTES: u64 = 24;
 
-/// Hot records of one stream (F6c): message records that start at or above
-/// its first hot byte. Records of external appends that sit above hot bytes
+/// Per-record hot overhead from feature level 4 (F4b): message records are
+/// gone, and each hot message costs one 8-byte boundary (a dense record
+/// offset for JSON, an append start otherwise).
+pub const HOT_RECORD_OVERHEAD_BYTES_LB4: u64 = 8;
+
+/// Hot records of one stream (F6c): messages that start at or above its
+/// first hot byte. Records of external appends that sit above hot bytes
 /// count too; they occupy the same bookkeeping until the next flush.
-fn slot_hot_records(slot: &StreamSlot) -> u64 {
+fn slot_hot_records(slot: &StreamSlot, derived: bool) -> u64 {
     let Some(hot_start) = slot.hot_buffer.first_start_offset() else {
         return 0;
     };
+    if derived {
+        return slot.derived_hot_messages();
+    }
     let below = slot
         .message_records
         .partition_point(|record| record.start_offset < hot_start);
     u64::try_from(slot.message_records.len().saturating_sub(below)).unwrap_or(u64::MAX)
 }
 
-/// Payload plus per-record overhead (F6c).
+/// Payload plus per-record overhead (F6c), below feature level 4.
 pub fn hot_real_bytes(payload_bytes: u64, records: u64) -> u64 {
-    payload_bytes.saturating_add(records.saturating_mul(HOT_RECORD_OVERHEAD_BYTES))
+    hot_real_bytes_with(payload_bytes, records, HOT_RECORD_OVERHEAD_BYTES)
+}
+
+fn hot_real_bytes_with(payload_bytes: u64, records: u64, per_record: u64) -> u64 {
+    payload_bytes.saturating_add(records.saturating_mul(per_record))
 }
 
 new_key_type! {
@@ -299,7 +315,7 @@ impl StreamStateMachine {
 
     fn insert_stream_slot(&mut self, mut slot: StreamSlot) -> Option<StreamKey> {
         let hot_payload_bytes = u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64");
-        let hot_records = slot_hot_records(&slot);
+        let hot_records = slot_hot_records(&slot, self.derived_boundaries(&slot));
         slot.hot_buffer.set_accounted_records(hot_records);
         let stream_id = (!slot.hot_buffer.is_empty()).then(|| slot.metadata.stream_id.clone());
         let key = self.registry.insert(slot)?;
@@ -316,10 +332,12 @@ impl StreamStateMachine {
     /// buffer or message records changed.
     fn sync_hot_index(&mut self, stream_id: &BucketStreamId) {
         let mut hot = false;
+        let records_removed = self.message_records_removed();
         if let Some(slot) = self.registry.slot_mut(stream_id) {
             hot = !slot.hot_buffer.is_empty();
             let previous = slot.hot_buffer.accounted_records();
-            let current = slot_hot_records(slot);
+            let derived = records_removed && slot.message_records.is_empty();
+            let current = slot_hot_records(slot, derived);
             slot.hot_buffer.set_accounted_records(current);
             self.hot_records = self
                 .hot_records
@@ -1110,6 +1128,8 @@ mod external_locators_tests;
 mod hygiene_tests;
 #[cfg(test)]
 mod lb1_cold_tests;
+#[cfg(test)]
+mod lb4_boundaries_tests;
 #[cfg(test)]
 mod producer_window_tests;
 #[cfg(test)]

@@ -45,6 +45,17 @@
 //!   then removes them from state with `OffloadColdRefs`. Raised, like
 //!   level 2, only after a completed cold-index page-repair cycle.
 //!
+//! - [`FEATURE_LEVEL_HOT_REPRESENTATION`] (4): bounded-state Lb4 (F4b) —
+//!   message records are removed from replicated state. Streams with a
+//!   record index (JSON) take their message boundaries from the dense record
+//!   offsets; other streams keep the start offset of every message at or
+//!   above the seal point in the hot buffer (8 B per message). Bootstrap,
+//!   snapshot alignment, retention and restore derive boundaries from those,
+//!   snapshots carry the append starts (stream entry field 20) and no
+//!   longer write message records (field 10), and a stream that still holds
+//!   legacy message records converts them on its next write, flush,
+//!   retention or `TidyStream`.
+//!
 //! Later core-track changes (C1, C3, C4, U22) take the remaining levels in
 //! release order.
 //!
@@ -70,10 +81,14 @@ pub const FEATURE_LEVEL_SPARSE_MARKS: u32 = 2;
 /// offloaded to cold-index pages by `OffloadColdRefs`.
 pub const FEATURE_LEVEL_EXTERNAL_LOCATORS: u32 = 3;
 
-/// Highest group feature level this binary can apply.
-pub const MAX_SUPPORTED_FEATURE_LEVEL: u32 = FEATURE_LEVEL_EXTERNAL_LOCATORS;
+/// Bounded-state Lb4 (F4b): message records removed; boundaries come from
+/// the dense record offsets (JSON) or the hot buffer's append starts.
+pub const FEATURE_LEVEL_HOT_REPRESENTATION: u32 = 4;
 
-const _: () = assert!(MAX_SUPPORTED_FEATURE_LEVEL >= FEATURE_LEVEL_EXTERNAL_LOCATORS);
+/// Highest group feature level this binary can apply.
+pub const MAX_SUPPORTED_FEATURE_LEVEL: u32 = FEATURE_LEVEL_HOT_REPRESENTATION;
+
+const _: () = assert!(MAX_SUPPORTED_FEATURE_LEVEL >= FEATURE_LEVEL_HOT_REPRESENTATION);
 
 /// Pure form of the apply-time gate: `Ok` when a group at `current` may run
 /// an operation that needs `required`, otherwise the plain-text reason that

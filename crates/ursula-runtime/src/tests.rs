@@ -430,10 +430,12 @@ fn committed_write_command_is_state_machine_apply_boundary() {
             placement,
             hot_start_offset: 2,
             group_commit_index: 3,
-            // F6a: the write response carries the backlog it left.
+            // F6a: the write response carries the backlog it left. The
+            // clipped record [2, 3) still costs one record's overhead (F6c),
+            // as a replica restored from a snapshot counts it.
             hot_backlog: Some(crate::request::WriteHotBacklog {
-                stream_hot_bytes: 1,
-                group_hot_bytes: 1,
+                stream_hot_bytes: 1 + R,
+                group_hot_bytes: 1 + R,
             }),
         })
     );
@@ -868,6 +870,115 @@ async fn bootstrap_issues_one_read_plan_for_all_updates() {
         assert_eq!(update.next_offset, offset);
     }
     assert_eq!(bootstrap.next_offset, offset);
+}
+
+/// bounded-stream-state F4b (feature level 4): without message records,
+/// bootstrap derives one part per message from the hot append starts. A
+/// flush that splits a message leaves no exact boundary before the next one,
+/// so bootstrap from below it is an honest partial; from the next message
+/// start it is exact again.
+#[tokio::test]
+async fn bootstrap_at_level_4_is_exact_per_message_or_an_honest_partial() {
+    let placement = placement();
+    let stream = BucketStreamId::new("benchcmp", "bootstrap-lb4");
+    let mut engine = InMemoryGroupEngine::default();
+    assert!(matches!(
+        engine
+            .state_machine
+            .apply(ursula_stream::StreamCommand::SetFeatureLevel {
+                level: ursula_stream::FEATURE_LEVEL_HOT_REPRESENTATION,
+            }),
+        ursula_stream::StreamResponse::FeatureLevelSet { .. }
+    ));
+    engine
+        .create_stream(
+            CreateStreamRequest::new(stream.clone(), DEFAULT_CONTENT_TYPE),
+            placement,
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("create stream");
+    for payload in [b"aaaa".as_slice(), b"bbbb", b"cccc"] {
+        engine
+            .append(
+                AppendRequest::from_bytes(stream.clone(), payload.to_vec()),
+                placement,
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("append");
+    }
+    async fn bootstrap(
+        engine: &mut InMemoryGroupEngine,
+        stream: &BucketStreamId,
+        placement: ShardPlacement,
+    ) -> BootstrapStreamResponse {
+        engine
+            .bootstrap_stream(
+                BootstrapStreamRequest {
+                    stream_id: stream.clone(),
+                    now_ms: 0,
+                },
+                placement,
+            )
+            .await
+            .expect("bootstrap")
+    }
+    let all = bootstrap(&mut engine, &stream, placement).await;
+    assert!(all.up_to_date);
+    let parts = all
+        .updates
+        .iter()
+        .map(|update| update.payload.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(parts, vec![
+        b"aaaa".to_vec(),
+        b"bbbb".to_vec(),
+        b"cccc".to_vec()
+    ]);
+
+    engine
+        .flush_cold(
+            FlushColdRequest {
+                cold_generation: None,
+                stream_id: stream.clone(),
+                chunk: ColdChunkRef {
+                    start_offset: 0,
+                    end_offset: 6,
+                    s3_path: "benchcmp/bootstrap-lb4/chunks/000000.bin".to_owned(),
+                    object_size: 6,
+                    ..Default::default()
+                },
+            },
+            placement,
+        )
+        .await
+        .expect("flush into the second message");
+    let partial = bootstrap(&mut engine, &stream, placement).await;
+    assert!(partial.updates.is_empty());
+    assert!(!partial.up_to_date);
+    assert_eq!(partial.next_offset, 0);
+
+    engine
+        .publish_snapshot(
+            PublishSnapshotRequest {
+                stream_id: stream.clone(),
+                snapshot_offset: 8,
+                content_type: DEFAULT_CONTENT_TYPE.to_owned(),
+                payload: Bytes::from_static(b"state"),
+                expected_digest: None,
+                now_ms: 0,
+            },
+            placement,
+        )
+        .await
+        .expect("publish snapshot at the third message");
+    let exact = bootstrap(&mut engine, &stream, placement).await;
+    assert!(exact.up_to_date);
+    assert_eq!(exact.snapshot_offset, Some(8));
+    assert_eq!(exact.updates.len(), 1);
+    assert_eq!(exact.updates[0].payload, b"cccc");
+    assert_eq!(exact.next_offset, 12);
 }
 
 #[tokio::test]

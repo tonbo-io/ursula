@@ -277,10 +277,15 @@ impl StreamStateMachine {
             return false;
         };
         let seal_point = slot.seal_point();
-        let collapsible = slot
-            .message_records
-            .get(1)
-            .is_some_and(|record| record.end_offset <= seal_point);
+        let collapsible = if self.message_records_removed() {
+            // F4b: legacy records left after the raise are debt; tidy
+            // converts them.
+            !slot.message_records.is_empty()
+        } else {
+            slot.message_records
+                .get(1)
+                .is_some_and(|record| record.end_offset <= seal_point)
+        };
         collapsible
             || self.stream_has_seal_debt(stream_id)
             || slot.receipt_window_over()
@@ -380,7 +385,13 @@ impl StreamStateMachine {
 
     /// F4a: collapses every message record that ends at or below the seal
     /// point into one `[retained, p)` record. Feature level 1.
+    /// From level 4 (F4b) there is nothing to collapse: the call converts
+    /// any legacy records instead.
     pub(super) fn collapse_sealed_message_records(&mut self, stream_id: &BucketStreamId) {
+        if self.message_records_removed() {
+            self.migrate_message_records(stream_id);
+            return;
+        }
         if !self.producer_bounds_enabled() {
             return;
         }

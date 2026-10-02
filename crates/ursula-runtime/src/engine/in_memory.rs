@@ -833,10 +833,10 @@ impl InMemoryGroupEngine {
             return Ok(());
         }
         let before = self.state_machine.total_hot_real_bytes();
-        let after = before.saturating_add(ursula_stream::hot_real_bytes(
-            incoming_bytes,
-            incoming_records.max(1),
-        ));
+        let after = before.saturating_add(
+            self.state_machine
+                .hot_real_bytes(incoming_bytes, incoming_records.max(1)),
+        );
         if after <= limit {
             return Ok(());
         }

@@ -354,6 +354,8 @@ impl StreamStateMachine {
             return response;
         }
         let shared_path = chunk.shared_object.then(|| chunk.s3_path.clone());
+        // F4b (level 4): convert legacy message records first.
+        self.migrate_message_records(&stream_id);
         let slot = self
             .stream_slot_mut(&stream_id)
             .expect("stream existence checked before cold flush mutation");
@@ -376,6 +378,9 @@ impl StreamStateMachine {
         self.collapse_sealed_message_records(&stream_id);
         // F1 (level 2): seal the record offsets below the seal point.
         self.seal_record_index(&stream_id);
+        // The collapse may have clipped a straddling record to start at the
+        // seal point; recount so the gauge matches a restored replica.
+        self.sync_hot_index(&stream_id);
         StreamResponse::ColdFlushed {
             hot_start_offset: self.hot_start_offset(&stream_id),
         }
@@ -731,6 +736,11 @@ impl StreamStateMachine {
     ) -> bool {
         let is_record_end = || {
             self.stream_slot(stream_id).is_some_and(|slot| {
+                if self.derived_boundaries(slot) {
+                    // F4b: a derived message start at or above the seal
+                    // point, or the tail.
+                    return slot.derived_is_boundary(snapshot_offset);
+                }
                 slot.message_records
                     .iter()
                     .any(|record| record.end_offset == snapshot_offset)
@@ -766,6 +776,9 @@ impl StreamStateMachine {
         prepared_record_retain: Option<crate::record_index::PreparedRetain>,
         gc_not_before_ms: u64,
     ) {
+        // F4b (level 4): convert legacy message records first; retention
+        // then only moves the hot buffer, which prunes the append starts.
+        self.migrate_message_records(stream_id);
         let frontier = if self.bounded_lb1() {
             // F18 step 2: collapse only what lies below the seal point.
             self.seal_point(stream_id)
@@ -809,6 +822,11 @@ impl StreamStateMachine {
         retained_offset: u64,
         frontier: u64,
     ) {
+        if self.message_records_removed() {
+            // F4b: no message records to collapse; callers converted any
+            // legacy records first.
+            return;
+        }
         let slot = self
             .stream_slot_mut(stream_id)
             .expect("stream existence checked before message-record compaction");
@@ -863,6 +881,12 @@ impl StreamStateMachine {
             return 0;
         };
         let retained_offset = slot.retained_offset;
+        if self.derived_boundaries(slot) {
+            // F4b: the first derived message start at or above the seal
+            // point. A message that straddles the seal point has no start
+            // there, so the frontier moves past it.
+            return slot.derived_exact_frontier();
+        }
         let frontier = if self.bounded_lb1() {
             // F18 step 2: records that start at or above the seal point are
             // whole messages; at Lb1 collapse never reaches past it. A group

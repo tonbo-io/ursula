@@ -75,6 +75,7 @@ impl StreamStateMachine {
                     cold_chunks: slot.cold.cold_chunks().to_vec(),
                     external_segments: slot.cold.external_segments().to_vec(),
                     message_records: slot.message_records.clone(),
+                    hot_append_starts: slot.hot_buffer.append_starts().iter().copied().collect(),
                     record_index: slot.record_index.clone(),
                     integrity: slot
                         .integrity
@@ -254,11 +255,32 @@ impl StreamStateMachine {
                     payload_len: entry.payload.len(),
                 });
             }
-            if !message_records_cover_retained_suffix(
-                &entry.message_records,
-                retained_offset,
-                entry.metadata.tail_offset,
-            ) {
+            // F4b (level 4): a converted stream holds no message records;
+            // its boundaries are the dense offsets or the append starts,
+            // which must lie at or above the seal point. A stream that
+            // still holds legacy records restores them as before.
+            let records_removed =
+                snapshot.feature_level >= crate::feature::FEATURE_LEVEL_HOT_REPRESENTATION;
+            let seal_point = hot_segments
+                .first()
+                .map_or(entry.metadata.tail_offset, |segment| segment.start_offset);
+            let boundaries_valid = if records_removed && entry.message_records.is_empty() {
+                super::boundaries::append_starts_valid(
+                    &entry.hot_append_starts,
+                    seal_point,
+                    entry.metadata.tail_offset,
+                    entry.record_index.is_some(),
+                    records_removed,
+                )
+            } else {
+                entry.hot_append_starts.is_empty()
+                    && message_records_cover_retained_suffix(
+                        &entry.message_records,
+                        retained_offset,
+                        entry.metadata.tail_offset,
+                    )
+            };
+            if !boundaries_valid {
                 return Err(StreamSnapshotError::MessageBoundaryMismatch { stream_id });
             }
             let integrity = StreamIntegrity::restore(entry.integrity).ok_or_else(|| {
@@ -284,10 +306,12 @@ impl StreamStateMachine {
                 .filter(|chunk| chunk.shared_object)
                 .map(|chunk| chunk.s3_path.clone())
                 .collect::<Vec<_>>();
+            let mut hot_buffer = HotBuffer::from_snapshot(entry.payload, &hot_segments);
+            hot_buffer.restore_append_starts(entry.hot_append_starts);
             let slot = StreamSlot {
                 metadata: entry.metadata,
                 attrs: normalize_stream_attrs(entry.attrs),
-                hot_buffer: HotBuffer::from_snapshot(entry.payload, &hot_segments),
+                hot_buffer,
                 cold: StreamColdState::restore(
                     // F18 step 2: Lb1 derives coverage from the hot buffer and
                     // never reads the scalar, so field 6 is ignored.

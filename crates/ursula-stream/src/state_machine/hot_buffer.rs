@@ -4,8 +4,11 @@
 //! its own start offset, so the buffer carries no per-append header. A block
 //! ends where the next append is not contiguous (an external append above hot
 //! bytes leaves a gap, F18) or where it is full. Per-message boundaries live
-//! in one place per stream: the message records (and, for JSON, the record
-//! index's dense offsets). Reads binary-search blocks, a flush drops whole
+//! in one place per stream: below feature level 4 the message records (and,
+//! for JSON, the record index's dense offsets); from level 4 (F4b) the dense
+//! offsets for streams with a record index and, for every other stream, the
+//! append starts this buffer keeps for each message at or above the seal
+//! point. Reads binary-search blocks, a flush drops whole
 //! blocks and trims at most one, and transaction rollback truncates blocks
 //! back to a checkpoint. Snapshots emit one hot segment per block and restore
 //! segments one-to-one, so every replica holds the same block layout after
@@ -29,6 +32,12 @@ pub(super) struct HotBuffer {
     /// Maintained by the state machine, which owns the record boundaries;
     /// the buffer only stores it next to the bytes it describes.
     accounted_records: u64,
+    /// F4b (level 4), streams without a record index: start offsets of the
+    /// messages that start at or above the seal point, strictly increasing.
+    /// Includes external appends that sit above hot bytes. A flush or
+    /// retention drops the starts below the new seal point; empty below
+    /// level 4 and for streams with a record index.
+    append_starts: VecDeque<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +58,7 @@ impl HotBlock {
 pub(super) struct HotCheckpoint {
     blocks: usize,
     last_block_len: usize,
+    append_starts: usize,
 }
 
 fn len_u64(len: usize) -> u64 {
@@ -104,7 +114,49 @@ impl HotBuffer {
             blocks,
             payload_len: bytes,
             accounted_records: 0,
+            append_starts: VecDeque::new(),
         }
+    }
+
+    /// Restores the append starts a snapshot recorded (F4b, field 20).
+    pub(super) fn restore_append_starts(&mut self, starts: Vec<u64>) {
+        self.append_starts = VecDeque::from(starts);
+    }
+
+    /// Start offsets of the messages at or above the seal point (F4b).
+    pub(super) fn append_starts(&self) -> &VecDeque<u64> {
+        &self.append_starts
+    }
+
+    /// Records the start of one message at or above the seal point (F4b).
+    /// Starts arrive in offset order; an out-of-order start is ignored.
+    pub(super) fn push_append_start(&mut self, start_offset: u64) {
+        if self
+            .append_starts
+            .back()
+            .is_none_or(|last| *last < start_offset)
+        {
+            self.append_starts.push_back(start_offset);
+        }
+    }
+
+    /// Drops the append starts below the seal point after the hot prefix
+    /// moved: the first hot byte, or every start when nothing is hot (the
+    /// seal point is then the tail, above every recorded start).
+    fn prune_append_starts(&mut self) {
+        if self.append_starts.is_empty() {
+            return;
+        }
+        match self.first_start_offset() {
+            Some(seal_point) => {
+                let below = self
+                    .append_starts
+                    .partition_point(|start| *start < seal_point);
+                self.append_starts.drain(..below);
+            }
+            None => self.append_starts.clear(),
+        }
+        shrink_deque_if_slack(&mut self.append_starts);
     }
 
     /// Hot payload bytes held, in O(1).
@@ -128,6 +180,11 @@ impl HotBuffer {
         self.blocks
             .len()
             .saturating_mul(std::mem::size_of::<HotBlock>())
+            .saturating_add(
+                self.append_starts
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
     }
 
     pub(super) fn accounted_records(&self) -> u64 {
@@ -233,6 +290,7 @@ impl HotBuffer {
         HotCheckpoint {
             blocks: self.blocks.len(),
             last_block_len: self.blocks.back().map_or(0, |block| block.bytes.len()),
+            append_starts: self.append_starts.len(),
         }
     }
 
@@ -251,6 +309,7 @@ impl HotBuffer {
             last.bytes.truncate(checkpoint.last_block_len);
             self.payload_len = self.payload_len.saturating_sub(removed);
         }
+        self.append_starts.truncate(checkpoint.append_starts);
     }
 
     /// Index of the first block that ends after `offset`.
@@ -364,6 +423,7 @@ impl HotBuffer {
             self.payload_len = self.payload_len.saturating_sub(drain_len);
         }
         shrink_deque_if_slack(&mut self.blocks);
+        self.prune_append_starts();
     }
 
     pub(super) fn discard_before(&mut self, retained_offset: u64) {

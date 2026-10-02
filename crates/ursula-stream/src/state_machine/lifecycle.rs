@@ -225,7 +225,7 @@ impl StreamStateMachine {
             let payload = hot_buffer.payload();
             integrity.append_payload(&input.stream_id, 0, initial_len, &payload);
         }
-        let message_records = Self::message_records_for_append(0, initial_len, &input.record_ends);
+        let records_removed = self.message_records_removed();
         let mut producer_states = HashMap::new();
         let bounded = self.producer_bounds_enabled();
         if let Some(producer) = input.producer {
@@ -258,12 +258,12 @@ impl StreamStateMachine {
             });
         }
         let stream_id = input.stream_id.clone();
-        let slot = StreamSlot {
+        let mut slot = StreamSlot {
             metadata,
             attrs,
             hot_buffer,
             cold: self.new_incarnation_cold_state(created_at_ms),
-            message_records,
+            message_records: Vec::new(),
             record_index,
             integrity,
             retained_offset: 0,
@@ -272,6 +272,9 @@ impl StreamStateMachine {
             producers: producer_states,
             append_count: 0,
         };
+        // F4b: the initial body's message boundaries (message records below
+        // level 4, append starts at or above the seal point from it).
+        slot.record_message_boundaries(records_removed, 0, initial_len, &input.record_ends);
         if self.insert_stream_slot(slot).is_none() {
             return StreamResponse::error(
                 StreamErrorCode::StreamAlreadyExistsConflict,
@@ -416,7 +419,7 @@ impl StreamStateMachine {
                 object.object_size,
             );
         }
-        let message_records = Self::message_records_for_append(0, initial_len, &input.record_ends);
+        let records_removed = self.message_records_removed();
         let mut producer_states = HashMap::new();
         let bounded = self.producer_bounds_enabled();
         if let Some(producer) = input.producer {
@@ -449,12 +452,12 @@ impl StreamStateMachine {
             });
         }
         let stream_id = input.stream_id.clone();
-        let slot = StreamSlot {
+        let mut slot = StreamSlot {
             metadata,
             attrs,
             hot_buffer: HotBuffer::default(),
             cold,
-            message_records,
+            message_records: Vec::new(),
             record_index,
             integrity,
             retained_offset: 0,
@@ -463,6 +466,9 @@ impl StreamStateMachine {
             producers: producer_states,
             append_count: 0,
         };
+        // F4b: the initial body's message boundaries (message records below
+        // level 4, append starts at or above the seal point from it).
+        slot.record_message_boundaries(records_removed, 0, initial_len, &input.record_ends);
         if self.insert_stream_slot(slot).is_none() {
             return StreamResponse::error(
                 StreamErrorCode::StreamAlreadyExistsConflict,
