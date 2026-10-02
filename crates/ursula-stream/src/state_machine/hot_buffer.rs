@@ -7,6 +7,9 @@ use super::VecDeque;
 #[derive(Debug, Clone, Default)]
 pub(super) struct HotBuffer {
     chunks: VecDeque<HotChunk>,
+    /// Sum of the chunks' payload lengths, kept incrementally so `len` is
+    /// O(1) for the flush planner and the group gauge.
+    bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,29 +26,37 @@ impl HotBuffer {
         }
         let end_offset = start_offset
             .saturating_add(u64::try_from(payload.len()).expect("payload len fits u64"));
+        let bytes = payload.len();
         let mut chunks = VecDeque::new();
         chunks.push_back(HotChunk {
             start_offset,
             end_offset,
             bytes: payload,
         });
-        Self { chunks }
+        Self { chunks, bytes }
     }
 
     pub(super) fn from_snapshot(payload: Vec<u8>, segments: &[HotPayloadSegment]) -> Self {
         let mut chunks = VecDeque::with_capacity(segments.len());
+        let mut bytes = 0usize;
         for segment in segments {
+            let chunk = payload[segment.payload_start..segment.payload_end].to_vec();
+            bytes = bytes.saturating_add(chunk.len());
             chunks.push_back(HotChunk {
                 start_offset: segment.start_offset,
                 end_offset: segment.end_offset,
-                bytes: payload[segment.payload_start..segment.payload_end].to_vec(),
+                bytes: chunk,
             });
         }
-        Self { chunks }
+        Self { chunks, bytes }
     }
 
     pub(super) fn len(&self) -> usize {
-        self.chunks.iter().map(|chunk| chunk.bytes.len()).sum()
+        self.bytes
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
     }
 
     pub(super) fn hot_start_offset(&self) -> u64 {
@@ -89,6 +100,7 @@ impl HotBuffer {
         if payload.is_empty() {
             return;
         }
+        self.bytes = self.bytes.saturating_add(payload.len());
         self.chunks.push_back(HotChunk {
             start_offset,
             end_offset,
@@ -101,7 +113,11 @@ impl HotBuffer {
     }
 
     pub(super) fn rollback_appends(&mut self, checkpoint: usize) {
-        self.chunks.truncate(checkpoint);
+        while self.chunks.len() > checkpoint {
+            if let Some(chunk) = self.chunks.pop_back() {
+                self.bytes = self.bytes.saturating_sub(chunk.bytes.len());
+            }
+        }
     }
 
     pub(super) fn plan_cold_flush_from(
@@ -140,17 +156,6 @@ impl HotBuffer {
         }
         let end_offset = from_offset + u64::try_from(payload.len()).expect("payload len fits u64");
         Some((from_offset, end_offset, payload))
-    }
-
-    pub(super) fn remaining_len_from(&self, from_offset: u64) -> usize {
-        self.chunks
-            .iter()
-            .filter(|chunk| chunk.end_offset > from_offset)
-            .map(|chunk| {
-                let start = chunk.start_offset.max(from_offset);
-                usize::try_from(chunk.end_offset - start).expect("remaining len fits usize")
-            })
-            .sum()
     }
 
     pub(super) fn read_segments(
@@ -208,7 +213,9 @@ impl HotBuffer {
             .front()
             .is_some_and(|chunk| chunk.end_offset <= end_offset)
         {
-            self.chunks.pop_front();
+            if let Some(chunk) = self.chunks.pop_front() {
+                self.bytes = self.bytes.saturating_sub(chunk.bytes.len());
+            }
         }
         if let Some(front) = self.chunks.front_mut()
             && front.start_offset < end_offset
@@ -217,6 +224,7 @@ impl HotBuffer {
                 usize::try_from(end_offset - front.start_offset).expect("drain len fits usize");
             front.bytes.drain(..drain_len);
             front.start_offset = end_offset;
+            self.bytes = self.bytes.saturating_sub(drain_len);
         }
     }
 

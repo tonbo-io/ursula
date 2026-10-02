@@ -577,6 +577,7 @@ pub(super) async fn run_cold_delete_fault_inner(
                 min_hot_bytes: old_payload.len(),
                 max_flush_bytes: old_payload.len(),
                 max_batch_bytes: old_payload.len(),
+                pressure: None,
             },
             1,
         )

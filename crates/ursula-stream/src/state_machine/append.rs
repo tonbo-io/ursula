@@ -189,6 +189,7 @@ impl StreamStateMachine {
                     }
                 }
             }
+            self.sync_hot_index(&stream_id);
         }
     }
 
@@ -401,6 +402,7 @@ impl StreamStateMachine {
                     &record_ends,
                 ));
             self.add_hot_payload_bytes(payload_len);
+            self.sync_hot_index(&stream_id);
             self.usage_on_append(
                 &stream_id.bucket_id,
                 payload_len,
@@ -821,6 +823,7 @@ impl StreamStateMachine {
                 .saturating_add(Self::appended_record_count(record_ends, item_bytes));
         }
         self.add_hot_payload_bytes(appended_bytes);
+        self.sync_hot_index(&stream_id);
         self.usage_on_append(&stream_id.bucket_id, appended_bytes, appended_records);
         Ok(StreamBatchAppend {
             items: items

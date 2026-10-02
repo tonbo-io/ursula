@@ -6,6 +6,7 @@ use serde::Serialize;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::ColdChunkRef;
+use ursula_stream::ColdFlushPressure;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::ProducerRequest;
 use ursula_stream::StreamAttrs;
@@ -559,6 +560,10 @@ pub struct PlanGroupColdFlushRequest {
     pub max_flush_bytes: usize,
     /// Maximum aggregate payload bytes returned by one group planning pass.
     pub max_batch_bytes: usize,
+    /// Node-level flush pressure: the group drains, largest streams first,
+    /// its proportional share of the node's excess hot bytes
+    /// (bounded-stream-state F10).
+    pub pressure: Option<ColdFlushPressure>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

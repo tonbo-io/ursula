@@ -1456,6 +1456,7 @@ pub(super) async fn run_runtime_raft_network_inner(
             min_hot_bytes: 1,
             max_flush_bytes: 8,
             max_batch_bytes: max_flush_candidates.saturating_mul(8),
+            pressure: None,
         };
         if let Some(old_leader_id) = failover_target_node_id {
             trace.push(SimEvent::RuntimeRaftNetworkLeaderFailoverStageReached {
@@ -2074,6 +2075,7 @@ pub(super) async fn run_runtime_cold_flush_worker_inner(
                 min_hot_bytes: 4,
                 max_flush_bytes: 4,
                 max_batch_bytes: 8,
+                pressure: None,
             },
             2,
         )
@@ -2195,6 +2197,7 @@ pub(super) async fn run_runtime_seeded_interleaving_inner(
                     min_hot_bytes: 4,
                     max_flush_bytes: 4,
                     max_batch_bytes: 4,
+                    pressure: None,
                 },
                 flush_group_limit,
             )
@@ -2318,6 +2321,7 @@ pub(super) async fn run_runtime_seeded_interleaving_inner(
                     min_hot_bytes: 4,
                     max_flush_bytes: 4,
                     max_batch_bytes: 4,
+                    pressure: None,
                 },
                 4,
             )

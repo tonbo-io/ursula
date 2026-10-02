@@ -5,14 +5,12 @@ use super::ColdChunkRef;
 use super::ColdFlushCandidate;
 use super::ColdGcEntry;
 use super::ColdGcTarget;
-use super::HashMap;
 use super::StreamErrorCode;
 use super::StreamErrorContext;
 use super::StreamMessageRecord;
 use super::StreamResponse;
 use super::StreamStateMachine;
 use super::StreamVisibleSnapshot;
-use super::compare_stream_ids;
 use super::stream_is_expired;
 
 impl StreamStateMachine {
@@ -58,50 +56,8 @@ impl StreamStateMachine {
         }))
     }
 
-    pub(super) fn plan_next_cold_flush_from_start(
-        &self,
-        mut start_fn: impl FnMut(&BucketStreamId) -> u64,
-        min_hot_bytes: usize,
-        max_flush_bytes: usize,
-        group_hot_bytes: u64,
-    ) -> Result<Option<ColdFlushCandidate>, StreamResponse> {
-        if max_flush_bytes == 0 {
-            return Ok(None);
-        }
-        let mut stream_ids = self.registry.stream_ids().cloned().collect::<Vec<_>>();
-        stream_ids.sort_by(compare_stream_ids);
-        for stream_id in &stream_ids {
-            let start = start_fn(stream_id);
-            match self.plan_cold_flush_with_start(stream_id, start, min_hot_bytes, max_flush_bytes)
-            {
-                Ok(Some(candidate)) => return Ok(Some(candidate)),
-                Ok(None) => {}
-                Err(StreamResponse::Error {
-                    code: StreamErrorCode::StreamGone | StreamErrorCode::StreamNotFound,
-                    ..
-                }) => {}
-                Err(err) => return Err(err),
-            }
-        }
-        let group_min_hot_bytes = u64::try_from(min_hot_bytes).unwrap_or(u64::MAX);
-        if group_hot_bytes < group_min_hot_bytes {
-            return Ok(None);
-        }
-        for stream_id in stream_ids {
-            let start = start_fn(&stream_id);
-            match self.plan_cold_flush_with_start(&stream_id, start, 1, max_flush_bytes) {
-                Ok(Some(candidate)) => return Ok(Some(candidate)),
-                Ok(None) => {}
-                Err(StreamResponse::Error {
-                    code: StreamErrorCode::StreamGone | StreamErrorCode::StreamNotFound,
-                    ..
-                }) => {}
-                Err(err) => return Err(err),
-            }
-        }
-        Ok(None)
-    }
-
+    /// Plans one batch without moving the leader-local rotation cursor; see
+    /// [`StreamStateMachine::plan_cold_flush_pass`] for the leader path.
     pub fn plan_next_cold_flush_batch(
         &self,
         min_hot_bytes: usize,
@@ -109,72 +65,17 @@ impl StreamStateMachine {
         max_batch_bytes: usize,
         max_candidates: usize,
     ) -> Result<Vec<ColdFlushCandidate>, StreamResponse> {
-        if max_candidates == 0 || max_flush_bytes == 0 || max_batch_bytes == 0 {
-            return Ok(Vec::new());
-        }
-        let mut planned_flush_offsets: HashMap<BucketStreamId, u64> = HashMap::new();
-        let mut candidates = Vec::with_capacity(max_candidates);
-        let mut batch_bytes = 0usize;
-        let initial_group_hot_bytes = self
-            .registry
-            .stream_ids()
-            .map(|stream_id| {
-                u64::try_from(
-                    self.stream_slot(stream_id)
-                        .map(|slot| {
-                            slot.hot_buffer
-                                .remaining_len_from(self.hot_start_offset(stream_id))
-                        })
-                        .unwrap_or(0),
-                )
-                .expect("len fits u64")
-            })
-            .sum::<u64>();
-        let drain_group =
-            initial_group_hot_bytes >= u64::try_from(min_hot_bytes).unwrap_or(u64::MAX);
-        while candidates.len() < max_candidates {
-            let start_for = |stream_id: &BucketStreamId| -> u64 {
-                planned_flush_offsets
-                    .get(stream_id)
-                    .copied()
-                    .unwrap_or_else(|| self.hot_start_offset(stream_id))
-            };
-            let group_hot_bytes: u64 = self
-                .registry
-                .stream_ids()
-                .map(|stream_id| {
-                    let start = start_for(stream_id);
-                    self.stream_slot(stream_id)
-                        .map(|slot| {
-                            u64::try_from(slot.hot_buffer.remaining_len_from(start))
-                                .expect("len fits u64")
-                        })
-                        .unwrap_or(0)
-                })
-                .sum();
-            let candidate = self.plan_next_cold_flush_from_start(
-                start_for,
-                if drain_group { 1 } else { min_hot_bytes },
+        let (pass, _) = self.plan_cold_flush_pass_from(
+            super::ColdFlushPassRequest {
+                min_hot_bytes,
                 max_flush_bytes,
-                group_hot_bytes,
-            )?;
-            let Some(candidate) = candidate else {
-                break;
-            };
-            let Some(next_batch_bytes) = batch_bytes.checked_add(candidate.payload.len()) else {
-                break;
-            };
-            if !candidates.is_empty() && next_batch_bytes > max_batch_bytes {
-                break;
-            }
-            planned_flush_offsets.insert(candidate.stream_id.clone(), candidate.end_offset);
-            batch_bytes = next_batch_bytes;
-            candidates.push(candidate);
-            if batch_bytes >= max_batch_bytes {
-                break;
-            }
-        }
-        Ok(candidates)
+                max_batch_bytes,
+                max_candidates,
+                pressure: None,
+            },
+            None,
+        )?;
+        Ok(pass.candidates)
     }
 
     pub(super) fn publish_snapshot(
@@ -504,6 +405,7 @@ impl StreamStateMachine {
         let hot_bytes_after = u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64");
         slot.cold.push_cold_chunk(chunk.clone());
         self.remove_hot_payload_bytes(hot_bytes_before.saturating_sub(hot_bytes_after));
+        self.sync_hot_index(&stream_id);
         if let Some(path) = shared_path {
             self.retain_shared_cold_object(&path, &stream_id.bucket_id);
         }
@@ -712,6 +614,7 @@ impl StreamStateMachine {
         slot.hot_buffer.discard_before(retained_offset);
         let hot_bytes_after = u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64");
         self.remove_hot_payload_bytes(hot_bytes_before.saturating_sub(hot_bytes_after));
+        self.sync_hot_index(stream_id);
     }
 
     pub(super) fn compact_message_records_before(

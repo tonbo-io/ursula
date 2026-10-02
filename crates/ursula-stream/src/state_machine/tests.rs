@@ -1985,6 +1985,194 @@ fn plan_next_cold_flush_batch_drains_triggered_group_to_batch_target() {
     );
 }
 
+fn planner_request(
+    min_hot_bytes: usize,
+    max_flush_bytes: usize,
+    max_batch_bytes: usize,
+    max_candidates: usize,
+) -> ColdFlushPassRequest {
+    ColdFlushPassRequest {
+        min_hot_bytes,
+        max_flush_bytes,
+        max_batch_bytes,
+        max_candidates,
+        pressure: None,
+    }
+}
+
+fn apply_flush_pass(machine: &mut StreamStateMachine, pass: &ColdFlushPass, round: usize) {
+    for (index, candidate) in pass.candidates.iter().enumerate() {
+        assert!(matches!(
+            machine.apply(flush_candidate_cmd(
+                candidate.stream_id.clone(),
+                candidate,
+                &format!("s3://bucket/planner/{round:04}-{index:04}"),
+            )),
+            StreamResponse::ColdFlushed { .. }
+        ));
+    }
+}
+
+/// bounded-stream-state F10: with flush_size = flush_max_size = batch, the
+/// old drain pass stopped at the first stream that did not fit and always
+/// walked streams in the same order, so a stream sorting after the small ones
+/// starved and its hot bytes grew without bound.
+#[test]
+fn flush_planner_does_not_starve_a_stream_behind_small_streams() {
+    const FLUSH_SIZE: usize = 64;
+    let mut machine = machine();
+    let small = (0..10)
+        .map(|index| format!("a-{index:02}"))
+        .collect::<Vec<_>>();
+    for name in &small {
+        create_stream(&mut machine, name);
+    }
+    create_stream(&mut machine, "zz-large");
+    for round in 0..50 {
+        for name in &small {
+            append_all(&mut machine, name, &[b"abcd"]);
+        }
+        append_all(&mut machine, "zz-large", &[&[b'z'; 20]]);
+        let pass = machine
+            .plan_cold_flush_pass(planner_request(
+                FLUSH_SIZE,
+                FLUSH_SIZE,
+                FLUSH_SIZE,
+                usize::MAX,
+            ))
+            .expect("plan pass");
+        apply_flush_pass(&mut machine, &pass, round);
+        for name in small.iter().map(String::as_str).chain(["zz-large"]) {
+            let hot = machine.hot_payload_len(&stream(name)).expect("hot len");
+            assert!(
+                hot <= 2 * FLUSH_SIZE as u64,
+                "round {round}: stream {name} holds {hot} hot bytes"
+            );
+        }
+    }
+}
+
+/// bounded-stream-state F10: planner work is bounded by the streams that hold
+/// hot bytes, with one sort per pass, not by candidates times streams.
+#[test]
+fn flush_planner_cost_is_bounded_by_hot_streams() {
+    let mut machine = machine();
+    for index in 0..1_000 {
+        create_stream(&mut machine, &format!("idle-{index:04}"));
+    }
+    for name in ["hot-a", "hot-b", "hot-c"] {
+        create_stream(&mut machine, name);
+        append_all(&mut machine, name, &[b"0123456789", b"0123456789"]);
+    }
+    let pass = machine
+        .plan_cold_flush_pass(planner_request(8, 4, usize::MAX, usize::MAX))
+        .expect("plan pass");
+    assert_eq!(pass.candidates.len(), 15);
+    assert_eq!(pass.stats.streams_visited, 3);
+    assert_eq!(pass.stats.sorts, 1);
+    assert_eq!(pass.stats.bytes_copied, 60);
+
+    apply_flush_pass(&mut machine, &pass, 0);
+    let pass = machine
+        .plan_cold_flush_pass(planner_request(8, 4, usize::MAX, usize::MAX))
+        .expect("plan empty pass");
+    assert!(pass.candidates.is_empty());
+    assert_eq!(pass.stats.streams_visited, 0);
+
+    // The index survives restore without being part of the snapshot.
+    append_all(&mut machine, "hot-b", &[b"0123456789"]);
+    let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore");
+    let (pass, _) = restored
+        .plan_cold_flush_pass_from(planner_request(8, 16, usize::MAX, usize::MAX), None)
+        .expect("plan restored pass");
+    assert_eq!(pass.stats.streams_visited, 1);
+    assert_eq!(pass.candidates.len(), 1);
+    assert_eq!(pass.candidates[0].stream_id, stream("hot-b"));
+}
+
+/// bounded-stream-state F10: passes rotate through equally large streams
+/// from a leader-local cursor, and candidates are a deterministic function of
+/// the index and the cursor.
+#[test]
+fn flush_planner_rotates_equal_streams_from_the_cursor() {
+    let mut machine = machine();
+    for name in ["rot-a", "rot-b", "rot-c", "rot-small"] {
+        create_stream(&mut machine, name);
+    }
+    for name in ["rot-a", "rot-b", "rot-c"] {
+        append_all(&mut machine, name, &[b"abcd"]);
+    }
+    append_all(&mut machine, "rot-small", &[b"x"]);
+    // Group hot is 13 bytes, at least min_hot_bytes = 4: the group drains,
+    // one candidate per pass, and the three equal streams take turns.
+    let mut request = planner_request(4, 4, 4, 1);
+    let mut order = Vec::new();
+    for _ in 0..4 {
+        let pass = machine.plan_cold_flush_pass(request).expect("plan pass");
+        order.push(pass.candidates[0].stream_id.stream_id.clone());
+    }
+    assert_eq!(order, ["rot-a", "rot-b", "rot-c", "rot-a"]);
+    let (pass, cursor) = machine
+        .plan_cold_flush_pass_from(request, Some(&stream("rot-b")))
+        .expect("plan from cursor");
+    assert_eq!(pass.candidates[0].stream_id, stream("rot-c"));
+    assert_eq!(cursor, Some(stream("rot-c")));
+
+    // A candidate gets at most the remaining batch budget, so a stream that
+    // does not fit is cut instead of stopping the pass.
+    request.max_candidates = usize::MAX;
+    request.max_batch_bytes = 6;
+    let (pass, _) = machine
+        .plan_cold_flush_pass_from(request, None)
+        .expect("plan budgeted pass");
+    assert_eq!(
+        pass.candidates
+            .iter()
+            .map(|candidate| (
+                candidate.stream_id.stream_id.as_str(),
+                candidate.payload.len()
+            ))
+            .collect::<Vec<_>>(),
+        vec![("rot-a", 4), ("rot-b", 2)]
+    );
+}
+
+/// bounded-stream-state F10: group drain flushes the largest streams until
+/// the group is below half of flush_size, and node pressure drains the
+/// group's proportional share of the node excess, largest first.
+#[test]
+fn flush_planner_drains_largest_streams_first() {
+    let mut machine = machine();
+    for (name, len) in [("d-10", 10usize), ("d-20", 20), ("d-30", 30), ("d-40", 40)] {
+        create_stream(&mut machine, name);
+        append_all(&mut machine, name, &[&vec![b'x'; len]]);
+    }
+    // Group hot 100 >= 64: drain until below 32.
+    let (pass, _) = machine
+        .plan_cold_flush_pass_from(planner_request(64, 64, usize::MAX, usize::MAX), None)
+        .expect("plan drain");
+    assert_eq!(
+        pass.candidates
+            .iter()
+            .map(|candidate| candidate.stream_id.stream_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["d-40", "d-30"]
+    );
+
+    // Pressure: node 200 hot, target 150, so this group (100 of 200) drains
+    // at least 25 bytes: the largest stream alone.
+    let mut request = planner_request(1_000, 64, usize::MAX, usize::MAX);
+    request.pressure = Some(ColdFlushPressure {
+        node_hot_bytes: 200,
+        node_target_bytes: 150,
+    });
+    let (pass, _) = machine
+        .plan_cold_flush_pass_from(request, None)
+        .expect("plan pressure");
+    assert_eq!(pass.candidates.len(), 1);
+    assert_eq!(pass.candidates[0].stream_id, stream("d-40"));
+}
+
 #[test]
 fn plan_next_cold_flush_batch_advances() {
     let mut machine = machine();

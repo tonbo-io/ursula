@@ -6,6 +6,7 @@ use bytes::Bytes;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::AppendStreamInput;
+use ursula_stream::ColdFlushPassRequest;
 use ursula_stream::ProducerRequest;
 use ursula_stream::StreamCommand;
 use ursula_stream::StreamErrorCode;
@@ -2049,12 +2050,14 @@ impl GroupEngine for InMemoryGroupEngine {
     ) -> GroupPlanNextColdFlushBatchFuture<'a> {
         Box::pin(async move {
             self.state_machine
-                .plan_next_cold_flush_batch(
-                    request.min_hot_bytes,
-                    request.max_flush_bytes,
-                    request.max_batch_bytes,
+                .plan_cold_flush_pass(ColdFlushPassRequest {
+                    min_hot_bytes: request.min_hot_bytes,
+                    max_flush_bytes: request.max_flush_bytes,
+                    max_batch_bytes: request.max_batch_bytes,
                     max_candidates,
-                )
+                    pressure: request.pressure,
+                })
+                .map(|pass| pass.candidates)
                 .map_err(stream_response_error)
         })
     }
