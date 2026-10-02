@@ -472,6 +472,9 @@ export class Stack {
 		await bounded("close standby proxy", this.standbyProxy?.close());
 		await bounded("close S3 proxy", this.s3Proxy?.close());
 		await bounded("stop S3", this.s3?.stop());
+		// Whatever a late step left running must not keep the runner alive.
+		const procs = [...this.extraProcs, this.gateway, ...this.nodes.map((node) => node.proc)];
+		for (const proc of procs) proc?.release();
 		if (process.env.KEEP_STACK !== "1" && this.options.dir === undefined) rmSync(this.dir, { recursive: true, force: true });
 	}
 }
