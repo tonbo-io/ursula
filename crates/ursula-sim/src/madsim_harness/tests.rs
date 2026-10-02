@@ -2040,3 +2040,66 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
     assert_eq!(quiet.receipts.len(), 1, "quiet restarted after idle expiry");
     assert_eq!(quiet.last_seen_ms, Some(5 + 7 * 24 * 60 * 60 * 1_000));
 }
+
+/// Keyed indexer DST (keyed-streams §6.1 U21, §11.8): the PR seed set holds
+/// every invariant (published namespaces equal the fold, `D` monotone, no
+/// referenced object deleted, no orphan beyond grace after the sweep) under
+/// S3 faults, Raft leader changes, indexer crashes and restores.
+#[test]
+fn keyed_indexer_seed_family_holds_invariants() {
+    let _guard = sim_test_guard();
+    let seeds: Vec<u64> = std::env::var("KEYED_INDEXER_SEEDS")
+        .ok()
+        .and_then(|range| {
+            let (start, end) = range.split_once("..=")?;
+            Some((start.parse().ok()?..=end.parse().ok()?).collect())
+        })
+        .unwrap_or_else(|| (600..=605).collect());
+    let mut plans = Vec::new();
+    for seed in seeds {
+        let schedule = SimSchedule::generate_keyed_indexer(seed);
+        let report = schedule.run();
+        assert_eq!(report.scenario, SimScenario::KeyedIndexer);
+        assert!(
+            report
+                .outcome
+                .trace
+                .events
+                .iter()
+                .any(|event| matches!(event, SimEvent::KeyedIndexerVerified { .. })),
+            "seed {seed} reached verification"
+        );
+        if std::env::var("KEYED_INDEXER_VERBOSE").is_ok() {
+            let rounds: Vec<_> = report
+                .outcome
+                .trace
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        SimEvent::KeyedIndexerVerified { .. } | SimEvent::KeyedIndexerFault { .. }
+                    )
+                })
+                .collect();
+            eprintln!("seed {seed}: {rounds:?}");
+        }
+        plans.push(KeyedIndexerPlan::from_seed(seed));
+    }
+    // The default set covers every fault class.
+    if std::env::var("KEYED_INDEXER_SEEDS").is_err() {
+        assert!(plans.iter().any(|plan| !plan.indexer_crashes.is_empty()));
+        assert!(plans.iter().any(|plan| plan.restore_round.is_some()));
+        assert!(plans.iter().all(|plan| !plan.leader_changes.is_empty()));
+    }
+}
+
+/// The same seed replays to the same trace.
+#[test]
+fn keyed_indexer_replays_with_same_seed_and_trace() {
+    let _guard = sim_test_guard();
+    let schedule = SimSchedule::generate_keyed_indexer(601);
+    let first = schedule.run();
+    let second = schedule.run();
+    assert_eq!(first, second);
+}
