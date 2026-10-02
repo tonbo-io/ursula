@@ -32,6 +32,10 @@ export interface CachedRow {
 /** Accounting overhead per cached row or overlay op, on top of key and value octets. */
 export const ROW_OVERHEAD = 64;
 const rowBytes = (key: string, value: string): number => key.length + value.length + ROW_OVERHEAD;
+/** Fixed per-range charge: the range object plus its skip-list node (§7.5 budget). */
+export const RANGE_OVERHEAD = 64;
+/** What an explicit covered range costs the cache budget: its bounds plus the fixed overhead. */
+const rangeBytes = (r: { lo: string; hi: string | undefined }): number => RANGE_OVERHEAD + r.lo.length + (r.hi?.length ?? 0);
 const opBytes = (op: KeyedOp): number =>
 	ROW_OVERHEAD + (op.op === "p" ? op.key.length + op.value.length : op.op === "d" ? op.key.length : op.start.length + op.end.length);
 
@@ -194,6 +198,7 @@ export class LocalStore implements StateStore {
 		return this.fresh;
 	}
 
+	/** Bytes charged to the cache budget: cached rows plus explicit covered ranges' metadata (§7.5). */
 	get cacheBytes(): number {
 		return this.cacheBytesTotal;
 	}
@@ -366,7 +371,7 @@ export class LocalStore implements StateStore {
 		if (this.coveredKey(key)) return;
 		this.putRow(key, { record: this.cache.get(source)?.record ?? 0, value });
 		const range: CoveredRange = { lo: key, hi: keySuccessor(key), pins: 0, used: ++this.tick, hot: key };
-		this.ranges.set(key, range);
+		this.addRange(range);
 		this.coalesce(range);
 		this.enforceBudget();
 	}
@@ -410,7 +415,7 @@ export class LocalStore implements StateStore {
 
 	private dropRange(range: CoveredRange): void {
 		this.metrics.rangesEvicted++;
-		this.ranges.delete(range.lo);
+		this.removeRange(range);
 		const drop: string[] = [];
 		for (const [k] of this.cache.range(range.lo, range.hi)) if (!isFreshKey(k, this.fresh)) drop.push(k);
 		for (const k of drop) this.deleteRow(k);
@@ -418,10 +423,10 @@ export class LocalStore implements StateStore {
 
 	/** Remove `key` from the unpinned `range`, splitting it into `[lo, key)` and `(key, hi)`. */
 	private splitOut(range: CoveredRange, key: string): void {
-		this.ranges.delete(range.lo);
+		this.removeRange(range);
 		const after = keySuccessor(key);
-		if (range.lo < key) this.ranges.set(range.lo, { lo: range.lo, hi: key, pins: 0, used: range.used, hot: range.hot });
-		if (range.hi === undefined || after < range.hi) this.ranges.set(after, { lo: after, hi: range.hi, pins: 0, used: range.used, hot: range.hot });
+		if (range.lo < key) this.addRange({ lo: range.lo, hi: key, pins: 0, used: range.used, hot: range.hot });
+		if (range.hi === undefined || after < range.hi) this.addRange({ lo: after, hi: range.hi, pins: 0, used: range.used, hot: range.hot });
 		this.deleteRow(key);
 	}
 
@@ -454,10 +459,10 @@ export class LocalStore implements StateStore {
 		}
 		if (lo === range.lo && hi === range.hi) return;
 		this.metrics.rangesShrunk++;
-		this.ranges.delete(range.lo);
+		this.removeRange(range);
 		range.lo = lo;
 		range.hi = hi;
-		if (hi === undefined || lo < hi) this.ranges.set(lo, range);
+		if (hi === undefined || lo < hi) this.addRange(range);
 	}
 
 	/** Merge the unpinned `range` with adjacent unpinned ranges (§7.5), keeping the newer LRU stamp and hot key. */
@@ -466,20 +471,23 @@ export class LocalStore implements StateStore {
 		let merged = range;
 		const left = this.ranges.lower(merged.lo)?.[1];
 		if (left !== undefined && left.pins === 0 && left.hi === merged.lo) {
-			this.ranges.delete(merged.lo);
+			this.removeRange(merged);
 			this.absorb(left, merged);
 			merged = left;
 		}
 		const right = merged.hi === undefined ? undefined : this.ranges.get(merged.hi);
 		if (right !== undefined && right.pins === 0) {
-			this.ranges.delete(right.lo);
+			this.removeRange(right);
 			this.absorb(merged, right);
 		}
 	}
 
 	/** `into` (which precedes `from`) takes over `from`'s span. */
 	private absorb(into: CoveredRange, from: CoveredRange): void {
+		// `into` is re-added so its charge follows its new bound.
+		this.removeRange(into);
 		into.hi = from.hi;
+		this.addRange(into);
 		if (from.used > into.used) {
 			into.used = from.used;
 			into.hot = from.hot;
@@ -718,13 +726,26 @@ export class LocalStore implements StateStore {
 			for (const [k, row] of merged.range(pos, gapEnd)) this.putRow(k, row);
 			const installed: CoveredRange = { lo: pos, hi: gapEnd, pins: 1, used: ++this.tick, hot: pos };
 			pins.add(installed);
-			this.ranges.set(pos, installed);
+			this.addRange(installed);
 			pos = gapEnd;
 		}
 		this.enforceBudget();
 	}
 
 	// ================================================================ helpers
+
+	/** Insert `range` under its `lo`, charging its metadata to the budget (§7.5). */
+	private addRange(range: CoveredRange): void {
+		this.ranges.set(range.lo, range);
+		this.cacheBytesTotal += rangeBytes(range);
+	}
+
+	/** Remove `range` (under its current `lo`) and its charge. Mutate its bounds only while removed. */
+	private removeRange(range: CoveredRange): void {
+		if (this.ranges.get(range.lo) !== range) return;
+		this.ranges.delete(range.lo);
+		this.cacheBytesTotal -= rangeBytes(range);
+	}
 
 	private putRow(key: string, row: CachedRow): void {
 		const prev = this.cache.set(key, row);

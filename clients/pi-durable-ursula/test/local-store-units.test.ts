@@ -3,7 +3,7 @@
 import { describe, expect, it } from "vitest";
 import { K } from "../src/families.ts";
 import { isFreshKey, isFreshRange } from "../src/local-store/fresh.ts";
-import { LocalStore } from "../src/local-store/local-store.ts";
+import { LocalStore, RANGE_OVERHEAD } from "../src/local-store/local-store.ts";
 import { SkipList } from "../src/local-store/skip-list.ts";
 import { OrderedMap } from "../src/ordered-map.ts";
 import { H } from "../src/protocol.ts";
@@ -224,6 +224,10 @@ describe("LocalStore", () => {
 		return { store, ks, row: K.t(1).length + size + 64 };
 	}
 	const rangesOf = (store: LocalStore): [string, string | undefined][] => store.coveredRanges().map((r) => [r.lo, r.hi]);
+	/** What the store's explicit ranges cost the budget (§7.5): bounds plus RANGE_OVERHEAD each. */
+	const rangeCharge = (store: LocalStore): number => store.coveredRanges().reduce((n, r) => n + RANGE_OVERHEAD + r.lo.length + (r.hi?.length ?? 0), 0);
+	/** Room for one range's metadata, well below one 100-octet row. */
+	const RANGE_ROOM = RANGE_OVERHEAD + 40;
 
 	it("§7.5: evicts values over the large-value threshold first, splitting their range", async () => {
 		const { store, ks, row } = await covered(100, { largeValueBytes: 200, big: 3 });
@@ -236,7 +240,7 @@ describe("LocalStore", () => {
 			[K.t(), K.t(3)],
 			[`${K.t(3)}\u0000`, strinc(K.t())],
 		]);
-		expect(store.cacheBytes).toBe(3 * row);
+		expect(store.cacheBytes).toBe(3 * row + rangeCharge(store));
 		expect(await store.read((v) => v.get(K.t(4)))).toBe("x".repeat(100));
 		expect(ks.calls).toHaveLength(1);
 	});
@@ -244,7 +248,7 @@ describe("LocalStore", () => {
 	it("§7.5: shrinks a range from its cold end, away from the key last read", async () => {
 		const { store, row } = await covered(100);
 		// The last read scanned from the range's start: the high end is cold.
-		store.evict(2 * row);
+		store.evict(2 * row + RANGE_ROOM);
 		expect(store.cachedRows().map(([k]) => k)).toEqual([K.t(1), K.t(2)]);
 		expect(rangesOf(store)).toEqual([[K.t(), K.t(3)]]);
 		expect(store.metrics.rangesShrunk).toBe(1);
@@ -253,9 +257,26 @@ describe("LocalStore", () => {
 		const hot = await covered(100);
 		expect(await hot.store.read((v) => v.get(K.t(4)))).toBe("x".repeat(100));
 		// Rows above the hot key t/4 go first (none), then rows from the bottom up.
-		hot.store.evict(2 * row);
+		hot.store.evict(2 * row + RANGE_ROOM);
 		expect(hot.store.cachedRows().map(([k]) => k)).toEqual([K.t(3), K.t(4)]);
 		expect(rangesOf(hot.store)).toEqual([[`${K.t(2)}\u0000`, strinc(K.t())]]);
+	});
+
+	it("§7.5: charges empty covered ranges to the budget, so missing-key reads cannot grow it unbounded", async () => {
+		// Every miss on a nonexistent key installs an empty range [key, key\0). Only row bytes used
+		// to count, so 10,000 such ranges stayed forever while cacheBytes reported 0.
+		const empty: KeyedStateTransport = { scan: async () => page(0, []) };
+		const store = new LocalStore({ keyedState: empty, base: 0, cacheBudgetBytes: 1 });
+		let peak = 0;
+		for (let id = 1; id <= 10_000; id++) {
+			expect(await store.read((v) => v.get(K.t(id * 3)) ?? null)).toBeNull();
+			peak = Math.max(peak, store.coveredRanges().length);
+		}
+		expect(peak).toBeLessThanOrEqual(2);
+		expect(store.cacheBytes).toBe(rangeCharge(store));
+		store.evict(0);
+		expect(store.coveredRanges()).toHaveLength(0);
+		expect(store.cacheBytes).toBe(0);
 	});
 
 	it("§7.5: coalesces adjacent unpinned ranges once their reads settle", async () => {
