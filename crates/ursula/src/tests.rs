@@ -6210,6 +6210,29 @@ mod snapshot_driver {
             vec![0, 3]
         );
     }
+
+    #[test]
+    fn metrics_export_log_bytes_since_snapshot_and_last_snapshot_size() {
+        // Bounded-state §7.5 soak gauges: unpurged log bytes and snapshot raw
+        // bytes per group, scraped from `/__ursula/metrics`.
+        let rendered = crate::render::render_raft_group_metrics_array(&[snap(
+            3,
+            Some(100),
+            Some(40),
+            GroupLogProgress {
+                log_bytes: 5 * MIB,
+                log_entries: 60,
+                last_snapshot_bytes: 3 * MIB,
+                has_snapshot: true,
+            },
+        )]);
+        let group = &rendered[0];
+        assert_eq!(group["raft_group_id"], 3);
+        assert_eq!(group["log_bytes_since_snapshot"], 5 * MIB);
+        assert_eq!(group["log_entries_since_snapshot"], 60);
+        assert_eq!(group["last_snapshot_bytes"], 3 * MIB);
+        assert_eq!(group["has_snapshot"], true);
+    }
 }
 
 mod leadership_balance {
