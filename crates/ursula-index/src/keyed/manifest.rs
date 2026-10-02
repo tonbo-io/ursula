@@ -12,6 +12,10 @@
 //! and adopts the tag only when the bytes are its own; anything else is a
 //! conflict, after which the caller reloads.
 
+use std::collections::HashSet;
+use std::time::Duration;
+use std::time::UNIX_EPOCH;
+
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -278,6 +282,20 @@ impl KeyedManifest {
         Ok(Some(next))
     }
 
+    /// The object key [`KeyedNamespace::publish`] writes this manifest
+    /// under when it publishes it on top of `base`.
+    pub(crate) fn object_key_on(
+        &self,
+        base: Option<&PublishedKeyedManifest>,
+    ) -> Result<String, IndexError> {
+        let mut manifest = self.clone();
+        manifest.generation = base
+            .map_or(0, |base| base.manifest.generation)
+            .checked_add(1)
+            .ok_or_else(|| invalid("generation overflowed"))?;
+        Ok(manifest.encode()?.0)
+    }
+
     fn encode(&self) -> Result<(String, Vec<u8>, Vec<u8>), IndexError> {
         let bytes = serde_json::to_vec(self)?;
         let key = format!("manifests/{:020}-{}.json", self.generation, digest(&bytes));
@@ -445,6 +463,45 @@ impl KeyedNamespace {
         let manifest: KeyedManifest = serde_json::from_slice(&object.bytes)?;
         manifest.validate()?;
         Ok(Some(manifest))
+    }
+
+    /// The orphan sweep (U20 `sweep`): one LIST of the namespace, then
+    /// deletes every part and manifest that the published manifest does not
+    /// reference and that is older than `grace` at `now_ms`. Objects of
+    /// unknown age are kept. Returns the number of objects deleted.
+    pub async fn sweep(&self, now_ms: u64, grace: Duration) -> Result<usize, IndexError> {
+        let objects = self.store.list(&self.prefix).await?;
+        let published = self.load().await?;
+        let mut referenced: HashSet<&str> = HashSet::new();
+        if let Some(published) = &published {
+            referenced.insert(published.manifest_key.as_str());
+            referenced.extend(published.manifest.part_keys());
+        }
+        let grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
+        let mut deleted = 0_usize;
+        for object in objects {
+            let Some(name) = object.key.strip_prefix(&self.prefix) else {
+                continue;
+            };
+            let data = (name.starts_with("parts/") && name.ends_with(".parquet"))
+                || (name.starts_with("manifests/") && name.ends_with(".json"));
+            if !data || referenced.contains(name) {
+                continue;
+            }
+            let Some(modified_ms) = object
+                .modified
+                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                .and_then(|age| u64::try_from(age.as_millis()).ok())
+            else {
+                continue;
+            };
+            if now_ms.saturating_sub(modified_ms) < grace_ms {
+                continue;
+            }
+            self.store.delete(&object.key).await?;
+            deleted = deleted.saturating_add(1);
+        }
+        Ok(deleted)
     }
 
     /// Loads the published manifest; `None` is a missing namespace

@@ -28,7 +28,6 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
-use super::engine::now_ms;
 use super::engine::stored_digest;
 use super::fold::Lower;
 use super::fold::RangeQuery;
@@ -49,6 +48,8 @@ use super::part::PartOptions;
 use super::run::BuiltRun;
 use super::run::RunBuilder;
 use super::source::KeyedSourceClient;
+use crate::clock::Clock;
+use crate::clock::SystemClock;
 use crate::object_store::ObjectStore;
 
 /// Rows fetched per page when scanning a state.
@@ -587,7 +588,7 @@ fn replacement(
         through_record: through,
         through_digest: digest,
         runs: runs.to_vec(),
-        published_at_ms: now_ms(),
+        published_at_ms: SystemClock.now_ms(),
         obsoleted: vec![base.manifest_key.clone()],
     };
     let kept: HashSet<String> = manifest.part_keys().map(str::to_owned).collect();

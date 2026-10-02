@@ -36,10 +36,10 @@
   },
   {
     "category": "system_time_now",
-    "path": "crates/ursula-index/src/keyed/engine.rs",
+    "path": "crates/ursula-index/src/clock.rs",
     "snippet_contains": "SystemTime::now()",
     "reason": "already-cfg-gated",
-    "plan": "no action: the keyed engine's now_ms() reads the wall clock only under cfg(not(madsim)); cfg(madsim) returns 0 (the epoch), as the event-time GC clock does. An injectable keyed clock is U21's indexer DST work."
+    "plan": "no action: SystemClock (the keyed engine's and the memory store's default wall clock) reads SystemTime only under cfg(not(madsim)); cfg(madsim) returns 0 (the epoch). The simulator injects a virtual-time Clock (KeyedEngine::with_clock, MemoryObjectStore::new), keyed-streams U21."
   },
   {
     "category": "tokio_runtime_builder",

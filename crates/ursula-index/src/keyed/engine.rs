@@ -36,6 +36,19 @@
 //! when the view is older than `current_revalidate`, so a pod never serves
 //! a `D` below what another pod or a previous process published (P3.6).
 //! Object-store requests are counted per namespace and per pod (U24).
+//!
+//! Objects a crash leaves behind are removed by the orphan sweep
+//! ([`KeyedEngine::sweep`], or the `keyed sweep` tool).
+//!
+//! Parts and manifests are content-addressed, so a retry can write an
+//! object whose deletion an earlier attempt queued. A writer therefore pins
+//! the keys it is about to reference (waiting out a deletion in flight, and
+//! re-writing the object after it), and a queued deletion decided before the
+//! latest pin of its key is dropped: the key's new life schedules its own.
+//!
+//! The source log ([`SourceClient`]), the object store and the wall clock
+//! ([`Clock`]) are injected, and tasks and timers go through the crate's
+//! task seam, so the engine runs under the deterministic simulator (U21).
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -49,10 +62,6 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-#[cfg(not(madsim))]
-use std::time::SystemTime;
-#[cfg(not(madsim))]
-use std::time::UNIX_EPOCH;
 
 use bytes::Bytes;
 use futures_util::FutureExt;
@@ -60,7 +69,6 @@ use futures_util::future::BoxFuture;
 use parquet::arrow::async_reader::AsyncFileReader;
 use tokio::sync::Notify;
 use tokio::sync::watch;
-use tokio::time::Instant;
 
 use super::fold::RangeQuery;
 use super::manifest::KeyedManifest;
@@ -86,13 +94,17 @@ use super::run::RunBuilder;
 use super::run::compact;
 use super::run::plan_compaction;
 use super::source::IncarnationState;
-use super::source::KeyedSourceClient;
+use super::source::SourceClient;
 use super::source::SourceError;
 use crate::EventIndexCache;
 use crate::IndexError;
+use crate::clock::Clock;
+use crate::clock::SystemClock;
 use crate::object_store::ObjectRequestCounters;
 use crate::object_store::ObjectStore;
 use crate::object_store::digest;
+use crate::rt;
+use crate::rt::time::Instant;
 
 /// Compactions attempted after one publication.
 const COMPACTIONS_PER_PASS: usize = 4;
@@ -222,22 +234,6 @@ fn namespace_id(source: &KeyedSource) -> NamespaceId {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Wall-clock milliseconds for `published_at_ms` and the publish interval;
-/// the epoch under the simulator, which has no wall clock.
-#[cfg(not(madsim))]
-pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-        })
-}
-
-#[cfg(madsim)]
-pub(crate) fn now_ms() -> u64 {
-    0
 }
 
 /// blake3 of a record's stored bytes: its message text plus the LF.
@@ -485,10 +481,56 @@ struct BucketState {
     drained_until: Option<Instant>,
 }
 
+/// A queued deletion: the namespace-relative key and the
+/// [`KeyGuards::sequence`] at which it was decided.
+type Decided = (String, u64);
+
 struct GcItem {
     namespace: Arc<Namespace>,
     key: String,
     due: Instant,
+    /// [`KeyGuards::sequence`] when the deletion was decided.
+    decided: u64,
+}
+
+/// Coordination of writers and garbage collection over object keys.
+#[derive(Debug, Default)]
+struct KeyGuards {
+    /// Orders deletion decisions and pins.
+    sequence: u64,
+    /// Keys a writer is about to reference (full object keys), counted.
+    pinned: HashMap<String, usize>,
+    /// The sequence of each key's latest pin.
+    last_pinned: HashMap<String, u64>,
+    /// Keys whose deletion is in flight.
+    deleting: HashSet<String>,
+}
+
+impl KeyGuards {
+    fn next(&mut self) -> u64 {
+        self.sequence = self.sequence.saturating_add(1);
+        self.sequence
+    }
+}
+
+/// Keys pinned by a writer; unpinned on drop.
+struct Pins {
+    guards: Arc<Mutex<KeyGuards>>,
+    keys: Vec<String>,
+}
+
+impl Drop for Pins {
+    fn drop(&mut self) {
+        let mut guards = lock(&self.guards);
+        for key in &self.keys {
+            if let Some(count) = guards.pinned.get_mut(key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    guards.pinned.remove(key);
+                }
+            }
+        }
+    }
 }
 
 /// Why a worker cycle stopped.
@@ -527,7 +569,8 @@ enum Folded {
 
 struct Inner {
     store: ObjectStore,
-    source: KeyedSourceClient,
+    source: Arc<dyn SourceClient>,
+    clock: Arc<dyn Clock>,
     cache: Option<EventIndexCache>,
     written: Arc<WrittenParts>,
     config: KeyedEngineConfig,
@@ -537,6 +580,11 @@ struct Inner {
     waiters: AtomicUsize,
     gc: Mutex<Vec<GcItem>>,
     metrics: KeyedMetrics,
+    guards: Arc<Mutex<KeyGuards>>,
+    /// Signalled when a deletion in flight finishes.
+    deletions: Notify,
+    /// Garbage-collection passes run one at a time.
+    gc_pass: tokio::sync::Mutex<()>,
 }
 
 /// The keyed projection engine of one indexer pod.
@@ -575,13 +623,25 @@ impl Drop for WaiterGuard<'_> {
 
 impl KeyedEngine {
     /// An engine storing namespaces in `store` (whose root holds `.keyed/`)
-    /// and reading sources through `source`. `cache` is a serving cache for
-    /// verified part ranges.
+    /// and reading sources through `source`, on the host's wall clock.
+    /// `cache` is a serving cache for verified part ranges.
     pub fn new(
         store: ObjectStore,
-        source: KeyedSourceClient,
+        source: impl SourceClient + 'static,
         cache: Option<EventIndexCache>,
         config: KeyedEngineConfig,
+    ) -> Self {
+        Self::with_clock(store, source, cache, config, Arc::new(SystemClock))
+    }
+
+    /// [`Self::new`] on an injected wall clock (the simulator's virtual
+    /// time).
+    pub fn with_clock(
+        store: ObjectStore,
+        source: impl SourceClient + 'static,
+        cache: Option<EventIndexCache>,
+        config: KeyedEngineConfig,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         let written = Arc::new(WrittenParts {
             capacity: config.write_cache_bytes,
@@ -592,7 +652,8 @@ impl KeyedEngine {
         Self {
             inner: Arc::new(Inner {
                 store,
-                source,
+                source: Arc::new(source),
+                clock,
                 cache,
                 written,
                 config,
@@ -602,6 +663,9 @@ impl KeyedEngine {
                 waiters: AtomicUsize::new(0),
                 gc: Mutex::new(Vec::new()),
                 metrics,
+                guards: Arc::new(Mutex::new(KeyGuards::default())),
+                deletions: Notify::new(),
+                gc_pass: tokio::sync::Mutex::new(()),
             }),
         }
     }
@@ -641,11 +705,21 @@ impl KeyedEngine {
         self.inner.collect_garbage().await
     }
 
+    /// The orphan sweep of `source`'s namespace: deletes unreferenced parts
+    /// and manifests older than the GC grace period (objects a crash left
+    /// behind, or whose queued deletion a crash lost). Returns the number of
+    /// objects deleted.
+    pub async fn sweep(&self, source: &KeyedSource) -> Result<usize, IndexError> {
+        KeyedNamespace::new(self.inner.store.clone(), source.clone())
+            .sweep(self.inner.clock.now_ms(), self.inner.config.gc_grace)
+            .await
+    }
+
     /// Runs garbage collection every `gc_tick` until `shutdown` turns true.
     pub async fn run_maintenance(&self, mut shutdown: watch::Receiver<bool>) {
         loop {
             tokio::select! {
-                () = tokio::time::sleep(self.inner.config.gc_tick) => {}
+                () = rt::time::sleep(self.inner.config.gc_tick) => {}
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         return;
@@ -661,6 +735,10 @@ impl KeyedEngine {
 }
 
 impl Inner {
+    fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
     fn enter(self: &Arc<Self>, bucket: &str) -> Option<BusyGuard> {
         let mut buckets = lock(&self.buckets);
         let state = buckets.entry(bucket.to_owned()).or_default();
@@ -749,7 +827,7 @@ impl Inner {
             .manifest
             .published_at_ms
             .saturating_add(u64::try_from(self.config.gc_grace.as_millis()).unwrap_or(u64::MAX))
-            .saturating_sub(now_ms());
+            .saturating_sub(self.now_ms());
         if namespace.adopt(published) {
             let due = Instant::now()
                 .checked_add(Duration::from_millis(remaining))
@@ -889,7 +967,7 @@ impl Inner {
                         return KeyedReadOutcome::Unavailable("keyed namespace closed".to_owned());
                     }
                 }
-                () = tokio::time::sleep_until(deadline) => {
+                () = rt::time::sleep_until(deadline) => {
                     let view = Arc::clone(&receiver.borrow());
                     if matches!(view.status, Status::Ready) && view.through() >= wanted {
                         return self.serve(&namespace, &view, &request.selection).await;
@@ -960,7 +1038,7 @@ impl Inner {
         drop(work);
         let inner = Arc::clone(self);
         let namespace = Arc::clone(namespace);
-        tokio::spawn(async move {
+        let _worker = rt::spawn(async move {
             inner.run_worker(namespace).await;
         });
     }
@@ -992,7 +1070,7 @@ impl Inner {
             };
             match self.cycle(&namespace, want_next, verify).await {
                 Ok(true) => {}
-                Ok(false) => tokio::time::sleep(NO_PROGRESS_BACKOFF).await,
+                Ok(false) => rt::time::sleep(NO_PROGRESS_BACKOFF).await,
                 Err(error) => {
                     let status = match error {
                         CycleError::Transient(reason) => {
@@ -1057,10 +1135,10 @@ impl Inner {
                 .manifest
                 .published_at_ms
                 .saturating_add(interval)
-                .saturating_sub(now_ms())
+                .saturating_sub(self.now_ms())
                 .min(interval);
             if wait > 0 {
-                tokio::time::sleep(Duration::from_millis(wait)).await;
+                rt::time::sleep(Duration::from_millis(wait)).await;
             }
         }
         let base = self.reload(namespace).await?;
@@ -1147,6 +1225,13 @@ impl Inner {
             ),
             _ => (0, None),
         };
+        // A rebuild replaces a publication at `D`: it may not publish less
+        // while the source holds that many records, so `max_ingest_bytes`
+        // splits it only above the old `D` (D is monotone per namespace).
+        let floor = match base {
+            Some(published) if rebuild => published.manifest.through_record,
+            _ => 0,
+        };
         let drop_tombstones =
             rebuild || base.is_none_or(|published| published.manifest.runs.is_empty());
         let mut builder = RunBuilder::new(d, drop_tombstones);
@@ -1164,7 +1249,7 @@ impl Inner {
             if expected.is_none() && cursor >= target {
                 break;
             }
-            if expected.is_none() && bytes >= self.config.max_ingest_bytes {
+            if expected.is_none() && bytes >= self.config.max_ingest_bytes && cursor >= floor {
                 truncated = true;
                 break;
             }
@@ -1209,7 +1294,7 @@ impl Inner {
                 if record >= target {
                     break 'pages;
                 }
-                if bytes >= self.config.max_ingest_bytes {
+                if bytes >= self.config.max_ingest_bytes && record >= floor {
                     truncated = true;
                     break 'pages;
                 }
@@ -1236,26 +1321,27 @@ impl Inner {
             base.map_or_else(empty_base, |published| published.manifest.clone())
         };
         let mut new_keys = Vec::new();
+        let mut pins = None;
         if let Some(digest) = last_digest {
             let through = builder.next_record();
             let options = self.config.part_options;
-            let built = tokio::task::spawn_blocking(move || builder.finish(&options))
+            let built = rt::run_blocking(move || builder.finish(&options))
                 .await
                 .map_err(transient)?
                 .map_err(transient)?;
-            self.store_parts(namespace, &built.parts).await?;
+            pins = Some(self.store_parts(namespace, &built.parts).await?);
             new_keys = built
                 .parts
                 .iter()
                 .map(|part| part.meta.key.clone())
                 .collect();
             manifest = manifest
-                .after_ingest(Some(built.meta), through, digest, now_ms())
+                .after_ingest(Some(built.meta), through, digest, self.now_ms())
                 .map_err(transient)?;
         } else if !rebuild {
             return Ok(Folded::Done);
         } else {
-            manifest.published_at_ms = now_ms();
+            manifest.published_at_ms = self.now_ms();
         }
         if let Some(published) = base {
             manifest.obsoleted.push(published.manifest_key.clone());
@@ -1271,14 +1357,56 @@ impl Inner {
             }
         }
         self.commit(namespace, base, manifest, new_keys).await?;
+        drop(pins);
         Ok(Folded::Done)
     }
 
+    /// Pins `keys` (namespace-relative) for a writer that is about to
+    /// reference them: waits for deletions of them in flight, then records
+    /// the pin, which voids deletions decided earlier.
+    async fn pin<'k>(
+        &self,
+        namespace: &Namespace,
+        keys: impl IntoIterator<Item = &'k str>,
+    ) -> Pins {
+        let prefix = namespace.namespace.prefix();
+        let keys: Vec<String> = keys
+            .into_iter()
+            .map(|key| format!("{prefix}{key}"))
+            .collect();
+        loop {
+            let finished = self.deletions.notified();
+            tokio::pin!(finished);
+            finished.as_mut().enable();
+            {
+                let mut guards = lock(&self.guards);
+                if !keys.iter().any(|key| guards.deleting.contains(key)) {
+                    let sequence = guards.next();
+                    for key in &keys {
+                        let count = guards.pinned.entry(key.clone()).or_default();
+                        *count = count.saturating_add(1);
+                        guards.last_pinned.insert(key.clone(), sequence);
+                    }
+                    return Pins {
+                        guards: Arc::clone(&self.guards),
+                        keys,
+                    };
+                }
+            }
+            finished.await;
+        }
+    }
+
+    /// Pins and stores `parts`; the pins last until the caller's commit
+    /// has published them or queued them for deletion.
     async fn store_parts(
         &self,
         namespace: &Namespace,
         parts: &[EncodedPart],
-    ) -> Result<(), CycleError> {
+    ) -> Result<Pins, CycleError> {
+        let pins = self
+            .pin(namespace, parts.iter().map(|part| part.meta.key.as_str()))
+            .await;
         for part in parts {
             namespace
                 .namespace
@@ -1290,7 +1418,7 @@ impl Inner {
                 Bytes::clone(&part.bytes),
             );
         }
-        Ok(())
+        Ok(pins)
     }
 
     /// Publishes `manifest` on `base`. On success, schedules the delta's GC
@@ -1303,6 +1431,10 @@ impl Inner {
         manifest: KeyedManifest,
         new_keys: Vec<String>,
     ) -> Result<bool, CycleError> {
+        let manifest_key = manifest
+            .object_key_on(base.map(Arc::as_ref))
+            .map_err(transient)?;
+        let _pinned = self.pin(namespace, [manifest_key.as_str()]).await;
         let outcome = namespace
             .namespace
             .publish(base.map(Arc::as_ref), &manifest)
@@ -1404,7 +1536,7 @@ impl Inner {
                     .map(|part| part.meta.bytes)
                     .fold(0_u64, u64::saturating_add),
             );
-            self.store_parts(namespace, &output.output.parts).await?;
+            let _pins = self.store_parts(namespace, &output.output.parts).await?;
             let new_keys: Vec<String> = output
                 .output
                 .parts
@@ -1423,7 +1555,7 @@ impl Inner {
                         &output.inputs,
                         &output.output.meta,
                         output.into_oldest,
-                        now_ms(),
+                        self.now_ms(),
                     )
                     .map_err(transient)?
                 else {
@@ -1456,17 +1588,30 @@ impl Inner {
         if keys.is_empty() {
             return;
         }
+        let decided = lock(&self.guards).next();
+        self.requeue_gc(
+            namespace,
+            keys.into_iter().map(|key| (key, decided)).collect(),
+            due,
+        );
+    }
+
+    /// Queues deletions with the sequence at which each was decided.
+    fn requeue_gc(&self, namespace: &Arc<Namespace>, keys: Vec<Decided>, due: Instant) {
         let mut gc = lock(&self.gc);
-        gc.extend(keys.into_iter().map(|key| GcItem {
+        gc.extend(keys.into_iter().map(|(key, decided)| GcItem {
             namespace: Arc::clone(namespace),
             key,
             due,
+            decided,
         }));
     }
 
     /// Deletes due objects that the namespace's current manifest does not
-    /// reference, and forgets idle namespaces.
+    /// reference and no writer re-referenced since the deletion was
+    /// decided, and forgets idle namespaces.
     async fn collect_garbage(&self) -> usize {
+        let _pass = self.gc_pass.lock().await;
         let now = Instant::now();
         let due: Vec<GcItem> = {
             let mut gc = lock(&self.gc);
@@ -1475,14 +1620,14 @@ impl Inner {
             *gc = later;
             due
         };
-        let mut by_namespace: Vec<(Arc<Namespace>, Vec<String>)> = Vec::new();
+        let mut by_namespace: Vec<(Arc<Namespace>, Vec<Decided>)> = Vec::new();
         for item in due {
             match by_namespace
                 .iter_mut()
                 .find(|(namespace, _)| Arc::ptr_eq(namespace, &item.namespace))
             {
-                Some((_, keys)) => keys.push(item.key),
-                None => by_namespace.push((item.namespace, vec![item.key])),
+                Some((_, keys)) => keys.push((item.key, item.decided)),
+                None => by_namespace.push((item.namespace, vec![(item.key, item.decided)])),
             }
         }
         let mut deleted = 0_usize;
@@ -1504,25 +1649,51 @@ impl Inner {
                 Ok(None) => HashSet::new(),
                 Err(error) => {
                     tracing::warn!(%error, "keyed GC cannot load CURRENT; retrying later");
-                    self.schedule_gc(&namespace, keys, retry);
+                    self.requeue_gc(&namespace, keys, retry);
                     continue;
                 }
             };
             let mut failed = Vec::new();
-            for key in keys {
+            for (key, decided) in keys {
                 if referenced.contains(&key) {
                     continue;
                 }
-                match namespace.namespace.delete(&key).await {
+                let object = format!("{}{key}", namespace.namespace.prefix());
+                {
+                    let mut guards = lock(&self.guards);
+                    if guards
+                        .last_pinned
+                        .get(&object)
+                        .is_some_and(|pinned| *pinned >= decided)
+                    {
+                        // Re-referenced since: its new life schedules its own
+                        // deletion.
+                        continue;
+                    }
+                    if guards.pinned.contains_key(&object) {
+                        failed.push((key, decided));
+                        continue;
+                    }
+                    guards.deleting.insert(object.clone());
+                }
+                let result = namespace.namespace.delete(&key).await;
+                lock(&self.guards).deleting.remove(&object);
+                self.deletions.notify_waiters();
+                match result {
                     Ok(()) => deleted = deleted.saturating_add(1),
                     Err(error) => {
                         tracing::warn!(%error, key, "keyed GC delete failed; retrying later");
-                        failed.push(key);
+                        failed.push((key, decided));
                     }
                 }
             }
-            self.schedule_gc(&namespace, failed, retry);
+            self.requeue_gc(&namespace, failed, retry);
         }
+        // A pin matters only to deletions decided before it.
+        let oldest = lock(&self.gc).iter().map(|item| item.decided).min();
+        lock(&self.guards)
+            .last_pinned
+            .retain(|_, pinned| oldest.is_some_and(|oldest| *pinned >= oldest));
         self.forget_idle();
         bump(
             &self.metrics.gc_deleted,

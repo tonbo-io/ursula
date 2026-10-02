@@ -16,6 +16,8 @@ pub mod artifact;
 #[cfg(madsim)]
 pub use madsim_harness::HttpProtocolSurfacePlan;
 #[cfg(madsim)]
+pub use madsim_harness::KeyedIndexerPlan;
+#[cfg(madsim)]
 pub use madsim_harness::LEADER_FAILOVER_SEEDS;
 #[cfg(madsim)]
 pub use madsim_harness::RAFT_PARTITION_FAILURE_SEEDS;

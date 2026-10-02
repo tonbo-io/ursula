@@ -97,6 +97,15 @@ jobs:
       - name: Run madsim smoke corpus
         run: RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim smoke_corpus_replays -- --nocapture
 
+      # Keyed indexer DST (keyed-streams U21): the PR seed family under S3
+      # faults, Raft leader changes, indexer crashes and restores.
+      - name: Run keyed indexer seed family
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib keyed_indexer_ -- --nocapture
+          RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
+            --seed-family keyed-indexer \
+            --failure-dir target/ursula-sim-keyed-indexer-failures
+
   typescript:
     name: TypeScript owner
     runs-on: ${{ vars.KS_RUNNER || 'ubuntu-24.04' }}

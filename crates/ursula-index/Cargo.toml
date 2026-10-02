@@ -39,10 +39,14 @@ url = { workspace = true }
 ursula-observability = { workspace = true }
 ursula-shard = { workspace = true }
 
+[target.'cfg(madsim)'.dependencies]
+sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
 [lints]
 workspace = true
 
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 tower = { workspace = true, features = ["util"] }

@@ -622,6 +622,22 @@ pub enum SimEvent {
         after_event: String,
         message: String,
     },
+    KeyedIndexerFault {
+        round: u32,
+        fault: String,
+    },
+    KeyedIndexerRound {
+        round: u32,
+        records: u64,
+        through: Option<u64>,
+    },
+    KeyedIndexerVerified {
+        publications: u64,
+        through: u64,
+        deleted: u64,
+        swept: u64,
+        collected: u64,
+    },
 }
 
 impl SimEvent {
