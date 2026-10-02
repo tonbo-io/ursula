@@ -22,11 +22,12 @@ fn envelopes(start: u64, timestamps: &[i64]) -> Vec<SourceEnvelope> {
         .enumerate()
         .map(|(index, timestamp)| SourceEnvelope {
             record: start.saturating_add(u64::try_from(index).unwrap_or(u64::MAX)),
-            value: serde_json::json!({
+            value: serde_json::value::to_raw_value(&serde_json::json!({
                 "captured_at": chrono::DateTime::from_timestamp_millis(*timestamp)
                     .map(|value| value.to_rfc3339())
                     .unwrap_or_default()
-            }),
+            }))
+            .expect("a JSON object serializes"),
         })
         .collect()
 }

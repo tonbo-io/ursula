@@ -35,7 +35,7 @@ async fn source_client_reads_envelopes_and_retention_gap() -> anyhow::Result<()>
                 [("stream-extensions", "json-record-coordinates-v1")],
                 concat!(
                     "{\"record\":0,\"value\":{\"captured_at\":\"2026-07-18T10:00:00Z\"}}\n",
-                    "{\"record\":1,\"value\":{\"captured_at\":\"2026-07-18T09:00:00Z\"}}\n"
+                    "{\"record\":1,\"value\":{\"note\":\"\\ud800\",\"captured_at\":\"2026-07-18T09:00:00Z\"}}\n"
                 ),
             )
                 .into_response()
@@ -51,6 +51,11 @@ async fn source_client_reads_envelopes_and_retention_gap() -> anyhow::Result<()>
             assert_eq!(records.len(), 2);
             assert_eq!(records[0].record, 0);
             assert_eq!(records[1].record, 1);
+            // P1 stores lone-surrogate escapes; the raw value keeps them.
+            assert_eq!(
+                records[1].value.get(),
+                "{\"note\":\"\\ud800\",\"captured_at\":\"2026-07-18T09:00:00Z\"}"
+            );
         }
         SourceBatch::RetentionGap { .. } => anyhow::bail!("expected source records"),
     }
