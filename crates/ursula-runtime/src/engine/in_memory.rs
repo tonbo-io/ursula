@@ -132,6 +132,9 @@ pub struct InMemoryGroupEngine {
     pub(crate) stream_append_counts: HashMap<BucketStreamId, u64>,
     pub(crate) cold_store: Option<ColdStoreHandle>,
     pub(crate) cold_index_cache: Option<Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>>,
+    /// Read plans issued while serving `/bootstrap`; one per request
+    /// (bounded-stream-state F11). Node-local and not replicated.
+    pub(crate) bootstrap_read_plans: u64,
 }
 
 impl InMemoryGroupEngine {
@@ -1223,46 +1226,69 @@ impl InMemoryGroupEngine {
         .await
     }
 
+    /// Materializes bootstrap updates from ONE read plan covering every
+    /// update, then cuts the window into one part per message record.
     pub(crate) async fn bootstrap_updates(
-        &self,
+        &mut self,
         stream_id: &BucketStreamId,
         records: &[StreamMessageRecord],
         content_type: &str,
         now_ms: u64,
     ) -> Result<Vec<BootstrapUpdate>, GroupEngineError> {
+        let (Some(first), Some(last)) = (records.first(), records.last()) else {
+            return Ok(Vec::new());
+        };
+        let window_start = first.start_offset;
+        let window_end = last.end_offset;
+        let window_error = |message: &str| {
+            GroupEngineError::stream(
+                StreamErrorCode::InvalidSnapshot,
+                format!(
+                    "bootstrap window [{window_start}..{window_end}) for stream '{stream_id}' {message}"
+                ),
+            )
+        };
+        let window_len = window_end
+            .checked_sub(window_start)
+            .and_then(|len| usize::try_from(len).ok())
+            .ok_or_else(|| window_error("is invalid"))?;
+        self.bootstrap_read_plans = self.bootstrap_read_plans.saturating_add(1);
+        let plan = self
+            .state_machine
+            .read_plan_at(stream_id, window_start, window_len, now_ms)
+            .map_err(stream_response_error)?;
+        // Bootstrap never reads cold storage: the plan only covers messages
+        // at or above the exact-message frontier, which are hot.
+        if plan
+            .segments
+            .iter()
+            .any(|segment| !matches!(segment, StreamReadSegment::Hot(_)))
+        {
+            return Err(GroupEngineError::new(format!(
+                "bootstrap window [{window_start}..{window_end}) for stream '{stream_id}' is not hot"
+            )));
+        }
+        let payload = self.read_own_payload_from_plan(stream_id, &plan).await?;
+        if payload.len() != window_len {
+            return Err(window_error("was not fully materialized"));
+        }
         let mut updates = Vec::with_capacity(records.len());
         for record in records {
-            let len = usize::try_from(record.end_offset - record.start_offset).map_err(|_| {
-                GroupEngineError::stream(
-                    StreamErrorCode::InvalidSnapshot,
-                    format!(
-                        "bootstrap message [{}..{}) for stream '{stream_id}' is too large",
-                        record.start_offset, record.end_offset
-                    ),
-                )
-            })?;
-            let plan = self
-                .state_machine
-                .read_plan_at(stream_id, record.start_offset, len, now_ms)
-                .map_err(stream_response_error)?;
-            // Bootstrap never reads cold storage: the plan only lists
-            // messages at or above the exact-message frontier, which are hot.
-            if plan
-                .segments
-                .iter()
-                .any(|segment| !matches!(segment, StreamReadSegment::Hot(_)))
-            {
-                return Err(GroupEngineError::new(format!(
-                    "bootstrap message [{}..{}) for stream '{stream_id}' is not hot",
-                    record.start_offset, record.end_offset
-                )));
-            }
-            let payload = self.read_own_payload_from_plan(stream_id, &plan).await?;
+            let part = record
+                .start_offset
+                .checked_sub(window_start)
+                .zip(record.end_offset.checked_sub(window_start))
+                .and_then(|(start, end)| {
+                    let start = usize::try_from(start).ok()?;
+                    let end = usize::try_from(end).ok()?;
+                    payload.get(start..end)
+                })
+                .ok_or_else(|| window_error("does not contain every message"))?;
             updates.push(BootstrapUpdate {
                 start_offset: record.start_offset,
                 next_offset: record.end_offset,
                 content_type: content_type.to_owned(),
-                payload,
+                payload: part.to_vec(),
             });
         }
         Ok(updates)

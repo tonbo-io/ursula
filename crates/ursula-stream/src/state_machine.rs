@@ -35,6 +35,7 @@ use crate::command::StreamCommand;
 use crate::integrity::StreamIntegrity;
 use crate::model::AppendExternalInput;
 use crate::model::AppendStreamInput;
+use crate::model::BOOTSTRAP_MAX_UPDATE_BYTES;
 use crate::model::BucketQuota;
 use crate::model::BucketQuotaSnapshot;
 use crate::model::BucketUsage;

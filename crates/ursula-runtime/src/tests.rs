@@ -788,6 +788,59 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
     assert!(entry.external_segments.is_empty());
 }
 
+/// bounded-stream-state F11: bootstrap plans one read window for all hot
+/// updates instead of one plan per message (O(hot records²) before).
+#[tokio::test]
+async fn bootstrap_issues_one_read_plan_for_all_updates() {
+    let placement = placement();
+    let stream = BucketStreamId::new("benchcmp", "bootstrap-one-plan");
+    let mut engine = InMemoryGroupEngine::default();
+    engine
+        .create_stream(
+            CreateStreamRequest::new(stream.clone(), DEFAULT_CONTENT_TYPE),
+            placement,
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .expect("create stream");
+    let payloads = (0..64)
+        .map(|index| format!("message-{index}").into_bytes())
+        .collect::<Vec<_>>();
+    for payload in &payloads {
+        engine
+            .append(
+                AppendRequest::from_bytes(stream.clone(), payload.clone()),
+                placement,
+                ColdWriteAdmission::default(),
+            )
+            .await
+            .expect("append");
+    }
+
+    let plans_before = engine.bootstrap_read_plans;
+    let bootstrap = engine
+        .bootstrap_stream(
+            BootstrapStreamRequest {
+                stream_id: stream.clone(),
+                now_ms: 0,
+            },
+            placement,
+        )
+        .await
+        .expect("bootstrap");
+    assert_eq!(engine.bootstrap_read_plans - plans_before, 1);
+    assert!(bootstrap.up_to_date);
+    assert_eq!(bootstrap.updates.len(), payloads.len());
+    let mut offset = 0u64;
+    for (update, payload) in bootstrap.updates.iter().zip(&payloads) {
+        assert_eq!(&update.payload, payload);
+        assert_eq!(update.start_offset, offset);
+        offset += u64::try_from(payload.len()).expect("len fits u64");
+        assert_eq!(update.next_offset, offset);
+    }
+    assert_eq!(bootstrap.next_offset, offset);
+}
+
 #[tokio::test]
 async fn bootstrap_returns_honest_partial_when_updates_after_snapshot_are_cold() {
     let placement = placement();

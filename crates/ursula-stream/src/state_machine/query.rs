@@ -1,5 +1,6 @@
 //! Read and query paths: heads, attrs, hot/cold accessors, read plans, snapshots, bootstrap.
 
+use super::BOOTSTRAP_MAX_UPDATE_BYTES;
 use super::BucketStreamId;
 use super::COLD_INDEX_PAGE_SPAN_BYTES;
 use super::ColdChunkRef;
@@ -387,6 +388,19 @@ impl StreamStateMachine {
         &self,
         stream_id: &BucketStreamId,
     ) -> Result<StreamBootstrapPlan, StreamResponse> {
+        self.bootstrap_plan_with_cap(stream_id, BOOTSTRAP_MAX_UPDATE_BYTES)
+    }
+
+    /// Plans `/bootstrap` with at most `max_update_bytes` of update messages
+    /// (bounded-stream-state F11). The updates stop at a message boundary;
+    /// a single message larger than the cap is returned whole. A capped plan
+    /// is an honest partial: `next_offset` is the end of the last returned
+    /// message and `up_to_date` is false.
+    pub fn bootstrap_plan_with_cap(
+        &self,
+        stream_id: &BucketStreamId,
+        max_update_bytes: u64,
+    ) -> Result<StreamBootstrapPlan, StreamResponse> {
         let Some(slot) = self.stream_slot(stream_id) else {
             return Err(StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
@@ -415,18 +429,33 @@ impl StreamStateMachine {
                 closed: false,
             });
         }
-        let updates = slot
+        let mut updates = Vec::new();
+        let mut update_bytes = 0u64;
+        let mut capped_at = None;
+        for record in slot
             .message_records
             .iter()
             .filter(|record| record.start_offset >= snapshot_offset)
-            .cloned()
-            .collect::<Vec<_>>();
+        {
+            let len = record.end_offset.saturating_sub(record.start_offset);
+            let next_bytes = update_bytes.saturating_add(len);
+            if !updates.is_empty() && next_bytes > max_update_bytes {
+                capped_at = Some(record.start_offset);
+                break;
+            }
+            update_bytes = next_bytes;
+            updates.push(record.clone());
+        }
+        let (next_offset, up_to_date, closed) = match capped_at {
+            Some(boundary) => (boundary, false, false),
+            None => (stream.tail_offset, true, closed),
+        };
         Ok(StreamBootstrapPlan {
             snapshot,
             updates,
-            next_offset: stream.tail_offset,
+            next_offset,
             content_type: stream.content_type.clone(),
-            up_to_date: true,
+            up_to_date,
             closed,
         })
     }

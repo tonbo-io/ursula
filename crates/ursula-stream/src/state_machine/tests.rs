@@ -1423,6 +1423,49 @@ fn bootstrap_without_cold_flush_returns_every_message() {
     assert!(plan.up_to_date);
 }
 
+/// bounded-stream-state F11: bootstrap updates stop at the response cap on a
+/// message boundary, as an honest partial; a single message larger than the
+/// cap is still returned whole.
+#[test]
+fn bootstrap_caps_updates_at_a_message_boundary() {
+    let mut machine = machine();
+    create_stream(&mut machine, "boot-cap");
+    append_all(&mut machine, "boot-cap", &[b"ab", b"cd", b"ef"]);
+    assert!(matches!(
+        machine.apply(close_cmd(stream("boot-cap"))),
+        StreamResponse::Closed { .. }
+    ));
+
+    let plan = machine
+        .bootstrap_plan_with_cap(&stream("boot-cap"), 5)
+        .expect("bootstrap");
+    assert_eq!(plan.updates, records(&[(0, 2), (2, 4)]));
+    assert_eq!(plan.next_offset, 4);
+    assert!(!plan.up_to_date);
+    assert!(!plan.closed);
+
+    let plan = machine
+        .bootstrap_plan_with_cap(&stream("boot-cap"), 1)
+        .expect("bootstrap");
+    assert_eq!(plan.updates, records(&[(0, 2)]));
+    assert_eq!(plan.next_offset, 2);
+    assert!(!plan.up_to_date);
+
+    let plan = machine
+        .bootstrap_plan_with_cap(&stream("boot-cap"), 6)
+        .expect("bootstrap");
+    assert_eq!(plan.updates, records(&[(0, 2), (2, 4), (4, 6)]));
+    assert_eq!(plan.next_offset, 6);
+    assert!(plan.up_to_date);
+    assert!(plan.closed);
+    assert_eq!(
+        machine
+            .bootstrap_plan(&stream("boot-cap"))
+            .expect("default cap"),
+        plan
+    );
+}
+
 #[test]
 fn bootstrap_reports_closed_only_when_complete() {
     let mut machine = machine();

@@ -28,6 +28,7 @@ pub use feature::MAX_SUPPORTED_FEATURE_LEVEL;
 pub use feature::check_feature_level;
 pub use integrity::StreamIntegritySnapshot;
 pub use model::AppendStreamInput;
+pub use model::BOOTSTRAP_MAX_UPDATE_BYTES;
 pub use model::BucketQuota;
 pub use model::BucketQuotaSnapshot;
 pub use model::BucketUsage;
