@@ -652,8 +652,12 @@ struct Inner {
     /// Set by [`KeyedEngine::shutdown`]: reads answer 503 and no worker
     /// starts.
     closing: AtomicBool,
-    /// Turned true when shutdown cancels the workers still running.
-    cancel: watch::Sender<bool>,
+    /// Set when shutdown cancels the workers still running, with
+    /// `cancelled` signalled. (A `Notify`, not a `watch`: a watch picks
+    /// its wait slot from tokio's thread-local RNG, which simulation
+    /// replays do not reset.)
+    cancel: AtomicBool,
+    cancelled: Notify,
     /// Background workers alive (spawned and not yet finished).
     workers: AtomicUsize,
     /// Signalled when a worker finishes.
@@ -760,7 +764,8 @@ impl KeyedEngine {
                 created: Mutex::new(HashMap::new()),
                 admission,
                 closing: AtomicBool::new(false),
-                cancel: watch::Sender::new(false),
+                cancel: AtomicBool::new(false),
+                cancelled: Notify::new(),
                 workers: AtomicUsize::new(0),
                 worker_done: Notify::new(),
             }),
@@ -813,7 +818,8 @@ impl KeyedEngine {
                 workers = inner.workers.load(Ordering::SeqCst),
                 "keyed workers did not finish within the shutdown grace; cancelling them"
             );
-            inner.cancel.send_replace(true);
+            inner.cancel.store(true, Ordering::SeqCst);
+            inner.cancelled.notify_waiters();
             let _idle = inner.wait_workers(None).await;
         }
     }
@@ -1009,6 +1015,19 @@ impl Inner {
         }
         namespace.mark_checked(started);
         Ok(namespace.published())
+    }
+
+    /// Resolves once shutdown cancels the background workers.
+    async fn wait_cancelled(&self) {
+        loop {
+            let cancelled = self.cancelled.notified();
+            tokio::pin!(cancelled);
+            cancelled.as_mut().enable();
+            if self.cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            cancelled.await;
+        }
     }
 
     /// Waits until no background worker runs, or `until` passes; returns
@@ -1229,13 +1248,12 @@ impl Inner {
         }
         let inner = Arc::clone(self);
         let namespace = Arc::clone(namespace);
-        let mut cancel = self.cancel.subscribe();
         let _worker = rt::spawn(async move {
             let _guard = guard;
             // Biased: a cancellation wins over further work.
             tokio::select! {
                 biased;
-                _cancelled = cancel.wait_for(|cancel| *cancel) => {
+                () = inner.wait_cancelled() => {
                     let mut work = lock(&namespace.work);
                     namespace.set_status(Status::Unavailable(
                         "the keyed indexer is shutting down".to_owned(),
@@ -1878,9 +1896,6 @@ impl Inner {
         work: impl std::future::Future<Output = Result<T, CycleError>>,
     ) -> Result<T, CycleError> {
         let deadline = self.config.work_deadline;
-        if cfg!(madsim) {
-            return work.await;
-        }
         // Biased: completion and the deadline at the same instant resolve
         // the same way on every run (simulation determinism).
         tokio::select! {
