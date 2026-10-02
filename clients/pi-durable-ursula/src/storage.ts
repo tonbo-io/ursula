@@ -54,6 +54,7 @@ import {
 	type KeyedScanOutcome,
 	type KeyedStateTransport,
 	type LogTransport,
+	type ReadRecordsOptions,
 	type ReadRecordsOutcome,
 	TransportError,
 } from "./transport.ts";
@@ -210,8 +211,20 @@ class Backoff {
 
 interface ReplayedRecord {
 	readonly ordinal: number;
-	readonly bytes: Uint8Array;
 	readonly ops: KeyedOp[];
+}
+
+/** Replay page size: bytes once the server reports the keyed-state extension (P7), records before. */
+const replayPageSize = (p7: boolean, timing: Timing): ReadRecordsOptions =>
+	p7 ? { maxBytes: timing.replayPageBytes } : { maxRecords: timing.replayPageRecords };
+
+/** Parse log record `ordinal` as a keyed batch. */
+function parseRecord(bytes: Uint8Array, ordinal: number): KeyedOp[] {
+	try {
+		return parseKeyedBatch(fromUtf8(bytes));
+	} catch (error) {
+		throw new Error(`UrsulaStorage: record ${ordinal} is not a valid keyed batch`, { cause: error });
+	}
 }
 
 /** True when a record carries an owner claim (a put of `m/owner` without `closed_at_ms`). */
@@ -780,11 +793,11 @@ export class UrsulaStorage implements Storage {
 	}
 
 	findDocument(address: DocumentAddress, at: DocumentPoint, _context: Context): Promise<DocumentRecord | undefined> {
-		return this.read((v) => pi.findDocument(v, address, at));
+		return this.read((v) => pi.findDocumentAt(v, address, at));
 	}
 
 	document(id: DocumentId, at: DocumentPoint, _context: Context): Promise<StoredDocument | undefined> {
-		return this.read((v) => pi.document(v, id, at));
+		return this.read((v) => pi.materializeDocument(v, id, at));
 	}
 
 	scanDocuments(query: DocumentQuery, limit: number, cursor: Cursor | undefined, _context: Context): Promise<Page<DocumentRecord, Cursor>> {
@@ -839,7 +852,7 @@ async function readLog(
 	const backoff = new Backoff(clock, timing);
 	for (;;) {
 		const at = next;
-		const size = p7 ? { maxBytes: timing.replayPageBytes } : { maxRecords: timing.replayPageRecords };
+		const size = replayPageSize(p7, timing);
 		const page = await retryIdempotent(
 			clock,
 			timing,
@@ -851,13 +864,7 @@ async function readLog(
 		const start = intHeader(page.headers, H.recordStart) ?? at;
 		if (page.records.length > 0 && start !== at) throw new Error(`UrsulaStorage: log page starts at ${start}, expected ${at}`);
 		for (const recordBytes of page.records) {
-			let ops: KeyedOp[];
-			try {
-				ops = parseKeyedBatch(fromUtf8(recordBytes));
-			} catch (error) {
-				throw new Error(`UrsulaStorage: record ${next} is not a valid keyed batch`, { cause: error });
-			}
-			out.push({ ordinal: next, bytes: recordBytes, ops });
+			out.push({ ordinal: next, ops: parseRecord(recordBytes, next) });
 			bytes += recordBytes.length;
 			next++;
 		}
@@ -1001,20 +1008,19 @@ async function replay(
 	clock: Clock,
 	timing: Timing,
 	deadline: number,
-): Promise<ReplayedRecord[]> {
-	const out: ReplayedRecord[] = [];
+): Promise<void> {
 	for (;;) {
 		const from = store.tail;
 		const page = await retryIdempotent(
 			clock,
 			timing,
 			deadline,
-			() => log.readRecords(from, p7 ? { maxBytes: timing.replayPageBytes } : { maxRecords: timing.replayPageRecords }),
+			() => log.readRecords(from, replayPageSize(p7, timing)),
 			(last) => new Error(`UrsulaStorage open: replay from record ${from} did not succeed before the deadline: ${last}`),
 		);
 		if (page.status !== 200 && page.status !== 204) throw new Error(`UrsulaStorage open: replay from record ${from} failed with ${describe(page)}`);
-		out.push(...applyPage(store, page));
-		if (page.records.length === 0 || page.headers[H.upToDate] === "true") return out;
+		applyPage(store, page);
+		if (page.records.length === 0 || page.headers[H.upToDate] === "true") return;
 	}
 }
 
@@ -1026,14 +1032,9 @@ function applyPage(store: StateStore, page: ReadRecordsOutcome): ReplayedRecord[
 	const out: ReplayedRecord[] = [];
 	for (const bytes of page.records) {
 		const ordinal = store.tail;
-		let ops: KeyedOp[];
-		try {
-			ops = parseKeyedBatch(fromUtf8(bytes));
-		} catch (error) {
-			throw new Error(`UrsulaStorage: record ${ordinal} is not a valid keyed batch`, { cause: error });
-		}
+		const ops = parseRecord(bytes, ordinal);
 		store.apply(ordinal, ops);
-		out.push({ ordinal, bytes, ops });
+		out.push({ ordinal, ops });
 	}
 	return out;
 }
@@ -1090,7 +1091,7 @@ async function claim(
 			clock,
 			timing,
 			deadline,
-			() => log.readRecords(N, { leader: true, ...(p7 ? { maxBytes: timing.replayPageBytes } : { maxRecords: timing.replayPageRecords }) }),
+			() => log.readRecords(N, { leader: true, ...replayPageSize(p7, timing) }),
 			timeout,
 		);
 		if (page.status === 400) continue; // a lagging node (tail < N): retry

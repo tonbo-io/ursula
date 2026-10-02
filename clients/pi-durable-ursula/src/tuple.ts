@@ -109,9 +109,5 @@ export function unb64(text: string): string | undefined {
 	return raw.toString("latin1");
 }
 
-/** Number of octets of a binary string key. */
-export const keyOctets = (key: string): number => key.length;
-
-/** Binary string ↔ bytes. */
-export const binaryToBytes = (s: string): Uint8Array => Uint8Array.from(Buffer.from(s, "latin1"));
-export const bytesToBinary = (b: Uint8Array): string => Buffer.from(b).toString("latin1");
+/** The trailing `u64` ID of a `prefix ‖ u64(id)` key. */
+export const idSuffix = (key: string): number => Number(readU64(key, key.length - 8));
