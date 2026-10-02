@@ -41,7 +41,10 @@ fn tiny_workloads_produce_metrics_and_checks() {
     .expect("w1");
     assert_eq!(w1.metrics["records"], 4000.0);
     assert_eq!(w1.metrics["dense_entries"], 4000.0);
-    assert!(w1.metrics["heap_bytes"] > 0.0, "counting allocator installed");
+    assert!(
+        w1.metrics["heap_bytes"] > 0.0,
+        "counting allocator installed"
+    );
     // The dense index keeps every record today (F1 not built).
     assert!(!check_met(&w1, "f1_dense_entries_eq_unflushed"));
     assert!(!check_met(&w1, "residual_growth_n_to_4n"));
