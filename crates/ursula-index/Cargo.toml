@@ -45,7 +45,6 @@ ursula-observability = { workspace = true }
 ursula-shard = { workspace = true }
 
 [target.'cfg(madsim)'.dependencies]
-madsim = { workspace = true }
 sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [lints]

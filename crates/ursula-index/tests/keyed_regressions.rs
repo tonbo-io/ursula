@@ -76,11 +76,14 @@ impl Clock for TestClock {
     }
 }
 
-/// An in-memory source log that can be made to fail.
+/// An in-memory source log that can be made to fail, or to show only a
+/// prefix of its records (a lagging replica).
 #[derive(Default)]
 struct FakeLog {
     records: Mutex<Vec<String>>,
     failing: AtomicBool,
+    visible: Mutex<Option<usize>>,
+    leader_reads: std::sync::atomic::AtomicU64,
 }
 
 impl SourceClient for FakeLog {
@@ -91,14 +94,22 @@ impl SourceClient for FakeLog {
         record: u64,
         _max_bytes: u64,
         max_records: Option<u64>,
-        _leader: bool,
+        leader: bool,
     ) -> BoxFuture<'a, Result<SourcePage, SourceError>> {
         async move {
             if self.failing.load(Ordering::SeqCst) {
                 return Err(SourceError::Transient("injected source outage".to_owned()));
             }
+            if leader {
+                self.leader_reads.fetch_add(1, Ordering::SeqCst);
+            }
             let records = self.records.lock().unwrap();
-            let next_record = records.len() as u64;
+            let visible = self
+                .visible
+                .lock()
+                .unwrap()
+                .map_or(records.len(), |visible| visible.min(records.len()));
+            let next_record = visible as u64;
             if record > next_record {
                 return Err(SourceError::BeyondTail { next_record });
             }
@@ -479,9 +490,20 @@ async fn a_delete_landing_after_a_competing_publish_never_hits_current() {
 /// Defense in depth: a part of `CURRENT` that disappears anyway (an
 /// operator, a foreign tool) must not leave the namespace answering 503
 /// forever. The read that finds it missing, with `CURRENT` unchanged,
-/// schedules a rebuild from the source log; later reads succeed.
+/// schedules a rebuild from the source log; later reads succeed. With the
+/// footer cache on, the loss surfaces while reading a data page, wrapped in
+/// a Parquet error, and must be recognized all the same.
 #[tokio::test(start_paused = true)]
 async fn a_missing_part_of_current_triggers_a_rebuild() {
+    missing_part_triggers_a_rebuild(0).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_missing_part_behind_a_cached_footer_triggers_a_rebuild() {
+    missing_part_triggers_a_rebuild(KeyedEngineConfig::default().footer_cache_bytes).await;
+}
+
+async fn missing_part_triggers_a_rebuild(footer_cache_bytes: usize) {
     let log = Arc::new(FakeLog::default());
     let clock: Arc<dyn Clock> = Arc::new(TestClock(tokio::time::Instant::now()));
     let raw = MemoryObjectStore::new(Arc::clone(&clock));
@@ -495,7 +517,7 @@ async fn a_missing_part_of_current_triggers_a_rebuild() {
             gc_tick: Duration::from_secs(3_600),
             // Reads go to the store, so a deleted part is noticed.
             write_cache_bytes: 0,
-            footer_cache_bytes: 0,
+            footer_cache_bytes,
             ..KeyedEngineConfig::default()
         },
         Arc::clone(&clock),
@@ -504,6 +526,11 @@ async fn a_missing_part_of_current_triggers_a_rebuild() {
     let KeyedReadOutcome::Rows { through: 4, .. } = read(&engine, 4, Duration::from_secs(5)).await
     else {
         panic!("first publication");
+    };
+    // Served once from the store (this fills the footer cache, if on).
+    let KeyedReadOutcome::Rows { through: 4, .. } = read(&engine, 4, Duration::from_secs(5)).await
+    else {
+        panic!("served from the store");
     };
     let namespace = KeyedNamespace::new(ObjectStore::from(raw.clone()), source());
     let before = namespace.load().await.unwrap().unwrap();
@@ -816,4 +843,84 @@ async fn gc_of_a_lost_cas_never_touches_a_later_publication() {
     let records = log.records.lock().unwrap().clone();
     let state = KeyedState::fold(records.iter().map(String::as_str)).unwrap();
     assert_eq!(page.body(), state.range(&all_rows()).body());
+}
+
+/// A repair rebuild (a part of `CURRENT` is missing) replays from record 0.
+/// When the source it reads ends below the published `D` (a replica that
+/// lags), it must not publish a lower `D`: it keeps answering 503 with the
+/// rebuild pending, reads leader-consistently, and publishes once the
+/// source reaches the old `D`.
+#[tokio::test(start_paused = true)]
+async fn a_repair_rebuild_never_publishes_below_the_old_d() {
+    let log = Arc::new(FakeLog::default());
+    let clock: Arc<dyn Clock> = Arc::new(TestClock(tokio::time::Instant::now()));
+    let raw = MemoryObjectStore::new(Arc::clone(&clock));
+    let engine = KeyedEngine::with_clock(
+        ObjectStore::from(raw.clone()),
+        Arc::clone(&log),
+        None,
+        KeyedEngineConfig {
+            min_publish_interval: Duration::ZERO,
+            gc_grace: GRACE,
+            gc_tick: Duration::from_secs(3_600),
+            write_cache_bytes: 0,
+            footer_cache_bytes: 0,
+            ..KeyedEngineConfig::default()
+        },
+        Arc::clone(&clock),
+    );
+    log.records.lock().unwrap().extend((0..6).map(record));
+    let KeyedReadOutcome::Rows { through: 6, .. } = read(&engine, 6, Duration::from_secs(5)).await
+    else {
+        panic!("first publication");
+    };
+    let namespace = KeyedNamespace::new(ObjectStore::from(raw.clone()), source());
+    let before = namespace.load().await.unwrap().unwrap();
+    let lost = before.manifest.part_keys().next().unwrap().to_owned();
+    namespace.delete(&lost).await.unwrap();
+
+    // The source shows only 3 of the 6 records while the repair runs.
+    *log.visible.lock().unwrap() = Some(3);
+    for _ in 0..10 {
+        let outcome = read(&engine, 6, Duration::from_secs(1)).await;
+        assert!(
+            matches!(outcome, KeyedReadOutcome::Unavailable(_)),
+            "{outcome:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    for (generation, through) in manifests_by_generation(&raw) {
+        assert!(
+            generation <= before.manifest.generation || through >= 6,
+            "the repair published D = {through} below the old D = 6"
+        );
+    }
+    assert_eq!(
+        namespace.load().await.unwrap().unwrap().manifest.generation,
+        before.manifest.generation
+    );
+    assert!(
+        log.leader_reads.load(Ordering::SeqCst) > 0,
+        "repair reads the leader"
+    );
+
+    // The source catches up: the repair publishes at the old D.
+    *log.visible.lock().unwrap() = None;
+    let mut served = None;
+    for _ in 0..50 {
+        if let KeyedReadOutcome::Rows { through: 6, page } =
+            read(&engine, 6, Duration::from_secs(5)).await
+        {
+            served = Some(page);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let page = served.expect("the repaired namespace serves reads");
+    let records = log.records.lock().unwrap().clone();
+    let state = KeyedState::fold(records.iter().map(String::as_str)).unwrap();
+    assert_eq!(page.body(), state.range(&all_rows()).body());
+    let after = namespace.load().await.unwrap().unwrap();
+    assert!(after.manifest.generation > before.manifest.generation);
+    assert_eq!(after.manifest.through_record, 6);
 }

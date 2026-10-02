@@ -62,6 +62,8 @@ pub use object_store::ObjectStore;
 pub use object_store::ObservedStore;
 pub use object_store::S3ObjectStore;
 pub use object_store::S3ObjectStoreConfig;
+#[cfg(madsim)]
+pub use rt::reset_random_for_sim;
 pub use source::SourceBatch;
 pub use source::SourceClient;
 pub use source::SourceRecordRange;

@@ -299,6 +299,26 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Whether `error` is, or wraps (a Parquet read of a data page reports it
+/// as an external error), a missing object.
+fn is_missing_object(error: &IndexError) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = cause {
+        if let Some(index_error) = current.downcast_ref::<IndexError>() {
+            match index_error {
+                IndexError::MissingObject(_) => return true,
+                IndexError::Parquet(parquet::errors::ParquetError::External(inner)) => {
+                    cause = Some(inner.as_ref());
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        cause = current.source();
+    }
+    false
+}
+
 /// blake3 of a record's stored bytes: its message text plus the LF.
 pub(crate) fn stored_digest(text: &str) -> String {
     let mut hasher = blake3::Hasher::new();
@@ -1217,8 +1237,7 @@ impl Inner {
                 }
             }
             Ok(Some(published))
-                if published.manifest.generation == held
-                    && matches!(error, IndexError::MissingObject(_)) =>
+                if published.manifest.generation == held && is_missing_object(&error) =>
             {
                 return self.rebuild_damaged(namespace, &error);
             }
@@ -1488,7 +1507,7 @@ impl Inner {
             // The published state is damaged (a missing part).
             namespace.set_status(Status::Rebuilding);
             return match self
-                .fold(namespace, base.as_ref(), true, target, slot)
+                .fold(namespace, base.as_ref(), true, true, target, slot)
                 .await?
             {
                 Folded::Done => {
@@ -1499,7 +1518,7 @@ impl Inner {
             };
         }
         let Folded::Discontinuity(reason) = self
-            .fold(namespace, base.as_ref(), false, target, slot)
+            .fold(namespace, base.as_ref(), false, false, target, slot)
             .await?
         else {
             return Ok(());
@@ -1546,7 +1565,7 @@ impl Inner {
         );
         namespace.set_status(Status::Rebuilding);
         match self
-            .fold(namespace, base.as_ref(), true, target, slot)
+            .fold(namespace, base.as_ref(), true, false, target, slot)
             .await?
         {
             Folded::Done => Ok(()),
@@ -1556,11 +1575,17 @@ impl Inner {
 
     /// Reads `[D−1, target)` (from 0 for a rebuild or `D = 0`), checks the
     /// continuity record, folds the rest into one run and publishes it.
+    ///
+    /// A `repair` rebuild replaces a damaged publication (a missing part)
+    /// of a source that did not change: it reads leader-consistently and
+    /// never publishes below the old `D`; a source that ends earlier fails
+    /// the attempt transiently (it is retried, 503 meanwhile).
     async fn fold(
         self: &Arc<Self>,
         namespace: &Arc<Namespace>,
         base: Option<&Arc<PublishedKeyedManifest>>,
         rebuild: bool,
+        repair: bool,
         target: u64,
         slot: &Arc<Slot>,
     ) -> Result<Folded, CycleError> {
@@ -1627,7 +1652,7 @@ impl Inner {
                     cursor,
                     self.config.source_page_bytes,
                     None,
-                    false,
+                    repair,
                 )
                 .await
             {
@@ -1678,6 +1703,13 @@ impl Inner {
                     .saturating_add(1);
             }
             cursor = page.next_record;
+        }
+        if repair && builder.next_record() < floor {
+            return Err(CycleError::Transient(format!(
+                "the source ends at record {} below the published D = {floor}; \
+                 the repair waits for it",
+                builder.next_record()
+            )));
         }
         namespace.backlog.store(truncated, Ordering::SeqCst);
         let empty_base =
