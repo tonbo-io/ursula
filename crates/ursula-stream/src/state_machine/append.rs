@@ -875,6 +875,29 @@ impl StreamStateMachine {
         ))
     }
 
+    /// Read-only: whether an append (or append batch) from `producer` would be
+    /// answered as a duplicate without mutating the stream. Lets admission
+    /// control bypass backpressure for idempotent retries without previewing
+    /// the write on a copy of the group (F9).
+    pub fn append_would_deduplicate(
+        &self,
+        stream_id: &BucketStreamId,
+        producer: Option<&ProducerRequest>,
+        now_ms: u64,
+    ) -> bool {
+        if producer.is_none()
+            || self.validate_stream_scope(stream_id).is_err()
+            || validate_producer_request(producer).is_err()
+            || !self.stream_is_live(stream_id, now_ms)
+        {
+            return false;
+        }
+        matches!(
+            self.evaluate_producer(stream_id, producer),
+            Ok(ProducerDecision::Duplicate { .. })
+        )
+    }
+
     fn evaluate_producer(
         &self,
         stream_id: &BucketStreamId,

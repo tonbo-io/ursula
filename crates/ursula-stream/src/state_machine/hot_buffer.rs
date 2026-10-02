@@ -7,6 +7,9 @@ use super::VecDeque;
 #[derive(Debug, Clone, Default)]
 pub(super) struct HotBuffer {
     chunks: VecDeque<HotChunk>,
+    /// Running sum of `chunk.bytes.len()` over `chunks` (F6a), so callers
+    /// never rescan every hot chunk per append.
+    payload_len: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +32,11 @@ impl HotBuffer {
             end_offset,
             bytes: payload,
         });
-        Self { chunks }
+        let payload_len = chunks.iter().map(|chunk| chunk.bytes.len()).sum();
+        Self {
+            chunks,
+            payload_len,
+        }
     }
 
     pub(super) fn from_snapshot(payload: Vec<u8>, segments: &[HotPayloadSegment]) -> Self {
@@ -41,11 +48,16 @@ impl HotBuffer {
                 bytes: payload[segment.payload_start..segment.payload_end].to_vec(),
             });
         }
-        Self { chunks }
+        let payload_len = chunks.iter().map(|chunk| chunk.bytes.len()).sum();
+        Self {
+            chunks,
+            payload_len,
+        }
     }
 
+    /// Hot payload bytes held, in O(1).
     pub(super) fn len(&self) -> usize {
-        self.chunks.iter().map(|chunk| chunk.bytes.len()).sum()
+        self.payload_len
     }
 
     pub(super) fn hot_start_offset(&self) -> u64 {
@@ -94,6 +106,7 @@ impl HotBuffer {
             end_offset,
             bytes: payload.to_vec(),
         });
+        self.payload_len = self.payload_len.saturating_add(payload.len());
     }
 
     pub(super) fn append_checkpoint(&self) -> usize {
@@ -101,7 +114,11 @@ impl HotBuffer {
     }
 
     pub(super) fn rollback_appends(&mut self, checkpoint: usize) {
-        self.chunks.truncate(checkpoint);
+        while self.chunks.len() > checkpoint {
+            if let Some(chunk) = self.chunks.pop_back() {
+                self.payload_len = self.payload_len.saturating_sub(chunk.bytes.len());
+            }
+        }
     }
 
     pub(super) fn plan_cold_flush_from(
@@ -208,19 +225,122 @@ impl HotBuffer {
             .front()
             .is_some_and(|chunk| chunk.end_offset <= end_offset)
         {
-            self.chunks.pop_front();
+            if let Some(chunk) = self.chunks.pop_front() {
+                self.payload_len = self.payload_len.saturating_sub(chunk.bytes.len());
+            }
         }
         if let Some(front) = self.chunks.front_mut()
             && front.start_offset < end_offset
         {
             let drain_len =
                 usize::try_from(end_offset - front.start_offset).expect("drain len fits usize");
+            let drain_len = drain_len.min(front.bytes.len());
             front.bytes.drain(..drain_len);
+            shrink_vec_if_slack(&mut front.bytes);
             front.start_offset = end_offset;
+            self.payload_len = self.payload_len.saturating_sub(drain_len);
         }
+        shrink_deque_if_slack(&mut self.chunks);
     }
 
     pub(super) fn discard_before(&mut self, retained_offset: u64) {
         self.flush_prefix(retained_offset);
+    }
+}
+
+/// F7 capacity rule: after removing elements, a container whose capacity
+/// exceeds `2 * len + 64` shrinks to `2 * len`.
+pub(crate) fn capacity_has_slack(len: usize, capacity: usize) -> bool {
+    capacity > len.saturating_mul(2).saturating_add(64)
+}
+
+pub(crate) fn shrink_vec_if_slack<T>(values: &mut Vec<T>) {
+    if capacity_has_slack(values.len(), values.capacity()) {
+        values.shrink_to(values.len().saturating_mul(2));
+    }
+}
+
+pub(crate) fn shrink_deque_if_slack<T>(values: &mut VecDeque<T>) {
+    if capacity_has_slack(values.len(), values.capacity()) {
+        values.shrink_to(values.len().saturating_mul(2));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filled(appends: u64, bytes: usize) -> HotBuffer {
+        let mut hot = HotBuffer::default();
+        let payload = vec![7u8; bytes];
+        let width = u64::try_from(bytes).unwrap();
+        for index in 0..appends {
+            hot.push(index * width, (index + 1) * width, &payload);
+        }
+        hot
+    }
+
+    fn scanned_len(hot: &HotBuffer) -> usize {
+        hot.chunks.iter().map(|chunk| chunk.bytes.len()).sum()
+    }
+
+    #[test]
+    fn payload_len_counter_tracks_push_flush_discard_and_rollback() {
+        let mut hot = filled(10, 3);
+        assert_eq!(hot.len(), 30);
+        let checkpoint = hot.append_checkpoint();
+        hot.push(30, 35, b"abcde");
+        hot.push(35, 36, b"f");
+        assert_eq!(hot.len(), 36);
+        hot.rollback_appends(checkpoint);
+        assert_eq!(hot.len(), 30);
+        assert_eq!(scanned_len(&hot), 30);
+        // Flush ends inside a chunk: partial drain of the front chunk.
+        hot.flush_prefix(7);
+        assert_eq!(hot.len(), 23);
+        assert_eq!(scanned_len(&hot), 23);
+        hot.discard_before(15);
+        assert_eq!(hot.len(), 15);
+        assert_eq!(scanned_len(&hot), 15);
+        hot.flush_prefix(u64::MAX);
+        assert_eq!(hot.len(), 0);
+        assert_eq!(hot.hot_segments().len(), 0);
+    }
+
+    #[test]
+    fn payload_len_counter_restores_from_snapshot_and_payload() {
+        let hot = filled(4, 5);
+        let restored = HotBuffer::from_snapshot(hot.payload(), &hot.hot_segments());
+        assert_eq!(restored.len(), 20);
+        assert_eq!(HotBuffer::from_payload(9, vec![1, 2, 3]).len(), 3);
+        assert_eq!(HotBuffer::from_payload(9, Vec::new()).len(), 0);
+    }
+
+    #[test]
+    fn flush_prefix_shrinks_chunk_deque_capacity() {
+        // Measured before F7: a full flush window left the deque at its peak
+        // capacity (2.6 MB after one window).
+        let mut hot = filled(100_000, 1);
+        assert!(hot.chunks.capacity() >= 100_000);
+        hot.flush_prefix(99_990);
+        assert_eq!(hot.chunks.len(), 10);
+        assert!(
+            hot.chunks.capacity() <= 2 * hot.chunks.len() + 64,
+            "deque capacity {} not shrunk",
+            hot.chunks.capacity()
+        );
+        hot.flush_prefix(100_000);
+        assert!(hot.chunks.capacity() <= 64);
+    }
+
+    #[test]
+    fn partial_flush_shrinks_front_chunk_bytes() {
+        let mut hot = HotBuffer::default();
+        hot.push(0, 1 << 20, &vec![1u8; 1 << 20]);
+        hot.flush_prefix((1 << 20) - 10);
+        let front = hot.chunks.front().unwrap();
+        assert_eq!(front.bytes.len(), 10);
+        assert!(front.bytes.capacity() <= 2 * 10 + 64);
+        assert_eq!(hot.len(), 10);
     }
 }

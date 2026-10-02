@@ -245,6 +245,7 @@ impl StreamStateMachine {
             retained_offset: 0,
             visible_snapshot: None,
             producers: producer_states,
+            append_count: 0,
         };
         if self.insert_stream_slot(slot).is_none() {
             return StreamResponse::error(
@@ -417,6 +418,7 @@ impl StreamStateMachine {
             retained_offset: 0,
             visible_snapshot: None,
             producers: producer_states,
+            append_count: 0,
         };
         if self.insert_stream_slot(slot).is_none() {
             return StreamResponse::error(

@@ -160,6 +160,49 @@ impl StreamStateMachine {
         Ok(u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64"))
     }
 
+    /// Whether the stream exists and has not expired at `now_ms`.
+    pub fn stream_is_live(&self, stream_id: &BucketStreamId, now_ms: u64) -> bool {
+        self.stream_metadata(stream_id)
+            .is_some_and(|metadata| !super::stream_is_expired(metadata, now_ms))
+    }
+
+    /// Runtime append count of the stream's current incarnation (0 when the
+    /// stream does not exist).
+    pub fn stream_append_count(&self, stream_id: &BucketStreamId) -> u64 {
+        self.stream_slot(stream_id)
+            .map_or(0, |slot| slot.append_count)
+    }
+
+    /// Adds `appends` to the stream's runtime append count and returns the new
+    /// value, or `None` when the stream does not exist.
+    pub fn add_stream_append_count(
+        &mut self,
+        stream_id: &BucketStreamId,
+        appends: u64,
+    ) -> Option<u64> {
+        let slot = self.stream_slot_mut(stream_id)?;
+        slot.append_count = slot.append_count.saturating_add(appends);
+        Some(slot.append_count)
+    }
+
+    /// Overwrites the stream's runtime append count (snapshot install and
+    /// engine-level rollback). Returns `false` when the stream does not exist.
+    pub fn set_stream_append_count(&mut self, stream_id: &BucketStreamId, count: u64) -> bool {
+        let Some(slot) = self.stream_slot_mut(stream_id) else {
+            return false;
+        };
+        slot.append_count = count;
+        true
+    }
+
+    /// Non-zero runtime append counts of live streams, in arbitrary order.
+    pub fn stream_append_counts(&self) -> impl Iterator<Item = (&BucketStreamId, u64)> {
+        self.registry
+            .slots()
+            .filter(|slot| slot.append_count > 0)
+            .map(|slot| (&slot.metadata.stream_id, slot.append_count))
+    }
+
     pub fn total_hot_payload_bytes(&self) -> u64 {
         self.hot_payload_bytes
     }
