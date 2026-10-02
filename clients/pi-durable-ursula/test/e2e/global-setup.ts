@@ -76,6 +76,7 @@ export default async function setup(project: TestProject): Promise<() => Promise
 	project.provide("stackInfo", JSON.stringify(info));
 	return async () => {
 		control.close();
+		control.closeAllConnections();
 		await stack.stop();
 	};
 }

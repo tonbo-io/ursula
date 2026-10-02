@@ -75,6 +75,17 @@ const ACCESS_ENV = (s3: S3Server): NodeJS.ProcessEnv => ({
 
 let stackCounter = 0;
 
+/** Awaits `work` for at most `ms`, reporting (not failing) a step that overruns. */
+async function bounded(what: string, work: Promise<unknown> | undefined, ms = 20_000): Promise<void> {
+	let timer: NodeJS.Timeout | undefined;
+	const late = new Promise<"late">((r) => {
+		timer = setTimeout(() => r("late"), ms);
+	});
+	const outcome = await Promise.race([Promise.resolve(work).then(() => "done" as const), late]);
+	clearTimeout(timer);
+	if (outcome === "late") console.error(`[stack] ${what} did not finish within ${ms} ms; continuing`);
+}
+
 export class Stack {
 	readonly dir: string;
 	readonly options: StackOptions;
@@ -399,12 +410,13 @@ export class Stack {
 	}
 
 	async stop(): Promise<void> {
-		await Promise.all(this.extraProcs.map((proc) => proc.stop()));
-		await this.gateway?.stop();
-		await Promise.all(this.nodes.map((node) => node.proc?.stop()));
-		await this.indexerProxy?.close();
-		await this.s3Proxy?.close();
-		await this.s3?.stop();
+		// Each step is bounded, and a slow one is reported, so a teardown can never hang a run.
+		await bounded("stop indexers", Promise.all(this.extraProcs.map((proc) => proc.stop())));
+		await bounded("stop gateway", this.gateway?.stop());
+		await bounded("stop nodes", Promise.all(this.nodes.map((node) => node.proc?.stop())));
+		await bounded("close indexer proxy", this.indexerProxy?.close());
+		await bounded("close S3 proxy", this.s3Proxy?.close());
+		await bounded("stop S3", this.s3?.stop());
 		if (process.env.KEEP_STACK !== "1" && this.options.dir === undefined) rmSync(this.dir, { recursive: true, force: true });
 	}
 }

@@ -183,6 +183,7 @@ jobs:
       # The whole e2e suite plus the S3 lifecycle checks (stream-delete GC and bucket purge remove
       # the indexer's namespaces) on one S3-backed node.
       - name: e2e on S3, single node
+        timeout-minutes: 15
         run: |
           cd clients/pi-durable-ursula
           npm ci
@@ -191,6 +192,7 @@ jobs:
       # The same suite through the gateway of a 3-node cluster, plus keyed-state on followers, an
       # owner on a follower node (307 to the leader) and a takeover across nodes.
       - name: e2e on S3, 3 nodes + gateway
+        timeout-minutes: 15
         run: |
           cd clients/pi-durable-ursula
           E2E_NODES=3 E2E_S3=1 URSULA_BIN="$GITHUB_WORKSPACE/target/release/ursula" npm run test:e2e
@@ -236,6 +238,7 @@ jobs:
         run: cargo build --release -p ursula --bin ursula
 
       - name: Drills
+        timeout-minutes: 45
         run: |
           cd clients/pi-durable-ursula
           npm ci

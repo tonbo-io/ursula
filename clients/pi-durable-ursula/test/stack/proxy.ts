@@ -81,6 +81,7 @@ export class FaultProxy {
 
 	async close(): Promise<void> {
 		this.down();
-		await new Promise((r) => this.server.close(r));
+		this.server.close();
+		this.server.unref();
 	}
 }
