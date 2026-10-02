@@ -43,14 +43,14 @@ it.runIf(s3Available())("restore: keyed-state 503 until the continuity rebuild, 
 	f.start();
 	await untilEveryOwnerCommits(f, 10, 120_000);
 
-	// Backup: export every group.
+	// Backup: export every group. The tails read first are a lower bound of what the export holds.
+	const backupTails = await Promise.all(f.owners.map((owner) => recordTail(s.url, owner.stream)));
 	const backup: Uint8Array[] = [];
 	for (let group = 0; group < s.groupCount; group++) {
 		const r = await fetch(`${node.adminUrl}/__ursula/backup/group/${group}`);
 		if (!r.ok) throw new Error(`export group ${group}: ${r.status} ${await r.text()}`);
 		backup.push(new Uint8Array(await r.arrayBuffer()));
 	}
-	const backupTails = await Promise.all(f.owners.map((owner) => recordTail(s.url, owner.stream)));
 	// The projection moves well past the backup.
 	await until(
 		"E beyond the backup",
