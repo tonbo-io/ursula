@@ -211,6 +211,7 @@ pub use snapshot_store::S3SnapshotStore;
 pub use snapshot_store::SharedSnapshotStore;
 pub use snapshot_store::SnapshotBytesIterator;
 pub use snapshot_store::SnapshotCompression;
+pub use snapshot_store::SnapshotEnvelope;
 pub use snapshot_store::SnapshotKey;
 pub use snapshot_store::SnapshotLocation;
 pub use snapshot_store::SnapshotPointer;
