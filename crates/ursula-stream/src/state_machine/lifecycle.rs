@@ -656,6 +656,23 @@ impl StreamStateMachine {
                 }
             }
         }
+        // A keyed stream's projection namespaces live outside its cold
+        // objects and may exist even when it never flushed. Enqueue the
+        // removed incarnation's prefix; a recreated stream has a new
+        // incarnation (C7), so its namespace is never swept (U22).
+        if self.incarnation_scoped_cold_objects()
+            && ursula_shard::is_keyed_batch_content_type(&slot.metadata.content_type)
+        {
+            self.cold_gc.enqueue(
+                stream_id.bucket_id.clone(),
+                ColdGcTarget::Paths(vec![
+                    ursula_shard::keyed_namespace::keyed_incarnation_prefix(
+                        stream_id,
+                        slot.metadata.created_at_ms,
+                    ),
+                ]),
+            );
+        }
         self.release_shared_cold_objects(&stream_id.bucket_id, shared_paths, 0);
         true
     }

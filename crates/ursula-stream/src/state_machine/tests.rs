@@ -4977,3 +4977,85 @@ fn d1_read_plan_keeps_hot_bytes_between_cold_ranges() {
     assert_eq!(shape, vec![("cold", 0), ("hot", 0), ("cold", 7)]);
     StreamStateMachine::restore(machine.snapshot()).expect("restore with a hot gap");
 }
+
+#[test]
+fn u22_keyed_stream_delete_enqueues_its_incarnation_namespace_prefix() {
+    const KEYED: &str = "application/json; profile=keyed-batch-v1";
+    let mut machine = machine();
+    machine.apply(set_feature_level_cmd(crate::FEATURE_LEVEL_KEYED_STREAMS));
+    let keyed = Create {
+        content_type: KEYED,
+        ..Create::default()
+    };
+    assert!(matches!(
+        machine.apply(create_cmd(stream("harness"), keyed.clone())),
+        StreamResponse::Created { .. }
+    ));
+    // A plain JSON stream is not keyed and has no projection namespace.
+    assert!(matches!(
+        machine.apply(create_cmd(stream("plain"), Create {
+            content_type: "application/json",
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+    let first = created_at_ms(&machine, "harness");
+    assert_eq!(
+        machine.apply(delete_cmd(stream("plain"))),
+        StreamResponse::Deleted
+    );
+    assert_eq!(
+        machine.apply(delete_cmd(stream("harness"))),
+        StreamResponse::Deleted
+    );
+    assert!(matches!(
+        machine.apply(create_cmd(stream("harness"), keyed)),
+        StreamResponse::Created { .. }
+    ));
+    let second = created_at_ms(&machine, "harness");
+    assert_ne!(first, second);
+
+    // The stream had no cold objects, so the namespace prefix is the only
+    // entry, and it names the deleted incarnation, never the recreated one.
+    let entries = machine.pending_cold_gc_batch(8);
+    let expected =
+        ursula_shard::keyed_namespace::keyed_incarnation_prefix(&stream("harness"), first);
+    assert_eq!(expected, format!(".keyed/benchcmp/harness/{first:016x}/"));
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].bucket_id, "benchcmp");
+    assert_eq!(entries[0].target, ColdGcTarget::Paths(vec![expected]));
+}
+
+#[test]
+fn u22_keyed_stream_purge_enqueues_each_namespace_prefix() {
+    const KEYED: &str = "application/json; profile=keyed-batch-v1";
+    let mut machine = machine();
+    machine.apply(set_feature_level_cmd(crate::FEATURE_LEVEL_KEYED_STREAMS));
+    let affinity = BucketStreamId::with_affinity("benchcmp", "run", "log");
+    assert!(matches!(
+        machine.apply(create_cmd(affinity.clone(), Create {
+            content_type: KEYED,
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+    assert!(matches!(
+        machine.apply(StreamCommand::PurgeBucket {
+            bucket_id: "benchcmp".to_owned(),
+        }),
+        StreamResponse::BucketPurged {
+            removed_streams: 1,
+            pending_cold_gc_entries: 1,
+            ..
+        }
+    ));
+    let entries = machine.pending_cold_gc_batch(8);
+    let ColdGcTarget::Paths(paths) = &entries[0].target else {
+        panic!("expected a path entry: {entries:?}");
+    };
+    assert_eq!(paths.len(), 1);
+    assert!(
+        paths[0].starts_with(".keyed/benchcmp/run%2Flog/"),
+        "{paths:?}"
+    );
+}

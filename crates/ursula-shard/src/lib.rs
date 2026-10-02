@@ -4,6 +4,9 @@
 //!
 //! - [`content_type`]: content-type normalization and JSON profile detection
 //!   (`keyed-batch-v1` activation), shared by node, gateway and indexer.
+//! - [`keyed_namespace`]: object-store layout of keyed-state projection
+//!   namespaces (`.keyed/{bucket}/{key}/{incarnation:016x}/`), shared by
+//!   node lifecycle (stream-delete GC, bucket purge) and the indexer.
 //! - crate root: shard and Raft group identifiers, [`BucketStreamId`],
 //!   reserved affinity stream IDs and the static shard map.
 
@@ -13,6 +16,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 pub mod content_type;
+pub mod keyed_namespace;
 
 pub use content_type::KEYED_BATCH_CONTENT_TYPE;
 pub use content_type::KEYED_BATCH_PROFILE;

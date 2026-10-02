@@ -37,6 +37,13 @@ impl UrsulaConfig {
                 "raft.node_id is required (use --node-id CLI flag)".into(),
             ));
         }
+        for url in &self.keyed_state.indexer_urls {
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return Err(ValidationError::Other(format!(
+                    "keyed_state.indexer_urls entry '{url}' must be an http:// or https:// base URL"
+                )));
+            }
+        }
         if self.raft.wal.backend == WalBackend::Disk && self.raft.wal.path.is_none() {
             return Err(ValidationError::RaftWalPathRequired);
         }

@@ -251,12 +251,25 @@ fn parse_params(raw_query: Option<&str>) -> Result<KeyedStateParams, String> {
 /// Handler for every method on both forms of `{stream_url}/keyed-state`.
 /// Routed with `any` so `HEAD` is never answered by running the GET (and its
 /// wait); only `GET` is defined (P3.1).
+/// Every response is counted in the keyed-state request metrics (U24).
 pub(crate) async fn keyed_state(
     State(state): State<HttpState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
     Path(path): Path<StreamPath>,
     RawQuery(raw_query): RawQuery,
+) -> Response {
+    let response = serve(&state, method, uri, path, raw_query).await;
+    state.keyed_state_metrics.record(response.status());
+    response
+}
+
+async fn serve(
+    state: &HttpState,
+    method: Method,
+    uri: axum::http::Uri,
+    path: StreamPath,
+    raw_query: Option<String>,
 ) -> Response {
     let Some(upstream) = state.keyed_state_upstream.clone() else {
         return not_served();

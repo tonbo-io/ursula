@@ -203,8 +203,18 @@ async fn init_state(
         ursula_config::WalBackend::Memory => "memory",
         ursula_config::WalBackend::Disk => "disk",
     };
+    // Bucket purge drains `keyed_state.indexer_urls`; with none listed, the
+    // keyed-state upstream is the one indexer to drain (a single pod, or a
+    // deployment that has not listed its pods yet).
+    let mut keyed_state_config = config.keyed_state.clone();
+    if keyed_state_config.indexer_urls.is_empty()
+        && let Some(upstream) = &config.server.keyed_state_upstream
+    {
+        keyed_state_config.indexer_urls.push(upstream.clone());
+    }
     let mut state = state
         .with_runtime_config(&config.runtime)
+        .with_keyed_state_config(&keyed_state_config)
         .with_wal_backend(wal_backend);
     if let Some(upstream) = &config.server.keyed_state_upstream {
         let upstream = crate::keyed_state::KeyedStateUpstream::new(upstream)

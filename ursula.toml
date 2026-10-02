@@ -299,3 +299,12 @@ backend = "inline"
 # Enable tokio-console integration (requires building with tokio_unstable).
 # Can also be enabled by setting URSULA_TOKIO_CONSOLE=1.
 tokio_console = false
+
+# ------------------------------------------------------------------------------
+# [keyed_state]  — Keyed-state projection (keyed-streams)
+# ------------------------------------------------------------------------------
+[keyed_state]
+# Base URL of every keyed-state indexer pod. Bucket purge drains each one
+# (POST {url}/v1/keyed/drain) before erasing .keyed/{bucket}/.
+indexer_urls = []
+drain_timeout = "60s"

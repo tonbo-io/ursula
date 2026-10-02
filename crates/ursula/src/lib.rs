@@ -7,6 +7,9 @@
 //!   minification of `application/json` write bodies.
 //! - [`keyed_state`]: `{stream_url}/keyed-state` (keyed-streams P3): parameter
 //!   validation, stream resolution and forwarding to the indexer's `/v1/keyed`.
+//! - `keyed_lifecycle`: keyed-state lifecycle on the node: the bucket-purge
+//!   drain fan-out to keyed-state indexers (U23) and keyed-state request
+//!   counters (U24).
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
 //! - [`bootstrap`]: typed-config `spawn_*_runtime` constructors and cold-flush worker.
 //! - [`server`]: command arguments and the long-running server service entrypoint.
@@ -14,6 +17,7 @@
 mod bootstrap;
 pub mod json_text;
 pub mod keyed_state;
+mod keyed_lifecycle;
 mod otel_metrics;
 pub mod server;
 mod http_time {
@@ -358,6 +362,10 @@ pub struct HttpState {
     /// (`{stream_url}/keyed-state` answers 404 and nothing advertises
     /// `keyed-state-v1`).
     keyed_state_upstream: Option<Arc<keyed_state::KeyedStateUpstream>>,
+    /// Bucket-purge drain fan-out to the keyed-state indexer pods (U23).
+    keyed_drain: keyed_lifecycle::KeyedStateDrain,
+    /// Keyed-state responses by status (U24).
+    keyed_state_metrics: Arc<keyed_lifecycle::KeyedStateRequestMetrics>,
 }
 
 impl HttpState {
@@ -381,6 +389,8 @@ impl HttpState {
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
             keyed_state_upstream: None,
+            keyed_drain: keyed_lifecycle::KeyedStateDrain::default(),
+            keyed_state_metrics: Arc::default(),
         }
     }
 
@@ -401,6 +411,8 @@ impl HttpState {
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
             keyed_state_upstream: None,
+            keyed_drain: keyed_lifecycle::KeyedStateDrain::default(),
+            keyed_state_metrics: Arc::default(),
         }
     }
 
@@ -442,6 +454,8 @@ impl HttpState {
             wal_backend: "memory",
             wal_disk: WalDiskMonitor::default(),
             keyed_state_upstream: None,
+            keyed_drain: keyed_lifecycle::KeyedStateDrain::default(),
+            keyed_state_metrics: Arc::default(),
         }
     }
 
@@ -509,6 +523,12 @@ impl HttpState {
             self.external_payload_min_bytes = usize::try_from(min_size.as_bytes())
                 .expect("config validation ensures payload size fits usize");
         }
+        self
+    }
+
+    /// Apply the keyed-state settings: the indexer pods bucket purge drains.
+    pub fn with_keyed_state_config(mut self, config: &ursula_config::KeyedStateConfig) -> Self {
+        self.keyed_drain = keyed_lifecycle::KeyedStateDrain::from_config(config);
         self
     }
 
@@ -1593,8 +1613,10 @@ pub(crate) fn append_http_response(response: AppendResponse) -> Response {
 }
 
 /// Administrator-triggered tenant offboarding (#150): purges the bucket from
-/// every Raft group, then runs one cold-GC pass so the enqueued cold-object
-/// prefixes are reclaimed before the report returns. Idempotent — purging an
+/// every Raft group, drains every keyed-state indexer pod (U23), then runs
+/// one cold-GC pass so the enqueued cold-object prefixes are reclaimed
+/// before the report returns, and finally erases and proves empty both
+/// `{bucket}/` and `.keyed/{bucket}/`. Idempotent — purging an
 /// absent bucket returns the same report shape with zero counts, and a
 /// crashed purge converges on re-run because cold reclamation is
 /// list-then-delete over object prefixes.
@@ -1631,6 +1653,9 @@ pub(crate) async fn purge_bucket(
             "cold_gc_complete": false,
             "cold_gc_error": null,
             "bucket_prefix_absent": false,
+            "keyed_drain_complete": false,
+            "keyed_drain_error": null,
+            "keyed_prefix_absent": false,
             "legacy_shared_chunks_pending": legacy.pending_chunks,
         }))
         .into_response();
@@ -1642,6 +1667,33 @@ pub(crate) async fn purge_bucket(
             return runtime_error_or_leader_redirect_async(&state, err, &target).await;
         }
     };
+    // After the tombstone, nodes answer 404 for the bucket's streams, so no
+    // new keyed-state work arrives. Every indexer pod must still block new
+    // work for the bucket and finish its in-flight ingestion before
+    // `.keyed/{bucket}/` is erased, or a late publish could recreate objects
+    // below the proven-empty prefix (keyed-streams U23). Without every
+    // acknowledgement the purge stays incomplete and is retried.
+    if let Err(err) = state.keyed_drain.drain_bucket(&bucket).await {
+        tracing::warn!(
+            bucket = %bucket,
+            error = %err,
+            "keyed-state indexer drain failed; bucket erasure deferred"
+        );
+        return axum::Json(serde_json::json!({
+            "bucket": bucket,
+            "removed_streams": report.removed_streams,
+            "groups_with_streams": report.groups_with_streams,
+            "cold_gc_entries_reclaimed": 0,
+            "cold_gc_pending_entries": report.pending_cold_gc_entries,
+            "cold_gc_complete": false,
+            "cold_gc_error": null,
+            "bucket_prefix_absent": false,
+            "keyed_drain_complete": false,
+            "keyed_drain_error": err,
+            "keyed_prefix_absent": false,
+        }))
+        .into_response();
+    }
     // Reclaim the just-enqueued cold prefixes now instead of waiting for the
     // background worker's next pass. Failures leave entries queued for the
     // worker; the purge itself is already durable.
@@ -1697,6 +1749,12 @@ pub(crate) async fn purge_bucket(
         "cold_gc_complete": cold_gc_complete,
         "cold_gc_error": cold_gc_error,
         "bucket_prefix_absent": bucket_prefix_absent,
+        "keyed_drain_complete": true,
+        "keyed_drain_error": null,
+        "keyed_indexers_drained": state.keyed_drain.indexer_count(),
+        // `erase_bucket_cold_prefix_and_prove` erases and proves
+        // `{bucket}/` and `.keyed/{bucket}/` together.
+        "keyed_prefix_absent": bucket_prefix_absent,
     }))
     .into_response()
 }
@@ -1991,6 +2049,11 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
     let group_state_gauges = group_state_gauges_json(&state).await;
     if let Some(object) = body.as_object_mut() {
         object.insert("group_state_gauges".to_owned(), group_state_gauges);
+        object.insert(
+            "keyed_state_requests".to_owned(),
+            serde_json::to_value(state.keyed_state_metrics.snapshot())
+                .unwrap_or(serde_json::Value::Null),
+        );
         object.insert("process_rss_bytes".to_owned(), serde_json::json!(rss));
         object.insert(
             "node_memory_abort_cap_bytes".to_owned(),
@@ -4688,3 +4751,4 @@ mod staging_cleanup_tests;
 
 #[cfg(test)]
 mod keyed_state_tests;
+mod keyed_lifecycle_tests;
