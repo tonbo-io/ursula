@@ -119,9 +119,13 @@ export default async function setup(project: TestProject): Promise<() => Promise
 	const dir = mkdtempSync(join(tmpdir(), "pi-durable-ursula-e2e-"));
 	const config = join(dir, "ursula.toml");
 	const indexerUrl = `http://127.0.0.1:${indexerPort}`;
+	// The node has no cold tier, so a group's hot bytes only grow; the benchmarks' 100k-record logs
+	// need more than the default 64 MiB admission cap (E2E_MAX_HOT_PER_GROUP, e.g. "1GiB").
+	const hotCap = process.env.E2E_MAX_HOT_PER_GROUP;
+	const storage = hotCap === undefined ? "" : `\n[storage.cold]\nmax_hot_size_per_group = "${hotCap}"\n`;
 	writeFileSync(
 		config,
-		`[server]\nlisten = "127.0.0.1:${port}"\nadmin_listen = "127.0.0.1:${adminPort}"\nkeyed_state_upstream = "${indexerUrl}"\n\n[raft]\nnode_id = 1\n\n[raft.wal]\nbackend = "memory"\n`,
+		`[server]\nlisten = "127.0.0.1:${port}"\nadmin_listen = "127.0.0.1:${adminPort}"\nkeyed_state_upstream = "${indexerUrl}"\n\n[raft]\nnode_id = 1\n\n[raft.wal]\nbackend = "memory"\n${storage}`,
 	);
 	const url = `http://127.0.0.1:${port}`;
 	const objects = join(dir, "objects");

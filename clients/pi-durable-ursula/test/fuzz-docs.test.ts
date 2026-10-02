@@ -5,7 +5,7 @@
 import { type DocumentRecord, MemoryStorage, type Storage, type StorageWrite } from "@earendil-works/pi-durable";
 import { expect, it } from "vitest";
 import { ctx, freshPath, openOn } from "./helpers.ts";
-import { type OwnerVariant, reopen, rng, trials, VARIANTS } from "./fuzz-util.ts";
+import { type OwnerVariant, reopen, rng, trials, VARIANTS, variantOptions } from "./fuzz-util.ts";
 
 type Scope = DocumentRecord["scope"];
 const SCOPES: { scope: Scope; history?: "latest" | "rewindable"; fork?: string }[] = [
@@ -25,7 +25,8 @@ async function runSeed(seed: number, rounds: number, variant: OwnerVariant): Pro
 		const fake = variant.fake();
 		const path = freshPath();
 		const memory = new MemoryStorage();
-		let ursula = await openOn(fake, path, variant.options);
+		const options = variantOptions(variant);
+		let ursula = await openOn(fake, path, options);
 		const seqPairs: [number, number][] = [];
 		const setup: StorageWrite[] = [
 			{ type: "conversation", value: { id: 1 } as never },
@@ -93,7 +94,7 @@ async function runSeed(seed: number, rounds: number, variant: OwnerVariant): Pro
 				break;
 			}
 			if (ms !== undefined && us !== undefined) seqPairs.push([ms, us]);
-			if (rnd() < 0.3) ursula = await reopen(fake, path, ursula, rnd() < 0.5, variant.options);
+			if (rnd() < 0.3) ursula = await reopen(fake, path, ursula, rnd() < 0.5, options);
 			const toMem = (u: number) => seqPairs.find(([, x]) => x === u)?.[0] ?? `?${u}`;
 			const fixRec = (r: DocumentRecord | undefined) =>
 				r === undefined ? r : { ...r, createdAt: toMem(r.createdAt), ...(r.retiredAt !== undefined ? { retiredAt: toMem(r.retiredAt) } : {}) };

@@ -92,6 +92,9 @@ interface CaseStats {
 	commitWaits: number;
 	evicted: number;
 	merged: number;
+	shrunk: number;
+	coalesced: number;
+	large: number;
 }
 
 /** One case: a world, a store opened at a random base, and a random schedule. Returns a divergence or undefined. */
@@ -117,6 +120,8 @@ async function runCase(seed: number, stats: CaseStats): Promise<string | undefin
 		cacheBudgetBytes: r.chance(0.3) ? 300 + r.int(600) : 1 << 20,
 		backoff: () => Promise.resolve(),
 		maxRetries: 1000,
+		// Values like `{"v":123}` count as large, so §7.5's large-values-first path runs often.
+		largeValueBytes: 8,
 		commitInFlight: () =>
 			inflight === undefined ? undefined : new Promise<void>((resolve) => (inflight as { waiters: (() => void)[] }).waiters.push(resolve)),
 	});
@@ -221,12 +226,15 @@ async function runCase(seed: number, stats: CaseStats): Promise<string | undefin
 	stats.commitWaits += store.metrics.commitWaits;
 	stats.evicted += store.metrics.rangesEvicted;
 	stats.merged += store.metrics.pagesMerged;
+	stats.shrunk += store.metrics.rangesShrunk;
+	stats.coalesced += store.metrics.rangesCoalesced;
+	stats.large += store.metrics.largeValuesEvicted;
 	store.close();
 	return failures[0];
 }
 
 it(`M0e: overlay/cache equals state(tail) on every covered range over ${CASES} cases`, async () => {
-	const stats: CaseStats = { reads: 0, fetches: 0, stale: 0, commitWaits: 0, evicted: 0, merged: 0 };
+	const stats: CaseStats = { reads: 0, fetches: 0, stale: 0, commitWaits: 0, evicted: 0, merged: 0, shrunk: 0, coalesced: 0, large: 0 };
 	const failures: string[] = [];
 	for (let seed = 1; seed <= CASES && failures.length === 0; seed++) {
 		const f = await runCase(seed, stats);
@@ -236,8 +244,10 @@ it(`M0e: overlay/cache equals state(tail) on every covered range over ${CASES} c
 	expect(stats.reads).toBeGreaterThan(CASES);
 	expect(stats.fetches).toBeGreaterThan(CASES);
 	// Every §3.5 step-3 branch was exercised: stale pages (D_resp < E), pages ahead of the tail
-	// while a commit was in flight, merges, and evictions.
+	// while a commit was in flight, merges, and evictions; and every §7.5 eviction refinement:
+	// large values first, cold-end shrinking, and coalescing of adjacent unpinned ranges.
 	expect(Math.min(stats.stale, stats.commitWaits, stats.evicted, stats.merged)).toBeGreaterThan(CASES / 100);
+	expect(Math.min(stats.shrunk, stats.coalesced, stats.large)).toBeGreaterThan(CASES / 100);
 });
 
 it("a page reflecting records above tail with no commit in flight poisons with FencedError", async () => {

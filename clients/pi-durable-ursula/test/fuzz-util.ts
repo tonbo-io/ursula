@@ -2,13 +2,14 @@ import type { Storage } from "@earendil-works/pi-durable";
 import { FakeUrsula } from "../src/fake/index.ts";
 import type { UrsulaStorage, UrsulaStorageOptions } from "../src/storage.ts";
 import { BOUNDED_TIMING, fakeFor } from "./bounded-helpers.ts";
-import { ctx, openOn } from "./helpers.ts";
+import { ctx, openOn, virtualClock } from "./helpers.ts";
 
 /** Which owner a fuzz seed runs against. */
 export interface OwnerVariant {
 	readonly name: string;
 	readonly fake: () => FakeUrsula;
-	readonly options: Partial<UrsulaStorageOptions>;
+	/** Owner options, or a factory called once per trial (fresh state such as a virtual clock). */
+	readonly options: Partial<UrsulaStorageOptions> | (() => Partial<UrsulaStorageOptions>);
 	/** Fraction of the configured trials this variant runs. */
 	readonly share: number;
 }
@@ -18,10 +19,11 @@ export const VARIANTS: readonly OwnerVariant[] = [
 	{
 		name: "bounded, 4 KiB cache, flaky lagging indexer",
 		fake: () => fakeFor("flaky"),
-		options: { stateStore: "bounded", cacheBudgetBytes: 4096, timing: BOUNDED_TIMING },
 		// Every snapshot re-reads most of the state through the 4 KiB cache and a faulty indexer (up
-		// to ~1,000 keyed-state reads per step late in a trial), so this variant runs few trials.
-		share: 0.03,
+		// to ~1,000 keyed-state reads per step late in a trial). The virtual clock makes every retry
+		// backoff free (no wall-clock sleeps), so the cost is CPU only.
+		options: () => ({ stateStore: "bounded", cacheBudgetBytes: 4096, timing: BOUNDED_TIMING, clock: virtualClock() }),
+		share: 0.2,
 	},
 	{ name: "full-resident", fake: () => new FakeUrsula(), options: { stateStore: "full-resident" }, share: 0.5 },
 ];
@@ -55,6 +57,10 @@ export async function reopen(
 	await current.close(ctx); // the fenced zombie's close marker must fail and not disturb the new owner
 	return next;
 }
+
+/** The owner options of one trial. */
+export const variantOptions = (variant: OwnerVariant): Partial<UrsulaStorageOptions> =>
+	typeof variant.options === "function" ? variant.options() : variant.options;
 
 export const trials = (name: string, fallback: number): number => Number(process.env[name] ?? fallback);
 

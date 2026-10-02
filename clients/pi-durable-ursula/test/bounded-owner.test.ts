@@ -113,6 +113,34 @@ describe("bounded open (§3.6)", () => {
 		await b.close(ctx);
 	});
 
+	it("preloads the root conversation's live documents (record, newest base, deltas since), in parallel", async () => {
+		const fake = new FakeUrsula({ indexer: "aggressive" });
+		const path = freshPath();
+		const a = await openOn(fake, path, { stateStore: "bounded" });
+		await a.commit(conv(1), ctx);
+		const scope = { kind: "conversation", conversationId: 1 };
+		const docs = [20, 21, 22];
+		await a.commit(
+			docs.map((id) => ({ type: "document.create", record: { id, kind: `pi.k${id}`, scope }, content: { kind: "base", version: 1, value: { n: 0 } } }) as never),
+			ctx,
+		);
+		for (let i = 1; i <= 3; i++) {
+			await a.commit(docs.map((id) => ({ type: "document.change", id, content: { kind: "delta", version: 1, ops: [["s", ["n"], i]] } }) as never), ctx);
+		}
+		await a.commit([{ type: "document.change", id: 21, content: { kind: "base", version: 1, value: { n: 9 } } } as never], ctx);
+		await a.commit([{ type: "document.change", id: 21, content: { kind: "delta", version: 1, ops: [["s", ["n"], 10]] } } as never], ctx);
+		await a.close(ctx);
+		const b = await openOn(fake, path, { stateStore: "bounded" });
+		const before = b.localStore?.metrics.remoteReads ?? 0;
+		for (const id of docs) {
+			const found = await b.findDocument({ kind: `pi.k${id}`, scope } as never, "current", ctx);
+			expect(found?.id).toBe(id);
+			expect((await b.document(id as never, "current", ctx))?.value).toEqual({ n: id === 21 ? 10 : 3 });
+		}
+		expect(b.localStore?.metrics.remoteReads).toBe(before);
+		await b.close(ctx);
+	});
+
 	describe("records beyond N0 seen during preload (the current owner is writing)", () => {
 		const setup = async (): Promise<{ fake: FakeUrsula; path: string }> => {
 			const fake = new FakeUrsula({ indexer: "aggressive" });

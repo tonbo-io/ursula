@@ -13,6 +13,7 @@
 // - planner.ts     — StorageWrite → ops (§4.4), MemoryStorage-ported validation, pre-checks, claims.
 // - transport.ts   — LogTransport / KeyedStateTransport interfaces (1:1 with the HTTP API).
 // - http.ts        — HttpLogTransport / HttpKeyedStateTransport over fetch (NDJSON records, raw keyed rows).
+// - metrics.ts     — OwnerMetrics (§7.6): Session-line remote reads and latency, poison/fence/contention counts.
 // - storage.ts     — UrsulaStorage: bounded or full-resident state, commit outcome policy, open/claim, close, poison.
 // - errors.ts      — FencedError, OwnershipActive, OwnershipContention, ClaimTimeout, OpenRefused.
 // - fake/          — in-memory fake Ursula with fault injection (tests and local development).
@@ -30,6 +31,7 @@ export {
 export { encodeRecord, type KeyedOp, KeyedBatchError, normalizeJsonMessage, parseKeyedBatch } from "./keyed-batch.ts";
 export { EXT_KEYED_BATCH, EXT_KEYED_STATE, H, KEYED_CONTENT_TYPE, KEYED_ROWS_MEDIA_TYPE, LIMITS } from "./protocol.ts";
 export { LocalStore, type LocalStoreOptions } from "./local-store/index.ts";
+export { type LatencySnapshot, LatencyRecorder, OwnerMetrics, type OwnerMetricsSnapshot } from "./metrics.ts";
 export { FullResidentStateStore, type Row, type StateStore, type StateView, ViewAbort } from "./state-store.ts";
 export {
 	type Clock,

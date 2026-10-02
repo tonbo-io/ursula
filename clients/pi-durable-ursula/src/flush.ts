@@ -38,6 +38,8 @@ export interface FlushHost {
 	readonly owner: OwnerClaim;
 	readonly timing: FlushTiming;
 	now(): number;
+	/** Backoff sleep between flush-wait attempts on the storage's injectable clock; `signal` cuts it short. */
+	sleep(ms: number, signal: AbortSignal): Promise<void>;
 	/** The in-flight commit's landing (append + apply), or undefined when none is in flight. */
 	inflight(): Promise<void> | undefined;
 	/** Poison the storage (terminal outcomes only). */
@@ -141,14 +143,12 @@ export class FlushLoop {
 		});
 	}
 
+	/** Back off for `ms` on the host's clock; `stop()` and `urge()` cut it short. */
 	private sleep(ms: number): Promise<void> {
-		return new Promise<void>((resolve) => {
-			this.wakeSleep = resolve;
-			this.timer = setTimeout(() => this.kick(), ms);
-			this.timer.unref?.();
-		}).finally(() => {
-			if (this.timer !== undefined) clearTimeout(this.timer);
-			this.timer = undefined;
+		const abort = new AbortController();
+		this.wakeSleep = () => abort.abort();
+		return this.host.sleep(ms, abort.signal).finally(() => {
+			this.wakeSleep = undefined;
 		});
 	}
 

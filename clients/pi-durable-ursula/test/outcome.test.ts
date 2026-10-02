@@ -71,7 +71,7 @@ describe("deterministic rejections", () => {
 			const { fake, path, storage } = await setup({ onAlert: (a) => alerts.push(a) });
 			fake.fault = faults.nth(faults.status(status));
 			await expect(storage.commit(conv(10), ctx)).rejects.toBeInstanceOf(StorageRejected);
-			expect(alerts.map((a) => a.status)).toEqual([status]);
+			expect(alerts.map((a) => (a.kind === "server-limit" ? a.status : a.kind))).toEqual([status]);
 			expect(landed(fake, path, 10)).toBe(0);
 			expect(await storage.commit(conv(10), ctx)).toBe(1);
 			await storage.close(ctx);

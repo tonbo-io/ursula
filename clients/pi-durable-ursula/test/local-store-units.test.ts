@@ -213,6 +213,81 @@ describe("LocalStore", () => {
 		expect(store.cachedRows().map(([k]) => k)).toEqual([K.t(102), K.t(103)]);
 	});
 
+	/** A store whose cache covers `[t/, strinc(t/))` with rows t/1..t/4 of `size` value octets each. */
+	async function covered(size: number, options: { largeValueBytes?: number; big?: number } = {}): Promise<{ store: LocalStore; ks: Scripted; row: number }> {
+		const ks = new Scripted();
+		const store = new LocalStore({ keyedState: ks, base: 0, ...options });
+		const read = store.read((v) => [...v.scan(K.t(), strinc(K.t()))].length);
+		await drain();
+		ks.calls[0]?.answer(page(0, [1, 2, 3, 4].map((id) => [K.t(id), 0, (id === options.big ? "y" : "x").repeat(id === options.big ? size * 4 : size)])));
+		expect(await read).toBe(4);
+		return { store, ks, row: K.t(1).length + size + 64 };
+	}
+	const rangesOf = (store: LocalStore): [string, string | undefined][] => store.coveredRanges().map((r) => [r.lo, r.hi]);
+
+	it("§7.5: evicts values over the large-value threshold first, splitting their range", async () => {
+		const { store, ks, row } = await covered(100, { largeValueBytes: 200, big: 3 });
+		const before = store.cacheBytes;
+		store.evict(before - 1);
+		// Only the large row left; the rest of the range stays covered around it.
+		expect(store.cachedRows().map(([k]) => k)).toEqual([K.t(1), K.t(2), K.t(4)]);
+		expect(store.metrics.largeValuesEvicted).toBe(1);
+		expect(rangesOf(store)).toEqual([
+			[K.t(), K.t(3)],
+			[`${K.t(3)}\u0000`, strinc(K.t())],
+		]);
+		expect(store.cacheBytes).toBe(3 * row);
+		expect(await store.read((v) => v.get(K.t(4)))).toBe("x".repeat(100));
+		expect(ks.calls).toHaveLength(1);
+	});
+
+	it("§7.5: shrinks a range from its cold end, away from the key last read", async () => {
+		const { store, row } = await covered(100);
+		// The last read scanned from the range's start: the high end is cold.
+		store.evict(2 * row);
+		expect(store.cachedRows().map(([k]) => k)).toEqual([K.t(1), K.t(2)]);
+		expect(rangesOf(store)).toEqual([[K.t(), K.t(3)]]);
+		expect(store.metrics.rangesShrunk).toBe(1);
+		expect(store.metrics.rangesEvicted).toBe(0);
+
+		const hot = await covered(100);
+		expect(await hot.store.read((v) => v.get(K.t(4)))).toBe("x".repeat(100));
+		// Rows above the hot key t/4 go first (none), then rows from the bottom up.
+		hot.store.evict(2 * row);
+		expect(hot.store.cachedRows().map(([k]) => k)).toEqual([K.t(3), K.t(4)]);
+		expect(rangesOf(hot.store)).toEqual([[`${K.t(2)}\u0000`, strinc(K.t())]]);
+	});
+
+	it("§7.5: coalesces adjacent unpinned ranges once their reads settle", async () => {
+		const ks = new Scripted();
+		const store = new LocalStore({ keyedState: ks, base: 0 });
+		const a = store.read((v) => [...v.scan(K.t(1), K.t(3))].length);
+		await drain();
+		ks.calls[0]?.answer(page(0, [[K.t(1), 0, "1"]]));
+		expect(await a).toBe(1);
+		const b = store.read((v) => [...v.scan(K.t(3), K.t(5))].length);
+		await drain();
+		ks.calls[1]?.answer(page(0, [[K.t(4), 0, "4"]]));
+		expect(await b).toBe(1);
+		expect(rangesOf(store)).toEqual([[K.t(1), K.t(5)]]);
+		expect(store.metrics.rangesCoalesced).toBe(1);
+		// The coalesced range answers reads across the old boundary locally.
+		expect(await store.read((v) => [...v.scan(K.t(1), K.t(5))].map(([k]) => k))).toEqual([K.t(1), K.t(4)]);
+		expect(ks.calls).toHaveLength(2);
+	});
+
+	it("§7.5: alerts once when the overlay passes the alert size, and re-arms below it", () => {
+		const alerts: number[] = [];
+		const store = new LocalStore({ keyedState: new Scripted(), base: 0, overlayAlertBytes: 500, onOverlayAlert: (bytes) => alerts.push(bytes) });
+		for (let i = 0; i < 6; i++) store.apply(i, [{ op: "p", key: K.t(i), value: "x".repeat(100) }]);
+		expect(alerts).toHaveLength(1);
+		expect(alerts[0]).toBeGreaterThanOrEqual(500);
+		store.advanceFloor(6);
+		for (let i = 6; i < 12; i++) store.apply(i, [{ op: "p", key: K.t(i), value: "x".repeat(100) }]);
+		expect(alerts).toHaveLength(2);
+		expect(store.metrics.overlayAlerts).toBe(2);
+	});
+
 	it("retries transient keyed-state failures and poisons after the retry budget", async () => {
 		const ks = new Scripted();
 		const store = new LocalStore({ keyedState: ks, base: 0, backoff: () => Promise.resolve(), maxRetries: 2 });
