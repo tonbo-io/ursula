@@ -1,11 +1,12 @@
 // Drill: blue/green projection format rebuild (design §5.5 "a new format means a new namespace
 // rebuilt from record 0", §6.1 U20, §10 M4).
 //
-// Live bounded owners on an S3-backed node served by the "blue" indexer at projection format 1. A
-// "green" indexer pod at format 2 (the hidden `--keyed-projection-format` drill knob: same layout,
-// separate `v2/` namespaces) starts on the same object store and is warmed stream by stream through
-// its internal API, rebuilding every namespace from record 0 while blue keeps serving. Keyed-state
-// is then cut over to green under live traffic. Expected: zero poison and zero faulted tasks; E keeps
+// Live bounded owners on an S3-backed node served by the "blue" indexer at projection format 1.
+// While blue keeps serving, the U20 maintenance CLI `ursula indexer keyed rebuild
+// --projection-format 2` builds every stream's format-2 namespace (same layout, separate `v2/`
+// prefix) from record 0 to the stream's tail. A "green" indexer pod at format 2 (the hidden
+// `--keyed-projection-format` drill knob) then starts on the same object store from those
+// namespaces, and keyed-state is cut over to it under live traffic. Expected: zero poison and zero faulted tasks; E keeps
 // catching up after the cutover; at the same tail both formats answer byte-identical rows; both
 // `v1/` and `v2/` exist side by side, and deleting a stream removes both (stream GC reaches every
 // format of the incarnation); every acknowledged commit is stored byte-for-byte.
@@ -73,16 +74,29 @@ it.runIf(s3Available())("blue/green: a format-2 pod rebuilds next to format 1 an
 		incarnations.set(owner.stream, BigInt(`0x${hex}`));
 	}
 
-	// Green: format 2 on the same store, warmed while blue serves.
-	const green = await s.spawnIndexer({ format: 2 });
+	// Green: the rebuild CLI builds format 2 on the same store from record 0 while blue serves.
 	const warmStart = Date.now();
+	const rebuilt: number[] = [];
+	for (const owner of f.owners) {
+		const key = owner.stream.slice("drill/".length);
+		const report = (await s.keyedTool("rebuild", "drill", key, incarnations.get(owner.stream) ?? 0n, ["--projection-format", "2"])) as {
+			previous_through: number;
+			through_record: number;
+		};
+		expect(report.previous_through).toBe(0);
+		expect(report.through_record).toBeGreaterThan(0);
+		rebuilt.push(report.through_record);
+	}
+	const warmMs = Date.now() - warmStart;
+
+	// A green pod at format 2 starts from the rebuilt namespaces and catches up to the tail.
+	const green = await s.spawnIndexer({ format: 2 });
 	for (const owner of f.owners) {
 		const tail = await recordTail(s.url, owner.stream);
 		const answer = await scanPod(green.url, "drill", owner.stream.slice("drill/".length), incarnations.get(owner.stream) ?? 0n, tail);
 		expect(answer.status, answer.body).toBe(200);
 		expect(Number(answer.through)).toBe(tail);
 	}
-	const warmMs = Date.now() - warmStart;
 
 	// Cutover under live traffic.
 	const before = f.totals();
@@ -126,6 +140,7 @@ it.runIf(s3Available())("blue/green: a format-2 pod rebuilds next to format 1 an
 
 	record("blue-green", {
 		warm_ms: warmMs,
+		rebuilt_through_records: rebuilt,
 		e_catch_up_after_cutover_ms: catchUpMs,
 		poison: totals.poison - before.poison,
 		faulted: totals.faulted,
