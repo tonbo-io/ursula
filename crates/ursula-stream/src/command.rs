@@ -7,6 +7,7 @@ use ursula_shard::BucketStreamId;
 
 use crate::model::ColdChunkRef;
 use crate::model::ExternalPayloadRef;
+use crate::model::ObjectPayloadRef;
 use crate::model::ProducerRequest;
 use crate::model::StreamAttrs;
 use crate::snapshot::StreamSnapshot;
@@ -190,6 +191,17 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
         now_ms: u64,
     },
+    /// Bounded-state F5 (feature level 3): removes `refs` from the stream's
+    /// state-held external payload locators after the leader wrote their
+    /// cold-index page entries. Apply removes exactly the listed refs that are
+    /// still present and queues no GC, because the pages now reference the
+    /// objects; refs already gone (replay, retention, delete) are skipped, so
+    /// replays are idempotent. Appended last so older variants keep their
+    /// serialized positions.
+    OffloadColdRefs {
+        stream_id: BucketStreamId,
+        refs: Vec<ObjectPayloadRef>,
+    },
 }
 
 impl fmt::Display for StreamCommand {
@@ -280,6 +292,9 @@ impl fmt::Display for StreamCommand {
             }
             Self::SetFeatureLevel { level } => write!(f, "set_feature_level:{level}"),
             Self::TidyStream { stream_id, .. } => write!(f, "tidy_stream:{stream_id}"),
+            Self::OffloadColdRefs { stream_id, refs } => {
+                write!(f, "offload_cold_refs:{stream_id}:{} refs", refs.len())
+            }
         }
     }
 }

@@ -11,6 +11,8 @@
 //! - [`persist`]: snapshot / restore / integrity serialization.
 //! - [`producers`]: F3 receipt window, idle-producer expiry, F4a collapse and
 //!   `TidyStream` (feature level 1).
+//! - [`external_locators`]: F5 state-held external payload locators and
+//!   `OffloadColdRefs` (feature level 3), plus the offload pass's query.
 //! - [`hot_buffer`], [`cold_state`], [`ttl`]: internal per-stream data structures.
 //!
 //! The root keeps the [`StreamStateMachine`] type, its core slot/TTL accessors,
@@ -90,6 +92,7 @@ mod cold;
 mod cold_gc;
 mod cold_refs;
 mod cold_state;
+mod external_locators;
 mod flush_planner;
 mod gauges;
 mod hot_buffer;
@@ -100,6 +103,9 @@ pub use self::cold_refs::SharedRefCandidate;
 pub use self::cold_refs::SharedRefCompactionRequest;
 pub use self::cold_refs::SharedRefIdleTracker;
 pub use self::cold_refs::plan_shared_ref_run;
+pub use self::external_locators::MAX_STAGED_EXTERNAL_REFS;
+pub use self::external_locators::STAGED_EXTERNAL_REF_MAX_AGE_MS;
+pub use self::external_locators::StagedExternalRefCandidate;
 pub use self::flush_planner::ColdFlushPass;
 pub use self::flush_planner::ColdFlushPassRequest;
 pub use self::flush_planner::ColdFlushPlanStats;
@@ -841,6 +847,9 @@ impl StreamStateMachine {
             } => self.set_bucket_quota(bucket_id, max_streams, max_retained_bytes),
             StreamCommand::SetFeatureLevel { level } => self.set_feature_level(level),
             StreamCommand::TidyStream { stream_id, now_ms } => self.tidy_stream(&stream_id, now_ms),
+            StreamCommand::OffloadColdRefs { stream_id, refs } => {
+                self.offload_cold_refs(&stream_id, &refs)
+            }
         }
     }
 }
@@ -1046,6 +1055,8 @@ fn snapshot_digest(content_type: &str, payload: &[u8]) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+#[cfg(test)]
+mod external_locators_tests;
 #[cfg(test)]
 mod hygiene_tests;
 #[cfg(test)]

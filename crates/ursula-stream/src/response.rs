@@ -112,6 +112,15 @@ pub enum StreamResponse {
     StreamTidied {
         debt_remaining: bool,
     },
+    /// Result of [`StreamCommand::OffloadColdRefs`]: how many of the listed
+    /// refs were still in state and removed, and how many state-held external
+    /// refs the stream keeps.
+    ///
+    /// [`StreamCommand::OffloadColdRefs`]: crate::StreamCommand::OffloadColdRefs
+    ColdRefsOffloaded {
+        removed: u64,
+        remaining: u64,
+    },
     Error {
         code: StreamErrorCode,
         message: String,

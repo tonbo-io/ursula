@@ -648,6 +648,7 @@ impl StreamStateMachine {
                 }],
             );
         }
+        let external_locators_in_state = self.external_locators_in_state();
         let object = ObjectPayloadRef {
             start_offset: offset,
             end_offset: next_offset,
@@ -662,7 +663,13 @@ impl StreamStateMachine {
         {
             let _range = index.commit_append(prepared);
         }
-        slot.cold.push_external_segment(object.clone());
+        if external_locators_in_state {
+            // F5 (level 3): commit first, index after. State holds the
+            // locator until the leader's offload pass writes its page entry.
+            slot.cold.push_direct_external_segment(object.clone());
+        } else {
+            slot.cold.push_external_segment(object.clone());
+        }
         slot.integrity.append_external(
             &stream_id,
             object.start_offset,

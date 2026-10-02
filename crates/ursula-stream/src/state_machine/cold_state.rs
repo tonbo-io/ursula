@@ -49,6 +49,18 @@ impl StreamColdState {
         self.external_segments.push(object);
     }
 
+    /// Removes exactly the listed external refs that state still holds
+    /// (F5 `OffloadColdRefs`) and returns how many it removed.
+    pub(super) fn remove_external_segments(&mut self, refs: &[ObjectPayloadRef]) -> u64 {
+        let before = self.external_segments.len();
+        self.external_segments
+            .retain(|object| !refs.iter().any(|offloaded| offloaded == object));
+        if self.external_segments.len() < before {
+            self.external_segments.shrink_to_fit();
+        }
+        u64::try_from(before.saturating_sub(self.external_segments.len())).unwrap_or(u64::MAX)
+    }
+
     pub(super) fn push_cold_chunk(&mut self, chunk: ColdChunkRef) {
         self.cold_frontier = chunk.end_offset;
         if chunk.shared_object {
