@@ -2554,6 +2554,7 @@ fn snapshot_entry(
         cold_chunks: Vec::new(),
         external_segments: Vec::new(),
         message_records: Vec::new(),
+        hot_append_starts: Vec::new(),
         record_index: None,
         integrity: empty_integrity(),
         visible_snapshot: None,

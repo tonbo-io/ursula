@@ -167,11 +167,14 @@ fn rotated_order(
 }
 
 impl StreamStateMachine {
-    /// Message records of `stream_id` that start in `[start, end)`.
+    /// Messages of `stream_id` that start in `[start, end)`.
     fn hot_records_between(&self, stream_id: &BucketStreamId, start: u64, end: u64) -> u64 {
         let Some(slot) = self.stream_slot(stream_id) else {
             return 0;
         };
+        if self.derived_boundaries(slot) {
+            return slot.derived_starts_between(start, end);
+        }
         let records = &slot.message_records;
         let from = records.partition_point(|record| record.start_offset < start);
         let to = records.partition_point(|record| record.start_offset < end);
@@ -267,7 +270,7 @@ impl StreamStateMachine {
             let hot_len = slot.hot_buffer.len();
             if hot_len > 0 {
                 let aged = self.hot_tail_aged(stream_id, request.max_hot_age);
-                let real_len = super::hot_real_bytes(
+                let real_len = self.hot_real_bytes(
                     u64::try_from(hot_len).unwrap_or(u64::MAX),
                     slot.hot_buffer.accounted_records(),
                 );
@@ -335,10 +338,9 @@ impl StreamStateMachine {
                     candidate.start_offset,
                     candidate.end_offset,
                 );
-                planned_total = planned_total.saturating_add(super::hot_real_bytes(
-                    u64::try_from(len).unwrap_or(u64::MAX),
-                    records,
-                ));
+                planned_total = planned_total.saturating_add(
+                    self.hot_real_bytes(u64::try_from(len).unwrap_or(u64::MAX), records),
+                );
                 budget = budget.saturating_sub(len);
                 start = candidate.end_offset;
                 last_stream = Some(stream_id);

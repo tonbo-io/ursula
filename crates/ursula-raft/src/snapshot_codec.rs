@@ -374,6 +374,7 @@ fn stream_to_proto(
         record_mark_records,
         record_mark_offsets,
         dense_first_record,
+        hot_append_starts: entry.hot_append_starts,
     })
 }
 
@@ -446,6 +447,7 @@ fn stream_from_proto(
             .into_iter()
             .map(message_record_from_proto)
             .collect(),
+        hot_append_starts: entry.hot_append_starts,
         record_index,
         integrity: integrity_from_proto(required(entry.integrity, "snapshot stream integrity")?),
         retained_offset: entry.retained_offset,
@@ -1022,6 +1024,120 @@ mod tests {
 
         let mut below = decoded.stream_snapshot;
         below.feature_level = ursula_stream::FEATURE_LEVEL_KEYED_STREAMS;
+        assert!(ursula_stream::StreamStateMachine::restore(below).is_err());
+    }
+
+    /// Bounded-state F4b (level 4): the codec writes no message records
+    /// (field 10), binary streams carry their hot append starts in field 20,
+    /// JSON streams carry neither, and the decoded snapshot restores to the
+    /// live state with the same bootstrap answers.
+    #[test]
+    fn level_4_append_starts_round_trip_without_message_records() {
+        let mut machine = ursula_stream::StreamStateMachine::new();
+        machine.apply(ursula_stream::StreamCommand::SetFeatureLevel {
+            level: ursula_stream::FEATURE_LEVEL_HOT_REPRESENTATION,
+        });
+        machine.apply(ursula_stream::StreamCommand::CreateBucket {
+            bucket_id: "bucket".to_owned(),
+        });
+        let binary = BucketStreamId::new("bucket", "binary");
+        let json = BucketStreamId::new("bucket", "json");
+        for (stream_id, content_type) in [
+            (&binary, "application/octet-stream"),
+            (&json, "application/json"),
+        ] {
+            machine.apply(ursula_stream::StreamCommand::CreateStream {
+                stream_id: stream_id.clone(),
+                content_type: content_type.to_owned(),
+                initial_payload: bytes::Bytes::new(),
+                close_after: false,
+                stream_seq: None,
+                producer: None,
+                stream_ttl_seconds: None,
+                stream_expires_at_ms: None,
+                attrs: None,
+                now_ms: 1,
+            });
+            for index in 0..4u64 {
+                let payload = if content_type == "application/json" {
+                    format!("{{\"i\":{index}}}\n").into_bytes()
+                } else {
+                    vec![b'a'; 8]
+                };
+                let response = machine.apply(ursula_stream::StreamCommand::Append {
+                    stream_id: stream_id.clone(),
+                    content_type: Some(content_type.to_owned()),
+                    payload: bytes::Bytes::from(payload),
+                    close_after: false,
+                    stream_seq: None,
+                    producer: None,
+                    now_ms: 2,
+                    record_match: None,
+                });
+                assert!(matches!(
+                    response,
+                    ursula_stream::StreamResponse::Appended { .. }
+                ));
+            }
+        }
+        // Flush into the second binary message: its start leaves the hot
+        // buffer with it.
+        machine.apply(ursula_stream::StreamCommand::FlushCold {
+            stream_id: binary.clone(),
+            chunk: ursula_stream::ColdChunkRef {
+                start_offset: 0,
+                end_offset: 12,
+                s3_path: "bucket/binary/chunks/0.bin".to_owned(),
+                object_size: 12,
+                ..Default::default()
+            },
+            cold_generation: None,
+        });
+        let entries = machine
+            .snapshot()
+            .streams
+            .into_iter()
+            .map(|entry| stream_to_proto(entry).expect("encode entry"))
+            .collect::<Vec<_>>();
+        let binary_entry = &entries[0];
+        assert!(binary_entry.message_records.is_empty());
+        assert_eq!(binary_entry.hot_append_starts, vec![16, 24]);
+        let json_entry = &entries[1];
+        assert!(json_entry.message_records.is_empty());
+        assert!(json_entry.hot_append_starts.is_empty());
+
+        let snapshot = GroupSnapshot {
+            placement: ShardPlacement {
+                core_id: CoreId(0),
+                shard_id: ShardId(0),
+                raft_group_id: RaftGroupId(0),
+            },
+            group_commit_index: 9,
+            stream_snapshot: machine.snapshot(),
+            stream_append_counts: Vec::new(),
+        };
+        let bytes = group_snapshot_frames(Arc::new(snapshot.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("encode frames")
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let decoded = decode_group_snapshot(&bytes).expect("decode frames");
+        assert_eq!(decoded, snapshot);
+        let restored = ursula_stream::StreamStateMachine::restore(decoded.stream_snapshot.clone())
+            .expect("restore decoded snapshot");
+        assert_eq!(restored.snapshot(), machine.snapshot());
+        assert_eq!(restored.state_gauges(), machine.state_gauges());
+        for stream_id in [&binary, &json] {
+            assert_eq!(
+                restored.bootstrap_plan(stream_id),
+                machine.bootstrap_plan(stream_id)
+            );
+        }
+
+        // A level-3 binary refuses append starts.
+        let mut below = decoded.stream_snapshot;
+        below.feature_level = ursula_stream::FEATURE_LEVEL_EXTERNAL_LOCATORS;
         assert!(ursula_stream::StreamStateMachine::restore(below).is_err());
     }
 

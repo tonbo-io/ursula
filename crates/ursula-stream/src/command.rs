@@ -183,8 +183,9 @@ pub enum StreamCommand {
     },
     /// Bounded normalization of one stream's replicated state (bounded-state
     /// F0 `TidyStream`, feature level 1): collapses message records below
-    /// the seal point (F4a), stamps and expires idle producers and trims the
-    /// receipt window (F3). Each command does bounded work; a leader-side
+    /// the seal point (F4a; from level 4 converts legacy message records to
+    /// the F4b representation instead), stamps and expires idle producers
+    /// and trims the receipt window (F3). Each command does bounded work; a leader-side
     /// driver repeats it while debt remains. Idempotent. Appended last so
     /// older variants keep their serialized positions.
     TidyStream {

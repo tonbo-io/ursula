@@ -11,6 +11,7 @@ use super::ProducerRequest;
 use super::StreamAttrs;
 use super::StreamBootstrapPlan;
 use super::StreamErrorCode;
+use super::StreamMessageRecord;
 use super::StreamMetadata;
 use super::StreamRead;
 use super::StreamReadColdIndexSegment;
@@ -256,17 +257,34 @@ impl StreamStateMachine {
     /// Hot payload plus per-record overhead across the group (F6c): what
     /// admission and the flush planner count.
     pub fn total_hot_real_bytes(&self) -> u64 {
-        super::hot_real_bytes(self.hot_payload_bytes, self.hot_records)
+        self.hot_real_bytes(self.hot_payload_bytes, self.hot_records)
     }
 
     /// One stream's hot payload plus per-record overhead (F6c).
     pub fn hot_real_len(&self, stream_id: &BucketStreamId) -> Option<u64> {
         self.stream_slot(stream_id).map(|slot| {
-            super::hot_real_bytes(
+            self.hot_real_bytes(
                 u64::try_from(slot.hot_buffer.len()).unwrap_or(u64::MAX),
                 slot.hot_buffer.accounted_records(),
             )
         })
+    }
+
+    /// Per-record hot overhead of this group's representation (F6c):
+    /// [`super::HOT_RECORD_OVERHEAD_BYTES`] below feature level 4 and
+    /// [`super::HOT_RECORD_OVERHEAD_BYTES_LB4`] from it (F4b).
+    pub fn hot_record_overhead_bytes(&self) -> u64 {
+        if self.message_records_removed() {
+            super::HOT_RECORD_OVERHEAD_BYTES_LB4
+        } else {
+            super::HOT_RECORD_OVERHEAD_BYTES
+        }
+    }
+
+    /// `payload_bytes` plus this group's per-record overhead for `records`
+    /// (F6c). Admission charges incoming writes with it.
+    pub fn hot_real_bytes(&self, payload_bytes: u64, records: u64) -> u64 {
+        super::hot_real_bytes_with(payload_bytes, records, self.hot_record_overhead_bytes())
     }
 
     pub fn bucket_exists(&self, bucket_id: &str) -> bool {
@@ -582,11 +600,20 @@ impl StreamStateMachine {
         let mut updates = Vec::new();
         let mut update_bytes = 0u64;
         let mut capped_at = None;
-        for record in slot
-            .message_records
-            .iter()
-            .filter(|record| record.start_offset >= snapshot_offset)
-        {
+        // F4b (level 4): the messages derive from the dense record offsets or
+        // the hot append starts; below it from the message records.
+        let derived: Box<dyn Iterator<Item = StreamMessageRecord> + '_> =
+            if self.derived_boundaries(slot) {
+                Box::new(slot.derived_messages_from(snapshot_offset))
+            } else {
+                Box::new(
+                    slot.message_records
+                        .iter()
+                        .filter(move |record| record.start_offset >= snapshot_offset)
+                        .cloned(),
+                )
+            };
+        for record in derived {
             let len = record.end_offset.saturating_sub(record.start_offset);
             let next_bytes = update_bytes.saturating_add(len);
             if !updates.is_empty() && next_bytes > max_update_bytes {
@@ -594,7 +621,7 @@ impl StreamStateMachine {
                 break;
             }
             update_bytes = next_bytes;
-            updates.push(record.clone());
+            updates.push(record);
         }
         let (next_offset, up_to_date, closed) = match capped_at {
             Some(boundary) => (boundary, false, false),

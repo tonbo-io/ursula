@@ -16,7 +16,7 @@ The mapping is direct:
 
 1. Every node runs a release that supports feature level 1, and the level is raised: `ursulactl cluster enable-feature --level 1` ([Operations](/docs/operations#feature-levels)). Below it, creating the keyed stream answers `409`.
 2. A keyed-state indexer, with `server.keyed_state_upstream` pointing at it on every node ([Deploy](/docs/deploy-cluster#optional-keyed-state-indexer)). Without one the owner still works, but replays the whole log into memory at every open.
-3. Room for a 32 MiB commit. A Pi commit can be as large as the 32 MiB request limit, and it must fit the per-group admission caps, `raft.max_uncommitted_size_per_group` and `storage.cold.max_hot_size_per_group`. Use the `standard` or `large` preset, or set both caps to at least 64 MiB; `tiny` and `small` are too small. Until the cluster's groups are raised to feature level 3, also keep `runtime.external_payload_min_size` above 32 MiB so commits are never staged as external payloads; at level 3 it may be lowered.
+3. Room for a 32 MiB commit. A Pi commit can be as large as the 32 MiB request limit, and it must fit the per-group admission caps, `raft.max_uncommitted_size_per_group` and `storage.cold.max_hot_size_per_group`. Use the `standard` or `large` preset, or set both caps to at least 64 MiB; `tiny` and `small` are too small. Until the cluster's groups are raised to feature level 3, also keep `runtime.external_payload_min_size` above 32 MiB so commits are never staged as external payloads; at level 3 or higher it may be lowered.
 4. No retention on harness streams. Keyed state is built from the full log.
 
 ## Install and run

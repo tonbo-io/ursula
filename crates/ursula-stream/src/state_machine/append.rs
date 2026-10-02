@@ -79,6 +79,9 @@ impl StreamStateMachine {
                     "append transaction streams must share one bucket and affinity key",
                 ));
             }
+            // F4b: convert legacy message records before the undo
+            // checkpoint, so a rollback never undoes the conversion.
+            self.migrate_message_records(stream_id);
             let Some(slot) = self.stream_slot(stream_id) else {
                 return Err(StreamResponse::error(
                     StreamErrorCode::StreamNotFound,
@@ -239,6 +242,7 @@ impl StreamStateMachine {
         if let Err(response) = self.validate_stream_scope(&stream_id) {
             return response;
         }
+        self.migrate_message_records(&stream_id);
         if let Err(response) = validate_producer_request(producer.as_ref()) {
             return response;
         }
@@ -446,6 +450,7 @@ impl StreamStateMachine {
                 producer: producer_ack,
             }
         } else {
+            let records_removed = self.message_records_removed();
             let slot = self
                 .stream_slot_mut(&stream_id)
                 .expect("stream existence checked before append mutation");
@@ -457,12 +462,7 @@ impl StreamStateMachine {
             slot.hot_buffer.push(offset, next_offset, payload);
             slot.integrity
                 .append_payload(&stream_id, offset, next_offset, payload);
-            slot.message_records
-                .extend(Self::message_records_for_append(
-                    offset,
-                    next_offset,
-                    &record_ends,
-                ));
+            slot.record_message_boundaries(records_removed, offset, next_offset, &record_ends);
             self.add_hot_payload_bytes(payload_len);
             self.sync_hot_index(&stream_id);
             self.usage_on_append(
@@ -510,6 +510,7 @@ impl StreamStateMachine {
         if let Err(response) = self.validate_stream_scope(&stream_id) {
             return response;
         }
+        self.migrate_message_records(&stream_id);
         if let Err(response) = validate_producer_request(producer.as_ref()) {
             return response;
         }
@@ -671,6 +672,7 @@ impl StreamStateMachine {
             object_size: payload.object_size,
             object_offset: 0,
         };
+        let records_removed = self.message_records_removed();
         let slot = self
             .stream_slot_mut(&stream_id)
             .expect("stream existence checked before external append mutation");
@@ -692,12 +694,7 @@ impl StreamStateMachine {
             &object.s3_path,
             object.object_size,
         );
-        slot.message_records
-            .extend(Self::message_records_for_append(
-                offset,
-                next_offset,
-                &record_ends,
-            ));
+        slot.record_message_boundaries(records_removed, offset, next_offset, &record_ends);
         // F4a: an external append is a cold transition.
         self.collapse_sealed_message_records(&stream_id);
         self.sync_hot_index(&stream_id);
@@ -761,6 +758,7 @@ impl StreamStateMachine {
             ));
         }
         self.validate_stream_scope(&stream_id)?;
+        self.migrate_message_records(&stream_id);
         validate_producer_request(producer.as_ref())?;
         if self.expire_stream_if_due(&stream_id, now_ms) {
             return Err(StreamResponse::error(
@@ -946,6 +944,7 @@ impl StreamStateMachine {
                 items.clone(),
             );
         }
+        let records_removed = self.message_records_removed();
         let slot = self
             .stream_slot_mut(&stream_id)
             .expect("stream existence checked before batch append mutation");
@@ -962,12 +961,12 @@ impl StreamStateMachine {
                 .append_payload(&stream_id, item.start_offset, item.next_offset, payload);
         }
         for (item, record_ends) in items.iter().zip(all_record_ends.iter()) {
-            slot.message_records
-                .extend(Self::message_records_for_append(
-                    item.start_offset,
-                    item.next_offset,
-                    record_ends,
-                ));
+            slot.record_message_boundaries(
+                records_removed,
+                item.start_offset,
+                item.next_offset,
+                record_ends,
+            );
         }
         let mut appended_bytes: u64 = 0;
         let mut appended_records: u64 = 0;

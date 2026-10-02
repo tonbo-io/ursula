@@ -68,7 +68,14 @@ pub struct StreamSnapshotEntry {
     pub cold_index_generation: u64,
     pub cold_chunks: Vec<ColdChunkRef>,
     pub external_segments: Vec<ObjectPayloadRef>,
+    /// Legacy message boundaries. Empty from feature level 4 (F4b) once
+    /// the stream converted; snapshots then carry `hot_append_starts`.
     pub message_records: Vec<StreamMessageRecord>,
+    /// F4b (level 4): start offsets of the messages at or above the seal
+    /// point, for streams without a record index. Absent in older
+    /// snapshots.
+    #[serde(default)]
+    pub hot_append_starts: Vec<u64>,
     #[serde(default)]
     pub record_index: Option<StreamRecordIndex>,
     pub integrity: StreamIntegritySnapshot,
