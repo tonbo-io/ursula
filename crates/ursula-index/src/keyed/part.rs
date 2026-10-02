@@ -202,9 +202,17 @@ fn invalid(message: impl Into<String>) -> IndexError {
     IndexError::InvalidKeyedState(message.into())
 }
 
-/// Content-addressed object key of a part, relative to its namespace.
+/// A fresh object key for a part, relative to its namespace:
+/// `parts/{blake3}-{nonce}.parquet`. The nonce makes every encoded part's key
+/// unique, so a key is never reused after a deleter could have scheduled it
+/// (`manifest` module docs); readers verify the bytes against the manifest
+/// entry, not the key.
 pub fn part_object_key(bytes: &[u8]) -> String {
-    format!("parts/{}.parquet", digest(bytes))
+    format!(
+        "parts/{}-{}.parquet",
+        digest(bytes),
+        super::manifest::unique_object_nonce()
+    )
 }
 
 /// Encodes one part. `entries` must be strictly ascending by key, and
