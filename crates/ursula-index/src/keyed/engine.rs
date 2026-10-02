@@ -1836,7 +1836,11 @@ impl Inner {
         deleted
     }
 
-    /// The objects `CURRENT` references (adopting it when newer).
+    /// The objects a reader may still use: what `CURRENT` references
+    /// (adopting it when newer), plus every manifest written within the
+    /// grace period and what it references (IX2). Queued orphans of a lost
+    /// CAS or an abandoned compaction are content-addressed, so a recent
+    /// manifest other than `CURRENT` may reference them.
     async fn gc_referenced(
         &self,
         namespace: &Arc<Namespace>,
@@ -1850,6 +1854,12 @@ impl Inner {
             published.manifest.part_keys().map(str::to_owned).collect();
         referenced.insert(published.manifest_key.clone());
         self.adopt_loaded(namespace, published);
+        referenced.extend(
+            namespace
+                .namespace
+                .protected_now(self.now_ms(), self.config.gc_grace)
+                .await?,
+        );
         Ok(referenced)
     }
 
